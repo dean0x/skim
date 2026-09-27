@@ -102,7 +102,7 @@ fn tiny_block() -> &'static str {
     "tiny" // 4 bytes — well below the 64-byte floor
 }
 
-/// A large code block (>32 KiB). Routes to Passthrough unconditionally (ADR-007).
+/// A large code block (>32 KiB). Routes to Passthrough unconditionally (L3-ADR-007).
 fn large_code_block() -> String {
     // ~33 KiB of code text.
     "fn placeholder() {}\n".repeat(33 * 1024 / 20)
@@ -967,7 +967,7 @@ mod prefilter_public_api {
 
     /// AC22 / P0.1 — Prefilter constants are accessible for documentation and testing.
     ///
-    /// Note: code blocks always route to Passthrough before the prefilter (ADR-007);
+    /// Note: code blocks always route to Passthrough before the prefilter (L3-ADR-007);
     /// no per-class size threshold is needed for `Class::Code`.
     #[test]
     fn all_constants_accessible() {
@@ -1665,7 +1665,7 @@ fn ac25_full_router_passes_conformance_suite() {
 /// over `ALL_CORPUS`. BlockRouter must not normalize JSON number tokens or silently
 /// drop log lines — proven end-to-end through the full router stack.
 ///
-/// # What this proves (ADR-007 / #427 Pass 3)
+/// # What this proves (L3-ADR-007 / #427 Pass 3)
 ///
 /// - JSON minifier + value-equivalence gate preserve raw number tokens (`1e10` stays
 ///   `1e10`; `value_equivalent_raw` returns `Some(true)`).
@@ -1800,11 +1800,11 @@ fn ac26_rskim_compress_no_direct_hyper_tokio_axum() {
         "AC26: rskim-compress [dependencies] must NOT contain 'axum' (AC9/AC26)\n\
          Found: {deps_section}"
     );
-    // P0.1 / ADR-007: rskim-core (AST transform) must NOT be a direct dependency
+    // P0.1 / L3-ADR-007: rskim-core (AST transform) must NOT be a direct dependency
     // of rskim-compress. Code blocks pass through losslessly; no tree-sitter on egress.
     assert!(
         !deps_section.contains("rskim-core"),
-        "P0.1/ADR-007: rskim-compress [dependencies] must NOT contain 'rskim-core' \
+        "P0.1/L3-ADR-007: rskim-compress [dependencies] must NOT contain 'rskim-core' \
          (code blocks are always Passthrough; no AST transforms on the egress path)\n\
          Found: {deps_section}"
     );

@@ -58,10 +58,11 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 
 ### Command Rewriting (`skim init`)
 - PreToolUse hook rewrites `ls`, `grep`, `gh`, `cargo test`, `vitest`, `git diff` into skim equivalents
-- File reads (`cat`, `head`, `tail` on code files) are rewritten into direct skim reads (e.g. `cat file.ts` → `skim file.ts --mode=pseudo`); output is a structured view, not raw bytes — skim emits a one-line stderr notice whenever the served view differs from raw file contents. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20` (verbatim lines; when the file is longer, one slot goes to the elision marker), and `tail -5 file.ts` likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines
+- File reads (`cat`, `head`, `tail` on code files) are rewritten into direct skim reads (e.g. `cat file.ts` → `skim file.ts --mode=pseudo`); output is a structured view, not raw bytes — skim emits a one-line stderr notice whenever the served view differs from raw file contents. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20` (verbatim lines; when the file is longer, one slot goes to the elision marker, so the bound is N lines *total* — with one documented exception at `N=1`, which emits 1 content line plus the marker), and `tail -5 file.ts` likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 - Round-trip safe: commands with newlines, heredocs, or command substitution are never rewritten; piped commands are refused too, with one exception — `<cmd> | cat` (bare `cat`, sole consumer, no redirects) rewrites its source, because bare `cat` renders a stream for a reader rather than consuming its bytes
+- Dev installs (`skim init --dev`): while working on skim itself, the hook's commit pin goes stale the moment you rebuild at a new commit, which forces a full reinstall on the next `skim init` and makes `skim doctor` exit 1 for being behind HEAD — neither of which rebuilding can fix, because HEAD keeps moving. `--dev` marks the installed hook as dev-pinned: the real commit is still recorded, and only the commit-staleness check is waived, so repeat installs take the already-up-to-date fast path and doctor stops failing. Version and binary-path checks are unchanged, and the waiver applies only to a hook whose SHA-256 manifest verifies. Dev mode is a property of the command, not stored state — running `skim init` **without** `--dev` reverts the hook to a strict install and reports `dev-pinned -> pinned`, so there is no `--undev`; `skim init --dev --force` re-stamps one in place
 - PATH wrappers (`skim init --wrappers`) now apply a force-raw sidecar marker (set by the PreToolUse hook when it identifies a pipeline shape where compression would cause byte loss) and an `fstat`/`isatty` gate (which serves raw bytes when stdout is a regular file, socket, or non-terminal character device). Together these partially close the compression-into-piped-consumer window (#319). Two holes remain (#514): (1) a same-tool concurrent command can clear a live marker, and (2) when no PreToolUse hook fires at all the wrapper falls back to `fstat`-only behaviour with no pipeline-shape awareness. Use `SKIM_PASSTHROUGH=1` when byte-exact output is required in those cases
 
 ### Test Output Compression
@@ -83,7 +84,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Extracts vulnerabilities, version conflicts, and dependency issues
 
 ### Git Output Compression (`skim git`)
-- **`skim git diff`** -- AST-aware: renders hunk-scoped context (AST breadcrumb + changed lines), bounded by a guardrail so output never exceeds the raw diff size; strips diff noise
+- **`skim git diff`** -- AST-aware: renders hunk-scoped context (AST breadcrumb — prefixed `~`, marking a declaration header skim pulled in from outside the hunk rather than a line git printed — plus the changed lines), bounded by a guardrail so output never exceeds the raw diff size; strips diff noise
   - `--mode structure` adds unchanged functions as signatures for context
   - `--mode full` shows entire files with change markers
   - Supports `--staged`, commit ranges (`HEAD~3`, `main..feature`)
@@ -131,7 +132,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
   `Default` (lossless re-encoding allowed for API key auth)
 - Per-engine runtime certification gate — every engine must prove value-equivalence before the
   modified bytes leave the proxy; fail-open to byte-identical passthrough on any uncertainty
-- `SKIM_PASSTHROUGH=1` bypasses all compression; `--port` / `--bind` configure the listener
+- `SKIM_PASSTHROUGH=1` substitutes the identity pipeline, so no proxy-side compression is applied (the proxy builds its own pipeline and does not go through the subcommand passthrough gate, whose exceptions are listed under **Common options** below); `--port` / `--bind` configure the listener
 
 ### Intelligence
 - `skim discover` scans agent session history for optimization opportunities
@@ -241,10 +242,10 @@ skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 - `-l, --language` - Override auto-detection (recommended for stdin; else shebang is tried, then lossless passthrough)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
 - `-n, --line-numbers` - Annotate output with original source line numbers (prefix `{line}\t{content}`)
-- `--max-lines N` - Emit at most N lines total; when content is elided, one slot goes to the elision marker
-- `--last-lines N` - Emit at most N lines from the tail; when content is elided, one slot goes to the elision marker
+- `--max-lines N` - Emit at most N lines total; when content is elided, one slot goes to the elision marker. One documented exception at `N=1`: 1 content line **plus** the marker (2 lines), because spending the only slot on the marker returns a view containing no code, and dropping the marker to fit is silent loss
+- `--last-lines N` - Emit at most N lines from the tail; when content is elided, one slot goes to the elision marker. The same `N=1` exception applies — the carve-out is a property of the bound, not of the direction
 - `--tokens N` - Fit output within N tokens by escalating through modes, then line-truncating with a marker
-- `--passthrough` - Bypass all compression and exec the real tool with raw argv (equivalent to `SKIM_PASSTHROUGH=1`)
+- `--passthrough` - Bypass compression and exec the real tool with raw argv (equivalent to `SKIM_PASSTHROUGH=1`). **Not universal:** `env`/`printenv` keep credential redaction regardless of passthrough state, and the multi-level dispatchers (`cargo`, `dotnet`, `go`, `swift`) still serve the compressed summary whenever stdin is not a TTY — which is every agent harness, CI job, and pipeline. Run the tool directly when you need raw bytes from a build tool
 - `--debug` - Enable raw-fallback diagnostic banners on stderr (loss-bearing elision markers are always emitted regardless)
 - `--no-cache` - Disable caching
 - `--show-stats` - Show token reduction stats
@@ -259,11 +260,15 @@ Skim offers six modes with different levels of aggressiveness:
 | Mode       | Reduction | What's Kept                              | Use Case                   |
 |------------|-----------|------------------------------------------|----------------------------|
 | Full       | 0%        | Everything (original source)             | Testing/comparison         |
-| Minimal    | 15-30%    | All code, doc comments                   | Light cleanup              |
-| Pseudo     | 30-50%    | Logic flow, names, values, return types; parameter types preserved for TypeScript and Rust | LLM context with logic     |
-| Structure  | 70-80%    | Signatures, types, classes, imports      | Understanding architecture |
+| Minimal    | 15-30% †  | All code, doc comments                   | Light cleanup              |
+| Pseudo     | 30-50% †  | Logic flow, names, values, return types; parameter types preserved for TypeScript and Rust | LLM context with logic     |
+| Structure  | 60-80% ‡  | Signatures, types, classes, imports      | Understanding architecture |
 | Signatures | 85-92%    | Only callable signatures                 | API documentation          |
 | Types      | 90-95%    | Only type definitions                    | Type system analysis       |
+
+† **Unverified targets, not measured figures.** These two numbers were never derived from a measurement, and no CI gate defends them. Both modes have since been widened to preserve *more* content — module header comments are now kept in every language (#476), and Rust's pseudo mode strips only statement semicolons and non-doc comments — so treat these two rows as aspirational until they are re-measured.
+
+‡ **Measured basis: 60.3%.** Structure mode's only measured figure is the 60.3% in the reduction table at the top of this README and in the Real-World Token Reduction table under Performance — both on the same production TypeScript codebase. The range on this row is stated wide enough to contain it. No CI gate defends the range either way: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
 ```bash
 skim file.ts --mode structure   # Default
@@ -626,7 +631,8 @@ cargo bench
 - Three-tier degradation: Structured → Regex → Passthrough
 
 ✅ **Agent Integration:**
-- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush; optional consent-gated permission seeding (`--permissions`)
+- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush; optional consent-gated permission seeding (`--permissions`); dev-pinned installs for skim development (`--dev`)
+- `skim doctor` — install health check: which `skim` on `$PATH` wins, per-agent hook state (version, commit, binary pin, tamper verdict), wrapper targets, and staleness vs. repo HEAD. Exit 0 healthy / 1 on drift, so it works as a CI pre-flight. A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)` — never `✓` — printing both the commit the install froze and the commit the running binary was built from, so `skim doctor | grep dev-pinned` is a one-line guard against shipping a dev install.
 - `skim rewrite` — command rewriting engine with `--hook` mode
 - MCP server mode for agent-native workflows
 

@@ -1,24 +1,137 @@
 //! Integration tests for `skim init` and `skim rewrite --hook` (#44).
 //!
-//! All tests use `tempfile::TempDir` + `CLAUDE_CONFIG_DIR` env override for
-//! isolation. Non-interactive tests pass `--yes`.
+//! # Hermeticity
+//!
+//! `skim init`, `skim init --uninstall` and `skim doctor` are an installer and
+//! an uninstaller, so a test that runs them against the developer's real `$HOME`
+//! does not merely read state — it *deletes* state. A global `--uninstall` with
+//! no `--agent` removes wrapper symlinks from `~/.skim/bin` and guidance files
+//! from `~/.gemini` and `~/.copilot` for every configured agent (PF-017).
+//!
+//! A successful `skim init` also ends by walking ancestors of the process
+//! working directory for a project root and installing git hooks into it, so an
+//! invocation left at the cwd cargo supplies writes `post-commit`, `post-merge`
+//! and `post-checkout` into the skim clone this test binary was built from. That
+//! axis belongs to no environment variable and is closed in the sandbox builder
+//! itself.
+//!
+//! Every invocation in this file is therefore built by [`Sandbox`], which owns a
+//! `TempDir` and routes through `common::skim_sandboxed`. The convention is not
+//! left to memory — three guards turn it into a failure:
+//!
+//! - [`test_every_invocation_in_this_file_is_sandboxed`] scans this file's own
+//!   source for unsandboxed constructors and for the cwd pin;
+//! - [`test_every_init_test_file_is_sandboxed`] scans every installer test file
+//!   ([`INSTALLER_TEST_PREFIXES`] — `cli_init*` and `cli_integrity*`), so a
+//!   sibling cannot escape the convention this file documents;
+//! - [`test_sandbox_env_block_classifies_every_env_var_the_binary_reads`] scans
+//!   every crate linked into the `skim` binary and fails when a newly-added env
+//!   read has no sandbox entry.
+//!
+//! Non-interactive tests pass `--yes`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 mod common;
 
 // ============================================================================
-// Helper: build an isolated `skim init` command with CLAUDE_CONFIG_DIR override
+// Sandbox — the only way to build a skim invocation in this file
 // ============================================================================
 
-fn skim_init_cmd(config_dir: &std::path::Path) -> Command {
-    let mut cmd = common::skim();
-    cmd.arg("init")
-        .env("CLAUDE_CONFIG_DIR", config_dir.as_os_str());
-    cmd
+/// A `TempDir` home plus the env block that confines a `skim` invocation to it.
+///
+/// Holding the `TempDir` inside the sandbox is what makes the confinement hard
+/// to get wrong: a command cannot be built without a live sandbox, and the
+/// sandbox cannot outlive the directory its env block points at. Every config
+/// directory, cache directory and wrapper directory the child process resolves
+/// lands under [`Sandbox::home`].
+struct Sandbox {
+    home: TempDir,
+}
+
+impl Sandbox {
+    /// A sandbox with no agent config directory pre-created.
+    ///
+    /// Use for invocations that never reach agent detection (`--help`,
+    /// `rewrite --hook`) or that create the directories they need themselves.
+    fn bare() -> Self {
+        Self {
+            home: TempDir::new().expect("failed to create sandbox home"),
+        }
+    }
+
+    /// A sandbox with `.claude/` already present — the common case.
+    ///
+    /// `detect_installed_agents()` in override mode only considers an agent
+    /// whose override path is an existing directory (`p.is_dir()`), so a
+    /// missing `.claude/` silently reduces an auto-detect install to a no-op.
+    fn new() -> Self {
+        let sandbox = Self::bare();
+        sandbox.claude_config();
+        sandbox
+    }
+
+    /// The sandbox home — `$HOME` for every invocation this sandbox builds.
+    fn home(&self) -> &std::path::Path {
+        self.home.path()
+    }
+
+    /// Create and return an agent config directory inside the sandbox.
+    ///
+    /// `dot_dir` must match the relative path the sandbox env block assigns to
+    /// that agent's override variable (`common::SANDBOX_REDIRECTED_VARS`).
+    fn config_dir(&self, dot_dir: &str) -> std::path::PathBuf {
+        let path = self.home().join(dot_dir);
+        fs::create_dir_all(&path).expect("failed to create sandbox config dir");
+        path
+    }
+
+    /// `$CLAUDE_CONFIG_DIR` for invocations this sandbox builds.
+    fn claude_config(&self) -> std::path::PathBuf {
+        self.config_dir(".claude")
+    }
+
+    /// `$SKIM_CACHE_DIR` for invocations this sandbox builds — where `hook.log`
+    /// and the force-raw sidecars land.
+    fn cache_dir(&self) -> std::path::PathBuf {
+        self.config_dir(".cache/skim")
+    }
+
+    /// Create and return a working directory for a `--project` install.
+    fn project_dir(&self, name: &str) -> std::path::PathBuf {
+        let path = self.home().join(name);
+        fs::create_dir_all(&path).expect("failed to create sandbox project dir");
+        path
+    }
+
+    /// Build a `skim` invocation confined to this sandbox.
+    ///
+    /// This is the single call site of `common::skim_sandboxed` in this file,
+    /// and the guard test asserts it stays that way.
+    ///
+    /// The cwd pin is deliberate redundancy, not an oversight: the shared
+    /// builder already sets it, and this restatement is the line
+    /// [`test_every_invocation_in_this_file_is_sandboxed`] can see and pin, so
+    /// the axis cannot regress in this file on its own. It is worth restating
+    /// because an unpinned cwd is not a read of the developer's home directory
+    /// but a write to their repository — `skim init` ends by walking ancestors
+    /// of the cwd for a project root and installing git hooks into it.
+    fn skim(&self) -> Command {
+        let mut cmd = common::skim_sandboxed(self.home());
+        cmd.current_dir(self.home());
+        cmd
+    }
+
+    /// [`Sandbox::skim`] with the `init` subcommand already applied.
+    fn init(&self) -> Command {
+        let mut cmd = self.skim();
+        cmd.arg("init");
+        cmd
+    }
 }
 
 /// Returns true if the hook entry references the skim-rewrite script.
@@ -42,10 +155,11 @@ fn is_skim_hook(entry: &serde_json::Value) -> bool {
 
 #[test]
 fn test_init_creates_hook_script() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--yes"])
         .assert()
         .success()
@@ -101,10 +215,10 @@ fn test_init_creates_hook_script() {
 
 #[test]
 fn test_init_creates_settings_from_scratch() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     let settings_path = config.join("settings.json");
     assert!(settings_path.exists(), "settings.json should be created");
@@ -124,9 +238,8 @@ fn test_init_creates_settings_from_scratch() {
 
 #[test]
 fn test_init_preserves_existing_hooks() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    fs::create_dir_all(config).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Pre-populate with an existing hook
     let existing = serde_json::json!({
@@ -145,7 +258,7 @@ fn test_init_preserves_existing_hooks() {
     )
     .unwrap();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     let contents = fs::read_to_string(config.join("settings.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -184,8 +297,8 @@ fn test_init_preserves_existing_hooks() {
 /// This is the core regression guard for F6 (binary path pinning).
 #[test]
 fn test_init_migrates_bare_command_format_to_pinned() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Set up hooks directory with a hook script in the OLD bare-command format
     // (no SKIM_HOOK_BINARY export). The version string matches so that version
@@ -207,7 +320,8 @@ fn test_init_migrates_bare_command_format_to_pinned() {
 
     // Run `skim init --yes` — should detect the old bare format (missing
     // SKIM_HOOK_BINARY) and rewrite the script even though the version matches.
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--yes"])
         .assert()
         .success()
@@ -240,13 +354,13 @@ fn test_init_migrates_bare_command_format_to_pinned() {
 
 #[test]
 fn test_init_idempotent_no_duplicates() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Run init twice
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     let contents = fs::read_to_string(config.join("settings.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -263,11 +377,11 @@ fn test_init_idempotent_no_duplicates() {
 
 #[test]
 fn test_init_updates_stale_hook_version() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Run init once
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     // Manually overwrite the hook script with an old version
     let hook_path = config.join("hooks/skim-rewrite.sh");
@@ -275,7 +389,8 @@ fn test_init_updates_stale_hook_version() {
     fs::write(&hook_path, old_content).unwrap();
 
     // Run init again — should update the script
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--yes"])
         .assert()
         .success()
@@ -295,10 +410,10 @@ fn test_init_updates_stale_hook_version() {
 
 #[test]
 fn test_init_hook_structure() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     let contents = fs::read_to_string(config.join("settings.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -316,10 +431,10 @@ fn test_init_hook_structure() {
 
 #[test]
 fn test_init_no_permission_decision() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     let contents = fs::read_to_string(config.join("settings.json")).unwrap();
     assert!(
@@ -334,20 +449,19 @@ fn test_init_no_permission_decision() {
 
 #[test]
 fn test_init_preserves_symlinks() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    let real_dir = dir.path().join("real_claude");
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
+    let real_dir = sandbox.home().join("real_claude");
     fs::create_dir_all(&real_dir).unwrap();
 
     // Create a real settings.json in the "real" location
     fs::write(real_dir.join("settings.json"), "{}").unwrap();
 
-    // Create config dir and symlink settings.json
-    fs::create_dir_all(config).unwrap();
+    // Symlink settings.json into the config dir
     std::os::unix::fs::symlink(real_dir.join("settings.json"), config.join("settings.json"))
         .unwrap();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     // The symlink should still exist
     assert!(
@@ -369,16 +483,12 @@ fn test_init_preserves_symlinks() {
 
 #[test]
 fn test_init_project_mode() {
-    let dir = TempDir::new().unwrap();
-    let project_dir = dir.path().join("my-project");
-    let claude_config = dir.path().join("claude-home");
-    fs::create_dir_all(&project_dir).unwrap();
-    fs::create_dir_all(&claude_config).unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("my-project");
 
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", claude_config.as_os_str())
         .current_dir(&project_dir)
         .assert()
         .success();
@@ -402,31 +512,22 @@ fn test_init_project_mode() {
 
 #[test]
 fn test_init_yes_flag() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
 
     // --yes should complete without stdin
-    skim_init_cmd(config)
-        .args(["--yes"])
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("Done!").or(predicate::str::contains("Already up to date")),
-        );
+    sandbox.init().args(["--yes"]).assert().success().stdout(
+        predicate::str::contains("Done!").or(predicate::str::contains("Already up to date")),
+    );
 }
 
 #[test]
 fn test_init_project_yes() {
-    let dir = TempDir::new().unwrap();
-    let project_dir = dir.path().join("proj");
-    let claude_config = dir.path().join("claude-home");
-    fs::create_dir_all(&project_dir).unwrap();
-    fs::create_dir_all(&claude_config).unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", claude_config.as_os_str())
         .current_dir(&project_dir)
         .assert()
         .success();
@@ -440,11 +541,10 @@ fn test_init_project_yes() {
 
 #[test]
 fn test_init_non_tty_works_without_yes() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
 
     // Non-TTY install should succeed without --yes (non-interactive by default)
-    skim_init_cmd(config).assert().success().stdout(
+    sandbox.init().assert().success().stdout(
         predicate::str::contains("Done!").or(predicate::str::contains("Already up to date")),
     );
 }
@@ -455,10 +555,11 @@ fn test_init_non_tty_works_without_yes() {
 
 #[test]
 fn test_init_dry_run() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--yes", "--dry-run"])
         .assert()
         .success()
@@ -481,25 +582,15 @@ fn test_init_dry_run() {
 
 #[test]
 fn test_init_uninstall() {
-    // Sandboxed: HOME is a TempDir so uninstall cannot touch real ~/.gemini,
-    // ~/.copilot, ~/.skim/bin, or ~/.claude/hooks/ (avoids PF-009 / PF-015).
-    let home = TempDir::new().unwrap();
-    let config = home.path().join(".claude"); // CLAUDE_CONFIG_DIR set by skim_sandboxed
-
-    // Pre-create the config dir: detect_installed_agents() in override-mode
-    // requires the override path to be an existing directory (p.is_dir()).
-    fs::create_dir_all(&config).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // First install
-    common::skim_sandboxed(home.path())
-        .arg("init")
-        .args(["--yes"])
-        .assert()
-        .success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     // Then uninstall
-    common::skim_sandboxed(home.path())
-        .arg("init")
+    sandbox
+        .init()
         .args(["--uninstall", "--yes"])
         .assert()
         .success()
@@ -521,21 +612,11 @@ fn test_init_uninstall() {
 
 #[test]
 fn test_init_uninstall_preserves_other_hooks() {
-    // Sandboxed: HOME is a TempDir so uninstall cannot touch real home directory
-    // artifacts (avoids PF-009 / PF-015).
-    let home = TempDir::new().unwrap();
-    let config = home.path().join(".claude"); // CLAUDE_CONFIG_DIR set by skim_sandboxed
-
-    // Pre-create the config dir: detect_installed_agents() in override-mode
-    // requires the override path to be an existing directory (p.is_dir()).
-    fs::create_dir_all(&config).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Install skim
-    common::skim_sandboxed(home.path())
-        .arg("init")
-        .args(["--yes"])
-        .assert()
-        .success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     // Manually add another hook
     let contents = fs::read_to_string(config.join("settings.json")).unwrap();
@@ -552,8 +633,8 @@ fn test_init_uninstall_preserves_other_hooks() {
     .unwrap();
 
     // Uninstall skim
-    common::skim_sandboxed(home.path())
-        .arg("init")
+    sandbox
+        .init()
         .args(["--uninstall", "--yes"])
         .assert()
         .success();
@@ -568,10 +649,15 @@ fn test_init_uninstall_preserves_other_hooks() {
 
 #[test]
 fn test_init_uninstall_when_not_installed() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    // This is a GLOBAL uninstall with no `--agent`: before sandboxing it reached
+    // `uninstall_wrappers` -> real `~/.skim/bin` and `remove_guidance` -> real
+    // `~/.gemini/GEMINI.md`, the exact destructive path PF-017 names. The
+    // assertion itself only depends on `$CLAUDE_CONFIG_DIR` being an empty
+    // existing directory, so confining it costs nothing.
+    let sandbox = Sandbox::new();
 
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--uninstall", "--yes"])
         .assert()
         .success()
@@ -583,33 +669,26 @@ fn test_init_uninstall_when_not_installed() {
 // ============================================================================
 
 /// Regression guard: `skim init` artifacts (hooks, wrappers, guidance) must land
-/// inside the TempDir home provided to `skim_sandboxed`, not in the developer's
-/// real home directory.
+/// inside the `TempDir` home owned by [`Sandbox`], not in the developer's real
+/// home directory.
 ///
-/// Covers the three env-var override surfaces introduced in issue #472:
-/// - `CLAUDE_CONFIG_DIR` → hook script + settings.json
-/// - `SKIM_WRAPPERS_DIR` → wrapper symlinks (none expected without --wrappers)
-/// - `GEMINI_CONFIG_DIR` / `COPILOT_CONFIG_DIR` → guidance files (if written)
+/// Covers every env-var override surface the sandbox redirects — `HOME`, the
+/// five agent config dirs, the wrapper dir and the cache dir. The wrapper and
+/// cache axes are asserted by walking the sandbox for anything that escaped it,
+/// which is the only assertion shape that stays honest as the sandbox grows:
+/// naming the artifacts one by one would pass for a var the block forgot.
 #[test]
 fn test_init_sandbox_artifacts_stay_inside_tempdir() {
-    let home = TempDir::new().unwrap();
-
-    // Pre-create the Claude config dir: detect_installed_agents() in override-mode
-    // requires the override path to be an existing directory (p.is_dir()).
-    let claude_config = home.path().join(".claude");
-    fs::create_dir_all(&claude_config).unwrap();
+    let sandbox = Sandbox::new();
+    let claude_config = sandbox.claude_config();
 
     // Global install via the sandboxed helper (sets HOME + all per-agent config dirs).
-    common::skim_sandboxed(home.path())
-        .arg("init")
-        .args(["--yes"])
-        .assert()
-        .success();
+    sandbox.init().args(["--yes"]).assert().success();
 
-    // Claude Code hook artifacts must be inside home.path()/.claude/, not real ~/.claude/.
+    // Claude Code hook artifacts must be inside the sandbox, not real ~/.claude/.
     assert!(
         claude_config.join("hooks/skim-rewrite.sh").exists(),
-        "Hook script must land inside sandboxed Claude config (PF-009): \
+        "Hook script must land inside sandboxed Claude config (PF-017): \
          real ~/.claude/hooks/ must not be touched"
     );
     assert!(
@@ -617,23 +696,34 @@ fn test_init_sandbox_artifacts_stay_inside_tempdir() {
         "settings.json must land inside sandboxed Claude config"
     );
 
+    // Every redirected variable must resolve to a path inside the sandbox home.
+    // `HOME` maps to the home itself, so `starts_with` holds for all of them.
+    for (var, relative) in common::SANDBOX_REDIRECTED_VARS {
+        let resolved = common::sandbox_var_path(sandbox.home(), relative);
+        assert!(
+            resolved.starts_with(sandbox.home()),
+            "{var} must resolve inside the sandbox home, got: {}",
+            resolved.display()
+        );
+    }
+
     // Wrapper dir — only created by `--wrappers`; this is a bare install.
     // If anything was written to the wrapper dir, it must be inside the sandbox.
-    let sandbox_wrappers = home.path().join(".skim").join("bin");
+    let sandbox_wrappers = sandbox.home().join(".skim").join("bin");
     if sandbox_wrappers.exists() {
         for entry in fs::read_dir(&sandbox_wrappers).unwrap() {
             let path = entry.unwrap().path();
             assert!(
-                path.starts_with(home.path()),
-                "Wrapper symlink must be inside TempDir, found outside: {:?}",
-                path
+                path.starts_with(sandbox.home()),
+                "Wrapper symlink must be inside TempDir, found outside: {}",
+                path.display()
             );
         }
     }
 
     // Uninstall via the same sandbox — cleanup must also stay inside TempDir.
-    common::skim_sandboxed(home.path())
-        .arg("init")
+    sandbox
+        .init()
         .args(["--uninstall", "--yes"])
         .assert()
         .success();
@@ -651,14 +741,13 @@ fn test_init_sandbox_artifacts_stay_inside_tempdir() {
 
 #[test]
 fn test_init_creates_backup() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    fs::create_dir_all(config).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Create an existing settings.json
     fs::write(config.join("settings.json"), "{}\n").unwrap();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     assert!(
         config.join("settings.json.bak").exists(),
@@ -672,14 +761,13 @@ fn test_init_creates_backup() {
 
 #[test]
 fn test_init_empty_settings_file() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    fs::create_dir_all(config).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Create a 0-byte settings.json
     fs::write(config.join("settings.json"), "").unwrap();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     let contents = fs::read_to_string(config.join("settings.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -691,14 +779,14 @@ fn test_init_empty_settings_file() {
 
 #[test]
 fn test_init_malformed_json() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    fs::create_dir_all(config).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Create a malformed settings.json
     fs::write(config.join("settings.json"), "{not valid json}").unwrap();
 
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--yes"])
         .assert()
         .failure()
@@ -722,9 +810,10 @@ fn hook_payload(command: &str) -> String {
 
 #[test]
 fn test_hook_cargo_test_match() {
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
-        .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(hook_payload("cargo test"))
         .assert()
         .success();
@@ -743,7 +832,9 @@ fn test_hook_cargo_test_match() {
 
 #[test]
 fn test_hook_no_match_empty_output() {
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("echo hello"))
         .assert()
@@ -758,7 +849,9 @@ fn test_hook_no_match_empty_output() {
 
 #[test]
 fn test_hook_already_rewritten_passthrough() {
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("skim cargo test"))
         .assert()
@@ -773,7 +866,9 @@ fn test_hook_already_rewritten_passthrough() {
 
 #[test]
 fn test_hook_no_permission_decision() {
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("cargo test"))
         .assert()
@@ -788,7 +883,9 @@ fn test_hook_no_permission_decision() {
 
 #[test]
 fn test_hook_malformed_json_exits_zero() {
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
         .write_stdin("not json at all")
         .assert()
@@ -811,7 +908,9 @@ fn test_hook_missing_command_field() {
     })
     .to_string();
 
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
         .write_stdin(payload)
         .assert()
@@ -831,9 +930,10 @@ fn test_hook_missing_command_field() {
 #[test]
 fn test_hook_compound_command_rewrite() {
     // Send a compound command (&&) through hook mode — first segment should be rewritten
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
-        .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(hook_payload("cargo test && cargo clippy"))
         .assert()
         .success();
@@ -858,7 +958,9 @@ fn test_hook_compound_command_rewrite() {
 #[test]
 fn test_hook_pipe_command_passthrough() {
     // Pipe command where neither segment matches a rewrite rule — empty output
-    let output = common::skim()
+    let sandbox = Sandbox::bare();
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
         .write_stdin(hook_payload("echo hello | grep world"))
         .assert()
@@ -877,16 +979,18 @@ fn test_hook_pipe_command_passthrough() {
 
 #[test]
 fn test_hook_version_mismatch_warning() {
-    // Use a temp dir for cache to avoid stamp file pollution across tests.
-    let cache_dir = TempDir::new().unwrap();
+    // The sandbox's own SKIM_CACHE_DIR keeps the stamp file and hook.log
+    // per-test; the force-raw sidecar is PPID-keyed and would otherwise bleed
+    // between tests sharing a nextest runner.
+    let sandbox = Sandbox::bare();
+    let cache_dir = sandbox.cache_dir();
 
     // Set SKIM_HOOK_VERSION to a value that differs from the compiled version.
     // The warning now goes to hook.log (NEVER stderr -- GRANITE #361 Bug 3).
-    let output = common::skim()
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
-        .env_remove("SKIM_PASSTHROUGH")
         .env("SKIM_HOOK_VERSION", "0.0.1")
-        .env("SKIM_CACHE_DIR", cache_dir.path().as_os_str())
         .write_stdin(hook_payload("cargo test"))
         .assert()
         .success();
@@ -924,7 +1028,7 @@ fn test_hook_version_mismatch_warning() {
     );
 
     // Verify warning went to hook.log file instead
-    let hook_log = cache_dir.path().join("hook.log");
+    let hook_log = cache_dir.join("hook.log");
     assert!(
         hook_log.exists(),
         "Version mismatch warning should be written to hook.log"
@@ -940,18 +1044,18 @@ fn test_hook_version_mismatch_warning() {
 /// binary, a daily warning must appear in hook.log — never in stderr.
 #[test]
 fn test_hook_binary_mismatch_warning() {
-    let cache_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::bare();
+    let cache_dir = sandbox.cache_dir();
 
     // Set SKIM_HOOK_BINARY to a path that does not match the running binary.
     // Use a plausible but different path: /tmp/skim-other.  The versions match
     // so only the binary path mismatch check fires (check_hook_binary_mismatch).
     let current_version = env!("CARGO_PKG_VERSION");
-    let output = common::skim()
+    let output = sandbox
+        .skim()
         .args(["rewrite", "--hook"])
-        .env_remove("SKIM_PASSTHROUGH")
         .env("SKIM_HOOK_VERSION", current_version)
         .env("SKIM_HOOK_BINARY", "/tmp/skim-other-binary")
-        .env("SKIM_CACHE_DIR", cache_dir.path().as_os_str())
         .write_stdin(hook_payload("cargo test"))
         .assert()
         .success();
@@ -989,7 +1093,7 @@ fn test_hook_binary_mismatch_warning() {
     );
 
     // Warning must appear in hook.log.
-    let hook_log = cache_dir.path().join("hook.log");
+    let hook_log = cache_dir.join("hook.log");
     assert!(
         hook_log.exists(),
         "Binary mismatch warning should be written to hook.log"
@@ -1007,7 +1111,9 @@ fn test_hook_binary_mismatch_warning() {
 
 #[test]
 fn test_init_help() {
-    common::skim()
+    let sandbox = Sandbox::bare();
+    sandbox
+        .skim()
         .args(["init", "--help"])
         .assert()
         .success()
@@ -1021,7 +1127,9 @@ fn test_init_help() {
 
 #[test]
 fn test_rewrite_hook_help() {
-    common::skim()
+    let sandbox = Sandbox::bare();
+    sandbox
+        .skim()
         .args(["rewrite", "--help"])
         .assert()
         .success()
@@ -1034,23 +1142,20 @@ fn test_rewrite_hook_help() {
 
 #[test]
 fn test_init_creates_guidance() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-
     // Create a CLAUDE.md at the "global" location (config_dir/../CLAUDE.md won't work,
     // so we test via project mode which creates CLAUDE.md in CWD)
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // Check that CLAUDE.md was created with guidance
-    let claude_md = project_dir.path().join("CLAUDE.md");
+    let claude_md = project_dir.join("CLAUDE.md");
     assert!(
         claude_md.exists(),
         "CLAUDE.md should be created with guidance"
@@ -1072,19 +1177,18 @@ fn test_init_creates_guidance() {
 
 #[test]
 fn test_init_no_guidance_flag() {
-    let dir = TempDir::new().unwrap();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes", "--no-guidance"])
-        .env("CLAUDE_CONFIG_DIR", dir.path().as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // CLAUDE.md should not exist (no guidance injected, file not created)
-    let claude_md = project_dir.path().join("CLAUDE.md");
+    let claude_md = project_dir.join("CLAUDE.md");
     assert!(
         !claude_md.exists(),
         "CLAUDE.md should not be created with --no-guidance"
@@ -1093,34 +1197,31 @@ fn test_init_no_guidance_flag() {
 
 #[test]
 fn test_init_uninstall_removes_guidance() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
     // First install with guidance
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // Verify install created guidance
-    let claude_md = project_dir.path().join("CLAUDE.md");
+    let claude_md = project_dir.join("CLAUDE.md");
     assert!(claude_md.exists(), "CLAUDE.md should exist after install");
 
     // Then uninstall
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--uninstall", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // CLAUDE.md should not contain skim guidance (or be deleted if it was the only content)
-    let claude_md = project_dir.path().join("CLAUDE.md");
+    let claude_md = project_dir.join("CLAUDE.md");
     if claude_md.exists() {
         let content = fs::read_to_string(&claude_md).unwrap();
         assert!(
@@ -1133,23 +1234,21 @@ fn test_init_uninstall_removes_guidance() {
 
 #[test]
 fn test_init_guidance_idempotent() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
     // Install twice
     for _ in 0..2 {
-        common::skim()
-            .arg("init")
+        sandbox
+            .init()
             .args(["--project", "--yes"])
-            .env("CLAUDE_CONFIG_DIR", config.as_os_str())
-            .current_dir(project_dir.path())
+            .current_dir(&project_dir)
             .assert()
             .success();
     }
 
     // CLAUDE.md should have exactly one skim section
-    let claude_md = project_dir.path().join("CLAUDE.md");
+    let claude_md = project_dir.join("CLAUDE.md");
     assert!(claude_md.exists(), "CLAUDE.md should exist after init");
     let content = fs::read_to_string(&claude_md).unwrap();
     let start_count = content.matches("<!-- skim-start").count();
@@ -1162,15 +1261,13 @@ fn test_init_guidance_idempotent() {
 
 #[test]
 fn test_init_dry_run_shows_guidance() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes", "--dry-run"])
-        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success()
         .stdout(predicate::str::contains("guidance"));
@@ -1182,19 +1279,18 @@ fn test_init_dry_run_shows_guidance() {
 
 #[test]
 fn test_init_cursor_creates_mdc() {
-    let config_dir = TempDir::new().unwrap();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes", "--agent", "cursor"])
-        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // Should create .cursor/rules/skim.mdc with frontmatter
-    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    let mdc = project_dir.join(".cursor/rules/skim.mdc");
     assert!(mdc.exists(), ".cursor/rules/skim.mdc should be created");
     let content = fs::read_to_string(&mdc).unwrap();
     assert!(content.starts_with("---\n"), "Should have YAML frontmatter");
@@ -1214,27 +1310,25 @@ fn test_init_cursor_creates_mdc() {
 
 #[test]
 fn test_init_cursor_uninstall_deletes_mdc() {
-    let config_dir = TempDir::new().unwrap();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
     // Install
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes", "--agent", "cursor"])
-        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
-    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    let mdc = project_dir.join(".cursor/rules/skim.mdc");
     assert!(mdc.exists(), "skim.mdc should exist after install");
 
     // Uninstall
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--uninstall", "--yes", "--agent", "cursor"])
-        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
@@ -1243,11 +1337,11 @@ fn test_init_cursor_uninstall_deletes_mdc() {
 
 #[test]
 fn test_init_cursor_cleans_legacy_cursorrules() {
-    let config_dir = TempDir::new().unwrap();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
     // Pre-populate a .cursorrules with skim markers (legacy format)
-    let cursorrules = project_dir.path().join(".cursorrules");
+    let cursorrules = project_dir.join(".cursorrules");
     fs::write(
         &cursorrules,
         "# User rules\n\n<!-- skim-start v1.0.0 -->\nold guidance\n<!-- skim-end -->\n\n# More user rules\n",
@@ -1255,16 +1349,15 @@ fn test_init_cursor_cleans_legacy_cursorrules() {
     .unwrap();
 
     // Install Cursor (should create .mdc AND clean legacy .cursorrules)
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes", "--agent", "cursor"])
-        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // New .mdc should exist
-    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    let mdc = project_dir.join(".cursor/rules/skim.mdc");
     assert!(mdc.exists(), ".cursor/rules/skim.mdc should be created");
 
     // Legacy .cursorrules should still exist (user may have created it)
@@ -1292,7 +1385,9 @@ fn test_init_cursor_cleans_legacy_cursorrules() {
 #[test]
 fn test_init_help_mentions_agent_flag() {
     // init --help should document the --agent flag for multi-agent support
-    common::skim()
+    let sandbox = Sandbox::bare();
+    sandbox
+        .skim()
         .args(["init", "--help"])
         .assert()
         .success()
@@ -1302,7 +1397,9 @@ fn test_init_help_mentions_agent_flag() {
 #[test]
 fn test_rewrite_help_mentions_agent_flag() {
     // rewrite --help should mention the --agent flag
-    common::skim()
+    let sandbox = Sandbox::bare();
+    sandbox
+        .skim()
         .args(["rewrite", "--help"])
         .assert()
         .success()
@@ -1318,20 +1415,18 @@ fn test_init_guidance_upgrade_updates_stale_version() {
     // Verifies that is_guidance_current returns false when the guidance section
     // contains a stale version marker, causing a re-run of init --yes to
     // update guidance rather than print "Already up to date".
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-    let project_dir = TempDir::new().unwrap();
+    let sandbox = Sandbox::new();
+    let project_dir = sandbox.project_dir("proj");
 
     // Step 1: fresh install — creates guidance at the current version
-    common::skim()
-        .arg("init")
+    sandbox
+        .init()
         .args(["--project", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
-    let claude_md = project_dir.path().join("CLAUDE.md");
+    let claude_md = project_dir.join("CLAUDE.md");
     assert!(
         claude_md.exists(),
         "CLAUDE.md should exist after initial install"
@@ -1362,11 +1457,10 @@ fn test_init_guidance_upgrade_updates_stale_version() {
     );
 
     // Step 3: re-run init --yes — should NOT say "Already up to date"
-    let output = common::skim()
-        .arg("init")
+    let output = sandbox
+        .init()
         .args(["--project", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success()
         .get_output()
@@ -1399,10 +1493,10 @@ fn test_init_guidance_upgrade_updates_stale_version() {
 
 #[test]
 fn test_init_no_marketplace_in_settings() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     let settings = fs::read_to_string(config.join("settings.json")).unwrap();
     assert!(
@@ -1415,38 +1509,27 @@ fn test_init_no_marketplace_in_settings() {
 // Multi-agent auto-detect install and uninstall loop (issues 3 & 4)
 // ============================================================================
 
-/// Create an isolated temp directory for an agent's config path.
-///
-/// Returns `(TempDir, PathBuf)`. The caller must hold the `TempDir` alive for
-/// the duration of the test; dropping it deletes the directory prematurely.
-fn create_agent_config_dir() -> (TempDir, std::path::PathBuf) {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-    (dir, path)
-}
-
 #[test]
 fn test_init_multi_agent_auto_detect_installs_claude_and_gemini() {
-    // Create isolated config dirs for Claude Code and Gemini CLI.
-    // Setting CLAUDE_CONFIG_DIR and GEMINI_CONFIG_DIR causes detect_installed_agents
-    // to scope detection to only those two agents (override mode).
-    let (claude_dir, claude_path) = create_agent_config_dir();
-    let (gemini_dir, gemini_path) = create_agent_config_dir();
+    // The sandbox sets an override for every agent, and detect_installed_agents
+    // in override mode only picks up agents whose override path EXISTS. Creating
+    // just .claude/ and .gemini/ therefore scopes detection to those two.
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".gemini");
     // Project dir: `skim init --project` installs to CWD-relative dirs, so both
     // agents write to <project>/.claude/ and <project>/.gemini/ respectively —
     // no home-directory writes occur during the test.
-    let project_dir = TempDir::new().unwrap();
+    let project_dir = sandbox.project_dir("proj");
 
-    common::skim()
+    sandbox
+        .skim()
         .args(["init", "--project", "--yes", "--no-guidance"])
-        .env("CLAUDE_CONFIG_DIR", &claude_path)
-        .env("GEMINI_CONFIG_DIR", &gemini_path)
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // Claude Code: settings.json with hook entry
-    let claude_settings = project_dir.path().join(".claude/settings.json");
+    let claude_settings = project_dir.join(".claude/settings.json");
     assert!(
         claude_settings.exists(),
         "Claude Code settings.json should be created by auto-detect install"
@@ -1460,7 +1543,7 @@ fn test_init_multi_agent_auto_detect_installs_claude_and_gemini() {
     );
 
     // Gemini CLI: settings.json with hook entry under .gemini/ using BeforeTool event key
-    let gemini_settings = project_dir.path().join(".gemini/settings.json");
+    let gemini_settings = project_dir.join(".gemini/settings.json");
     assert!(
         gemini_settings.exists(),
         "Gemini CLI settings.json should be created by auto-detect install"
@@ -1476,44 +1559,34 @@ fn test_init_multi_agent_auto_detect_installs_claude_and_gemini() {
 
     // Hook scripts must be created for both agents
     assert!(
-        project_dir
-            .path()
-            .join(".claude/hooks/skim-rewrite.sh")
-            .exists(),
+        project_dir.join(".claude/hooks/skim-rewrite.sh").exists(),
         "Claude Code hook script should be created"
     );
     assert!(
-        project_dir
-            .path()
-            .join(".gemini/hooks/skim-rewrite.sh")
-            .exists(),
+        project_dir.join(".gemini/hooks/skim-rewrite.sh").exists(),
         "Gemini CLI hook script should be created"
     );
-
-    // Keep TempDirs alive until end of test.
-    drop(claude_dir);
-    drop(gemini_dir);
 }
 
 #[test]
 fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
-    // Create isolated config dirs for Claude Code and Gemini CLI.
-    let (claude_dir, claude_path) = create_agent_config_dir();
-    let (gemini_dir, gemini_path) = create_agent_config_dir();
-    let project_dir = TempDir::new().unwrap();
+    // Scope auto-detect to Claude Code and Gemini CLI by creating only those
+    // two override directories inside the sandbox.
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".gemini");
+    let project_dir = sandbox.project_dir("proj");
 
     // Step 1: install both agents
-    common::skim()
+    sandbox
+        .skim()
         .args(["init", "--project", "--yes", "--no-guidance"])
-        .env("CLAUDE_CONFIG_DIR", &claude_path)
-        .env("GEMINI_CONFIG_DIR", &gemini_path)
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
     // Verify hook scripts exist after install
-    let claude_hook = project_dir.path().join(".claude/hooks/skim-rewrite.sh");
-    let gemini_hook = project_dir.path().join(".gemini/hooks/skim-rewrite.sh");
+    let claude_hook = project_dir.join(".claude/hooks/skim-rewrite.sh");
+    let gemini_hook = project_dir.join(".gemini/hooks/skim-rewrite.sh");
     assert!(
         claude_hook.exists(),
         "Claude Code hook should exist after install"
@@ -1524,11 +1597,10 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
     );
 
     // Step 2: uninstall both agents without specifying --agent
-    common::skim()
+    sandbox
+        .skim()
         .args(["init", "--project", "--uninstall", "--yes", "--force"])
-        .env("CLAUDE_CONFIG_DIR", &claude_path)
-        .env("GEMINI_CONFIG_DIR", &gemini_path)
-        .current_dir(project_dir.path())
+        .current_dir(&project_dir)
         .assert()
         .success();
 
@@ -1544,7 +1616,7 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
 
     // Settings files should have skim hook entries removed.
     // Both files must still exist (uninstall patches them, not deletes them).
-    let claude_settings = project_dir.path().join(".claude/settings.json");
+    let claude_settings = project_dir.join(".claude/settings.json");
     assert!(
         claude_settings.exists(),
         "Claude Code settings.json must still exist after uninstall (hook entries are removed, file is kept)"
@@ -1557,7 +1629,7 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
         "Claude Code hooks.PreToolUse should be removed after uninstall"
     );
 
-    let gemini_settings = project_dir.path().join(".gemini/settings.json");
+    let gemini_settings = project_dir.join(".gemini/settings.json");
     assert!(
         gemini_settings.exists(),
         "Gemini CLI settings.json must still exist after uninstall (hook entries are removed, file is kept)"
@@ -1570,10 +1642,6 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
         hooks.is_none() || hooks.and_then(|h| h.get("BeforeTool")).is_none(),
         "Gemini CLI hooks.BeforeTool should be removed after uninstall"
     );
-
-    // Keep TempDirs alive until end of test.
-    drop(claude_dir);
-    drop(gemini_dir);
 }
 
 // ============================================================================
@@ -1584,11 +1652,12 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
 /// in the patch-settings description line, not the hardcoded "PreToolUse".
 #[test]
 fn test_gemini_dry_run_shows_before_tool_hook_key() {
-    let (gemini_dir, gemini_path) = create_agent_config_dir();
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".gemini");
 
-    let output = common::skim()
+    let output = sandbox
+        .skim()
         .args(["init", "--agent", "gemini", "--no-guidance", "--dry-run"])
-        .env("GEMINI_CONFIG_DIR", &gemini_path)
         .output()
         .expect("skim init must run");
 
@@ -1619,8 +1688,6 @@ fn test_gemini_dry_run_shows_before_tool_hook_key() {
         !line.contains("PreToolUse"),
         "Gemini dry-run patch line must use 'BeforeTool', not 'PreToolUse'; line: {line}"
     );
-
-    drop(gemini_dir);
 }
 
 // ============================================================================
@@ -1642,11 +1709,11 @@ fn test_init_rewrites_hook_on_stale_commit_same_version() {
         return;
     }
 
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Step 1: Install once to get a valid hook structure (settings.json + script).
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     // Step 2: Overwrite the hook script with the correct version but a STALE commit.
     let hook_path = config.join("hooks/skim-rewrite.sh");
@@ -1671,7 +1738,8 @@ fn test_init_rewrites_hook_on_stale_commit_same_version() {
     fs::write(&hook_path, &stale_script).unwrap();
 
     // Step 3: Re-run `skim init --yes` — must detect the commit drift and rewrite.
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--yes"])
         .assert()
         .success()
@@ -1697,14 +1765,14 @@ fn test_init_rewrites_hook_on_stale_commit_same_version() {
 /// Guards against the fix over-correcting: init must not rewrite on every invocation.
 #[test]
 fn test_init_skips_when_version_and_commit_are_current() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    let sandbox = Sandbox::new();
 
     // First install — establishes a fully-pinned script.
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     // Second install with the identical binary — must be idempotent.
-    skim_init_cmd(config)
+    sandbox
+        .init()
         .args(["--yes"])
         .assert()
         .success()
@@ -1728,23 +1796,14 @@ fn test_init_skips_when_version_and_commit_are_current() {
 /// installed because they run first inside the fast-path block.
 #[test]
 fn test_init_wrappers_bypasses_fast_path() {
-    let home = TempDir::new().unwrap();
-    let home_path = home.path();
-
-    // Pre-create the claude config dir: detect_installed_agents() in override-mode
-    // requires the override path to be an existing directory (p.is_dir()).
-    fs::create_dir_all(home_path.join(".claude")).unwrap();
+    let sandbox = Sandbox::new();
 
     // Step 1: Fresh install without wrappers — hook becomes current.
-    common::skim_sandboxed(home_path)
-        .arg("init")
-        .args(["--yes"])
-        .assert()
-        .success();
+    sandbox.init().args(["--yes"]).assert().success();
 
     // Step 2: Re-run with --wrappers — fast path fires AND wrappers are installed.
-    let out = common::skim_sandboxed(home_path)
-        .arg("init")
+    let out = sandbox
+        .init()
         .args(["--yes", "--wrappers"])
         .output()
         .unwrap();
@@ -1775,14 +1834,11 @@ fn test_init_wrappers_bypasses_fast_path() {
 /// silently a no-op (empirically confirmed; see empirical-doctor-init-verification.md).
 #[test]
 fn test_init_force_bypasses_fast_path() {
-    let home = TempDir::new().unwrap();
-    let home_path = home.path();
-
-    fs::create_dir_all(home_path.join(".claude")).unwrap();
+    let sandbox = Sandbox::new();
 
     // Step 1: Fresh install — hook becomes current.
-    common::skim_sandboxed(home_path)
-        .arg("init")
+    sandbox
+        .init()
         .args([
             "--yes",
             "--agent",
@@ -1794,8 +1850,8 @@ fn test_init_force_bypasses_fast_path() {
         .success();
 
     // Step 2: Re-run with --force — must NOT print "Already up to date".
-    let out = common::skim_sandboxed(home_path)
-        .arg("init")
+    let out = sandbox
+        .init()
         .args([
             "--yes",
             "--agent",
@@ -1825,14 +1881,12 @@ fn test_init_force_bypasses_fast_path() {
 /// that `--force` does not interfere with the repair.
 #[test]
 fn test_init_force_repairs_unpinned_hook() {
-    let home = TempDir::new().unwrap();
-    let home_path = home.path();
-
-    fs::create_dir_all(home_path.join(".claude")).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Step 1: Write a pre-pin hook script directly (simulates a legacy install
     // without SKIM_HOOK_BINARY).
-    let hooks_dir = home_path.join(".claude/hooks");
+    let hooks_dir = config.join("hooks");
     fs::create_dir_all(&hooks_dir).unwrap();
     let hook_path = hooks_dir.join("skim-rewrite.sh");
     let version = env!("CARGO_PKG_VERSION");
@@ -1851,7 +1905,7 @@ fn test_init_force_repairs_unpinned_hook() {
     }
 
     // Also create a minimal settings.json so init can find the hook entry.
-    let settings_path = home_path.join(".claude/settings.json");
+    let settings_path = config.join("settings.json");
     fs::write(
         &settings_path,
         r#"{"hooks":{"PreToolUse":[{"matcher":"","hooks":[{"type":"command","command":"skim-rewrite.sh rewrite --hook --agent claude-code"}]}]}}"#,
@@ -1859,8 +1913,8 @@ fn test_init_force_repairs_unpinned_hook() {
     .unwrap();
 
     // Step 2: Run init with --force — must detect the missing pin and rewrite.
-    common::skim_sandboxed(home_path)
-        .arg("init")
+    sandbox
+        .init()
         .args([
             "--yes",
             "--agent",
@@ -1895,21 +1949,19 @@ fn test_init_force_repairs_unpinned_hook() {
 /// new `.bak` that overwrote the user's original backup.
 #[test]
 fn test_init_repeat_wrappers_does_not_clobber_bak() {
-    let home = TempDir::new().unwrap();
-    let home_path = home.path();
-
-    fs::create_dir_all(home_path.join(".claude")).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Write a sentinel settings.json so patch_settings has something to back up.
-    let settings_path = home_path.join(".claude/settings.json");
+    let settings_path = config.join("settings.json");
     let original_content = r#"{"custom":"user setting"}"#;
     fs::write(&settings_path, original_content).unwrap();
 
-    let bak_path = home_path.join(".claude/settings.json.bak");
+    let bak_path = config.join("settings.json.bak");
 
     // Step 1: First install with --wrappers — creates bak from the original file.
-    common::skim_sandboxed(home_path)
-        .arg("init")
+    sandbox
+        .init()
         .args([
             "--yes",
             "--agent",
@@ -1934,8 +1986,8 @@ fn test_init_repeat_wrappers_does_not_clobber_bak() {
     // Step 2: Second install with --wrappers on a now-current hook.
     // After C-3: fast path fires (wrappers run inside it, hook is NOT reinstalled),
     // so settings.json is NOT re-read and bak is NOT overwritten.
-    common::skim_sandboxed(home_path)
-        .arg("init")
+    sandbox
+        .init()
         .args([
             "--yes",
             "--agent",
@@ -1975,13 +2027,12 @@ fn test_init_repeat_wrappers_does_not_clobber_bak() {
 /// - `skim doctor` reports `Verified` (for the now-correct content).
 #[test]
 fn test_init_repairs_tampered_hook_not_launders() {
-    let home = TempDir::new().unwrap();
-    let home_path = home.path();
-
-    std::fs::create_dir_all(home_path.join(".claude")).unwrap();
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
 
     // Step 1: Fresh install.
-    common::skim_sandboxed(home_path)
+    sandbox
+        .skim()
         .args([
             "init",
             "--yes",
@@ -1993,8 +2044,8 @@ fn test_init_repairs_tampered_hook_not_launders() {
         .assert()
         .success();
 
-    let script_path = home_path.join(".claude/hooks/skim-rewrite.sh");
-    let manifest_path = home_path.join(".claude/hooks/skim-claude-code.sha256");
+    let script_path = config.join("hooks/skim-rewrite.sh");
+    let manifest_path = config.join("hooks/skim-claude-code.sha256");
     assert!(script_path.exists(), "hook script must exist after init");
     assert!(manifest_path.exists(), "manifest must exist after init");
 
@@ -2021,7 +2072,8 @@ fn test_init_repairs_tampered_hook_not_launders() {
 
     // Step 3: Re-run `skim init`. The self-heal path must REPAIR the script
     // (regenerate from source), NOT launder (hash-and-bless the tampered bytes).
-    let out = common::skim_sandboxed(home_path)
+    let out = sandbox
+        .skim()
         .args([
             "init",
             "--yes",
@@ -2056,20 +2108,14 @@ fn test_init_repairs_tampered_hook_not_launders() {
     // Step 5: `skim doctor` must now report Verified (not Tampered).
     // This confirms that the manifest was recomputed from the repaired content.
     //
-    // We run doctor from the sandbox home (not a git repo) and prepend the
-    // test binary's directory to PATH so the PATH scan does not spuriously
-    // report drift from an unrelated release build.
-    let bin = common::skim_bin();
-    let bin_dir = bin.parent().expect("skim binary has a parent directory");
-    let hermetic_path = format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let doctor_out = common::skim_sandboxed(home_path)
+    // `Sandbox::skim` already runs doctor from the sandbox home, which is not a
+    // git repo, so the staleness-vs-HEAD check skips. Prepend the test binary's
+    // directory to PATH so the PATH scan does not spuriously report drift from
+    // an unrelated release build.
+    let doctor_out = sandbox
+        .skim()
         .arg("doctor")
-        .current_dir(home_path)
-        .env("PATH", hermetic_path)
+        .env("PATH", common::hermetic_path())
         .output()
         .unwrap();
 
@@ -2085,6 +2131,291 @@ fn test_init_repairs_tampered_hook_not_launders() {
 }
 
 // ============================================================================
+// Dev mode is a property of the COMMAND, not sticky state (ADR-014)
+// ============================================================================
+
+/// The dev declaration an installed hook script carries.
+///
+/// Duplicated from `cmd::hooks::HOOK_DEV_MARKER`, which is `pub(crate)` inside a
+/// bin-only crate and unreachable from an integration test. The duplication is
+/// the point: this literal is the on-disk contract, so a test that followed the
+/// production constant could never fail on a format change.
+const DEV_MARKER_LINE: &str = "export SKIM_HOOK_DEV=1";
+
+/// Install a hook, then leave it with NO integrity manifest — and, when
+/// `declare_dev`, with the dev declaration appended.
+///
+/// Deleting the manifest is what makes this pair discriminating. With a manifest
+/// present, appending the marker yields `Tampered`, and the pre-existing repair
+/// path regenerates the script for a reason that has nothing to do with the
+/// mode — so a passing test would prove nothing about `mode_matches`. With the
+/// manifest gone the verdict is `NoManifest`, whose `create_hook_script` arm
+/// SKIPS the write and re-stamps the on-disk bytes; the mode term is then the
+/// only thing that can send the same script down the regeneration path instead.
+fn install_then_declare(sandbox: &Sandbox, declare_dev: bool) -> std::path::PathBuf {
+    let config = sandbox.claude_config();
+    sandbox
+        .skim()
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success();
+
+    let script_path = config.join("hooks/skim-rewrite.sh");
+    if declare_dev {
+        let current = fs::read_to_string(&script_path).unwrap();
+        fs::write(&script_path, format!("{current}{DEV_MARKER_LINE}\n")).unwrap();
+    }
+    fs::remove_file(config.join("hooks/skim-claude-code.sha256")).unwrap();
+    script_path
+}
+
+/// `skim init` with no dev request must STRIP a dev declaration from the
+/// installed script.
+///
+/// This is the counterweight to the commit-gate waiver and the reason
+/// `mode_matches` exists as its own term: without it, a script that declares dev
+/// mode survives every subsequent `skim init`, so the declaration becomes sticky
+/// state and the feature would need an undo flag. ADR-014 rules that dev mode is
+/// a property of the COMMAND — re-running the installer without the flag reverts
+/// to strict pinning.
+#[test]
+fn test_init_without_dev_request_strips_a_dev_declaration() {
+    let sandbox = Sandbox::new();
+    let script_path = install_then_declare(&sandbox, true);
+
+    let declared = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        declared.contains("SKIM_HOOK_DEV"),
+        "setup must leave the declaration in the script"
+    );
+
+    let out = sandbox
+        .skim()
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(out.status.success(), "init must succeed, got:\n{stdout}");
+    let reverted = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        !reverted.contains("SKIM_HOOK_DEV"),
+        "a plain `skim init` must rewrite the script back to strict, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Skipped"),
+        "the mode mismatch must send the script down the write path, not the \
+         skip-and-re-stamp path, got:\n{stdout}"
+    );
+}
+
+/// The control: identical setup MINUS the declaration takes the skip path.
+///
+/// Without this, the test above could be passing because a missing manifest
+/// alone forces a rewrite — which would make `mode_matches` unobservable and the
+/// assertion vacuous.
+#[test]
+fn test_init_without_a_declaration_still_takes_the_skip_path() {
+    let sandbox = Sandbox::new();
+    let script_path = install_then_declare(&sandbox, false);
+
+    let out = sandbox
+        .skim()
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(out.status.success(), "init must succeed, got:\n{stdout}");
+    assert!(
+        stdout.contains("Skipped"),
+        "a strict script with no manifest must be skipped and re-stamped, not \
+         rewritten — otherwise the test above proves nothing, got:\n{stdout}"
+    );
+    assert!(
+        script_path.exists(),
+        "the script must survive the self-heal"
+    );
+}
+
+// ============================================================================
+// `skim init --dev`
+// ============================================================================
+
+/// Run `skim init` in `sandbox`, with `--dev` when asked, and return stdout.
+///
+/// Nothing is done here to keep `install_search_integration` away from the
+/// repository this test binary runs from: [`Sandbox::skim`] pins the cwd to the
+/// sandbox home for every invocation in this file, so with no `.git` above the
+/// sandbox there is no project root, no search hooks are installed and no
+/// background index build is spawned. This used to be applied at three call
+/// sites and missed at the other thirty-odd.
+fn run_init(sandbox: &Sandbox, dev: bool) -> String {
+    let mut cmd = sandbox.skim();
+    cmd.args(["init", "--agent", "claude-code", "--no-guidance"]);
+    if dev {
+        cmd.arg("--dev");
+    }
+    cmd.arg("--no-wrappers");
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "init must succeed, got:\n{stdout}");
+    stdout
+}
+
+/// `--dev` writes the declaration, and writes the manifest OVER it.
+///
+/// The manifest coverage is what makes the declaration meaningful:
+/// `honour_dev_declaration` requires `ScriptIntegrity::Verified`, so a marker
+/// the hash did not cover could be appended by anyone holding a write handle to
+/// the script and would buy a self-asserted exemption (PF-016). Proven by the
+/// re-run below rather than by re-hashing here: a manifest that did not cover
+/// the marker classifies as `Tampered`, which takes the repair path and prints
+/// "Repaired" instead of skipping.
+#[test]
+fn test_init_dev_writes_a_manifest_covered_declaration() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, true);
+
+    let script_path = sandbox.claude_config().join("hooks/skim-rewrite.sh");
+    let script = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        script.contains("SKIM_HOOK_DEV"),
+        "`--dev` must write the declaration:\n{script}"
+    );
+    assert!(
+        script.contains("export SKIM_HOOK_BINARY=") && script.contains("export SKIM_HOOK_COMMIT="),
+        "a dev install is still a pinned install carrying its real commit:\n{script}"
+    );
+
+    let second = run_init(&sandbox, true);
+    assert!(
+        !second.contains("Repaired"),
+        "the manifest must cover the declaration, or the re-run repairs a tamper:\n{second}"
+    );
+}
+
+/// THE FAST-PATH MEASUREMENT. A repeat `skim init --dev` must reach
+/// "Already up to date", which requires EVERY fast-path term to hold —
+/// including `mode_matches` (the script declares what the command asked for) and
+/// `integrity_verified` (the manifest covers the declaration). A full reinstall
+/// here would rewrite the script, back up `settings.json`, and re-run guidance.
+#[test]
+fn test_init_dev_twice_takes_the_already_up_to_date_fast_path() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, true);
+    let second = run_init(&sandbox, true);
+
+    assert!(
+        second.contains("Already up to date"),
+        "a repeat dev install must take the fast path:\n{second}"
+    );
+    assert!(
+        !sandbox.claude_config().join("settings.json.bak").exists(),
+        "the fast path must not reach the settings backup"
+    );
+}
+
+/// The revert, through the flag's ABSENCE. There is no `--undev`: re-running the
+/// installer without `--dev` is the undo, and the transition is reported rather
+/// than performed silently (ADR-014 — dev mode is a property of the command).
+#[test]
+fn test_init_without_dev_reverts_and_reports_the_transition() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, true);
+
+    let reverted = run_init(&sandbox, false);
+    assert!(
+        reverted.contains("dev-pinned -> pinned"),
+        "the revert must be reported, not silent:\n{reverted}"
+    );
+
+    let script_path = sandbox.claude_config().join("hooks/skim-rewrite.sh");
+    let script = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        !script.contains("SKIM_HOOK_DEV"),
+        "a plain `skim init` must strip the declaration:\n{script}"
+    );
+
+    // And the reverted install is itself steady state — the revert does not
+    // leave something that reinstalls forever.
+    let third = run_init(&sandbox, false);
+    assert!(
+        third.contains("Already up to date"),
+        "a reverted install must settle on the fast path:\n{third}"
+    );
+}
+
+/// The forward transition is reported the same way, so the output never has to
+/// be read as "v2.14.0 -> v2.14.0" to learn what changed.
+#[test]
+fn test_init_dev_reports_the_switch_from_strict() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, false);
+
+    let switched = run_init(&sandbox, true);
+    assert!(
+        switched.contains("pinned -> dev-pinned"),
+        "switching to dev must be reported:\n{switched}"
+    );
+}
+
+/// `--dev` must fan out to EVERY detected agent, exactly like any other
+/// `skim init`. Narrowing it would defeat the feature: several agents' hooks pin
+/// the same binary, so leaving three strict while one is dev keeps `skim doctor`
+/// at exit 1 and the developer is no better off.
+#[test]
+fn test_init_dev_fans_out_to_every_detected_agent() {
+    let sandbox = Sandbox::new();
+    let claude = sandbox.claude_config();
+    let gemini = sandbox.config_dir(".gemini");
+
+    // No `--agent`: auto-detect mode, which is the fan-out path.
+    let out = sandbox
+        .skim()
+        .args(["init", "--no-guidance", "--no-wrappers", "--dev"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "fan-out init must succeed:\n{stdout}");
+
+    for config in [&claude, &gemini] {
+        let script = fs::read_to_string(config.join("hooks/skim-rewrite.sh")).unwrap_or_else(|e| {
+            panic!(
+                "{} must have a hook script: {e}\n{stdout}",
+                config.display()
+            )
+        });
+        assert!(
+            script.contains("SKIM_HOOK_DEV"),
+            "every detected agent must get the dev declaration, {} did not:\n{script}",
+            config.display()
+        );
+    }
+}
+
+// ============================================================================
 // Fix: --project --wrappers mutual exclusion
 // ============================================================================
 
@@ -2097,12 +2428,10 @@ fn test_init_repairs_tampered_hook_not_launders() {
 /// matching the shape of the existing `--permissions + --project` guard.
 #[test]
 fn test_init_project_and_wrappers_is_rejected() {
-    let home = TempDir::new().unwrap();
-    let home_path = home.path();
+    let sandbox = Sandbox::new();
 
-    std::fs::create_dir_all(home_path.join(".claude")).unwrap();
-
-    let out = common::skim_sandboxed(home_path)
+    let out = sandbox
+        .skim()
         .args([
             "init",
             "--yes",
@@ -2124,4 +2453,762 @@ fn test_init_project_and_wrappers_is_rejected() {
         combined.contains("mutually exclusive"),
         "--project --wrappers must report a mutual-exclusion error, got:\n{combined}"
     );
+}
+
+// ============================================================================
+// Hermeticity guards (PF-017)
+// ============================================================================
+//
+// PF-017's durable lesson is that sandboxing an installer's own tests is a
+// convention, and a convention that must be remembered is one that will be
+// forgotten: five days after the first fix shipped, a new test hand-rolled its
+// own env block and dropped two variables from it. The tests below turn the
+// convention into a failure. They guard different things and none subsumes the
+// others — the first catches a test in THIS file that escapes the sandbox, the
+// second catches one in any installer test file (`cli_init*`/`cli_integrity*`),
+// and the last catches a sandbox that has stopped covering the program.
+
+/// The invocation-builder spellings that escape the sandbox, and what each one
+/// does wrong.
+///
+/// Every needle is assembled from fragments. Spelled out whole, a needle would
+/// match its own text in this file — which both file-scanning guards read as
+/// data — and they would fail on themselves rather than on a real violation.
+const ESCAPING_NEEDLES: &[(&str, &str)] = &[
+    (
+        concat!("common::", "skim()"),
+        "builds an UNSANDBOXED command against the real $HOME",
+    ),
+    (
+        concat!("common::", "skim_with_analytics"),
+        "writes to a caller-chosen analytics DB rather than the sandbox's",
+    ),
+    (
+        concat!("cargo", "_bin"),
+        "resolves the binary directly, skipping the sandbox env block",
+    ),
+    (
+        concat!("Command", "::new("),
+        "constructs a bare command that inherits the host environment",
+    ),
+];
+
+/// Guard: every `skim` invocation in this file is built by [`Sandbox`], and that
+/// constructor still pins the working directory.
+///
+/// `skim init --uninstall` with no `--agent` removes wrapper symlinks and
+/// guidance files for every configured agent, so an unsandboxed invocation here
+/// does not read the developer's home directory — it deletes from it. There is
+/// no consent gate on that path to catch the mistake later. The cwd is the same
+/// class of hazard reached through a different door: `skim init` writes git hooks
+/// into whatever repository encloses the cwd, which no `$HOME` redirect covers.
+#[test]
+fn test_every_invocation_in_this_file_is_sandboxed() {
+    let source = include_str!("cli_init.rs");
+
+    /// Sandboxed, but the wrong layer: legitimate elsewhere, so it is a rule
+    /// about this file rather than an escape [`ESCAPING_NEEDLES`] can carry.
+    const WRONG_LAYER: (&str, &str) = (
+        concat!("common::", "skim_sandboxed_with_bin"),
+        "is the low-level builder — go through Sandbox::skim",
+    );
+
+    for (needle, why) in ESCAPING_NEEDLES.iter().copied().chain([WRONG_LAYER]) {
+        assert!(
+            !source.contains(needle),
+            "cli_init.rs uses `{needle}`, which {why}. Build every invocation \
+             with `Sandbox::skim()` / `Sandbox::init()` instead — a global \
+             `skim init --uninstall` DELETES real agent config (PF-017)."
+        );
+    }
+
+    // The cwd axis, pinned at this file's chokepoint. No environment variable
+    // can confine it: a successful `skim init` ends by walking ancestors of the
+    // process cwd for a project root and writing git hooks into it, so an
+    // invocation left at the cargo-supplied cwd installs real post-commit,
+    // post-merge and post-checkout hooks into the skim clone this test binary
+    // was built from. Assembled from fragments for the same reason as the
+    // needles above — spelled whole, this assertion would satisfy itself.
+    let cwd_pin = concat!("cmd.current_dir(self.", "home());");
+    assert!(
+        source.contains(cwd_pin),
+        "`Sandbox::skim` must pin the cwd to the sandbox home (`{cwd_pin}`), \
+         which has no `.git` above it. Without the pin every install in this \
+         file reaches the repository the test binary runs from."
+    );
+
+    // Exactly one call to the sandboxed constructor: the one in `Sandbox::skim`.
+    // A second call site is a second sandbox definition waiting to drift.
+    let sandboxed = concat!("common::", "skim_sandboxed(");
+    let call_sites = source.matches(sandboxed).count();
+    assert_eq!(
+        call_sites, 1,
+        "`{sandboxed}` must appear exactly once in cli_init.rs (inside \
+         `Sandbox::skim`), found {call_sites}."
+    );
+
+    // Setting a variable the sandbox owns re-opens the hole the sandbox closes:
+    // a hand-rolled override is the exact shape PF-017 caught the second time.
+    for (var, _) in common::SANDBOX_REDIRECTED_VARS {
+        let needle = format!(".env(\"{var}\"");
+        assert!(
+            !source.contains(&needle),
+            "cli_init.rs sets `{var}` by hand, but the sandbox already redirects \
+             it. Use the matching `Sandbox` accessor for that path instead."
+        );
+    }
+}
+
+/// An installer test file that still contains unsandboxed invocations, with the
+/// exact number measured today.
+///
+/// An explicit, named list rather than a narrowed scan: a scan that quietly
+/// covers one file is how the escape survived in the first place. Each entry is
+/// pinned by [`test_sandbox_exclusions_still_measure_their_documented_count`],
+/// so it cannot outlive the invocations it excuses.
+struct SandboxExclusion {
+    /// File name directly under `crates/rskim/tests`.
+    file: &'static str,
+    /// The needle, spelled exactly as [`ESCAPING_NEEDLES`] assembles it.
+    needle: &'static str,
+    /// Occurrences measured today — a pin, not an upper bound.
+    count: usize,
+    /// What the invocations reach, and why they are not fixed here.
+    reason: &'static str,
+}
+
+const SANDBOX_EXCLUSIONS: &[SandboxExclusion] = &[SandboxExclusion {
+    file: "cli_init_copilot_migrate.rs",
+    needle: concat!("common::", "skim()"),
+    count: 3,
+    reason: "installs and uninstalls Copilot artifacts with only \
+             COPILOT_CONFIG_DIR redirected, so guidance files, wrapper \
+             symlinks and the cache outside that one directory are still \
+             the developer's own",
+}];
+
+/// Guard: every installer test file is sandboxed, not just this one.
+///
+/// "Installer test file" is [`INSTALLER_TEST_PREFIXES`], which is `cli_init*`
+/// **and** `cli_integrity*` — the test keeps its historical name, but its scope
+/// is whatever that list says.
+///
+/// The predecessor of this test scanned `include_str!("cli_init.rs")` — its own
+/// source — while its failure message universalised from it ("Build every
+/// invocation with `Sandbox::skim()`"). It was therefore structurally blind to
+/// its siblings, which is where the unsandboxed invocations actually were:
+/// eleven in `cli_init_permissions.rs` and three in
+/// `cli_init_copilot_migrate.rs`, every one an installer pointed at the
+/// developer's real `$HOME`. The eleven are closed — that file is now covered
+/// by this guard with no exclusion — and the three remain in
+/// [`SANDBOX_EXCLUSIONS`].
+///
+/// The scan that replaced it inherited a narrower blindness: it matched on the
+/// name `cli_init`, and `cli_integrity.rs` — an install/tamper/uninstall suite —
+/// is not named that. Its two unsandboxed invocations are closed and the prefix
+/// list now covers the file, again with no exclusion.
+#[test]
+fn test_every_init_test_file_is_sandboxed() {
+    let tests_root = tests_root();
+    let files = init_test_files(&tests_root);
+    assert!(
+        files.len() >= 4,
+        "found {} installer test sources under {} (prefixes: {:?}), expected at \
+         least the four that exist today — a filter that stopped matching must \
+         not let this guard pass vacuously",
+        files.len(),
+        tests_root.display(),
+        INSTALLER_TEST_PREFIXES
+    );
+
+    // Assembled from fragments like the needles: spelled whole in a message,
+    // this would be a second call site of the sandboxed builder as far as
+    // `test_every_invocation_in_this_file_is_sandboxed` can tell.
+    let builder = concat!("common::", "skim_sandboxed(home)");
+
+    for path in &files {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| panic!("{} has no file name", path.display()));
+        let body = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+        for (needle, why) in ESCAPING_NEEDLES.iter().copied() {
+            if SANDBOX_EXCLUSIONS
+                .iter()
+                .any(|e| e.file == name && e.needle == needle)
+            {
+                continue; // pinned by the self-retiring guard below
+            }
+            let found = body.matches(needle).count();
+            assert_eq!(
+                found, 0,
+                "{name} uses `{needle}` {found}×, which {why}. Route every \
+                 invocation through `{builder}` with a `TempDir` home: a global \
+                 `skim init --uninstall` DELETES real agent config, and a \
+                 successful `skim init` writes git hooks into whatever \
+                 repository encloses the cwd (PF-017)."
+            );
+        }
+    }
+
+    // The cwd axis is closed for all of them at once in the shared builder —
+    // including the files excluded above, which is why the exclusions are about
+    // `$HOME` and not about the repository. Assembled from fragments so this
+    // assertion cannot be satisfied by its own text.
+    let shared_path = tests_root.join("common/mod.rs");
+    let shared = fs::read_to_string(&shared_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", shared_path.display()));
+    let shared_cwd_pin = concat!("c.current_dir(", "home);");
+    assert!(
+        shared.contains(shared_cwd_pin),
+        "`skim_sandboxed_with_bin` must pin the cwd to the sandbox home \
+         (`{shared_cwd_pin}`). Without it every sandboxed install inherits the \
+         cargo cwd and writes post-commit, post-merge and post-checkout hooks \
+         into the skim clone the test binary was built from."
+    );
+}
+
+/// Guard: each [`SANDBOX_EXCLUSIONS`] entry still measures exactly its count.
+///
+/// This is what makes the list self-retiring. Sandbox one more invocation and
+/// this test goes red naming the entry to update; sandbox the last one and the
+/// entry must be deleted, at which point
+/// [`test_every_init_test_file_is_sandboxed`] covers the file with no further
+/// edit. The pin also makes a typo impossible to ignore: a misspelled needle
+/// measures zero and fails here, rather than silently excluding nothing.
+#[test]
+fn test_sandbox_exclusions_still_measure_their_documented_count() {
+    let tests_root = tests_root();
+    for excl in SANDBOX_EXCLUSIONS {
+        let (file, needle, count, reason) = (excl.file, excl.needle, excl.count, excl.reason);
+        assert!(
+            ESCAPING_NEEDLES.iter().any(|(n, _)| *n == needle),
+            "the exclusion for {file} names `{needle}`, which is not one of the \
+             needles test_every_init_test_file_is_sandboxed checks — the entry \
+             excludes nothing"
+        );
+        let path = tests_root.join(file);
+        let body = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let found = body.matches(needle).count();
+        assert_eq!(
+            found, count,
+            "{file} now contains `{needle}` {found}×, not the {count} pinned in \
+             SANDBOX_EXCLUSIONS ({reason}). If you sandboxed some of them, \
+             update the count; if you sandboxed all of them, DELETE this entry \
+             — test_every_init_test_file_is_sandboxed then covers the file."
+        );
+    }
+}
+
+/// `crates/rskim/tests` — the directory the file-scanning guards walk.
+fn tests_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"))
+}
+
+/// Name prefixes of the integration test files that drive the installer.
+///
+/// A prefix list rather than a single prefix, because the first scoping of this
+/// guard used `cli_init` alone — and `cli_integrity.rs`, which installs, tampers
+/// and uninstalls throughout, does not start with it. The two names share
+/// `cli_int` and diverge one character later, which is close enough to read as
+/// covered and is not. That file ran `skim init` against the developer's real
+/// `$HOME`, with one agent config directory redirected and nothing else, for as
+/// long as the filter was written that way.
+///
+/// A prefix is still the right shape for the entries themselves: a new
+/// `cli_init_*.rs` or `cli_integrity_*.rs` file is covered the moment it is
+/// added, which is the failure mode these guards exist to prevent. Widening this
+/// list — rather than adding a [`SANDBOX_EXCLUSIONS`] entry — is also the rule
+/// for the next file found outside it: an exclusion records a hole, a prefix
+/// closes one.
+const INSTALLER_TEST_PREFIXES: &[&str] = &["cli_init", "cli_integrity"];
+
+/// The installer integration test files, via the bounded walk.
+fn init_test_files(tests_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = rust_sources_under(tests_root)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    INSTALLER_TEST_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(*prefix))
+                })
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Guard: the sandbox env block still accounts for every variable the program
+/// reads.
+///
+/// A hand-maintained enumeration of overrides is always incomplete (PF-017), so
+/// this checks the enumeration against the source rather than trusting it: each
+/// env var the shipped binary reads must be redirected, pinned, removed, or
+/// explicitly inherited. Adding an env read without classifying it fails here.
+///
+/// # Scope: every crate linked into the binary
+///
+/// `rskim` itself, its unconditional library dependencies (`rskim-core`,
+/// `rskim-compress`, `rskim-search`, `rskim-tokens`) and the two the `proxy`
+/// feature adds (`rskim-contract`, `rskim-proxy`), because release builds enable
+/// it. Scanning the binary crate alone was not enough, and the justification for
+/// doing so named one of the five other crates it links: `rskim-search`'s index
+/// reader reads `SKIM_DEBUG` and `rskim-tokens` reads `ANTHROPIC_API_KEY`, both
+/// invisible to that scope. `rskim-research` and `rskim-bench` are deliberately
+/// out — neither is linked into the binary, so a read there cannot reach a
+/// sandboxed invocation.
+///
+/// # `#[cfg(test)]` is out of scope
+///
+/// A variable only a unit test reads is not one the shipped binary reads, and
+/// demanding a sandbox entry for it produces a false classification rather than
+/// a real one: `CARGO_BIN_EXE_skim`, read only by this workspace's own test
+/// modules, was filed in `SANDBOX_REMOVED_VARS` under a contract ("a host value
+/// would leak session state into a test") that does not describe a cargo harness
+/// variable, because that was the cheapest way to satisfy this guard. Both
+/// shapes of test-only code are skipped: an inline `#[cfg(test)]` item, and a
+/// whole file declared `#[cfg(test)] mod …;` by its parent.
+#[test]
+fn test_sandbox_env_block_classifies_every_env_var_the_binary_reads() {
+    /// Indirect reads (`env::var(SOMETHING)`) whose argument is neither a string
+    /// literal nor a resolvable `const`. `name` is the `|name: &str|` parameter
+    /// of the `read` closures in `DetectionEnv::from_process` and
+    /// `InstructionEnv::from_process`; their call sites are string literals and
+    /// are covered by the `read("…")` pattern below.
+    const EXPECTED_INDIRECT_READS: &[&str] = &["name"];
+
+    /// Crate directories under the workspace `crates/`, per the scope note.
+    const LINKED_CRATES: &[&str] = &[
+        "rskim",
+        "rskim-core",
+        "rskim-compress",
+        "rskim-search",
+        "rskim-tokens",
+        "rskim-contract",
+        "rskim-proxy",
+    ];
+
+    /// Reads that are unambiguously production code, used to detect a
+    /// `#[cfg(test)]` skip that has begun swallowing live source. Skipping too
+    /// much is the one failure of that scan which makes this guard weaker
+    /// instead of noisier, so it gets an explicit tripwire.
+    const PRODUCTION_SENTINELS: &[&str] = &["SKIM_CACHE_DIR", "CLAUDE_CONFIG_DIR"];
+
+    let crates_root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let mut sources = Vec::new();
+    for crate_name in LINKED_CRATES {
+        let src_root = crates_root.join(crate_name).join("src");
+        assert!(
+            src_root.is_dir(),
+            "{} is not a directory — a renamed or moved crate must not silently \
+             shrink this guard's scope",
+            src_root.display()
+        );
+        sources.extend(rust_sources_under(&src_root));
+    }
+    assert!(
+        !sources.is_empty(),
+        "found no Rust sources under {} — the guard would pass vacuously",
+        crates_root.display()
+    );
+
+    // Two passes: consts first, because a read may resolve a const defined in
+    // another file.
+    let mut consts = BTreeMap::new();
+    let mut bodies = Vec::with_capacity(sources.len());
+    for path in &sources {
+        let body = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        collect_string_consts(&body, &mut consts);
+        bodies.push(body);
+    }
+
+    let test_only = test_only_module_files(&sources, &bodies);
+    let mut names = BTreeSet::new();
+    let mut unresolved = BTreeSet::new();
+    for (path, body) in sources.iter().zip(&bodies) {
+        if test_only.contains(path) {
+            continue;
+        }
+        collect_env_reads(body, &consts, &mut names, &mut unresolved);
+    }
+
+    for sentinel in PRODUCTION_SENTINELS {
+        assert!(
+            names.contains(*sentinel),
+            "`{sentinel}` is read by production code but was not collected. The \
+             `#[cfg(test)]` skip is over-reaching and swallowing live source, \
+             which would let this guard pass by finding nothing."
+        );
+    }
+
+    let unexpected: Vec<&String> = unresolved
+        .iter()
+        .filter(|ident| !EXPECTED_INDIRECT_READS.contains(&ident.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "env var(s) read through an unresolvable expression: {unexpected:?}. \
+         The sandbox cannot classify what it cannot name — give the variable a \
+         `const NAME: &str = \"…\";` binding, or add the argument to \
+         EXPECTED_INDIRECT_READS with a note on where its literals live."
+    );
+
+    // A variable must be in EXACTLY one table. Listing one in two tables is
+    // silently resolved by whichever loop in `skim_sandboxed_with_bin` runs
+    // last — a var in both REDIRECTED and REMOVED ends up removed, and the
+    // union check below would still call it classified.
+    let mut classified: BTreeSet<String> = BTreeSet::new();
+    let tables = common::SANDBOX_REDIRECTED_VARS
+        .iter()
+        .map(|(var, _)| *var)
+        .chain(common::SANDBOX_PINNED_VARS.iter().map(|(var, _)| *var))
+        .chain(common::SANDBOX_REMOVED_VARS.iter().copied())
+        .chain(common::SANDBOX_INHERITED_VARS.iter().copied());
+    for var in tables {
+        assert!(
+            classified.insert(var.to_string()),
+            "`{var}` appears in more than one sandbox table; the later loop in \
+             `skim_sandboxed_with_bin` silently wins. Keep each variable in \
+             exactly one table."
+        );
+    }
+
+    let unclassified: Vec<&String> = names
+        .iter()
+        .filter(|name| !classified.contains(name.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "env var(s) read by a crate linked into the skim binary with no sandbox \
+         entry: {unclassified:?}. Add each to exactly one table in tests/common/mod.rs \
+         — SANDBOX_REDIRECTED_VARS if it names a path that could reach real user \
+         state, SANDBOX_REMOVED_VARS if a host value would leak session state \
+         into a test, SANDBOX_PINNED_VARS if tests need a fixed value, or \
+         SANDBOX_INHERITED_VARS with a written reason why the host value is safe."
+    );
+}
+
+/// Collect `.rs` files under `root`, with explicit bounds on the walk.
+///
+/// The bounds are what make a symlink cycle fail loudly instead of hanging.
+fn rust_sources_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    /// Upper bound on directories visited — the crate has well under 100.
+    const MAX_DIRS: usize = 1024;
+    /// Upper bound on files collected.
+    const MAX_FILES: usize = 4096;
+
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut dirs_visited: usize = 0;
+
+    while let Some(dir) = pending.pop() {
+        dirs_visited += 1;
+        assert!(
+            dirs_visited <= MAX_DIRS,
+            "directory walk exceeded {MAX_DIRS} directories under {} — cycle?",
+            root.display()
+        );
+        let entries = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("failed to read dir {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("failed to read entry in {}: {e}", dir.display()))
+                .path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                assert!(
+                    files.len() < MAX_FILES,
+                    "collected more than {MAX_FILES} Rust sources under {}",
+                    root.display()
+                );
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Record `const NAME: &str = "value";` bindings so an indirect env read
+/// written as `env::var(NAME)` can be resolved back to its variable name.
+fn collect_string_consts(source: &str, out: &mut BTreeMap<String, String>) {
+    for line in source.lines() {
+        let Some(idx) = line.find("const ") else {
+            continue;
+        };
+        let rest = &line[idx + "const ".len()..];
+        let Some((name, tail)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some((ty, value)) = tail.split_once('=') else {
+            continue;
+        };
+        if ty.trim() != "&str" {
+            continue;
+        }
+        let Some(value) = value.trim().strip_prefix('"') else {
+            continue;
+        };
+        // Everything up to the closing quote; `split` always yields a first item.
+        let value = value.split('"').next().unwrap_or_default();
+        out.insert(name.trim().to_string(), value.to_string());
+    }
+}
+
+/// Extract env-var names read by `source` into `names`, and the arguments of
+/// reads that could not be resolved to a name into `unresolved`.
+///
+/// Reads inside a `#[cfg(test)]` item are not collected: they are not reads the
+/// shipped binary makes, so requiring a sandbox classification for one asks for a
+/// fiction. See [`cfg_test_regions`] for what counts as such an item, and
+/// [`test_only_module_files`] for the whole-file case this cannot see.
+fn collect_env_reads(
+    source: &str,
+    consts: &BTreeMap<String, String>,
+    names: &mut BTreeSet<String>,
+    unresolved: &mut BTreeSet<String>,
+) {
+    // `read(` is the `|name: &str|` closure both `from_process` impls use. It is
+    // the ambiguous one — it also matches `fs::read("path")` — so only its
+    // quoted form is taken, and only when the literal has env-var shape.
+    const READ_CLOSURE: &str = "read(";
+    const PATTERNS: &[&str] = &["env::var(", "env::var_os(", READ_CLOSURE];
+
+    let test_regions = cfg_test_regions(source);
+
+    for pattern in PATTERNS {
+        for (idx, _) in source.match_indices(pattern) {
+            if test_regions.iter().any(|region| region.contains(&idx)) {
+                continue;
+            }
+            let rest = &source[idx + pattern.len()..];
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let name = quoted.split('"').next().unwrap_or_default();
+                if *pattern == READ_CLOSURE && !has_env_var_shape(name) {
+                    continue;
+                }
+                names.insert(name.to_string());
+            } else if *pattern != READ_CLOSURE {
+                let ident: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                match consts.get(&ident) {
+                    Some(value) => {
+                        names.insert(value.clone());
+                    }
+                    None => {
+                        unresolved.insert(ident);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `SCREAMING_SNAKE_CASE` — the shape every env var this crate reads has.
+fn has_env_var_shape(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The leading whitespace of `line`.
+fn indent_of(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+/// Byte ranges of the `#[cfg(test)]` items in `source`.
+///
+/// Only the exact attribute `#[cfg(test)]`, alone on its line, is recognised.
+/// `#[cfg(any(test, feature = "harness"))]` is deliberately NOT treated as
+/// test-only: that item compiles into a production build whenever the feature is
+/// enabled, so a read inside it still needs a sandbox entry.
+///
+/// Where an item ends is decided by lines, not by counting braces. A brace
+/// counter would have to lex string literals and comments, or it ends a region
+/// early on a `{` inside a fixture string — and the analogous mistake in the
+/// other direction silently hides production code. Two rules cover every shape
+/// in this workspace:
+///
+/// - an item whose first line ends in `;` (`mod tests;`, `use …;`) is that one
+///   line, so a bodyless declaration cannot swallow the items that follow it;
+/// - anything else opens a block, which ends at the first line whose indent
+///   equals the attribute's and whose first character is `}`.
+///
+/// Both rules fail toward ending a region early, which makes the caller scan
+/// more source rather than less. An unterminated block runs to the end of the
+/// file, which is where `mod tests { … }` sits in every file here, and
+/// `PRODUCTION_SENTINELS` is the tripwire for that one unsafe direction.
+fn cfg_test_regions(source: &str) -> Vec<std::ops::Range<usize>> {
+    /// The only attribute spelling that means "test builds only".
+    const CFG_TEST: &str = "#[cfg(test)]";
+    /// Upper bound on regions per file — two orders of magnitude above the
+    /// largest file in the workspace, so a scan that fails to terminate on real
+    /// input panics instead of growing without limit.
+    const MAX_REGIONS: usize = 4096;
+
+    /// What the scan is waiting for. Each variant carries the item's indent.
+    enum State {
+        /// Outside any `#[cfg(test)]` item.
+        Idle,
+        /// Saw the attribute; waiting for the item's first line to learn whether
+        /// it is a bodyless declaration or a block.
+        Pending(String),
+        /// Inside a block; waiting for its closing brace.
+        InBlock(String),
+    }
+
+    let mut regions: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut state = State::Idle;
+    let mut start = 0usize;
+    let mut offset = 0usize;
+
+    // `split_inclusive` keeps the line terminator, so `offset` stays an exact
+    // byte offset whatever the line endings are, and `trim_end` drops any `\r`.
+    for raw in source.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw.len();
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+
+        state = match std::mem::replace(&mut state, State::Idle) {
+            State::Idle if trimmed == CFG_TEST => {
+                assert!(
+                    regions.len() < MAX_REGIONS,
+                    "more than {MAX_REGIONS} `{CFG_TEST}` items in one file — the \
+                     scan is not terminating on real input"
+                );
+                start = line_start;
+                State::Pending(indent_of(line).to_string())
+            }
+            State::Idle => State::Idle,
+            // Further attributes, comments and blank lines belong to the same
+            // item: `#[cfg(test)]` / `#[path = "x_tests.rs"]` / `mod tests;`.
+            State::Pending(indent)
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") =>
+            {
+                State::Pending(indent)
+            }
+            State::Pending(_) if trimmed.ends_with(';') => {
+                regions.push(start..offset);
+                State::Idle
+            }
+            State::Pending(indent) => State::InBlock(indent),
+            State::InBlock(indent)
+                if indent_of(line) == indent.as_str() && trimmed.starts_with('}') =>
+            {
+                regions.push(start..offset);
+                State::Idle
+            }
+            State::InBlock(indent) => State::InBlock(indent),
+        };
+    }
+    if !matches!(state, State::Idle) {
+        regions.push(start..source.len());
+    }
+    regions
+}
+
+/// Source files whose whole content is a module their parent declares
+/// `#[cfg(test)]`.
+///
+/// [`cfg_test_regions`] structurally cannot see these: the gate is written at
+/// the `mod` declaration in the parent, so the module file itself carries no
+/// `#[cfg(test)]` anywhere in it. `cmd/search/index_tests.rs` is the case that
+/// matters — two reads of the cargo-supplied `CARGO_BIN_EXE_skim` that the
+/// shipped binary never makes.
+///
+/// A declaration whose resolved path is not among `sources` is ignored rather
+/// than asserted on: `#[path]` resolution and the `mod.rs`-versus-plain-module
+/// rules are subtle, and a resolution miss must fail toward scanning a file,
+/// never toward skipping one.
+fn test_only_module_files(
+    sources: &[std::path::PathBuf],
+    bodies: &[String],
+) -> BTreeSet<std::path::PathBuf> {
+    const CFG_TEST: &str = "#[cfg(test)]";
+    const PATH_ATTR: &str = "#[path = \"";
+
+    let known: BTreeSet<&std::path::Path> = sources.iter().map(|path| path.as_path()).collect();
+    let mut out = BTreeSet::new();
+
+    for (path, body) in sources.iter().zip(bodies) {
+        let Some(dir) = path.parent() else { continue };
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let mut pending = false;
+        let mut path_attr: Option<&str> = None;
+
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if !pending {
+                if trimmed == CFG_TEST {
+                    pending = true;
+                    path_attr = None;
+                }
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix(PATH_ATTR) {
+                path_attr = rest.split('"').next();
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                continue; // any other attribute on the same item
+            }
+            // The item itself. Only a bodyless `mod NAME;` gates another FILE;
+            // an inline `mod tests {` is `cfg_test_regions`' job.
+            if let Some(name) = bodyless_module_name(trimmed) {
+                let resolved = match path_attr {
+                    // `#[path]` on a module outside an inline block resolves
+                    // against the declaring file's own directory.
+                    Some(relative) => dir.join(relative),
+                    // Otherwise `mod.rs` and `lib.rs` declare siblings, and any
+                    // other file declares children of its own subdirectory.
+                    None if stem == "mod" || stem == "lib" => dir.join(format!("{name}.rs")),
+                    None => dir.join(stem).join(format!("{name}.rs")),
+                };
+                if known.contains(resolved.as_path()) {
+                    out.insert(resolved);
+                }
+            }
+            pending = false;
+        }
+    }
+    out
+}
+
+/// The module name in a bodyless declaration (`pub(crate) mod test_utils;`).
+///
+/// `None` for an inline module (`mod tests {`) and for every other item, because
+/// only a bodyless declaration names a separate file.
+fn bodyless_module_name(trimmed: &str) -> Option<&str> {
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens.next()?;
+    if first != "mod" {
+        // A visibility token may precede it: `pub`, `pub(crate)`, `pub(super)`.
+        if !first.starts_with("pub") || tokens.next()? != "mod" {
+            return None;
+        }
+    }
+    let name = tokens.next()?.strip_suffix(';')?;
+    if tokens.next().is_some() || name.is_empty() {
+        return None;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then_some(name)
 }

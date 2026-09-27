@@ -17,18 +17,18 @@ fn test_default_values() {
     assert_eq!(w.lexical, 0.5, "lexical default must be 0.5 (AC1)");
     assert_eq!(w.ast, 0.3, "ast default must be 0.3 (AC1)");
     assert_eq!(w.temporal, 0.2, "temporal default must be 0.2 (AC1)");
-    // Extended signals default to 0.0 (ADR-003 gated until measured).
+    // Extended signals default to 0.0 (SEARCH-ADR-003 gated until measured).
     assert_eq!(
         w.import_graph, 0.0,
-        "import_graph must default to 0.0 (ADR-003 gated)"
+        "import_graph must default to 0.0 (SEARCH-ADR-003 gated)"
     );
     assert_eq!(
         w.dir_proximity, 0.0,
-        "dir_proximity must default to 0.0 (ADR-003 gated)"
+        "dir_proximity must default to 0.0 (SEARCH-ADR-003 gated)"
     );
     assert_eq!(
         w.structural_coupling, 0.0,
-        "structural_coupling must default to 0.0 (ADR-003 gated)"
+        "structural_coupling must default to 0.0 (SEARCH-ADR-003 gated)"
     );
     // Confirm with_six_signal_defaults() and Default::default() are identical.
     assert_eq!(

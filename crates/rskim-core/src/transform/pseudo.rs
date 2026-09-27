@@ -11,11 +11,29 @@
 //! For Python, parameter and variable type annotations are still stripped.
 //! TypeScript preserves parameter type annotations (ADR-007); only decorator,
 //! `readonly`, and `abstract` are stripped alongside variable/property `type_annotation`.
-//! Rust strips lifetimes, type parameters, where clauses, and attribute items only;
-//! `mutable_specifier` is preserved as it is part of the function's API surface.
+//! Rust strips nothing via `strip_kinds`: lifetimes, type/generic parameters, where
+//! clauses, and attribute items are all preserved as API surface, extending the same
+//! rationale that already kept `visibility_modifier` and `mutable_specifier` out of
+//! the strip list.
 //! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
-//! Token reduction target: 30-50%
+//! # Token reduction
+//!
+//! There is no figure for this mode, because none has been measured. The "30-50%"
+//! target this header used to state was never derived from a measurement: ADR-008's
+//! 2026-08-26 archaeology traces it to the original pseudo-mode commit (04b5f9f, #70),
+//! where it was copied into several files and never re-derived, and ADR-007 records
+//! that no CI gate defends it.
+//!
+//! It is also not a figure one number could carry any more, because the rule sets
+//! diverged. Rust and Go both have an empty `strip_kinds`, empty `strip_keywords` and
+//! `strip_self_param: false`, so Rust pseudo removes only statement semicolons and
+//! non-doc comments, and Go pseudo removes only non-doc comments. Rust is this
+//! repository's own dominant file type, so the mode's headline behaviour here is close
+//! to `minimal`'s.
+//!
+//! Do not restate a number here until one exists per language and something that runs
+//! in CI defends it; a target nothing measures reads as a measurement.
 //!
 //! # Traversal rule (PF-020)
 //!
@@ -47,7 +65,7 @@ use tree_sitter::{Node, Tree};
 use super::minimal::{
     CommentClassification, MAX_AST_DEPTH, MAX_AST_NODES, adjust_range_for_line_removal,
     build_newline_table, compute_go_doc_comment_starts, compute_header_end_byte,
-    is_removable_comment, remove_ranges, trim_and_normalize,
+    fold_leading_blank_run_with_line_map, is_removable_comment, remove_ranges, trim_and_normalize,
 };
 use super::{compute_line_map_from_removed_ranges, normalize_line_map_blanks};
 use crate::transform::utils::is_function_scope_kind;
@@ -208,15 +226,16 @@ fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
 /// Returns true for node kinds that act as inline modifiers preceding another token.
 ///
 /// When these kinds are stripped, the trailing space between the modifier and the next
-/// token should also be consumed. For example, stripping `'a` from `&'a str` should
-/// produce `&str` (not `& str`), and stripping `mut` from `&mut self` should produce
-/// `& self`.
+/// token should also be consumed. For example, stripping `readonly` from
+/// `readonly foo: string` should produce `foo: string` (not ` foo: string`).
 ///
 /// Type annotations and decorators are NOT inline modifiers — their trailing spaces
 /// may belong to surrounding syntax (e.g., `: number = 42`).
 fn is_inline_modifier_kind(kind: &str) -> bool {
     // `mutable_specifier` was removed because it is no longer stripped (E2.4).
-    matches!(kind, "lifetime" | "readonly" | "abstract")
+    // `lifetime` was removed for the same reason: Rust's strip_kinds no longer
+    // strips lifetimes, so this predicate is never consulted for that kind.
+    matches!(kind, "readonly" | "abstract")
 }
 
 /// Per-language rules for what constitutes "noise" in pseudo mode
@@ -269,17 +288,13 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_self_param: true,
         },
         Language::Rust => PseudoRules {
-            strip_kinds: &[
-                // "visibility_modifier" intentionally NOT listed — pub/pub(crate)/pub(super)
-                // convey API surface and re-export intent; preserving them matches the
-                // decision to keep visibility in pseudo output (A4 contract).
-                "lifetime",
-                "type_parameters",
-                "where_clause",
-                "attribute_item",
-                // "mutable_specifier" intentionally NOT listed — `&mut self` and `&mut T`
-                // convey mutation intent and are part of the function's API surface (E2.4).
-            ],
+            // No node kinds are stripped here. Lifetimes, type/generic parameters,
+            // where clauses and attribute items are API surface, not syntactic noise —
+            // extending the same A4 contract that already excluded
+            // "visibility_modifier" (pub/pub(crate)/pub(super) convey API surface and
+            // re-export intent) and "mutable_specifier" (`&mut self`/`&mut T` convey
+            // mutation intent, E2.4) from this list.
+            strip_kinds: &[],
             strip_keywords: &[],
             strip_semicolons: true,
             strip_self_param: false,
@@ -442,6 +457,11 @@ pub(crate) fn transform_pseudo_with_spans(
 ///
 /// `normalize_line_map_blanks` mirrors both rules on the line map so the map stays
 /// in sync with the final output text.
+///
+/// A third line-dropping rule, `fold_leading_blank_run_with_line_map`, runs BEFORE
+/// both of them and folds the body's first blank run to one line.  It is applied to
+/// the text and the map in the same call, so it needs no mirror — and putting it
+/// upstream is what lets the two mirrored functions stay unaware of it.
 pub(crate) fn transform_pseudo_with_spans_and_line_map(
     source: &str,
     tree: &Tree,
@@ -518,6 +538,19 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     // Returns the collapsed string AND the protected ranges in output coordinates
     // (needed by trim_and_normalize and normalize_line_map_blanks).
     let (result, protected_after_collapse) = collapse_whitespace(&result, &protected_in_result);
+    // Fold the residue a stripped module-level comment leaves behind: the blank lines
+    // that flanked it are now adjacent, directly under the header #476 preserves, where
+    // a bounded view spends its budget on them. The fold happens here because
+    // `--max-lines N` is exact (ADR-016) — the truncator cannot recover a slot, and it
+    // sees a flat line vector in which residue and authored spacing look the same.
+    // Text, line map and protected ranges move together, upstream of both
+    // trim_and_normalize and normalize_line_map_blanks, so those two stay mirrored.
+    let (result, line_map_after_removal, protected_after_collapse) =
+        fold_leading_blank_run_with_line_map(
+            result,
+            line_map_after_removal,
+            protected_after_collapse,
+        );
     // trim_and_normalize may drop lines when there are 3+ consecutive blanks.
     // Capture the text before that step so normalize_line_map_blanks can replay
     // the same logic to keep the line map in sync.
@@ -1067,6 +1100,80 @@ mod tests {
     }
 
     // ========================================================================
+    // Leading blank-run fold (#476 stripped-comment residue)
+    // ========================================================================
+
+    #[test]
+    fn test_pseudo_leading_blank_residue_costs_one_line_not_two() {
+        // Stripping the two module-level comments makes the blank line above them
+        // adjacent to the blank line below them — neither was written next to the
+        // other. Since #476 preserves the module header in every language, that pair
+        // now sits directly under the header, and `--max-lines N` is an exact bound
+        // (ADR-016), so two residue blanks are two slots that show the reader nothing.
+        let source = concat!(
+            "// FIXTURE: header\n",
+            "// TESTS: header\n",
+            "\n",
+            "// strip me\n",
+            "/* strip me too */\n",
+            "\n",
+            "/**\n",
+            " * doc (KEEP)\n",
+            " */\n",
+            "export function add(x: number): number {\n",
+            "    return x;\n",
+            "}\n",
+        );
+        let result = transform(source, Language::TypeScript);
+        let lines: Vec<&str> = result.lines().collect();
+
+        assert_eq!(lines[0], "// FIXTURE: header");
+        assert_eq!(lines[1], "// TESTS: header");
+        assert_eq!(
+            lines[2], "",
+            "one blank line still separates the header from the body: {result}"
+        );
+        assert_eq!(
+            lines[3], "/**",
+            "the header/body gap must cost one line, not two: {result}"
+        );
+    }
+
+    #[test]
+    fn test_pseudo_leading_blank_fold_keeps_the_line_map_in_step() {
+        // The fold drops a line from the text, so the map has to lose the same entry —
+        // otherwise every `-n` annotation below the fold names the wrong source line.
+        let source = concat!(
+            "// FIXTURE: header\n",
+            "\n",
+            "// strip me\n",
+            "\n",
+            "export const VERSION = \"1.0.0\";\n",
+        );
+        let mut parser = Parser::new(Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = TransformConfig::with_mode(Mode::Pseudo);
+        let (text, _spans, line_map) =
+            transform_pseudo_with_spans_and_line_map(source, &tree, Language::TypeScript, &config)
+                .unwrap();
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            line_map.len(),
+            "one map entry per output line: {lines:?} vs {line_map:?}"
+        );
+        let version_idx = lines
+            .iter()
+            .position(|l| l.contains("VERSION"))
+            .expect("the const must survive the transform");
+        assert_eq!(
+            line_map[version_idx], 5,
+            "the const is source line 5; got {line_map:?} for {lines:?}"
+        );
+    }
+
+    // ========================================================================
     // TypeScript pseudo tests
     // ========================================================================
 
@@ -1310,34 +1417,41 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_pseudo_strips_lifetimes_and_type_params() {
+    fn test_rust_pseudo_preserves_lifetimes_and_type_params() {
+        // Lifetimes and generic type parameters are API surface, not noise —
+        // preserved in pseudo mode (extends the A4 contract, mirrors ADR-007).
         let source = "pub fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {\n    if x.len() > y.len() { x } else { y }\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("<'a>"),
-            "type parameters should be stripped"
+            result.contains("<'a>"),
+            "generic lifetime parameters must be preserved, got: {result}"
         );
-        // Lifetimes in the body might remain in some nodes, but the key is
-        // that the type_parameters on the function are stripped
     }
 
     #[test]
-    fn test_rust_pseudo_strips_attributes() {
+    fn test_rust_pseudo_preserves_attributes() {
+        // Attribute items (`#[derive(...)]`) are API surface, not noise — preserved
+        // in pseudo mode (extends the A4 contract, mirrors ADR-007).
         let source = "#[derive(Debug)]\npub struct Point {\n    pub x: i32,\n    pub y: i32,\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("#[derive(Debug)]"),
-            "attribute should be stripped"
+            result.contains("#[derive(Debug)]"),
+            "attribute must be preserved, got: {result}"
         );
         assert!(result.contains("struct Point"), "struct preserved");
     }
 
     #[test]
-    fn test_rust_pseudo_strips_where_clause() {
+    fn test_rust_pseudo_preserves_where_clause() {
+        // Where clauses are API surface, not noise — preserved in pseudo mode
+        // (extends the A4 contract, mirrors ADR-007).
         let source =
             "fn process<T>(value: T) where T: Clone + Debug {\n    println!(\"{:?}\", value);\n}\n";
         let result = transform(source, Language::Rust);
-        assert!(!result.contains("where"), "where clause should be stripped");
+        assert!(
+            result.contains("where"),
+            "where clause must be preserved, got: {result}"
+        );
         assert!(result.contains("fn process"), "function preserved");
     }
 
@@ -1367,6 +1481,29 @@ mod tests {
         assert!(
             !result.contains("& self"),
             "mutable_specifier must not be stripped, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_preserved_generics_reparse_without_error() {
+        // Preserving lifetimes, generic type parameters, where clauses and
+        // attribute items (this change) must not corrupt the output into
+        // something that fails to re-parse as valid Rust. The fixture uses only
+        // item declarations plus a single bare-expression function body — no
+        // statement-level `;` appears anywhere, so `strip_semicolons` (which
+        // makes `use`/`let` statements unparseable independently of this
+        // change, per pseudo.rs's semicolon-stripping rule) cannot be the
+        // source of any parse error observed here (PF-025: this assertion is
+        // scoped to what THIS change touches, not a general no-corruption claim).
+        let source = "#[derive(Debug, Clone)]\npub struct Container<'a, T> where T: Clone {\n    pub value: &'a T,\n}\n\nimpl<'a, T> Container<'a, T> where T: Clone {\n    pub fn get(&self) -> &T {\n        self.value\n    }\n}\n";
+        let result = transform(source, Language::Rust);
+
+        let mut parser = Parser::new(Language::Rust).unwrap();
+        let tree = parser.parse(&result).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "pseudo output preserving lifetimes/generics/where-clauses/attributes \
+             must re-parse as valid Rust with no error nodes, got: {result}"
         );
     }
 
@@ -1734,23 +1871,19 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_pseudo_lifetime_no_space() {
-        // BUG 6: Stripping lifetime from `&'a str` left `& str` (extra space).
-        // Return type is preserved (A4), with lifetime stripped inside it: `-> &str`.
+    fn test_rust_pseudo_preserves_lifetime_intact() {
+        // Lifetimes are preserved as API surface (no longer stripped), so `&'a str`
+        // must survive intact, including in the return type position.
         let source = "pub fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {\n    if x.len() > y.len() { x } else { y }\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("& str"),
-            "lifetime removal should not leave extra space in references, got: {result}"
+            result.contains("&'a str"),
+            "reference-with-lifetime must be preserved intact, got: {result}"
         );
+        // Return type preserved with lifetime intact: -> &'a str
         assert!(
-            result.contains("&str"),
-            "reference types should be clean, got: {result}"
-        );
-        // Return type preserved with lifetime stripped: -> &str (not -> &'a str)
-        assert!(
-            result.contains("-> &str"),
-            "return type must be preserved with lifetime stripped, got: {result}"
+            result.contains("-> &'a str"),
+            "return type must be preserved with lifetime intact, got: {result}"
         );
     }
 
@@ -1875,7 +2008,6 @@ mod tests {
 
     #[test]
     fn test_is_inline_modifier_kind_positives() {
-        assert!(is_inline_modifier_kind("lifetime"));
         // `mutable_specifier` removed from is_inline_modifier_kind (E2.4) —
         // it is no longer in the strip list so the trailing-space consumer is moot.
         assert!(is_inline_modifier_kind("readonly"));
@@ -1885,6 +2017,9 @@ mod tests {
     #[test]
     fn test_is_inline_modifier_kind_negatives() {
         assert!(!is_inline_modifier_kind("mutable_specifier")); // E2.4: no longer inline modifier
+        // Rust's strip_kinds no longer strips lifetimes, so this predicate is never
+        // consulted for that kind (see is_inline_modifier_kind's own comment).
+        assert!(!is_inline_modifier_kind("lifetime"));
         assert!(!is_inline_modifier_kind("type_annotation"));
         assert!(!is_inline_modifier_kind("decorator"));
         assert!(!is_inline_modifier_kind("identifier"));

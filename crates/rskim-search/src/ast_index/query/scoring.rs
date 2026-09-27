@@ -140,7 +140,7 @@ impl ScoringCtx {
         // Per-n-gram IDF memoization: at most one distinct value per language.
         // Avoid HashMap overhead — track only the last seen (lang, idf) pair.
         // P2 (#286): scalar cache already collapses O(postings) IDF lookups to
-        // O(distinct-langs-in-run); no array needed (ADR-003, closed-by-#284).
+        // O(distinct-langs-in-run); no array needed (SEARCH-ADR-003, closed-by-#284).
         //
         // AC8 (#286): the scalar `last_lang`/`last_idf` cache is reset each
         // `score_postings` call (per-n-gram scope).  Score-equivalence vs. a

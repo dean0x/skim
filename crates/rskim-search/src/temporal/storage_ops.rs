@@ -43,7 +43,7 @@ pub(super) const MIN_JACCARD_THRESHOLD: f64 = 0.10;
 /// Write the version-attestation pair atomically within `tx`.
 ///
 /// `META_GIT_HEAD` and `META_DATA_VERSION` form a co-required pair (AD-408-3,
-/// ADR-006): any `temporal.db` that carries `git_head` must also carry
+/// SEARCH-ADR-006): any `temporal.db` that carries `git_head` must also carry
 /// `data_version`, or `temporal_db_is_stale` flags it stale indefinitely.
 /// Co-locating both writes in this single primitive makes the invariant
 /// un-bypassable in the production write path — callers that need to record a
@@ -160,7 +160,7 @@ fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) 
 /// tie-break is load-bearing, not cosmetic: Jaccard is a ratio of small
 /// integers, so ties at the truncation boundary are common, and ordering on
 /// score alone would let two builds of the same repository drop *different*
-/// rows.  `temporal.db` is a cache artifact that ADR-007's dog-food pass
+/// rows.  `temporal.db` is a cache artifact that SEARCH-ADR-007's dog-food pass
 /// compares against ground truth, so which rows survive must be a function of
 /// the data only (PF-012: determinism via a stable key).  `(file_a, file_b)` is
 /// unique per row — the caller guarantees `file_a < file_b` and one row per

@@ -55,7 +55,7 @@ impl HookProtocol for CursorHook {
     }
 
     fn generate_script(&self, version: &str, binary_path: &str) -> String {
-        super::generate_hook_script(version, "cursor", binary_path)
+        super::generate_hook_script(version, "cursor", binary_path, super::HookMode::Strict)
     }
 
     // -------------------------------------------------------------------------

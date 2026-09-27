@@ -26,14 +26,75 @@ pub(crate) struct NodeSpan {
     pub transformed_range: Range<usize>,
     /// tree-sitter node kind string (for priority scoring)
     pub node_kind: &'static str,
+    /// Line range in the ORIGINAL SOURCE that this span puts on screen
+    /// (0-indexed, exclusive end), or `None` when the producer does not know it.
+    ///
+    /// ARCHITECTURE: this is a DISCLOSURE coordinate. The elision markers read it
+    /// for BOTH halves of their claim -- how many source lines are hidden, and
+    /// whether a marker fires at all. PF-033 rule 4: a coordinate migration has to
+    /// move the presence predicate and the count TOGETHER, because a count that is
+    /// right about a gap the predicate got wrong is a new defect class rather than
+    /// a partial fix, and a harder one to see because the arithmetic reconciles.
+    /// [`count_markers`] reads it for the same reason, so its prediction matches
+    /// what the builder emits and the ADR-016 trim loop neither over- nor
+    /// under-reserves.
+    ///
+    /// Presence as it stands: the LEADING marker is decided purely here
+    /// (`omitted > 0`). The GAP and TRAILING markers require BOTH a transformed
+    /// gap and `omitted > 0`, so a source gap the transformed cursor cannot see is
+    /// still undisclosed -- signatures mode joins its spans contiguously and hits
+    /// exactly that. It is tracked, with the exact shortfall and the reason it
+    /// cannot be lifted yet, by
+    /// `signatures_max_lines_undisclosed_source_lines_are_pinned` in
+    /// tests/truncation_markers.rs.
+    ///
+    /// Selection, layout and the ADR-016 `max_lines` bound stay in
+    /// `transformed_range`'s space and are untouched by this field.
+    ///
+    /// It cannot REPLACE `transformed_range`, because the two spaces are not
+    /// affine: structure mode collapses many source lines onto one output line,
+    /// and types mode inserts blank separator lines that exist in output space
+    /// and in no source line at all. A bound enforced in source space would
+    /// therefore not be the `head -N` bound ADR-016 requires. Both coordinates
+    /// have to travel together -- PF-033 rule 1: enforce the bound ONCE, in ONE
+    /// space, and hand the other space along rather than re-deriving it from
+    /// rendered output that no longer distinguishes content from marker.
+    ///
+    /// CONTRACT: the range's LENGTH is what the marker arithmetic consumes -- it
+    /// is the number of source lines this span actually shows the reader. Its
+    /// `start` is the source line the span's first output line came from.
+    pub source_range: Option<Range<usize>>,
 }
 
 impl NodeSpan {
-    /// Create a new NodeSpan
+    /// Create a NodeSpan that knows only its transformed-output range.
+    ///
+    /// Retained for producers that have no source-line information to give (and
+    /// for the unit tests below). A selection containing even one such span
+    /// degrades to transformed-space marker counts -- wrong but bounded, and
+    /// identical to the pre-fix behaviour -- rather than breaking the build or
+    /// mixing two coordinate spaces inside one set of markers.
     pub fn new(transformed_range: Range<usize>, node_kind: &'static str) -> Self {
         Self {
             transformed_range,
             node_kind,
+            source_range: None,
+        }
+    }
+
+    /// Create a NodeSpan that also knows which SOURCE lines it puts on screen.
+    ///
+    /// `source_range` is 0-indexed with an exclusive end; see the field's
+    /// CONTRACT note for what its length must mean.
+    pub fn with_source(
+        transformed_range: Range<usize>,
+        node_kind: &'static str,
+        source_range: Range<usize>,
+    ) -> Self {
+        Self {
+            transformed_range,
+            node_kind,
+            source_range: Some(source_range),
         }
     }
 
@@ -89,7 +150,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     }
 
     // Truncation is needed: evaluate the lazy count exactly once, now.
-    let source_line_count = Some(source_line_count_fn());
+    let source_line_count = source_line_count_fn();
 
     // If no spans provided, fall back to simple line truncation.
     // (The spans-empty path was previously the first check to avoid a redundant
@@ -97,7 +158,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     // happened. The double traversal inside simple_line_truncate is acceptable
     // for this fallback path, which is reached only by unusual inputs.)
     if spans.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Filter out empty spans and spans beyond the actual line count
@@ -107,7 +168,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
         .collect();
 
     if valid_spans.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Fast-path: single span starting at line 0 — no inter-span gaps, no priority
@@ -116,7 +177,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     // all of which emit NodeSpan::new(0..line_count, "source_file").
     // E3: pass source_line_count so the marker states omitted SOURCE lines.
     if valid_spans.len() == 1 && valid_spans[0].transformed_range.start == 0 {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Score and sort spans: priority desc, position asc (tie-break)
@@ -159,7 +220,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
 
     // Step 3: Count actual markers from position-sorted set
     let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
-    let mut markers = count_markers(&selected_spans, lines.len());
+    let mut markers = count_markers(&selected_spans, lines.len(), source_line_count);
 
     // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines.
     //
@@ -208,14 +269,14 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
 
         // Recalculate markers with updated selection
         let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
-        markers = count_markers(&selected_spans, lines.len());
+        markers = count_markers(&selected_spans, lines.len(), source_line_count);
     }
 
     // Extract just the spans (already position-sorted from Step 2)
     let selected: Vec<&NodeSpan> = selected.into_iter().map(|(_, s)| s).collect();
 
     if selected.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Build output with omission markers between gaps.
@@ -224,18 +285,67 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     let make_marker =
         |omitted: usize| elision_marker_line(Some(language), omitted, ElidedSide::Truncated, hint);
 
+    // ADR-011 (2026-09-24 amendment): the counts below are stated in SOURCE-line
+    // space -- how many lines of the user's own file the view does not show. The
+    // AST-span modes (structure, signatures, types) previously counted lines of
+    // the TRANSFORMED output instead, which is a fact about a text the reader
+    // never asked for and cannot see; on a 2,589-line file that understated the
+    // hidden lines by up to ~20x. full/minimal/pseudo were already correct only
+    // because their single 0..n span short-circuits onto `simple_line_truncate`,
+    // which has carried the source count since E3.
+    //
+    // PF-033 rule 1 -- ONE coordinate space per render: source space is used only
+    // when EVERY selected span carries a source range. One unmigrated producer
+    // degrades the whole selection back to transformed space rather than mixing
+    // two spaces inside one set of markers, which is the coordinate collision
+    // that PF-033 records as a defect in its own right.
+    //
+    // PF-033 rule 5: the all-or-nothing gate is materialised ONCE, here, as the
+    // source ranges themselves -- `collect::<Option<Vec<_>>>()` yields `None` the
+    // moment any span lacks one -- and every site below indexes the chosen space
+    // directly. The previous shape re-asked each site for its own
+    // `source_range.as_ref().map_or(<transformed value>, ..)`; because the gate
+    // had already proved the `Some` arm, those three fallbacks were unreachable
+    // code duplicating the `else` branch, i.e. a gate bypassed at every site it
+    // governs.
+    let source_ranges: Option<Vec<&Range<usize>>> =
+        selected.iter().map(|s| s.source_range.as_ref()).collect();
+    let source_total = source_line_count;
+
     // Cow: content lines borrow from `lines`, markers are owned Strings.
     let mut result_lines: Vec<Cow<'_, str>> = Vec::with_capacity(max_lines + 1);
     let mut last_end: usize = 0;
+    // Source-space shadow of `last_end`: the first source line not yet accounted
+    // for. Read ONLY by the marker counts; it never reaches selection, layout or
+    // the ADR-016 bound. Every subtraction against it saturates, so a mis-stated
+    // source range yields a wrong-but-bounded count, never a `usize` underflow
+    // printed to an agent as if it were fact.
+    let mut last_source_end: usize = 0;
     let mut content_count: usize = 0;
 
-    // Leading marker: content before the first selected span
-    if selected[0].transformed_range.start > 0 {
-        let omitted = selected[0].transformed_range.start;
-        result_lines.push(Cow::Owned(make_marker(omitted)));
+    // Leading marker: the source lines above the first selected span.
+    //
+    // PF-033 rule 4 -- presence and count are two halves of ONE claim, so both
+    // are decided in whichever space the count is stated in. Asking the
+    // TRANSFORMED cursor whether anything is missing while stating the number in
+    // SOURCE space is what produced `// ... (0 lines truncated)`: an ADR-011
+    // class-1 disclosure that discloses nothing, paid for with an ADR-016 budget
+    // line.
+    //
+    // `omitted > 0` is therefore the whole presence test. In source space a span
+    // whose first shown line IS the file's first line has nothing above it; a
+    // span that starts at output line 0 but at source line 5 has five lines above
+    // it that nothing else will ever mention, because signatures and types join
+    // their spans from output line 0 and no gap marker precedes the first one.
+    let leading_omitted = match source_ranges.as_ref() {
+        Some(ranges) => ranges[0].start.saturating_sub(last_source_end),
+        None => selected[0].transformed_range.start,
+    };
+    if leading_omitted > 0 {
+        result_lines.push(Cow::Owned(make_marker(leading_omitted)));
     }
 
-    for span in &selected {
+    for (idx, span) in selected.iter().enumerate() {
         let start = span.transformed_range.start;
         let end = span.transformed_range.end.min(lines.len());
 
@@ -255,14 +365,37 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
         if start > last_end && last_end > 0 {
             if remaining_after_gap <= 1 {
                 // Fold: a single marker covers the gap AND the full span content.
-                let omitted = end.saturating_sub(last_end); // gap lines + span lines
-                result_lines.push(Cow::Owned(make_marker(omitted)));
+                let omitted = match source_ranges.as_ref() {
+                    // gap source lines + this span's own source lines
+                    Some(ranges) => ranges[idx].end.saturating_sub(last_source_end),
+                    None => end.saturating_sub(last_end), // gap lines + span lines
+                };
+                // `omitted == 0` means this span's source range ends where the
+                // cursor already stands: the folded region covers no line of the
+                // user's file, so skipping both the marker and the span loses
+                // nothing in source space. Only a synthetic output line can
+                // reach this shape.
+                if omitted > 0 {
+                    result_lines.push(Cow::Owned(make_marker(omitted)));
+                }
                 // Advance past the entire span so trailing marker is not double-counted.
                 last_end = end;
+                if let Some(r) = span.source_range.as_ref() {
+                    last_source_end = r.end;
+                }
                 continue; // skip content-addition loop for this span
             }
-            let omitted = start - last_end;
-            result_lines.push(Cow::Owned(make_marker(omitted)));
+            let omitted = match source_ranges.as_ref() {
+                Some(ranges) => ranges[idx].start.saturating_sub(last_source_end),
+                None => start.saturating_sub(last_end),
+            };
+            // A transformed gap that hides no SOURCE line is types mode's
+            // synthetic `\n\n` separator: one output line that belongs to no line
+            // of the user's file. Emitting `(0 lines truncated)` for it spends a
+            // budget line on a claim of nothing -- see the leading-marker note.
+            if omitted > 0 {
+                result_lines.push(Cow::Owned(make_marker(omitted)));
+            }
         }
 
         // Add lines from this span. Reserve 1 slot for the trailing marker so that
@@ -282,6 +415,22 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
         // Track where we actually stopped emitting (span_end, not the full span end).
         // This ensures the trailing marker fires when the span was clamped.
         last_end = span_end;
+
+        // Advance the source cursor in step with `last_end`. A span emitted in
+        // full accounts for its whole source range; a span the budget clamped
+        // accounts only for the prefix it actually put on screen, and never past
+        // its own source end. Erring short here makes the trailing marker report
+        // MORE hidden lines, which is the safe direction for a class-1
+        // disclosure: under-reporting is the defect being fixed.
+        if let Some(r) = span.source_range.as_ref() {
+            last_source_end = if span_end >= end {
+                r.end
+            } else {
+                r.start
+                    .saturating_add(span_end.saturating_sub(start))
+                    .min(r.end)
+            };
+        }
     }
 
     // Safety: if no content lines fit (e.g. max_lines=1 with a leading marker consuming
@@ -289,13 +438,35 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     // 1 content line.  Without this guard the output would be pure elision markers with
     // zero visible code — confusing and unhelpful for agents.
     if content_count == 0 && !lines.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
+
+    // The `omitted > 0` guards make the source cursor load-bearing for
+    // DISCLOSURE, not just for arithmetic: an over-stated cursor now suppresses a
+    // marker instead of printing a wrong number. Assert the cursor's bound in
+    // debug (rust.md: `debug_assert!` for invariants in hot paths -- truncation is
+    // one, and it runs per file). A release `assert!` is deliberately NOT used:
+    // this is a reader, and panicking on a producer's bad span would replace a
+    // missing marker with no output at all, which #317 rates strictly worse. The
+    // accounting-identity suite in tests/truncation_markers.rs is the other half
+    // of this check and runs in release too.
+    debug_assert!(
+        source_ranges.is_none() || last_source_end <= source_total,
+        "invariant: the source cursor ({last_source_end}) must stay within the file \
+         ({source_total} lines); a span whose source_range runs past EOF would \
+         silently suppress the trailing marker"
+    );
 
     // Trailing marker: content after the last emitted line
     if last_end < lines.len() {
-        let omitted = lines.len() - last_end;
-        result_lines.push(Cow::Owned(make_marker(omitted)));
+        let omitted = if source_ranges.is_some() {
+            source_total.saturating_sub(last_source_end)
+        } else {
+            lines.len().saturating_sub(last_end)
+        };
+        if omitted > 0 {
+            result_lines.push(Cow::Owned(make_marker(omitted)));
+        }
     }
 
     // Safety cap: total output (content + all markers) must not exceed max_lines
@@ -549,6 +720,55 @@ pub fn simple_last_line_truncate_with_start(
     hint: Option<&str>,
     source_line_count: Option<usize>,
 ) -> Result<(String, usize)> {
+    // Legacy budget arithmetic, preserved byte-for-byte for the callers that have
+    // no output-line -> source-line map to offer (the raw passthrough paths, where
+    // `text` IS the source so the two spaces coincide, and `None` callers).
+    //
+    // For a transform that COLLAPSES lines this shape is the PF-033 rule 4
+    // coordinate collision -- `source_line_count` is source-space while
+    // `content_lines` is output-space -- which is why the AST modes now go through
+    // [`simple_last_line_truncate_with_omitted`] instead.
+    simple_last_line_truncate_with_omitted(text, language, n, hint, |start, total| {
+        let content_lines = total.saturating_sub(start);
+        source_line_count
+            .unwrap_or(total)
+            .saturating_sub(content_lines)
+    })
+}
+
+/// [`simple_last_line_truncate_with_start`], with the elided-line count supplied
+/// by the caller as a function of the retained window's start.
+///
+/// # Why the count arrives as a closure
+///
+/// The tail marker makes a POSITIONAL claim -- "N lines above" -- so the honest
+/// value is the number of source lines above the first line the window shows.
+/// Two facts are needed and they live in different places: where the window
+/// begins is owned HERE (#511 may move it forward), while what that output line
+/// means in source space is owned by the caller's line map. The closure is where
+/// they meet, exactly once: this function settles `start`, then asks the caller
+/// what `start` is worth.
+///
+/// Deriving the count from the budget instead -- `source_total` minus the number
+/// of retained OUTPUT lines -- subtracts one coordinate space from another. The
+/// two are not commensurable, and the error is exactly the number of source lines
+/// the transform collapsed inside the window (PF-033 rule 4).
+///
+/// `omitted_above` receives `(start, total)` -- the 0-based index of the first
+/// retained line and the number of lines in `text` -- and returns the count the
+/// marker states. It is called at most once, and only when truncation actually
+/// happens; `total` is handed over rather than recounted so the delegating
+/// wrapper costs no second pass over the text.
+pub(crate) fn simple_last_line_truncate_with_omitted<F>(
+    text: &str,
+    language: Language,
+    n: usize,
+    hint: Option<&str>,
+    omitted_above: F,
+) -> Result<(String, usize)>
+where
+    F: FnOnce(usize, usize) -> usize,
+{
     let total = text.lines().count();
 
     if total <= n {
@@ -591,13 +811,11 @@ pub fn simple_last_line_truncate_with_start(
         }
     }
 
-    // Recomputed from the (possibly moved) start, in the counting spaces the
-    // pre-#511 code used: content in output space, `omitted` against the
-    // source-space total when the caller supplied one (E3/E5).
+    // The window is settled (possibly moved by #511), so the count is asked for
+    // now and not before: `start` is the single authority both the marker and the
+    // caller's line map key off.
     let content_lines = total.saturating_sub(start);
-    let source_total = source_line_count.unwrap_or(total);
-    let omitted = source_total.saturating_sub(content_lines);
-    let marker = elision_marker_line(Some(language), omitted, side, hint);
+    let marker = elision_marker_line(Some(language), omitted_above(start, total), side, hint);
 
     // Skip to the tail without collecting all lines into a Vec
     let mut result: Vec<&str> = Vec::with_capacity(content_lines + 1);
@@ -615,22 +833,45 @@ pub fn simple_last_line_truncate_with_start(
 /// Count the number of omission markers needed for a position-sorted selection
 ///
 /// Counts:
-/// - Leading marker: if the first span doesn't start at line 0
-/// - Gap markers: for each gap between adjacent spans
+/// - Leading marker: if any line is hidden above the first span
+/// - Gap markers: for each gap between adjacent spans that hides a line
 /// - Trailing marker: if the last span doesn't reach the end of the output
+///
+/// # Agreement with the builder (PF-033 rule 4)
+///
+/// This prediction feeds the trim loop that enforces ADR-016, so it must apply
+/// the SAME coordinate space and the SAME `omitted > 0` gate that
+/// [`truncate_to_lines`] applies where it actually pushes a marker. Counting a
+/// marker the builder will suppress makes the trim loop over-reserve and spend a
+/// content slot on nothing; missing one the builder will push breaches the
+/// `max_lines` bound until `result_lines.truncate` clips it, and what gets
+/// clipped is the trailing marker -- silent loss, the defect #317 exists to
+/// prevent. When no span carries a source range the two spaces coincide
+/// (`omitted` IS the transformed gap), so every branch below reduces exactly to
+/// its pre-migration form.
 ///
 /// # Arguments
 /// * `selected` - Position-sorted slice of selected spans
 /// * `total_lines` - Total number of lines in the original output
-fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
+/// * `source_total` - Total number of lines in the ORIGINAL SOURCE, read only
+///   when every selected span carries a source range
+fn count_markers(selected: &[&NodeSpan], total_lines: usize, source_total: usize) -> usize {
     if selected.is_empty() {
         return 0;
     }
 
+    // Same all-or-nothing gate, same materialisation, as the builder's.
+    let source_ranges: Option<Vec<&Range<usize>>> =
+        selected.iter().map(|s| s.source_range.as_ref()).collect();
+
     let mut count = 0;
 
     // Leading marker
-    if selected[0].transformed_range.start > 0 {
+    let leading = match source_ranges.as_ref() {
+        Some(ranges) => ranges[0].start,
+        None => selected[0].transformed_range.start,
+    };
+    if leading > 0 {
         count += 1;
     }
 
@@ -638,7 +879,11 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
     for i in 1..selected.len() {
         let prev_end = selected[i - 1].transformed_range.end.min(total_lines);
         let curr_start = selected[i].transformed_range.start;
-        if curr_start > prev_end {
+        let omitted = match source_ranges.as_ref() {
+            Some(ranges) => ranges[i].start.saturating_sub(ranges[i - 1].end),
+            None => curr_start.saturating_sub(prev_end),
+        };
+        if curr_start > prev_end && omitted > 0 {
             count += 1;
         }
     }
@@ -649,7 +894,13 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
         .end
         .min(total_lines);
     if last_end < total_lines {
-        count += 1;
+        let omitted = match source_ranges.as_ref() {
+            Some(ranges) => source_total.saturating_sub(ranges[ranges.len() - 1].end),
+            None => total_lines.saturating_sub(last_end),
+        };
+        if omitted > 0 {
+            count += 1;
+        }
     }
 
     count
@@ -1403,11 +1654,17 @@ mod tests {
     // ========================================================================
     // count_markers tests
     // ========================================================================
+    //
+    // `NodeSpan::new` leaves `source_range` at `None`, so these four pin the
+    // transformed-space branch -- the shape count_markers must keep for
+    // producers that have not migrated. The `source_total` argument is unread on
+    // that branch; it is passed as the output line count so the two spaces
+    // coincide and the call reads as a no-op.
 
     #[test]
     fn test_count_markers_empty() {
         let selected: Vec<&NodeSpan> = vec![];
-        assert_eq!(count_markers(&selected, 10), 0);
+        assert_eq!(count_markers(&selected, 10, 10), 0);
     }
 
     #[test]
@@ -1416,7 +1673,7 @@ mod tests {
         let s1 = NodeSpan::new(0..3, "type_alias_declaration");
         let s2 = NodeSpan::new(3..6, "function_declaration");
         let selected: Vec<&NodeSpan> = vec![&s1, &s2];
-        assert_eq!(count_markers(&selected, 6), 0);
+        assert_eq!(count_markers(&selected, 6, 6), 0);
     }
 
     #[test]
@@ -1426,7 +1683,7 @@ mod tests {
         let s2 = NodeSpan::new(3..4, "type_alias_declaration");
         let selected: Vec<&NodeSpan> = vec![&s1, &s2];
         // No leading (starts at 0), 1 gap (1..3), 1 trailing (4..10) = 2
-        assert_eq!(count_markers(&selected, 10), 2);
+        assert_eq!(count_markers(&selected, 10, 10), 2);
     }
 
     #[test]
@@ -1435,7 +1692,38 @@ mod tests {
         let s1 = NodeSpan::new(2..4, "function_declaration");
         let selected: Vec<&NodeSpan> = vec![&s1];
         // 1 leading + 1 trailing = 2
-        assert_eq!(count_markers(&selected, 10), 2);
+        assert_eq!(count_markers(&selected, 10, 10), 2);
+    }
+
+    /// A transformed gap that hides no SOURCE line must not be predicted.
+    ///
+    /// Types mode's shape: two source-ADJACENT definitions separated in the
+    /// output by one synthetic `\n\n` separator. The transformed gap is 1, the
+    /// source gap is 0, and the builder emits nothing -- so predicting a marker
+    /// here would make the trim loop over-reserve and drop a definition to pay
+    /// for a marker that never appears.
+    #[test]
+    fn test_count_markers_skips_zero_source_gap() {
+        let s1 = NodeSpan::with_source(0..3, "interface_declaration", 0..3);
+        let s2 = NodeSpan::with_source(4..7, "interface_declaration", 3..6);
+        let selected: Vec<&NodeSpan> = vec![&s1, &s2];
+        // 6 source lines total: no leading (source 0), no gap (source 3 == 3),
+        // no trailing (source cursor 6 == 6, and output 7 == 7).
+        assert_eq!(count_markers(&selected, 7, 6), 0);
+    }
+
+    /// A span that starts at output line 0 but NOT at source line 0 still hides
+    /// lines above itself, and nothing else will ever mention them.
+    ///
+    /// Signatures mode's shape: spans are joined from output line 0, so no gap
+    /// marker precedes the first one. Presence therefore has to be decided by
+    /// the source count, exactly as the count itself is.
+    #[test]
+    fn test_count_markers_leading_from_source_offset() {
+        let s1 = NodeSpan::with_source(0..1, "function_declaration", 5..6);
+        let selected: Vec<&NodeSpan> = vec![&s1];
+        // 1 leading (5 source lines above) + 1 trailing (20 - 6 = 14) = 2
+        assert_eq!(count_markers(&selected, 4, 20), 2);
     }
 
     // ========================================================================

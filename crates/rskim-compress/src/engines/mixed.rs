@@ -18,7 +18,7 @@
 //!    - `json` hint (case-insensitive) → JSON minifier, then `value_equivalent_raw`
 //!      gate; only `Some(true)` splices the minified body. Everything else: byte-identical.
 //!    - all other hints / no hint → passthrough (byte-identical body).
-//!    - Code language hints → passthrough (P0.1 / ADR-007: code never compressed on egress).
+//!    - Code language hints → passthrough (P0.1 / L3-ADR-007: code never compressed on egress).
 //! 4. Unclosed fences (no closing ```) are left byte-identical (fail-safe).
 //! 5. CRLF line endings in prose and delimiters are preserved byte-identical.
 //!    CRLF inside fence bodies is also preserved (no code engine, no LF normalization).
@@ -114,7 +114,7 @@ fn reconstruct_with_compressed_fences(text: &str) -> String {
 
         // Determine the engine for this fence's language hint via the single
         // routing table (AD-006 / Gate-1). engine_for_fence routes json → Json,
-        // everything else → Passthrough (code stays byte-identical per ADR-007).
+        // everything else → Passthrough (code stays byte-identical per L3-ADR-007).
         let engine = engine_for_fence(info_lang.as_deref());
         let closing_line = &after_opener[closing_fence_offset..];
         let (closer_line, after_closer) = split_first_line(closing_line);
@@ -258,7 +258,7 @@ fn strip_trailing_newline(s: &str) -> (&str, &str) {
 /// 3. The stripped newline is re-appended after minification so the closing fence
 ///    remains on its own line.
 ///
-/// # P0.1 / ADR-007
+/// # P0.1 / L3-ADR-007
 ///
 /// All non-json fences pass through byte-identical. `engine_for_fence` returns
 /// `Passthrough` for every hint except `"json"`.
@@ -290,7 +290,7 @@ fn apply_fence_engine(body: &str, engine: EngineTarget) -> String {
         }
         EngineTarget::Log | EngineTarget::Mixed | EngineTarget::Passthrough => {
             // Data-format hints, code fences (P0.1), unknown hints, nested mixed →
-            // byte-identical (AD-006 / ADR-007).
+            // byte-identical (AD-006 / L3-ADR-007).
             body.to_string()
         }
     }
@@ -528,7 +528,7 @@ mod tests {
         );
     }
 
-    /// Discriminating: rust-hinted fence bodies stay byte-identical (ADR-007).
+    /// Discriminating: rust-hinted fence bodies stay byte-identical (L3-ADR-007).
     ///
     /// Fails if any restoration of code-engine routing is attempted for rust fences.
     #[test]
@@ -542,7 +542,7 @@ mod tests {
         // The rust fence body must be byte-identical (no code compression, P0.1).
         assert!(
             output.contains(body),
-            "rust fence body must be byte-identical (ADR-007/P0.1); got: {output:?}"
+            "rust fence body must be byte-identical (L3-ADR-007/P0.1); got: {output:?}"
         );
     }
 

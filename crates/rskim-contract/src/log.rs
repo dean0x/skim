@@ -206,7 +206,7 @@ pub enum Decision {
 /// Refining outcome reason for a block-level compression decision.
 ///
 /// Added in **#342** as a schema coordination step between #301 (this crate,
-/// schema owner) and #305 (persistence) per ADR-004. This field extends the
+/// schema owner) and #305 (persistence) per L3-ADR-004. This field extends the
 /// two-variant [`Decision`] wire vocabulary with a six-value refining reason
 /// so that #304's `BlockRouter` can record the full 6→3 outcome mapping without
 /// carrying a local wrapper that risks drifting from the #305 schema.
@@ -383,8 +383,8 @@ pub struct DecisionRecord {
     /// serialization; `#[serde(default)]` governs deserialization.
     /// Together they satisfy the 'parse at boundaries, trust internally'
     /// principle: a schema-additive field must not hard-fail on valid
-    /// pre-field records at the persistence boundary (#305, per ADR-001 /
-    /// ADR-004).
+    /// pre-field records at the persistence boundary (#305, per L3-ADR-001 /
+    /// L3-ADR-004).
     #[serde(default)]
     pub reason: OutcomeReason,
     /// Input byte count.
@@ -402,7 +402,7 @@ pub struct DecisionRecord {
     /// documented in the #304 plan (304-plan.md:108,118), keeping this field
     /// consistent with the producing API and the sibling `bytes_in`/`bytes_out`
     /// fields (also `usize`). Using `u64` here would require a lossy-looking
-    /// `as u64` cast at every call site (ADR-001: fix type drift before it
+    /// `as u64` cast at every call site (L3-ADR-001: fix type drift before it
     /// propagates to #304/#305 consumers).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in: Option<usize>,

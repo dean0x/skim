@@ -36,9 +36,9 @@ fn f6_at_least_25_patterns() {
 /// and CLAUDE.md must stay in sync with the actual array length. Adding or removing
 /// a pattern without updating documentation is a silent contract break.
 ///
-/// applies ADR-001: fix noticed issues immediately — the count was hand-maintained
+/// applies SEARCH-ADR-001: fix noticed issues immediately — the count was hand-maintained
 /// with no test guard, enabling silent drift.
-/// applies PF-005/ADR-003: acceptance criteria must be grounded and actually verified.
+/// applies PF-005/SEARCH-ADR-003: acceptance criteria must be grounded and actually verified.
 #[test]
 fn f6_exact_catalog_count() {
     const EXPECTED: usize = 29;
@@ -54,7 +54,7 @@ fn f6_exact_catalog_count() {
 /// KNOWLEDGE.md documents 6/5/6/7/5 for ErrorHandling/Performance/Concurrency/Quality/Structure.
 /// This test locks those counts so a category subtotal cannot silently drift.
 ///
-/// applies ADR-001: noticed drift risk; fix immediately.
+/// applies SEARCH-ADR-001: noticed drift risk; fix immediately.
 #[test]
 fn f6_per_category_counts() {
     let counts = |cat: PatternCategory| -> usize {
@@ -252,7 +252,7 @@ fn f7_gold_all_patterns() {
         // and the pattern passes GOLD without verifying anything — a silent
         // disarming of the honesty gate.
         //
-        // applies ADR-003: test assertions must genuinely verify.
+        // applies SEARCH-ADR-003: test assertions must genuinely verify.
         assert!(
             !resolved_bs.is_empty() || !resolved_ts.is_empty(),
             "GOLD GATE DISARMED for pattern '{}': zero declared n-grams resolved — \

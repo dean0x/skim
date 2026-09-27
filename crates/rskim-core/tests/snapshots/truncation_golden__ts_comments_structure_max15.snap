@@ -4,7 +4,7 @@ expression: "snap(TS_COMMENTS, Language::TypeScript,\nTransformConfig::with_mode
 ---
 // ... (12 lines truncated)
 export function add(x: number, y: number): number  {...}
-// ... (7 lines truncated)
+// ... (11 lines truncated)
 export class Calculator {
     private value: number;
 
@@ -16,4 +16,4 @@ export class Calculator {
      */
     add(x: number): number  {...}
 }
-// ... (14 lines truncated)
+// ... (19 lines truncated)

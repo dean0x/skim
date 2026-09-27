@@ -110,7 +110,7 @@ impl CochangeMatrixReader {
         // EVERY open() — the same fixed per-open latency floor that #376 moved off
         // the hot path for the lexical and AST readers via the `crate::validity`
         // marker mechanism.  The co-change reader was deferred to #384 (filed
-        // up-front, ADR-004) and is intentionally OUT of scope here; apply the
+        // up-front, SEARCH-ADR-004) and is intentionally OUT of scope here; apply the
         // same marker fix there.
         let payload = &mmap[HEADER_SIZE..pairs_end];
         let actual_checksum = compute_checksum(payload);

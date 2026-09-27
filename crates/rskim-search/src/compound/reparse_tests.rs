@@ -945,7 +945,7 @@ fn pattern_occurs_true_and_false_cover_both_branches() {
 // the strict ancestor walk structurally unsatisfiable. Fixed via
 // extraction-reuse (AD-394-1/AD-394-2). Ground-truth lines below were
 // established via empirical dogfood verification against the release binary
-// (ADR-003), not eyeballed.
+// (SEARCH-ADR-003), not eyeballed.
 // ============================================================================
 
 /// AC1 (#394) unit-level, all 5: `pattern_occurs_in_file` returns `true` for

@@ -306,7 +306,7 @@ pub fn extract_ast_ngrams_with_metrics(
 /// to recover a representative `:line` for a matched synthetic-marker AST
 /// pattern (god-function, deep-nesting, empty-function, empty-catch,
 /// excessive-params), reusing the exact traversal that emitted the marker
-/// instead of re-implementing detection on a second CST walk (ADR-006 — the
+/// instead of re-implementing detection on a second CST walk (SEARCH-ADR-006 — the
 /// indexer is the single source of truth).
 ///
 /// [`extract_ast_ngrams_with_metrics`]'s 2-tuple signature is preserved
@@ -342,7 +342,7 @@ pub fn extract_ast_ngrams_with_lines(
 }
 
 /// Shared single-pass traversal used by both [`extract_ast_ngrams_with_metrics`]
-/// and [`extract_ast_ngrams_with_lines`] (ADR-006: one implementation, no
+/// and [`extract_ast_ngrams_with_lines`] (SEARCH-ADR-006: one implementation, no
 /// drift between the membership-only and lines-preserving entry points).
 /// Returns `None` for empty input; callers substitute the empty defaults.
 fn run_extraction(nodes: &[LinearNode], lang: Language) -> Option<ExtractState> {
@@ -444,7 +444,7 @@ struct ExtractState {
     /// AD-394-5 / AD-394-6: representative `(1-indexed line, start byte)` per
     /// emitted synthetic bigram, recorded at the SAME emission site that adds
     /// the marker to `bigram_map` — so `recover_line`'s synthetic branch never
-    /// needs a second, drift-prone detection pass (ADR-006). Keyed by the
+    /// needs a second, drift-prone detection pass (SEARCH-ADR-006). Keyed by the
     /// encoded `AstBigram`: synthetic markers are always bigrams (no synthetic
     /// trigram is ever emitted by this module). MIN line wins on repeat
     /// emission within a file (AC-F3 determinism: topmost occurrence).
@@ -915,7 +915,7 @@ fn emit_empty_or_large_body(
 /// bucket_label(0)) that fires at the first node whose CST depth is >= 4,
 /// typically within the first few hundred of the total node list.
 ///
-/// # ADR-006 compliance (single source of truth)
+/// # SEARCH-ADR-006 compliance (single source of truth)
 ///
 /// This function uses the SAME [`ExtractState`] state machine and the SAME
 /// helper methods (`emit_depth_buckets`, `close_open_subtrees`, `fill_depth_gap`,

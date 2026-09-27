@@ -12,8 +12,8 @@ Core library for smart code reading and transformation.
 
 ## Features
 
-- **12 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
-- **5 Transformation Modes**: Structure, Signatures, Types, Minimal, Full
+- **18 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Bash, Markdown, JSON, YAML, TOML
+- **6 Transformation Modes**: Structure, Signatures, Types, Full, Minimal, Pseudo
 - **Fast**: 14.6ms for 3000-line files (verified benchmarks)
 - **Safe**: Built-in DoS protections and memory limits
 - **Zero-copy**: Efficient string slicing where possible
@@ -48,7 +48,13 @@ function add(a: number, b: number): number {
 
 ## Transformation Modes
 
-### Structure Mode (70-80% reduction)
+Reduction figures below are targets, not gates. Structure mode's only measured
+value is 60.3%, on the production TypeScript codebase in the repository
+README's reduction tables, and the range is stated wide enough to contain it.
+No CI gate defends any of these ranges — the only reduction ratio the test
+suite asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
+
+### Structure Mode (60-80% reduction)
 Removes function bodies while preserving signatures and structure.
 
 ```rust
@@ -76,6 +82,25 @@ Returns the original code unchanged.
 let result = transform(code, Language::Java, Mode::Full)?;
 ```
 
+### Minimal Mode (reduction unverified)
+Strips non-doc comments at module and class level while keeping all code intact.
+Doc comments, comments inside function bodies, module header comments, and
+shebangs are preserved.
+
+```rust
+let result = transform(code, Language::Python, Mode::Minimal)?;
+```
+
+### Pseudo Mode (reduction unverified)
+Strips syntactic noise — type annotations, decorators, semicolons — while
+preserving logic flow, names, values, visibility modifiers, and function return
+types. What is stripped varies by language: TypeScript and Rust keep parameter
+types, and Rust removes only statement semicolons and non-doc comments.
+
+```rust
+let result = transform(code, Language::TypeScript, Mode::Pseudo)?;
+```
+
 ## Auto-Detection
 
 Use `transform_auto` for automatic language detection from file paths:
@@ -95,14 +120,20 @@ let result = transform_auto(
 
 | Language | Extensions | Node Types |
 |----------|-----------|------------|
-| TypeScript | `.ts`, `.tsx` | Full support |
-| JavaScript | `.js`, `.jsx`, `.mjs` | Full support |
-| Python | `.py` | Full support |
+| TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | Full support |
+| JavaScript | `.js`, `.jsx`, `.cjs`, `.mjs` | Full support |
+| Python | `.py`, `.pyi` | Full support |
 | Rust | `.rs` | Full support |
 | Go | `.go` | Full support |
 | Java | `.java` | Full support |
 | C | `.c`, `.h` | Full support |
 | C++ | `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` | Full support |
+| C# | `.cs` | Full support |
+| Ruby | `.rb` | Full support |
+| SQL | `.sql` | Full support |
+| Kotlin | `.kt`, `.kts` | Full support |
+| Swift | `.swift` | Full support |
+| Bash | `.sh`, `.bash` | Full support |
 | Markdown | `.md`, `.markdown` | Full support |
 | JSON | `.json` | Full support |
 | YAML | `.yaml`, `.yml` | Full support |

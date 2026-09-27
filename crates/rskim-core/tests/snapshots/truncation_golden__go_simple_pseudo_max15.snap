@@ -2,6 +2,9 @@
 source: crates/rskim-core/tests/truncation_golden.rs
 expression: "snap(GO_SIMPLE, Language::Go,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(15))"
 ---
+// FIXTURE: Simple Go functions
+// TESTS: Basic function signature extraction
+
 package main
 
 import "fmt"
@@ -13,7 +16,4 @@ func Add(a int, b int) int {
 func Greet(name string) string {
     return fmt.Sprintf("Hello, %s!", name)
 }
-
-type Calculator struct {
-    value int
 // ... (20 lines truncated)

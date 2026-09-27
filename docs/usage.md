@@ -26,10 +26,20 @@ skim [FILE|DIRECTORY] [OPTIONS]
 Transformation mode [default: structure]
 
 **Values:**
-- `structure` - Keep structure only (70-80% reduction)
+- `structure` - Keep structure only (60-80% reduction)
 - `signatures` - Function signatures only (85-92% reduction)
 - `types` - Type definitions only (90-95% reduction)
 - `full` - No transformation (0% reduction)
+- `minimal` - Strip non-doc comments, keep all code (reduction unverified)
+- `pseudo` - Strip syntactic noise, keep logic flow (reduction unverified)
+
+Structure mode's only measured figure is 60.3%, on the production TypeScript
+codebase in the repository README's reduction tables; the range is stated wide
+enough to contain it. `minimal` and `pseudo` state no figure because none has
+been measured — ADR-008 traces the `15-30%` and `30-50%` targets that once
+circulated for them to an unsourced copy in 04b5f9f that was never re-derived.
+No CI gate defends any of these numbers — the only reduction ratio the test
+suite asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
 **Example:**
 ```bash

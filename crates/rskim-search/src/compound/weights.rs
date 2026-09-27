@@ -22,7 +22,7 @@
 //!
 //! `CompositeWeights::with_six_signal_defaults()` returns the #200 starting
 //! profile.  Extended-signal weights default to `0.0` because no
-//! corpus-grounded lift measurement has been performed yet (applies ADR-003).
+//! corpus-grounded lift measurement has been performed yet (applies SEARCH-ADR-003).
 //! They will be promoted to a non-zero value once a relative-lift benchmark
 //! (composite macro-F1 >= jaccard-only baseline F1) confirms positive marginal
 //! lift on the same corpus in the same run.
@@ -61,7 +61,7 @@ pub const WEIGHT6_TEMPORAL: f64 = 0.2;
 /// Default weight for the import-graph signal (gated at 0.0 until measured).
 ///
 /// Set to a non-zero value once a relative-lift benchmark confirms positive
-/// marginal lift (applies ADR-003).
+/// marginal lift (applies SEARCH-ADR-003).
 pub const WEIGHT6_IMPORT_GRAPH: f64 = 0.0;
 
 /// Default weight for the directory-proximity signal (gated at 0.0 until measured).

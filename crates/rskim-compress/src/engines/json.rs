@@ -3,7 +3,7 @@
 //! # Design (replacing the lossy structural compressor from Phase 2 / D5)
 //!
 //! The old engine replaced values with type-placeholder strings (`"<string>"`,
-//! `"<number>"`, `"<bool>"`). This violated ADR-007 (lossless-only egress): it
+//! `"<number>"`, `"<bool>"`). This violated L3-ADR-007 (lossless-only egress): it
 //! changed the semantics of the block, breaking tool-result cache keys and LLM
 //! context integrity. The new engine is a LOSSLESS whitespace stripper.
 //!
@@ -46,7 +46,7 @@
 //! immediately. This prevents the output from silently misrepresenting inputs
 //! where JSON consumers disagree on which value wins for duplicate keys.
 //!
-//! ## Bounds (ADR-003 / PF-005)
+//! ## Bounds (L3-ADR-003 / PF-005)
 //!
 //! - `MAX_JSON_DEPTH = 500`: matches the old lossy engine; prevents stack-frame
 //!   over-allocation on adversarial inputs.

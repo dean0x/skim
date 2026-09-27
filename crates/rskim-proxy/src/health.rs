@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
-// Evidence-cited constants (ADR-003 / PF-005)
+// Evidence-cited constants (L3-ADR-003 / PF-005)
 // ============================================================================
 
 /// Number of consecutive forward failures that flip /readyz non-200.

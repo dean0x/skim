@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Multi-file batch runs no longer attribute a shared disclosure marker's cost to one
+  arbitrary file** (#561) — a multi-file run (`skim <glob>` / `skim dir/`) emits exactly
+  one aggregate disclosure marker on stderr for the whole run when any file's rendered
+  view differs from its raw bytes; that on-screen marker is unchanged. What changed is
+  how its cost is recorded in `analytics.db`: previously the marker's token/byte cost
+  was attributed to the *first* file in the run whose view differed, while every other
+  differing file recorded a measured zero for that cost — indistinguishable from a file
+  that genuinely incurred none. Batch rows now record that cost as **unmeasured**
+  (`NULL`, not a measured `0`) instead, so `skim stats`'s delivered/measured-savings
+  series no longer includes a fabricated per-file number for a cost that was never
+  actually attributable to one file. Single-file runs (`skim <file>`) are unaffected and
+  still record the marker's real per-file cost.
+
+- **Credential scrubbing of the analytics `original_cmd` label now covers `build`,
+  `test`, `pkg`, and `file` commands, not just `db` and `infra`** (security-07) —
+  `format_analytics_label`'s scrub gate was `"db" => scrub_db_args`, `"infra" =>
+  scrub_infra_args`, everything else stored verbatim; a `mvn deploy
+  -Dsonar.token=...`, an `npm publish --//registry/:_authToken=...`, or a `find /etc
+  -exec printenv AWS_SECRET_ACCESS_KEY {} \;` all persisted their credential to
+  `analytics.db` unredacted. The gate is now `"db" => scrub_db_args`, `"infra" |
+  "build" | "test" | "pkg" => scrub_infra_args` (never `scrub_db_args`, whose
+  `-p`/`-u`/`-U`/`-h` rules are DB-family and would otherwise mangle `cargo test -p
+  <crate>` or `pytest -p <plugin>`), plus new fragment/suffix rules for `-D`/`-P`
+  Java and Gradle property credentials and npm's config-as-flag auth tokens, and a
+  `find -exec`/`-execdir`/`-ok`/`-okdir` classifier that elides the nested command
+  at `[ELIDED]` since its flag vocabulary is unbounded. `lint` is deliberately left
+  unscrubbed after auditing all 13 supported linters, which accept no
+  credential-bearing flag. **Accepted over-redaction:** a plain argument that merely
+  looks like a credential flag (e.g. a grep pattern of `--password=`) is redacted in
+  the label even though nothing secret was present — the label exists to protect
+  against leaks, not to reproduce the command byte-for-byte.
+
+- **Pipe consumers that measure, compare, or render exact bytes are no longer fed a
+  compressed producer** — `BYTE_EXACT_PIPE_CONSUMERS` gains a third category
+  (measure/compare/render) covering `wc`, `cmp`, `diff`, `od`, `xxd`, `hexdump`,
+  `sum`, and `md5`, alongside gap-fills in the existing persist and digest
+  categories. This affects the PATH-wrapper surface (`skim init --wrappers`) only —
+  the hook/rewrite surface already declines to compress every pipeline but a bare
+  `| cat`. `nl` is intentionally left uncompressed-safe and unlisted: it prints its
+  line number beside the content it counted, so a substituted stream is visibly
+  wrong rather than silently wrong.
+
+### Fixed
+
+- **`cargo +toolchain ...` run through the skim hook could silently run on the
+  wrong toolchain and report success.** The rewrite engine reordered a rustup
+  `+toolchain` token to after the subcommand, so `cargo +nightly test` became
+  `skim cargo test +nightly`; for `cargo test`, rustup's `+nightly` was instead
+  read by libtest as a test-name filter, so the run reported exit 0 / "ok" having
+  matched and executed zero tests — on the default toolchain, not nightly — with
+  no error of any kind. skim now declines to rewrite `cargo +toolchain ...` at all
+  (byte-faithful reconstruction or bail): the token has no valid rewritten
+  position, since the applicable rewrite rules produce `skim rustfmt`, a command
+  line with no `cargo` token left to carry it. Cost: `cargo +toolchain ...`
+  invocations are no longer compressed by the hook; the real `cargo` runs
+  untouched. This cost is small in practice — reordering the token bought zero
+  compression anyway, since it was read as the subcommand and fell through to raw
+  passthrough regardless.
+
 ### BREAKING
 
 - **`skim search` temporal layer now walks the full commit DAG** (#407) — the

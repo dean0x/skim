@@ -45,7 +45,7 @@ pub(crate) enum CompressResult {
 /// If `compress_log` would produce zero output lines, this function returns
 /// `CompressResult::Passthrough` instead. An empty result is never returned.
 ///
-/// # ADR-007 — Lossless proxy egress
+/// # L3-ADR-007 — Lossless proxy egress
 ///
 /// The proxy adapter uses `Losslessness::Lossless`: timestamps are captured as
 /// min–max range metadata, dedup is case-sensitive, DEBUG/TRACE lines are never
@@ -77,7 +77,7 @@ mod tests {
     use super::*;
 
     // =========================================================================
-    // AC4 — Successful log compression (Lossless proxy path — ADR-007)
+    // AC4 — Successful log compression (Lossless proxy path — L3-ADR-007)
     // =========================================================================
 
     /// Lossless dedup produces `×N` count annotations and preserves message text.

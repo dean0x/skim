@@ -59,6 +59,14 @@ pub(crate) struct HookFacts {
     pub(crate) hook_binary_pin: Option<String>,
     /// Whether the hook uses the pinned-binary format (exports `SKIM_HOOK_BINARY`).
     pub(crate) hook_uses_pinned_binary: bool,
+    /// Install mode the hook script declares — strict, or dev-pinned.
+    ///
+    /// Projected across the module boundary so `skim doctor` can reach what the
+    /// INSTALLED HOOK declares without re-reading the script. Doctor pairs it
+    /// with `script_integrity` through `hooks::honour_dev_declaration` — the
+    /// declaration lives in the hook script, which is the artefact a tamper
+    /// edits, so it is never read on its own (PF-016).
+    pub(crate) hook_mode: crate::cmd::hooks::HookMode,
     /// Whether the hook is fully current (version + pinned binary + commit all match).
     pub(crate) hook_is_current: bool,
     /// Whether the hook's recorded binary pin points to the same canonical path
@@ -83,21 +91,21 @@ pub(crate) struct HookFacts {
 /// (`project: false`), which is the scope that fires for every session.
 /// Returns an error only if the config-dir resolver itself fails (e.g.,
 /// cannot determine home directory).
+///
+/// The scope is the only thing passed because it is the only thing detection
+/// takes: `skim doctor` is not an install and has no `--dev`, `--force` or
+/// `--uninstall` to answer for, so `state::detect_state`'s signature leaves this
+/// path nothing to fabricate and no non-use to keep true.
+///
+/// Doctor consults `DetectedState::hook_is_current` alone, never the
+/// installer's mode-aware conjunction: it has no request to match, so pairing
+/// the two would judge every dev-pinned hook against `dev_requested = false`,
+/// report it stale and exit 1 on exactly the installs the waiver keeps green
+/// (ADR-019). That predicate is defined privately in `init::install` and is not
+/// reachable from this module, so the asymmetry is a compiler property.
 pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Result<HookFacts> {
-    let init_flags = flags::InitFlags {
-        project: false,
-        yes: false,
-        dry_run: false,
-        uninstall: false,
-        force: false,
-        no_guidance: false,
-        agent: Some(agent),
-        wrappers: None,
-        permissions: None,
-        permissions_tier: flags::PermissionsTier::Seed,
-    };
     let env = DetectionEnv::from_process();
-    let detected = state::detect_state(&init_flags, agent, &env)?;
+    let detected = state::detect_state(agent, false, &env)?;
 
     // Evaluate hook_is_current() and pin_is_current() before partially moving
     // out of `detected`. Both queries read struct fields, so they must be called
@@ -109,30 +117,25 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         .join("hooks")
         .join(helpers::HOOK_SCRIPT_NAME);
 
-    // Integrity is derived from the SHA-256 manifest (independent of the script
-    // bytes), so a tampered script cannot influence this verdict (PF-016).
+    // Integrity comes from `detect_state`, which derives it from the SHA-256
+    // manifest (independent of the script bytes), so a tampered script cannot
+    // influence this verdict (PF-016).
     //
-    // Verification: `detected.hook_config_dir` is the same directory that
-    // `create_hook_script` in `install.rs` passes to `write_hash_manifest`
-    // (`write_hash_manifest(&state.hook_config_dir, state.agent_cli_name, ...)`).
-    // This alignment holds for every agent — including Copilot, whose
-    // `hook_config_dir` redirects to `~/.copilot/` via `HookProtocol::hook_config_dir`.
-    let script_integrity = crate::cmd::integrity::classify_script_integrity(
-        &detected.hook_config_dir,
-        agent.cli_name(),
-        &hook_script_path,
-    );
-
+    // Taken from the detected state rather than reclassified here so that the
+    // verdict doctor REPORTS is the same one `hook_is_current` above consulted
+    // when deciding whether to waive the commit gate. A second classification
+    // could disagree with the first, and the disagreement would be invisible.
     Ok(HookFacts {
         hook_installed: detected.hook_installed,
         hook_version: detected.hook_version,
         hook_commit: detected.hook_commit,
         hook_binary_pin: detected.hook_binary_pin,
         hook_uses_pinned_binary: detected.hook_uses_pinned_binary,
+        hook_mode: detected.hook_mode,
         hook_is_current: is_current,
         pin_is_current: pin_current,
         hook_script_path,
-        script_integrity,
+        script_integrity: detected.script_integrity,
     })
 }
 
@@ -229,6 +232,16 @@ pub(super) fn command() -> clap::Command {
                 .long("force")
                 .action(clap::ArgAction::SetTrue)
                 .help("Force operation (e.g., uninstall tampered hook)"),
+        )
+        .arg(
+            clap::Arg::new("dev")
+                .long("dev")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Install a dev-pinned hook: keep the real commit but waive the \
+                     commit-staleness check, so an in-place rebuild no longer forces a \
+                     full reinstall. Omit the flag to revert to a strict install.",
+                ),
         )
         .arg(
             clap::Arg::new("wrappers")

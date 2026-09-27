@@ -188,7 +188,7 @@ pub fn wilson_lower_bound(successes: u32, trials: u32) -> f64 {
 /// # Grounding (AD-378-2)
 ///
 /// The choice of Wilson+decay over the bare ratio is validated by a temporal
-/// predict-future-fixes backtest (ADR-003, tied to #361): risk is computed from
+/// predict-future-fixes backtest (SEARCH-ADR-003, tied to #361): risk is computed from
 /// commits before a cutoff `T`, each file is labelled by whether it received a
 /// fix-commit *after* `T` (reusing the heatmap fix-after-touch classifier
 /// [`is_fix_commit`]), and rankers are scored by precision@N / NDCG against the

@@ -9,7 +9,7 @@
 //! `AAAA…AAAAmk4_longline_marker`) is a *substring-only* candidate: the AD-411-7
 //! `token_length` gate deliberately gives it zero aligned whole-token
 //! occurrences, so `search_exact_intersection` emits it with score `0.0` and an
-//! empty `match_positions` vec.  ADR-007 requires it to stay in the result set
+//! empty `match_positions` vec.  SEARCH-ADR-007 requires it to stay in the result set
 //! (git-grep recall parity) — and AD-396-8 requires it to carry a real
 //! `line_number`, resolved by the substring-verify gate from the file bytes.
 //!

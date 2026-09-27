@@ -186,7 +186,13 @@ fn try_parse_env(stdout: &str) -> Option<FileResult> {
 ///
 /// Uses `eq_ignore_ascii_case` throughout to avoid `to_uppercase()` heap allocations
 /// on every env variable (issue 3d).
-fn is_sensitive_key(key: &str) -> bool {
+///
+/// [`SENSITIVE_EXACT`] / [`SENSITIVE_SUFFIXES`] are the canonical binary-facing
+/// secret list (`tests/contract_secret_list_sync.rs` holds them in sync with
+/// `rskim_contract::log`), so this predicate is also the single name
+/// authority for `cmd::security`'s bare `NAME=VALUE` analytics scrubbing —
+/// hence `pub(crate)` rather than private.
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
     // Exact match check — zero allocation
     if SENSITIVE_EXACT
         .iter()

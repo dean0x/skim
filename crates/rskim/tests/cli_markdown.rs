@@ -77,13 +77,30 @@ fn test_markdown_structure_mode_auto_detect() {
     let file_path = temp_dir.path().join("README.md");
     fs::write(
         &file_path,
+        // Prose under each heading gives the structure view something to strip.
+        // A headings-only document saves almost nothing (21 B / 4 t measured),
+        // which is under the 76 B / 22 t marker the ADR-001 guard now charges, so
+        // raw would be served and `#### Detailed Steps` would appear after all.
+        // Measured here: raw 646 B / 124 t → 51 B / 11 t, margin +519 B / +91 t.
         r#"# Project Title
+
+The build pipeline compiles every crate in the workspace and publishes the
+resulting artefacts to the internal registry before the release job starts.
 
 ## Installation
 
+Install the toolchain with the bootstrap script, then run the verification
+suite to confirm the local environment matches the pinned configuration.
+
 ### Prerequisites
 
+A recent stable toolchain, a POSIX shell and roughly two gigabytes of free
+disk space for the build cache are required before you begin.
+
 #### Detailed Steps
+
+Clone the repository, run the bootstrap script, and wait for the cache to warm
+before invoking the release target for the first time.
 "#,
     )
     .unwrap();
@@ -121,7 +138,12 @@ fn test_markdown_signatures_mode_all_headers() {
 
 ###### H6 Header
 
-Some body text that should not appear.
+Some body text that should not appear. The signatures view keeps every heading
+level from H1 through H6 and discards the prose between them, so this paragraph
+and the ones that follow exist to give that discard something to remove.
+
+Another paragraph of body text that should not appear in the signatures view,
+padding the document so the saving covers the disclosure the guard charges.
 "#,
     )
     .unwrap();
@@ -197,15 +219,22 @@ fn test_markdown_setext_headers() {
     let file_path = temp_dir.path().join("test.md");
     fs::write(
         &file_path,
+        // Margin +476 B / +86 t against the 76 B / 22 t structure marker.
         r#"Main Title
 ==========
 
-Some content here.
+Some content here. Setext headers are underlined rather than prefixed with
+hashes, and the structure view must recognise both spellings equally well.
+This paragraph continues so that removing it is a saving large enough to
+cover the disclosure the guard charges against the compressed view.
 
 Subtitle
 --------
 
-More content.
+More content. This paragraph exists so that collapsing the prose away is a
+real saving rather than a rounding error against the disclosure cost, in
+tokens as well as in bytes, with enough margin that a tokeniser patch bump
+cannot move the verdict either way.
 "#,
     )
     .unwrap();
@@ -413,7 +442,22 @@ fn test_markdown_empty_file() {
 fn test_markdown_no_headers() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test.md");
-    fs::write(&file_path, "Just some plain text without any headers.").unwrap();
+    // The structure view of a header-less document is EMPTY, so the compressed
+    // side is 0 B / 0 t and the whole raw size is the saving. It still has to
+    // exceed the 76 B / 22 t marker the guard charges, which the original
+    // 41-byte fixture did not — it was served raw, prose and all.
+    // Measured: raw 388 B / 74 t → 0 B / 0 t, margin +312 B / +52 t.
+    fs::write(
+        &file_path,
+        r#"Just some plain text without any headers. This document deliberately contains
+no heading of any level, so the structure view has nothing at all to extract
+and must therefore produce an empty result rather than echoing the prose back.
+
+A second paragraph, still with no headers, so the raw side is comfortably
+larger than the disclosure the guard charges against the empty compressed view.
+"#,
+    )
+    .unwrap();
 
     let output = common::skim()
         .arg(&file_path)

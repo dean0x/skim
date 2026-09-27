@@ -6,7 +6,7 @@
 //! - **F3**: `ls -la d1 d2` output is sectioned on both surfaces.
 //! - **F5**: grep leading-indent lines are preserved on both surfaces.
 //! - **F2**: mypy synthesized success line appears on both surfaces.
-//! - **`du` byte-faithful passthrough** (ADR-014 / PF-006): TAB and ESC bytes must
+//! - **`du` byte-faithful passthrough** (ADR-009 / PF-006): TAB and ESC bytes must
 //!   survive on both surfaces.  ONE paired test discharges the two-surface
 //!   discipline *here specifically* because the defect lives in the shared
 //!   execution.rs `skip_ansi_strip` gate, which runs downstream of dispatch.
@@ -327,7 +327,7 @@ src/app.py:12:        return self.value\n";
 
     // ========================================================================
     // du — byte-faithful passthrough: TAB and ESC must survive on both surfaces
-    // (ADR-014 / PF-006)
+    // (ADR-009 / PF-006)
     //
     // ONE paired test discharges the two-surface discipline here specifically
     // because the defect (skip_ansi_strip: false) lives in the shared execution.rs

@@ -116,7 +116,7 @@ fn full_body(b: impl Into<Bytes>) -> ProxyBody {
 /// time-to-headers phase (via `tokio::time::timeout` around `forward_request`)
 /// AND the inter-frame idle gap of the streaming body (via this wrapper).
 /// A single bound avoids introducing an empirically-baseless separate constant
-/// (ADR-003 / PF-005). If a separate, shorter body-idle bound is required in
+/// (L3-ADR-003 / PF-005). If a separate, shorter body-idle bound is required in
 /// the future, it must be justified with documented evidence and cited here.
 struct IdleTimedBody {
     inner: Incoming,
@@ -554,7 +554,7 @@ async fn handle_request(
     // `config.upstream_timeout` bounds BOTH time-to-headers (the `timeout()`
     // above) AND the inter-frame idle gap here. See [`IdleTimedBody`] for the
     // full rationale and why reusing the same bound avoids an
-    // empirically-baseless constant (ADR-003 / PF-005).
+    // empirically-baseless constant (L3-ADR-003 / PF-005).
     let relay_response = relay_builder
         .body(streaming_body_with_idle_timeout(
             resp_body,

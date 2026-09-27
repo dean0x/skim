@@ -98,7 +98,7 @@ fn resolve_diff_files(
             // so resolve paths against the repo root to avoid cwd-dependent failures.
             let root = git_source.get_repo_root().unwrap_or_default();
             for f in &files {
-                // ADR-008: containment guard — skip any git-diff path that is
+                // Containment guard — skip any git-diff path that is
                 // absolute or escapes root via `..` or a drive-relative prefix.
                 // Delegates to the canonical shared guard (`super::is_repo_relative_safe`)
                 // so this site stays consistent with `walk::list_tracked_files` and

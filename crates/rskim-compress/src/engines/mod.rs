@@ -7,7 +7,7 @@
 //! - `mixed` — single-pass, CRLF-aware fence scanner + per-fence routing
 //!
 //! Note: the `code` engine (`engines/code.rs`) was deleted in P0.1 (#427).
-//! Under ADR-007 (lossless-only egress), code blocks always pass through
+//! Under L3-ADR-007 (lossless-only egress), code blocks always pass through
 //! byte-identical on the proxy path — no rskim-core AST transform is applied.
 
 pub(crate) mod json;

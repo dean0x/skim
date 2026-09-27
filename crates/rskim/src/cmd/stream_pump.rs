@@ -13,24 +13,30 @@
 //!
 //! # Why streaming, and not the buffered runner
 //!
-//! [`crate::runner::read_pipe`] accumulates a child's whole pipe into a `String`
-//! and, past [`MAX_OUTPUT_BYTES`], **hard-errors and discards the entire
-//! buffer**.  It also decodes with `String::from_utf8(..).unwrap_or_else(lossy)`,
-//! so non-UTF-8 bytes reach the reader as U+FFFD.  For a sink that has no
-//! compressed view to build, buffering bought nothing and cost four separate
-//! fidelity defects (PF-021):
+//! The buffered runner accumulates a child's whole pipe into a `String` and
+//! stops at [`MAX_OUTPUT_BYTES`].  Stdout takes the degrade path
+//! (`runner::read_pipe_degrade`): past the ceiling the reader keeps every byte
+//! that fit and an unconditional ADR-011 class-1 marker names the exact kept
+//! count — a disclosed cap, where [`crate::runner::read_pipe`] (stderr-only
+//! now) hard-errors and discards the entire buffer.  Either way a ceiling
+//! applies, and both forms decode with
+//! `String::from_utf8(..).unwrap_or_else(lossy)`, so non-UTF-8 bytes reach the
+//! reader as U+FFFD.  For a sink that has no compressed view to build,
+//! buffering bought nothing and cost four separate fidelity defects (PF-021):
 //!
 //! 1. **Silent data loss on slow producers.**  A reader that closed early got
 //!    everything the raw tool had already emitted and nothing from skim, because
 //!    skim's single write took `EPIPE` and threw the whole buffer away.
 //! 2. **Latency.**  Nothing reached the reader until the child exited.
 //! 3. **Non-UTF-8 corruption.**  See the lossy decode above.
-//! 4. **Total loss past 64 MiB.**  The ceiling is a genuine zero-output path.
+//! 4. **A ceiling at 64 MiB.**  Disclosed since the degrade path landed; total
+//!    loss before it.
 //!
 //! Defect 4 is worst on the escape hatch: `SKIM_PASSTHROUGH=1` is what a user
-//! runs *because* compressed output hid something, and past the ceiling it
-//! returned nothing at all.  A byte pump has no ceiling on stdout — memory is
-//! O(chunk) because each chunk is written out before the next is read — so
+//! runs *because* compressed output hid something, and buffered it stopped at
+//! the ceiling — returning nothing at all before the degrade path, and a
+//! disclosed partial after it.  A byte pump has no ceiling on stdout — memory
+//! is O(chunk) because each chunk is written out before the next is read — so
 //! ADR-002's rule (an oversized input degrades losslessly instead of
 //! hard-erroring) is satisfied by construction rather than by a degrade branch.
 //!
@@ -47,7 +53,7 @@
 //! **before the first stdout read**, and **never stops draining** — past its
 //! ceiling it keeps reading and discarding rather than leaving the pipe full.
 //!
-//! # DESIGN NOTE — ChildGuard bounds the child's lifetime (ADR-008)
+//! # DESIGN NOTE — ChildGuard bounds the child's lifetime
 //!
 //! The child is wrapped in [`ChildGuard`] **at spawn**.  skim imposes no internal
 //! timeout, so kill-on-drop is the *only* thing that stops a child once the
@@ -63,7 +69,7 @@
 //! `SKIM_PASSTHROUGH=1 skim cargo build | head` and `skim yarn <sub> | head`
 //! are exactly that shape — cargo/yarn/npm spawn tool processes that inherit
 //! stderr — and a join would block skim for the grandchild's whole lifetime
-//! while raw `cargo build | head` returns at once.  ADR-008 forbids an internal
+//! while raw `cargo build | head` returns at once.  skim imposes no internal
 //! timeout, so the bound has to come from not waiting at all.
 //!
 //! Abandoning costs nothing: [`StreamOutcome::PipeClosed`] carries no payload,
@@ -288,7 +294,7 @@ pub(crate) fn stream_child(
         cmd.env(key, value);
     }
 
-    // ChildGuard AT SPAWN (ADR-008): on every early return below, kill-on-drop is
+    // ChildGuard AT SPAWN: on every early return below, kill-on-drop is
     // what stops a tool that would otherwise keep working after the reader has
     // gone.
     let mut child = match cmd.spawn() {
@@ -519,10 +525,14 @@ mod tests {
     /// **The headline A2 property.**  The pump has no byte ceiling, so a stream
     /// far larger than a buffered collector's limit is *delivered*, not discarded.
     ///
-    /// `runner::read_pipe` returns `Err("output exceeded … byte limit")` past
-    /// [`MAX_OUTPUT_BYTES`] and throws the accumulated buffer away — a genuine
-    /// zero-output path that `SKIM_PASSTHROUGH=1` shared, so the documented
-    /// escape hatch lost *all* data precisely when a user reached for it.
+    /// The buffered runner stops stdout at [`MAX_OUTPUT_BYTES`]:
+    /// `runner::read_pipe_degrade` keeps the bytes that fit and discloses the
+    /// cut with an ADR-011 class-1 marker.  Before that degrade path,
+    /// `runner::read_pipe` returned `Err("output exceeded … byte limit")` and
+    /// threw the accumulated buffer away — a genuine zero-output path that
+    /// `SKIM_PASSTHROUGH=1` shared, so the documented escape hatch lost *all*
+    /// data precisely when a user reached for it.  A disclosed cap is still a
+    /// cap; the pump has none.
     ///
     /// The ceiling is injected as `CEILING` rather than using the real 64 MiB
     /// constant, following the `read_pipe_degrade_impl(reader, limit)` precedent:

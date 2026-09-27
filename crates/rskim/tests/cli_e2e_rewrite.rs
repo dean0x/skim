@@ -20,24 +20,57 @@ use std::os::unix::fs::PermissionsExt as _;
 use tempfile::TempDir;
 mod common;
 
-/// Per-binary cache sandbox for the hook-mode invocations below.
+/// Root of the cache sandbox for the hook-mode invocations below.
 ///
 /// `skim rewrite --hook` writes the D5 force-raw marker to
-/// `{SKIM_CACHE_DIR}/sessions/{ppid}.raw`.  With no override that resolves to
-/// the developer's real `~/.cache/skim`, and the PID it keys on is the shared
-/// nextest runner — so a hook test here leaves a marker that
+/// `{SKIM_CACHE_DIR}/sessions/{ppid}.{tool}.raw`.  With no override that
+/// resolves to the developer's real `~/.cache/skim`, and the PID it keys on is
+/// the shared test runner — so a hook test here leaves a marker that
 /// `force_raw_requested()` finds from an unrelated wrapper-surface test binary
 /// running concurrently, flipping it to serve raw and fail.  The collision is
 /// scheduling-dependent, so it surfaces only at certain suite sizes; adding any
 /// new test binary can move the schedule enough to expose it.
+///
+/// The root is per-binary; [`cache_dir_for_current_test`] subdivides it, which
+/// is what closes the *intra*-binary half of the same collision.
 static CACHE_SANDBOX: std::sync::LazyLock<TempDir> =
     std::sync::LazyLock::new(|| tempfile::tempdir().expect("cache sandbox tempdir must succeed"));
+
+/// A cache directory private to the running test.
+///
+/// A per-binary directory is not enough granularity.  Under `cargo test` every
+/// test in this file runs as a thread of ONE process, so they share both the
+/// cache directory and the PPID that the marker is keyed on — two concurrent
+/// same-tool hook tests then collide on `{ppid}.{tool}.raw`, and one's clear
+/// deletes the other's live marker.  (Under `cargo nextest` each test is its own
+/// process, so the PPID already differs; this helper makes the guarantee hold on
+/// both runners rather than depending on which one is invoked.)
+///
+/// libtest names each test thread after the test itself, which is the only
+/// per-test identity available to a process that skim spawns.  `main` is the
+/// nextest case, where the process boundary supplies the isolation instead.
+///
+/// Residual, and deliberate: two concurrent invocations *within one test* still
+/// share a key — that is the same-tool limitation documented in
+/// `cmd/session_sidecar.rs`, and a test that depends on it should say so.
+fn cache_dir_for_current_test() -> std::path::PathBuf {
+    let thread = std::thread::current();
+    let key: String = thread
+        .name()
+        .unwrap_or("main")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let dir = CACHE_SANDBOX.path().join(key);
+    fs::create_dir_all(&dir).expect("per-test cache dir must be creatable");
+    dir
+}
 
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_REWRITTEN_FROM");
-    cmd.env("SKIM_CACHE_DIR", CACHE_SANDBOX.path());
+    cmd.env("SKIM_CACHE_DIR", cache_dir_for_current_test());
     cmd
 }
 
@@ -2853,17 +2886,39 @@ fn fix_e_git_show_pipe_passes_through() {
 #[test]
 fn test_hook_rewritten_cat_with_session_id_executes() {
     let dir = TempDir::new().unwrap();
-    // Use a class with a decorator so pseudo mode strips content and fires the
-    // transparency marker.  A plain typed function is no longer sufficient after
-    // E1 (ADR-008): parameter type annotations are now preserved, and A4 already
+    // Use a decorator- and annotation-dense class so pseudo mode strips enough to
+    // fire the transparency marker.  A plain typed function is not sufficient after
+    // E1 (ADR-008): parameter type annotations are preserved, and A4 already
     // preserved return types — together they make simple functions byte-identical
-    // to raw.  The @injectable() decorator and the `private name: string` property
-    // type annotation are both still stripped in pseudo mode, guaranteeing
-    // view_differs = true.
+    // to raw.  Decorators and declaration type annotations ARE still stripped.
+    //
+    // Density (not just difference) is what matters since the ADR-001 guard began
+    // charging the disclosure it prints: a single-decorator class saved 24 B / 7 t
+    // against the 162 B / 40 t hook-origin pseudo marker, so the guard served raw,
+    // view_differs went false and no marker fired at all.
+    //
+    // Measured: raw 802 B / 174 t → pseudo 266 B / 60 t = saving 536 B / 114 t;
+    // margin +412 B / +82 t (3.3x / 2.6x the marker).  `greet` is retained because
+    // the stdout predicate below asserts on it.
     let file = dir.path().join("roundtrip.ts");
     fs::write(
         &file,
-        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
+        r#"@Injectable({ scope: "singleton" })
+@Controller("/users")
+export class UserService {
+  @Inject("repository") private readonly repository: Repository<UserEntity>;
+  @Inject("cache") private readonly cache: CacheStore<string, UserEntity>;
+  @Inject("clock") private readonly clock: ClockProvider<Date>;
+  @Inject("logger") private readonly logger: StructuredLogger<LogRecord>;
+  @Inject("metrics") private readonly metrics: MetricsSink<Counter, Gauge>;
+  @Inject("tracer") private readonly tracer: TraceProvider<SpanContext>;
+  @Inject("config") private readonly config: ConfigResolver<ServiceOptions>;
+  private readonly greeted: Map<string, Array<UserEntity>> = new Map();
+  private readonly failures: Record<string, ReadonlyArray<Error>> = {};
+
+  greet(name: string): string { return `Hi ${name}`; }
+}
+"#,
     )
     .unwrap();
 

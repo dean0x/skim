@@ -216,8 +216,12 @@ fn test_swift_minimal_preserves_doc_comments() {
 
 #[test]
 fn test_swift_minimal_strips_regular_comments() {
+    // The comment sits BELOW the import on purpose: a comment contiguous from
+    // byte 0 is the module header and is preserved in every language under
+    // #476, which would test header preservation rather than the stripping this
+    // test exists for. See test_swift_minimal_preserves_module_header.
     let source =
-        "// This is a regular comment\nimport Foundation\n\nfunc main() {\n    // inside body\n}\n";
+        "import Foundation\n\n// This is a regular comment\nfunc main() {\n    // inside body\n}\n";
     let result = transform(source, Language::Swift, Mode::Minimal).unwrap();
     assert!(
         !result.contains("regular comment"),
@@ -226,6 +230,18 @@ fn test_swift_minimal_strips_regular_comments() {
     assert!(
         result.contains("inside body"),
         "in-body comments should be preserved, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_swift_minimal_preserves_module_header() {
+    // #476: the leading contiguous comment run is the module header and is
+    // preserved in every language, not just the four that used to be allowlisted.
+    let source = "// Copyright header line\nimport Foundation\n\nfunc main() {\n}\n";
+    let result = transform(source, Language::Swift, Mode::Minimal).unwrap();
+    assert!(
+        result.contains("// Copyright header line"),
+        "top-of-file header comment must be preserved, got:\n{result}"
     );
 }
 

@@ -123,11 +123,11 @@ pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// rejects any version below `FileManifest::FORMAT_VERSION` (currently 7),
 /// yielding an empty manifest so `build_index` has no stale cached field_maps
 /// to reuse even under `force=false`. A full rebuild is triggered on the
-/// next query with no `--rebuild` required. ADR-006 invariant preserved:
+/// next query with no `--rebuild` required. SEARCH-ADR-006 invariant preserved:
 /// the rebuild aborts before persisting the new manifest on any per-file
 /// desync so the old v5 index survives until a clean rebuild completes.
 ///
-/// Compile-time SSOT guard (AD-411-5, applies ADR-001): `crate::CLASSIFIER_SCHEMA_VERSION`
+/// Compile-time SSOT guard (AD-411-5, applies SEARCH-ADR-001): `crate::CLASSIFIER_SCHEMA_VERSION`
 /// is defined in `lib.rs` and must be bumped whenever `classify_source` changes
 /// field attribution. Compile-time assertions in both this crate (`lib.rs`) and
 /// `rskim/src/cmd/search/manifest.rs` enforce that `FORMAT_VERSION` (lexical) AND

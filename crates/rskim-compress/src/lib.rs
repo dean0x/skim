@@ -54,7 +54,7 @@
 //! ```
 //!
 //! Note: `engines/code.rs` (rskim-core AST transform adapter) was deleted in P0.1
-//! (#427). Under ADR-007 (lossless-only egress), code blocks always pass through
+//! (#427). Under L3-ADR-007 (lossless-only egress), code blocks always pass through
 //! byte-identical on the proxy path.
 //!
 //! ## Dependency constraints (AC9 / AC26)
@@ -237,7 +237,7 @@ impl BlockRouter {
     /// per-class maximum are forwarded byte-identical with a `Passthrough` record.
     /// Size-based only — never time-based.
     ///
-    /// ## Value-equivalence gate (ADR-007 / #427 Pass 2 Step 5)
+    /// ## Value-equivalence gate (L3-ADR-007 / #427 Pass 2 Step 5)
     ///
     /// After the byte gate, a per-request budget-bounded comparator verifies that
     /// the JSON engine's output is value-equivalent to the original. Budget starts
@@ -392,7 +392,7 @@ impl BlockRouter {
                 continue;
             }
 
-            // Value-equivalence gate — JSON engine only (ADR-007 / #427 Pass 2 Step 5).
+            // Value-equivalence gate — JSON engine only (L3-ADR-007 / #427 Pass 2 Step 5).
             //
             // The lossless JSON minifier is designed to be byte-exact over number tokens
             // and string escapes. This gate catches any engine regression at runtime.
@@ -653,10 +653,10 @@ enum EngineOutcome {
 ///   (engine internally chose passthrough, treated as fail-open for logging)
 /// - engine returns `Compressed` → `EngineOutcome::Compressed { content, degraded }`
 ///
-/// # P0.1 / ADR-007
+/// # P0.1 / L3-ADR-007
 ///
 /// `Class::Code` routes to `Passthrough` unconditionally in `engine_for_class`
-/// (ADR-007 / #427) — no engine dispatch occurs for code blocks.
+/// (L3-ADR-007 / #427) — no engine dispatch occurs for code blocks.
 fn apply_engine(engine: EngineTarget, text: &str) -> EngineOutcome {
     match engine {
         EngineTarget::Passthrough => {

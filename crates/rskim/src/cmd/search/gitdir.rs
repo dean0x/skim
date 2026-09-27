@@ -8,9 +8,9 @@
 //! we degrade gracefully to `HeadState::NotARepo` or `HeadState::Unresolved`.
 //!
 //! AD-413-10: #413 extended this hand-rolled reader instead of switching to `gix`
-//! (ADR-008's in-process rule is satisfied either way): `gix 0.72.1`/`gix-ref 0.52.1`
+//! (SEARCH-ADR-008's in-process rule is satisfied either way): `gix 0.72.1`/`gix-ref 0.52.1`
 //! contain ZERO reftable support (measured), so gix buys no correctness the ladder lacks,
-//! while `check_staleness` runs on every query and ADR-003 forbids an unmeasured hot-path cost.
+//! while `check_staleness` runs on every query and SEARCH-ADR-003 forbids an unmeasured hot-path cost.
 //! `resolve_git_dir` still resolves ONE directory and never walks up, because
 //! `walk::resolve_git_index_path` and the bare-repo boundary (AD-413-11) depend on that.
 //! Ancestor discovery lives one level up in `git_head_state`, which for a root with NO `.git`
@@ -239,7 +239,7 @@ pub(super) fn git_head_state(project_root: &Path) -> HeadState {
     let head_str = content.trim();
     if let Some(ref_path) = head_str.strip_prefix("ref: ") {
         // AD-413-6: a symbolic HEAD must both start with `refs/` AND pass
-        // `crate::cmd::is_repo_relative_safe` (the ADR-008 canonical guard). The prefix check
+        // `crate::cmd::is_repo_relative_safe` (the SEARCH-ADR-008 canonical guard). The prefix check
         // alone let `ref: refs/../../../outside-sha` read a file outside the root and PERSIST it
         // into `index.skfiles` and `temporal.db`'s `META_GIT_HEAD` (measured, #413).
         if !ref_path.starts_with("refs/") || !crate::cmd::is_repo_relative_safe(Path::new(ref_path))

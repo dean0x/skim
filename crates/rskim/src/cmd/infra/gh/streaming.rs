@@ -75,7 +75,7 @@
 //! # DESIGN NOTE (AD-STR-9) — ChildGuard kills and reaps on drop
 //!
 //! The spawned child is wrapped in [`ChildGuard`] (canonical definition in
-//! `crate::runner`; ADR-001 / ADR-008), whose `Drop` implementation calls
+//! `crate::runner`, reused rather than duplicated), whose `Drop` implementation calls
 //! `kill()` followed by `wait()`.  This ensures the child is reaped when the
 //! parent exits early (SIGPIPE, SIGINT unwind, or any other panic path).
 //! `kill()` on an already-exited child is a no-op on all platforms (PF-025).

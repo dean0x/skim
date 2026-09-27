@@ -140,8 +140,11 @@ fn tokens_budget_tiny_budget_still_discloses_with_marker() {
 /// predates the empty-mode guard and this fix):
 ///   stdout: (empty — the old cascade accepted the 0-token empty types output)
 ///   stderr: "[skim] token budget: escalated from structure to types mode (0 tokens)"
-///           "[skim] structure view: bodies removed — SKIM_PASSTHROUGH=1 for raw output"
+///           "[skim] structure view: bodies removed — SKIM_PASSTHROUGH=1 for full output"
 ///   → no truncation remedy emitted on stderr
+///
+/// ("for full output" is `output::ELISION_HINT`, the only remedy this marker has
+/// ever carried; the assertion at the bottom of this test pins the same wording.)
 ///
 /// Expected after fix: stdout carries the compact elision marker (count only,
 /// no inline hint); stderr carries the exact remedy line.

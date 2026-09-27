@@ -122,9 +122,19 @@ pub(crate) fn transform_types_with_spans_and_line_map(
         .enumerate()
         .map(|(idx, (def, kind, source_start_line))| {
             let line_count = def.lines().count().max(1);
-            spans.push(NodeSpan::new(
+            // ADR-011 source-space marker counts: the type-def text is a
+            // verbatim slice of source, so this span shows `line_count`
+            // consecutive source lines starting at `source_start_line`
+            // (1-indexed here, 0-indexed in the span). This mirrors the
+            // source_line_map built just below. The blank `\n\n` separator added
+            // after each def is synthetic -- it belongs to output space only and
+            // deliberately has no source line, which is precisely why the marker
+            // counts must not be derived from output lines.
+            let source_first_line = source_start_line.saturating_sub(1);
+            spans.push(NodeSpan::with_source(
                 current_output_line..current_output_line + line_count,
                 kind,
+                source_first_line..source_first_line.saturating_add(line_count),
             ));
             // Map each output line to consecutive source lines from source_start_line
             for i in 0..line_count {

@@ -55,7 +55,7 @@ use crate::errors::ProxyError;
 ///
 /// Evidence: upstream LLM providers typically respond within 30s; 60s provides
 /// a 2× margin for slow networks and avoids premature 504s on large uploads.
-/// Per ADR-003 / PF-005: not a baseless figure — derived from provider SLA
+/// Per L3-ADR-003 / PF-005: not a baseless figure — derived from provider SLA
 /// observations documented in the plan (auto-resolved #6).
 pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 60;
 
@@ -63,7 +63,7 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 60;
 ///
 /// Evidence: sub-second upstream cancel on client drop. 500ms is generous for
 /// OS TCP teardown notification without leaking per-request resources for multiple
-/// seconds. Per ADR-003 / PF-005: not baseless — bounded by OS TCP teardown
+/// seconds. Per L3-ADR-003 / PF-005: not baseless — bounded by OS TCP teardown
 /// propagation observed at <100ms on localhost; 500ms gives 5× margin for
 /// cross-network client drops (auto-resolved #6).
 pub const DEFAULT_CLIENT_DISCONNECT_CANCEL_MS: u64 = 500;

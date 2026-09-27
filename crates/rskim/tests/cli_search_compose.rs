@@ -99,7 +99,7 @@ fn search_help_documents_full_surface_and_degradation() {
 /// WEIGHT6_* constants exported from `rskim_search::compound::weights`.
 ///
 /// If a future code change bumps a default, this test will fail and remind
-/// the author to update the help text (ADR-003: no empirically-baseless claims).
+/// the author to update the help text (SEARCH-ADR-003: no empirically-baseless claims).
 #[test]
 fn weights_help_default_matches_code_default() {
     use rskim_search::compound::weights::{WEIGHT6_AST, WEIGHT6_LEXICAL, WEIGHT6_TEMPORAL};
@@ -818,7 +818,7 @@ mod root_validation_400 {
 // entry-point path.
 //
 // Oracle for positive recall assertions: `git grep -l <token>` — respects the
-// git index and includes tracked-but-.gitignored files (ADR-003 / ADR-007).
+// git index and includes tracked-but-.gitignored files (SEARCH-ADR-003 / SEARCH-ADR-007).
 
 mod tracked_union_402 {
     use assert_cmd::Command;
@@ -1413,11 +1413,11 @@ mod tracked_union_402 {
     }
 
     // -------------------------------------------------------------------------
-    // Cross-plan composed dog-food: #400 + #402 compose (ADR-007)
+    // Cross-plan composed dog-food: #400 + #402 compose (SEARCH-ADR-007)
     // -------------------------------------------------------------------------
     /// One fresh isolated SKIM_CACHE_DIR: (a) bad-root fails loud (#400 behavior)
     /// AND (b) a tracked-but-.gitignored file surfaces in search (#402 behavior).
-    /// Proves the two fixes compose in the wave (applies ADR-007).
+    /// Proves the two fixes compose in the wave (applies SEARCH-ADR-007).
     #[test]
     fn cross_plan_400_402_compose() {
         let proj = tempfile::tempdir().unwrap();

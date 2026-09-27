@@ -1038,7 +1038,7 @@ mod anchor_unit_tests {
             "Tier 1: earliest all-tokens line is line 3 (AC16); \
              anchor landed on line {line} instead"
         );
-        // Verify anchor line actually contains BOTH tokens (ADR-007 invariant).
+        // Verify anchor line actually contains BOTH tokens (SEARCH-ADR-007 invariant).
         let anchor_line_text = content.lines().nth(line - 1).unwrap_or("");
         assert!(
             anchor_line_text.contains("tok_a") && anchor_line_text.contains("tok_b"),
@@ -1057,7 +1057,7 @@ mod anchor_unit_tests {
     /// trigrams may or may not appear in TRIGRAM_WEIGHTS with IDF > DEFAULT_WEIGHT).
     /// Whether selectivity or length is the deciding Tier-2 factor depends on
     /// TRIGRAM_WEIGHTS at the time; either way "zqxjvwb_unique_long" wins.
-    /// The test asserts the ADR-007-visible outcome: anchor line contains ≥1 token.
+    /// The test asserts the SEARCH-ADR-007-visible outcome: anchor line contains ≥1 token.
     #[test]
     fn anchor_multi_token_tier2_rarest_token_fallback_ac17() {
         // Line 1: "ab" only.
@@ -1079,13 +1079,13 @@ mod anchor_unit_tests {
         let line = byte_offset_to_line(content.as_bytes(), start);
         let anchor_line = content.lines().nth(line - 1).unwrap_or("");
 
-        // ADR-007: anchor line must contain ≥1 token.
+        // SEARCH-ADR-007: anchor line must contain ≥1 token.
         let has_token = query
             .split_whitespace()
             .any(|tok| anchor_line.contains(tok));
         assert!(
             has_token,
-            "ADR-007: Tier 2 anchor line {line} must contain ≥1 query token; \
+            "SEARCH-ADR-007: Tier 2 anchor line {line} must contain ≥1 query token; \
              got anchor_line={anchor_line:?}"
         );
 
@@ -1136,13 +1136,13 @@ mod anchor_unit_tests {
         let line = byte_offset_to_line(content.as_bytes(), start);
         let anchor_line = content.lines().nth(line - 1).unwrap_or("");
 
-        // ADR-007: anchor line must contain ≥1 token.
+        // SEARCH-ADR-007: anchor line must contain ≥1 token.
         let has_token = query
             .split_whitespace()
             .any(|tok| anchor_line.contains(tok));
         assert!(
             has_token,
-            "ADR-007: anchor line {line} must contain ≥1 query token; got {anchor_line:?}"
+            "SEARCH-ADR-007: anchor line {line} must contain ≥1 query token; got {anchor_line:?}"
         );
 
         // Length tie-break: "mn" (len 2) > "q" (len 1) → anchor on "mn"'s line (line 2).
@@ -1199,13 +1199,13 @@ mod anchor_unit_tests {
         let line = byte_offset_to_line(content.as_bytes(), start);
         let anchor_line = content.lines().nth(line - 1).unwrap_or("");
 
-        // ADR-007: anchor line must contain ≥1 token.
+        // SEARCH-ADR-007: anchor line must contain ≥1 token.
         let has_token = query
             .split_whitespace()
             .any(|tok| anchor_line.contains(tok));
         assert!(
             has_token,
-            "ADR-007: anchor line {line} must contain ≥1 query token; got {anchor_line:?}"
+            "SEARCH-ADR-007: anchor line {line} must contain ≥1 query token; got {anchor_line:?}"
         );
 
         // Position tie-break: "ab" (pos ~9) appears before "cd" (pos ~27) → line 1 wins.
@@ -1331,7 +1331,7 @@ mod anchor_unit_tests {
             "AC18 multi-token: run 1 and run 3 must agree"
         );
 
-        // ADR-007: stable anchor line contains ≥1 token.
+        // SEARCH-ADR-007: stable anchor line contains ≥1 token.
         let line = byte_offset_to_line(content.as_bytes(), start1);
         let anchor_line = content.lines().nth(line - 1).unwrap_or("");
         let has_token = query
@@ -1379,7 +1379,7 @@ mod anchor_unit_tests {
         assert!(anchor_line.contains("fn"), "anchor line must contain 'fn'");
     }
 
-    /// ADR-007 zero-token invariant: for every case where Some is returned,
+    /// SEARCH-ADR-007 zero-token invariant: for every case where Some is returned,
     /// the anchor line contains ≥1 query token (discriminating PF-007 check).
     #[test]
     fn anchor_adur007_anchor_line_always_contains_token() {
@@ -1400,7 +1400,7 @@ mod anchor_unit_tests {
                     .any(|tok| anchor_line.contains(tok));
                 assert!(
                     has_token,
-                    "ADR-007: anchor line {line} must contain ≥1 query token \
+                    "SEARCH-ADR-007: anchor line {line} must contain ≥1 query token \
                      for query={query:?}; got anchor_line={anchor_line:?}"
                 );
             }

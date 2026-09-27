@@ -38,7 +38,7 @@
 //! ## AD-PXY-09 — `turn_id` reserved
 //!
 //! `turn_id` is intentionally absent from [`TransformContext`]. The derivation
-//! spec is tracked in #344 (filed per ADR-004; see DECISIONS-NEEDED.md). It will
+//! spec is tracked in #344 (filed per L3-ADR-004; see DECISIONS-NEEDED.md). It will
 //! be added to `TransformContext` by #305 before turn-level tests land.
 
 use rskim_contract::contract::{Contract, Outcome};

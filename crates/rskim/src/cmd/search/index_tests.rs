@@ -96,7 +96,7 @@ fn test_index_writes_manifest_sidecar() {
 }
 
 // ============================================================================
-// AC-8 / AC-9 (#380): grounded manifest-size regression guard (ADR-003)
+// AC-8 / AC-9 (#380): grounded manifest-size regression guard (SEARCH-ADR-003)
 // ============================================================================
 
 /// Write a deterministic source corpus of `n` Rust files totalling >= 8 KiB and
@@ -140,7 +140,7 @@ fn write_size_corpus(root: &Path) -> u64 {
     total
 }
 
-/// AC-8 / AC-9 (#380), GROUNDED REGRESSION GUARD (ADR-003, replaces the baseless
+/// AC-8 / AC-9 (#380), GROUNDED REGRESSION GUARD (SEARCH-ADR-003, replaces the baseless
 /// <30% target): build a REAL index over a >= 8 KiB source corpus, measure
 /// `index.skfiles bytes / source bytes`, `eprintln!` the ratio, and assert it is
 /// below a grounded ceiling = measured binary ratio + fixed headroom.
@@ -185,7 +185,7 @@ fn test_manifest_size_grounded_ceiling() {
     let jsonl_ratio_lb = jsonl_lower_bound as f64 / source_bytes as f64;
 
     // Grounded ceiling: measured binary ratio + fixed 0.50x headroom. Recorded as
-    // a real measured number (ADR-003), NOT the arbitrary 0.30x #174 target.
+    // a real measured number (SEARCH-ADR-003), NOT the arbitrary 0.30x #174 target.
     let headroom = 0.50_f64;
     let ceiling = binary_ratio + headroom;
 
@@ -923,10 +923,10 @@ fn test_streaming_skipped_includes_minified() {
 }
 
 // ============================================================================
-// ADR-006: dual-index desync abort — the central correctness invariant
+// SEARCH-ADR-006: dual-index desync abort — the central correctness invariant
 // ============================================================================
 
-/// ADR-006 abort path: when `add_file_ngrams` rejects a FileId after the same
+/// SEARCH-ADR-006 abort path: when `add_file_ngrams` rejects a FileId after the same
 /// FileId's lexical entry was already accepted, `consume()` must return `Err`
 /// and the manifest must NOT be saved (old manifest survives).
 ///
@@ -938,7 +938,7 @@ fn test_streaming_skipped_includes_minified() {
 /// calling `consume`.  The builder then expects FileId(1) next.  When `consume`
 /// tries to insert FileId(0) for the first real file it returns `Err("FileId
 /// must equal sequential insertion index: expected 1, got 0")` — exactly the
-/// desync abort path documented in ADR-006. (applies ADR-006)
+/// desync abort path documented in SEARCH-ADR-006. (applies SEARCH-ADR-006)
 #[test]
 fn test_adr006_desync_aborts_before_manifest_save() {
     use rskim_search::{
@@ -1033,7 +1033,7 @@ fn test_adr006_desync_aborts_before_manifest_save() {
 
     assert!(
         result.is_err(),
-        "consume must return Err on AST desync (ADR-006 abort path); got Ok"
+        "consume must return Err on AST desync (SEARCH-ADR-006 abort path); got Ok"
     );
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
@@ -1051,7 +1051,7 @@ fn test_adr006_desync_aborts_before_manifest_save() {
 
     assert_eq!(
         old_mtime, new_mtime,
-        "manifest file mtime must not change — the old manifest must survive the abort (ADR-006)"
+        "manifest file mtime must not change — the old manifest must survive the abort (SEARCH-ADR-006)"
     );
 
     // Double-check by loading: entry count must be the same as before the broken run.
@@ -1060,11 +1060,11 @@ fn test_adr006_desync_aborts_before_manifest_save() {
     assert_eq!(
         reloaded.entry_count(),
         old_entry_count,
-        "manifest entry count must be unchanged — new_manifest was never saved (ADR-006)"
+        "manifest entry count must be unchanged — new_manifest was never saved (SEARCH-ADR-006)"
     );
 }
 
-/// ADR-006 self-heal: after an abort, a subsequent successful build restores
+/// SEARCH-ADR-006 self-heal: after an abort, a subsequent successful build restores
 /// the index and manifest. Verifies that the old-manifest-survives property
 /// does not permanently break the project — the next `build_index` succeeds.
 #[test]
@@ -1156,7 +1156,7 @@ fn test_adr006_self_heal_after_abort() {
 }
 
 // ============================================================================
-// AC10 (#402) — ADR-006 desync-abort for a unioned WalkEntry
+// AC10 (#402) — SEARCH-ADR-006 desync-abort for a unioned WalkEntry
 // ============================================================================
 
 /// AC10 (#402) — Desync-abort on a unioned WalkEntry leaves the old manifest intact.
@@ -1164,10 +1164,10 @@ fn test_adr006_self_heal_after_abort() {
 /// `secretdoc.md` is tracked-but-.gitignored, so it enters the build via
 /// `merge_tracked_union` (the union path, AD-402-4). When `add_file_ngrams` is
 /// forced to fail for that unioned file (by pre-advancing the AST builder), the
-/// existing `Pipeline::consume` abort path (ADR-006) must fire BEFORE
+/// existing `Pipeline::consume` abort path (SEARCH-ADR-006) must fire BEFORE
 /// `new_manifest.save()`, leaving the on-disk manifest byte-identical.
 ///
-/// This proves that the ADR-006 desync-abort invariant inherited by unioned entries
+/// This proves that the SEARCH-ADR-006 desync-abort invariant inherited by unioned entries
 /// (stated in AD-402-4: "unioned files are downstream-indistinguishable") actually
 /// holds — unioned files are NOT silently skipped past the abort gate.
 ///
@@ -1178,7 +1178,7 @@ fn test_adr006_self_heal_after_abort() {
 /// any adversarial save — the check fails if the abort-before-save guard is removed;
 /// (5) an adversarial `new_manifest.save()` drops the on-disk count to 0, proving
 /// observable (4) is non-tautological and that save() is effective when called.
-/// (applies ADR-006 / AD-402-4)
+/// (applies SEARCH-ADR-006 / AD-402-4)
 #[test]
 fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
     use rskim_search::{
@@ -1203,7 +1203,7 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
             .entry_count();
 
     // Verify secretdoc.md (the unioned file) is in the manifest — otherwise the
-    // test only exercises regular-file abort behavior (same as ADR-006 test above).
+    // test only exercises regular-file abort behavior (same as SEARCH-ADR-006 test above).
     assert!(
         old_entry_count >= 2,
         "AC10: old manifest must include both src/a.rs and secretdoc.md (unioned); \
@@ -1212,7 +1212,7 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
 
     // Stage 2: pre-break the AST builder by inserting FileId(0) so it expects
     // FileId(1) next.  When consume processes secretdoc.md at FileId(0), the
-    // builder rejects it with the sequential-FileId error → ADR-006 abort.
+    // builder rejects it with the sequential-FileId error → SEARCH-ADR-006 abort.
     let mut lexical_builder = NgramIndexBuilder::new(cache.path().to_path_buf())
         .expect("lexical builder must initialise");
     let mut ast_builder =
@@ -1259,11 +1259,11 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
         false,
     );
 
-    // Stage 4: consume MUST return Err — the ADR-006 abort fires for the unioned file.
+    // Stage 4: consume MUST return Err — the SEARCH-ADR-006 abort fires for the unioned file.
     assert!(
         result.is_err(),
         "AC10: consume must return Err when add_file_ngrams fails for a unioned file \
-         (ADR-006 / AD-402-4 invariant); got Ok"
+         (SEARCH-ADR-006 / AD-402-4 invariant); got Ok"
     );
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
@@ -1285,14 +1285,14 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
         new_manifest.entry_count(),
         0,
         "AC10: new_manifest must have 0 entries post-abort — manifest.insert() is \
-         skipped when add_file_ngrams returns Err (ADR-006)"
+         skipped when add_file_ngrams returns Err (SEARCH-ADR-006)"
     );
 
     // (b) On-disk manifest is unchanged after consume() Err — the correct
     //     abort-before-save guard means run() never reaches new_manifest.save().
     //     This assertion fails if the guard is removed (new_manifest has 0 entries,
     //     so a save would overwrite the old {old_entry_count}-entry manifest with 0).
-    //     (PF-007, ADR-006 / AD-402-4)
+    //     (PF-007, SEARCH-ADR-006 / AD-402-4)
     {
         let on_disk = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
             .expect("on-disk manifest must be loadable after consume() Err");
@@ -1301,7 +1301,7 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
             old_entry_count,
             "AC10: on-disk manifest must still hold {old_entry_count} entries after \
              consume() returns Err — abort-before-save guard must suppress \
-             new_manifest.save() (ADR-006 / AD-402-4)"
+             new_manifest.save() (SEARCH-ADR-006 / AD-402-4)"
         );
     }
 
@@ -2050,7 +2050,7 @@ fn test_index_crash_window_skcache_written_manifest_not_saved() {
 /// - `ast_reextracted < full_build_file_count` (strictly less than full build)
 ///
 /// This is the binding performance gate (counter-based, not timing-based), per
-/// ADR-003 discipline.  (AC12)
+/// SEARCH-ADR-003 discipline.  (AC12)
 #[test]
 fn test_index_incremental_extraction_count_less_than_full_build() {
     use super::super::types::IndexConfig;
@@ -2170,7 +2170,7 @@ fn test_index_incremental_extraction_count_less_than_full_build() {
 // ============================================================================
 
 /// AC13: The ast_index.skcache file size must be within the measured ratio bound
-/// (skcache bytes / source bytes).  (applies ADR-003)
+/// (skcache bytes / source bytes).  (applies SEARCH-ADR-003)
 ///
 /// Binding gate: skcache_bytes < 3.0 × source_bytes. The ratio is only meaningful
 /// once per-file format overhead (64-byte SHA key + 4-byte length prefix + 9-byte
@@ -2181,7 +2181,7 @@ fn test_index_incremental_extraction_count_less_than_full_build() {
 /// absolute cap guarded skcache size.
 ///
 /// The measured ratio on real Rust sources is well below 1.0× (the AST index itself
-/// measured 1.23× source bytes per ADR-003); 3.0× is a generous regression margin —
+/// measured 1.23× source bytes per SEARCH-ADR-003); 3.0× is a generous regression margin —
 /// any implementation that exceeds 3× has bloated. The eprintln records the actual
 /// ratio each run so regressions are visible in CI output even when the gate passes.
 #[test]
@@ -2224,7 +2224,7 @@ fn test_index_skcache_size_within_measured_bound() {
     // binding ratio gate never ran on CI and only a loose absolute cap guarded
     // skcache size. Synthesize a representative >= 8 KiB Rust source so the
     // measured ratio gate actually exercises. (testing review 2026-06-23;
-    // applies ADR-003 — measure the bound, don't skip past it.)
+    // applies SEARCH-ADR-003 — measure the bound, don't skip past it.)
     let synth_path = project.path().join("generated_ratio_fixture.rs");
     fs::write(&synth_path, synthetic_rust_source()).unwrap();
     source_dir_paths.push(synth_path);
@@ -2262,7 +2262,7 @@ fn test_index_skcache_size_within_measured_bound() {
     let ratio = skcache_bytes as f64 / source_bytes as f64;
     eprintln!(
         "AC13: file_count={}, skcache_bytes={skcache_bytes}, source_bytes={source_bytes}, \
-         ratio={ratio:.3}× (binding gate: < 3.0×; applies ADR-003)",
+         ratio={ratio:.3}× (binding gate: < 3.0×; applies SEARCH-ADR-003)",
         result.file_count
     );
 
@@ -2277,11 +2277,11 @@ fn test_index_skcache_size_within_measured_bound() {
 
     // Binding gate: skcache must be < 3.0 × source_bytes.
     // The measured ratio on real Rust sources is well below 1.0×; the AST index
-    // itself measured at 1.23× source bytes per ADR-003. 3.0× is a generous
+    // itself measured at 1.23× source bytes per SEARCH-ADR-003. 3.0× is a generous
     // regression bound that would only trip on catastrophic n-gram bloat.
     assert!(
         ratio < 3.0,
-        "skcache ratio ({ratio:.3}×) must be < 3.0× source bytes (AC13 binding gate, applies ADR-003); \
+        "skcache ratio ({ratio:.3}×) must be < 3.0× source bytes (AC13 binding gate, applies SEARCH-ADR-003); \
          skcache_bytes={skcache_bytes}, source_bytes={source_bytes}"
     );
 }
@@ -2615,7 +2615,7 @@ fn test_index_corrupt_skcache_entry_causes_single_reextract() {
 /// to return `Err` WITHOUT saving the manifest.
 ///
 /// This exercises the new cache → builder poison path introduced by #290:
-/// unlike the ADR-006 tests (which pre-advance the builder via a dummy
+/// unlike the SEARCH-ADR-006 tests (which pre-advance the builder via a dummy
 /// `add_file_ngrams` call), this test injects the poison via a `CachedAstEntry`
 /// attached to `ProcessedFile.ast_cached`.  The consumer must detect it on the
 /// AST desync path.  (AC7 — avoids PF-007)
@@ -2726,7 +2726,7 @@ fn test_ac7_cached_zero_count_entry_aborts_via_desync() {
         .expect("mtime must be available");
     assert_eq!(
         old_mtime, new_mtime,
-        "manifest file mtime must not change after AC7 cache-poison abort (ADR-006 invariant)"
+        "manifest file mtime must not change after AC7 cache-poison abort (SEARCH-ADR-006 invariant)"
     );
 }
 

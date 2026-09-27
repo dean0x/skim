@@ -192,7 +192,7 @@ const LOSSLESS_CONTENT_BUDGET: usize = 2_000_000;
 /// this invariant. Isolation is asserted by
 /// `assert_lossy_engine_fails_lossless_content_only`.
 ///
-/// # ADR-007 / #427
+/// # L3-ADR-007 / #427
 ///
 /// Registered as `"lossless-content"` → reported as `"ext:lossless-content"` in
 /// `ConformanceReport`.
@@ -387,7 +387,7 @@ fn line_has_log_level_prefix(line: &str) -> bool {
 /// `" ERROR: connection refused (×3, [2024-01-01T10:00:00Z..2024-01-01T10:10:00Z])"`,
 /// so no content was lost.
 ///
-/// # Timestamp extremes (check 3 — ADR-007 Pass 5)
+/// # Timestamp extremes (check 3 — L3-ADR-007 Pass 5)
 ///
 /// The Lossless engine annotates duplicate groups with `[ts_min..ts_max]`. The
 /// oracle verifies that both extremes appear verbatim in the output, proving the

@@ -68,7 +68,7 @@ pub(super) fn run_commit(
         rec,
         output_format,
         label,
-        // ADR-015 / D1 declaration — `Lossy`.  `parse_commit` keeps the hash,
+        // ADR-011 / D1 declaration — `Lossy`.  `parse_commit` keeps the hash,
         // subject and changed-files summary and discards everything else git
         // printed (hook output, `-v` scissors diff, advice blocks), and there is
         // no 1:1 unit to count, so `elided` stays `None`.

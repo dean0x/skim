@@ -5,7 +5,7 @@
 //! The merge fixture (`make_merge_repo`) contains exactly four non-merge
 //! commits.  After #407's full-DAG walk, `skim search --risky --json` on
 //! that fixture MUST report `total_commits` equal to `git rev-list --count
-//! --no-merges <HEAD>` (derived in-test per ADR-003), and per-file counts
+//! --no-merges <HEAD>` (derived in-test per SEARCH-ADR-003), and per-file counts
 //! MUST match `git rev-list --count --no-merges --full-history HEAD -- <f>`.
 //!
 //! # AD-407-10: T-20 / AC-17 — author-date window
@@ -19,7 +19,7 @@
 //! # AC-21 guard
 //!
 //! With `--root <subdirectory>`, every path in temporal output MUST be inside
-//! that subtree; no co-change peer outside the subtree may appear (ADR-009).
+//! that subtree; no co-change peer outside the subtree may appear (SEARCH-ADR-009).
 //!
 //! # AC-22 / T-19 — heatmap parity
 //!
@@ -373,7 +373,7 @@ fn make_author_date_repo() -> TempDir {
 /// `--blast-radius a.rs` (with `--root src/`) a non-empty in-scope peer list
 /// (`c.rs`).  `other/b.rs` co-changes with both but is outside the subtree.
 /// When built with `--root <repo>/src/`, only paths relative to `src/` may
-/// appear; `other/b.rs` must be absent from all temporal output (ADR-009).
+/// appear; `other/b.rs` must be absent from all temporal output (SEARCH-ADR-009).
 fn make_subdir_scope_repo() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
     let now = now_epoch();
@@ -405,7 +405,7 @@ fn make_subdir_scope_repo() -> TempDir {
 // ============================================================================
 
 /// T-18 / AC-16: `skim search --risky --json` on the merge fixture MUST report
-/// per-file counts matching `git rev-list --count --no-merges` (ADR-003).
+/// per-file counts matching `git rev-list --count --no-merges` (SEARCH-ADR-003).
 ///
 /// - b.txt: total_commits=2, fix_commits=2, fix_density=1.0
 /// - a.txt: total_commits=2, fix_commits=0, fix_density=0.0
@@ -432,7 +432,7 @@ fn test_risky_json_matches_git_ground_truth_on_merge_repo() {
         .as_array()
         .expect("results must be an array");
 
-    // Derive ground-truth counts from git (ADR-003 — never hardcode)
+    // Derive ground-truth counts from git (SEARCH-ADR-003 — never hardcode)
     let total_no_merge = git_rev_list_no_merges_count(repo.path(), None);
     assert_eq!(
         total_no_merge, 4,
@@ -532,7 +532,7 @@ fn test_risky_json_matches_git_ground_truth_on_merge_repo() {
 // ============================================================================
 
 /// AC-21: `--root <subdirectory>` MUST scope every temporal output path to the
-/// subtree and MUST NOT emit co-change peers from outside it (ADR-009).
+/// subtree and MUST NOT emit co-change peers from outside it (SEARCH-ADR-009).
 ///
 /// The larger commit population (#407 full-DAG walk) MUST NOT widen the #413
 /// scope that `apply_scope_filter` enforces at build time.
@@ -545,7 +545,7 @@ fn test_root_subdir_scope_contains_only_subtree_paths() {
     let src_root = repo.path().join("src");
 
     // AC-21: the src/ subtree contains exactly these two files.  Every
-    // temporal output path must be a member of this set (ADR-009).  A
+    // temporal output path must be a member of this set (SEARCH-ADR-009).  A
     // positive membership check catches regressions that a `!starts_with`
     // guard misses: absolute paths, `../other/b.rs`, or a peer re-anchored
     // to a different spelling all fail membership but pass the negative test.
@@ -607,7 +607,7 @@ fn test_root_subdir_scope_contains_only_subtree_paths() {
     // --blast-radius a.rs --json: peer must not reference other/b.rs.
     //
     // The subtree-relative spelling `a.rs` is correct under `--root src/`;
-    // `src/a.rs` would not resolve (ADR-009).
+    // `src/a.rs` would not resolve (SEARCH-ADR-009).
     //
     // PF-007: replace `if let Some` with `.expect`.  Assert c.rs is present:
     // c.rs is an in-scope co-change peer of a.rs (both appear in every commit
@@ -1031,14 +1031,14 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
 }
 
 // ============================================================================
-// AC-5: dog-food risky ground truth on this repository  (ADR-007)
+// AC-5: dog-food risky ground truth on this repository  (SEARCH-ADR-007)
 // ============================================================================
 
 /// AC-5 (dog-food): on this repository, `skim search --risky --json` MUST
 /// report `total_commits` and `fix_commits` for `crates/rskim/src/main.rs`
 /// that match `git rev-list --count --no-merges --full-history HEAD -- <path>`
 /// and a case-insensitive word-boundary grep of the same commits' subjects
-/// respectively (ADR-003, ADR-007).
+/// respectively (SEARCH-ADR-003, SEARCH-ADR-007).
 ///
 /// Every count is derived from git at run time; none is hardcoded, so the
 /// test holds across squash merges and future history.  Non-vacuity (PF-007)
@@ -1052,7 +1052,7 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
 ///
 /// Building the temporal index for the full workspace takes ~8 s on a warm
 /// OS page cache; this cost is accepted for the only dog-food test in the
-/// suite (ADR-007: "a fully green CI and acceptance suite is not evidence
+/// suite (SEARCH-ADR-007: "a fully green CI and acceptance suite is not evidence
 /// of retrieval correctness; the dog-food campaign is the real merge gate").
 ///
 /// AD-407-1 (full-DAG walk replaces first-parent walk).
@@ -1090,7 +1090,7 @@ fn test_ac5_dog_food_risky_matches_git_ground_truth() {
         "AC-5 guard: {TARGET} must exist in the workspace"
     );
 
-    // ── Ground truth from git (ADR-003) ─────────────────────────────────────
+    // ── Ground truth from git (SEARCH-ADR-003) ─────────────────────────────────────
     //
     // Each count is taken under two walks: `--full-history` (the full DAG skim
     // walks, AD-407-1) and `--first-parent` (the walk it replaced, i.e. what a
@@ -1246,7 +1246,7 @@ fn test_ac5_dog_food_risky_matches_git_ground_truth() {
         skim_fix, git_fix,
         "AC-5: fix_commits for {TARGET} must match \
          `git log --no-merges --full-history --format=%s | grep -ciE fix-pattern` \
-         (ADR-003); skim={skim_fix}, git={git_fix}"
+         (SEARCH-ADR-003); skim={skim_fix}, git={git_fix}"
     );
 
     // Confirm fix_density is consistent with the reported counts.

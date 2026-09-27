@@ -103,7 +103,7 @@ fn write_ast_index_stub(cache_dir: &std::path::Path) {
 /// Writing the current FORMAT_VERSION prevents the lexical self-heal from
 /// reporting `NoStoredHead` in unit tests that only want to exercise the
 /// HEAD-comparison or AST-self-heal logic paths
-/// (Finding 9, ADR-006, #355 cycle-2, #358 Item 2).
+/// (Finding 9, SEARCH-ADR-006, #355 cycle-2, #358 Item 2).
 ///
 /// The version bytes are derived from `rskim_search::LEXICAL_INDEX_FORMAT_VERSION`
 /// so this stub automatically tracks future FORMAT_VERSION bumps without requiring
@@ -673,7 +673,7 @@ fn test_check_staleness_ast_below_version_still_returns_manifest() {
 }
 
 // ============================================================================
-// check_staleness — lexical self-heal (#355 Finding 9 / ADR-006)
+// check_staleness — lexical self-heal (#355 Finding 9 / SEARCH-ADR-006)
 // ============================================================================
 
 /// When the lexical index has a below-FORMAT_VERSION magic (v2 = bigram),
@@ -718,14 +718,14 @@ fn test_check_staleness_lexical_below_version_triggers_rebuild_returns_manifest(
     );
 }
 
-/// Finding 8 / ADR-006: a v3 lexical stub (pre-varint-compression, the specific
+/// Finding 8 / SEARCH-ADR-006: a v3 lexical stub (pre-varint-compression, the specific
 /// format version this ticket (#358 Item 2) upgrades from) must also trigger
 /// `NoStoredHead` so the staleness check self-heals via full rebuild.
 ///
 /// The generic `v < LEXICAL_INDEX_FORMAT_VERSION` guard (staleness.rs)
 /// covers v3 (3 < 4) via the same code path as v2, so migration is functional;
 /// this test adds a v3-specific end-to-end regression case so the #358-owned
-/// v3→v4 boundary is directly guarded at the integration level (applies ADR-006
+/// v3→v4 boundary is directly guarded at the integration level (applies SEARCH-ADR-006
 /// self-heal intent; avoids PF-007 by asserting the exact `NoStoredHead`
 /// discriminating observable, not just exit-0).
 ///
@@ -801,7 +801,7 @@ fn test_check_staleness_lexical_v4_below_version_triggers_rebuild_returns_manife
     );
 }
 
-/// AD-411-5 / ADR-006: a v5 lexical stub (pre-AD-411-1 field_id semantic change)
+/// AD-411-5 / SEARCH-ADR-006: a v5 lexical stub (pre-AD-411-1 field_id semantic change)
 /// must trigger `NoStoredHead` so the staleness check self-heals via full rebuild
 /// under the v7 binary.  The stored field_ids are semantically incorrect in v5:
 /// identifier bytes all carry SymbolName (unconditional) rather than the new
@@ -843,13 +843,13 @@ fn test_check_staleness_lexical_v5_below_version_triggers_rebuild_returns_manife
     );
 }
 
-/// AD-411-7 / ADR-006: a v6 lexical stub (pre-token_length posting field, the
+/// AD-411-7 / SEARCH-ADR-006: a v6 lexical stub (pre-token_length posting field, the
 /// format version the v6→v7 bump in #411 alignment-fix upgrades FROM) must trigger
 /// `NoStoredHead` so the staleness check self-heals via full rebuild under the v7
 /// binary.  A v6 on-disk index lacks the `delta_token_length` 5th varint per
 /// posting entry; `decode_postings_varint` would desync or read across entry
 /// boundaries if the v7 binary tried to use it — clean rejection + self-heal is
-/// the only safe response (ADR-006, same `v < LEXICAL_INDEX_FORMAT_VERSION` guard
+/// the only safe response (SEARCH-ADR-006, same `v < LEXICAL_INDEX_FORMAT_VERSION` guard
 /// in staleness.rs that covers v2/v3/v4/v5).
 ///
 /// This test complements `test_v6_header_rejected_with_please_rebuild_message` in
@@ -1450,7 +1450,7 @@ fn create_real_git_worktree(
 /// four handles the caller needs.
 ///
 /// Encapsulates the 6-line linked-worktree preamble that was duplicated across
-/// 13 test functions (ADR-001 deduplication):
+/// 13 test functions (SEARCH-ADR-001 deduplication):
 /// ```
 ///     let dir = tempdir().unwrap();
 ///     let primary = dir.path().join("primary");
@@ -1836,7 +1836,7 @@ fn test_temporal_db_data_version_forward_compat() {
 /// written by a binary that produced version 0 before the ghost-filter was
 /// introduced).
 ///
-/// Applies ADR-006: the gate uses `stored < current` so any lower integer
+/// Applies SEARCH-ADR-006: the gate uses `stored < current` so any lower integer
 /// version forces a self-heal rebuild.  An inverted or mis-wired numeric
 /// comparison for this branch would pass all other data-version tests
 /// (forward_compat only guards the `>` direction) while silently leaving ghost
@@ -1865,7 +1865,7 @@ fn test_temporal_db_data_version_lower_integer_is_stale() {
         temporal_db_is_stale(dir.path(), head, None),
         "AD-408-4: data_version=\"0\" (valid integer < TEMPORAL_DATA_VERSION) must be \
          stale — the `stored < current` numeric gate must fire for any lower version \
-         (self-heal trigger for versioned-but-outdated pre-fix DBs, applies ADR-006)"
+         (self-heal trigger for versioned-but-outdated pre-fix DBs, applies SEARCH-ADR-006)"
     );
 }
 
@@ -3975,7 +3975,7 @@ fn test_ac_413_ad_series_comments_present() {
     );
 
     // Belt-and-suspenders: every file also must not have any bare #NEW markers
-    // (ADR-004: no phantom tickets; real numbers only).
+    // (SEARCH-ADR-004: no phantom tickets; real numbers only).
     for (name, src) in &[
         ("staleness.rs", staleness_src),
         ("gitdir.rs", gitdir_src),
@@ -3988,7 +3988,7 @@ fn test_ac_413_ad_series_comments_present() {
     ] {
         assert!(
             !src.contains("#NEW"),
-            "ADR-004: {name} must not contain #NEW placeholder tickets"
+            "SEARCH-ADR-004: {name} must not contain #NEW placeholder tickets"
         );
     }
 }

@@ -246,7 +246,7 @@ impl AstIndexBuilder {
         node_count: u32,
         metrics: StructuralMetrics,
     ) -> Result<()> {
-        // ── FileId guards (mirrors lexical builder, ADR-001) ────────────────
+        // ── FileId guards (mirrors lexical builder, SEARCH-ADR-001) ────────────────
         if self.seen_file_ids.contains(&id.0) {
             return Err(SearchError::InvalidQuery(format!(
                 "duplicate FileId: {}",

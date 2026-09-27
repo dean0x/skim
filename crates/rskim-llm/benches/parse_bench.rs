@@ -1,9 +1,9 @@
 //! Criterion benchmark for rskim-llm parse+classify+serialize pipeline.
 //!
-//! # Relative linearity baseline (ADR-003/AC14)
+//! # Relative linearity baseline (L3-ADR-003/AC14)
 //!
 //! This benchmark RECORDS the absolute parse+classify+serialize times across
-//! 100KB / 1MB / 10MB tool-result-heavy bodies. Per ADR-003, the absolute
+//! 100KB / 1MB / 10MB tool-result-heavy bodies. Per L3-ADR-003, the absolute
 //! <=1ms/100KB figure is a baseline, NOT a pass/fail gate (1ms is within
 //! CI-runner noise).
 //!

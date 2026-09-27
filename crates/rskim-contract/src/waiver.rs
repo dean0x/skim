@@ -34,10 +34,10 @@
 /// Verified by `debug_assert_eq!(marker.len(), MARKER_BYTES)` in `apply_reorder`
 /// and the `marker_bytes_constant_is_correct` unit test — the string is 37 bytes.
 ///
-/// **Plan/AC15 supersession note (ADR-003):** the 301 plan, risk table, and
+/// **Plan/AC15 supersession note (L3-ADR-003):** the 301 plan, risk table, and
 /// DECISIONS-RESOLVED.md Decision 7 cited `MARKER_BYTES = 38` as an estimate.
 /// The verified compact-serialization length is 37 bytes; 37 supersedes 38 per
-/// ADR-003 (numeric criteria must trace to a measured basis, not an invented figure).
+/// L3-ADR-003 (numeric criteria must trace to a measured basis, not an invented figure).
 /// The code is correct; the plan figure was off by one.
 pub const MARKER_BYTES: usize = 37;
 
