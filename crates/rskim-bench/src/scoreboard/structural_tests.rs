@@ -995,6 +995,15 @@ fn oracle_uses_only_pattern_names_from_skim() {
 }
 
 #[test]
+fn the_structural_scoring_module_is_independent_too() {
+    // structural_metrics.rs turns the oracle's answers and skim's rows into
+    // the structural checks: the same rule applies to it.
+    let src = include_str!("structural_metrics.rs");
+    assert_eq!(independence_violations(src), Vec::<String>::new());
+    assert!(strip_line_comments(src).contains("StructuralOracle"));
+}
+
+#[test]
 fn independence_check_catches_imports_and_ignores_comments() {
     let bad = [
         "use rskim_search::ast_index::linearize_source;",

@@ -26,6 +26,9 @@
 //! - [`structural`] — the structural oracle for `--ast` patterns (#541):
 //!   tree-sitter queries encoding each catalog description, the nested-loop
 //!   intent oracles, and the oracle's own AST language table and size cap.
+//! - [`structural_metrics`] — scores skim's `--ast` answers against the
+//!   structural oracle: rows split by language, the `structural.*` HARD
+//!   checks, the per-entry measurements, `uncovered_patterns`.
 //! - [`types`] — what a skim invocation returns (rows, pages, stats) and the
 //!   HARD-check vocabulary.
 //! - [`runner`] — runs the skim CLI as a sandboxed, time-bounded subprocess:
@@ -54,6 +57,7 @@ pub mod pipeline;
 pub mod report;
 pub mod runner;
 pub mod structural;
+pub mod structural_metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 pub mod types;

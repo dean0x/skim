@@ -10,6 +10,7 @@
 //! scoreboard check [same flags]           # run + gate against baseline.json / known_failures.toml
 //! scoreboard bless --from report.json [--data-dir D] [--accept-regression "<reason>"]
 //! scoreboard golden-gen --corpus NAME [--corpus-dir D] [--data-dir D]   # TOML proposal on stdout
+//! scoreboard golden-gen --corpus NAME --ast [--skim-bin P] [...]         # [[ast]] proposal (runs skim)
 //! ```
 //!
 //! # Exit codes
@@ -19,8 +20,9 @@
 //! - `1` — gate failure (`check`), or `bless` refused.
 //! - `2` — harness error: clone verification, golden integrity, an invalid
 //!   data file, a skim crash / timeout / unparsable output, temporal data
-//!   skim reports unusable for entries that rank by it, a corpus changed by
-//!   the run. A harness error is never reported as a regression, and leaves
+//!   skim reports unusable for entries that rank by it, a vacuous `[[ast]]`
+//!   entry, a structural oracle failure, a corpus changed by the run. A
+//!   harness error is never reported as a regression, and leaves
 //!   no `report.json` / `report.md` in `--out` (`run` / `check` remove the
 //!   previous ones first).
 
@@ -38,6 +40,8 @@ use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
 use rskim_bench::scoreboard::report::{GateStatus, Report, clear_outputs, total, write_outputs};
 use rskim_bench::scoreboard::runner::{SkimRunner, SkimSandbox};
+use rskim_bench::scoreboard::structural::StructuralOracle;
+use rskim_bench::scoreboard::structural_metrics::OracleAnswers;
 use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
 
 const EXIT_PASS: u8 = 0;
@@ -64,8 +68,9 @@ enum Command {
     Check(EngineArgs),
     /// Rewrite baseline.json from a report.json (e.g. the CI artifact).
     Bless(BlessArgs),
-    /// Print candidate `[[ident]]` entries for one corpus (a proposal to review
-    /// and freeze in `golden/<corpus>.toml`; never run in CI).
+    /// Print candidate `[[ident]]` entries for one corpus — or, with `--ast`,
+    /// candidate `[[ast]]` entries (a proposal to review and freeze in
+    /// `golden/<corpus>.toml`; never run in CI).
     GoldenGen(GoldenGenArgs),
 }
 
@@ -122,6 +127,16 @@ struct GoldenGenArgs {
     /// The data dir holding corpora.toml.
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
+
+    /// Propose `[[ast]]` entries instead of `[[ident]]` ones: runs the
+    /// structural oracle and skim's `--ast <pattern>` (so it needs
+    /// `--skim-bin`).
+    #[arg(long)]
+    ast: bool,
+
+    /// The skim binary `--ast` calls.
+    #[arg(long, default_value = DEFAULT_SKIM_BIN)]
+    skim_bin: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +263,16 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
         .tempdir()
         .context("creating the isolated HOME")?;
     let universe = Universe::compute(&root, &GitIsolation::new(home.path()))?;
+    if args.ast {
+        return golden_gen_ast(
+            args,
+            &spec.name,
+            &spec.commit,
+            &root,
+            &universe,
+            home.path(),
+        );
+    }
     let candidates = golden_gen::generate(&spec.name, &universe, golden_gen::GENERATED_PER_CORPUS)?;
 
     println!(
@@ -263,6 +288,52 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
         "scoreboard: golden-gen {}: {} candidate(s) over {} universe file(s)",
         spec.name,
         candidates.len(),
+        universe.len()
+    );
+    Ok(EXIT_PASS)
+}
+
+/// `golden-gen --ast`: run the structural oracle over the universe, call
+/// skim once per pattern with a covered language present in the corpus
+/// (sandboxed under `home`, as in `run`), and print the non-vacuous
+/// `[[ast]]` entries.
+fn golden_gen_ast(
+    args: &GoldenGenArgs,
+    corpus: &str,
+    commit: &str,
+    root: &std::path::Path,
+    universe: &Universe,
+    home: &std::path::Path,
+) -> anyhow::Result<u8> {
+    let skim_bin = std::fs::canonicalize(&args.skim_bin).with_context(|| {
+        format!(
+            "skim binary {} not found (build it with `cargo build --release -p rskim`, or pass --skim-bin)",
+            args.skim_bin.display()
+        )
+    })?;
+    let oracle = StructuralOracle::new().context("compiling the structural oracle")?;
+    let answers = OracleAnswers::compute(&oracle, universe.files()).context("structural oracle")?;
+    let runner = SkimRunner::new(skim_bin, SkimSandbox::new(home));
+    runner.build(root)?;
+    let mut skim = std::collections::BTreeMap::new();
+    for pattern in golden_gen::ast_patterns_to_query(&answers) {
+        let (page, _) = runner
+            .ast_list(root, pattern)
+            .with_context(|| format!("--ast {pattern}"))?;
+        skim.insert(pattern.to_string(), page.page);
+    }
+    let candidates = golden_gen::generate_ast(corpus, &answers, &skim)?;
+
+    println!(
+        "# golden-gen --ast proposal for corpus {corpus} at {commit} ({} entr{}; review, then freeze in golden/{corpus}.toml)",
+        candidates.len(),
+        if candidates.len() == 1 { "y" } else { "ies" }
+    );
+    print!("{}", golden_gen::render_ast_toml(&candidates));
+    eprintln!(
+        "scoreboard: golden-gen --ast {corpus}: {} candidate(s) from {} pattern call(s) over {} universe file(s)",
+        candidates.len(),
+        skim.len(),
         universe.len()
     );
     Ok(EXIT_PASS)

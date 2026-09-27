@@ -7,7 +7,8 @@ use crate::scoreboard::baseline::{Baseline, BaselineCorpus, HardState};
 use crate::scoreboard::golden::parse_golden;
 use crate::scoreboard::metrics::plan;
 use crate::scoreboard::report::{
-    CorpusInfo, CoverageReport, FailureKind, GateStatus, SkippedByReason, UniverseReport,
+    CorpusInfo, CoverageReport, FailureKind, GateStatus, SkippedByReason, StructuralReport,
+    UniverseReport,
 };
 
 // --- ledger ---------------------------------------------------------------------
@@ -198,6 +199,81 @@ fn a_ledger_ref_to_a_check_that_never_runs_on_its_entry_is_rejected() {
     );
 }
 
+#[test]
+fn structural_checks_are_ledgered_by_check_and_id_like_every_hard_check() {
+    let l = Ledger::parse(
+        r##"
+[[xfail]]
+issue = "#546"
+check = "structural.precision"
+ids = ["skim-ast-try-catch-finally-javascript"]
+"##,
+    )
+    .unwrap();
+    let id = "skim-ast-try-catch-finally-javascript";
+    assert_eq!(l.issue(CheckId::StructuralPrecision, id), Some("#546"));
+    assert_eq!(l.issue(CheckId::StructuralRecall, id), None);
+    let records = apply_ledger(
+        &[
+            (
+                id.to_string(),
+                CheckId::StructuralPrecision,
+                CheckOutcome::fail("1 returned file(s) with no oracle match"),
+            ),
+            (
+                id.to_string(),
+                CheckId::StructuralRecall,
+                CheckOutcome::Pass,
+            ),
+        ],
+        &l,
+    );
+    assert_eq!(
+        (records[0].outcome, records[1].outcome),
+        (Outcome::Xfail, Outcome::Pass)
+    );
+    let fixed = apply_ledger(
+        &[(
+            id.to_string(),
+            CheckId::StructuralPrecision,
+            CheckOutcome::Pass,
+        )],
+        &l,
+    );
+    assert_eq!(fixed[0].outcome, Outcome::Xpass, "a fix asks for promotion");
+}
+
+#[test]
+fn structural_precision_cannot_be_ledgered_on_a_ratchet_class_entry() {
+    let golden = parse_golden(
+        "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
+         [[ast]]\nid = \"skim-A1\"\npattern = \"rust-nested-loop\"\nlang = \"rust\"\nprecision = \"ratchet\"\n\
+         [[ast]]\nid = \"skim-A2\"\npattern = \"try-catch\"\nlang = \"typescript\"\nprecision = \"hard\"\n",
+    )
+    .unwrap();
+    let plan = plan(&golden).unwrap();
+    let refs = [
+        LedgerRef {
+            check: CheckId::StructuralPrecision,
+            id: "skim-A1",
+        },
+        LedgerRef {
+            check: CheckId::StructuralPrecision,
+            id: "skim-A2",
+        },
+        LedgerRef {
+            check: CheckId::StructuralRecall,
+            id: "skim-A1",
+        },
+    ];
+    let v = unplanned_ledger_refs(&refs, &plan);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(
+        v[0].contains("structural.precision") && v[0].contains("skim-A1"),
+        "a ratchet-class entry's precision is a RATCHET value: {v:?}"
+    );
+}
+
 // --- gate -------------------------------------------------------------------------
 
 fn record(id: &str, check: CheckId, outcome: Outcome, detail: Option<&str>) -> CheckRecord {
@@ -231,6 +307,7 @@ fn corpus(name: &str, checks: Vec<CheckRecord>, ratchet: &[(&str, f64)]) -> Corp
         },
         checks,
         ratchet: ratchet.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        structural: StructuralReport::default(),
         info: CorpusInfo {
             oracle_skipped_by_reason: BTreeMap::new(),
             unindexed_hits: BTreeMap::new(),

@@ -417,7 +417,8 @@ mod tests {
     use super::*;
     use crate::scoreboard::report::{
         AggregateReport, CheckRecord, CorpusInfo, CorpusReport, CoverageReport, GateReport,
-        GateStatus, LatencyReport, REPORT_SCHEMA, SkippedByReason, UniverseReport,
+        GateStatus, LatencyReport, REPORT_SCHEMA, SkippedByReason, StructuralReport,
+        UniverseReport,
     };
     use crate::scoreboard::types::CheckId;
 
@@ -452,6 +453,7 @@ mod tests {
             },
             checks,
             ratchet: BTreeMap::from([("ident.mrr".to_string(), mrr)]),
+            structural: StructuralReport::default(),
             info: CorpusInfo {
                 oracle_skipped_by_reason: BTreeMap::new(),
                 unindexed_hits: BTreeMap::new(),
@@ -471,6 +473,7 @@ mod tests {
                 hard: BTreeMap::new(),
                 ratchet: BTreeMap::from([("ident.mrr".to_string(), mrr)]),
             },
+            uncovered_patterns: Vec::new(),
             gate: GateReport {
                 status: GateStatus::Pass,
                 failures: Vec::new(),

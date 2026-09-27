@@ -11,7 +11,8 @@
 //!
 //! `report.md` is the step summary (`$GITHUB_STEP_SUMMARY`): the vision's
 //! scoreboard table (metric | bar | current | baseline | status), the gate
-//! failures, and the HARD tallies.
+//! failures, the HARD tallies, each corpus's structural (`--ast`) table, and
+//! the catalog patterns no structural entry scores.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -22,6 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::baseline::Baseline;
 use crate::scoreboard::metrics::{self, Beat, ConceptSample, IdentSample, RatchetChange};
+use crate::scoreboard::structural_metrics::{
+    CoverageComparison, StructuralSample, UncoveredCause, UncoveredPattern,
+};
 use crate::scoreboard::types::CheckId;
 
 /// `report.json` schema version; `bless` refuses any other.
@@ -50,6 +54,10 @@ pub struct Report {
     /// One entry per corpus, in `corpora.toml` order.
     pub corpora: Vec<CorpusReport>,
     pub aggregate: AggregateReport,
+    /// Catalog patterns no `[[ast]]` entry of this run scores, sorted by
+    /// name (they stay under ADR-007 manual dog-food).
+    #[serde(default)]
+    pub uncovered_patterns: Vec<UncoveredPattern>,
     pub gate: GateReport,
     /// INFO only — the one section allowed to differ between runs. Always
     /// the last key.
@@ -70,8 +78,26 @@ pub struct CorpusReport {
     pub checks: Vec<CheckRecord>,
     /// RATCHET values by metric name.
     pub ratchet: BTreeMap<String, f64>,
+    /// The `[[ast]]` entries' measurements (their HARD outcomes are in
+    /// `checks`, their RATCHET values in `ratchet`).
+    #[serde(default)]
+    pub structural: StructuralReport,
     /// INFO: never gated.
     pub info: CorpusInfo,
+}
+
+/// One corpus's structural (`--ast`) section (#541).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuralReport {
+    /// skim's `ast_coverage` next to the oracle's over-cap count; absent
+    /// when the corpus has no `[[ast]]` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageComparison>,
+    /// Per `[[ast]]` entry (corpus, pattern, lang), in golden order.
+    pub entries: Vec<StructuralSample>,
+    /// skim `--ast` rows in a language no entry scores, per pattern called.
+    pub unscored_rows: BTreeMap<String, u64>,
 }
 
 /// Oracle universe vs skim's index.
@@ -443,6 +469,22 @@ pub fn render_markdown(report: &Report, baseline: Option<&Baseline>) -> String {
                 .and_then(|b| b.corpora.get(&c.name))
                 .map(|b| &b.ratchet),
         );
+        structural_table(&mut md, &c.structural);
+    }
+
+    if !report.uncovered_patterns.is_empty() {
+        let _ = writeln!(
+            md,
+            "## Uncovered structural patterns (manual dog-food, ADR-007)\n"
+        );
+        for p in &report.uncovered_patterns {
+            let cause = match p.cause {
+                UncoveredCause::NoOracle => "no oracle",
+                UncoveredCause::NoEntry => "no entry",
+            };
+            let _ = writeln!(md, "- `{}` ({cause}): {}", p.name, md_escape(&p.reason));
+        }
+        md.push('\n');
     }
 
     let _ = writeln!(md, "## Latency (INFO, never gated)\n");
@@ -487,6 +529,63 @@ fn ratchet_table(
             fmt_value(*value),
             base.map_or_else(|| "—".to_string(), fmt_value),
             metrics::beats_baseline(name, current).map_or("—", Beat::as_str)
+        );
+    }
+    md.push('\n');
+}
+
+/// One corpus's structural table: per `[[ast]]` entry, the oracle and skim
+/// file counts, file-level recall / precision (and intent, for the nested
+/// loops), and the rows anchored on an oracle match line.
+fn structural_table(md: &mut String, s: &StructuralReport) {
+    if s.entries.is_empty() {
+        return;
+    }
+    let _ = writeln!(md, "### Structural (`--ast`)\n");
+    if let Some(c) = &s.coverage {
+        let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(" / ");
+        let _ = writeln!(
+            md,
+            "AST size cap: skim `size_excluded_files` {} · oracle over-cap {} · skim undetermined {}\n",
+            list(&c.skim_size_excluded_files),
+            c.oracle_over_cap,
+            list(&c.skim_undetermined_files)
+        );
+    }
+    let _ = writeln!(
+        md,
+        "| entry | pattern | lang | class | oracle files | skim files | recall | precision | intent recall | intent precision | line on match |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|---|");
+    let opt = |v: Option<f64>| v.map_or_else(|| "—".to_string(), fmt_value);
+    for e in &s.entries {
+        let _ = writeln!(
+            md,
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            e.id,
+            e.pattern,
+            e.lang,
+            e.precision_class.as_str(),
+            e.oracle_files,
+            e.skim_files,
+            fmt_value(e.recall),
+            fmt_value(e.precision),
+            opt(e.intent_recall),
+            opt(e.intent_precision),
+            e.line_on_match
+        );
+    }
+    let unscored: Vec<String> = s
+        .unscored_rows
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(pattern, n)| format!("{pattern} {n}"))
+        .collect();
+    if !unscored.is_empty() {
+        let _ = writeln!(
+            md,
+            "\nUnscored `--ast` rows (a language no entry scores): {}",
+            unscored.join(", ")
         );
     }
     md.push('\n');
@@ -568,6 +667,7 @@ mod tests {
                 ("ident.mrr".to_string(), 0.9),
                 ("ident.mrr.baseline_alpha".to_string(), 0.5),
             ]),
+            structural: StructuralReport::default(),
             info: CorpusInfo {
                 oracle_skipped_by_reason: BTreeMap::new(),
                 unindexed_hits: BTreeMap::new(),
@@ -584,6 +684,7 @@ mod tests {
                 ratchet: corpus.ratchet.clone(),
             },
             corpora: vec![corpus],
+            uncovered_patterns: Vec::new(),
             gate: GateReport {
                 status: GateStatus::Pass,
                 failures: Vec::new(),
@@ -623,6 +724,158 @@ mod tests {
             .unwrap()
             .replacen("\"schema\": 1", "\"schema\": 9", 1);
         assert!(Report::parse(&other).is_err());
+    }
+
+    fn structural_report() -> Report {
+        use crate::scoreboard::golden::PrecisionClass;
+        use crate::scoreboard::structural::OracleLang;
+        let mut r = minimal_report();
+        let entry =
+            |id: &str, pattern: &str, lang, intent: Option<(u64, f64, f64)>| StructuralSample {
+                id: id.to_string(),
+                pattern: pattern.to_string(),
+                lang,
+                precision_class: PrecisionClass::Hard,
+                oracle_files: 3,
+                skim_files: 4,
+                recall: 1.0,
+                precision: 0.75,
+                intent_files: intent.map(|i| i.0),
+                intent_recall: intent.map(|i| i.1),
+                intent_precision: intent.map(|i| i.2),
+                line_on_match: 2,
+            };
+        r.corpora[0].structural = StructuralReport {
+            coverage: Some(CoverageComparison {
+                oracle_over_cap: 2,
+                skim_size_excluded_files: vec![2],
+                skim_undetermined_files: vec![0],
+            }),
+            entries: vec![
+                entry(
+                    "skim-ast-rust-nested-loop-rust",
+                    "rust-nested-loop",
+                    OracleLang::Rust,
+                    Some((110, 0.9, 0.3)),
+                ),
+                entry(
+                    "skim-ast-try-catch-typescript",
+                    "try-catch",
+                    OracleLang::TypeScript,
+                    None,
+                ),
+            ],
+            unscored_rows: BTreeMap::from([
+                ("try-catch".to_string(), 0),
+                ("rust-nested-loop".to_string(), 7),
+            ]),
+        };
+        r.uncovered_patterns = vec![UncoveredPattern {
+            name: "deep-nesting".to_string(),
+            cause: UncoveredCause::NoOracle,
+            reason: "threshold | not stated".to_string(),
+        }];
+        r
+    }
+
+    #[test]
+    fn the_structural_section_carries_the_ac4_fields_and_omits_absent_intent() {
+        let r = structural_report();
+        let json: serde_json::Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+        let entries = &json["corpora"][0]["structural"]["entries"];
+        let nested = entries[0].as_object().unwrap();
+        for key in [
+            "oracle_files",
+            "skim_files",
+            "recall",
+            "precision",
+            "intent_recall",
+            "intent_precision",
+            "line_on_match",
+        ] {
+            assert!(nested.contains_key(key), "{key}");
+        }
+        let plain = entries[1].as_object().unwrap();
+        for key in ["intent_files", "intent_recall", "intent_precision"] {
+            assert!(!plain.contains_key(key), "{key} is omitted when None");
+        }
+        assert_eq!(
+            json["corpora"][0]["structural"]["coverage"]["oracle_over_cap"],
+            2
+        );
+        assert_eq!(
+            json["uncovered_patterns"][0],
+            serde_json::json!({"name": "deep-nesting", "cause": "no_oracle", "reason": "threshold | not stated"})
+        );
+        // Unscored rows serialize in key order, whatever the insertion order.
+        let unscored: Vec<&String> = json["corpora"][0]["structural"]["unscored_rows"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(unscored, ["rust-nested-loop", "try-catch"]);
+        // latency stays the last key.
+        let top: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(top.last().map(|k| k.as_str()), Some("latency"));
+    }
+
+    #[test]
+    fn a_structural_report_round_trips_byte_for_byte() {
+        let r = structural_report();
+        let first = r.to_json().unwrap();
+        assert_eq!(Report::parse(&first).unwrap(), r);
+        assert_eq!(Report::parse(&first).unwrap().to_json().unwrap(), first);
+        assert_eq!(structural_report().to_json().unwrap(), first);
+        // A corpus with no [[ast]] entry has no coverage key.
+        let plain = minimal_report().to_json().unwrap();
+        assert!(!plain.contains("oracle_over_cap"), "{plain}");
+    }
+
+    #[test]
+    fn a_report_from_before_the_structural_section_still_parses() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&minimal_report().to_json().unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("uncovered_patterns");
+        json["corpora"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("structural");
+        let parsed = Report::parse(&json.to_string()).unwrap();
+        assert_eq!(parsed, minimal_report());
+    }
+
+    #[test]
+    fn markdown_shows_each_corpus_structural_table_and_the_uncovered_patterns() {
+        let md = render_markdown(&structural_report(), None);
+        assert!(md.contains("### Structural (`--ast`)"), "{md}");
+        assert!(
+            md.contains("AST size cap: skim `size_excluded_files` 2 · oracle over-cap 2"),
+            "{md}"
+        );
+        let row = md
+            .lines()
+            .find(|l| l.starts_with("| `skim-ast-rust-nested-loop-rust` "))
+            .unwrap();
+        assert_eq!(
+            row,
+            "| `skim-ast-rust-nested-loop-rust` | rust-nested-loop | rust | hard | 3 | 4 | 1 | 0.7500 | 0.9000 | 0.3000 | 2 |"
+        );
+        let plain = md
+            .lines()
+            .find(|l| l.starts_with("| `skim-ast-try-catch-typescript` "))
+            .unwrap();
+        assert!(plain.ends_with("| — | — | 2 |"), "{plain}");
+        assert!(
+            md.contains("Unscored `--ast` rows (a language no entry scores): rust-nested-loop 7")
+        );
+        assert!(md.contains("## Uncovered structural patterns"), "{md}");
+        assert!(
+            md.contains("- `deep-nesting` (no oracle): threshold \\| not stated"),
+            "{md}"
+        );
+        // No structural section without [[ast]] entries.
+        let plain_md = render_markdown(&minimal_report(), None);
+        assert!(!plain_md.contains("Structural"), "{plain_md}");
     }
 
     #[test]

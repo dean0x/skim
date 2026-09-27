@@ -133,6 +133,22 @@ impl FromStr for OracleLang {
     }
 }
 
+/// Serialized as [`OracleLang::as_str`] (golden `lang`, report fields).
+impl serde::Serialize for OracleLang {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Parsed from [`OracleLang::as_str`] names only, so a golden `lang` the
+/// oracle has no grammar for fails the load.
+impl<'de> serde::Deserialize<'de> for OracleLang {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// How skim treats a file's language on the `--ast` path, by extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LangClass {
@@ -542,6 +558,50 @@ pub fn query_sources() -> Vec<QuerySource> {
         .collect();
     out.sort_by(|a, b| (a.pattern, a.lang.as_str()).cmp(&(b.pattern, b.lang.as_str())));
     out
+}
+
+/// A canonical rendering of everything besides the grammars that decides
+/// the oracle's answers: every registered query (file name, post-filter,
+/// full text), every intent spec, and the size cap. The golden digest folds
+/// it in (`golden::structural_oracle_sha256`), so editing a query, a
+/// post-filter threshold or an intent's node kinds forces a re-bless.
+pub fn fingerprint() -> String {
+    let mut queries: Vec<&OracleQuery> = QUERIES.iter().collect();
+    queries.sort_by(|a, b| (a.pattern, a.lang.as_str()).cmp(&(b.pattern, b.lang.as_str())));
+    let mut out = format!("size-cap {AST_SIZE_CAP_BYTES}\n");
+    for q in queries {
+        let filter = match q.filter {
+            None => "none".to_string(),
+            Some(PostFilter::Empty { capture }) => format!("empty @{capture}"),
+            Some(PostFilter::AtLeast { capture, min }) => format!("at-least {min} @{capture}"),
+        };
+        out.push_str(&format!(
+            "query {}.{}.scm filter {filter} bytes {}\n{}\n",
+            q.pattern,
+            q.lang,
+            q.source.len(),
+            q.source
+        ));
+    }
+    for spec in INTENTS {
+        let langs: Vec<&str> = spec.langs.iter().map(|l| l.as_str()).collect();
+        out.push_str(&format!(
+            "intent {} langs [{}] loops [{}] boundaries [{}]\n",
+            spec.pattern,
+            langs.join(" "),
+            spec.loop_kinds.join(" "),
+            spec.boundary_kinds.join(" ")
+        ));
+    }
+    out
+}
+
+/// Whether the oracle answers the intent of `pattern` in `lang` (see
+/// [`INTENTS`]).
+pub fn has_intent(pattern: &str, lang: OracleLang) -> bool {
+    INTENTS
+        .iter()
+        .any(|spec| spec.pattern == pattern && spec.langs.contains(&lang))
 }
 
 /// Whether the oracle covers a catalog pattern, and why not if it does not.

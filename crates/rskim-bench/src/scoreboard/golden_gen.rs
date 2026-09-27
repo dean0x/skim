@@ -1,5 +1,5 @@
-//! `golden-gen`: candidate `[[ident]]` entries for a corpus's golden file
-//! (#203).
+//! `golden-gen`: candidate `[[ident]]` entries (#203) and, with `--ast`,
+//! candidate `[[ast]]` entries (#541) for a corpus's golden file.
 //!
 //! The output is a proposal. It is reviewed, pasted into
 //! `golden/<corpus>.toml` and frozen there; the committed golden file is the
@@ -21,6 +21,14 @@
 //! `rskim_core::Language` appears here only as `extract_symbols`' dispatch
 //! key, chosen from this module's own extension table; nothing here calls
 //! `Language::from_extension`, and nothing here scores skim.
+//!
+//! `[[ast]]` selection ([`generate_ast`]): every `(pattern, language)` the
+//! structural oracle covers, where the corpus has files of that language in
+//! its AST universe and the entry is non-vacuous (the oracle matches a file,
+//! or skim's `--ast <pattern>` returns a row in that language). The proposed
+//! precision class is `hard` when the catalog marks the pattern `exact`,
+//! `ratchet` otherwise ([`proposed_class`]); once frozen in the golden file,
+//! the class is never re-read from the catalog.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -29,8 +37,11 @@ use anyhow::Context;
 use rskim_search::SearchField;
 
 use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
-use crate::scoreboard::golden::{DefSite, hex_sha256};
+use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
+use crate::scoreboard::structural::{self, OracleLang, PatternCoverage};
+use crate::scoreboard::structural_metrics::{OracleAnswers, rows_in};
+use crate::scoreboard::types::ResultPage;
 use crate::scoreboard::universe::Universe;
 
 /// Generated identifier entries per corpus.
@@ -226,6 +237,128 @@ pub fn render_toml(corpus: &str, candidates: &[Candidate]) -> String {
             toml_string(&c.name),
             toml_string(&c.def.path),
             c.def.line,
+        ));
+    }
+    out
+}
+
+// ============================================================================
+// [[ast]] candidates
+// ============================================================================
+
+/// One proposed `[[ast]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AstCandidate {
+    pub id: String,
+    pub pattern: String,
+    pub lang: OracleLang,
+    pub precision: PrecisionClass,
+    /// Files the oracle matches in `lang` (for the reviewer).
+    pub oracle_files: usize,
+    /// Distinct files skim's `--ast <pattern>` returns in `lang`.
+    pub skim_files: usize,
+}
+
+/// An `[[ast]]` id: `<corpus>-ast-<pattern>-<lang>`. It names the pair, not
+/// a position, so regenerating never renumbers an id the ledger or the
+/// baseline holds.
+pub fn ast_id(corpus: &str, pattern: &str, lang: OracleLang) -> String {
+    format!("{corpus}-ast-{pattern}-{lang}")
+}
+
+/// The class `golden-gen` proposes: `hard` when the catalog marks `pattern`
+/// `exact` (its n-grams are a reliable subset of every occurrence), else
+/// `ratchet`. The gate never calls this: the class is frozen in golden.
+pub fn proposed_class(pattern: &str) -> PrecisionClass {
+    let exact = rskim_search::all_patterns()
+        .iter()
+        .any(|p| p.name == pattern && p.exact);
+    if exact {
+        PrecisionClass::Hard
+    } else {
+        PrecisionClass::Ratchet
+    }
+}
+
+/// Every covered `(pattern, language)` whose language has files in the
+/// corpus's AST universe, ordered by `(pattern, language name)`.
+fn present_pairs(answers: &OracleAnswers) -> Vec<(&'static str, OracleLang)> {
+    let mut pairs: Vec<(&'static str, OracleLang)> = structural::catalog_coverage()
+        .into_iter()
+        .filter_map(|(pattern, coverage)| match coverage {
+            PatternCoverage::Covered { langs } => Some((pattern, langs)),
+            PatternCoverage::Uncovered { .. } => None,
+        })
+        .flat_map(|(pattern, langs)| langs.into_iter().map(move |lang| (pattern, lang)))
+        .filter(|&(_, lang)| answers.scored_files(lang) > 0)
+        .collect();
+    pairs.sort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
+    pairs
+}
+
+/// The patterns `golden-gen --ast` calls skim for: those with a covered
+/// language present in the corpus, sorted.
+pub fn ast_patterns_to_query(answers: &OracleAnswers) -> Vec<&'static str> {
+    let mut patterns: Vec<&'static str> = present_pairs(answers)
+        .into_iter()
+        .map(|(pattern, _)| pattern)
+        .collect();
+    patterns.dedup();
+    patterns
+}
+
+/// Propose `[[ast]]` entries (see the module docs). `skim` holds skim's
+/// `--ast <pattern>` full list per pattern called; a pattern not in it
+/// counts as no rows.
+///
+/// # Errors
+///
+/// A covered pair the oracle has no answer for (an oracle bug).
+pub fn generate_ast(
+    corpus: &str,
+    answers: &OracleAnswers,
+    skim: &BTreeMap<String, ResultPage>,
+) -> anyhow::Result<Vec<AstCandidate>> {
+    let mut out = Vec::new();
+    for (pattern, lang) in present_pairs(answers) {
+        let oracle_files = answers.definition(pattern, lang)?.len();
+        let skim_files = skim.get(pattern).map_or(0, |page| {
+            rows_in(page, lang)
+                .rows
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        });
+        if oracle_files == 0 && skim_files == 0 {
+            continue;
+        }
+        out.push(AstCandidate {
+            id: ast_id(corpus, pattern, lang),
+            pattern: pattern.to_string(),
+            lang,
+            precision: proposed_class(pattern),
+            oracle_files,
+            skim_files,
+        });
+    }
+    Ok(out)
+}
+
+/// TOML `[[ast]]` entries for `candidates`, each preceded by a review
+/// comment with the oracle's and skim's file counts.
+pub fn render_ast_toml(candidates: &[AstCandidate]) -> String {
+    let mut out = String::new();
+    for c in candidates {
+        out.push_str(&format!(
+            "\n# golden-gen: oracle files {}; skim files {}\n\
+             [[ast]]\nid = {}\npattern = {}\nlang = {}\nprecision = {}\n",
+            c.oracle_files,
+            c.skim_files,
+            toml_string(&c.id),
+            toml_string(&c.pattern),
+            toml_string(c.lang.as_str()),
+            toml_string(c.precision.as_str()),
         ));
     }
     out
@@ -542,6 +675,158 @@ mod tests {
                 corpus: "skim",
                 commit: &sha,
                 universe: Some(&universe),
+                ledger: &[],
+            },
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    // --- [[ast]] candidates --------------------------------------------------------
+
+    fn ast_answers(files: &[(&str, &str)]) -> OracleAnswers {
+        let oracle = crate::scoreboard::structural::StructuralOracle::new().unwrap();
+        OracleAnswers::compute(&oracle, files.iter().copied()).unwrap()
+    }
+
+    fn skim_rows(paths: &[&str]) -> ResultPage {
+        ResultPage {
+            rows: paths
+                .iter()
+                .map(|p| crate::scoreboard::types::ResultRow {
+                    path: p.to_string(),
+                    score: 1.0,
+                    line: Some(1),
+                    snippet: Vec::new(),
+                })
+                .collect(),
+            has_more: false,
+            verify_mode: crate::scoreboard::types::VerifyMode::Substring,
+            degraded: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ast_ids_name_the_pattern_and_language_pair() {
+        assert_eq!(
+            ast_id("zod", "try-catch", OracleLang::Tsx),
+            "zod-ast-try-catch-tsx"
+        );
+        assert_eq!(
+            ast_id("skim", "rust-nested-loop", OracleLang::Rust),
+            "skim-ast-rust-nested-loop-rust"
+        );
+    }
+
+    #[test]
+    fn the_proposed_class_follows_the_catalog_exact_flag() {
+        assert_eq!(proposed_class("try-catch"), PrecisionClass::Hard);
+        assert_eq!(proposed_class("try-catch-finally"), PrecisionClass::Hard);
+        assert_eq!(proposed_class("rust-nested-loop"), PrecisionClass::Ratchet);
+        assert_eq!(proposed_class("call-in-loop"), PrecisionClass::Ratchet);
+        assert_eq!(proposed_class("no-such-pattern"), PrecisionClass::Ratchet);
+    }
+
+    #[test]
+    fn ast_candidates_are_the_non_vacuous_pairs_of_the_corpus_languages() {
+        let answers = ast_answers(&[
+            (
+                "src/nested.rs",
+                "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {}\n    }\n}\n",
+            ),
+            ("web/a.ts", "try {\n  go();\n} catch (e) {}\n"),
+            // A try/finally wrapping a separate try/catch: no single try
+            // carries both clauses (the #546 shape).
+            (
+                "web/b.js",
+                "try { try { a(); } catch (e) {} } finally { b(); }\n",
+            ),
+        ]);
+        // Only patterns with a covered language present in the corpus.
+        let patterns = ast_patterns_to_query(&answers);
+        assert!(patterns.windows(2).all(|w| w[0] < w[1]), "{patterns:?}");
+        assert!(patterns.contains(&"try-catch-finally"));
+        assert!(patterns.contains(&"rust-nested-loop"));
+        assert!(!patterns.contains(&"go-select"), "no Go file");
+        assert!(!patterns.contains(&"python-try-except"), "no Python file");
+
+        // skim returns the JS file for try-catch-finally although the oracle
+        // does not match it: a skim-only entry is non-vacuous and proposed.
+        let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/b.js"]))]);
+        let got = generate_ast("skim", &answers, &skim).unwrap();
+        let pairs: Vec<(&str, &str, usize, usize)> = got
+            .iter()
+            .map(|c| {
+                (
+                    c.pattern.as_str(),
+                    c.lang.as_str(),
+                    c.oracle_files,
+                    c.skim_files,
+                )
+            })
+            .collect();
+        assert!(
+            pairs.contains(&("try-catch-finally", "javascript", 0, 1)),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("rust-nested-loop", "rust", 1, 0)),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("try-catch", "typescript", 1, 0)),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("try-catch", "javascript", 1, 0)),
+            "{pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|p| p.0 == "god-function"),
+            "vacuous: neither the oracle nor skim finds one: {pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|p| p.1 == "tsx"),
+            "no .tsx file in the corpus: {pairs:?}"
+        );
+        let mut sorted = pairs.clone();
+        sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        assert_eq!(pairs, sorted, "ordered by (pattern, language name)");
+        assert_eq!(generate_ast("skim", &answers, &skim).unwrap(), got);
+    }
+
+    #[test]
+    fn rendered_ast_candidates_are_integrity_clean_golden_entries() {
+        let answers = ast_answers(&[("web/a.ts", "try {\n  go();\n} catch (e) {}\n")]);
+        let got = generate_ast("skim", &answers, &BTreeMap::new()).unwrap();
+        assert!(!got.is_empty());
+        let golden = parse_golden(&format!(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n{}",
+            render_ast_toml(&got)
+        ))
+        .unwrap();
+        assert_eq!(golden.asts.len(), got.len());
+        for (entry, candidate) in golden.asts.iter().zip(&got) {
+            assert_eq!(
+                (
+                    entry.id.as_str(),
+                    entry.pattern.as_str(),
+                    entry.lang,
+                    entry.precision
+                ),
+                (
+                    candidate.id.as_str(),
+                    candidate.pattern.as_str(),
+                    candidate.lang,
+                    candidate.precision
+                )
+            );
+        }
+        let violations = check_integrity(
+            &golden,
+            &IntegrityContext {
+                corpus: "skim",
+                commit: "b8a0a79463382347820f1c2572bde37b68e87c76",
+                universe: None,
                 ledger: &[],
             },
         );

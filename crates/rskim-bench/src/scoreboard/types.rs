@@ -262,6 +262,91 @@ fn parse_degraded(value: &Value) -> anyhow::Result<Degraded> {
 }
 
 // ============================================================================
+// Standalone --ast: rows plus ast_coverage
+// ============================================================================
+
+/// The size-cap accounting a standalone `--ast` envelope carries in
+/// `ast_coverage` (`AstJsonEnvelope`,
+/// `crates/rskim-search/src/compound/output.rs:204-225`; the struct is
+/// `rskim_search::AstCoverage`, `crates/rskim-search/src/ast_index/coverage.rs:81-97`).
+///
+/// skim omits the key when the coverage is clean — no size-excluded and no
+/// undetermined file (`skip_serializing_if`, AD-405-3 / AC-405-9,
+/// `crates/rskim/src/cmd/search/ast.rs:658-670`) — so an absent or `null`
+/// key reads as all-zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AstCoverage {
+    /// Indexed files in an AST-participating language over the AST size cap
+    /// (the authoritative total).
+    pub size_excluded_files: u64,
+    /// Indexed files whose size or language skim could not determine.
+    pub undetermined_files: u64,
+    /// `size_excluded_files` by skim language name.
+    pub excluded_by_lang: BTreeMap<String, u64>,
+}
+
+impl AstCoverage {
+    /// Read `ast_coverage` from a standalone `--ast` envelope.
+    ///
+    /// # Errors
+    ///
+    /// `ast_coverage` is present but not an object, lacks an integer
+    /// `size_excluded_files` / `undetermined_files`, or has a non-integer
+    /// `excluded_by_lang` count.
+    pub fn from_envelope(envelope: &Value) -> anyhow::Result<Self> {
+        let obj = as_object(envelope, "skim output")?;
+        let Some(coverage) = obj.get("ast_coverage").filter(|v| !v.is_null()) else {
+            return Ok(AstCoverage::default());
+        };
+        let coverage = as_object(coverage, "ast_coverage")?;
+        let count = |key: &str| {
+            coverage
+                .get(key)
+                .and_then(Value::as_u64)
+                .with_context(|| format!("ast_coverage has no integer `{key}`"))
+        };
+        let excluded_by_lang = match coverage.get("excluded_by_lang") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(v) => as_object(v, "ast_coverage.excluded_by_lang")?
+                .iter()
+                .map(|(lang, n)| {
+                    n.as_u64().map(|n| (lang.clone(), n)).with_context(|| {
+                        format!("ast_coverage.excluded_by_lang.{lang} is not an integer")
+                    })
+                })
+                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
+        };
+        Ok(AstCoverage {
+            size_excluded_files: count("size_excluded_files")?,
+            undetermined_files: count("undetermined_files")?,
+            excluded_by_lang,
+        })
+    }
+}
+
+/// One standalone `--ast <pattern>` answer: its rows and its coverage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AstPage {
+    pub page: ResultPage,
+    pub coverage: AstCoverage,
+}
+
+impl AstPage {
+    /// Parse a standalone `--ast` envelope.
+    ///
+    /// # Errors
+    ///
+    /// As [`ResultPage::from_json`] for [`Arm::Ast`], and
+    /// [`AstCoverage::from_envelope`].
+    pub fn from_json(value: &Value) -> anyhow::Result<Self> {
+        Ok(AstPage {
+            page: ResultPage::from_json(Arm::Ast, value)?,
+            coverage: AstCoverage::from_envelope(value)?,
+        })
+    }
+}
+
+// ============================================================================
 // --stats --json
 // ============================================================================
 
@@ -388,6 +473,9 @@ pub enum EntryKind {
     Lexical,
     Pagination,
     Prefix,
+    /// `[[ast]]`: one catalog pattern in one oracle language, scored against
+    /// the structural oracle (#541).
+    Ast,
 }
 
 /// A HARD check (tolerance 0; the ledger in `known_failures.toml` names
@@ -419,6 +507,15 @@ pub enum CheckId {
     /// No path appears twice within one list: the full list, a `--limit`
     /// list, or one page of a sweep.
     ResultsUniquePaths,
+    /// `[[ast]]`: every file the structural oracle matches in the entry's
+    /// language is returned (file-level recall 1.0).
+    StructuralRecall,
+    /// `[[ast]]` with `precision = "hard"`: every returned file of the
+    /// entry's language is an oracle match (file-level precision 1.0).
+    StructuralPrecision,
+    /// `[[ast]]`: the call's `ast_coverage.size_excluded_files` equals the
+    /// oracle's own over-cap count, and nothing is undetermined.
+    StructuralCoverage,
 }
 
 impl CheckId {
@@ -435,6 +532,9 @@ impl CheckId {
         CheckId::OrderPrefixConsistent,
         CheckId::OrderScoreMonotone,
         CheckId::ResultsUniquePaths,
+        CheckId::StructuralRecall,
+        CheckId::StructuralPrecision,
+        CheckId::StructuralCoverage,
     ];
 
     /// The dotted name used in reports and the ledger.
@@ -451,6 +551,9 @@ impl CheckId {
             CheckId::OrderPrefixConsistent => "order.prefix_consistent",
             CheckId::OrderScoreMonotone => "order.score_monotone",
             CheckId::ResultsUniquePaths => "results.unique_paths",
+            CheckId::StructuralRecall => "structural.recall",
+            CheckId::StructuralPrecision => "structural.precision",
+            CheckId::StructuralCoverage => "structural.coverage",
         }
     }
 
@@ -464,12 +567,17 @@ impl CheckId {
             | CheckId::PaginationOrdered
             | CheckId::PaginationHasMoreHonest => kind == EntryKind::Pagination,
             CheckId::OrderPrefixConsistent => kind == EntryKind::Prefix,
+            // An `[[ast]]` entry is judged by the structural oracle; the
+            // standalone `--ast` arm's ordering is `[[prefix]]` territory.
             CheckId::LexicalRecall
             | CheckId::LexicalPrecision
             | CheckId::LexicalSilentFn
             | CheckId::LexicalVerifyMode
-            | CheckId::OrderScoreMonotone
-            | CheckId::ResultsUniquePaths => true,
+            | CheckId::OrderScoreMonotone => kind != EntryKind::Ast,
+            CheckId::ResultsUniquePaths => true,
+            CheckId::StructuralRecall
+            | CheckId::StructuralPrecision
+            | CheckId::StructuralCoverage => kind == EntryKind::Ast,
         }
     }
 }
@@ -766,7 +874,14 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", check.as_str()));
             assert_eq!(serde_json::from_str::<CheckId>(&json).unwrap(), *check);
         }
-        assert_eq!(CheckId::ALL.len(), 11);
+        assert_eq!(CheckId::ALL.len(), 14);
+        for (check, name) in [
+            (CheckId::StructuralRecall, "structural.recall"),
+            (CheckId::StructuralPrecision, "structural.precision"),
+            (CheckId::StructuralCoverage, "structural.coverage"),
+        ] {
+            assert_eq!(name.parse::<CheckId>().unwrap(), check);
+        }
         assert!("lexical.recal".parse::<CheckId>().is_err());
     }
 
@@ -784,8 +899,105 @@ mod tests {
             EntryKind::Lexical,
             EntryKind::Pagination,
             EntryKind::Prefix,
+            EntryKind::Ast,
         ] {
             assert!(CheckId::ResultsUniquePaths.applies_to(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn structural_checks_apply_to_ast_entries_only() {
+        let structural = [
+            CheckId::StructuralRecall,
+            CheckId::StructuralPrecision,
+            CheckId::StructuralCoverage,
+        ];
+        for check in structural {
+            assert!(check.applies_to(EntryKind::Ast), "{check}");
+            for kind in [
+                EntryKind::Ident,
+                EntryKind::Concept,
+                EntryKind::Lexical,
+                EntryKind::Pagination,
+                EntryKind::Prefix,
+            ] {
+                assert!(!check.applies_to(kind), "{check} on {kind:?}");
+            }
+        }
+        // An [[ast]] entry has no lexical oracle, and its standalone list is
+        // path-ordered (#547): no lexical or ordering check can apply.
+        for check in [
+            CheckId::LexicalRecall,
+            CheckId::LexicalPrecision,
+            CheckId::LexicalSilentFn,
+            CheckId::LexicalVerifyMode,
+            CheckId::OrderScoreMonotone,
+            CheckId::OrderPrefixConsistent,
+            CheckId::PaginationComplete,
+        ] {
+            assert!(!check.applies_to(EntryKind::Ast), "{check}");
+        }
+    }
+
+    // --- standalone --ast coverage ------------------------------------------------
+
+    #[test]
+    fn a_clean_ast_envelope_omits_ast_coverage_and_reads_as_zero() {
+        let page = AstPage::from_json(
+            &serde_json::from_str(
+                r#"{"mode":"ast","pattern":"try-catch","description":"d","total":1,
+                    "results":[{"path":"a.ts","score":1.0,"line":3,"snippet":"} catch (e) {"}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page.coverage, AstCoverage::default());
+        assert_eq!(page.page.rows[0].line, Some(3));
+        let null = serde_json::json!({"results": [], "ast_coverage": null});
+        assert_eq!(
+            AstCoverage::from_envelope(&null).unwrap(),
+            AstCoverage::default()
+        );
+    }
+
+    #[test]
+    fn ast_coverage_reads_the_excluded_and_undetermined_counts() {
+        let envelope = serde_json::json!({
+            "results": [],
+            "ast_coverage": {
+                "size_eligible_files": 810,
+                "size_excluded_files": 2,
+                "undetermined_files": 0,
+                "excluded_by_lang": {"rust": 1, "javascript": 1},
+                "excluded": [{"path": "a.rs", "lang": "rust", "size_bytes": 2000000,
+                              "limit_bytes": 1048576, "reason": "ast_size_cap"}]
+            }
+        });
+        assert_eq!(
+            AstCoverage::from_envelope(&envelope).unwrap(),
+            AstCoverage {
+                size_excluded_files: 2,
+                undetermined_files: 0,
+                excluded_by_lang: BTreeMap::from([
+                    ("javascript".to_string(), 1),
+                    ("rust".to_string(), 1)
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_ast_coverage_is_rejected() {
+        for coverage in [
+            serde_json::json!([]),
+            serde_json::json!({"undetermined_files": 0}),
+            serde_json::json!({"size_excluded_files": "2", "undetermined_files": 0}),
+            serde_json::json!({"size_excluded_files": 2}),
+            serde_json::json!({"size_excluded_files": 2, "undetermined_files": 0,
+                               "excluded_by_lang": {"rust": -1}}),
+        ] {
+            let envelope = serde_json::json!({"results": [], "ast_coverage": coverage});
+            assert!(AstCoverage::from_envelope(&envelope).is_err(), "{coverage}");
         }
     }
 

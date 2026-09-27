@@ -169,6 +169,58 @@ fn standalone_prefix_entries_check_prefix_and_monotonicity_only_where_score_rank
     assert!(!q.measures_text());
 }
 
+fn ast_entry(id: &str, pattern: &str, lang: &str, precision: &str) -> String {
+    format!(
+        "[[ast]]\nid = \"{id}\"\npattern = \"{pattern}\"\nlang = \"{lang}\"\nprecision = \"{precision}\"\n"
+    )
+}
+
+#[test]
+fn an_ast_entry_runs_the_structural_checks_by_its_precision_class() {
+    assert_eq!(
+        checks_of(&ast_entry("skim-A1", "try-catch", "typescript", "hard")),
+        vec![
+            CheckId::ResultsUniquePaths,
+            CheckId::StructuralRecall,
+            CheckId::StructuralPrecision,
+            CheckId::StructuralCoverage,
+        ]
+    );
+    assert_eq!(
+        checks_of(&ast_entry("skim-A2", "rust-nested-loop", "rust", "ratchet")),
+        vec![
+            CheckId::ResultsUniquePaths,
+            CheckId::StructuralRecall,
+            CheckId::StructuralCoverage,
+        ],
+        "a ratchet-class entry records structural.precision.<id> instead"
+    );
+}
+
+#[test]
+fn an_ast_entry_plans_a_standalone_ast_call_judged_by_the_structural_oracle() {
+    let g = golden_with(&ast_entry("skim-A1", "try-catch", "tsx", "hard"));
+    let q = &plan(&g).unwrap()[0];
+    assert_eq!((q.kind, q.arm), (EntryKind::Ast, Arm::Ast));
+    assert_eq!(q.query, None);
+    assert_eq!(q.flags.ast.as_deref(), Some("try-catch"));
+    assert!(q.lexical_oracle().is_none());
+    assert_eq!(
+        q.structural_target(),
+        Some(&StructuralTarget {
+            pattern: "try-catch".to_string(),
+            lang: crate::scoreboard::structural::OracleLang::Tsx,
+            precision: PrecisionClass::Hard,
+        })
+    );
+    assert!(!q.measures_text());
+    // No other entry kind gets a structural target.
+    let lexical =
+        golden_with("[[lexical]]\nid = \"skim-X01\"\nquery = \"a\"\ncategory = \"substr\"\n");
+    let q = &plan(&lexical).unwrap()[0];
+    assert!(q.structural_target().is_none() && q.lexical_oracle().is_some());
+}
+
 #[test]
 fn only_ident_and_concept_entries_measure_text_output() {
     let g = golden_with(
@@ -543,6 +595,8 @@ fn samples(idents: Vec<IdentSample>) -> CorpusSamples {
         idents,
         concepts: Vec::new(),
         oracle_less_rows: BTreeMap::new(),
+        structural: Vec::new(),
+        unscored_rows: BTreeMap::new(),
     }
 }
 
@@ -633,6 +687,113 @@ fn row_counts_of_entries_without_an_oracle_ratchet_per_entry() {
     );
 }
 
+fn structural_sample(id: &str, class: PrecisionClass, intent: bool) -> StructuralSample {
+    StructuralSample {
+        id: id.to_string(),
+        pattern: "rust-nested-loop".to_string(),
+        lang: crate::scoreboard::structural::OracleLang::Rust,
+        precision_class: class,
+        oracle_files: 4,
+        skim_files: 5,
+        recall: 1.0,
+        precision: 0.8,
+        intent_files: intent.then_some(2),
+        intent_recall: intent.then_some(0.5),
+        intent_precision: intent.then_some(0.2),
+        line_on_match: 3,
+    }
+}
+
+#[test]
+fn structural_measurements_ratchet_per_entry_and_unscored_rows_per_pattern() {
+    let mut a = samples(Vec::new());
+    a.structural = vec![
+        structural_sample("a-ast-1", PrecisionClass::Ratchet, true),
+        structural_sample("a-ast-2", PrecisionClass::Hard, false),
+    ];
+    a.unscored_rows = BTreeMap::from([("rust-nested-loop".to_string(), 2)]);
+    let r = ratchet_values(&[&a]);
+    assert_eq!(r["structural.precision.a-ast-1"], 0.8);
+    assert!(
+        !r.contains_key("structural.precision.a-ast-2"),
+        "a hard-class entry's precision is the HARD check"
+    );
+    assert_eq!(r["structural.line_on_match.a-ast-1"], 3.0);
+    assert_eq!(r["structural.line_on_match.a-ast-2"], 3.0);
+    assert_eq!(r["structural.intent_recall.a-ast-1"], 0.5);
+    assert_eq!(r["structural.intent_precision.a-ast-1"], 0.2);
+    assert!(!r.contains_key("structural.intent_recall.a-ast-2"));
+    assert_eq!(r["structural.unscored_rows.rust-nested-loop"], 2.0);
+    for name in r.keys() {
+        assert!(metric_def(name).is_some(), "{name} has no MetricDef");
+    }
+
+    // The aggregate keeps entries apart and sums unscored rows per pattern.
+    let mut b = samples(Vec::new());
+    b.structural = vec![structural_sample("b-ast-1", PrecisionClass::Ratchet, false)];
+    b.unscored_rows = BTreeMap::from([
+        ("rust-nested-loop".to_string(), 5),
+        ("try-catch".to_string(), 0),
+    ]);
+    let agg = ratchet_values(&[&a, &b]);
+    assert_eq!(agg["structural.unscored_rows.rust-nested-loop"], 7.0);
+    assert_eq!(agg["structural.unscored_rows.try-catch"], 0.0);
+    assert!(agg.contains_key("structural.precision.a-ast-1"));
+    assert!(agg.contains_key("structural.precision.b-ast-1"));
+    assert!(
+        !ratchet_values(&[&samples(Vec::new())])
+            .keys()
+            .any(|k| k.starts_with("structural.")),
+        "no [[ast]] entry, no structural metric"
+    );
+}
+
+#[test]
+fn structural_ratchets_are_exact_and_higher_is_better() {
+    for name in [
+        "structural.precision.a-ast-1",
+        "structural.line_on_match.a-ast-1",
+        "structural.intent_recall.a-ast-1",
+        "structural.intent_precision.a-ast-1",
+        "structural.unscored_rows.try-catch",
+    ] {
+        assert_eq!(
+            compare_ratchet(name, 0.5, 0.5),
+            RatchetChange::Unchanged,
+            "{name}"
+        );
+        assert_eq!(
+            compare_ratchet(name, 0.5, 0.4999),
+            RatchetChange::Regressed,
+            "{name}"
+        );
+        assert_eq!(
+            compare_ratchet(name, 0.5, 0.6),
+            RatchetChange::Improved,
+            "{name}"
+        );
+    }
+    for bare in [
+        "structural.precision.",
+        "structural.line_on_match.",
+        "structural.unscored_rows.",
+        "structural.recall",
+    ] {
+        assert!(metric_def(bare).is_none(), "{bare} names no entry");
+    }
+    // No family prefix shadows another or a fixed metric.
+    for (i, (a, _)) in STRUCTURAL_FAMILIES.iter().enumerate() {
+        for (b, _) in &STRUCTURAL_FAMILIES[i + 1..] {
+            assert!(!a.starts_with(b) && !b.starts_with(a), "{a} / {b}");
+        }
+        assert!(
+            RATCHET_METRICS.iter().all(|d| !d.name.starts_with(a)),
+            "{a}"
+        );
+        assert!(!a.starts_with(ORACLE_LESS_ROWS) && !ORACLE_LESS_ROWS.starts_with(a));
+    }
+}
+
 #[test]
 fn aggregate_ratchets_pool_every_corpus() {
     let a = samples(vec![ident("a-1", Some(1), Some(10))]);
@@ -698,7 +859,14 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
         },
     ];
 
-    let e = evaluate(&universe, &stats, &plan, &observations).unwrap();
+    let e = evaluate(
+        &universe,
+        &stats,
+        &plan,
+        &observations,
+        &StructuralEvidence::default(),
+    )
+    .unwrap();
 
     let outcome = |id: &str, check: CheckId| {
         e.outcomes
@@ -776,7 +944,14 @@ fn evaluate_records_the_full_list_size_of_entries_without_an_oracle() {
         },
     ];
 
-    let e = evaluate(&universe, &stats, &plan, &observations).unwrap();
+    let e = evaluate(
+        &universe,
+        &stats,
+        &plan,
+        &observations,
+        &StructuralEvidence::default(),
+    )
+    .unwrap();
 
     assert_eq!(
         e.samples.oracle_less_rows,
@@ -801,5 +976,156 @@ fn evaluate_rejects_observations_that_do_not_follow_the_plan() {
         skipped_by_reason: BTreeMap::new(),
         temporal_state: None,
     };
-    assert!(evaluate(&universe, &stats, &plan, &[]).is_err());
+    assert!(
+        evaluate(
+            &universe,
+            &stats,
+            &plan,
+            &[],
+            &StructuralEvidence::default()
+        )
+        .is_err()
+    );
+}
+
+// --- evaluate: [[ast]] entries --------------------------------------------------------
+
+#[test]
+fn evaluate_scores_ast_entries_against_the_structural_oracle() {
+    use crate::scoreboard::structural::StructuralOracle;
+    use crate::scoreboard::structural_metrics::{OracleAnswers, rows_in};
+    use crate::scoreboard::types::{AstCoverage, AstPage};
+
+    let repo = FixtureRepo::new();
+    repo.write(
+        "src/nested.rs",
+        "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {}\n    }\n}\n",
+    );
+    repo.write("src/plain.rs", "fn f() {}\n");
+    repo.write("web/a.ts", "try {\n  go();\n} catch (e) {}\n");
+    repo.write("lib/C.java", "class C { void m() {} }\n");
+    let commit = repo.commit_all("init");
+    let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let golden = parse_golden(&format!(
+        "corpus = \"skim\"\ncommit = \"{commit}\"\n{}{}",
+        ast_entry(
+            "skim-ast-rust-nested-loop-rust",
+            "rust-nested-loop",
+            "rust",
+            "ratchet"
+        ),
+        ast_entry(
+            "skim-ast-try-catch-typescript",
+            "try-catch",
+            "typescript",
+            "hard"
+        ),
+    ))
+    .unwrap();
+    let plan = plan(&golden).unwrap();
+    let stats = StatsSnapshot {
+        file_count: 4,
+        skipped_by_reason: BTreeMap::new(),
+        temporal_state: None,
+    };
+    let ast_page = |rows: Vec<ResultRow>, excluded: u64| AstPage {
+        page: page(rows, false),
+        coverage: AstCoverage {
+            size_excluded_files: excluded,
+            ..AstCoverage::default()
+        },
+    };
+    let mut nested = row("src/nested.rs", 1.0);
+    nested.line = Some(3);
+    let patterns = BTreeMap::from([
+        (
+            "rust-nested-loop".to_string(),
+            // plain.rs is a false positive; C.java is unscored.
+            ast_page(
+                vec![nested, row("src/plain.rs", 1.0), row("lib/C.java", 1.0)],
+                0,
+            ),
+        ),
+        // skim misses a.ts; its coverage disagrees with the oracle (0).
+        ("try-catch".to_string(), ast_page(Vec::new(), 1)),
+    ]);
+    let evidence = StructuralEvidence {
+        answers: OracleAnswers::compute(&StructuralOracle::new().unwrap(), universe.files())
+            .unwrap(),
+        patterns,
+    };
+    let observations: Vec<EntryObservation> = plan
+        .iter()
+        .map(|q| {
+            let t = q.structural_target().unwrap();
+            EntryObservation {
+                id: q.id.clone(),
+                full: rows_in(&evidence.patterns[&t.pattern].page, t.lang),
+                sweeps: Vec::new(),
+                limited: Vec::new(),
+                text: None,
+            }
+        })
+        .collect();
+
+    let e = evaluate(&universe, &stats, &plan, &observations, &evidence).unwrap();
+
+    let outcome = |id: &str, check: CheckId| {
+        e.outcomes
+            .iter()
+            .find(|(i, c, _)| i == id && *c == check)
+            .map(|(_, _, o)| o.clone())
+    };
+    let loops = "skim-ast-rust-nested-loop-rust";
+    let tc = "skim-ast-try-catch-typescript";
+    assert!(outcome(loops, CheckId::StructuralRecall).unwrap().is_pass());
+    assert!(
+        outcome(loops, CheckId::StructuralCoverage)
+            .unwrap()
+            .is_pass()
+    );
+    assert_eq!(
+        outcome(loops, CheckId::StructuralPrecision),
+        None,
+        "ratchet class"
+    );
+    assert!(
+        outcome(loops, CheckId::ResultsUniquePaths)
+            .unwrap()
+            .is_pass()
+    );
+    assert!(detail(&outcome(tc, CheckId::StructuralRecall).unwrap()).contains("web/a.ts"));
+    assert!(outcome(tc, CheckId::StructuralPrecision).unwrap().is_pass());
+    assert!(is_fail(&outcome(tc, CheckId::StructuralCoverage).unwrap()));
+
+    let s = &e.samples.structural;
+    assert_eq!(s.len(), 2);
+    assert_eq!((s[0].oracle_files, s[0].skim_files), (1, 2));
+    assert_eq!((s[0].precision, s[0].line_on_match), (0.5, 1));
+    assert_eq!(s[0].intent_recall, Some(1.0));
+    assert_eq!((s[1].recall, s[1].intent_recall), (0.0, None));
+    assert_eq!(
+        e.samples.unscored_rows,
+        BTreeMap::from([
+            ("rust-nested-loop".to_string(), 1),
+            ("try-catch".to_string(), 0)
+        ])
+    );
+    assert!(
+        e.samples.oracle_less_rows.is_empty(),
+        "[[ast]] entries have an oracle"
+    );
+    assert!(e.unindexed_hits.is_empty());
+
+    // Without the pattern's call, scoring an [[ast]] entry is an error.
+    assert!(
+        evaluate(
+            &universe,
+            &stats,
+            &plan,
+            &observations,
+            &StructuralEvidence::default()
+        )
+        .is_err()
+    );
 }

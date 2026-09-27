@@ -9,8 +9,15 @@
 //! can never apply), a skim crash / timeout / unparsable output, a temporal
 //! ranking skim reports it cannot apply (see [`require_temporal_data`]), an
 //! empty list for an entry with no oracle (see [`require_oracle_less_rows`]),
-//! or a corpus that changed under the run. Gate failures are not errors —
-//! they are recorded in the report's `gate` section.
+//! a vacuous `[[ast]]` entry (see [`require_non_vacuous_structural`]), a
+//! structural oracle failure, or a corpus that changed under the run. Gate
+//! failures are not errors — they are recorded in the report's `gate`
+//! section.
+//!
+//! `[[ast]]` entries (#541): the structural oracle is compiled once per run
+//! and run over each corpus's universe once; skim is called once per
+//! (corpus, pattern) with `--ast <pattern>`, and the rows are split among
+//! that pattern's entries by language.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -30,10 +37,14 @@ use crate::scoreboard::metrics::{
 };
 use crate::scoreboard::report::{
     AggregateReport, CorpusInfo, CorpusReport, CoverageReport, LatencyReport, LatencyStats,
-    REPORT_SCHEMA, Report, SkippedByReason, UniverseReport, round4, tally,
+    REPORT_SCHEMA, Report, SkippedByReason, StructuralReport, UniverseReport, round4, tally,
 };
 use crate::scoreboard::runner::{EntryObservation, SkimRunner, Timing};
-use crate::scoreboard::types::StatsSnapshot;
+use crate::scoreboard::structural::StructuralOracle;
+use crate::scoreboard::structural_metrics::{
+    OracleAnswers, StructuralEvidence, coverage_comparison, is_vacuous, rows_in, uncovered_patterns,
+};
+use crate::scoreboard::types::{AstPage, StatsSnapshot};
 use crate::scoreboard::universe::Universe;
 
 // ============================================================================
@@ -178,12 +189,20 @@ pub fn run(
     let mut corpora = Vec::with_capacity(inputs.corpora.len());
     let mut samples = Vec::with_capacity(inputs.corpora.len());
     let mut latency = BTreeMap::new();
+    // Compiled once per run, and only when some corpus has [[ast]] entries.
+    let oracle = inputs
+        .goldens
+        .values()
+        .any(|g| !g.file.asts.is_empty())
+        .then(StructuralOracle::new)
+        .transpose()
+        .context("compiling the structural oracle")?;
     for spec in &inputs.corpora {
         let golden = inputs
             .goldens
             .get(&spec.name)
             .with_context(|| format!("no golden file loaded for corpus {}", spec.name))?;
-        let run = run_corpus(spec, golden, inputs, source, runner)
+        let run = run_corpus(spec, golden, inputs, source, runner, oracle.as_ref())
             .with_context(|| format!("corpus {}", spec.name))?;
         latency.insert(spec.name.clone(), run.latency);
         corpora.push(run.report);
@@ -206,6 +225,7 @@ pub fn run(
             ratchet: aggregate_ratchet,
         },
         corpora,
+        uncovered_patterns: uncovered_patterns(inputs.goldens.values().map(|g| &g.file)),
         gate,
         latency: LatencyReport { corpora: latency },
     })
@@ -217,6 +237,7 @@ fn run_corpus(
     inputs: &Inputs,
     source: &dyn CorpusSource,
     runner: &SkimRunner,
+    oracle: Option<&StructuralOracle>,
 ) -> anyhow::Result<CorpusRun> {
     let name = spec.name.as_str();
     progress(name, "verifying the pinned clone");
@@ -226,6 +247,7 @@ fn run_corpus(
     let universe = Universe::compute(&root, &runner.sandbox().git())?;
     universe.check_file_cap()?;
     let plan = checked_plan(spec, golden, inputs, &universe)?;
+    let answers = structural_answers(name, &plan, &universe, oracle)?;
 
     progress(name, "skim search --build");
     runner.build(&root)?;
@@ -233,16 +255,13 @@ fn run_corpus(
     require_temporal_data(&plan, &stats)?;
 
     progress(name, &format!("running {} golden entries", plan.len()));
-    let mut observations = Vec::with_capacity(plan.len());
-    let mut timings = Vec::with_capacity(plan.len());
-    for q in &plan {
-        let observed = runner
-            .observe(&root, q)
-            .with_context(|| format!("entry {}", q.id))?;
-        observations.push(observed.observation);
-        timings.push((q.id.clone(), observed.timings));
-    }
-    require_oracle_less_rows(&plan, &observations)?;
+    let observed = observe_plan(runner, &root, &plan)?;
+    require_oracle_less_rows(&plan, &observed.observations)?;
+    let evidence = StructuralEvidence {
+        answers,
+        patterns: observed.patterns,
+    };
+    require_non_vacuous_structural(&plan, &observed.observations, &evidence.answers)?;
 
     let after = source.verify_untouched(spec, &root)?;
     anyhow::ensure!(
@@ -250,12 +269,105 @@ fn run_corpus(
         "the corpus changed during the run (skim must not write into the corpus root): {after}"
     );
 
-    let eval = metrics::evaluate(&universe, &stats, &plan, &observations)?;
-    let report = corpus_report(spec, golden, &universe, &stats, &eval, &inputs.ledger)?;
+    let eval = metrics::evaluate(&universe, &stats, &plan, &observed.observations, &evidence)?;
+    let report = corpus_report(
+        spec,
+        golden,
+        &universe,
+        &stats,
+        &eval,
+        &evidence,
+        &inputs.ledger,
+    )?;
     Ok(CorpusRun {
         report,
         samples: eval.samples,
-        latency: latency_stats(&timings),
+        latency: latency_stats(&observed.timings),
+    })
+}
+
+/// The structural oracle's answers over `universe` when `plan` has
+/// `[[ast]]` entries (empty answers otherwise).
+///
+/// # Errors
+///
+/// `[[ast]]` entries but no compiled oracle, or an oracle failure on a file.
+fn structural_answers(
+    corpus: &str,
+    plan: &[PlannedQuery],
+    universe: &Universe,
+    oracle: Option<&StructuralOracle>,
+) -> anyhow::Result<OracleAnswers> {
+    if !plan.iter().any(|q| q.structural_target().is_some()) {
+        return Ok(OracleAnswers::default());
+    }
+    let oracle = oracle.context("[[ast]] entries but no structural oracle was compiled")?;
+    progress(corpus, "running the structural oracle");
+    OracleAnswers::compute(oracle, universe.files()).context("structural oracle")
+}
+
+/// Every observation of one corpus's plan.
+struct PlanObservations {
+    /// One per planned entry, in plan order.
+    observations: Vec<EntryObservation>,
+    /// Call timings, by entry id (`--ast <pattern>` for a pattern's call).
+    timings: Vec<(String, Vec<Timing>)>,
+    /// skim's `--ast <pattern>` answer per pattern of the `[[ast]]` entries.
+    patterns: BTreeMap<String, AstPage>,
+}
+
+/// Run every call the plan needs. Each pattern of the `[[ast]]` entries is
+/// called once (`--ast <pattern>`, full list), in pattern order; an
+/// `[[ast]]` entry's observation is that call's rows in its language.
+///
+/// # Errors
+///
+/// Any skim call error, naming the entry or pattern.
+fn observe_plan(
+    runner: &SkimRunner,
+    root: &std::path::Path,
+    plan: &[PlannedQuery],
+) -> anyhow::Result<PlanObservations> {
+    let mut timings = Vec::with_capacity(plan.len());
+    let mut patterns: BTreeMap<String, AstPage> = BTreeMap::new();
+    let wanted: BTreeSet<&str> = plan
+        .iter()
+        .filter_map(|q| q.structural_target())
+        .map(|t| t.pattern.as_str())
+        .collect();
+    for pattern in wanted {
+        let (page, timing) = runner
+            .ast_list(root, pattern)
+            .with_context(|| format!("--ast {pattern}"))?;
+        timings.push((format!("--ast {pattern}"), vec![timing]));
+        patterns.insert(pattern.to_string(), page);
+    }
+
+    let mut observations = Vec::with_capacity(plan.len());
+    for q in plan {
+        if let Some(target) = q.structural_target() {
+            let call = patterns
+                .get(&target.pattern)
+                .with_context(|| format!("entry {}: no --ast {} call", q.id, target.pattern))?;
+            observations.push(EntryObservation {
+                id: q.id.clone(),
+                full: rows_in(&call.page, target.lang),
+                sweeps: Vec::new(),
+                limited: Vec::new(),
+                text: None,
+            });
+            continue;
+        }
+        let observed = runner
+            .observe(root, q)
+            .with_context(|| format!("entry {}", q.id))?;
+        observations.push(observed.observation);
+        timings.push((q.id.clone(), observed.timings));
+    }
+    Ok(PlanObservations {
+        observations,
+        timings,
+        patterns,
     })
 }
 
@@ -342,6 +454,44 @@ pub fn require_oracle_less_rows(
     )
 }
 
+/// Refuse to score a vacuous `[[ast]]` entry: the structural oracle matches
+/// no file of its language and skim returns no row in it.
+///
+/// Every structural check passes on such an entry, so it measures nothing,
+/// and a regression that made skim return nothing there could never show.
+/// It is a golden error (`golden-gen` proposes only non-vacuous entries):
+/// remove the entry, or pick a corpus where the pattern occurs.
+///
+/// # Errors
+///
+/// Some `[[ast]]` entry is vacuous; the message names them. Also an entry
+/// the oracle has no query for (integrity rejects that first).
+pub fn require_non_vacuous_structural(
+    plan: &[PlannedQuery],
+    observations: &[EntryObservation],
+    answers: &OracleAnswers,
+) -> anyhow::Result<()> {
+    let mut vacuous = Vec::new();
+    for (q, obs) in plan.iter().zip(observations) {
+        if let Some(target) = q.structural_target()
+            && is_vacuous(target, &obs.full.rows, answers)?
+        {
+            vacuous.push(q.id.as_str());
+        }
+    }
+    if vacuous.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "golden integrity failed: {} vacuous [[ast]] entr{} ({}): neither the structural oracle \
+         nor skim finds a file in the entry's language, so every check would pass on nothing; \
+         remove the entry (golden-gen proposes only entries where the oracle or skim finds a file)",
+        vacuous.len(),
+        if vacuous.len() == 1 { "y" } else { "ies" },
+        vacuous.join(", ")
+    )
+}
+
 /// Check golden integrity against the verified universe (ledger refs
 /// included), then plan the entries; a ledger ref naming a check the plan
 /// never runs is an integrity problem too.
@@ -388,6 +538,7 @@ fn corpus_report(
     universe: &Universe,
     stats: &StatsSnapshot,
     eval: &CorpusEvaluation,
+    structural: &StructuralEvidence,
     ledger: &Ledger,
 ) -> anyhow::Result<CorpusReport> {
     let coverage = universe.coverage();
@@ -411,6 +562,11 @@ fn corpus_report(
         },
         checks: gate::apply_ledger(&eval.outcomes, ledger),
         ratchet: metrics::ratchet_values(&[&eval.samples]),
+        structural: StructuralReport {
+            coverage: coverage_comparison(structural),
+            entries: eval.samples.structural.clone(),
+            unscored_rows: eval.samples.unscored_rows.clone(),
+        },
         info: CorpusInfo {
             oracle_skipped_by_reason: universe.skipped_by_reason(),
             unindexed_hits: eval.unindexed_hits.clone(),
@@ -598,6 +754,48 @@ mod tests {
         for id in ["skim-F002", "skim-Z01"] {
             assert!(!msg.contains(id), "{id} is not vacuous: {msg}");
         }
+    }
+
+    #[test]
+    fn a_vacuous_ast_entry_is_a_golden_error() {
+        use crate::scoreboard::structural::StructuralOracle;
+        let plan = plan_of(
+            "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\n\
+             [[ast]]\nid = \"skim-ast-go-defer-go\"\npattern = \"go-defer\"\nlang = \"go\"\nprecision = \"hard\"\n\
+             [[ast]]\nid = \"skim-ast-rust-nested-loop-rust\"\npattern = \"rust-nested-loop\"\nlang = \"rust\"\nprecision = \"ratchet\"\n",
+        );
+        // The oracle finds a Rust loop; there is no Go file at all.
+        let answers = OracleAnswers::compute(
+            &StructuralOracle::new().unwrap(),
+            [("src/a.rs", "fn f() {\n    for i in 0..2 {}\n}\n")],
+        )
+        .unwrap();
+
+        // go-defer is non-vacuous as long as skim returns a row for it.
+        let observations = [
+            observed("skim-ast-go-select-go", 0),
+            observed("skim-ast-go-defer-go", 1),
+            observed("skim-ast-rust-nested-loop-rust", 0),
+        ];
+        let err = require_non_vacuous_structural(&plan, &observations, &answers)
+            .expect_err("neither the oracle nor skim finds a go-select");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("golden integrity failed"), "{msg}");
+        assert!(msg.contains("skim-ast-go-select-go"), "{msg}");
+        for fine in ["skim-ast-go-defer-go", "skim-ast-rust-nested-loop-rust"] {
+            assert!(!msg.contains(fine), "{fine} is not vacuous: {msg}");
+        }
+
+        let fixed = [
+            observed("skim-ast-go-select-go", 1),
+            observed("skim-ast-go-defer-go", 1),
+            observed("skim-ast-rust-nested-loop-rust", 0),
+        ];
+        require_non_vacuous_structural(&plan, &fixed, &answers).unwrap();
+        // Entries without a structural oracle are not this guard's business.
+        let lexical =
+            plan_of("[[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n");
+        require_non_vacuous_structural(&lexical, &[observed("skim-Z01", 0)], &answers).unwrap();
     }
 
     #[test]
