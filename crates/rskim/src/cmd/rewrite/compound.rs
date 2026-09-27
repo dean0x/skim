@@ -255,28 +255,47 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
 
 // ---- Byte-exact destination detection (cross-surface fidelity parity) ----
 
-/// Pipe consumers that persist or digest the EXACT bytes of their stdin.
+/// Pipe consumers that persist, digest, measure, compare or render the EXACT
+/// bytes of their stdin.
 ///
 /// Membership means "compressing the producer corrupts this consumer's result",
 /// not merely "this consumer reads bytes". `cat`, `head`, `grep`, `less`, `jq`
-/// and friends are deliberately ABSENT: they render the stream for a reader, and
-/// compressing what an agent is about to read is skim's entire purpose.
+/// and friends are deliberately ABSENT: they show the reader the stream itself,
+/// so a substitution is visible in what they print, and compressing what an
+/// agent is about to read is skim's entire purpose. The test is whether the
+/// consumer's own output would let a reader catch the substitution — which is
+/// why `od`/`xxd`/`hexdump` ARE listed (there the encoding is the answer, not a
+/// view of it) and `nl` is not.
 ///
-/// The set only needs to cover consumers that persist WITHOUT a `>` redirect —
-/// `| gzip > out.gz` is already caught by [`stdout_redirected_to_file`] via its
-/// `>`. That keeps the list small and reviewable.
+/// For the persisting and archiving groups the set only needs to cover the
+/// consumers that persist WITHOUT a `>` redirect — `| gzip > out.gz` is already
+/// caught by [`stdout_redirected_to_file`] via its `>`. That keeps those groups
+/// small and reviewable. The measuring group gets no such reduction: `| wc -l`
+/// carries no redirect for another rule to catch it by.
 ///
-/// HEURISTIC, and honest about it: this is a denylist, so an unlisted persisting
+/// HEURISTIC, and honest about it: this is a denylist, so an unlisted byte-exact
 /// consumer still gets compressed bytes. A denylist was chosen over an allowlist
 /// of safe readers because the allowlist's failure mode — serving raw for every
-/// unlisted consumer — would silently kill compression for `| grep`, `| wc`,
-/// `| head` and every other everyday pipeline, which is the outcome this work
-/// explicitly rejects.
+/// unlisted consumer — would silently kill compression for `| grep`, `| head`
+/// and every other everyday pipeline, which is the outcome this work explicitly
+/// rejects.
+///
+/// STRUCTURAL LIMIT: membership is keyed on the consumer's command head name
+/// alone ([`segment_head`]), so a flag-discriminated consumer is unrepresentable.
+/// `head -c 100` measures exact bytes and `cat -n` renders them, but neither can
+/// be listed without also denying bare `| head` and `| cat` — the two pipelines
+/// skim exists to compress. Those shapes stay compressed knowingly; closing them
+/// needs a per-flag key, not a new name here.
 const BYTE_EXACT_PIPE_CONSUMERS: &[&str] = &[
     // Write the stream verbatim to a destination of their own.
     "tee",
     "dd",
-    "sponge", // Archive or re-encode the stream verbatim.
+    "sponge",
+    "split", // persists to xaa/xab… with no `>` of its own
+    "csplit",
+    "nc", // writes the stream verbatim to a network destination, like tee
+    "socat",
+    // Archive or re-encode the stream verbatim.
     "gzip",
     "bzip2",
     "xz",
@@ -284,6 +303,18 @@ const BYTE_EXACT_PIPE_CONSUMERS: &[&str] = &[
     "base64",
     "tar",
     "openssl",
+    "base32",
+    "basenc",
+    "uuencode",
+    "lz4",
+    "lzma",
+    "lzop",
+    "compress",
+    "pigz",
+    "pbzip2",
+    "brotli",
+    "7z",
+    "zip",
     // Digest the exact bytes — any substitution changes the answer.
     "cksum",
     "md5sum",
@@ -291,6 +322,19 @@ const BYTE_EXACT_PIPE_CONSUMERS: &[&str] = &[
     "sha256sum",
     "sha512sum",
     "shasum",
+    "b2sum",
+    "crc32",
+    // Measure, compare, or render the exact bytes — the reader's question is
+    // about the bytes themselves, so a substituted stream answers a different
+    // question than the one asked.
+    "wc",   // output is only a count; no view accompanies it, so a wrong number is unfalsifiable
+    "cmp",  // exit code IS the answer; measured flipping 1 -> 0, a silent false "identical"
+    "diff", // same; measured flipping 1 -> 0 on two genuinely-different inputs
+    "od",   // byte/encoding inspection is the only reason to run it
+    "xxd",  // ditto; offset 0 showed skim's bytes, not the tool's
+    "hexdump", // ditto
+    "sum",  // legacy BSD/SysV checksum; sibling of the already-listed cksum
+    "md5",  // BSD/macOS spelling of md5sum, which IS listed — and the only one macOS ships
 ];
 
 /// Return `true` when `cmd`'s stdout destination requires the tool's exact
@@ -307,8 +351,9 @@ const BYTE_EXACT_PIPE_CONSUMERS: &[&str] = &[
 ///   (`${…}` is parameter expansion, not capture, and is deliberately excluded.)
 /// - **R — redirect**: stdout or both streams land on a file or named FIFO,
 ///   including the `2>f … >&2` fd-dup shape.
-/// - **T — byte-exact pipe consumer**: the pipeline's next stage persists or
-///   digests the exact bytes ([`BYTE_EXACT_PIPE_CONSUMERS`]).
+/// - **T — byte-exact pipe consumer**: the pipeline's next stage persists,
+///   digests, measures, compares or renders the exact bytes
+///   ([`BYTE_EXACT_PIPE_CONSUMERS`]).
 ///
 /// Anything else — plain `| cat`, `| grep`, `| head`, a TTY — returns `false`
 /// and keeps compressing.
@@ -421,6 +466,9 @@ pub(super) fn command_heads(cmd: &str) -> Vec<String> {
 
 /// Return `true` when any pipe stage of `cmd` feeds a [`BYTE_EXACT_PIPE_CONSUMERS`]
 /// command.
+///
+/// Matching is on the consumer's head name only, so flag-discriminated consumers
+/// (`head -c`, `cat -n`) are out of reach — see the constant's STRUCTURAL LIMIT.
 fn pipe_consumer_needs_exact_bytes(cmd: &str) -> bool {
     match split_compound(cmd) {
         // No compound operator — no pipe consumer.
@@ -1286,7 +1334,8 @@ mod tests {
     // command_needs_exact_bytes — the rewrite surface's verdict for the wrapper
     // ========================================================================
 
-    /// Rule T: a pipe consumer that persists or digests exact bytes.
+    /// Rule T: a pipe consumer that persists, digests, measures, compares or
+    /// renders exact bytes.
     #[test]
     fn test_needs_exact_bytes_byte_exact_pipe_consumers() {
         assert!(command_needs_exact_bytes("git log -n 5 | tee out.txt"));
@@ -1299,6 +1348,32 @@ mod tests {
         // Leading env assignments and `sudo` do not hide the consumer.
         assert!(command_needs_exact_bytes("git log | LC_ALL=C tee out.txt"));
         assert!(command_needs_exact_bytes("git log | sudo tee /etc/x"));
+
+        // Measure, compare or render the exact bytes. #317 forbids showing the
+        // reader less than the raw tool, and these consumers carry no view the
+        // substitution could be falsified against — which is what
+        // `try_rewrite_compound`'s own doc comment warned of when it named `wc`
+        // beside `grep` and `head`. Each verdict was measured corrupted before
+        // this category existed, producer held at `git log -n 40`: `wc -l`
+        // 2192 -> 40, `wc -c` 115052 -> 4118, `cmp`/`diff` exit 1 -> 0 (a
+        // silent false "identical"), `od -c`/`hexdump` 7192 -> 259 lines, `xxd`
+        // offset 0 `"commit "` -> `"0fb1"`, `sum` `59617 113` -> `14618 5`.
+        assert!(command_needs_exact_bytes("git log | wc -l"));
+        assert!(command_needs_exact_bytes("git log | wc -c"));
+        assert!(command_needs_exact_bytes("git log | cmp - expected.txt"));
+        assert!(command_needs_exact_bytes("git log | diff - expected.txt"));
+        assert!(command_needs_exact_bytes("git log | od -c"));
+        assert!(command_needs_exact_bytes("git log | xxd"));
+        assert!(command_needs_exact_bytes("git log | hexdump -C"));
+        assert!(command_needs_exact_bytes("git log | sum"));
+        assert!(command_needs_exact_bytes("git log | md5"));
+
+        // Tier 2, grouped under the categories they belong to: a persisting
+        // consumer with no `>` of its own, a verbatim network destination, and
+        // a digest the existing `md5sum` entry already covers on GNU systems.
+        assert!(command_needs_exact_bytes("git log | split -l 100"));
+        assert!(command_needs_exact_bytes("git log | nc example.com 9000"));
+        assert!(command_needs_exact_bytes("git log | b2sum"));
     }
 
     /// **The case that must not regress.** Readers keep compressing — this is
@@ -1309,10 +1384,23 @@ mod tests {
         assert!(!command_needs_exact_bytes("git log -n 5 | cat"));
         assert!(!command_needs_exact_bytes("git log -n 5 | head -20"));
         assert!(!command_needs_exact_bytes("git log | grep fix"));
-        assert!(!command_needs_exact_bytes("git log | wc -l"));
         assert!(!command_needs_exact_bytes("git log | less"));
         assert!(!command_needs_exact_bytes("git log -n 5"));
         assert!(!command_needs_exact_bytes("cargo test && cargo build"));
+    }
+
+    /// `nl` is deliberately absent from [`BYTE_EXACT_PIPE_CONSUMERS`]; this
+    /// pins the line so a later reader does not "complete the set".
+    ///
+    /// `nl` prints its number beside the content it counted, so a reader handed
+    /// a substituted stream can see the numbering belongs to the wrong bytes —
+    /// the claim is falsifiable, which puts `nl` with `cat -n`, `head` and
+    /// `grep -n` as a renderer. `wc` emits only the number, with no view to
+    /// check it against, which is why `wc` is listed and `nl` is not.
+    #[test]
+    fn test_needs_exact_bytes_nl_renders_and_still_compresses() {
+        assert!(!command_needs_exact_bytes("git log | nl"));
+        assert!(!command_needs_exact_bytes("git log | nl -ba"));
     }
 
     /// Rule S: the shell consumes stdout as a value or plumbs it into an fd.
@@ -1511,6 +1599,7 @@ mod tests {
         let cases = [
             ("git log -n 5 | tee out.txt", "git"),
             ("git log | sha256sum", "git"),
+            ("git log | wc -l", "git"),
             ("git log -n 5 > out.txt", "git"),
             ("git log -n 5 >> out.txt", "git"),
             ("git log -n 5 2>f >&2", "git"),
@@ -2330,8 +2419,10 @@ mod tests {
         }
     }
 
-    /// Non-cat reader consumers (`head`, `wc`, `grep`) are outside the narrow
-    /// `| cat` shape and must never trigger the reversal.
+    /// Non-cat consumers are outside the narrow `| cat` shape and must never
+    /// trigger the reversal. `head` and `grep` are renderers; `wc` is a
+    /// byte-exact consumer ([`BYTE_EXACT_PIPE_CONSUMERS`]). Both classes refuse
+    /// here, for different reasons.
     ///
     /// Binary verdict: all three exit 1 (not rewritten).
     ///
