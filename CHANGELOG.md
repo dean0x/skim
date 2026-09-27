@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Multi-file batch runs no longer attribute a shared disclosure marker's cost to one
+  arbitrary file** (#561) — a multi-file run (`skim <glob>` / `skim dir/`) emits exactly
+  one aggregate disclosure marker on stderr for the whole run when any file's rendered
+  view differs from its raw bytes; that on-screen marker is unchanged. What changed is
+  how its cost is recorded in `analytics.db`: previously the marker's token/byte cost
+  was attributed to the *first* file in the run whose view differed, while every other
+  differing file recorded a measured zero for that cost — indistinguishable from a file
+  that genuinely incurred none. Batch rows now record that cost as **unmeasured**
+  (`NULL`, not a measured `0`) instead, so `skim stats`'s delivered/measured-savings
+  series no longer includes a fabricated per-file number for a cost that was never
+  actually attributable to one file. Single-file runs (`skim <file>`) are unaffected and
+  still record the marker's real per-file cost.
+
 ### BREAKING
 
 - **`skim search` temporal layer now walks the full commit DAG** (#407) — the
