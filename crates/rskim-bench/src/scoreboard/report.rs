@@ -302,18 +302,36 @@ pub struct LatencyReport {
     pub corpora: BTreeMap<String, LatencyStats>,
 }
 
-/// Latency percentiles over one corpus's skim query calls.
+/// One corpus's latency (INFO): its golden entries' skim calls, its
+/// `--ast <pattern>` calls, and its structural oracle pass.
+///
+/// `calls`, the percentiles and `entries_wall_ms` cover the golden entries'
+/// own calls only, so they stay comparable with a run that makes no pattern
+/// call; an `[[ast]]` entry makes none of its own (its rows come from its
+/// pattern's call, timed in `pattern_calls_wall_ms`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LatencyStats {
+    /// The golden entries' own skim calls.
     pub calls: u64,
     pub wall_ms_p50: f64,
     pub wall_ms_p95: f64,
     /// From the JSON `duration_ms` field, when the envelope carries it.
     pub duration_ms_p50: Option<f64>,
     pub duration_ms_p95: Option<f64>,
-    /// Total wall-clock milliseconds of every call behind each golden entry.
+    /// Total wall-clock milliseconds of every call behind each golden entry
+    /// that makes its own calls.
     pub entries_wall_ms: BTreeMap<String, f64>,
+    /// Wall-clock milliseconds of each `--ast <pattern>` call, by pattern:
+    /// one call per catalog pattern on a corpus with an `[[ast]]` entry,
+    /// shared by that pattern's entries. Absent when there is none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pattern_calls_wall_ms: BTreeMap<String, f64>,
+    /// Wall-clock milliseconds of the structural oracle's pass over the
+    /// corpus universe. Absent when the corpus has no `[[ast]]` entry (the
+    /// oracle does not run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_oracle_wall_ms: Option<f64>,
 }
 
 impl Report {
@@ -472,17 +490,36 @@ pub fn render_markdown(report: &Report, baseline: Option<&Baseline>) -> String {
     }
     uncovered_section(&mut md, &report.uncovered_patterns);
 
+    latency_section(&mut md, &report.latency);
+    md
+}
+
+/// The latency table (INFO): the golden entries' calls, then the
+/// `--ast <pattern>` calls and the structural oracle pass (both `—` when
+/// the corpus has no `[[ast]]` entry).
+fn latency_section(md: &mut String, latency: &LatencyReport) {
     let _ = writeln!(md, "## Latency (INFO, never gated)\n");
-    let _ = writeln!(md, "| corpus | calls | wall p50 ms | wall p95 ms |");
-    let _ = writeln!(md, "|---|---|---|---|");
-    for (name, l) in &report.latency.corpora {
+    let _ = writeln!(
+        md,
+        "| corpus | entry calls | wall p50 ms | wall p95 ms | pattern calls | pattern calls ms | structural oracle ms |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|");
+    let ms_or_dash = |ms: Option<f64>| ms.map_or_else(|| "—".to_string(), |ms| format!("{ms:.1}"));
+    for (name, l) in &latency.corpora {
+        // Summed only when there is a call: an empty f64 sum is -0.0.
+        let pattern_ms = (!l.pattern_calls_wall_ms.is_empty())
+            .then(|| l.pattern_calls_wall_ms.values().sum::<f64>());
         let _ = writeln!(
             md,
-            "| {name} | {} | {:.1} | {:.1} |",
-            l.calls, l.wall_ms_p50, l.wall_ms_p95
+            "| {name} | {} | {:.1} | {:.1} | {} | {} | {} |",
+            l.calls,
+            l.wall_ms_p50,
+            l.wall_ms_p95,
+            l.pattern_calls_wall_ms.len(),
+            ms_or_dash(pattern_ms),
+            ms_or_dash(l.structural_oracle_wall_ms)
         );
     }
-    md
 }
 
 fn ratchet_table(
@@ -939,6 +976,83 @@ mod tests {
         let md = render_markdown(&r, None);
         assert!(md.contains("### Structural (`--ast`)"), "{md}");
         assert!(!md.contains("FP guard"), "{md}");
+    }
+
+    fn latency(pattern_calls: &[(&str, f64)], oracle_ms: Option<f64>) -> LatencyStats {
+        LatencyStats {
+            calls: 3,
+            wall_ms_p50: 2.0,
+            wall_ms_p95: 4.3,
+            duration_ms_p50: None,
+            duration_ms_p95: None,
+            entries_wall_ms: BTreeMap::from([("skim-L01".to_string(), 6.5)]),
+            pattern_calls_wall_ms: pattern_calls
+                .iter()
+                .map(|(p, ms)| (p.to_string(), *ms))
+                .collect(),
+            structural_oracle_wall_ms: oracle_ms,
+        }
+    }
+
+    #[test]
+    fn latency_without_structural_work_serializes_no_structural_keys() {
+        let plain = serde_json::to_value(latency(&[], None)).unwrap();
+        let keys: Vec<&str> = plain
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "calls",
+                "wall_ms_p50",
+                "wall_ms_p95",
+                "duration_ms_p50",
+                "duration_ms_p95",
+                "entries_wall_ms"
+            ]
+        );
+        // A latency section from before the fields existed still parses.
+        let old = r#"{"calls": 1, "wall_ms_p50": 1.0, "wall_ms_p95": 1.0,
+            "duration_ms_p50": null, "duration_ms_p95": null, "entries_wall_ms": {}}"#;
+        let parsed: LatencyStats = serde_json::from_str(old).unwrap();
+        assert!(parsed.pattern_calls_wall_ms.is_empty());
+        assert_eq!(parsed.structural_oracle_wall_ms, None);
+
+        let structural = latency(&[("try-catch", 1.5)], Some(812.3));
+        let json = serde_json::to_value(&structural).unwrap();
+        assert_eq!(json["pattern_calls_wall_ms"]["try-catch"], 1.5);
+        assert_eq!(json["structural_oracle_wall_ms"], 812.3);
+        assert_eq!(
+            serde_json::from_value::<LatencyStats>(json).unwrap(),
+            structural
+        );
+    }
+
+    #[test]
+    fn markdown_latency_table_shows_pattern_calls_and_the_oracle_pass() {
+        let mut r = minimal_report();
+        r.latency.corpora = BTreeMap::from([
+            (
+                "skim".to_string(),
+                latency(&[("go-select", 1.2), ("try-catch", 2.5)], Some(812.3)),
+            ),
+            ("zod".to_string(), latency(&[], None)),
+        ]);
+        let md = render_markdown(&r, None);
+        assert!(
+            md.contains(
+                "| corpus | entry calls | wall p50 ms | wall p95 ms | pattern calls | pattern calls ms | structural oracle ms |"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("| skim | 3 | 2.0 | 4.3 | 2 | 3.7 | 812.3 |"),
+            "{md}"
+        );
+        assert!(md.contains("| zod | 3 | 2.0 | 4.3 | 0 | — | — |"), "{md}");
     }
 
     #[test]

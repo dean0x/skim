@@ -771,6 +771,21 @@ fn a_correct_skim_passes_run_bless_and_check() {
         None
     );
     assert_eq!(report["corpora"][0]["universe"]["delta"], 0);
+    // No [[ast]] entry: no pattern call and no oracle pass to time.
+    let latency = report["latency"]["corpora"]["fixture"].as_object().unwrap();
+    assert!(
+        !latency.contains_key("pattern_calls_wall_ms"),
+        "{latency:?}"
+    );
+    assert!(
+        !latency.contains_key("structural_oracle_wall_ms"),
+        "{latency:?}"
+    );
+    assert!(
+        !stderr(&run).contains("structural oracle"),
+        "{}",
+        stderr(&run)
+    );
 
     let bless = h.bless(None);
     assert_exit(&bless, 0);
@@ -1666,6 +1681,31 @@ fn every_catalog_pattern_is_called_and_rows_no_entry_scores_are_counted() {
         let want = if pattern == "god-function" { 2 } else { 1 };
         assert_eq!(n, want, "--ast {pattern}: {calls:?}");
     }
+
+    // Latency (INFO): each pattern call is timed on its own, apart from the
+    // golden entries' calls, and so is the oracle pass (also on stderr).
+    let latency = &report["latency"]["corpora"]["fixture"];
+    let pattern_calls = latency["pattern_calls_wall_ms"].as_object().unwrap();
+    let timed: Vec<&str> = pattern_calls.keys().map(String::as_str).collect();
+    assert_eq!(timed, called_patterns(catalog()), "{latency}");
+    let entries = latency["entries_wall_ms"].as_object().unwrap();
+    assert!(
+        entries.keys().all(|id| id.starts_with("fixture-")),
+        "{latency}"
+    );
+    assert!(
+        !entries.contains_key(AST_ID),
+        "an [[ast]] entry makes no call of its own"
+    );
+    assert!(
+        latency["structural_oracle_wall_ms"].as_f64().is_some(),
+        "{latency}"
+    );
+    assert!(
+        stderr(&run).contains("[scoreboard] fixture: structural oracle: "),
+        "{}",
+        stderr(&run)
+    );
 
     // Every called pattern carries an unscored count, 0 included.
     let unscored = &report["corpora"][0]["structural"]["unscored_rows"];

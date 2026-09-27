@@ -139,3 +139,13 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The search scoreboard's structural oracle (rskim-oracle, #541) runs the
+# tree-sitter runtime over every file of every corpus, and CI builds the
+# scoreboard in this profile, so the runtime (its C core included: `cc`
+# follows the package's opt-level) is optimised here too: the oracle pass
+# runs about 5x faster for a few seconds of extra compile. The grammar
+# crates stay at the default: with the runtime optimised, their lexers are
+# under a tenth of the pass (the tree and query cursors are most of it).
+[profile.dev.package.tree-sitter]
+opt-level = 3

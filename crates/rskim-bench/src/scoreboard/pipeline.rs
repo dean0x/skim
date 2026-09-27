@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Context;
 use rskim_oracle::structural::StructuralOracle;
@@ -263,7 +264,7 @@ fn run_corpus(
     let universe = Universe::compute(&root, &runner.sandbox().git())?;
     universe.check_file_cap()?;
     let plan = checked_plan(spec, golden, inputs, &universe)?;
-    let answers = structural_answers(name, &plan, &universe, oracle)?;
+    let (answers, oracle_wall_ms) = structural_answers(name, &plan, &universe, oracle)?;
     require_expected_empty_oracles(&plan, &answers)?;
 
     progress(name, "skim search --build");
@@ -301,12 +302,13 @@ fn run_corpus(
     Ok(CorpusRun {
         report,
         samples: eval.samples,
-        latency: latency_stats(&observed.timings),
+        latency: latency_stats(&observed.timings, &observed.pattern_timings, oracle_wall_ms),
     })
 }
 
-/// The structural oracle's answers over `universe` when `plan` has
-/// `[[ast]]` entries (empty answers otherwise).
+/// The structural oracle's answers over `universe`, and the pass's
+/// wall-clock milliseconds (INFO), when `plan` has `[[ast]]` entries; empty
+/// answers and no time otherwise.
 ///
 /// # Errors
 ///
@@ -316,21 +318,34 @@ fn structural_answers(
     plan: &[PlannedQuery],
     universe: &Universe,
     oracle: Option<&StructuralOracle>,
-) -> anyhow::Result<OracleAnswers> {
+) -> anyhow::Result<(OracleAnswers, Option<f64>)> {
     if !has_ast_entries(plan) {
-        return Ok(OracleAnswers::default());
+        return Ok((OracleAnswers::default(), None));
     }
     let oracle = oracle.context("[[ast]] entries but no structural oracle was compiled")?;
     progress(corpus, "running the structural oracle");
-    OracleAnswers::compute(oracle, universe.files()).context("structural oracle")
+    let started = Instant::now();
+    let answers = OracleAnswers::compute(oracle, universe.files()).context("structural oracle")?;
+    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+    progress(
+        corpus,
+        &format!(
+            "structural oracle: {wall_ms:.1} ms over {} universe file(s)",
+            universe.len()
+        ),
+    );
+    Ok((answers, Some(wall_ms)))
 }
 
 /// Every observation of one corpus's plan.
 struct PlanObservations {
     /// One per planned entry, in plan order.
     observations: Vec<EntryObservation>,
-    /// Call timings, by entry id (`--ast <pattern>` for a pattern's call).
+    /// The golden entries' own call timings, by entry id (an `[[ast]]`
+    /// entry makes no call of its own).
     timings: Vec<(String, Vec<Timing>)>,
+    /// Each `--ast <pattern>` call's timing, by pattern ([`ast_calls`]).
+    pattern_timings: BTreeMap<String, Timing>,
     /// skim's `--ast <pattern>` answer per called pattern ([`ast_calls`]).
     patterns: BTreeMap<String, AstPage>,
 }
@@ -399,13 +414,14 @@ fn observe_plan(
     catalog: &[CatalogPattern],
 ) -> anyhow::Result<PlanObservations> {
     let calls = call_patterns(runner, root, ast_calls(plan, catalog))?;
-    let mut timings = Vec::with_capacity(plan.len() + calls.len());
+    let mut pattern_timings = BTreeMap::new();
     let mut patterns: BTreeMap<String, AstPage> = BTreeMap::new();
     for (pattern, (page, timing)) in calls {
-        timings.push((format!("--ast {pattern}"), vec![timing]));
+        pattern_timings.insert(pattern.clone(), timing);
         patterns.insert(pattern, page);
     }
 
+    let mut timings = Vec::with_capacity(plan.len());
     let mut observations = Vec::with_capacity(plan.len());
     for q in plan {
         if let Some(target) = q.structural_target() {
@@ -424,6 +440,7 @@ fn observe_plan(
     Ok(PlanObservations {
         observations,
         timings,
+        pattern_timings,
         patterns,
     })
 }
@@ -726,9 +743,16 @@ fn progress(corpus: &str, step: &str) {
     eprintln!("[scoreboard] {corpus}: {step}");
 }
 
-/// Nearest-rank percentiles over every call, plus each entry's total
-/// wall-clock time (INFO).
-fn latency_stats(entries: &[(String, Vec<Timing>)]) -> LatencyStats {
+/// One corpus's latency (INFO): nearest-rank percentiles over the golden
+/// entries' own calls (`entries`, by entry id) and each entry's total
+/// wall-clock time; each `--ast <pattern>` call's wall-clock time
+/// (`pattern_calls`), kept out of the percentiles and the per-entry totals;
+/// and the structural oracle pass. Milliseconds are rounded to 4 decimals.
+fn latency_stats(
+    entries: &[(String, Vec<Timing>)],
+    pattern_calls: &BTreeMap<String, Timing>,
+    structural_oracle_wall_ms: Option<f64>,
+) -> LatencyStats {
     let timings: Vec<Timing> = entries
         .iter()
         .flat_map(|(_, t)| t.iter().copied())
@@ -749,6 +773,11 @@ fn latency_stats(entries: &[(String, Vec<Timing>)]) -> LatencyStats {
             .iter()
             .map(|(id, t)| (id.clone(), round4(t.iter().map(|t| t.wall_ms).sum())))
             .collect(),
+        pattern_calls_wall_ms: pattern_calls
+            .iter()
+            .map(|(pattern, t)| (pattern.clone(), round4(t.wall_ms)))
+            .collect(),
+        structural_oracle_wall_ms: structural_oracle_wall_ms.map(round4),
     }
 }
 
@@ -764,10 +793,11 @@ mod tests {
             wall_ms: ms,
             duration_ms: d,
         };
-        let s = latency_stats(&[
+        let entries = [
             ("a-1".to_string(), vec![t(4.0, Some(3)), t(1.0, None)]),
             ("a-2".to_string(), vec![t(3.0, Some(1)), t(2.0, None)]),
-        ]);
+        ];
+        let s = latency_stats(&entries, &BTreeMap::new(), None);
         assert_eq!(s.calls, 4);
         assert_eq!((s.wall_ms_p50, s.wall_ms_p95), (2.0, 4.0));
         assert_eq!(
@@ -778,7 +808,34 @@ mod tests {
             s.entries_wall_ms,
             BTreeMap::from([("a-1".to_string(), 5.0), ("a-2".to_string(), 5.0)])
         );
-        assert_eq!(latency_stats(&[]).wall_ms_p50, 0.0);
+        assert!(s.pattern_calls_wall_ms.is_empty());
+        assert_eq!(s.structural_oracle_wall_ms, None);
+        assert_eq!(latency_stats(&[], &BTreeMap::new(), None).wall_ms_p50, 0.0);
+
+        // Pattern calls (slow here) and the oracle pass are reported on their
+        // own: the entry count, percentiles and per-entry totals are the
+        // same as without them.
+        let pattern_calls = BTreeMap::from([
+            ("go-select".to_string(), t(900.0, Some(899))),
+            ("try-catch".to_string(), t(1.234_56, None)),
+        ]);
+        let with = latency_stats(&entries, &pattern_calls, Some(812.345_67));
+        assert_eq!(
+            LatencyStats {
+                pattern_calls_wall_ms: BTreeMap::new(),
+                structural_oracle_wall_ms: None,
+                ..with.clone()
+            },
+            s
+        );
+        assert_eq!(
+            with.pattern_calls_wall_ms,
+            BTreeMap::from([
+                ("go-select".to_string(), 900.0),
+                ("try-catch".to_string(), 1.2346)
+            ])
+        );
+        assert_eq!(with.structural_oracle_wall_ms, Some(812.3457));
     }
 
     fn plan_of(entries: &str) -> Vec<PlannedQuery> {
