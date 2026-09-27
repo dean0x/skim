@@ -24,8 +24,8 @@
 //! although skim parses them with the plain TypeScript grammar.
 //!
 //! Every query names one `@match` capture; the match line is the first
-//! (1-based) line of that node. Three queries carry a small post-filter
-//! ([`PostFilter`]) because their catalog description states a count
+//! (1-based) line of that node. Four patterns (six queries) carry a small
+//! post-filter ([`PostFilter`]) because their catalog description states a count
 //! (`empty-catch`, `empty-function`: zero body elements; `god-function`:
 //! at least 20; `excessive-params`: at least 5 parameters).
 //!
