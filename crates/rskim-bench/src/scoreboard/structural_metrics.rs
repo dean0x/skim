@@ -4,12 +4,17 @@
 //! structural checks, the per-entry measurements behind the structural
 //! RATCHET values ([`StructuralSample`]), and the `uncovered_patterns` list.
 //!
-//! skim is called once per (corpus, pattern) with `--ast <pattern>`. Its rows
-//! are split by file extension (the oracle's own table,
-//! [`structural::classify`]) into that pattern's `[[ast]]` entries. A row in
-//! a language with no entry for the pattern — a language the oracle has no
-//! grammar for (Java, C, Markdown, …) or an oracle language with no entry —
-//! is counted in `structural.unscored_rows.<pattern>`, never dropped.
+//! On a corpus with at least one `[[ast]]` entry, skim is called once per
+//! catalog pattern ([`called_patterns`]) with `--ast <pattern>` — the
+//! patterns the oracle cannot encode, and those with no entry in the corpus,
+//! included. Its rows are split by file extension (the oracle's own table,
+//! [`structural::classify`]) into that pattern's `[[ast]]` entries. A row no
+//! entry scores — a language the oracle has no grammar for (Java, C,
+//! Markdown, …), an oracle language with no entry for the pattern, or a
+//! pattern with no entry at all — is counted in
+//! `structural.unscored_rows.<pattern>`, never dropped. The count is emitted
+//! for every called pattern, 0 included, so a pattern's first unscored row is
+//! a visible RATCHET move.
 //!
 //! Like `structural.rs`, nothing here imports skim's AST search code: the
 //! expectations come from the oracle's tree-sitter queries only.
@@ -163,8 +168,17 @@ fn insert_match(
 pub struct StructuralEvidence {
     pub answers: OracleAnswers,
     /// skim's `--ast <pattern>` answer (every row, every language) for each
-    /// pattern with at least one `[[ast]]` entry in the corpus.
+    /// catalog pattern ([`called_patterns`]; empty when the corpus has no
+    /// `[[ast]]` entry).
     pub patterns: BTreeMap<String, AstPage>,
+}
+
+/// The patterns skim is called for, once per corpus with an `[[ast]]` entry
+/// and by `golden-gen --ast`: every catalog pattern (sorted), whether or not
+/// the oracle covers it and whether or not the corpus has an entry for it. A
+/// pattern left out would have its rows neither scored nor counted.
+pub fn called_patterns() -> Vec<&'static str> {
+    structural::catalog_coverage().into_keys().collect()
 }
 
 // ============================================================================
@@ -188,10 +202,26 @@ pub fn rows_in(page: &ResultPage, lang: OracleLang) -> ResultPage {
     }
 }
 
-/// skim rows no `[[ast]]` entry scores, per pattern skim was called for
-/// (zero counts included): rows in a language the oracle has no grammar for,
-/// rows in an extension skim never AST-indexes, and rows in an oracle
-/// language with no entry for that pattern.
+/// The rows of skim's `--ast <pattern>` answer `page` that no entry in
+/// `scored` (its `(pattern, language)` pairs) scores, in skim's order: rows in
+/// a language the oracle has no grammar for, rows in an extension skim never
+/// AST-indexes, and rows in an oracle language with no entry for `pattern`.
+pub fn unscored_in<'p>(
+    pattern: &str,
+    page: &'p ResultPage,
+    scored: &BTreeSet<(&str, OracleLang)>,
+) -> Vec<&'p ResultRow> {
+    page.rows
+        .iter()
+        .filter(|r| match structural::classify(&r.path) {
+            LangClass::Oracle(lang) => !scored.contains(&(pattern, lang)),
+            LangClass::Unscored { .. } | LangClass::NotIndexed { .. } => true,
+        })
+        .collect()
+}
+
+/// skim rows no `[[ast]]` entry scores ([`unscored_in`]), per pattern skim
+/// was called for (zero counts included).
 pub fn unscored_rows<'a>(
     targets: impl IntoIterator<Item = &'a StructuralTarget>,
     patterns: &BTreeMap<String, AstPage>,
@@ -203,15 +233,7 @@ pub fn unscored_rows<'a>(
     patterns
         .iter()
         .map(|(pattern, call)| {
-            let unscored = call
-                .page
-                .rows
-                .iter()
-                .filter(|r| match structural::classify(&r.path) {
-                    LangClass::Oracle(lang) => !scored.contains(&(pattern.as_str(), lang)),
-                    LangClass::Unscored { .. } | LangClass::NotIndexed { .. } => true,
-                })
-                .count();
+            let unscored = unscored_in(pattern, &call.page, &scored).len();
             (pattern.clone(), unscored as u64)
         })
         .collect()
@@ -435,11 +457,14 @@ pub fn score_entry(
 /// returns no row in its language. Every check passes on such an entry, so it
 /// is a golden error, never a pass.
 ///
-/// A false-positive guard (`expect_oracle_empty`) is never vacuous: its
+/// A false-positive guard (`expect_oracle_empty`) is judged differently: its
 /// oracle is empty by declaration, and skim returning nothing is the state it
 /// guards (recall and precision both read 1 over an empty denominator; a row
-/// fails `structural.precision`). [`unexpected_oracle_matches`] keeps the flag
-/// honest.
+/// fails `structural.precision`), so it is vacuous only when the corpus has
+/// no scored file in its language (none at all, or every one over the AST
+/// size cap): then there is no file a false positive could land on, and the
+/// guard would pass forever while measuring nothing.
+/// [`unexpected_oracle_matches`] keeps the flag honest.
 ///
 /// # Errors
 ///
@@ -450,7 +475,10 @@ pub fn is_vacuous(
     answers: &OracleAnswers,
 ) -> anyhow::Result<bool> {
     let oracle = answers.definition(&target.pattern, target.lang)?;
-    Ok(!target.expect_oracle_empty && rows.is_empty() && oracle.is_empty())
+    if target.expect_oracle_empty {
+        return Ok(answers.scored_files(target.lang) == 0);
+    }
+    Ok(rows.is_empty() && oracle.is_empty())
 }
 
 /// The oracle's matches for an `[[ast]]` entry flagged `expect_oracle_empty`

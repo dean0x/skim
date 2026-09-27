@@ -17,9 +17,12 @@
 //! section.
 //!
 //! `[[ast]]` entries (#541): the structural oracle is compiled once per run
-//! and run over each corpus's universe once; skim is called once per
-//! (corpus, pattern) with `--ast <pattern>`, and the rows are split among
-//! that pattern's entries by language.
+//! and run over each corpus's universe once. On a corpus with an `[[ast]]`
+//! entry, skim is called once per catalog pattern with `--ast <pattern>`
+//! ([`called_patterns`]: patterns with no entry in the corpus, and patterns
+//! the oracle cannot encode, included), and the rows are split among that
+//! pattern's entries by language; rows no entry scores are counted in
+//! `structural.unscored_rows.<pattern>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -44,7 +47,7 @@ use crate::scoreboard::report::{
 use crate::scoreboard::runner::{EntryObservation, SkimRunner, Timing};
 use crate::scoreboard::structural::StructuralOracle;
 use crate::scoreboard::structural_metrics::{
-    OracleAnswers, StructuralEvidence, coverage_comparison, is_vacuous, rows_in,
+    OracleAnswers, StructuralEvidence, called_patterns, coverage_comparison, is_vacuous, rows_in,
     uncovered_patterns, unexpected_oracle_matches,
 };
 use crate::scoreboard::types::{AstPage, StatsSnapshot};
@@ -316,13 +319,25 @@ struct PlanObservations {
     observations: Vec<EntryObservation>,
     /// Call timings, by entry id (`--ast <pattern>` for a pattern's call).
     timings: Vec<(String, Vec<Timing>)>,
-    /// skim's `--ast <pattern>` answer per pattern of the `[[ast]]` entries.
+    /// skim's `--ast <pattern>` answer per called pattern ([`ast_calls`]).
     patterns: BTreeMap<String, AstPage>,
 }
 
-/// Run every call the plan needs. Each pattern of the `[[ast]]` entries is
-/// called once (`--ast <pattern>`, full list), in pattern order; an
-/// `[[ast]]` entry's observation is that call's rows in its language.
+/// The `--ast <pattern>` calls a corpus's plan makes: every catalog pattern
+/// ([`called_patterns`]) when the plan has an `[[ast]]` entry, so no skim row
+/// escapes both the entries and `structural.unscored_rows.<pattern>`; none
+/// otherwise.
+fn ast_calls(plan: &[PlannedQuery]) -> Vec<&'static str> {
+    if plan.iter().any(|q| q.structural_target().is_some()) {
+        called_patterns()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Run every call the plan needs. Each pattern of [`ast_calls`] is called
+/// once (`--ast <pattern>`, full list), in pattern order; an `[[ast]]`
+/// entry's observation is its pattern call's rows in its language.
 ///
 /// # Errors
 ///
@@ -332,14 +347,10 @@ fn observe_plan(
     root: &Path,
     plan: &[PlannedQuery],
 ) -> anyhow::Result<PlanObservations> {
-    let mut timings = Vec::with_capacity(plan.len());
+    let calls = ast_calls(plan);
+    let mut timings = Vec::with_capacity(plan.len() + calls.len());
     let mut patterns: BTreeMap<String, AstPage> = BTreeMap::new();
-    let wanted: BTreeSet<&str> = plan
-        .iter()
-        .filter_map(PlannedQuery::structural_target)
-        .map(|t| t.pattern.as_str())
-        .collect();
-    for pattern in wanted {
+    for pattern in calls {
         let (page, timing) = runner
             .ast_list(root, pattern)
             .with_context(|| format!("--ast {pattern}"))?;
@@ -458,21 +469,24 @@ pub fn require_oracle_less_rows(
     )
 }
 
-/// Refuse to score a vacuous `[[ast]]` entry: the structural oracle matches
-/// no file of its language and skim returns no row in it.
+/// Refuse to score a vacuous `[[ast]]` entry ([`is_vacuous`]): the
+/// structural oracle matches no file of its language and skim returns no row
+/// in it, or, for a false-positive guard (`expect_oracle_empty = true`), the
+/// corpus has no scored file in its language.
 ///
 /// Every structural check passes on such an entry, so it measures nothing,
 /// and a regression that made skim return nothing there could never show.
 /// It is a golden error (`golden-gen` proposes only non-vacuous entries):
-/// remove the entry, or pick a corpus where the pattern occurs. A
-/// false-positive guard (`expect_oracle_empty = true`) is exempt: skim
-/// returning nothing is the fixed state it guards, and
-/// [`require_expected_empty_oracles`] keeps its oracle empty.
+/// remove the entry, or pick a corpus where the pattern occurs. A guard with
+/// scored files in its language is exempt: skim returning nothing is the
+/// fixed state it guards, and [`require_expected_empty_oracles`] keeps its
+/// oracle empty.
 ///
 /// # Errors
 ///
-/// Some `[[ast]]` entry is vacuous; the message names them. Also an entry
-/// the oracle has no query for (integrity rejects that first).
+/// Some `[[ast]]` entry is vacuous; the message names them (a guard with the
+/// reason). Also an entry the oracle has no query for (integrity rejects
+/// that first).
 pub fn require_non_vacuous_structural(
     plan: &[PlannedQuery],
     observations: &[EntryObservation],
@@ -480,11 +494,20 @@ pub fn require_non_vacuous_structural(
 ) -> anyhow::Result<()> {
     let mut vacuous = Vec::new();
     for (q, obs) in plan.iter().zip(observations) {
-        if let Some(target) = q.structural_target()
-            && is_vacuous(target, &obs.full.rows, answers)?
-        {
-            vacuous.push(q.id.as_str());
+        let Some(target) = q.structural_target() else {
+            continue;
+        };
+        if !is_vacuous(target, &obs.full.rows, answers)? {
+            continue;
         }
+        vacuous.push(if target.expect_oracle_empty {
+            format!(
+                "{} (false-positive guard: no scored {} file)",
+                q.id, target.lang
+            )
+        } else {
+            q.id.clone()
+        });
     }
     if vacuous.is_empty() {
         return Ok(());
@@ -494,7 +517,8 @@ pub fn require_non_vacuous_structural(
          nor skim finds a file in the entry's language, so every check would pass on nothing; \
          remove the entry (golden-gen proposes only entries where the oracle or skim finds a file). \
          An entry that guards a skim false positive the oracle rejects declares \
-         `expect_oracle_empty = true` and is exempt",
+         `expect_oracle_empty = true` and is exempt while the corpus has a scored file in its \
+         language; with none, a false positive has nowhere to land and the guard is vacuous too",
         vacuous.len(),
         if vacuous.len() == 1 { "y" } else { "ies" },
         vacuous.join(", ")
@@ -855,6 +879,33 @@ mod tests {
     }
 
     #[test]
+    fn skim_is_called_for_every_catalog_pattern_once_the_corpus_has_an_ast_entry() {
+        let with_ast = plan_of(
+            "[[ast]]\nid = \"skim-ast-rust-nested-loop-rust\"\npattern = \"rust-nested-loop\"\nlang = \"rust\"\nprecision = \"ratchet\"\n\
+             [[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n",
+        );
+        let calls = ast_calls(&with_ast);
+        assert_eq!(calls, called_patterns());
+        // Patterns with no entry in this corpus, and patterns no oracle
+        // covers, are called too: their rows count as unscored.
+        for pattern in [
+            "god-function",
+            "go-select",
+            "deep-nesting",
+            "java-synchronized",
+        ] {
+            assert!(calls.contains(&pattern), "{pattern}");
+        }
+        // A corpus with no [[ast]] entry makes no pattern call (its
+        // standalone `--ast` [[prefix]] entries are observed on their own).
+        let without = plan_of(
+            "[[prefix]]\nid = \"skim-F003\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n\
+             [[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n",
+        );
+        assert!(ast_calls(&without).is_empty());
+    }
+
+    #[test]
     fn a_false_positive_guard_is_exempt_from_vacuity_but_its_flag_must_hold() {
         use crate::scoreboard::structural::StructuralOracle;
         let oracle = StructuralOracle::new().unwrap();
@@ -862,9 +913,16 @@ mod tests {
             "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\nexpect_oracle_empty = true\n\
              [[ast]]\nid = \"skim-ast-go-defer-go\"\npattern = \"go-defer\"\nlang = \"go\"\nprecision = \"hard\"\n",
         );
-        // No Go file: both oracles are empty.
-        let no_go = OracleAnswers::compute(&oracle, [("src/a.rs", "fn f() {}\n")]).unwrap();
-        require_expected_empty_oracles(&plan, &no_go).unwrap();
+        // A Go file with no select and no defer: both oracles are empty.
+        let no_select = OracleAnswers::compute(
+            &oracle,
+            [
+                ("src/a.rs", "fn f() {}\n"),
+                ("cmd/main.go", "package main\n\nfunc f() {}\n"),
+            ],
+        )
+        .unwrap();
+        require_expected_empty_oracles(&plan, &no_select).unwrap();
 
         // Both entries find nothing: the flagged one is the fixed state of a
         // false positive and is scored; the unflagged one is still vacuous.
@@ -872,7 +930,7 @@ mod tests {
             observed("skim-ast-go-select-go", 0),
             observed("skim-ast-go-defer-go", 0),
         ];
-        let err = require_non_vacuous_structural(&plan, &empty, &no_go)
+        let err = require_non_vacuous_structural(&plan, &empty, &no_select)
             .expect_err("the unflagged entry is vacuous");
         let msg = format!("{err:#}");
         assert!(msg.contains("skim-ast-go-defer-go"), "{msg}");
@@ -884,7 +942,20 @@ mod tests {
         let flagged_only = plan_of(
             "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\nexpect_oracle_empty = true\n",
         );
-        require_non_vacuous_structural(&flagged_only, &empty[..1], &no_go).unwrap();
+        require_non_vacuous_structural(&flagged_only, &empty[..1], &no_select).unwrap();
+
+        // With no scored Go file at all, the guard has nothing to guard: it
+        // is vacuous too, and the message says why.
+        let no_go = OracleAnswers::compute(&oracle, [("src/a.rs", "fn f() {}\n")]).unwrap();
+        require_expected_empty_oracles(&flagged_only, &no_go).unwrap();
+        let err = require_non_vacuous_structural(&flagged_only, &empty[..1], &no_go)
+            .expect_err("a guard in a language the corpus has no scored file in measures nothing");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("golden integrity failed"), "{msg}");
+        assert!(
+            msg.contains("skim-ast-go-select-go (false-positive guard: no scored go file)"),
+            "{msg}"
+        );
 
         // Once the oracle matches, the flag is stale: a golden error that
         // names the entry and a matched file, before skim is even run.

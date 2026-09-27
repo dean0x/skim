@@ -43,7 +43,7 @@ use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
 use rskim_bench::scoreboard::report::{GateStatus, Report, clear_outputs, total, write_outputs};
 use rskim_bench::scoreboard::runner::{SkimRunner, SkimSandbox};
 use rskim_bench::scoreboard::structural::StructuralOracle;
-use rskim_bench::scoreboard::structural_metrics::OracleAnswers;
+use rskim_bench::scoreboard::structural_metrics::{OracleAnswers, called_patterns};
 use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
 
 const EXIT_PASS: u8 = 0;
@@ -301,9 +301,10 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
 }
 
 /// `golden-gen --ast`: run the structural oracle over the universe, call
-/// skim once per pattern with a covered language present in the corpus
-/// (sandboxed under `home`, as in `run`), and print the non-vacuous
-/// `[[ast]]` entries (a skim-only one as an `expect_oracle_empty` guard).
+/// skim once per catalog pattern, the gate's call set (sandboxed under
+/// `home`, as in `run`), and print the non-vacuous `[[ast]]` entries (a
+/// skim-only one as an `expect_oracle_empty` guard), after a comment listing
+/// the rows no proposed entry would score.
 fn golden_gen_ast(
     args: &GoldenGenArgs,
     corpus: &str,
@@ -317,7 +318,7 @@ fn golden_gen_ast(
     let answers = OracleAnswers::compute(&oracle, universe.files()).context("structural oracle")?;
     let runner = SkimRunner::new(skim_bin, SkimSandbox::new(home));
     runner.build(root)?;
-    let skim = golden_gen::ast_patterns_to_query(&answers)
+    let skim = called_patterns()
         .into_iter()
         .map(|pattern| {
             let (page, _) = runner
@@ -332,6 +333,10 @@ fn golden_gen_ast(
         "# golden-gen --ast proposal for corpus {corpus} at {commit} ({} entr{}; review, then freeze in golden/{corpus}.toml)",
         candidates.len(),
         if candidates.len() == 1 { "y" } else { "ies" }
+    );
+    print!(
+        "{}",
+        golden_gen::render_unscored_comment(&golden_gen::unscored_after(&candidates, &skim))
     );
     print!("{}", golden_gen::render_ast_toml(&candidates));
     eprintln!(

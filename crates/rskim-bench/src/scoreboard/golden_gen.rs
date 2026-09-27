@@ -32,8 +32,13 @@
 //! no file for exists only because skim returns one (a false positive), so it
 //! is proposed with `expect_oracle_empty = true`: a false-positive guard that
 //! stays scored after a fix empties skim's rows.
+//!
+//! `golden-gen --ast` calls skim for every catalog pattern
+//! ([`crate::scoreboard::structural_metrics::called_patterns`]), the call set
+//! the gate uses, and reports the rows no proposed entry would score
+//! ([`unscored_after`]) as a comment above the proposal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Context;
@@ -41,10 +46,11 @@ use rskim_search::SearchField;
 
 use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
 use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};
+use crate::scoreboard::metrics::sample;
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use crate::scoreboard::structural::{self, OracleLang, PatternCoverage};
-use crate::scoreboard::structural_metrics::{OracleAnswers, distinct_files, rows_in};
-use crate::scoreboard::types::ResultPage;
+use crate::scoreboard::structural_metrics::{OracleAnswers, distinct_files, rows_in, unscored_in};
+use crate::scoreboard::types::{ResultPage, ResultRow};
 use crate::scoreboard::universe::Universe;
 
 /// Generated identifier entries per corpus.
@@ -302,17 +308,6 @@ fn present_pairs(answers: &OracleAnswers) -> Vec<(&'static str, OracleLang)> {
     pairs
 }
 
-/// The patterns `golden-gen --ast` calls skim for: those with a covered
-/// language present in the corpus, sorted.
-pub fn ast_patterns_to_query(answers: &OracleAnswers) -> Vec<&'static str> {
-    let mut patterns: Vec<&'static str> = present_pairs(answers)
-        .into_iter()
-        .map(|(pattern, _)| pattern)
-        .collect();
-    patterns.dedup();
-    patterns
-}
-
 /// Propose `[[ast]]` entries (see the module docs). `skim` holds skim's
 /// `--ast <pattern>` full list per pattern called; a pattern not in it
 /// counts as no rows.
@@ -345,6 +340,50 @@ pub fn generate_ast(
         });
     }
     Ok(out)
+}
+
+/// skim rows no candidate scores ([`unscored_in`]), per called pattern with
+/// at least one, in pattern order: what the gate counts in
+/// `structural.unscored_rows.<pattern>` once the proposal is frozen.
+pub fn unscored_after<'s>(
+    candidates: &[AstCandidate],
+    skim: &'s BTreeMap<String, ResultPage>,
+) -> Vec<(&'s str, Vec<&'s ResultRow>)> {
+    let scored: BTreeSet<(&str, OracleLang)> = candidates
+        .iter()
+        .map(|c| (c.pattern.as_str(), c.lang))
+        .collect();
+    skim.iter()
+        .map(|(pattern, page)| (pattern.as_str(), unscored_in(pattern, page, &scored)))
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
+}
+
+/// TOML comment lines reporting [`unscored_after`] to the reviewer: each
+/// pattern's count and a sample of `path:line` rows, or `none`.
+pub fn render_unscored_comment(unscored: &[(&str, Vec<&ResultRow>)]) -> String {
+    if unscored.is_empty() {
+        return "# golden-gen: skim rows no proposed entry scores: none\n".to_string();
+    }
+    let mut out = String::from(
+        "# golden-gen: skim rows no proposed entry scores (the gate counts them in \
+         structural.unscored_rows.<pattern>):\n",
+    );
+    for (pattern, rows) in unscored {
+        let located: Vec<String> = rows
+            .iter()
+            .map(|r| match r.line {
+                Some(line) => format!("{}:{line}", r.path),
+                None => r.path.clone(),
+            })
+            .collect();
+        out.push_str(&format!(
+            "#   {pattern} {}: {}\n",
+            rows.len(),
+            sample(located.iter().map(String::as_str))
+        ));
+    }
+    out
 }
 
 /// TOML `[[ast]]` entries for `candidates`, each preceded by a review
@@ -747,14 +786,6 @@ mod tests {
                 "try { try { a(); } catch (e) {} } finally { b(); }\n",
             ),
         ]);
-        // Only patterns with a covered language present in the corpus.
-        let patterns = ast_patterns_to_query(&answers);
-        assert!(patterns.windows(2).all(|w| w[0] < w[1]), "{patterns:?}");
-        assert!(patterns.contains(&"try-catch-finally"));
-        assert!(patterns.contains(&"rust-nested-loop"));
-        assert!(!patterns.contains(&"go-select"), "no Go file");
-        assert!(!patterns.contains(&"python-try-except"), "no Python file");
-
         // skim returns the JS file for try-catch-finally although the oracle
         // does not match it: a skim-only entry is non-vacuous and proposed.
         let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/b.js"]))]);
@@ -794,6 +825,12 @@ mod tests {
             !pairs.iter().any(|p| p.1 == "tsx"),
             "no .tsx file in the corpus: {pairs:?}"
         );
+        assert!(
+            !pairs
+                .iter()
+                .any(|p| p.0 == "go-select" || p.0 == "python-try-except"),
+            "no Go or Python file in the corpus: {pairs:?}"
+        );
         let mut sorted = pairs.clone();
         sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         assert_eq!(pairs, sorted, "ordered by (pattern, language name)");
@@ -810,6 +847,70 @@ mod tests {
         assert!(
             got.iter()
                 .all(|c| c.expect_oracle_empty == (c.oracle_files == 0))
+        );
+    }
+
+    #[test]
+    fn rows_no_proposed_entry_scores_are_reported_per_pattern() {
+        let answers = ast_answers(&[
+            (
+                "src/nested.rs",
+                "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {}\n    }\n}\n",
+            ),
+            ("web/a.ts", "try {\n  go();\n} catch (e) {}\n"),
+        ]);
+        // skim is called for every catalog pattern. deep-nesting has no
+        // oracle, god-function has no entry for Python, and the corpus has
+        // no .tsx file, so no try-catch entry scores `web/b.tsx`.
+        let skim = BTreeMap::from([
+            (
+                "rust-nested-loop".to_string(),
+                skim_rows(&["src/nested.rs"]),
+            ),
+            (
+                "deep-nesting".to_string(),
+                skim_rows(&["src/nested.rs", "lib/C.java"]),
+            ),
+            ("god-function".to_string(), skim_rows(&["app.py"])),
+            ("go-select".to_string(), skim_rows(&[])),
+            (
+                "try-catch".to_string(),
+                skim_rows(&["web/a.ts", "web/b.tsx"]),
+            ),
+        ]);
+        let candidates = generate_ast("skim", &answers, &skim).unwrap();
+        let unscored = unscored_after(&candidates, &skim);
+        let got: Vec<(&str, Vec<&str>)> = unscored
+            .iter()
+            .map(|(p, rows)| (*p, rows.iter().map(|r| r.path.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("deep-nesting", vec!["src/nested.rs", "lib/C.java"]),
+                ("god-function", vec!["app.py"]),
+                ("try-catch", vec!["web/b.tsx"]),
+            ],
+            "patterns with no unscored row are left out"
+        );
+
+        let comment = render_unscored_comment(&unscored);
+        assert!(comment.lines().all(|l| l.starts_with('#')), "{comment}");
+        assert!(
+            comment.contains("structural.unscored_rows.<pattern>"),
+            "{comment}"
+        );
+        assert!(
+            comment.contains("#   deep-nesting 2: src/nested.rs:1, lib/C.java:1"),
+            "{comment}"
+        );
+        assert!(
+            comment.contains("#   try-catch 1: web/b.tsx:1"),
+            "{comment}"
+        );
+        assert_eq!(
+            render_unscored_comment(&[]),
+            "# golden-gen: skim rows no proposed entry scores: none\n"
         );
     }
 

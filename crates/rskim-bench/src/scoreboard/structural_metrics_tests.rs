@@ -215,6 +215,83 @@ fn unscored_rows_count_every_row_no_entry_scores_per_called_pattern() {
     assert!(unscored_rows(&targets, &BTreeMap::new()).is_empty());
 }
 
+#[test]
+fn every_row_of_a_pattern_with_no_entry_is_unscored_even_in_an_oracle_language() {
+    // The corpus scores rust-nested-loop in Rust only. skim is still called
+    // for every catalog pattern: god-function (covered, but no entry here)
+    // and deep-nesting (no oracle at all) count every row they return.
+    let targets = [target(
+        "rust-nested-loop",
+        OracleLang::Rust,
+        PrecisionClass::Ratchet,
+    )];
+    let patterns = BTreeMap::from([
+        (
+            "god-function".to_string(),
+            call(
+                vec![row("src/app.py", Some(310)), row("src/big.rs", Some(1))],
+                0,
+            ),
+        ),
+        (
+            "deep-nesting".to_string(),
+            call(
+                vec![row("src/nested.rs", Some(2)), row("lib/C.java", None)],
+                0,
+            ),
+        ),
+        ("go-select".to_string(), call(Vec::new(), 0)),
+        (
+            "rust-nested-loop".to_string(),
+            call(vec![row("src/nested.rs", Some(3))], 0),
+        ),
+    ]);
+    assert_eq!(
+        unscored_rows(&targets, &patterns),
+        BTreeMap::from([
+            ("deep-nesting".to_string(), 2),
+            ("go-select".to_string(), 0),
+            ("god-function".to_string(), 2),
+            ("rust-nested-loop".to_string(), 0),
+        ]),
+        "a called pattern with no row still reads 0, so its first row is a visible move"
+    );
+
+    // The same predicate, row by row, in skim's order.
+    let scored = BTreeSet::from([("rust-nested-loop", OracleLang::Rust)]);
+    let god = &patterns["god-function"].page;
+    let unscored: Vec<&str> = unscored_in("god-function", god, &scored)
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+    assert_eq!(unscored, ["src/app.py", "src/big.rs"]);
+    let nested = &patterns["rust-nested-loop"].page;
+    assert!(unscored_in("rust-nested-loop", nested, &scored).is_empty());
+}
+
+#[test]
+fn skim_is_called_for_every_catalog_pattern_covered_or_not() {
+    let called = called_patterns();
+    let catalog: BTreeSet<&str> = rskim_search::all_patterns()
+        .iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(called.iter().copied().collect::<BTreeSet<_>>(), catalog);
+    assert_eq!(called.len(), catalog.len(), "each pattern once");
+    assert!(called.windows(2).all(|w| w[0] < w[1]), "sorted: {called:?}");
+    // No oracle query, and oracle queries with no corpus entry, alike.
+    for pattern in [
+        "deep-nesting",
+        "java-synchronized",
+        "ruby-begin-rescue",
+        "go-select",
+        "god-function",
+        "excessive-params",
+    ] {
+        assert!(called.contains(&pattern), "{pattern}");
+    }
+}
+
 // --- HARD checks ---------------------------------------------------------------------
 
 #[test]
@@ -393,7 +470,39 @@ fn an_entry_is_vacuous_only_when_the_oracle_and_skim_both_find_nothing() {
 }
 
 #[test]
-fn a_false_positive_guard_is_never_vacuous_and_its_flag_must_match_an_empty_oracle() {
+fn a_false_positive_guard_is_vacuous_only_without_a_scored_file_in_its_language() {
+    let a = answers();
+    // The universe has scored TypeScript files: both empty is the fixed state.
+    assert!(!is_vacuous(&guard("try-catch-finally", OracleLang::TypeScript), &[], &a).unwrap());
+    // No Go file at all: the guard judges nothing, rows or not.
+    let go = guard("go-select", OracleLang::Go);
+    assert!(is_vacuous(&go, &[], &a).unwrap());
+    assert!(is_vacuous(&go, &[row("cmd/x.go", Some(1))], &a).unwrap());
+    // The only Python file is over the AST size cap: outside the AST
+    // universe, so it is not a scored file either.
+    let over_cap = format!("# {}\n", "x".repeat(1024 * 1024));
+    let capped = OracleAnswers::compute(oracle(), [("big.py", over_cap.as_str())]).unwrap();
+    assert_eq!(capped.scored_files(OracleLang::Python), 0);
+    assert!(
+        is_vacuous(
+            &guard("python-try-except", OracleLang::Python),
+            &[],
+            &capped
+        )
+        .unwrap()
+    );
+    // Unflagged entries keep the both-empty rule.
+    let plain = target(
+        "python-try-except",
+        OracleLang::Python,
+        PrecisionClass::Hard,
+    );
+    assert!(is_vacuous(&plain, &[], &capped).unwrap());
+    assert!(!is_vacuous(&plain, &[row("big.py", Some(1))], &capped).unwrap());
+}
+
+#[test]
+fn a_false_positive_guard_is_not_vacuous_and_its_flag_must_match_an_empty_oracle() {
     let a = answers();
     // The oracle finds no try/catch/finally anywhere in the universe.
     let fp = guard("try-catch-finally", OracleLang::TypeScript);

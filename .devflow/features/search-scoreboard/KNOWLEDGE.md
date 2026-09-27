@@ -41,7 +41,8 @@ against four pinned full-history corpora (skim `b8a0a79`, ripgrep, flask, zod). 
 oracles that share no code with skim's search stack, and it compares ranking with naive baselines. It replaced the
 manual ADR-007 dog-food campaign as the standing gate. Manual dog-food is still required only where the scoreboard
 cannot see: the `--ast` patterns the structural oracle does not score (`uncovered_patterns`: `deep-nesting`,
-`java-synchronized`, `ruby-begin-rescue` have no query; the four Go patterns have no corpus file), the temporal
+`java-synchronized`, `ruby-begin-rescue` have no query; the four Go patterns have no corpus Go file where the
+oracle or skim finds a match), the temporal
 arms against `git log` (#542), and any new query flag or arm that has no golden entries yet.
 
 The user-facing runbook is `crates/rskim-bench/scoreboard/README.md`. This file covers what the README does not
@@ -245,17 +246,26 @@ if rx.recv_timeout(KILL_GRACE).is_ok() { // KILL_GRACE = 2 s
 (`scoreboard/structural/<pattern>.<lang>.scm`, `include_str!`ed into `QUERIES`) over the oracle universe;
 `structural_metrics.rs` turns its answers plus skim's `--ast` rows into checks. Couplings and traps:
 
-- **Independence is test-enforced here**, unlike `oracle.rs`: `structural_tests.rs` source-scans both files and
-  fails on any `ast_index` / `compound` / `linearize` / `rskim_core::Language` use. Only pattern names come from
-  `rskim_search::all_patterns()`. The extension table, the AST-indexed language list and the 1 MiB **inclusive**
+- **Independence is test-enforced here**, unlike `oracle.rs`: `structural_tests.rs` source-scans six files
+  (`structural.rs`, `structural_metrics.rs`, and the `golden.rs` / `metrics.rs` / `report.rs` / `types.rs` modules
+  the scoring imports) and fails on any `ast_index` / `compound` / `linearize` / `rskim_core` use (any
+  `rskim_core` item, not only `Language`) and on any `rskim_search` item other than `all_patterns`. Only pattern
+  names come from `rskim_search::all_patterns()`. The extension table, the AST-indexed language list and the 1 MiB **inclusive**
   cap are cited copies.
 - **The oracle is folded into the golden digest.** A file with `[[ast]]` entries hashes its bytes plus the SHA-256
   of `structural::fingerprint()` (every `.scm`, post-filter, `INTENTS` spec, the cap, every `EXT_CLASSES` row plus
   `UNKNOWN_EXTENSION`, `ATTRIBUTE_KINDS`; rendered by `render_fingerprint` over explicit `OracleInputs`, so a test
   can render an edited copy). Editing any of them moves the `golden_sha256` of every `[[ast]]`-bearing corpus:
   "bless required", and `bless` refuses a report made with other queries.
-- **One skim call per (corpus, pattern)** (`observe_plan`), rows split by `structural::classify`, so `.tsx` is its
-  own language. Rows in a language with no entry become `structural.unscored_rows.<pattern>` (a shrink regresses).
+- **One skim call per (corpus, pattern), for every catalog pattern** (`observe_plan` / `ast_calls`, via
+  `structural_metrics::called_patterns`) once the corpus has any `[[ast]]` entry — patterns with no entry in that
+  corpus and the uncovered ones included (116 calls over the four corpora, was 41). Rows split by
+  `structural::classify`, so `.tsx` is its own language. Every row no entry scores (no oracle grammar, an oracle
+  language with no entry for the pattern, or a pattern with no entry at all) becomes
+  `structural.unscored_rows.<pattern>`, emitted for every called pattern with 0 included (a shrink regresses).
+  Trap: calling only the patterns that have an entry (the pre-fix set) silently dropped e.g. skim's
+  god-function / excessive-params rows on flask and zod. `golden-gen --ast` uses the same call set and prints the
+  rows no proposed entry scores (`unscored_after`) as a comment above the proposal.
 - **`structural.coverage` is recorded per `[[ast]]` id** (HARD records are keyed `(id, check)`), so a coverage
   mismatch fails every `[[ast]]` id of the corpus and ledgering it needs all of them. Deliberate: every HARD
   record, ledger ref and baseline state is keyed by a golden id (a corpus-level id would need its own namespace
@@ -267,12 +277,17 @@ if rx.recv_timeout(KILL_GRACE).is_ok() { // KILL_GRACE = 2 s
   `oracle files 0` candidate). A guard stays scored after the fix empties skim's rows (recall and precision read 1
   over an empty denominator), so fixing #546 turns `skim-ast-try-catch-finally-javascript`'s XFAIL into an XPASS:
   remove the ledger ids, keep the golden entry, bless (no reason needed). A guard whose oracle matches a file is exit
-  2 before skim runs (`require_expected_empty_oracles`), so the flag can never hide a recall loss. The report marks
+  2 before skim runs (`require_expected_empty_oracles`), so the flag can never hide a recall loss. A guard in a
+  language where the corpus has no oracle-scored file (`OracleAnswers::scored_files(lang) == 0`, i.e. none at all
+  or all over the size cap) is itself vacuous, exit 2 ("`<id>` (false-positive guard: no scored `<lang>` file)"):
+  a false positive has nowhere to land, so it would pass forever. The report marks
   a guard (`StructuralSample.expect_oracle_empty`, serialized only when true; `<class>, FP guard` in report.md).
 - **`line_on_match` reads low by design**: skim anchors on the child that completes an edge (`catch_clause`,
   `class_body`, …); the oracle anchors on the construct. try-*, class-method, impl-method read 0. Not a bug.
 - **Cost**: the oracle is rayon-parallel, one parse per file; the structural share of a warm local run is about
-  25–30 s (full `check` about 208 s vs about 180 s before).
+  30–35 s. The 116 `--ast` pattern calls take about 16 s of skim wall time (the 41 calls before the every-pattern
+  call set took 9.7 s); the oracle pass is the rest. A full `check` measured 220 s on a loaded machine (about
+  205 s before the call-set change, about 180 s before #541).
 
 ### Pinned full-history clones (`ensure_pinned_history_clone`)
 

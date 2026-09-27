@@ -35,8 +35,8 @@ What it does **not** cover yet, where manual adversarial dog-food (ADR-007) is s
 
 - The `--ast` patterns the structural oracle does not score, listed under "Uncovered structural patterns" in
   `report.md`: `deep-nesting`, `java-synchronized` and `ruby-begin-rescue` have no oracle query, and
-  `go-channel-send`, `go-defer`, `go-goroutine` and `go-select` have no corpus file to score (see
-  [Uncovered patterns](#uncovered-patterns)).
+  `go-channel-send`, `go-defer`, `go-goroutine` and `go-select` have no corpus Go file where the oracle or skim
+  finds a match (see [Uncovered patterns](#uncovered-patterns)).
 - The temporal arms (`--hot` / `--cold` / `--risky` / `--blast-radius`) against `git log`: #542.
 - Any new query flag or arm, until it has golden entries here.
 
@@ -50,7 +50,7 @@ cargo run -p rskim-bench --bin scoreboard -- check --skim-bin target/release/ski
 ```
 
 - The first run clones about 115 MB of full-history corpora into `.bench-corpus/scoreboard/` (gitignored), which
-  takes about 30 s on a fast link. After that a `check` takes about 3 minutes on Apple Silicon.
+  takes about 30 s on a fast link. After that a `check` takes about 3.5 minutes on Apple Silicon.
 - On macOS, run long checks under `caffeinate -i -s`. An unattended Mac can sleep mid-run: one run stretched to
   about 27 minutes, while the per-call timers (which stop during sleep) still looked normal.
 - Reports go to `target/scoreboard/report.{json,md}` (change this with `--out`).
@@ -222,7 +222,9 @@ expect_oracle_empty = true                     # optional, default false: a fals
 - `precision` is declared here and never re-read from the catalog. `golden-gen` proposes `hard` iff the catalog
   marks the pattern `exact`. Reclassifying an entry is a reviewed golden edit plus a bless.
 - skim is called once per (corpus, pattern): `skim search --root <clone> --json --limit 1000000 --ast <pattern>`.
-  The rows are split by extension into languages, so each entry sees only its own language's rows.
+  On a corpus with at least one `[[ast]]` entry it is called for **every** catalog pattern, including patterns with
+  no entry in that corpus and the uncovered ones. The rows are split by extension into languages, so each entry sees
+  only its own language's rows, and every row no entry scores is counted in `structural.unscored_rows.<pattern>`.
 - Integrity errors (exit 2): an unknown `lang` or `precision`, a pattern that is not in the catalog, an uncovered
   pattern, a language the pattern has no query for, two entries for one (pattern, language), a vacuous entry
   ([Vacuity guard](#vacuity-guard)), or an `expect_oracle_empty` entry whose oracle matches a file. A
@@ -236,8 +238,10 @@ cargo build -p rskim-bench --bin scoreboard
 target/debug/scoreboard golden-gen --corpus zod --ast --skim-bin target/release/skim
 ```
 
-It prints one `[[ast]]` entry per candidate, each under a `# golden-gen: oracle files N; skim files M` comment, and
-adds `expect_oracle_empty = true` to a candidate with `oracle files 0`. Review them, append them to
+It calls skim for every catalog pattern, as the gate does. It prints one `[[ast]]` entry per candidate, each under a
+`# golden-gen: oracle files N; skim files M` comment, and adds `expect_oracle_empty = true` to a candidate with
+`oracle files 0`. A comment above the entries lists, per pattern, the skim rows no proposed entry would score (the
+gate's `structural.unscored_rows.<pattern>`), with a sample of `path:line` rows. Review them, append them to
 `golden/<corpus>.toml`, then run `check` and bless. Ids are stable across regeneration. New entries bless without
 `--accept-regression`: their checks go `new -> pass` or `new -> xfail`, and neither is a downgrade.
 
@@ -252,13 +256,14 @@ adds `expect_oracle_empty = true` to a candidate with `oracle files 0`. Review t
 | `structural.precision.<id>` | RATCHET | `precision = "ratchet"` entries | file-level precision (4 dp) |
 | `structural.line_on_match.<id>` | RATCHET | every `[[ast]]` entry | how many skim rows have a `line` that is the first line of an oracle match in that file |
 | `structural.intent_recall.<id>`, `structural.intent_precision.<id>` | RATCHET | `nested-loop` (typescript, tsx, javascript), `rust-nested-loop` (rust) | recall and precision against the intent oracle: a loop with a loop ancestor inside the same function |
-| `structural.unscored_rows.<pattern>` | RATCHET | per corpus, every pattern skim was called for | skim rows in a language no entry scores for that pattern (Java, C, Markdown, `.sh`, …) |
+| `structural.unscored_rows.<pattern>` | RATCHET | per corpus with an `[[ast]]` entry, every catalog pattern (0 included) | skim rows no entry scores: a language the oracle has no grammar for (Java, C, Markdown, `.sh`, …), an oracle language with no entry for that pattern, or a pattern with no entry at all |
 
 - `line_on_match` reads low by construction for multi-line constructs. skim anchors a row on the child node that
   completes the pattern's edge (`catch_clause`, `class_body`, …), while the oracle anchors on the construct the
   description names. It is a count, so it is defined even when there is no true positive.
-- `unscored_rows` keeps rows the oracle cannot judge visible instead of dropping them. Like `oracle_less.full_rows`,
-  a shrink is a regression.
+- `unscored_rows` keeps rows no entry judges visible instead of dropping them: every row of every catalog pattern
+  lands in an entry or in this count. It is emitted for every called pattern, 0 included, so a pattern's first
+  unscored row is a visible RATCHET move. Like `oracle_less.full_rows`, a shrink is a regression.
 - `report.json` carries, under `corpora[i].structural`, each entry's `oracle_files`, `skim_files`, `recall`,
   `precision`, the intent fields where they apply and `line_on_match`, plus the coverage comparison. A
   [false-positive guard](#false-positive-guards) also carries `"expect_oracle_empty": true`; the key is absent on
@@ -273,7 +278,8 @@ An `[[ast]]` entry where the oracle matches no file in its language AND skim ret
 check without testing anything. It is a golden error, exit 2 ("golden integrity failed: N vacuous [[ast]] entr(y|ies)
 …"), and `golden-gen --ast` never proposes one. It can appear later, for example when a pin bump empties an entry.
 Remove the entry together with its ledger ids and bless with `--accept-regression`, because a blessed check that no
-longer runs is a HARD downgrade. A false-positive guard is exempt (below).
+longer runs is a HARD downgrade. A false-positive guard is exempt while the corpus has a scored file in its language
+(below).
 
 ### False-positive guards
 
@@ -290,6 +296,9 @@ An entry whose oracle is empty exists only because skim returns a file the oracl
   hide a recall loss.
 - The report says it is a guard (`"expect_oracle_empty": true` in `report.json`, `FP guard` in its `report.md`
   class cell), so a fixed guard's oracle 0 / skim 0 does not read as an ordinary entry.
+- Its language must have scored files. A guard in a language where the corpus has no file the oracle scores (none at
+  all, or every one over the 1 MiB cap) has nowhere for a false positive to land, so it would pass forever while
+  measuring nothing. It is vacuous: exit 2, naming it as "`<id>` (false-positive guard: no scored `<lang>` file)".
 - Unflagged entries keep the vacuity guard.
 
 When the fix lands (for #546, `skim-ast-try-catch-finally-javascript`), the ledgered `structural.precision` XPASSes.

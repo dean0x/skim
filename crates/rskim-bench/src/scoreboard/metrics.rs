@@ -995,8 +995,9 @@ pub const STRUCTURAL_INTENT_RECALL: &str = "structural.intent_recall.";
 /// Name prefix of `structural.intent_precision.<id>` (nested-loop entries).
 pub const STRUCTURAL_INTENT_PRECISION: &str = "structural.intent_precision.";
 
-/// Name prefix of `structural.unscored_rows.<pattern>`: skim `--ast` rows in
-/// a language no `[[ast]]` entry of this corpus scores.
+/// Name prefix of `structural.unscored_rows.<pattern>`: skim `--ast` rows no
+/// `[[ast]]` entry of this corpus scores, for every catalog pattern of a
+/// corpus with an `[[ast]]` entry (0 included).
 pub const STRUCTURAL_UNSCORED_ROWS: &str = "structural.unscored_rows.";
 
 /// The structural RATCHET families (#541), each `(name prefix, definition)`;

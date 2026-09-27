@@ -28,6 +28,7 @@ use std::process::{Command, Output};
 use rskim_bench::scoreboard::MAX_PAGES;
 use rskim_bench::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
 use rskim_bench::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
+use rskim_bench::scoreboard::structural_metrics::called_patterns;
 use rskim_bench::scoreboard::test_support::FixtureRepo;
 use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
 use serde_json::{Value, json};
@@ -316,8 +317,23 @@ impl Harness {
         .unwrap();
         h.write_golden(DEF_LINE);
         h.install_stub();
+        h.write_empty_pattern_calls();
         h.write_correct_responses();
         h
+    }
+
+    /// Serve an empty `--ast <pattern>` full list for every catalog pattern:
+    /// a corpus with an `[[ast]]` entry calls skim for each of them. Tests
+    /// override the patterns they are about.
+    fn write_empty_pattern_calls(&self) {
+        for pattern in called_patterns() {
+            self.write_response(
+                "",
+                &["--ast", pattern],
+                &format!("l{FULL_LIMIT}_o0.json"),
+                &ast_page_json(&[], false),
+            );
+        }
     }
 
     fn write_golden(&self, def_line: u32) {
@@ -1490,6 +1506,109 @@ fn a_structural_entry_is_scored_against_the_oracle_then_blessed_and_checked() {
 }
 
 #[test]
+fn every_catalog_pattern_is_called_and_rows_no_entry_scores_are_counted() {
+    let h = Harness::new();
+    h.enable_structural(Some(3), None);
+    // deep-nesting has no oracle query; try-catch has one, but the fixture
+    // corpus has no try-catch entry (and a Rust row has no try-catch query).
+    for (pattern, path, line) in [
+        ("deep-nesting", "src/loops.rs", 3),
+        ("try-catch", "src/other.rs", 2),
+    ] {
+        h.write_response(
+            "",
+            &["--ast", pattern],
+            &format!("l{FULL_LIMIT}_o0.json"),
+            &ast_page_json(
+                &[(
+                    Row {
+                        path: path.to_string(),
+                        line,
+                        content: "x".to_string(),
+                    },
+                    1.0,
+                )],
+                false,
+            ),
+        );
+    }
+
+    let run = h.run();
+    assert_exit(&run, 0);
+    let report = h.report();
+
+    // Every catalog pattern is called, each once (god-function's pattern
+    // call shares its argv with the standalone `--ast god-function` entry's
+    // full list, so that key is logged twice).
+    let calls = h.calls();
+    for pattern in called_patterns() {
+        // The trailing space keeps `try-catch` from matching `try-catch-finally`.
+        let logged = format!(
+            "{} json=1 limit={FULL_LIMIT} ",
+            key("", &["--ast", pattern])
+        );
+        let n = calls.iter().filter(|c| c.starts_with(&logged)).count();
+        let want = if pattern == "god-function" { 2 } else { 1 };
+        assert_eq!(n, want, "--ast {pattern}: {calls:?}");
+    }
+
+    // Every called pattern carries an unscored count, 0 included.
+    let unscored = &report["corpora"][0]["structural"]["unscored_rows"];
+    assert_eq!(
+        unscored.as_object().unwrap().len(),
+        called_patterns().len(),
+        "{unscored}"
+    );
+    for (pattern, rows) in [
+        ("deep-nesting", 1.0),
+        ("try-catch", 1.0),
+        // The standalone entry's two Rust rows: no god-function entry here.
+        ("god-function", 2.0),
+        // The README row: no oracle grammar.
+        (AST_PATTERN, 1.0),
+        ("go-select", 0.0),
+        ("java-synchronized", 0.0),
+    ] {
+        assert_eq!(
+            ratchet(&report, &format!("structural.unscored_rows.{pattern}")),
+            rows,
+            "{pattern}"
+        );
+        assert_eq!(
+            report["aggregate"]["ratchet"][format!("structural.unscored_rows.{pattern}")],
+            rows,
+            "{pattern} (aggregate)"
+        );
+    }
+    let md = fs::read_to_string(h.out_dir.path().join("report.md")).unwrap();
+    assert!(
+        md.contains(
+            "Unscored `--ast` rows (a language no entry scores): deep-nesting 1, god-function 2, \
+             rust-nested-loop 1, try-catch 1"
+        ),
+        "{md}"
+    );
+
+    assert_exit(&h.bless(None), 0);
+    assert_exit(&h.check(), 0);
+
+    // An unscored row that disappears is a RATCHET move, not a silent drop.
+    h.write_response(
+        "",
+        &["--ast", "deep-nesting"],
+        &format!("l{FULL_LIMIT}_o0.json"),
+        &ast_page_json(&[], false),
+    );
+    let check = h.check();
+    assert_exit(&check, 1);
+    assert!(
+        stderr(&check).contains("structural.unscored_rows.deep-nesting"),
+        "{}",
+        stderr(&check)
+    );
+}
+
+#[test]
 fn a_structural_recall_miss_fails_the_gate_and_the_ledger_excuses_it() {
     let h = Harness::new();
     h.enable_structural(Some(3), None);
@@ -1675,6 +1794,35 @@ fn a_false_positive_guard_survives_the_fix_and_catches_the_false_positive_return
         "{err}"
     );
     assert!(err.contains("src/loops.rs"), "{err}");
+}
+
+#[test]
+fn a_false_positive_guard_in_a_language_the_corpus_has_no_file_in_is_a_harness_error() {
+    let h = Harness::new();
+    // The fixture has no Go file: the guard could never catch anything.
+    let id = "fixture-ast-go-select-go";
+    h.write_golden_with(
+        DEF_LINE,
+        &format!(
+            "\n[[ast]]\nid = \"{id}\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\n\
+             expect_oracle_empty = true\n"
+        ),
+    );
+
+    let run = h.run();
+
+    assert_exit(&run, 2);
+    let err = stderr(&run);
+    assert!(err.contains("golden integrity failed"), "{err}");
+    assert!(err.contains("vacuous"), "{err}");
+    assert!(
+        err.contains(&format!("{id} (false-positive guard: no scored go file)")),
+        "{err}"
+    );
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
 }
 
 #[test]
