@@ -61,8 +61,9 @@ The scoreboard lives in [`crates/rskim-bench/scoreboard/`](../crates/rskim-bench
 
 - **Required gate.** The `Search Scoreboard` CI job runs on every PR that touches search code; a search PR merges only with it green.
 - **HARD checks** must pass per query: recall = precision = 1, zero silent misses, honest pagination, prefix consistency, score order. **RATCHET** metrics (definition top-1, MRR, anchor = definition, P@k vs baselines, output bytes) cannot move in either direction without an explicit re-bless of `baseline.json`. Latency is informational.
+- **Structural oracle (#541).** Each `--ast` named pattern is scored per (pattern, language) against a hand-written tree-sitter query (`scoreboard/structural/<pattern>.<lang>.scm`) that encodes the pattern's documented description on the real grammar (TSX for `.tsx`). It shares nothing with skim's AST index except the pattern names. File-level recall is HARD (= 1) for every golden `[[ast]]` entry, and precision is HARD for `hard`-class entries. RATCHETs cover the precision of `ratchet`-class entries, whether skim's `line` lands on a match, intent recall and precision for the nested-loop patterns, and rows in languages no entry scores. The `.scm` files are hashed into the golden digest, so editing a query forces a re-bless.
 - **Known failures are ledgered, never hidden.** Each entry in `known_failures.toml` names its ticket; fixing the bug turns the entry into an XPASS, which fails the gate until the entry is removed.
-- **Manual adversarial dog-food (ADR-007)** remains only for capabilities the scoreboard does not cover yet: structural precision until #541, temporal parity until #542.
+- **Manual adversarial dog-food (ADR-007)** remains only for capabilities the scoreboard does not cover yet: the `--ast` patterns `report.md` lists as uncovered (`deep-nesting`, `java-synchronized`, `ruby-begin-rescue`: no oracle query; `go-channel-send`, `go-defer`, `go-goroutine`, `go-select`: no corpus file to score), and temporal parity until #542.
 
 A change to retrieval or ranking merges only if the scoreboard does not regress.
 

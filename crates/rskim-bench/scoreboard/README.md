@@ -16,14 +16,15 @@ It is the **required merge gate for search PRs** (owner decision 2026-09-25, ADR
 | `corpora.toml` | The four corpora (skim, ripgrep, flask, zod): URL, a 40-hex commit pin, and language |
 | `golden/<corpus>.toml` | The frozen golden queries for one corpus (`commit` must equal its pin) |
 | `known_failures.toml` | The ledger: known HARD failures, each tied to a filed ticket |
+| `structural/<pattern>.<lang>.scm` | The structural oracle's tree-sitter queries, one per (pattern, language), compiled into the scoreboard and hashed into the golden digest (see [Structural oracle](#structural-oracle)) |
 | `baseline.json` | The blessed state: every HARD outcome and RATCHET value, pins and golden hashes. Written only by `bless` |
 
 ## What it measures
 
 | Class | Checks | Rule |
 |---|---|---|
-| **HARD** (per query) | `lexical.recall`, `lexical.precision` (skim's full list = oracle ground truth on the indexed universe) · `lexical.silent_fn` (a ground-truth file is missing and `degraded[]` is empty) · `lexical.verify_mode` · `pagination.complete` / `.disjoint` / `.ordered` / `.has_more_honest` · `order.prefix_consistent` · `order.score_monotone` · `results.unique_paths` (no path twice in one list: the full list, a `--limit` list, or one page) | Tolerance 0. A failure passes only if it is ledgered (XFAIL). |
-| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `oracle_less.full_rows.<id>`, the full-list row count of each entry with no oracle (`--ast`, `--blast-radius`, a standalone `--hot` / `--cold` / `--risky` run); a shrink is a regression | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
+| **HARD** (per query) | `lexical.recall`, `lexical.precision` (skim's full list = oracle ground truth on the indexed universe) · `lexical.silent_fn` (a ground-truth file is missing and `degraded[]` is empty) · `lexical.verify_mode` · `pagination.complete` / `.disjoint` / `.ordered` / `.has_more_honest` · `order.prefix_consistent` · `order.score_monotone` · `results.unique_paths` (no path twice in one list: the full list, a `--limit` list, or one page) · `structural.recall`, `structural.precision`, `structural.coverage` on `[[ast]]` entries ([Structural oracle](#structural-oracle)) | Tolerance 0. A failure passes only if it is ledgered (XFAIL). |
+| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `oracle_less.full_rows.<id>`, the full-list row count of each entry with no oracle (`--ast`, `--blast-radius`, a standalone `--hot` / `--cold` / `--risky` run); a shrink is a regression · the structural families `structural.precision.<id>`, `structural.line_on_match.<id>`, `structural.intent_recall.<id>` / `structural.intent_precision.<id>` and `structural.unscored_rows.<pattern>` | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
 | **INFO** (never gated) | Latency p50/p95 · `unindexed_hits` · the oracle's per-reason skip breakdown · the "beats baseline" column | none |
 
 A changed golden file, corpus pin, or HARD outcome (for example `xfail -> pass`) also means "bless required". A
@@ -32,8 +33,10 @@ regression: only with `--accept-regression "<reason>"`.
 
 What it does **not** cover yet, where manual adversarial dog-food (ADR-007) is still required:
 
-- AST structural precision and recall (`--ast` patterns): #541. `--ast` entries are checked only for ordering,
-  pagination and their row count (an empty list is a harness error; any other change to the count needs a bless).
+- The `--ast` patterns the structural oracle does not score, listed under "Uncovered structural patterns" in
+  `report.md`: `deep-nesting`, `java-synchronized` and `ruby-begin-rescue` have no oracle query, and
+  `go-channel-send`, `go-defer`, `go-goroutine` and `go-select` have no corpus file to score (see
+  [Uncovered patterns](#uncovered-patterns)).
 - The temporal arms (`--hot` / `--cold` / `--risky` / `--blast-radius`) against `git log`: #542.
 - Any new query flag or arm, until it has golden entries here.
 
@@ -58,7 +61,7 @@ cargo run -p rskim-bench --bin scoreboard -- check --skim-bin target/release/ski
 | `run` | Runs every corpus and writes `report.json` + `report.md`. It never gates: exit 0 unless a harness error occurs. |
 | `check` | `run`, then gates against `baseline.json` and `known_failures.toml`. This is what CI runs. |
 | `bless --from <report.json> [--accept-regression "<reason>"]` | Rewrites `baseline.json` from a report (see [Blessing](#blessing)). |
-| `golden-gen --corpus <name>` | Prints candidate `[[ident]]` entries for one corpus on stdout. Never run in CI. |
+| `golden-gen --corpus <name> [--ast]` | Prints candidate `[[ident]]` entries for one corpus on stdout; with `--ast`, candidate `[[ast]]` entries (it runs the structural oracle and skim, so it also takes `--skim-bin`). Never run in CI. |
 
 `run` and `check` take these flags:
 
@@ -74,7 +77,7 @@ cargo run -p rskim-bench --bin scoreboard -- check --skim-bin target/release/ski
 |---|---|
 | `0` | Gate passed (`check`), the run finished (`run`), or the baseline was written (`bless`). |
 | `1` | Gate failure (`check`), or `bless` refused. |
-| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, temporal data that skim reports unusable (`--stats` `temporal_state` not `ready`, or `degraded[]` on a `--hot` / `--cold` / `--risky` / `--blast-radius` entry), an empty full list for an entry with no oracle (it would pass every check vacuously), or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
+| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, temporal data that skim reports unusable (`--stats` `temporal_state` not `ready`, or `degraded[]` on a `--hot` / `--cold` / `--risky` / `--blast-radius` entry), an empty full list for an entry with no oracle (it would pass every check vacuously), a vacuous `[[ast]]` entry (see [Vacuity guard](#vacuity-guard)), a structural oracle failure (a parser that returns no tree, a query over its match limit), or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
 
 On a gate failure, stderr prints one `FAIL <check> [<ids>]: <message>` line per failure, and `report.md` lists them
 under "Gate failures".
@@ -187,6 +190,113 @@ the corpus, a name of at least 6 bytes, and 2–60 ground-truth files, ordered b
 the proposal, then paste it.
 
 Adding any entry changes the golden hash, so the next `check` says "bless required". Bless from that run.
+
+## Structural oracle
+
+`--ast` named patterns are scored by a structural oracle (#541), `src/scoreboard/structural.rs`. For each
+(pattern, language) it runs a hand-written tree-sitter query, `structural/<pattern>.<lang>.scm`, over every file of
+that language in the oracle's universe. The query encodes the pattern's catalog **description**, not skim's n-grams,
+on the real grammar: `.tsx` is parsed with the TSX grammar, although skim parses it as TypeScript (ADR-003).
+
+It takes only the pattern **names** from skim (`rskim_search::all_patterns()`). The extension-to-grammar table, the
+list of languages skim AST-indexes and the 1 MiB inclusive size cap are the oracle's own copies, with citations. A
+unit test fails if `structural.rs` or `structural_metrics.rs` imports skim's `ast_index`, `compound` or
+`linearize` code.
+
+### `[[ast]]` golden entries
+
+```toml
+[[ast]]
+id = "skim-ast-try-catch-finally-javascript"   # <corpus>-ast-<pattern>-<lang>
+pattern = "try-catch-finally"                  # a catalog name the oracle has a query for in `lang`
+lang = "javascript"                            # rust | python | typescript | tsx | javascript | go
+precision = "hard"                             # hard | ratchet
+```
+
+- There is one entry per (pattern, language) where the corpus has files in that language and the oracle or skim
+  finds at least one of them.
+- `precision` is declared here and never re-read from the catalog. `golden-gen` proposes `hard` iff the catalog
+  marks the pattern `exact`. Reclassifying an entry is a reviewed golden edit plus a bless.
+- skim is called once per (corpus, pattern): `skim search --root <clone> --json --limit 1000000 --ast <pattern>`.
+  The rows are split by extension into languages, so each entry sees only its own language's rows.
+- Integrity errors (exit 2): an unknown `lang` or `precision`, a pattern that is not in the catalog, an uncovered
+  pattern, a language the pattern has no query for, or two entries for one (pattern, language). A `structural.*`
+  ledger entry may name only `[[ast]]` ids, and `structural.precision` only `hard` ones.
+
+To propose entries, build both binaries and run `golden-gen --ast`:
+
+```bash
+cargo build --release -p rskim
+cargo build -p rskim-bench --bin scoreboard
+target/debug/scoreboard golden-gen --corpus zod --ast --skim-bin target/release/skim
+```
+
+It prints one `[[ast]]` entry per candidate, each under a `# golden-gen: oracle files N; skim files M` comment. Review
+them, append them to `golden/<corpus>.toml`, then run `check` and bless. Ids are stable across regeneration. New
+entries bless without `--accept-regression`: their checks go `new -> pass` or `new -> xfail`, and neither is a
+downgrade.
+
+### Checks
+
+| Check | Class | Runs on | Passes iff / measures |
+|---|---|---|---|
+| `structural.recall` | HARD | every `[[ast]]` entry | every file the oracle matches in the entry's language is in skim's rows |
+| `structural.precision` | HARD | `precision = "hard"` entries | every file skim returns in the entry's language is an oracle match |
+| `structural.coverage` | HARD | every `[[ast]]` entry | skim's `ast_coverage.size_excluded_files` equals the oracle's own count of files over 1 MiB, and `undetermined_files` is 0 (an absent `ast_coverage` reads as all zero) |
+| `results.unique_paths` | HARD | every `[[ast]]` entry | no path twice in the entry's rows |
+| `structural.precision.<id>` | RATCHET | `precision = "ratchet"` entries | file-level precision (4 dp) |
+| `structural.line_on_match.<id>` | RATCHET | every `[[ast]]` entry | how many skim rows have a `line` that is the first line of an oracle match in that file |
+| `structural.intent_recall.<id>`, `structural.intent_precision.<id>` | RATCHET | `nested-loop` (typescript, tsx, javascript), `rust-nested-loop` (rust) | recall and precision against the intent oracle: a loop with a loop ancestor inside the same function |
+| `structural.unscored_rows.<pattern>` | RATCHET | per corpus, every pattern skim was called for | skim rows in a language no entry scores for that pattern (Java, C, Markdown, `.sh`, …) |
+
+- `line_on_match` reads low by construction for multi-line constructs. skim anchors a row on the child node that
+  completes the pattern's edge (`catch_clause`, `class_body`, …), while the oracle anchors on the construct the
+  description names. It is a count, so it is defined even when there is no true positive.
+- `unscored_rows` keeps rows the oracle cannot judge visible instead of dropping them. Like `oracle_less.full_rows`,
+  a shrink is a regression.
+- `report.json` carries, under `corpora[i].structural`, each entry's `oracle_files`, `skim_files`, `recall`,
+  `precision`, the intent fields where they apply and `line_on_match`, plus the coverage comparison. The top level
+  carries `uncovered_patterns`. `report.md` has a "Structural (`--ast`)" table per corpus and the uncovered list.
+- `[[prefix]]` and `[[pagination]]` entries with an `--ast` flag still check ordering, pagination and their row count.
+
+### Vacuity guard
+
+An `[[ast]]` entry where the oracle matches no file in its language AND skim returns no row there would pass every
+check without testing anything. It is a golden error, exit 2 ("golden integrity failed: N vacuous [[ast]] entr(y|ies)
+…"), and `golden-gen --ast` never proposes one. It can appear later: a pin bump can empty an entry, and so can a skim
+fix whose only effect on the entry was a false positive (fixing #546 empties `skim-ast-try-catch-finally-javascript`).
+Remove the entry together with its ledger ids and bless with `--accept-regression`, because a blessed check that no
+longer runs is a HARD downgrade.
+
+### Adding or editing a query
+
+1. Write or edit `structural/<pattern>.<lang>.scm`. Open it with a comment naming the grammar version and quoting
+   the catalog description, and capture exactly one `@match` node: its first line is the match line.
+2. Register a new file in `QUERIES` in `src/scoreboard/structural.rs`, sorted by pattern and then language (a unit
+   test checks the order and pins the query count, so update the count too). Add a `PostFilter` only when the
+   description states a count (`empty-*`: zero body elements; `god-function`: at least 20; `excessive-params`: at
+   least 5).
+3. Add a fixture in `src/scoreboard/structural_tests.rs`: the catalog example (or a hand-written positive) must match
+   on the expected lines, and a near-miss must not. The tests fail on a `.scm` file that is not registered, a
+   registered query with no fixture, or a query that does not compile for its grammar.
+4. Run `check` and read the structural diff, then bless. The query text, the post-filters, the intent specs and the
+   size cap are hashed into the digest of every golden file with `[[ast]]` entries. Any edit therefore reads as
+   "golden file changed; bless required" on each of those corpora, and `bless` refuses a report made with other
+   queries.
+
+A catalog pattern with neither a query nor a recorded reason fails a unit test, so a pattern added to skim cannot go
+unscored silently.
+
+### Uncovered patterns
+
+These stay under manual adversarial dog-food (ADR-007). `report.md` lists them under "Uncovered structural patterns":
+
+| Pattern | Why |
+|---|---|
+| `deep-nesting` | No oracle: "depth >= 4" does not say where depth is measured from or which nodes count. |
+| `java-synchronized` | No oracle: the construct exists only in the Java grammar. |
+| `ruby-begin-rescue` | No oracle: the construct exists only in the Ruby grammar. |
+| `go-channel-send`, `go-defer`, `go-goroutine`, `go-select` | The oracle has a Go query, but no corpus has a Go file where the oracle or skim finds a match, so there is no entry. |
 
 ## Bumping a corpus pin
 
