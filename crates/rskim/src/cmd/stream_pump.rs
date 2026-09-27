@@ -53,7 +53,7 @@
 //! **before the first stdout read**, and **never stops draining** — past its
 //! ceiling it keeps reading and discarding rather than leaving the pipe full.
 //!
-//! # DESIGN NOTE — ChildGuard bounds the child's lifetime (ADR-008)
+//! # DESIGN NOTE — ChildGuard bounds the child's lifetime
 //!
 //! The child is wrapped in [`ChildGuard`] **at spawn**.  skim imposes no internal
 //! timeout, so kill-on-drop is the *only* thing that stops a child once the
@@ -69,7 +69,7 @@
 //! `SKIM_PASSTHROUGH=1 skim cargo build | head` and `skim yarn <sub> | head`
 //! are exactly that shape — cargo/yarn/npm spawn tool processes that inherit
 //! stderr — and a join would block skim for the grandchild's whole lifetime
-//! while raw `cargo build | head` returns at once.  ADR-008 forbids an internal
+//! while raw `cargo build | head` returns at once.  skim imposes no internal
 //! timeout, so the bound has to come from not waiting at all.
 //!
 //! Abandoning costs nothing: [`StreamOutcome::PipeClosed`] carries no payload,
@@ -294,7 +294,7 @@ pub(crate) fn stream_child(
         cmd.env(key, value);
     }
 
-    // ChildGuard AT SPAWN (ADR-008): on every early return below, kill-on-drop is
+    // ChildGuard AT SPAWN: on every early return below, kill-on-drop is
     // what stops a tool that would otherwise keep working after the reader has
     // gone.
     let mut child = match cmd.spawn() {

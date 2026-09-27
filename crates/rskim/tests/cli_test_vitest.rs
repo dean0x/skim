@@ -36,7 +36,7 @@ fn skim_cmd() -> Command {
 fn test_skim_vitest_help() {
     // v2.8.0: `skim vitest --help` — "test" is no longer a subcommand.
     //
-    // Regression (ADR-008): use `skim_cmd()` so SKIM_PASSTHROUGH is removed and
+    // Regression: use `skim_cmd()` so SKIM_PASSTHROUGH is removed and
     // the daemon guard is ACTIVE. `--help` must be treated as finite (print and
     // exit) — otherwise the guard would route `vitest --help` through
     // `run_inherited_passthrough` and exit 127 instead of printing skim's help.

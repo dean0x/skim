@@ -256,7 +256,7 @@ fn render_and_format<'a>(
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-            // ADR-015 / D1 declaration — derived, not hard-coded.
+            // ADR-011 / D1 declaration — derived, not hard-coded.
             //
             // When every file entry carries a `patch` body (`DiffFileEntry::patch`
             // is `Some`), all hunk content is faithfully re-encoded and no

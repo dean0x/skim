@@ -491,8 +491,8 @@ fn t4_interleaved_stdout_and_stderr_does_not_deadlock() {
 ///
 /// The stub writes a large fixture, stalls, then touches a sentinel.  Raw
 /// `grep … | head` dies immediately on SIGPIPE; skim must do the same via
-/// `ChildGuard` kill-on-drop (ADR-008: there is no internal timeout — the guard
-/// is the only thing bounding child lifetime).  A buffered wrapper instead waits
+/// `ChildGuard` kill-on-drop (there is no internal timeout — the guard is the
+/// only thing bounding child lifetime).  A buffered wrapper instead waits
 /// for the child to exit before writing anything, so the sentinel appears.
 #[test]
 fn t6_child_is_killed_when_the_reader_closes_early() {
@@ -598,8 +598,8 @@ fn t6b_early_close_does_not_wait_for_a_grandchild_holding_stderr() {
         "skim took {exit_gap:?} to exit after the reader closed the pipe, \
          budget {EXIT_BUDGET:?}. A grandchild is holding the child's stderr \
          write end open, so the drain thread never reaches EOF — the \
-         early-close path must ABANDON that thread, not join it (ADR-008 \
-         forbids an internal timeout, so not waiting is the only bound)."
+         early-close path must ABANDON that thread, not join it (skim has \
+         no internal timeout, so not waiting is the only bound)."
     );
 }
 

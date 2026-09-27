@@ -482,7 +482,7 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     // rewrite engine would try to capture its output — a dev server never
     // exits, so the agent would hang. Treat these as no-rewrite passthroughs
     // the same way already-skim commands are treated (audit + exit 0, empty
-    // stdout → agent runs the raw command unchanged). (ADR-008 Part C)
+    // stdout → agent runs the raw command unchanged).
     if super::indefinite::is_indefinite_command(&tokens) {
         audit_hook(&command, false, "");
         return Ok(ExitCode::SUCCESS);

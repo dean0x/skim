@@ -341,7 +341,7 @@ pub(crate) fn write_line_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
 }
 
 // ============================================================================
-// JSON disclosure sink (D1 / ADR-015)
+// JSON disclosure sink (D1 / ADR-011)
 // ============================================================================
 
 /// Named struct for the elision count threaded into [`emit_json_envelope`].
@@ -960,7 +960,7 @@ where
 {
     let s = serialize_output(result, output_format)?;
     let status = match output_format {
-        // ADR-015 / D1 declaration — derived, not hand-written: the tier already
+        // ADR-011 / D1 declaration — derived, not hand-written: the tier already
         // answers it.  `Passthrough(raw)` re-encodes the tool's bytes verbatim
         // (`Reencoded`); `Full`/`Degraded` carry a parser's summary of them
         // (`Lossy`).  See `ParseResult::completeness`.
@@ -1446,7 +1446,7 @@ where
 
     let result = parse(&output);
 
-    // INVARIANT (ADR-014 / PF-006): `RawPassthrough` serves `output.stdout` straight
+    // INVARIANT (ADR-009 / PF-006): `RawPassthrough` serves `output.stdout` straight
     // to the reader with no parser in between, so it MUST come from a config that
     // disabled the strip above — otherwise the reader receives bytes the raw tool
     // never emitted.  `cmd::file::passthrough_config` is the conventional write-point
@@ -1507,7 +1507,7 @@ where
         if output_format == OutputFormat::Json {
             let val = serde_json::json!({"tier": "passthrough", "raw": &output.stdout});
             let mut json_str = serde_json::to_string(&val)?;
-            // ADR-015 / D1 declaration — `Reencoded`.  The envelope embeds
+            // ADR-011 / D1 declaration — `Reencoded`.  The envelope embeds
             // `output.stdout` verbatim as a JSON string, so every byte the tool
             // produced reaches the reader; only the framing differs.
             //

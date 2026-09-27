@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn test_cat_code_file() {
         let result = try_rewrite(&["cat", "file.rs"]).unwrap();
-        // Origin tag is injected before the skim binary token (ADR-004 out-of-band channel).
+        // Origin tag is injected before the skim binary token (ADR-008 out-of-band channel).
         assert_eq!(
             result.tokens,
             vec![

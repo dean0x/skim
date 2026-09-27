@@ -4,7 +4,7 @@
 //! to prevent pipe deadlocks. No shell interpretation — commands are executed
 //! directly via `Command::new().args()`.
 //!
-//! # Design (ADR-008 — no internal timeout)
+//! # Design — no internal timeout
 //!
 //! Skim is a transparent command wrapper: it intercepts `cargo test`, `git diff`,
 //! `npm build`, etc., runs the real command, compresses the output, and prints.
@@ -96,13 +96,13 @@ pub(crate) enum RunnerError {
 /// interpretation. Stdout and stderr are captured concurrently via two reader
 /// threads to prevent pipe deadlocks on large output.
 ///
-/// # Stateless unit struct (ADR-008)
+/// # Stateless unit struct
 ///
 /// `CommandRunner` is a zero-field unit struct. `new()` takes no arguments and
 /// carries no configuration: there is no timeout, no retry count, and no
 /// buffering policy stored here. All policy is provided at call sites.
 ///
-/// # No internal timeout (ADR-008)
+/// # No internal timeout
 ///
 /// `CommandRunner` imposes no wall-clock cap. Skim is a transparent wrapper:
 /// a transparent wrapper must not change whether or when a command completes.
@@ -380,7 +380,7 @@ impl CommandRunner {
 }
 
 // ============================================================================
-// ChildGuard — kill + reap on drop (ADR-008)
+// ChildGuard — kill + reap on drop
 // ============================================================================
 
 /// RAII wrapper that kills and reaps a child process on drop.
@@ -400,11 +400,11 @@ impl CommandRunner {
 /// `kill()` signals the direct child process; grandchildren (e.g., the `node`
 /// subprocess spawned by `npm`, or `rustc` spawned by `cargo`) are not reached.
 /// Hardening to kill the full process group (`kill(-pgid, SIGKILL)`) is a
-/// Unix-only change deferred to a follow-up (ADR-001: noticed but out of scope
-/// for ADR-008).
+/// Unix-only change deferred to a follow-up: noticed while adding the
+/// kill-on-drop guard, but out of scope for it.
 ///
 /// `pub(crate)` so that `cmd::infra::gh::streaming` can reuse this guard
-/// instead of maintaining a duplicate definition (ADR-001).
+/// instead of maintaining a duplicate definition.
 pub(crate) struct ChildGuard(pub(crate) std::process::Child);
 
 impl Drop for ChildGuard {
@@ -1098,7 +1098,7 @@ mod tests {
     }
 
     // ========================================================================
-    // ChildGuard kill-on-drop contract (ADR-008)
+    // ChildGuard kill-on-drop contract
     // ========================================================================
 
     /// Verify that ChildGuard kills a long-running child when dropped.
@@ -1138,7 +1138,7 @@ mod tests {
         }
     }
 
-    /// Regression: CommandRunner imposes NO internal wall-clock cap (ADR-008).
+    /// Regression: CommandRunner imposes NO internal wall-clock cap.
     ///
     /// Runs a finite command that takes ~1.5 s and asserts it completes
     /// successfully with full output — it must not be killed or truncated by
@@ -1156,7 +1156,7 @@ mod tests {
         assert_eq!(
             result.exit_code,
             Some(0),
-            "finite 1.5-second command must exit 0 (ADR-008: no internal cap)"
+            "finite 1.5-second command must exit 0 (no internal cap)"
         );
         assert!(
             result.stdout.contains("done"),
@@ -1176,7 +1176,7 @@ mod tests {
         );
     }
 
-    /// ChildGuard kill() on an already-exited child is a harmless no-op (ADR-008).
+    /// ChildGuard kill() on an already-exited child is a harmless no-op.
     ///
     /// Spawns a command that exits immediately, waits for it to exit, then
     /// drops the guard.  Drop must not panic or return an error — `kill()` on
@@ -1203,7 +1203,7 @@ mod tests {
     }
 
     /// End-to-end coverage of the 64 MiB output-cap path through `run_with_env`
-    /// (ADR-008 / reliability-02). Drives a real child whose stdout exceeds the
+    /// (reliability-02). Drives a real child whose stdout exceeds the
     /// cap and asserts the reader is handed the bytes that fit — not an error,
     /// and not nothing — while the call still returns rather than hanging or
     /// leaking the child.

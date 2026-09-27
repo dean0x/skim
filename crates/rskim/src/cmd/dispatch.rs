@@ -383,7 +383,7 @@ fn extract_subcmd<'a>(
 }
 
 // ============================================================================
-// Inherited-stdio passthrough for daemon / streaming commands (ADR-008 Part C)
+// Inherited-stdio passthrough for daemon / streaming commands
 // ============================================================================
 
 /// Map the result of `Command::status()` to a raw exit-code byte.
@@ -1220,7 +1220,7 @@ fn dispatch_inner(
         );
     }
 
-    // Daemon / streaming guard (ADR-008 Part C).
+    // Daemon / streaming guard.
     //
     // Commands like `vite`, `npm run dev`, `jest --watch` run indefinitely;
     // skim cannot buffer-then-compress an unbounded stream, so detect them and
@@ -2136,7 +2136,7 @@ mod tests {
     // ========================================================================
 
     /// `spawn_status_to_code` returns 127 for a `NotFound` I/O error — the POSIX
-    /// "command not found" convention (applies ADR-008, avoids PF-003).
+    /// "command not found" convention (avoids PF-003).
     #[test]
     fn test_spawn_status_to_code_not_found_returns_127() {
         use std::io::{Error, ErrorKind};

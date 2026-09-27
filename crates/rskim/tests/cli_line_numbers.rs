@@ -614,7 +614,7 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
         })
         .collect();
 
-    // N-total semantics (b5507ad / ADR-002): `--last-lines 3` yields at most 3
+    // N-total semantics (b5507ad / ADR-016): `--last-lines 3` yields at most 3
     // lines TOTAL — 1 marker + 2 content lines, the last 2 of a 10-line file.
     assert_eq!(
         content_line_nums.len(),
@@ -1292,7 +1292,7 @@ fn test_line_numbers_last_lines_correct_source_numbers() {
         })
         .collect();
 
-    // N-total semantics (b5507ad / ADR-002): `--last-lines N` yields at most N
+    // N-total semantics (b5507ad / ADR-016): `--last-lines N` yields at most N
     // lines TOTAL, so the marker consumes one slot and n=3 gives 1 marker + 2
     // content lines — the last 2 of a 5-line file, i.e. source lines 4 and 5.
     // PF-019: the numbers must be the REAL source lines. Before the fix they were
@@ -1414,7 +1414,7 @@ fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
 
-    // N-total semantics (b5507ad / ADR-002): `--last-lines 3` yields at most 3
+    // N-total semantics (b5507ad / ADR-016): `--last-lines 3` yields at most 3
     // lines TOTAL — 1 marker + 2 content lines. The marker consumes one slot.
     assert_eq!(
         lines.len(),

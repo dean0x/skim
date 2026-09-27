@@ -1,11 +1,12 @@
 //! Cross-crate consistency guard: `rskim_contract` scrub lists vs `env.rs` lists.
 //!
-//! # Why this test exists (ADR-006)
+//! # Why this test exists
 //!
 //! `rskim_contract::log::SENSITIVE_EXACT` and `SENSITIVE_SUFFIXES` duplicate
 //! the lists in `crates/rskim/src/cmd/file/env.rs`. Only a doc comment binds
 //! them. A future unmirrored edit to `env.rs` would silently let a secret pass
-//! through a `DecisionRecord` — the exact fail-soft failure ADR-006 forbids.
+//! through a `DecisionRecord` — a silent fail-soft leak, which this project's
+//! "fail loud, never silently" design constraint forbids.
 //!
 //! This test converts silent desync into a **loud CI failure** without inverting
 //! the dependency (rskim_contract remains independent of the binary crate).
@@ -19,7 +20,7 @@
 //!
 //! **When to update this test:** if `env.rs` grows a new entry, add it here AND
 //! mirror it in `rskim_contract::log`. The build will fail until both are done,
-//! which is exactly the guard we want (applies ADR-006, avoids PF-007).
+//! which is exactly the guard we want (avoids PF-007).
 
 use rskim_contract::log::{SENSITIVE_EXACT, SENSITIVE_SUFFIXES};
 
@@ -79,7 +80,7 @@ fn contract_sensitive_exact_is_superset_of_env() {
             covered,
             "rskim_contract::log::SENSITIVE_EXACT is missing `{required}` \
              which is present in crates/rskim/src/cmd/file/env.rs::SENSITIVE_EXACT. \
-             Mirror the entry in rskim_contract/src/log.rs (ADR-006)."
+             Mirror the entry in rskim_contract/src/log.rs (keep the two lists mirrored)."
         );
     }
 }
@@ -98,7 +99,7 @@ fn contract_sensitive_suffixes_is_superset_of_env() {
             covered,
             "rskim_contract::log::SENSITIVE_SUFFIXES is missing `{required}` \
              which is present in crates/rskim/src/cmd/file/env.rs::SENSITIVE_SUFFIXES. \
-             Mirror the suffix in rskim_contract/src/log.rs (ADR-006)."
+             Mirror the suffix in rskim_contract/src/log.rs (keep the two lists mirrored)."
         );
     }
 }

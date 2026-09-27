@@ -136,7 +136,7 @@ use std::sync::LazyLock;
 ///
 /// Exception: `args == ["run"]` is treated as stdin-eligible because `run` is
 /// a vitest/jest finite-mode routing hint (not a test file or flag). After
-/// `skim vitest` became indefinite (ADR-008 Part C), callers that want
+/// `skim vitest` became indefinite, callers that want
 /// compression via piped stdin should use `skim vitest run`; `should_read_stdin`
 /// recognises this single-token case so existing stdin pipelines keep working.
 ///
@@ -455,7 +455,7 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
 ///   (e.g. `C:foo`) that escape the root on that platform.
 ///
 /// This is the **single canonical containment guard** for untrusted git-history
-/// and git-diff paths (applies ADR-008). All three call sites that stat a
+/// and git-diff paths. All three call sites that stat a
 /// repo-relative string from git output MUST delegate here — not inline their
 /// own variant — so the invariant stays in one place and cannot drift:
 /// - `cmd::search::walk::list_tracked_files` (git index paths)

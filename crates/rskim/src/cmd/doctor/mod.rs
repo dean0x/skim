@@ -391,7 +391,7 @@ fn print_path_section(entries: &[PathEntry]) -> bool {
 /// - `Unreadable` → drift (`✗`).
 /// - `NoManifest` → advisory only (`⚠`), **not** drift — users who installed
 ///   before manifests existed have done nothing wrong and must not have their
-///   `skim doctor` exit-0 broken (applies ADR-004 backward-compat intent).
+///   `skim doctor` exit-0 broken (applies ADR-014 backward-compat intent).
 /// - `Verified`   → fall through to existing pin/currency logic.
 fn hook_status_line(
     facts: &crate::cmd::init::HookFacts,

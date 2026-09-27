@@ -588,7 +588,7 @@ fn emit_show_commit(
             // could spuriously emit `[skim:guardrail]` to stderr.
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
-            // ADR-015 / D1 declaration — derived, not hard-coded.
+            // ADR-011 / D1 declaration — derived, not hard-coded.
             //
             // Header fields (hash, author, date, subject, body, parents) and
             // every hunk body (`DiffFileEntry::patch`, D3 / #510) are carried

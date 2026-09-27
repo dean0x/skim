@@ -84,7 +84,7 @@ impl<T> ParseResult<T> {
         }
     }
 
-    /// The [`Completeness`] of this result's **JSON envelope** (ADR-015 / D1).
+    /// The [`Completeness`] of this result's **JSON envelope** (ADR-011 / D1).
     ///
     /// Derived, not declared, because the tier already carries the answer:
     ///

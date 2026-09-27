@@ -43,7 +43,7 @@ use std::borrow::Cow;
 use crate::cmd::execution::OutputFormat;
 
 // ============================================================================
-// Completeness — disclosure-gate type (ADR-015 / D1)
+// Completeness — disclosure-gate type (ADR-011 / D1)
 // ============================================================================
 
 /// Whether the served view contains all content that was in the raw output.
@@ -58,7 +58,7 @@ use crate::cmd::execution::OutputFormat;
 /// A newly-written `--json` handler that tries to construct output without
 /// explicitly choosing a `Completeness` gets a compile error.  This is the
 /// type-level enforcement that prevents handlers from silently defaulting to
-/// `Complete` (ADR-015 / D1).
+/// `Complete` (ADR-011 / D1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub(crate) enum Completeness {
@@ -669,7 +669,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // D1: Completeness / view_differs / remedy_for (ADR-015)
+    // D1: Completeness / view_differs / remedy_for (ADR-011)
     // -----------------------------------------------------------------------
 
     /// Completeness has no Default impl; constructing one requires an explicit

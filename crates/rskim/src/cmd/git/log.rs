@@ -116,7 +116,7 @@ pub(super) fn run_log(
 
     let (result_str, effective_tier) = match output_format {
         OutputFormat::Json => {
-            // ADR-015 / D1 declaration — `Lossy`.
+            // ADR-011 / D1 declaration — `Lossy`.
             //
             // Two independent drops, neither recoverable from the envelope:
             //   1. The handler injects `--format=%h %s (%cr) <%an>`, so every

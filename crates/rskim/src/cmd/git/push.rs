@@ -90,7 +90,7 @@ pub(super) fn run_push(
         rec,
         output_format,
         label,
-        // ADR-015 / D1 declaration — `Lossy`.  `parse_push` renders the
+        // ADR-011 / D1 declaration — `Lossy`.  `parse_push` renders the
         // injected `--porcelain` per-ref lines into a summary and drops git's
         // remaining output; countless, so `elided` = None.
         super::ParsedCommandOptions::combined(crate::output::fidelity::Completeness::Lossy),

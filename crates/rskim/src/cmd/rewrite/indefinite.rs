@@ -1,4 +1,4 @@
-//! Indefinite-duration command detection (ADR-008 / Part C).
+//! Indefinite-duration command detection.
 //!
 //! Detects commands that run indefinitely (daemon processes, watch modes, live
 //! log followers) so the dispatcher can pass them through with inherited stdio
@@ -64,7 +64,7 @@ pub(crate) fn is_indefinite_command(tokens: &[&str]) -> bool {
     // starts the server. Without this guard, `skim vitest --help`,
     // `skim nodemon --help`, etc. are misclassified as indefinite and routed to
     // `run_inherited_passthrough`, which spawns the real binary (or exits 127 if
-    // it is absent) instead of letting skim's own handler print help. (ADR-008)
+    // it is absent) instead of letting skim's own handler print help.
     if has_help_or_version_flag(rest) {
         return false;
     }
@@ -353,7 +353,7 @@ mod tests {
         }
     }
 
-    // ─── pm_is_indefinite: flags-before-run regression (ADR-008, ADR-001) ──
+    // ─── pm_is_indefinite: flags-before-run regression ───────────────────
     //
     // `yarn --silent run dev` previously returned false (finite) because
     // `skip_while(|s| *s == "run")` restarted from the beginning of `rest`,
@@ -413,7 +413,7 @@ mod tests {
         }
     }
 
-    // ─── Regression: --help / --version are always finite (ADR-008) ───────
+    // ─── Regression: --help / --version are always finite ─────────────────
     //
     // A daemon/watch tool asked for its help or version prints and exits; it
     // never starts the server. Before the `has_help_or_version_flag` guard,

@@ -1,11 +1,11 @@
-//! E2E tests for daemon/streaming command passthrough (ADR-008 Part C).
+//! E2E tests for daemon/streaming command passthrough.
 //!
 //! Verifies that indefinitely-running commands are routed through
 //! `run_inherited_passthrough` instead of being buffered by the normal
 //! compression pipeline, and that finite commands are still compressed.
 //!
 //! Design note: the daemon guard fires regardless of whether stdin is a
-//! terminal (ADR-008 alignment fix). Bare `vitest` is indefinite; use
+//! terminal. Bare `vitest` is indefinite; use
 //! `vitest run` for the finite one-shot mode that skim should compress.
 //! `should_read_stdin` treats `args == ["run"]` as stdin-eligible, so
 //! `skim vitest run` + piped fixture goes through the compression pipeline.
