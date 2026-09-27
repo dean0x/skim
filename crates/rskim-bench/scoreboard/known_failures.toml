@@ -91,12 +91,12 @@ ids = ["skim-ast-try-catch-finally-javascript"]
 note = "npm/rskim/scripts/postinstall.js: try{}finally{} (:233/:271) wraps a separate try{}catch{} (:273/:275); no try has both clauses"
 
 # --- #571: .tsx is parsed with the TypeScript grammar -------------------------------------
-# Language::from_extension("tsx") is TypeScript (rskim-core/src/types.rs:57) and
-# to_tree_sitter() maps it to LANGUAGE_TYPESCRIPT (types.rs:291), so the AST
-# index and the verify gate never see the TSX grammar. JSX breaks that tree: in
-# _og.tsx the root is an ERROR node and no try_statement, catch_clause or
-# expression_statement exists. The structural oracle (#541) parses .tsx with
-# the TSX grammar (ADR-003 ground truth).
+# Language::from_extension("tsx") is TypeScript and Language::to_tree_sitter()
+# maps it to LANGUAGE_TYPESCRIPT (both in crates/rskim-core/src/types.rs), so
+# the AST index and the verify gate never see the TSX grammar. JSX breaks that
+# tree: in _og.tsx the root is an ERROR node and no try_statement, catch_clause
+# or expression_statement exists. The structural oracle (#541) parses .tsx with
+# the TSX grammar (SEARCH-ADR-007 (independent ground-truth oracle), #571).
 
 [[xfail]]
 issue = "#571"

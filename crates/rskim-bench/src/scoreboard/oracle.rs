@@ -295,7 +295,7 @@ fn phrase_near_matches(words: &[String], tokens: &[&str], span: usize) -> bool {
 // ============================================================================
 
 /// One language: the display name, its file extensions (the oracle's copy of
-/// `rskim_core::Language::from_extension`, `crates/rskim-core/src/types.rs:55-80`)
+/// `rskim_core::Language::from_extension`, `crates/rskim-core/src/types.rs`)
 /// and the extra `--lang` names the CLI accepts for it
 /// (`parse_lang_value`, `crates/rskim/src/cmd/search/mod.rs:496-527`).
 struct LangSpec {

@@ -29,9 +29,9 @@
 //! and a test keeps it equal to the version the workspace `Cargo.lock`
 //! resolves: a grammar bump fails that test until the headers are edited,
 //! and the edit changes the digest, so the gate asks for a bless.
-//! `.tsx` files are parsed with the TSX grammar
-//! (ADR-003: the oracle is the real grammar), although skim parses them with
-//! the plain TypeScript grammar.
+//! `.tsx` files are parsed with the TSX grammar (SEARCH-ADR-007: an
+//! independent ground-truth oracle parses with the real grammar; #571),
+//! although skim parses them with the plain TypeScript grammar.
 //!
 //! Every query names one `@match` capture; the match line is the first
 //! (1-based) line of that node. Four patterns (six queries) carry a small
@@ -79,9 +79,10 @@ use tree_sitter::{
 /// A language the oracle has a tree-sitter grammar for.
 ///
 /// `Tsx` is separate from `TypeScript` because the oracle parses `.tsx`
-/// with the TSX grammar (ADR-003), whereas skim parses every TypeScript
-/// extension with `LANGUAGE_TYPESCRIPT`
-/// (`crates/rskim-core/src/types.rs:289-310`).
+/// with the TSX grammar (SEARCH-ADR-007 (independent ground-truth oracle),
+/// #571), whereas skim parses every TypeScript extension with
+/// `LANGUAGE_TYPESCRIPT` (`rskim_core::Language::to_tree_sitter`,
+/// `crates/rskim-core/src/types.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OracleLang {
     /// `.rs` — tree-sitter-rust.
@@ -211,13 +212,12 @@ struct ExtClass {
 }
 
 /// The oracle's own copy of skim's extension → language table
-/// (`rskim_core::Language::from_extension`,
-/// `crates/rskim-core/src/types.rs:55-80`, case-sensitive) crossed with the
-/// languages skim AST-indexes (`LANG_MAPS`,
+/// (`rskim_core::Language::from_extension`, `crates/rskim-core/src/types.rs`,
+/// case-sensitive) crossed with the languages skim AST-indexes (`LANG_MAPS`,
 /// `crates/rskim-search/src/ast_index/linearize.rs:119-134`: every
 /// tree-sitter language except Bash, which has a grammar but no AST
-/// vocabulary) and the grammar table (`crates/rskim-core/src/types.rs:289-310`;
-/// JSON / YAML / TOML have none).
+/// vocabulary) and the grammar table (`rskim_core::Language::to_tree_sitter`,
+/// same file; JSON / YAML / TOML have none).
 const EXT_CLASSES: &[ExtClass] = &[
     ExtClass {
         extensions: &["ts", "mts", "cts"],
@@ -543,7 +543,7 @@ const QUERIES: &[OracleQuery] = &[
 ];
 
 /// Catalog patterns the oracle deliberately does not cover, as `(pattern
-/// name, reason)`. They stay under ADR-007 manual dog-food.
+/// name, reason)`. They stay under SEARCH-ADR-007 manual dog-food.
 pub const UNCOVERED: &[(&str, &str)] = &[
     (
         "deep-nesting",

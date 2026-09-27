@@ -1,7 +1,7 @@
 ---
 feature: search-scoreboard
 name: Search scoreboard (end-to-end retrieval quality gate)
-description: "Use when a search PR's Search Scoreboard CI job fails, when changing skim search retrieval/ranking/pagination/walker universe/text output, when running the scoreboard locally, when ledgering or promoting a known HARD failure, when blessing baseline.json (incl. --accept-regression), when adding golden queries or bumping a corpus pin, or when editing the scoreboard harness (oracle, universe, runner, gate, bless), the CI search-path filter, or rskim-research pinned-clone / subprocess-timeout code. Keywords: scoreboard, Search Scoreboard, run, check, bless, golden-gen, golden-gen --ast, [[ast]], structural oracle, structural.recall, structural.precision, structural.coverage, line_on_match, unscored_rows, intent_recall, .scm, vacuous, expect_oracle_empty, false-positive guard, uncovered_patterns, baseline.json, known_failures.toml, ledger, XFAIL, XPASS, promote, HARD, RATCHET, INFO, bless required, --accept-regression, accepted_regressions, golden, corpora.toml, oracle, universe.delta, skipped_by_reason_mismatch, coverage.tracked_text, oracle_less.full_rows, results.unique_paths, silent_fn, degraded, temporal_state, harness error, exit 2, SEARCH_PATHS, --no-renames, skim-release, scoreboard-report, ensure_pinned_history_clone, verify_pinned_clone, OWNERSHIP_MARKER, zeroPaddedFilemode, process_group, git_output_with_timeout, KILL_GRACE, caffeinate, .bench-corpus/scoreboard, #544, #545, #547, #541, #542, ADR-007."
+description: "Use when a search PR's Search Scoreboard CI job fails, when changing skim search retrieval/ranking/pagination/walker universe/text output, when running the scoreboard locally, when ledgering or promoting a known HARD failure, when blessing baseline.json (incl. --accept-regression), when adding golden queries or bumping a corpus pin, or when editing the scoreboard harness (oracle, universe, runner, gate, bless), the CI search-path filter, or rskim-research pinned-clone / subprocess-timeout code. Keywords: scoreboard, Search Scoreboard, run, check, bless, golden-gen, golden-gen --ast, [[ast]], structural oracle, structural.recall, structural.precision, structural.coverage, line_on_match, unscored_rows, intent_recall, .scm, vacuous, expect_oracle_empty, false-positive guard, uncovered_patterns, baseline.json, known_failures.toml, ledger, XFAIL, XPASS, promote, HARD, RATCHET, INFO, bless required, --accept-regression, accepted_regressions, golden, corpora.toml, oracle, universe.delta, skipped_by_reason_mismatch, coverage.tracked_text, oracle_less.full_rows, results.unique_paths, silent_fn, degraded, temporal_state, harness error, exit 2, SEARCH_PATHS, --no-renames, skim-release, scoreboard-report, ensure_pinned_history_clone, verify_pinned_clone, OWNERSHIP_MARKER, zeroPaddedFilemode, process_group, git_output_with_timeout, KILL_GRACE, caffeinate, .bench-corpus/scoreboard, #544, #545, #547, #541, #542, SEARCH-ADR-007."
 category: domain-knowledge
 directories: [crates/rskim-bench/src/scoreboard/, crates/rskim-bench/src/bin/scoreboard.rs, crates/rskim-bench/scoreboard/, crates/rskim-bench/tests/scoreboard.rs, crates/rskim-research/src/clone.rs, .github/workflows/ci.yml]
 referencedFiles:
@@ -40,7 +40,7 @@ The scoreboard (#203, PR #560) is the **required merge gate for search PRs**. It
 `.github/workflows/ci.yml`. It runs the **release `skim` binary as a subprocess**, the same way an agent does,
 against four pinned full-history corpora (skim `b8a0a79`, ripgrep, flask, zod). It checks every answer against
 oracles that share no code with skim's search stack, and it compares ranking with naive baselines. It replaced the
-manual ADR-007 dog-food campaign as the standing gate. Manual dog-food is still required only where the scoreboard
+manual SEARCH-ADR-007 dog-food campaign as the standing gate. Manual dog-food is still required only where the scoreboard
 cannot see: the `--ast` patterns the structural oracle does not score (`uncovered_patterns`: `deep-nesting`,
 `java-synchronized`, `ruby-begin-rescue` have no query; the four Go patterns have no corpus Go file where the
 oracle or skim finds a match), the temporal
@@ -54,17 +54,17 @@ hard way during #203.
 
 - **Why it exists.** Dog-food rounds produce only negative evidence and never a "done" signal. The old reader-API
   `rskim-bench` harness scored a different file universe and bypassed the verify gate, anchors and pagination. The
-  scoreboard measures what the shipped CLI actually returns (ADR-007 amendment, 2026-09-25).
+  scoreboard measures what the shipped CLI actually returns (SEARCH-ADR-007 amendment, 2026-09-25).
 - **What "passing" means.** `scoreboard check` passes when every HARD outcome is PASS or ledgered XFAIL, and
   nothing differs from the blessed `baseline.json`. That covers RATCHET values, HARD states, corpus pins, golden
   hashes and the corpus set. It does **not** mean skim beats the baselines. The "beats baseline" column is INFO.
   The committed baseline has skim *losing* some comparisons, for example aggregate `bytes.text_median` 2177 vs
   simulated rg 1573, and `concept.p5` 0.8538 vs occurrence-count 0.9.
 - **Ratchets, not targets.** RATCHET values are compared with blessed *measured* values. The "bar" column is not
-  compared (applies ADR-003: grounded regression guards instead of aspirational targets). Golden data is declared
+  compared (applies SEARCH-ADR-003: grounded regression guards instead of aspirational targets). Golden data is declared
   before anyone looks at skim's output, and it is never regenerated in CI.
 - **A green scoreboard is not merge authorization.** Report the verdict and stop. The user asks for the merge
-  (ADR-005).
+  (SEARCH-ADR-005).
 
 ## Core Business Rules
 
@@ -132,7 +132,7 @@ are carried forward and never dropped. `--accept-regression` with nothing to acc
 
 `universe.delta` and `universe.skipped_by_reason_mismatch` are **RATCHETs** (ZeroBest, exact, bar "= 0"), not
 HARD checks. Moving away from 0 is a regression, so it can only be blessed with a reason. In practice, fix the
-mismatch instead (ADR-008: skim indexes walked ∪ tracked, and the oracle must reproduce that universe
+mismatch instead (SEARCH-ADR-008: skim indexes walked ∪ tracked, and the oracle must reproduce that universe
 independently).
 
 ### Oracle independence
@@ -456,13 +456,13 @@ A failed run therefore can never leave an older passing report for `bless --from
 
 ## Related
 
-- **ADR-007** (amended 2026-09-25): this scoreboard is the required search gate. Manual adversarial dog-food only
+- **SEARCH-ADR-007** (amended 2026-09-25): this scoreboard is the required search gate. Manual adversarial dog-food only
   covers what it cannot see: uncovered structural patterns, temporal until #542, and new flags or arms.
-- **ADR-008**: skim indexes walked ∪ tracked. `universe.rs` reproduces that union independently, and
+- **SEARCH-ADR-008**: skim indexes walked ∪ tracked. `universe.rs` reproduces that union independently, and
   `universe.delta` must stay 0.
-- **ADR-003**: ratchets against blessed measured values rather than invented targets. Golden data is declared up
+- **SEARCH-ADR-003**: ratchets against blessed measured values rather than invented targets. Golden data is declared up
   front.
-- **ADR-005**: a green `Search Scoreboard` is not permission to merge.
+- **SEARCH-ADR-005**: a green `Search Scoreboard` is not permission to merge.
 - **PF-019**: build the binary the run spawns first. **PF-013**: warm fresh binaries on macOS. **PF-009**:
   `clippy --all-targets` after `cargo clean -p`.
 - Feature knowledge `cmd-search`: the CLI code the scoreboard judges. The ledgered bugs live in

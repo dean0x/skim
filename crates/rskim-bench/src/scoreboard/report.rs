@@ -51,7 +51,7 @@ pub struct Report {
     pub corpora: Vec<CorpusReport>,
     pub aggregate: AggregateReport,
     /// Catalog patterns no `[[ast]]` entry of this run scores, sorted by
-    /// name (they stay under ADR-007 manual dog-food).
+    /// name (they stay under SEARCH-ADR-007 manual dog-food).
     #[serde(default)]
     pub uncovered_patterns: Vec<UncoveredPattern>,
     pub gate: GateReport,
@@ -641,7 +641,7 @@ fn uncovered_section(md: &mut String, uncovered: &[UncoveredPattern]) {
     }
     let _ = writeln!(
         md,
-        "## Uncovered structural patterns (manual dog-food, ADR-007)\n"
+        "## Uncovered structural patterns (manual dog-food, SEARCH-ADR-007)\n"
     );
     for p in uncovered {
         let cause = match p.cause {

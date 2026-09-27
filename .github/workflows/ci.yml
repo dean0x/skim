@@ -347,7 +347,7 @@ jobs:
           echo "search=$search" >> "$GITHUB_OUTPUT"
 
   # Search Scoreboard (#203): the end-to-end retrieval-quality gate, REQUIRED
-  # for search PRs (owner decision 2026-09-25, ADR-007 amendment). It drives
+  # for search PRs (owner decision 2026-09-25, SEARCH-ADR-007 amendment). It drives
   # this run's release skim (the Build Check artifact) against four pinned
   # corpora and gates on crates/rskim-bench/scoreboard/{baseline.json,
   # known_failures.toml}; see the README there. Keep `name:` stable: branch

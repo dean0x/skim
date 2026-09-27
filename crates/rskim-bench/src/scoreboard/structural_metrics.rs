@@ -469,7 +469,8 @@ pub struct StructuralSample {
     /// row's file (a count; a row without `line` never counts). skim anchors
     /// on the child node that completes a declared n-gram, the oracle on the
     /// construct the description names, so multi-line constructs read low by
-    /// design (see the #541 handoff).
+    /// design (see the `line_on_match` note under "Checks" in
+    /// `crates/rskim-bench/scoreboard/README.md`).
     pub line_on_match: u64,
 }
 
@@ -657,8 +658,8 @@ pub enum UncoveredCause {
     NoEntry,
 }
 
-/// A catalog pattern no `[[ast]]` entry scores; it stays under ADR-007
-/// manual dog-food.
+/// A catalog pattern no `[[ast]]` entry scores; it stays under
+/// SEARCH-ADR-007 manual dog-food.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UncoveredPattern {

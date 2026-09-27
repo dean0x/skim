@@ -1,6 +1,6 @@
 //! Search scoreboard — the end-to-end retrieval-quality gate for
-//! `skim search` (#203; the required search gate per ADR-007's 2026-09-25
-//! amendment).
+//! `skim search` (#203; the required search gate per SEARCH-ADR-007's
+//! 2026-09-25 amendment).
 //!
 //! The scoreboard drives the release `skim` binary as a subprocess against
 //! pinned real-world corpora and checks its output against oracles that are

@@ -4,7 +4,7 @@ The scoreboard is the end-to-end quality gate for `skim search` retrieval (#203)
 `skim` binary** as a subprocess, the same path an agent takes, against four pinned corpora. It checks every answer
 against oracles that share no code with skim's search stack, and it compares ranking with naive baselines.
 
-It is the **required merge gate for search PRs** (owner decision 2026-09-25, ADR-007 amendment). In CI it is the
+It is the **required merge gate for search PRs** (owner decision 2026-09-25, SEARCH-ADR-007 amendment). In CI it is the
 `Search Scoreboard` job in `.github/workflows/ci.yml`.
 
 - Code: `crates/rskim-bench/src/scoreboard/`. The binary is `src/bin/scoreboard.rs`, and the offline tests are
@@ -33,7 +33,7 @@ A changed golden file, corpus pin, or HARD outcome (for example `xfail -> pass`)
 HARD downgrade (`pass -> xfail`, or a blessed check, entry or corpus that no longer runs) is blessed like a RATCHET
 regression: only with `--accept-regression "<reason>"`.
 
-What it does **not** cover yet, where manual adversarial dog-food (ADR-007) is still required:
+What it does **not** cover yet, where manual adversarial dog-food (SEARCH-ADR-007) is still required:
 
 - The `--ast` patterns the structural oracle does not score, listed under "Uncovered structural patterns" in
   `report.md`: `deep-nesting`, `java-synchronized` and `ruby-begin-rescue` have no oracle query, and
@@ -136,7 +136,7 @@ Promoting a fixed ledger entry therefore takes two steps:
 
 ## Adding a golden query
 
-Golden data is declared **before** looking at skim's output (ADR-003), and CI never regenerates it. Each entry needs
+Golden data is declared **before** looking at skim's output (SEARCH-ADR-003), and CI never regenerates it. Each entry needs
 an `id` that is unique and prefixed with `<corpus>-`. The existing id scheme:
 
 - `L..` curated identifiers, `I..` generated identifiers;
@@ -199,7 +199,7 @@ Adding any entry changes the golden hash, so the next `check` says "bless requir
 (`crates/rskim-oracle/src/structural.rs`). For each (pattern, language) it runs a hand-written tree-sitter query,
 `crates/rskim-oracle/queries/<pattern>.<lang>.scm`, over every file of that language in the oracle's universe. The
 query encodes the pattern's catalog **description**, not skim's n-grams, on the real grammar: `.tsx` is parsed with
-the TSX grammar, although skim parses it as TypeScript (ADR-003).
+the TSX grammar, although skim parses it as TypeScript (SEARCH-ADR-007 (independent ground-truth oracle), #571).
 
 It sees only the pattern **names** from skim: the scoreboard reads skim's catalog once
 (`rskim_search::all_patterns()`, in `src/scoreboard/catalog.rs`) and crosses the names with the oracle's registry. The
@@ -331,7 +331,7 @@ unscored silently.
 
 ### Uncovered patterns
 
-These stay under manual adversarial dog-food (ADR-007). `report.md` lists them under "Uncovered structural patterns":
+These stay under manual adversarial dog-food (SEARCH-ADR-007). `report.md` lists them under "Uncovered structural patterns":
 
 | Pattern | Why |
 |---|---|
