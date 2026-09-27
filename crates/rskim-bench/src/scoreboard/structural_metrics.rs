@@ -218,13 +218,19 @@ pub fn unscored_rows<'a>(
 // HARD checks (pure)
 // ============================================================================
 
-fn skim_files(rows: &[ResultRow]) -> BTreeSet<&str> {
+/// The distinct files of `rows`.
+pub(crate) fn distinct_files(rows: &[ResultRow]) -> BTreeSet<&str> {
     rows.iter().map(|r| r.path.as_str()).collect()
+}
+
+/// How many of `skim`'s files `oracle` matches.
+fn overlap(skim: &BTreeSet<&str>, oracle: &MatchFiles) -> usize {
+    skim.iter().filter(|p| oracle.contains_key(**p)).count()
 }
 
 /// `structural.recall`: every file the oracle matches is returned.
 pub fn check_recall(rows: &[ResultRow], oracle: &MatchFiles) -> CheckOutcome {
-    let returned = skim_files(rows);
+    let returned = distinct_files(rows);
     let missing: Vec<&str> = oracle
         .keys()
         .map(String::as_str)
@@ -243,7 +249,7 @@ pub fn check_recall(rows: &[ResultRow], oracle: &MatchFiles) -> CheckOutcome {
 
 /// `structural.precision`: every returned file is an oracle match.
 pub fn check_precision(rows: &[ResultRow], oracle: &MatchFiles) -> CheckOutcome {
-    let extra: Vec<&str> = skim_files(rows)
+    let extra: Vec<&str> = distinct_files(rows)
         .into_iter()
         .filter(|p| !oracle.contains_key(*p))
         .collect();
@@ -354,16 +360,9 @@ pub fn measure(
     answers: &OracleAnswers,
 ) -> anyhow::Result<StructuralSample> {
     let oracle = answers.definition(&target.pattern, target.lang)?;
-    let skim = skim_files(rows);
-    let hits = skim.iter().filter(|p| oracle.contains_key(**p)).count();
-    let intent = answers.intent(&target.pattern, target.lang).map(|intent| {
-        let hits = skim.iter().filter(|p| intent.contains_key(**p)).count();
-        (
-            intent.len() as u64,
-            ratio(hits, intent.len()),
-            ratio(hits, skim.len()),
-        )
-    });
+    let skim = distinct_files(rows);
+    let hits = overlap(&skim, oracle);
+    let intent = answers.intent(&target.pattern, target.lang);
     let line_on_match = rows
         .iter()
         .filter(|r| {
@@ -380,9 +379,9 @@ pub fn measure(
         skim_files: skim.len() as u64,
         recall: ratio(hits, oracle.len()),
         precision: ratio(hits, skim.len()),
-        intent_files: intent.map(|(files, _, _)| files),
-        intent_recall: intent.map(|(_, recall, _)| recall),
-        intent_precision: intent.map(|(_, _, precision)| precision),
+        intent_files: intent.map(|intent| intent.len() as u64),
+        intent_recall: intent.map(|intent| ratio(overlap(&skim, intent), intent.len())),
+        intent_precision: intent.map(|intent| ratio(overlap(&skim, intent), skim.len())),
         line_on_match: line_on_match as u64,
     })
 }

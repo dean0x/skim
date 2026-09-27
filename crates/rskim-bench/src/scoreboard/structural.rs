@@ -46,7 +46,7 @@
 //! and skim drops non-UTF-8 files on this path too
 //! (`crates/rskim-search/src/compound/reparse.rs:163`, `:296`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -339,15 +339,6 @@ pub fn over_cap_count<'a>(files: impl IntoIterator<Item = (&'a str, u64)>) -> u6
     u64::try_from(over).unwrap_or(u64::MAX)
 }
 
-/// The oracle language `path` is scored in, if the file is in the AST
-/// universe: an oracle language and within the size cap.
-pub fn scored_lang(path: &str, len: u64) -> Option<OracleLang> {
-    match classify(path) {
-        LangClass::Oracle(lang) if within_size_cap(len) => Some(lang),
-        _ => None,
-    }
-}
-
 // ============================================================================
 // Query registry
 // ============================================================================
@@ -400,6 +391,17 @@ struct OracleQuery {
     lang: OracleLang,
     source: &'static str,
     filter: Option<PostFilter>,
+}
+
+impl OracleQuery {
+    fn file_name(&self) -> String {
+        scm_file_name(self.pattern, self.lang)
+    }
+}
+
+/// A query's file name, `<pattern>.<lang>.scm`.
+fn scm_file_name(pattern: &str, lang: OracleLang) -> String {
+    format!("{pattern}.{lang}.scm")
 }
 
 /// Registry row: `(pattern, OracleLang variant, file-name language)` plus an
@@ -541,23 +543,28 @@ pub struct QuerySource {
 impl QuerySource {
     /// The query's file name, `<pattern>.<lang>.scm`.
     pub fn file_name(&self) -> String {
-        format!("{}.{}.scm", self.pattern, self.lang.as_str())
+        scm_file_name(self.pattern, self.lang)
     }
+}
+
+/// The registry ordered by `(pattern, language name)`.
+fn sorted_queries() -> Vec<&'static OracleQuery> {
+    let mut queries: Vec<&'static OracleQuery> = QUERIES.iter().collect();
+    queries.sort_by_key(|q| (q.pattern, q.lang.as_str()));
+    queries
 }
 
 /// Every registered query, ordered by `(pattern, language name)` — the input
 /// for folding the `.scm` files into the golden digest.
 pub fn query_sources() -> Vec<QuerySource> {
-    let mut out: Vec<QuerySource> = QUERIES
-        .iter()
+    sorted_queries()
+        .into_iter()
         .map(|q| QuerySource {
             pattern: q.pattern,
             lang: q.lang,
             source: q.source,
         })
-        .collect();
-    out.sort_by(|a, b| (a.pattern, a.lang.as_str()).cmp(&(b.pattern, b.lang.as_str())));
-    out
+        .collect()
 }
 
 /// A canonical rendering of everything besides the grammars that decides
@@ -566,19 +573,16 @@ pub fn query_sources() -> Vec<QuerySource> {
 /// it in (`golden::structural_oracle_sha256`), so editing a query, a
 /// post-filter threshold or an intent's node kinds forces a re-bless.
 pub fn fingerprint() -> String {
-    let mut queries: Vec<&OracleQuery> = QUERIES.iter().collect();
-    queries.sort_by(|a, b| (a.pattern, a.lang.as_str()).cmp(&(b.pattern, b.lang.as_str())));
     let mut out = format!("size-cap {AST_SIZE_CAP_BYTES}\n");
-    for q in queries {
+    for q in sorted_queries() {
         let filter = match q.filter {
             None => "none".to_string(),
             Some(PostFilter::Empty { capture }) => format!("empty @{capture}"),
             Some(PostFilter::AtLeast { capture, min }) => format!("at-least {min} @{capture}"),
         };
         out.push_str(&format!(
-            "query {}.{}.scm filter {filter} bytes {}\n{}\n",
-            q.pattern,
-            q.lang,
+            "query {} filter {filter} bytes {}\n{}\n",
+            q.file_name(),
             q.source.len(),
             q.source
         ));
@@ -594,14 +598,6 @@ pub fn fingerprint() -> String {
         ));
     }
     out
-}
-
-/// Whether the oracle answers the intent of `pattern` in `lang` (see
-/// [`INTENTS`]).
-pub fn has_intent(pattern: &str, lang: OracleLang) -> bool {
-    INTENTS
-        .iter()
-        .any(|spec| spec.pattern == pattern && spec.langs.contains(&lang))
 }
 
 /// Whether the oracle covers a catalog pattern, and why not if it does not.
@@ -765,17 +761,13 @@ impl StructuralOracle {
             .iter()
             .map(compile_definition)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        for (i, a) in QUERIES.iter().enumerate() {
-            if QUERIES[..i]
-                .iter()
-                .any(|b| b.pattern == a.pattern && b.lang == a.lang)
-            {
-                anyhow::bail!(
-                    "oracle query {}.{}.scm is registered twice",
-                    a.pattern,
-                    a.lang
-                );
-            }
+        let mut registered = BTreeSet::new();
+        for q in QUERIES {
+            anyhow::ensure!(
+                registered.insert((q.pattern, q.lang)),
+                "oracle query {} is registered twice",
+                q.file_name()
+            );
         }
         let intents = INTENTS
             .iter()
@@ -874,7 +866,7 @@ impl StructuralOracle {
 }
 
 fn compile_definition(spec: &'static OracleQuery) -> anyhow::Result<CompiledQuery> {
-    let file = format!("{}.{}.scm", spec.pattern, spec.lang);
+    let file = spec.file_name();
     let query = Query::new(&spec.lang.grammar(), spec.source)
         .map_err(|e| anyhow::anyhow!("compiling oracle query {file}: {e}"))?;
     let match_capture = query
@@ -950,46 +942,33 @@ pub fn parse(lang: OracleLang, source: &str) -> anyhow::Result<Tree> {
 }
 
 fn run_definition(compiled: &CompiledQuery, tree: &Tree, source: &str) -> anyhow::Result<Vec<u32>> {
-    let mut cursor = QueryCursor::new();
-    let mut lines = Vec::new();
-    {
-        let mut matches = cursor.matches(&compiled.query, tree.root_node(), source.as_bytes());
-        while let Some(m) = matches.next() {
+    let spec = compiled.spec;
+    first_lines(
+        &compiled.query,
+        tree,
+        source,
+        spec.pattern,
+        spec.lang,
+        |m| {
             if !filter_accepts(compiled, m)? {
-                continue;
+                return Ok(Vec::new());
             }
-            for capture in m
-                .captures
-                .iter()
-                .filter(|c| c.index == compiled.match_capture)
-            {
-                lines.push(first_line(capture.node)?);
-            }
-        }
-    }
-    ensure_complete(&cursor, compiled.spec.pattern, compiled.spec.lang)?;
-    lines.sort_unstable();
-    lines.dedup();
-    Ok(lines)
+            Ok(captured(m, compiled.match_capture).collect())
+        },
+    )
 }
 
 fn filter_accepts(compiled: &CompiledQuery, m: &QueryMatch<'_, '_>) -> anyhow::Result<bool> {
     let Some((index, filter)) = compiled.filter else {
         return Ok(true);
     };
-    let node = m
-        .captures
-        .iter()
-        .find(|c| c.index == index)
-        .map(|c| c.node)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "oracle query {}.{}.scm matched without its @{} capture",
-                compiled.spec.pattern,
-                compiled.spec.lang,
-                filter.capture()
-            )
-        })?;
+    let node = captured(m, index).next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "oracle query {} matched without its @{} capture",
+            compiled.spec.file_name(),
+            filter.capture()
+        )
+    })?;
     Ok(filter.accepts(body_elements(node)))
 }
 
@@ -1003,26 +982,67 @@ fn body_elements(node: Node<'_>) -> usize {
 }
 
 fn run_intent(compiled: &CompiledIntent, tree: &Tree, source: &str) -> anyhow::Result<Vec<u32>> {
+    let spec = compiled.spec;
+    first_lines(
+        &compiled.query,
+        tree,
+        source,
+        spec.pattern,
+        compiled.lang,
+        |m| {
+            Ok(captured(m, compiled.loop_capture)
+                .filter(|&node| has_loop_ancestor_in_same_function(node, spec))
+                .collect())
+        },
+    )
+}
+
+/// Run `query` over `tree`: the 1-based first line of every node `select`
+/// picks from a match, sorted and de-duplicated. `pattern` and `lang` name
+/// the query in errors.
+///
+/// # Errors
+///
+/// `select` fails, a line does not fit a `u32`, or the query exceeded
+/// tree-sitter's in-progress match limit: it may have dropped matches, which
+/// is a harness error, never a silent miss.
+fn first_lines<'tree>(
+    query: &Query,
+    tree: &'tree Tree,
+    source: &str,
+    pattern: &str,
+    lang: OracleLang,
+    mut select: impl FnMut(&QueryMatch<'_, 'tree>) -> anyhow::Result<Vec<Node<'tree>>>,
+) -> anyhow::Result<Vec<u32>> {
     let mut cursor = QueryCursor::new();
     let mut lines = Vec::new();
     {
-        let mut matches = cursor.matches(&compiled.query, tree.root_node(), source.as_bytes());
+        let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
         while let Some(m) = matches.next() {
-            for capture in m
-                .captures
-                .iter()
-                .filter(|c| c.index == compiled.loop_capture)
-            {
-                if has_loop_ancestor_in_same_function(capture.node, compiled.spec) {
-                    lines.push(first_line(capture.node)?);
-                }
+            for node in select(m)? {
+                lines.push(first_line(node)?);
             }
         }
     }
-    ensure_complete(&cursor, compiled.spec.pattern, compiled.lang)?;
+    anyhow::ensure!(
+        !cursor.did_exceed_match_limit(),
+        "oracle query {} exceeded tree-sitter's match limit",
+        scm_file_name(pattern, lang)
+    );
     lines.sort_unstable();
     lines.dedup();
     Ok(lines)
+}
+
+/// The nodes `m` captured under capture `index`, in capture order.
+fn captured<'m, 'tree>(
+    m: &'m QueryMatch<'_, 'tree>,
+    index: u32,
+) -> impl Iterator<Item = Node<'tree>> + 'm {
+    m.captures
+        .iter()
+        .filter(move |c| c.index == index)
+        .map(|c| c.node)
 }
 
 /// Walk `node`'s ancestors (bounded by the tree's depth) up to the nearest
@@ -1032,15 +1052,6 @@ fn has_loop_ancestor_in_same_function(node: Node<'_>, spec: &IntentSpec) -> bool
         .map(|ancestor| ancestor.kind())
         .find(|kind| spec.loop_kinds.contains(kind) || spec.boundary_kinds.contains(kind))
         .is_some_and(|kind| spec.loop_kinds.contains(&kind))
-}
-
-/// A query that exceeded tree-sitter's in-progress match limit may have
-/// dropped matches; that is a harness error, never a silent miss.
-fn ensure_complete(cursor: &QueryCursor, pattern: &str, lang: OracleLang) -> anyhow::Result<()> {
-    if cursor.did_exceed_match_limit() {
-        anyhow::bail!("oracle query {pattern}.{lang}.scm exceeded tree-sitter's match limit");
-    }
-    Ok(())
 }
 
 /// The 1-based first line of `node`.

@@ -40,7 +40,7 @@ use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
 use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use crate::scoreboard::structural::{self, OracleLang, PatternCoverage};
-use crate::scoreboard::structural_metrics::{OracleAnswers, rows_in};
+use crate::scoreboard::structural_metrics::{OracleAnswers, distinct_files, rows_in};
 use crate::scoreboard::types::ResultPage;
 use crate::scoreboard::universe::Universe;
 
@@ -322,14 +322,9 @@ pub fn generate_ast(
     let mut out = Vec::new();
     for (pattern, lang) in present_pairs(answers) {
         let oracle_files = answers.definition(pattern, lang)?.len();
-        let skim_files = skim.get(pattern).map_or(0, |page| {
-            rows_in(page, lang)
-                .rows
-                .iter()
-                .map(|r| r.path.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-        });
+        let skim_files = skim
+            .get(pattern)
+            .map_or(0, |page| distinct_files(&rows_in(page, lang).rows).len());
         if oracle_files == 0 && skim_files == 0 {
             continue;
         }

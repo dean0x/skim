@@ -26,7 +26,8 @@
 //!   no `report.json` / `report.md` in `--out` (`run` / `check` remove the
 //!   previous ones first).
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
@@ -166,12 +167,7 @@ fn engine(args: &EngineArgs, mode: Mode) -> anyhow::Result<u8> {
     // Before any work: a harness error below must not leave an older report
     // in --out for `bless --from` to take as this run's.
     clear_outputs(&args.out)?;
-    let skim_bin = std::fs::canonicalize(&args.skim_bin).with_context(|| {
-        format!(
-            "skim binary {} not found (build it with `cargo build --release -p rskim`, or pass --skim-bin)",
-            args.skim_bin.display()
-        )
-    })?;
+    let skim_bin = resolve_skim_bin(&args.skim_bin)?;
     let data = DataDir::new(&args.data_dir);
     let inputs = Inputs::load(&data, args.only.as_deref())?;
 
@@ -194,7 +190,17 @@ fn engine(args: &EngineArgs, mode: Mode) -> anyhow::Result<u8> {
     })
 }
 
-fn print_summary(report: &Report, mode: Mode, out: &std::path::Path) {
+/// The canonical path of the skim binary `--skim-bin` names.
+fn resolve_skim_bin(skim_bin: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::canonicalize(skim_bin).with_context(|| {
+        format!(
+            "skim binary {} not found (build it with `cargo build --release -p rskim`, or pass --skim-bin)",
+            skim_bin.display()
+        )
+    })
+}
+
+fn print_summary(report: &Report, mode: Mode, out: &Path) {
     for c in &report.corpora {
         let t = total(&c.checks);
         eprintln!(
@@ -301,27 +307,24 @@ fn golden_gen_ast(
     args: &GoldenGenArgs,
     corpus: &str,
     commit: &str,
-    root: &std::path::Path,
+    root: &Path,
     universe: &Universe,
-    home: &std::path::Path,
+    home: &Path,
 ) -> anyhow::Result<u8> {
-    let skim_bin = std::fs::canonicalize(&args.skim_bin).with_context(|| {
-        format!(
-            "skim binary {} not found (build it with `cargo build --release -p rskim`, or pass --skim-bin)",
-            args.skim_bin.display()
-        )
-    })?;
+    let skim_bin = resolve_skim_bin(&args.skim_bin)?;
     let oracle = StructuralOracle::new().context("compiling the structural oracle")?;
     let answers = OracleAnswers::compute(&oracle, universe.files()).context("structural oracle")?;
     let runner = SkimRunner::new(skim_bin, SkimSandbox::new(home));
     runner.build(root)?;
-    let mut skim = std::collections::BTreeMap::new();
-    for pattern in golden_gen::ast_patterns_to_query(&answers) {
-        let (page, _) = runner
-            .ast_list(root, pattern)
-            .with_context(|| format!("--ast {pattern}"))?;
-        skim.insert(pattern.to_string(), page.page);
-    }
+    let skim = golden_gen::ast_patterns_to_query(&answers)
+        .into_iter()
+        .map(|pattern| {
+            let (page, _) = runner
+                .ast_list(root, pattern)
+                .with_context(|| format!("--ast {pattern}"))?;
+            Ok((pattern.to_string(), page.page))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
     let candidates = golden_gen::generate_ast(corpus, &answers, &skim)?;
 
     println!(

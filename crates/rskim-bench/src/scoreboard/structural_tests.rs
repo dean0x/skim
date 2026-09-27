@@ -844,9 +844,6 @@ fn size_cap_is_one_mib_inclusive() {
     assert_eq!(cap, 1_048_576);
     assert!(within_size_cap(cap));
     assert!(!within_size_cap(cap + 1));
-    assert_eq!(scored_lang("a.rs", cap), Some(OracleLang::Rust));
-    assert_eq!(scored_lang("a.rs", cap + 1), None);
-    assert_eq!(scored_lang("A.java", 10), None);
 
     // Every language skim size-caps counts (Bash included); data formats and
     // unknown extensions never do.

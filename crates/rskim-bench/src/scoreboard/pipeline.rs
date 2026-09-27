@@ -20,7 +20,7 @@
 //! that pattern's entries by language.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
@@ -325,14 +325,14 @@ struct PlanObservations {
 /// Any skim call error, naming the entry or pattern.
 fn observe_plan(
     runner: &SkimRunner,
-    root: &std::path::Path,
+    root: &Path,
     plan: &[PlannedQuery],
 ) -> anyhow::Result<PlanObservations> {
     let mut timings = Vec::with_capacity(plan.len());
     let mut patterns: BTreeMap<String, AstPage> = BTreeMap::new();
     let wanted: BTreeSet<&str> = plan
         .iter()
-        .filter_map(|q| q.structural_target())
+        .filter_map(PlannedQuery::structural_target)
         .map(|t| t.pattern.as_str())
         .collect();
     for pattern in wanted {
