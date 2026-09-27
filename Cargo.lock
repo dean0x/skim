@@ -2599,6 +2599,7 @@ dependencies = [
  "toml 0.8.23",
  "tree-sitter",
  "tree-sitter-go",
+ "tree-sitter-javascript",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
