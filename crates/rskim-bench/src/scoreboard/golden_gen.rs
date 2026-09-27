@@ -282,9 +282,7 @@ pub fn ast_id(corpus: &str, pattern: &str, lang: OracleLang) -> String {
 /// `exact` (its n-grams are a reliable subset of every occurrence), else
 /// `ratchet`. The gate never calls this: the class is frozen in golden.
 pub fn proposed_class(pattern: &str) -> PrecisionClass {
-    let exact = rskim_search::all_patterns()
-        .iter()
-        .any(|p| p.name == pattern && p.exact);
+    let exact = structural::catalog_patterns().any(|p| p.name == pattern && p.exact);
     if exact {
         PrecisionClass::Hard
     } else {

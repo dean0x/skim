@@ -6,13 +6,17 @@
 //!
 //! Nothing here reuses skim's AST search stack — no linearization, n-gram,
 //! query engine or re-parse verify code. The one item taken from
-//! `rskim-search` is the pattern catalog's NAMES, through
-//! `rskim_search::all_patterns`, so a catalog pattern with no oracle query is
-//! listed as uncovered instead of silently skipped. Where the oracle must
-//! agree with skim (the extension table, the AST-indexed language list, the
-//! size cap) it keeps its OWN copy with a citation, so a policy change on
-//! skim's side shows up as a scoreboard diff (the `oracle.rs` / `universe.rs`
-//! convention). The unit tests enforce this with a source scan.
+//! `rskim-search` is the pattern catalog, read in exactly one place:
+//! [`catalog_patterns`], which projects each entry to its name, `exact` flag
+//! and example snippet, never its n-gram tables. The oracle uses the NAMES,
+//! so a catalog pattern with no oracle query is listed as uncovered instead
+//! of silently skipped. Where the oracle must agree with skim (the extension
+//! table, the AST-indexed language list, the size cap) it keeps its OWN copy
+//! with a citation, so a policy change on skim's side shows up as a
+//! scoreboard diff (the `oracle.rs` / `universe.rs` convention). The unit
+//! tests enforce this with a source scan of the whole structural scoring
+//! path: this file, `structural_metrics.rs`, and every in-crate module they
+//! import, transitively.
 //!
 //! # Ground truth
 //!
@@ -674,6 +678,35 @@ fn class_fingerprint(class: LangClass) -> String {
     }
 }
 
+// ============================================================================
+// Skim's pattern catalog (the one input taken from skim)
+// ============================================================================
+
+/// One entry of skim's pattern catalog, as the scoreboard may see it. The
+/// n-gram tables that encode how skim matches the pattern are left out, so
+/// no oracle answer or score can depend on them (AC-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogPattern {
+    /// The `--ast` pattern name.
+    pub name: &'static str,
+    /// skim's `exact` flag, from which `golden-gen` proposes an entry's
+    /// precision class. No oracle answer or score reads it.
+    pub exact: bool,
+    /// The catalog's example snippet, which the oracle's fixture tests match.
+    pub example: &'static str,
+}
+
+/// skim's pattern catalog projected to [`CatalogPattern`], in catalog order:
+/// the scoreboard's only read of `rskim_search::all_patterns`. The
+/// independence test pins this body.
+pub fn catalog_patterns() -> impl Iterator<Item = CatalogPattern> {
+    rskim_search::all_patterns().iter().map(|p| CatalogPattern {
+        name: p.name,
+        exact: p.exact,
+        example: p.example,
+    })
+}
+
 /// Whether the oracle covers a catalog pattern, and why not if it does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternCoverage {
@@ -689,11 +722,10 @@ pub enum PatternCoverage {
     },
 }
 
-/// Coverage of every pattern in skim's catalog (`rskim_search::all_patterns`
-/// — the oracle's only use of skim's AST code), keyed by pattern name.
+/// Coverage of every pattern in skim's catalog ([`catalog_patterns`]), keyed
+/// by pattern name.
 pub fn catalog_coverage() -> BTreeMap<&'static str, PatternCoverage> {
-    rskim_search::all_patterns()
-        .iter()
+    catalog_patterns()
         .map(|p| (p.name, coverage_of(p.name)))
         .collect()
 }

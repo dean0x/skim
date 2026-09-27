@@ -1,6 +1,6 @@
 //! Unit tests for `structural.rs` (co-located file, `#[path]`-included).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use super::*;
@@ -16,8 +16,7 @@ const TS_FAMILY: [OracleLang; 3] = [
 ];
 
 fn catalog_example(pattern: &str) -> &'static str {
-    rskim_search::all_patterns()
-        .iter()
+    catalog_patterns()
         .find(|p| p.name == pattern)
         .map(|p| p.example)
         .unwrap_or_else(|| panic!("{pattern} is not a catalog pattern"))
@@ -106,10 +105,7 @@ fn query_sources_are_ordered_by_pattern_then_language_name() {
 
 #[test]
 fn every_catalog_pattern_is_covered_or_uncovered_with_a_reason() {
-    let catalog: BTreeSet<&str> = rskim_search::all_patterns()
-        .iter()
-        .map(|p| p.name)
-        .collect();
+    let catalog: BTreeSet<&str> = catalog_patterns().map(|p| p.name).collect();
     let coverage = catalog_coverage();
     assert_eq!(coverage.keys().copied().collect::<BTreeSet<_>>(), catalog);
 
@@ -173,7 +169,7 @@ fn uncovered_patterns_are_the_three_that_cannot_be_encoded() {
 /// Where a query's positive fixture comes from.
 #[derive(Clone, Copy)]
 enum Positive {
-    /// The pattern's catalog `example`, verbatim (via `all_patterns()`).
+    /// The pattern's catalog `example`, verbatim (via [`catalog_patterns`]).
     Catalog,
     /// A hand fixture mirroring the catalog example, for a language the
     /// example is not written in.
@@ -1033,98 +1029,639 @@ fn any_attribute_kind_edit_changes_the_fingerprint() {
 // ============================================================================
 // AC-3: independence from skim's AST search internals
 // ============================================================================
+//
+// A source scan over the structural scoring path: `structural.rs`,
+// `structural_metrics.rs`, and every in-crate module they reach through a
+// path, transitively. The set is computed from the sources at test time, so
+// a new import widens the scan by itself. Skim's pattern catalog is read in
+// exactly one place, `catalog_patterns`, whose body is pinned below: no other
+// catalog field (the n-gram tables above all) can reach the scoreboard.
 
-/// `structural.rs` with every `//` comment removed (string literals kept, so
-/// a `//` inside a string is not mistaken for a comment). Block comments are
-/// kept as code, which can only make the check stricter.
-fn strip_line_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut chars = src.chars().peekable();
-    let mut in_string = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if c == '\\' {
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            } else if c == '"' {
-                in_string = false;
+/// Where the scanned sources come from: the crate's `src/`, or an in-memory
+/// tree in the scanner's own tests. Paths are relative to `src/`.
+trait Sources {
+    fn exists(&self, rel: &str) -> bool;
+    fn read(&self, rel: &str) -> String;
+}
+
+/// `crates/rskim-bench/src/` on disk. Existence is looked up in the directory
+/// listing, not with `is_file`, so it is exact about case on a
+/// case-insensitive file system (where `Baseline.rs` would find `baseline.rs`).
+struct CrateSources {
+    files: BTreeSet<String>,
+}
+
+impl CrateSources {
+    fn new() -> Self {
+        Self {
+            files: crate_source_files().into_iter().collect(),
+        }
+    }
+}
+
+fn src_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+impl Sources for CrateSources {
+    fn exists(&self, rel: &str) -> bool {
+        self.files.contains(rel)
+    }
+
+    fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(src_dir().join(rel))
+            .unwrap_or_else(|e| panic!("reading src/{rel}: {e}"))
+    }
+}
+
+impl Sources for BTreeMap<&str, &str> {
+    fn exists(&self, rel: &str) -> bool {
+        self.contains_key(rel)
+    }
+
+    fn read(&self, rel: &str) -> String {
+        self.get(rel)
+            .map(|src| (*src).to_owned())
+            .unwrap_or_else(|| panic!("no source {rel}"))
+    }
+}
+
+/// Every `.rs` file under `src/`, relative to it, sorted.
+fn crate_source_files() -> Vec<String> {
+    /// Far above the crate's size: the walk stays bounded regardless.
+    const MAX_FILES: usize = 1024;
+    let root = src_dir();
+    let mut dirs = vec![root.clone()];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let rel = path.strip_prefix(&root).unwrap();
+                files.push(rel.to_string_lossy().replace('\\', "/"));
             }
-        } else if c == '/' && chars.peek() == Some(&'/') {
-            for skipped in chars.by_ref() {
-                if skipped == '\n' {
-                    out.push('\n');
-                    break;
-                }
-            }
+        }
+        assert!(files.len() + dirs.len() < MAX_FILES, "src/ walk runaway");
+    }
+    files.sort();
+    files
+}
+
+// ---------------------------------------------------------------------------
+// Lexing: comments out, literals kept or blanked
+// ---------------------------------------------------------------------------
+
+/// A source file with its comments removed, in two views.
+struct CodeViews {
+    /// String and char literals kept verbatim: what the forbidden-word scan
+    /// reads, so a `#[path]` or `include!` naming skim's sources is caught.
+    literal: String,
+    /// Every literal replaced by `""`: what the identifier scans read, so a
+    /// name inside a message or a test fixture is not a reference.
+    bare: String,
+}
+
+fn is_ident_char(c: char) -> bool {
+    c == '_' || c.is_alphanumeric()
+}
+
+/// Splits Rust source into [`CodeViews`]: line and (nested) block comments
+/// removed; plain, byte, C and raw strings (any `#` count) and char literals
+/// recognised, lifetimes and labels (`'a`) left as code.
+fn code_views(src: &str) -> CodeViews {
+    let s: Vec<char> = src.chars().collect();
+    let mut views = CodeViews {
+        literal: String::with_capacity(src.len()),
+        bare: String::with_capacity(src.len()),
+    };
+    let mut i = 0;
+    while i < s.len() {
+        let next = s.get(i + 1).copied();
+        if s[i] == '/' && next == Some('/') {
+            // A line comment ends at (and keeps) its newline.
+            i = s[i..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(s.len(), |n| i + n);
+        } else if s[i] == '/' && next == Some('*') {
+            i = block_comment_end(&s, i);
+            views.literal.push(' ');
+            views.bare.push(' ');
+        } else if let Some(end) = literal_end(&s, i) {
+            views.literal.extend(&s[i..end]);
+            views.bare.push_str("\"\"");
+            i = end;
         } else {
-            out.push(c);
-            in_string = c == '"';
+            views.literal.push(s[i]);
+            views.bare.push(s[i]);
+            i += 1;
+        }
+    }
+    views
+}
+
+/// The index just past the block comment opening at `start`, nesting
+/// counted; the end of the source if it is unterminated.
+fn block_comment_end(s: &[char], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < s.len() {
+        match (s[i], s.get(i + 1).copied()) {
+            ('/', Some('*')) => {
+                depth += 1;
+                i += 2;
+            }
+            ('*', Some('/')) => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    s.len()
+}
+
+/// The index just past the string or char literal starting at `start`, if
+/// one does: `"…"`, `b"…"`, `c"…"`, `r#"…"#`, `br"…"`, `'x'`, `'\n'`,
+/// `b'x'`. A lifetime or label (`'a`) and a raw identifier (`r#name`) are
+/// not literals.
+fn literal_end(s: &[char], start: usize) -> Option<usize> {
+    let at = |k: usize| s.get(k).copied();
+    let mut i = start;
+    if matches!(at(i), Some('b' | 'c' | 'r')) {
+        if start > 0 && is_ident_char(s[start - 1]) {
+            return None; // inside an identifier
+        }
+        if matches!(at(i), Some('b' | 'c')) && matches!(at(i + 1), Some('"' | '\'' | 'r')) {
+            i += 1;
+        }
+        if at(i) == Some('r') {
+            let hashes = s[i + 1..].iter().take_while(|&&c| c == '#').count();
+            if at(i + 1 + hashes) != Some('"') {
+                return None; // an identifier, or a raw identifier
+            }
+            let close = (i + 2 + hashes..s.len())
+                .find(|&k| s[k] == '"' && (1..=hashes).all(|h| at(k + h) == Some('#')));
+            return Some(close.map_or(s.len(), |k| k + 1 + hashes));
+        }
+    }
+    match at(i) {
+        Some('"') => {
+            let mut k = i + 1;
+            while k < s.len() {
+                match s[k] {
+                    '\\' => k += 2,
+                    '"' => return Some(k + 1),
+                    _ => k += 1,
+                }
+            }
+            Some(s.len())
+        }
+        Some('\'') => match (at(i + 1), at(i + 2)) {
+            (Some('\\'), _) => {
+                // An escape: `'\n'`, `'\''`, `'\u{1F600}'`.
+                let close = (i + 3..s.len()).find(|&k| s[k] == '\'');
+                Some(close.map_or(s.len(), |k| k + 1))
+            }
+            (Some(c), Some('\'')) if c != '\'' => Some(i + 3),
+            _ => None, // a lifetime or a label
+        },
+        _ => None,
+    }
+}
+
+/// A token of [`CodeViews::bare`]: an identifier (or number), `::`, or any
+/// other non-space character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    Ident(String),
+    PathSep,
+    Punct(char),
+}
+
+fn tokens(code: &str) -> Vec<Tok> {
+    let s: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        if is_ident_char(s[i]) {
+            let len = s[i..].iter().take_while(|&&c| is_ident_char(c)).count();
+            out.push(Tok::Ident(s[i..i + len].iter().collect()));
+            i += len;
+        } else if s[i] == ':' && s.get(i + 1) == Some(&':') {
+            out.push(Tok::PathSep);
+            i += 2;
+        } else {
+            if !s[i].is_whitespace() {
+                out.push(Tok::Punct(s[i]));
+            }
+            i += 1;
         }
     }
     out
 }
 
-/// The oracle's only permitted `rskim_search` item.
-const ALLOWED_RSKIM_SEARCH_ITEMS: &[&str] = &["all_patterns"];
+fn has_ident(toks: &[Tok], name: &str) -> bool {
+    toks.iter()
+        .any(|tok| matches!(tok, Tok::Ident(ident) if ident == name))
+}
 
-/// Every independence violation in `src`'s code (comments excluded).
-fn independence_violations(src: &str) -> Vec<String> {
-    let code = strip_line_comments(src);
-    let mut violations: Vec<String> = ["ast_index", "compound", "linearize", "rskim_core"]
-        .iter()
-        .filter(|word| code.contains(*word))
-        .map(|word| format!("code mentions `{word}`"))
+// ---------------------------------------------------------------------------
+// The scan set: the import closure of the structural scoring path
+// ---------------------------------------------------------------------------
+
+/// Every path in `toks`, `use` groups expanded: `a::{b, c::{self, d}}`
+/// yields `a::b`, `a::c::self` and `a::c::d`; a glob `a::*` yields `a::*`.
+fn paths(toks: &[Tok]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let starts = matches!(toks[i], Tok::Ident(_)) && (i == 0 || toks[i - 1] != Tok::PathSep);
+        i = if starts {
+            path_tree(toks, i, &[], &mut out)
+        } else {
+            i + 1
+        };
+    }
+    out
+}
+
+/// Parses the path starting at `toks[i]` (an identifier, `*` or `{`) under
+/// `prefix` into `out`; returns the index after it.
+fn path_tree(toks: &[Tok], mut i: usize, prefix: &[String], out: &mut Vec<Vec<String>>) -> usize {
+    let mut path = prefix.to_vec();
+    loop {
+        match toks.get(i) {
+            Some(Tok::Ident(name)) => path.push(name.clone()),
+            Some(Tok::Punct('*')) => {
+                path.push("*".to_owned());
+                out.push(path);
+                return i + 1;
+            }
+            Some(Tok::Punct('{')) => return path_group(toks, i + 1, &path, out),
+            _ => {
+                out.push(path);
+                return i;
+            }
+        }
+        if toks.get(i + 1) != Some(&Tok::PathSep) {
+            out.push(path);
+            return i + 1;
+        }
+        i += 2;
+    }
+}
+
+/// Parses the members of the `{…}` group whose first member is `toks[i]`;
+/// returns the index after its `}`.
+fn path_group(toks: &[Tok], mut i: usize, prefix: &[String], out: &mut Vec<Vec<String>>) -> usize {
+    while let Some(tok) = toks.get(i) {
+        i = match tok {
+            Tok::Punct('}') => return i + 1,
+            Tok::Ident(kw) if kw == "as" => i + 2, // `as alias`
+            Tok::Ident(_) | Tok::Punct('*' | '{') => path_tree(toks, i, prefix, out),
+            _ => i + 1,
+        };
+    }
+    i
+}
+
+/// The module a source file defines: `scoreboard/golden.rs` →
+/// `[scoreboard, golden]`, `scoreboard/mod.rs` → `[scoreboard]`, `lib.rs` →
+/// the crate root `[]`.
+fn module_of(rel: &str) -> Vec<String> {
+    let mut module: Vec<String> = rel
+        .trim_end_matches(".rs")
+        .split('/')
+        .map(str::to_owned)
         .collect();
-    for (at, _) in code.match_indices("rskim_search") {
-        let rest = &code[at + "rskim_search".len()..];
+    if module.last().is_some_and(|m| m == "mod") || module == ["lib"] {
+        module.pop();
+    }
+    module
+}
+
+fn is_module_root(rel: &str) -> bool {
+    rel == "lib.rs" || rel.ends_with("/mod.rs")
+}
+
+/// The source file of `module`, if the crate has one.
+fn module_file(sources: &dyn Sources, module: &[String]) -> Option<String> {
+    if module.is_empty() {
+        return Some("lib.rs".to_owned()).filter(|f| sources.exists(f));
+    }
+    let base = module.join("/");
+    [format!("{base}.rs"), format!("{base}/mod.rs")]
+        .into_iter()
+        .find(|f| sources.exists(f))
+}
+
+/// The in-crate source file that `path`, written in a file of `module`,
+/// reaches: the deepest module along it. Conservative wherever exact Rust
+/// scoping would need name resolution: `super` is the file's parent module
+/// (inside an inline `mod tests` it is really the file itself, which is
+/// scanned anyway), and a relative path whose first segment names a child of
+/// this module or of its parent counts, as a `use` may have imported it.
+fn resolve(sources: &dyn Sources, module: &[String], path: &[String]) -> Option<String> {
+    let first = path.first()?.as_str();
+    let supers = path.iter().take_while(|s| *s == "super").count();
+    let (mut at, rest): (Vec<String>, &[String]) = match first {
+        "crate" => (Vec::new(), &path[1..]),
+        "self" => (module.to_vec(), &path[1..]),
+        "super" => (
+            module[..module.len().saturating_sub(supers)].to_vec(),
+            &path[supers..],
+        ),
+        _ if path.len() < 2 => return None,
+        _ => {
+            let parent = &module[..module.len().saturating_sub(1)];
+            let base = [module, parent].into_iter().find(|base| {
+                module_file(sources, &[base.to_vec(), vec![first.to_owned()]].concat()).is_some()
+            })?;
+            (base.to_vec(), path)
+        }
+    };
+    for segment in rest {
+        match segment.as_str() {
+            "self" => {}
+            "*" => break,
+            name => {
+                let next = [at.clone(), vec![name.to_owned()]].concat();
+                if module_file(sources, &next).is_none() {
+                    break;
+                }
+                at = next;
+            }
+        }
+    }
+    module_file(sources, &at)
+}
+
+/// Where the structural scoring path starts: the oracle and the scoring.
+const SCAN_ROOTS: &[&str] = &[
+    "scoreboard/structural.rs",
+    "scoreboard/structural_metrics.rs",
+];
+
+/// `roots` and every in-crate source file they reach through a path,
+/// transitively, keyed by path relative to `src/`. Out-of-line child modules
+/// are not followed: [`independence_violations`] admits only `#[cfg(test)]`
+/// ones.
+fn scan_set(sources: &dyn Sources, roots: &[&str]) -> BTreeMap<String, String> {
+    /// Far above the crate's module count: the walk stays bounded regardless.
+    const MAX_SCANNED: usize = 256;
+    let mut scanned = BTreeMap::new();
+    let mut pending: Vec<String> = roots.iter().map(|r| (*r).to_owned()).collect();
+    while let Some(rel) = pending.pop() {
+        if scanned.contains_key(&rel) {
+            continue;
+        }
+        assert!(scanned.len() < MAX_SCANNED, "scan set runaway at {rel}");
+        let src = sources.read(&rel);
+        let module = module_of(&rel);
+        pending.extend(
+            paths(&tokens(&code_views(&src).bare))
+                .iter()
+                .filter_map(|path| resolve(sources, &module, path))
+                .filter(|dep| !scanned.contains_key(dep)),
+        );
+        scanned.insert(rel, src);
+    }
+    scanned
+}
+
+// ---------------------------------------------------------------------------
+// The rules
+// ---------------------------------------------------------------------------
+
+/// Names of skim's AST search stack (and its core crate): forbidden anywhere
+/// in a scanned file's code or literals.
+const FORBIDDEN_WORDS: &[&str] = &["ast_index", "compound", "linearize", "rskim_core"];
+
+/// Catalog `Pattern` members that encode how skim matches a pattern (its
+/// n-gram tables and their resolvers) or reach `rskim_core` (the example's
+/// language): never named on the scoring path.
+const CATALOG_INTERNALS: &[&str] = &[
+    "bigrams",
+    "trigrams",
+    "resolved_bigrams",
+    "resolved_trigrams",
+    "example_lang",
+];
+
+/// The `rskim_search` items the oracle may name: the catalog, read in
+/// `catalog_patterns` only.
+const ORACLE_SKIM_ITEMS: &[&str] = &["all_patterns"];
+
+/// The `rskim_search` items the rest of the scoring path may name, too:
+/// `FileId`, the plain `u32` id the crate's rank helpers (`crate::metrics`)
+/// take.
+const SCORING_PATH_SKIM_ITEMS: &[&str] = &["all_patterns", "FileId"];
+
+/// Skim's pattern-catalog entry points other than `all_patterns`: never
+/// named in the crate.
+const OTHER_CATALOG_ENTRY_POINTS: &[&str] =
+    &["lookup_pattern", "parse_ast_query", "pattern_to_query_set"];
+
+/// The one read of skim's pattern catalog, verbatim up to whitespace. It
+/// projects each entry to the facts the scoreboard may use; exposing another
+/// catalog field means editing this pin, a deliberate and reviewed change.
+const CATALOG_ACCESSOR: &str = "
+fn catalog_patterns() -> impl Iterator<Item = CatalogPattern> {
+    rskim_search::all_patterns().iter().map(|p| CatalogPattern {
+        name: p.name,
+        exact: p.exact,
+        example: p.example,
+    })
+}";
+
+/// Out-of-line child modules (`mod name;`) that are not `#[cfg(test)]`: code
+/// of this module in a file the scan does not read.
+fn untested_child_modules(bare: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (at, _) in bare.match_indices("mod") {
+        let after = &bare[at + "mod".len()..];
+        let name: String = after
+            .trim_start()
+            .chars()
+            .take_while(|&c| is_ident_char(c))
+            .collect();
+        let is_declaration = bare[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c))
+            && after.starts_with(char::is_whitespace)
+            && !name.is_empty()
+            && after.trim_start()[name.len()..]
+                .trim_start()
+                .starts_with(';');
+        if !is_declaration {
+            continue;
+        }
+        let item_start = bare[..at].rfind([';', '{', '}']).map_or(0, |p| p + 1);
+        let attributes: String = bare[item_start..at]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if !attributes.contains("#[cfg(test)]") {
+            found.push(name);
+        }
+    }
+    found
+}
+
+/// Every independence violation in the file `rel` (source `src`), naming
+/// only the `allowed` `rskim_search` items.
+fn independence_violations(rel: &str, src: &str, allowed: &[&str]) -> Vec<String> {
+    let views = code_views(src);
+    let mut violations: Vec<String> = FORBIDDEN_WORDS
+        .iter()
+        .filter(|word| views.literal.contains(**word))
+        .map(|word| format!("{rel}: mentions `{word}`"))
+        .collect();
+    for (at, _) in views.literal.match_indices("rskim_search") {
+        let rest = &views.literal[at + "rskim_search".len()..];
         let item: String = rest
             .strip_prefix("::")
-            .map(|r| {
-                r.chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect()
-            })
+            .map(|r| r.chars().take_while(|&c| is_ident_char(c)).collect())
             .unwrap_or_default();
-        if !ALLOWED_RSKIM_SEARCH_ITEMS.contains(&item.as_str()) {
+        if !allowed.contains(&item.as_str()) {
             let context: String = rest.chars().take(40).collect();
-            violations.push(format!("disallowed use `rskim_search{context}`"));
+            violations.push(format!("{rel}: names `rskim_search{context}`"));
         }
+    }
+    let toks = tokens(&views.bare);
+    violations.extend(
+        CATALOG_INTERNALS
+            .iter()
+            .filter(|member| has_ident(&toks, member))
+            .map(|member| format!("{rel}: reads catalog member `{member}`")),
+    );
+    if !is_module_root(rel) {
+        violations.extend(
+            untested_child_modules(&views.bare)
+                .into_iter()
+                .map(|name| format!("{rel}: declares module `{name}` the scan cannot see")),
+        );
     }
     violations
 }
 
+/// `src` with all whitespace removed: a layout-independent comparison.
+fn squash(src: &str) -> String {
+    src.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The item `fn <name>(…) … { … }` in `bare`, through its closing brace.
+fn fn_item<'a>(bare: &'a str, name: &str) -> Option<&'a str> {
+    let start = bare.find(&format!("fn {name}("))?;
+    let open = start + bare[start..].find('{')?;
+    let mut depth = 0usize;
+    for (k, c) in bare[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&bare[start..=open + k]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[test]
 fn oracle_uses_only_pattern_names_from_skim() {
-    let src = include_str!("structural.rs");
-    assert_eq!(independence_violations(src), Vec::<String>::new());
+    let rel = "scoreboard/structural.rs";
+    let src = CrateSources::new().read(rel);
+    assert_eq!(
+        independence_violations(rel, &src, ORACLE_SKIM_ITEMS),
+        Vec::<String>::new()
+    );
     // The check is not vacuous: the oracle does name the catalog.
-    assert!(strip_line_comments(src).contains("rskim_search::all_patterns()"));
+    assert!(
+        code_views(&src)
+            .bare
+            .contains("rskim_search::all_patterns()")
+    );
 }
 
 #[test]
-fn the_structural_scoring_module_is_independent_too() {
-    // structural_metrics.rs turns the oracle's answers and skim's rows into
-    // the structural checks: the same rule applies to it.
-    let src = include_str!("structural_metrics.rs");
-    assert_eq!(independence_violations(src), Vec::<String>::new());
-    assert!(strip_line_comments(src).contains("StructuralOracle"));
-}
-
-#[test]
-fn the_modules_the_structural_scoring_imports_are_independent_too() {
-    // structural_metrics.rs imports these; a re-export of skim's AST code
-    // from one of them would reach the scoring path without either file
-    // above naming it.
-    for (name, src) in [
-        ("golden.rs", include_str!("golden.rs")),
-        ("metrics.rs", include_str!("metrics.rs")),
-        ("report.rs", include_str!("report.rs")),
-        ("types.rs", include_str!("types.rs")),
+fn the_structural_scoring_path_is_independent() {
+    let scanned = scan_set(&CrateSources::new(), SCAN_ROOTS);
+    // Not vacuous: the walk reaches what the scoring imports, and what those
+    // modules import in turn (a re-export in any of them would reach the
+    // scoring path without the two roots naming it).
+    for rel in [
+        "scoreboard/golden.rs",
+        "scoreboard/metrics.rs",
+        "scoreboard/report.rs",
+        "scoreboard/types.rs",
+        "scoreboard/oracle.rs",
+        "scoreboard/runner.rs",
+        "scoreboard/universe.rs",
+        "scoreboard/baseline.rs",
+        "scoreboard/mod.rs",
+        "metrics.rs",
     ] {
-        assert_eq!(independence_violations(src), Vec::<String>::new(), "{name}");
+        assert!(
+            scanned.contains_key(rel),
+            "{rel} is on the scoring path; scanned: {:?}",
+            scanned.keys()
+        );
     }
+    let violations: Vec<String> = scanned
+        .iter()
+        .flat_map(|(rel, src)| independence_violations(rel, src, SCORING_PATH_SKIM_ITEMS))
+        .collect();
+    assert_eq!(violations, Vec::<String>::new());
+}
+
+#[test]
+fn skims_pattern_catalog_is_read_in_exactly_one_place() {
+    let sources = CrateSources::new();
+    let mut reads = Vec::new();
+    for rel in &sources.files {
+        let toks = tokens(&code_views(&sources.read(rel)).bare);
+        for name in std::iter::once(&"all_patterns").chain(OTHER_CATALOG_ENTRY_POINTS) {
+            if has_ident(&toks, name) {
+                reads.push(format!("{rel}: {name}"));
+            }
+        }
+    }
+    assert_eq!(
+        reads,
+        ["scoreboard/structural.rs: all_patterns"],
+        "skim's pattern catalog is read through `structural::catalog_patterns` only"
+    );
+    let rel = "scoreboard/structural.rs";
+    let bare = code_views(&sources.read(rel)).bare;
+    let catalog_calls = tokens(&bare)
+        .iter()
+        .filter(|tok| matches!(tok, Tok::Ident(name) if name == "all_patterns"))
+        .count();
+    assert_eq!(catalog_calls, 1, "{rel} names `all_patterns` once");
+    let accessor = fn_item(&bare, "catalog_patterns").expect("`catalog_patterns` exists");
+    assert!(
+        has_ident(&tokens(accessor), "all_patterns"),
+        "the one read is `catalog_patterns`"
+    );
+    assert_eq!(
+        squash(accessor),
+        squash(CATALOG_ACCESSOR),
+        "`catalog_patterns` projects the catalog to name / exact / example only"
+    );
 }
 
 #[test]
@@ -1136,20 +1673,129 @@ fn independence_check_catches_imports_and_ignores_comments() {
         "use rskim_search as rs;",
         "let l = rskim_core::Language::Rust;",
         "use crate::x; let s = \"//\"; linearize(s);",
+        // TP-5: an allowed catalog read that goes on to skim's n-gram tables.
+        "pub fn probe() -> usize { rskim_search::all_patterns().iter()\
+         .map(|p| p.bigrams.len() + p.trigrams.len()).sum() }",
+        "let n = pattern.resolved_trigrams().len();",
+        "let lang = p.example_lang;",
+        // Literals that would hide code from a naive scanner.
+        "let c = '\"'; let n = p.bigrams.len(); let d = '\"';",
+        "let s = r#\"say \"hi\" // not a comment\"#; let n = p.trigrams.len();",
+        "fn f<'a>(p: &'a P) -> usize { p.bigrams.len() }",
+        // A child module is code the scan cannot see; a path attribute
+        // naming skim's sources is caught through its literal.
+        "mod helpers;",
+        "pub(crate) mod helpers ;",
+        "#[cfg(test)] #[path = \"../../../rskim-search/src/ast_index/patterns.rs\"] mod p;",
     ];
-    for line in bad {
-        assert!(!independence_violations(line).is_empty(), "{line}");
+    for code in bad {
+        assert!(
+            !independence_violations("scoreboard/x.rs", code, SCORING_PATH_SKIM_ITEMS).is_empty(),
+            "{code}"
+        );
     }
     let fine = [
         "// cites crates/rskim-search/src/ast_index/linearize.rs:119-134",
         "/// see compound/reparse.rs and rskim_core::ast_size_limit",
         "let names = rskim_search::all_patterns(); // not ast_index",
+        "/* p.bigrams /* nested */ p.trigrams */ let n = 1;",
+        "let msg = \"p.bigrams and p.trigrams are skim's\";",
+        "let s = r#\"p.bigrams\"#; let t = b\"trigrams\"; let u = b'x';",
+        "let bigram_count = 2; let modules = 1; mod inline { }",
+        "#[cfg(test)]\n#[allow(clippy::unwrap_used)] // test code\n#[path = \"x_tests.rs\"]\nmod tests;",
+        "use crate::metrics::mrr; let id = rskim_search::FileId(1);",
     ];
-    for line in fine {
+    for code in fine {
         assert_eq!(
-            independence_violations(line),
+            independence_violations("scoreboard/x.rs", code, SCORING_PATH_SKIM_ITEMS),
             Vec::<String>::new(),
-            "{line}"
+            "{code}"
         );
     }
+    // The oracle itself names nothing from skim but the catalog.
+    assert!(
+        !independence_violations("x.rs", "rskim_search::FileId(1)", ORACLE_SKIM_ITEMS).is_empty()
+    );
+    // A module root declares the module tree; its `mod` items are not scanned code.
+    assert_eq!(
+        independence_violations(
+            "scoreboard/mod.rs",
+            "pub mod golden_gen;",
+            ORACLE_SKIM_ITEMS
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn paths_expand_use_groups_and_skip_comments_and_literals() {
+    let code = code_views(
+        "use crate::scoreboard::{golden::{self, G}, metrics as m, *};\n\
+         let x = a::B::<T>::new(); // c::D\n\
+         let s = \"e::F\";",
+    );
+    let got = paths(&tokens(&code.bare));
+    for want in [
+        &["crate", "scoreboard", "golden", "self"][..],
+        &["crate", "scoreboard", "golden", "G"][..],
+        &["crate", "scoreboard", "metrics"][..],
+        &["crate", "scoreboard", "*"][..],
+        &["a", "B"][..],
+    ] {
+        assert!(got.iter().any(|p| p == want), "{want:?} in {got:?}");
+    }
+    for absent in ["c", "e", "m", "as"] {
+        assert!(
+            got.iter().all(|p| p.len() < 2 || p[0] != absent),
+            "{absent} in {got:?}"
+        );
+    }
+}
+
+#[test]
+fn the_scan_follows_every_in_crate_path_transitively() {
+    let tree: BTreeMap<&str, &str> = BTreeMap::from([
+        ("lib.rs", "pub mod metrics;\npub mod scoreboard;\n"),
+        ("metrics.rs", "pub fn mrr() {}\n"),
+        (
+            "scoreboard/mod.rs",
+            "pub mod a;\npub mod b;\npub mod c;\npub mod d;\npub mod e;\n\
+             pub const MAX: u32 = 1;\n",
+        ),
+        (
+            "scoreboard/a.rs",
+            "use crate::scoreboard::{b::{self, B}, MAX};\n\
+             // crate::scoreboard::e::E\n\
+             fn g() -> &'static str { crate::metrics::mrr(); \"crate::scoreboard::e\" }\n\
+             #[cfg(test)]\nmod tests {\n    use super::*;\n}\n",
+        ),
+        ("scoreboard/b.rs", "use super::c::C;\n"),
+        ("scoreboard/c.rs", "pub fn f() { d::x(); }\n"),
+        (
+            "scoreboard/d.rs",
+            "pub use rskim_search::lookup_pattern as x;\n",
+        ),
+        ("scoreboard/e.rs", "unreached\n"),
+    ]);
+    let scanned = scan_set(&tree, &["scoreboard/a.rs"]);
+    assert_eq!(
+        scanned.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "metrics.rs",
+            "scoreboard/a.rs",
+            "scoreboard/b.rs",
+            "scoreboard/c.rs",
+            "scoreboard/d.rs",
+            "scoreboard/mod.rs",
+        ]
+    );
+    // The re-export two imports away is on the scanned path, and caught.
+    assert_eq!(
+        independence_violations(
+            "scoreboard/d.rs",
+            &scanned["scoreboard/d.rs"],
+            SCORING_PATH_SKIM_ITEMS
+        ),
+        ["scoreboard/d.rs: names `rskim_search::lookup_pattern as x;\n`"]
+    );
 }

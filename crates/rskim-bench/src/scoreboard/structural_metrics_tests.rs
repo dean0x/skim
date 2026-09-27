@@ -272,10 +272,7 @@ fn every_row_of_a_pattern_with_no_entry_is_unscored_even_in_an_oracle_language()
 #[test]
 fn skim_is_called_for_every_catalog_pattern_covered_or_not() {
     let called = called_patterns();
-    let catalog: BTreeSet<&str> = rskim_search::all_patterns()
-        .iter()
-        .map(|p| p.name)
-        .collect();
+    let catalog: BTreeSet<&str> = structural::catalog_patterns().map(|p| p.name).collect();
     assert_eq!(called.iter().copied().collect::<BTreeSet<_>>(), catalog);
     assert_eq!(called.len(), catalog.len(), "each pattern once");
     assert!(called.windows(2).all(|w| w[0] < w[1]), "sorted: {called:?}");
@@ -624,7 +621,7 @@ fn uncovered_patterns_list_the_oracle_gaps_and_the_patterns_no_corpus_scores() {
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "sorted by name");
-    assert_eq!(names.len(), rskim_search::all_patterns().len());
+    assert_eq!(names.len(), structural::catalog_patterns().count());
     let cause = |list: &[UncoveredPattern], name: &str| {
         list.iter().find(|p| p.name == name).map(|p| p.cause)
     };
