@@ -544,7 +544,7 @@ pub fn require_oracle_less_rows(
 /// # Errors
 ///
 /// Some `[[ast]]` entry is vacuous: a golden-integrity error
-/// ([`integrity_failure`]) with one `<id>: <reason>` line per entry, then
+/// (`integrity_failure`) with one `<id>: <reason>` line per entry, then
 /// the remediation. Also `observations` that do not follow `plan`
 /// ([`metrics::paired`]), or an entry the oracle has no query for
 /// (integrity rejects that first).
@@ -600,7 +600,7 @@ pub fn require_non_vacuous_structural(
 /// # Errors
 ///
 /// Some flagged entry's oracle matches a file: a golden-integrity error
-/// ([`integrity_failure`]) with one `<id>: <reason>` line per entry (naming
+/// (`integrity_failure`) with one `<id>: <reason>` line per entry (naming
 /// a matched file), then the remediation. Also an entry the oracle has no
 /// query for (integrity rejects that first).
 pub fn require_expected_empty_oracles(

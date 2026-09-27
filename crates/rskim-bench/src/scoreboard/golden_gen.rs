@@ -375,7 +375,7 @@ pub fn unscored_after<'s>(
 
 /// TOML comment lines reporting [`unscored_after`] to the reviewer: each
 /// pattern's count and a sample of `path:line` rows, or `none`. A row path
-/// is skim's output, so it is escaped ([`comment_safe`]) and can neither end
+/// is skim's output, so it is escaped (`comment_safe`) and can neither end
 /// its comment line nor reach the terminal as a control sequence.
 pub fn render_unscored_comment(unscored: &[(&str, Vec<&ResultRow>)]) -> String {
     if unscored.is_empty() {

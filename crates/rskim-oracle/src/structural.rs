@@ -35,7 +35,7 @@
 //!
 //! Every query names one `@match` capture; the match line is the first
 //! (1-based) line of that node. Four patterns (six queries) carry a small
-//! post-filter ([`PostFilter`]) because their catalog description states a count
+//! post-filter (`PostFilter`) because their catalog description states a count
 //! (`empty-catch`, `empty-function`: zero body elements; `god-function`:
 //! at least 20; `excessive-params`: at least 5 parameters).
 //!
@@ -47,7 +47,7 @@
 //! [`StructuralOracle::file_matches`] parses a file once and answers every
 //! pattern of its language; the parser and query cursor come from an
 //! [`OracleScratch`] the caller keeps per worker thread. A query that needs
-//! more in-progress matches than [`ORACLE_MATCH_LIMIT`] is an error, never a
+//! more in-progress matches than `ORACLE_MATCH_LIMIT` is an error, never a
 //! partial answer.
 //!
 //! # Parse errors
@@ -364,7 +364,7 @@ fn within_size_cap(len: u64) -> bool {
 
 /// How many of `files` (`(path, byte length)`) skim excludes from the AST
 /// index by size: files whose language takes part in the size-cap accounting
-/// ([`LangClass::counts_toward_size_cap`]) and whose length exceeds the cap.
+/// (`LangClass::counts_toward_size_cap`) and whose length exceeds the cap.
 /// This is the number skim reports as `ast_coverage.size_excluded_files`.
 pub fn over_cap_count<'a>(files: impl IntoIterator<Item = (&'a str, u64)>) -> u64 {
     let over = files
@@ -638,7 +638,7 @@ const ORACLE_INPUTS: OracleInputs<'static> = OracleInputs {
 /// A canonical rendering of every table the oracle's answers depend on: the
 /// size cap; the extension table ([`classify`]: every row's extensions and
 /// class, in table order, and the class of an unknown extension); the
-/// attribute kinds [`PostFilter`]'s body-element count skips; every
+/// attribute kinds `PostFilter`'s body-element count skips; every
 /// registered query (file name, post-filter, full text), ordered by pattern
 /// and language name; and every intent spec. Each is written out explicitly
 /// (never through `Debug`), so the text is stable across toolchains. The
@@ -871,7 +871,7 @@ pub struct OracleScratch {
 
 impl OracleScratch {
     /// A fresh parser, and a query cursor limited to
-    /// [`ORACLE_MATCH_LIMIT`] in-progress matches.
+    /// `ORACLE_MATCH_LIMIT` in-progress matches.
     pub fn new() -> Self {
         Self::limited(ORACLE_MATCH_LIMIT)
     }
@@ -999,7 +999,7 @@ impl StructuralOracle {
     ///
     /// The parser produced no tree, or a definition query needed more
     /// in-progress matches than `scratch`'s match limit
-    /// ([`ORACLE_MATCH_LIMIT`]), so tree-sitter dropped some; the error names
+    /// (`ORACLE_MATCH_LIMIT`), so tree-sitter dropped some; the error names
     /// `path` and the query file.
     pub fn file_matches(
         &self,

@@ -4,11 +4,17 @@
 //!
 //! The scoreboard drives the release `skim` binary as a subprocess against
 //! pinned real-world corpora and checks its output against oracles that are
-//! independent of skim's own code: nothing that scores skim imports
-//! `rskim_search::query_substring_present`, `rskim_core::Language`, or an
-//! `rskim-search` tokenizer. The one `rskim_core::Language` user is
-//! [`golden_gen`], which proposes golden entries for human review and passes
-//! the enum to the symbol extractor as a dispatch key only.
+//! independent of skim's own code. The structural oracle is its own crate,
+//! `rskim-oracle`, which depends on no `rskim-*` crate (its
+//! `tests/independence.rs` checks the manifest), so that independence holds
+//! at compile time. Everything in this module is independent by convention
+//! only, because `rskim-bench` depends on `rskim-search` and `rskim-core`:
+//! nothing that scores skim imports `rskim_search::query_substring_present`,
+//! `rskim_core::Language`, or an `rskim-search` tokenizer. Two modules read
+//! skim's code on purpose, and neither scores it: [`catalog`] reads skim's
+//! pattern catalog once and hands its projection to everything that needs
+//! it, and [`golden_gen`] proposes golden entries for human review, passing
+//! `rskim_core::Language` to the symbol extractor as a dispatch key only.
 //!
 //! # Modules
 //!
@@ -20,9 +26,11 @@
 //!   lang) and the in-process baselines (alphabetical, occurrence-count,
 //!   simulated `rg -n -F`).
 //! - [`golden`] — golden-set schema, query flags, loading, integrity.
-//! - [`golden_gen`] — `golden-gen`: candidate `[[ident]]` entries (a
-//!   reviewed proposal; uses `rskim_core::Language` only as the symbol
-//!   extractor's dispatch key, never scores skim).
+//! - [`golden_gen`] — `golden-gen`: candidate `[[ident]]` entries and, with
+//!   `--ast`, candidate `[[ast]]` entries from the structural oracle and the
+//!   gate's own `--ast` pattern calls (a reviewed proposal; uses
+//!   `rskim_core::Language` only as the symbol extractor's dispatch key,
+//!   never scores skim).
 //! - [`catalog`] — skim's `--ast` pattern catalog (the one read of
 //!   `rskim_search::all_patterns`, name / exact / example only) crossed with
 //!   the structural oracle's coverage. The structural oracle itself (#541:

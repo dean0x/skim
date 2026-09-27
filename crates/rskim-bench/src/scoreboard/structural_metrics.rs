@@ -89,7 +89,7 @@ impl OracleAnswers {
     /// Any [`StructuralOracle::file_matches`] error (a parser that returns
     /// no tree, a query over the oracle's match limit), naming the file.
     /// When several files fail, the first failing file in path order is
-    /// reported ([`first_failure_by_path`]), whatever order the workers
+    /// reported (`first_failure_by_path`), whatever order the workers
     /// reached them in.
     pub fn compute<'a>(
         oracle: &StructuralOracle,
