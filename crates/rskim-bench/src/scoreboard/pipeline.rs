@@ -36,7 +36,7 @@ use crate::scoreboard::catalog::{CatalogPattern, skim_catalog};
 use crate::scoreboard::corpus::{
     CorpusSource, CorpusSpec, find_corpus, load_corpora, materialize_verified,
 };
-use crate::scoreboard::fmt::round4;
+use crate::scoreboard::fmt::{entries_noun, round4};
 use crate::scoreboard::gate::{self, GateInputs, Ledger};
 use crate::scoreboard::golden::{
     IntegrityContext, LoadedGolden, check_integrity, golden_set_sha256, load_golden,
@@ -367,11 +367,6 @@ fn ast_calls(plan: &[PlannedQuery], catalog: &[CatalogPattern]) -> Vec<&'static 
 /// per catalog pattern.
 fn has_ast_entries(plan: &[PlannedQuery]) -> bool {
     plan.iter().any(PlannedQuery::is_structural)
-}
-
-/// `entry` or `entries`, whichever agrees with a count of `n`.
-pub fn entries_noun(n: usize) -> &'static str {
-    if n == 1 { "entry" } else { "entries" }
 }
 
 /// skim's `--ast <pattern>` full list and the call's timing for each of
@@ -1059,13 +1054,6 @@ mod tests {
             ),
             "{err:#}"
         );
-    }
-
-    #[test]
-    fn entries_noun_agrees_with_the_count() {
-        assert_eq!(entries_noun(0), "entries");
-        assert_eq!(entries_noun(1), "entry");
-        assert_eq!(entries_noun(2), "entries");
     }
 
     #[test]

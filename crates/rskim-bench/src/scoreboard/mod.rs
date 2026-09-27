@@ -51,9 +51,9 @@
 //! - [`baseline`] — `baseline.json` and `bless`.
 //! - [`report`] — `report.json` (deterministic apart from `latency`) and
 //!   `report.md` (the step summary).
-//! - [`fmt`] — value formatting the scoring and report modules share
-//!   (4-decimal rounding, path samples); a leaf, so they never import one
-//!   another for it.
+//! - [`fmt`] — value formatting shared across the scoreboard (4-decimal
+//!   rounding, path samples, the `entry` / `entries` noun); a leaf, so its
+//!   users never import one another for it.
 //! - [`pipeline`] — one run end to end; the `scoreboard` binary
 //!   (`src/bin/scoreboard.rs`) is a thin CLI over it.
 //!

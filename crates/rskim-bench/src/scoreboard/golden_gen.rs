@@ -304,7 +304,7 @@ fn covered_pairs(catalog: &[CatalogPattern]) -> Vec<(&'static str, OracleLang)> 
         })
         .flat_map(|(pattern, langs)| langs.into_iter().map(move |lang| (pattern, lang)))
         .collect();
-    pairs.sort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
+    pairs.sort_by_key(|&(pattern, lang)| (pattern, lang.as_str()));
     pairs
 }
 
@@ -461,7 +461,8 @@ fn toml_string(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
-    use crate::scoreboard::test_support::{FixtureRepo, catalog};
+    use crate::scoreboard::test_support::{FixtureRepo, catalog, oracle};
+    use crate::scoreboard::types::{AstCoverage, ResultPage, VerifyMode};
     use crate::scoreboard::universe::GitIsolation;
 
     fn site(name: &str, path: &str, line: u32) -> DefinitionSite {
@@ -772,20 +773,16 @@ mod tests {
     // --- [[ast]] candidates --------------------------------------------------------
 
     fn ast_answers(files: &[(&str, &str)]) -> OracleAnswers {
-        OracleAnswers::compute(
-            crate::scoreboard::test_support::oracle(),
-            files.iter().copied(),
-        )
-        .unwrap()
+        OracleAnswers::compute(oracle(), files.iter().copied()).unwrap()
     }
 
     /// skim's `--ast <pattern>` answer: one row per path, line 1.
     fn skim_rows(paths: &[&str]) -> AstPage {
         AstPage {
-            page: crate::scoreboard::types::ResultPage {
+            page: ResultPage {
                 rows: paths
                     .iter()
-                    .map(|p| crate::scoreboard::types::ResultRow {
+                    .map(|p| ResultRow {
                         path: p.to_string(),
                         score: 1.0,
                         line: Some(1),
@@ -793,10 +790,10 @@ mod tests {
                     })
                     .collect(),
                 has_more: false,
-                verify_mode: crate::scoreboard::types::VerifyMode::Substring,
+                verify_mode: VerifyMode::Substring,
                 degraded: Vec::new(),
             },
-            coverage: crate::scoreboard::types::AstCoverage::default(),
+            coverage: AstCoverage::default(),
         }
     }
 

@@ -202,6 +202,21 @@ impl LangClass {
             LangClass::NotIndexed { size_capped, .. } => size_capped,
         }
     }
+
+    /// The class as [`fingerprint`] tokens.
+    fn fingerprint(self) -> String {
+        match self {
+            LangClass::Oracle(lang) => format!("oracle {lang}"),
+            LangClass::Unscored { language } => format!("unscored {language}"),
+            LangClass::NotIndexed {
+                language,
+                size_capped,
+            } => format!(
+                "not-indexed {} size-capped {size_capped}",
+                language.unwrap_or("-")
+            ),
+        }
+    }
 }
 
 /// One row of the oracle's extension table.
@@ -692,23 +707,6 @@ impl std::fmt::Display for OracleInputs<'_> {
             )?;
         }
         Ok(())
-    }
-}
-
-impl LangClass {
-    /// The class as [`fingerprint`] tokens.
-    fn fingerprint(self) -> String {
-        match self {
-            LangClass::Oracle(lang) => format!("oracle {lang}"),
-            LangClass::Unscored { language } => format!("unscored {language}"),
-            LangClass::NotIndexed {
-                language,
-                size_capped,
-            } => format!(
-                "not-indexed {} size-capped {size_capped}",
-                language.unwrap_or("-")
-            ),
-        }
     }
 }
 

@@ -1,10 +1,10 @@
-//! Value formatting shared by the scoreboard's scoring and report modules
-//! (#203): report floats rounded to 4 decimal places, and path lists cut to
-//! a short sample for a failure detail.
+//! Value formatting shared across the scoreboard (#203): report floats
+//! rounded to 4 decimal places, path lists cut to a short sample for a
+//! failure detail, and the `entry` / `entries` noun for a count.
 //!
 //! A leaf module: it imports nothing from the scoreboard, so `metrics`,
-//! `structural_metrics`, `report` and `golden_gen` all use it without
-//! importing one another.
+//! `structural_metrics`, `report`, `golden_gen`, `pipeline` and the
+//! `scoreboard` binary all use it without importing one another.
 
 /// Paths quoted in a failure detail before "+N more".
 const SAMPLE_PATHS: usize = 5;
@@ -29,6 +29,11 @@ pub(crate) fn sample<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
     }
 }
 
+/// `entry` or `entries`, whichever agrees with a count of `n`.
+pub fn entries_noun(n: usize) -> &'static str {
+    if n == 1 { "entry" } else { "entries" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +54,12 @@ mod tests {
             sample(["a", "b", "c", "d", "e", "f", "g"]),
             "a, b, c, d, e (+2 more)"
         );
+    }
+
+    #[test]
+    fn entries_noun_agrees_with_the_count() {
+        assert_eq!(entries_noun(0), "entries");
+        assert_eq!(entries_noun(1), "entry");
+        assert_eq!(entries_noun(2), "entries");
     }
 }

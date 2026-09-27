@@ -1,5 +1,7 @@
 //! Unit tests for `metrics.rs` (co-located file, `#[path]`-included).
 
+use rskim_oracle::structural::OracleLang;
+
 use super::*;
 use crate::scoreboard::golden::parse_golden;
 use crate::scoreboard::runner::{SweepPage, TextOutput};
@@ -209,7 +211,7 @@ fn an_ast_entry_plans_a_standalone_ast_call_judged_by_the_structural_oracle() {
         q.structural_target(),
         Some(&StructuralTarget {
             pattern: "try-catch".to_string(),
-            lang: rskim_oracle::structural::OracleLang::Tsx,
+            lang: OracleLang::Tsx,
             precision: PrecisionClass::Hard,
             expect_oracle_empty: false,
         })
@@ -739,7 +741,7 @@ fn structural_sample(id: &str, class: PrecisionClass, intent: bool) -> Structura
     StructuralSample {
         id: id.to_string(),
         pattern: "rust-nested-loop".to_string(),
-        lang: rskim_oracle::structural::OracleLang::Rust,
+        lang: OracleLang::Rust,
         precision_class: class,
         expect_oracle_empty: false,
         oracle_files: 4,

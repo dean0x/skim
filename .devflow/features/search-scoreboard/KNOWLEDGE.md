@@ -516,7 +516,7 @@ A failed run therefore can never leave an older passing report for `bless --from
 - `crates/rskim-oracle/queries/*.scm`: the oracle's queries, one per (pattern, language), each naming its grammar on line 2.
 - `crates/rskim-oracle/tests/independence.rs`: the manifest check that keeps the oracle free of `rskim-*` crates (allow-list, every dependency table, no build script, no escaping `include!` / `#[path]`).
 - `crates/rskim-bench/src/scoreboard/catalog.rs`: the one read of skim's pattern catalog (`skim_catalog`, a name / `exact` / example projection) and `catalog_coverage`.
-- `crates/rskim-bench/src/scoreboard/fmt.rs`: `round4` and `sample`, the leaf formatting the scoring and report modules share.
+- `crates/rskim-bench/src/scoreboard/fmt.rs`: `round4`, `sample` and `entries_noun`, the leaf formatting the scoring, report and pipeline modules (and the `scoreboard` binary) share.
 - `crates/rskim-bench/scoreboard/{corpora.toml,golden/*.toml,known_failures.toml,baseline.json}`: the data. `baseline.json` is written only by `bless`.
 - `crates/rskim-bench/tests/scoreboard.rs`: offline end-to-end tests with a stub skim.
 - `crates/rskim-research/src/clone.rs`: `ensure_pinned_history_clone`, `verify_pinned_clone`, the process-group timeout (`git_output_with_timeout`).

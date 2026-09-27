@@ -255,16 +255,12 @@ pub fn called_patterns(catalog: &[CatalogPattern]) -> Vec<&'static str> {
 // Splitting skim's rows
 // ============================================================================
 
-/// Whether `row`'s file is in `lang` by the oracle's extension table (so
-/// `.tsx` is its own language).
-fn is_in(row: &ResultRow, lang: OracleLang) -> bool {
-    structural::classify(&row.path) == LangClass::Oracle(lang)
-}
-
 /// The rows of `page` whose file is in `lang` by the oracle's extension
 /// table (so `.tsx` is its own language), borrowed, in skim's order.
 pub fn lang_rows(page: &ResultPage, lang: OracleLang) -> impl Iterator<Item = &ResultRow> {
-    page.rows.iter().filter(move |r| is_in(r, lang))
+    page.rows
+        .iter()
+        .filter(move |r| structural::classify(&r.path) == LangClass::Oracle(lang))
 }
 
 /// The rows of `page` whose file is in `lang` ([`lang_rows`]), in skim's

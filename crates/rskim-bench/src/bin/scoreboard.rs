@@ -40,6 +40,7 @@ use rskim_bench::scoreboard::corpus::{
     CorpusSpec, DEFAULT_CORPUS_DIR, GitCorpusSource, find_corpus, load_corpora,
     materialize_verified,
 };
+use rskim_bench::scoreboard::fmt::entries_noun;
 use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
 use rskim_bench::scoreboard::report::{GateStatus, Report, clear_outputs, total, write_outputs};
@@ -322,7 +323,7 @@ fn golden_gen_ast(
     println!(
         "# golden-gen --ast proposal for corpus {corpus} at {commit} ({} {}; review, then freeze in golden/{corpus}.toml)",
         candidates.len(),
-        pipeline::entries_noun(candidates.len())
+        entries_noun(candidates.len())
     );
     print!(
         "{}",
