@@ -113,7 +113,9 @@ pub(crate) use registry::{
 };
 
 mod security;
-pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
+pub(crate) use security::{
+    redact_mandatory_assignments, sanitize_for_display, scrub_db_args, scrub_infra_args,
+};
 
 pub(crate) mod stream_pump;
 

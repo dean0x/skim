@@ -301,6 +301,16 @@ pub(crate) fn run(
             // ACCEPTED LIMITATION: `env FOO=1 sh -c env` still leaks because
             // the child is `sh` and skim cannot inspect what an arbitrary child
             // will print.  This shape is pinned in the regression test suite.
+            // ROUTING is keyed on the `env` spelling ONLY, and deliberately so:
+            // `printenv` never takes `VAR=val`, so sending that spelling to the
+            // real `env` binary would execute an unmediated environment dump —
+            // the redaction bypass `redaction_is_mandatory` exists to prevent.
+            // The `printenv NAME=VALUE` LABEL leak this spelling used to cause
+            // is fixed where it occurs instead, in
+            // `cmd::security::redact_mandatory_assignments`, which keys on
+            // `redaction_is_mandatory` and so covers BOTH spellings.  Routing
+            // membership and label membership are different questions; see that
+            // function's docs for why the four controls are not merged.
             if tool_name.as_str() == "env" && tool_args.iter().any(|a| a.contains('=')) {
                 // Find the first non-assignment arg (the child program name).
                 let child_idx = tool_args.iter().position(|a| !a.contains('='));

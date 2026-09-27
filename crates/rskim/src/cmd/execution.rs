@@ -456,7 +456,7 @@ pub(crate) fn emit_json_envelope(
 }
 
 use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
-use super::{scrub_db_args, scrub_infra_args};
+use super::{redact_mandatory_assignments, scrub_db_args, scrub_infra_args};
 
 /// Controls the output format of parsed command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1727,19 +1727,47 @@ where
 /// Centralises the label format so streaming and non-streaming code paths
 /// cannot drift.  `rest` is the pre-joined argument string (may be empty).
 ///
-/// Sensitive flags are redacted before the label is stored to prevent
-/// credentials persisting in the analytics SQLite database:
+/// The label is the ONLY thing persisted from argv, and it lands in
+/// `token_savings.original_cmd` for 90 days, so every family's treatment is
+/// decided here.  Each family below is listed with its treatment and the reason
+/// — a family absent from this list is an oversight, not a decision.
 ///
-/// - `"db"` family: passwords, usernames, hostnames (psql/mysql flags).
-/// - `"infra"` family: Authorization headers, `--token`, `--password`,
-///   `--secret`, `--api-key`, and similar flags used by curl, aws, gh, etc.
+/// | Family | Treatment | Why |
+/// |--------|-----------|-----|
+/// | `db` | [`scrub_db_args`] | psql/mysql pass credentials as `-p`/`-u`/`-U`/`-h` and as connection URIs. |
+/// | `infra` | [`scrub_infra_args`] | curl/aws/gh/kubectl/terraform/docker: Authorization headers, `--token`, credential URLs. |
+/// | `build`, `test`, `pkg` | [`scrub_infra_args`] | `-D`/`-P` Java & Gradle property credentials, npm config-as-flag auth tokens, bare `NAME=VALUE` overrides, registry/index URLs with userinfo. |
+/// | `file` | [`scrub_infra_args`] + [`redact_mandatory_assignments`] + `-exec` elision | measured leaks: `printenv NAME=VALUE` persisted the value, and `find -exec <cmd>` persisted the nested command's credentials. |
+/// | `lint` | **none, audited** | all 13 linters (biome, black, dprint, eslint, gofmt, golangci-lint, mypy, oxlint, prettier, rubocop, ruff, rustfmt, swiftlint) accept no credential-bearing flag, so scrubbing would add false-positive risk and buy nothing. |
+/// | `git` | **pre-scrubbed upstream** | `git/mod.rs::build_analytics_label` applies `scrub_credential_url` to each arg before calling this function. |
+///
+/// Two deliberate exclusions, both pinned by tests so neither reads as an
+/// oversight: `test_format_analytics_label_lint_is_unscrubbed_by_design` and
+/// `test_format_analytics_label_file_family_preserves_plain_reader_args`.
+///
+/// `file` is scrubbed AND additionally guarded because two of its twelve
+/// programs carry a credential surface the flag lists cannot reach:
+/// `env`/`printenv` take `NAME=VALUE` assignments (handled by total assignment
+/// redaction — the name list is not consulted), and `find` takes `-exec`, whose
+/// remainder is an arbitrary program's command line and is therefore elided
+/// rather than scrubbed; no flag list can enumerate an unbounded vocabulary.
+///
+/// The accepted cost of scrubbing `file` is over-redaction of a grep PATTERN
+/// that looks like a credential flag (`grep -- --password= logs/`), pinned by
+/// `test_format_analytics_label_flaglike_grep_pattern_is_over_redacted`.
+/// Over-redaction fails safe; a leak does not.
 pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) -> String {
     if rest.is_empty() {
         return format!("skim {family} {program}");
     }
     let scrubbed_rest = match family {
         "db" => scrub_db_args(rest),
-        "infra" => scrub_infra_args(rest),
+        // `scrub_db_args` must NOT be reached from these families: its `-p`,
+        // `-u`, `-U`, `-h` rules would mangle `cargo test -p <crate>`,
+        // `pytest -p <plugin>`, and `make -p`.
+        "infra" | "build" | "test" | "pkg" | "file" => {
+            scrub_infra_args(&redact_mandatory_assignments(program, rest))
+        }
         _ => rest.to_string(),
     };
     format!("skim {family} {program} {scrubbed_rest}")
@@ -2438,6 +2466,172 @@ mod tests {
     fn test_format_analytics_label_db_empty_rest() {
         let label = format_analytics_label("db", "psql", "");
         assert_eq!(label, "skim db psql");
+    }
+
+    #[test]
+    fn test_format_analytics_label_build_scrubs_java_property() {
+        // Simulate: skim mvn deploy -Dpassword=hunter2
+        let label = format_analytics_label("build", "mvn", "deploy -Dpassword=hunter2");
+        assert!(
+            !label.contains("hunter2"),
+            "build family must redact a Java system property credential: {label}"
+        );
+        assert!(
+            label.contains("-Dpassword=[REDACTED]"),
+            "property name must be preserved: {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_test_family_preserves_package_selector() {
+        // `-p <crate>` is cargo's package selector, NOT a password.  Routing the
+        // test family through the db scrubber would mangle it.
+        let label = format_analytics_label("test", "cargo", "test -p rskim-core");
+        assert_eq!(label, "skim test cargo test -p rskim-core");
+    }
+
+    #[test]
+    fn test_format_analytics_label_test_family_preserves_pytest_selectors() {
+        assert_eq!(
+            format_analytics_label("test", "pytest", "-p no:cacheprovider -k test_foo"),
+            "skim test pytest -p no:cacheprovider -k test_foo"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_pkg_scrubs_registry_credentials() {
+        let label = format_analytics_label(
+            "pkg",
+            "npm",
+            "install --registry=https://user:hunter2@npm.example.com",
+        );
+        assert!(
+            !label.contains("hunter2"),
+            "pkg family must scrub userinfo in a registry URL: {label}"
+        );
+        assert!(
+            label.contains("npm.example.com"),
+            "registry host must be preserved: {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_pkg_scrubs_npm_auth_token_flag() {
+        let label = format_analytics_label(
+            "pkg",
+            "npm",
+            "publish --//registry.npmjs.org/:_authToken=npm_secretvalue",
+        );
+        assert!(
+            !label.contains("npm_secretvalue"),
+            "pkg family must redact an npm auth token config flag: {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_file_family_scrubs_credentials() {
+        let label = format_analytics_label("file", "find", "/etc --token ghp_secrettoken");
+        assert!(
+            !label.contains("ghp_secrettoken"),
+            "file family must be scrubbed (security-07 Layer 2): {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_file_family_elides_find_nested_command() {
+        let label = format_analytics_label(
+            "file",
+            "find",
+            ". -name *.env -exec curl -u admin:hunter2 https://drop.example.com ;",
+        );
+        assert!(
+            !label.contains("hunter2") && !label.contains("curl"),
+            "find's nested command must be elided, not scrubbed: {label}"
+        );
+        assert!(
+            label.contains("-exec [ELIDED]"),
+            "elision marker must be present: {label}"
+        );
+        assert!(
+            label.starts_with("skim file find . -name *.env "),
+            "the predicate prefix must survive: {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_printenv_redacts_every_assignment_value() {
+        // `redaction_is_mandatory` programs get TOTAL assignment redaction: the
+        // second name is on no secret list, and its value is still redacted.
+        let label = format_analytics_label(
+            "file",
+            "printenv",
+            "NPM_TOKEN=sec_listed MY_CUSTOM_THING=sec_unlisted",
+        );
+        assert!(
+            !label.contains("sec_listed") && !label.contains("sec_unlisted"),
+            "every assignment value must be redacted for printenv: {label}"
+        );
+        assert_eq!(
+            label,
+            "skim file printenv NPM_TOKEN=[REDACTED] MY_CUSTOM_THING=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_other_family_keeps_unlisted_assignment() {
+        // The total-assignment rule is scoped to redaction-mandatory programs.
+        // The build family still redacts only names on the canonical secret list.
+        let label = format_analytics_label("build", "make", "deploy MY_CUSTOM_THING=plainvalue");
+        assert_eq!(label, "skim build make deploy MY_CUSTOM_THING=plainvalue");
+    }
+
+    #[test]
+    fn test_format_analytics_label_file_family_preserves_plain_reader_args() {
+        for (program, rest, expected) in &[
+            ("grep", "-n hello a.txt", "skim file grep -n hello a.txt"),
+            ("wc", "-l a.txt", "skim file wc -l a.txt"),
+            ("ls", "-la", "skim file ls -la"),
+            ("find", ". -name *.rs", "skim file find . -name *.rs"),
+            ("df", "-h", "skim file df -h"),
+            ("du", "-sh .", "skim file du -sh ."),
+            ("ps", "-p 1", "skim file ps -p 1"),
+            ("tree", "-L 1", "skim file tree -L 1"),
+        ] {
+            assert_eq!(
+                &format_analytics_label("file", program, rest),
+                expected,
+                "plain reader args must survive the file-family scrubber"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_analytics_label_flaglike_grep_pattern_is_over_redacted() {
+        // Pinned as KNOWN AND INTENDED (security-07 Layer 2): see the sibling
+        // test in `cmd::security` for the full rationale.
+        assert_eq!(
+            format_analytics_label("file", "grep", "-- --password= logs/"),
+            "skim file grep -- --password=[REDACTED] logs/"
+        );
+    }
+
+    /// The `lint` family is deliberately NOT scrubbed.
+    ///
+    /// All 13 supported linters (biome, black, dprint, eslint, gofmt,
+    /// golangci-lint, mypy, oxlint, prettier, rubocop, ruff, rustfmt,
+    /// swiftlint) were audited and accept no credential-bearing flag, so
+    /// scrubbing would buy nothing and add false-positive risk.  This test
+    /// pins that choice: if it fails, someone widened the gate — re-audit the
+    /// linter flag surface before accepting the change.
+    #[test]
+    fn test_format_analytics_label_lint_is_unscrubbed_by_design() {
+        let label = format_analytics_label("lint", "eslint", "--resolve-plugins-relative-to .");
+        assert_eq!(label, "skim lint eslint --resolve-plugins-relative-to .");
+
+        // A credential-shaped argument the build family WOULD redact passes
+        // through the lint family untouched.
+        let shaped = format_analytics_label("lint", "eslint", "-Dpassword=hunter2");
+        assert_eq!(shaped, "skim lint eslint -Dpassword=hunter2");
     }
 
     // ========================================================================
