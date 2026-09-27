@@ -15,7 +15,7 @@
 //!   real-node patterns ("does this file contain the queried structure, and if
 //!   so, which line?"). Both the verify
 //!   gate and the line anchor read from the same function call, so they can
-//!   never disagree (ADR-007 anchor-trust satisfied by construction).
+//!   never disagree (SEARCH-ADR-007 anchor-trust satisfied by construction).
 //! - **Real-node-only unify (AD-397-2).** The bug (wrong anchor lines,
 //!   missing lines for bigram-with-anonymous-token patterns) was entirely in
 //!   the old `MatchTable` pre-order-predecessor approximation. The five
@@ -94,7 +94,7 @@ use crate::ast_index::{
 /// ## AD-397-1: Single strict-ancestor predicate
 ///
 /// Gate and anchor share ONE call. The anchor is the node the gate admitted,
-/// so they cannot disagree. Satisfies ADR-007 (anchor-trust) by construction.
+/// so they cannot disagree. Satisfies SEARCH-ADR-007 (anchor-trust) by construction.
 ///
 /// ## AD-397-2: Real-node strict walk
 ///
@@ -119,7 +119,7 @@ use crate::ast_index::{
 /// ## AD-397-6: No index-format change
 ///
 /// Pure query-time display logic. No index artifact is read differently or
-/// rewritten. FORMAT_VERSION is unchanged. ADR-006 abort-before-manifest-
+/// rewritten. FORMAT_VERSION is unchanged. SEARCH-ADR-006 abort-before-manifest-
 /// persist build invariant is untouched. PF-004 (u16→u32 depth widening) does
 /// not apply — this path compares node *kinds*, not depth arithmetic.
 ///
@@ -260,7 +260,7 @@ fn anchor_from_node(
 /// (`query_contains_synthetic_id`) to a branch that re-runs the index-time
 /// extraction pipeline (`extract_ast_ngrams_with_lines`) and reads back the
 /// representative `(line, byte)` position it recorded for the emitted marker.
-/// One pass produces both the marker and its line (ADR-006). Per-pattern
+/// One pass produces both the marker and its line (SEARCH-ADR-006). Per-pattern
 /// representative-line rule: report the 1-indexed start line of the node the
 /// marker's condition is measured on, resolving up to the enclosing named
 /// construct for anonymous body/param blocks.
@@ -299,7 +299,7 @@ pub fn recover_line(
     // ancestor walk (`vocab_lookup` never yields a synthetic ID). Route them
     // through the SAME extraction pass that emits the marker
     // (`extract_ast_ngrams_with_lines`), reading back the representative
-    // position it recorded (ADR-006: one pass produces both the marker and its
+    // position it recorded (SEARCH-ADR-006: one pass produces both the marker and its
     // line — no second, drift-prone detection re-implementation).
     let result = linearize_source(source, lang).ok()?;
     let (_emitted, _metrics, synthetic_lines) = extract_ast_ngrams_with_lines(&result.nodes, lang);
@@ -413,7 +413,7 @@ fn recover_synthetic_line(
 /// `find_first_strict_match` applies identical guards (mtime, size, language,
 /// UTF-8) and the strict `node.parent()` ancestor walk. Returning `true` iff
 /// `find_first_strict_match` is `Some` means gate and anchor share ONE code path —
-/// no second walk can drift (ADR-007 satisfied by construction).
+/// no second walk can drift (SEARCH-ADR-007 satisfied by construction).
 ///
 /// ## AD-394-1 / AD-394-2: Synthetic-marker patterns route through extraction-reuse
 ///
@@ -428,7 +428,7 @@ fn recover_synthetic_line(
 /// `extract_ast_ngrams_with_metrics` that returns as soon as the target synthetic
 /// bigram is confirmed present — AC11 / #419 fix) and confirms every resolved
 /// n-gram KEY is emitted (reuses the indexer's SAME emission logic as the single
-/// source of truth — applies ADR-006). Real-node patterns are NOT routed through
+/// source of truth — applies SEARCH-ADR-006). Real-node patterns are NOT routed through
 /// extraction-reuse (AD-394-2) — collapsing the two branches would loosen the
 /// real patterns to the indexer's gap-fill tolerance, regressing AD-374-6
 /// precision.
@@ -482,7 +482,7 @@ pub fn pattern_occurs_in_file(
 
         // AD-394-1 / #419 (AC11 fix): verify by re-running the index-time pipeline
         // via `linearize_source` + `synthetic_key_present`. The latter uses the SAME
-        // ExtractState emission logic as `extract_ast_ngrams_with_metrics` (ADR-006)
+        // ExtractState emission logic as `extract_ast_ngrams_with_metrics` (SEARCH-ADR-006)
         // but exits as soon as the target bigram key is confirmed present — for
         // deep-nesting (DEEP_NODE → bucket_label(0)) this fires at the first node at
         // depth >= 4, dramatically faster than a full O(n) traversal.
@@ -539,7 +539,7 @@ pub fn pattern_occurs_in_file(
     // find_first_strict_match applies identical guards (mtime, size, language,
     // UTF-8, parse) and the strict node.parent() ancestor walk (AD-374-6).
     // Returning .is_some() makes this a thin wrapper with a single source of
-    // truth for both gate and anchor — no second walk can drift (ADR-007).
+    // truth for both gate and anchor — no second walk can drift (SEARCH-ADR-007).
     find_first_strict_match(file_path, query, manifest_mtime).is_some()
 }
 

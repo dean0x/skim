@@ -222,7 +222,7 @@ impl TemporalSource for GixSource {
     ///
     /// Every production caller passes `0` (no cutoff), so the AD-407-3
     /// `ByCommitTimeCutoff` path is currently exercised only by tests. Follow-up
-    /// #523 tracks wiring the parameter through or removing it (ADR-004).
+    /// #523 tracks wiring the parameter through or removing it (SEARCH-ADR-004).
     fn parse_history(&self, repo_path: &Path, lookback_days: u32) -> Result<HistoryResult> {
         parse_history_impl(repo_path, lookback_days)
     }

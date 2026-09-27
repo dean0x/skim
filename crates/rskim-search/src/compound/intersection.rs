@@ -42,7 +42,7 @@
 //! temporal multiplier parameter.  This parameter was dropped in the Cross-Plan
 //! Amendment because the `#202` gate blocks the combined `--ast + temporal` path
 //! entirely in Wave 4a, making a temporal multiplier unreachable and therefore
-//! baseless per ADR-003.  The omission is intentional and traceable to the amendment;
+//! baseless per SEARCH-ADR-003.  The omission is intentional and traceable to the amendment;
 //! #202 lifting it is the prerequisite for adding it.
 //!
 //! # Lexical candidate pool and completeness (#356)
@@ -115,7 +115,7 @@ pub const WEIGHT_AST: f64 = 1.0;
 /// # Extension by #200
 ///
 /// The four new fields (`temporal`, `import_graph`, `dir_proximity`,
-/// `structural_coupling`) default to `0.0` per ADR-003 — each will be promoted
+/// `structural_coupling`) default to `0.0` per SEARCH-ADR-003 — each will be promoted
 /// to a non-zero value after a measured relative-lift benchmark confirms positive
 /// marginal lift on the same corpus in the same run.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,11 +127,11 @@ pub struct CompositeWeights {
     /// Weight for the temporal co-change Jaccard ranked list (default 0.0 for
     /// the two-signal #198 path; 0.2 in the six-signal #200 profile).
     pub temporal: f64,
-    /// Weight for the import-graph signal (default 0.0 — ADR-003 gated).
+    /// Weight for the import-graph signal (default 0.0 — SEARCH-ADR-003 gated).
     pub import_graph: f64,
-    /// Weight for the directory-proximity signal (default 0.0 — ADR-003 gated).
+    /// Weight for the directory-proximity signal (default 0.0 — SEARCH-ADR-003 gated).
     pub dir_proximity: f64,
-    /// Weight for the structural-coupling signal (default 0.0 — ADR-003 gated).
+    /// Weight for the structural-coupling signal (default 0.0 — SEARCH-ADR-003 gated).
     pub structural_coupling: f64,
 }
 
@@ -156,7 +156,7 @@ impl CompositeWeights {
     /// Returns the canonical #200 starting weights:
     /// `lexical = 0.5`, `ast = 0.3`, `temporal = 0.2`, extended `0.0`.
     /// Extended signals will be promoted from `0.0` after measured relative-lift
-    /// benchmarks confirm positive marginal lift (ADR-003).
+    /// benchmarks confirm positive marginal lift (SEARCH-ADR-003).
     ///
     /// These literal values mirror `WEIGHT6_*` constants in `compound::weights`.
     /// They are inlined here to avoid a circular dependency
@@ -227,7 +227,7 @@ impl CompositeWeights {
     /// Accepts exactly 3 values: lexical, ast, temporal.  Extended-signal weights
     /// (import_graph, dir_proximity, structural_coupling) remain at their defaults
     /// (all 0.0) — they are not user-configurable until benchmark lift is measured
-    /// (applies ADR-003).
+    /// (applies SEARCH-ADR-003).
     ///
     /// Returns `Err` when the string does not contain exactly 3 comma-separated
     /// values, or any value fails to parse as a finite non-negative f64.
@@ -286,11 +286,11 @@ impl CompositeWeights {
 /// * `structural_lookup` — pure closure: `FileId → Option<StructuralMetrics>`.
 ///   Used to refine the AST-layer rank by `max_depth` (depth-only in 4a;
 ///   richer metrics are available in v2 but grounded baselines for branch_count
-///   etc. are deferred per ADR-003/ADR-004).  The closure must perform **no
+///   etc. are deferred per SEARCH-ADR-003/SEARCH-ADR-004).  The closure must perform **no
 ///   I/O** — callers pre-fetch metrics before calling this function.
 /// * `avg_max_depth` — corpus average max CST depth, from
 ///   `AstIndexReader::avg_max_depth()`.  Used as the ordering key baseline so
-///   the structural refinement is grounded (avoids ADR-003 baseless magic).
+///   the structural refinement is grounded (avoids SEARCH-ADR-003 baseless magic).
 ///   **Wave 4a**: the production caller passes `0.0` (structural seam deferred
 ///   to #290); depth re-ranking is not live until #290 wires a real lookup.
 /// * `weights` — per-signal RRF weights; use [`CompositeWeights::default()`]
@@ -374,14 +374,14 @@ pub fn intersect_and_rank(
     // The AST scored list arrives FileId-ASC; we need to build a DESC-score
     // ordering (rank 1 = most structurally complex) to feed RRF.
     //
-    // Structural refinement (4a, depth-only per ADR-003/ADR-004):
+    // Structural refinement (4a, depth-only per SEARCH-ADR-003/SEARCH-ADR-004):
     // Sort the AST results DESC by (depth_ordering_key, ast_score) where
     //   depth_ordering_key = max_depth / (1 + avg_max_depth)
     // using a grounded baseline (`avg_max_depth` from the stored v2 header).
     // Because RRF consumes rank, not magnitude, no corpus divisor is strictly
     // needed — we only need a stable relative ordering.  Using the normalised
     // depth as the primary sort key and ast_score as tiebreaker achieves this
-    // without arbitrary thresholds (ADR-003).
+    // without arbitrary thresholds (SEARCH-ADR-003).
     // PF-004: widen u16→u32→f64 BEFORE any arithmetic.
     //
     // Decorate-sort-undecorate: precompute depth key once per entry (O(m) closure

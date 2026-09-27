@@ -163,7 +163,7 @@ fn cache_save_and_load() {
     let cache_dir = dir.path();
 
     // Use `with_dir` so `save()` knows where to write without a path argument,
-    // matching the `FileManifest` pattern (cache_dir stored as a field). (applies ADR-003)
+    // matching the `FileManifest` pattern (cache_dir stored as a field). (applies SEARCH-ADR-003)
     let mut cache = AstNgramCache::with_dir(cache_dir);
     let sha = "d".repeat(SHA_HEX_LEN);
     let entry = make_entry();
@@ -344,7 +344,7 @@ fn corrupt_payload_is_miss_not_whole_cache_discard() {
 }
 
 /// A payload declaring length > MAX_ENTRY_BYTES must be rejected without
-/// triggering a multi-GB allocation. (AC10 — allocation-bomb guard, applies ADR-003)
+/// triggering a multi-GB allocation. (AC10 — allocation-bomb guard, applies SEARCH-ADR-003)
 #[test]
 fn oversized_payload_length_rejected() {
     let dir = tempfile::tempdir().expect("tempdir must succeed");

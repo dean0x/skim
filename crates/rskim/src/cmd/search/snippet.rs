@@ -397,7 +397,7 @@ pub(super) fn extract_snippet_and_verify(
     // ≥1 query token. `!verified` short-circuits for the extract_snippet sentinel
     // (query="", verified=false) and any non-verified path. When verified=true,
     // all three predicates return None/false for empty queries, so the inner block
-    // is always reached and the ADR-007 invariant is checked. Compiled out of
+    // is always reached and the SEARCH-ADR-007 invariant is checked. Compiled out of
     // --release; the test suite is the production correctness gate (PF-007).
     debug_assert!(
         !verified || {

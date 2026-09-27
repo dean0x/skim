@@ -47,7 +47,7 @@
 //!
 //! An empty or missing file is treated as a cold-start (no cache hits).
 //!
-//! # Atomicity (AD-380-8, ADR-006)
+//! # Atomicity (AD-380-8, SEARCH-ADR-006)
 //!
 //! Writes use a named temp file in the same directory, persisted (renamed) after
 //! the full write succeeds. Readers never observe a partial write. The build
@@ -180,7 +180,7 @@ const MAX_FIELD_MAP_TRIPLES: usize = 1_000_000;
 // reused during a lexical rebuild. When the classifier field-attribution rules
 // change, bump rskim_search::CLASSIFIER_SCHEMA_VERSION first — this assertion
 // then fails until FileManifest::FORMAT_VERSION is also advanced, making the
-// dual-bump invariant a build failure rather than a convention (applies ADR-001).
+// dual-bump invariant a build failure rather than a convention (applies SEARCH-ADR-001).
 const _: () = assert!(
     FileManifest::FORMAT_VERSION >= rskim_search::CLASSIFIER_SCHEMA_VERSION,
     "FileManifest::FORMAT_VERSION must be >= rskim_search::CLASSIFIER_SCHEMA_VERSION; \
@@ -455,13 +455,13 @@ impl FileManifest {
     /// v2 JSONL manifests lack the binary magic, so `version_matches` reports a
     /// mismatch and `check_staleness` rebuilds once on the next query —
     /// correctness-on-upgrade with no manual `--rebuild`, for BOTH git and
-    /// non-git roots (AC-4). The bump is monotonic 2→3→4 (ADR-006); #373 owns
-    /// 2→3 and #380 owns 3→4. Behavior of THIS ticket per ADR-004 (not a #NEW
+    /// non-git roots (AC-4). The bump is monotonic 2→3→4 (SEARCH-ADR-006); #373 owns
+    /// 2→3 and #380 owns 3→4. Behavior of THIS ticket per SEARCH-ADR-004 (not a #NEW
     /// placeholder).
     ///
     /// v4 → v5: AD-395-3: Append a skipped-entries section after the indexed
     /// entries. This monotonic bump rides the existing cold-start self-heal
-    /// (ADR-006) to force ONE rebuild that re-scans previously over-dropped
+    /// (SEARCH-ADR-006) to force ONE rebuild that re-scans previously over-dropped
     /// small long-line files AND introduces the persisted skipped-entries section
     /// that ends the infinite refresh loop for files that remain legitimately
     /// content-skipped (AD-395-4/5). A v4 manifest triggers NoStoredHead →
@@ -485,7 +485,7 @@ impl FileManifest {
     /// so that any future classifier schema change (advancing
     /// `rskim_search::CLASSIFIER_SCHEMA_VERSION`) fails the build until this
     /// constant is also advanced — preventing the silent-inertness regression fixed
-    /// in b21d08f from recurring (applies ADR-001). No classifier semantics changed
+    /// in b21d08f from recurring (applies SEARCH-ADR-001). No classifier semantics changed
     /// in this bump; it exists solely to satisfy the new compile-time invariant and
     /// to align FORMAT_VERSION with `CLASSIFIER_SCHEMA_VERSION = 7`.  #411 owns 6→7.
     pub const FORMAT_VERSION: u32 = 7;
@@ -610,7 +610,7 @@ impl FileManifest {
         }
         // Truncation note: a genuine v6 manifest NEVER reaches this code — decode_header
         // rejects any version != FORMAT_VERSION (7) before the entry loop runs (the
-        // ADR-006 version gate triggers a cold-start rebuild, not this fallback).
+        // SEARCH-ADR-006 version gate triggers a cold-start rebuild, not this fallback).
         // The only way `read_u32()` returns `None` here is a TRUNCATED v7 file where
         // all indexed entries are intact but the 4-byte skip_count is missing or partial.
         // Treat that as reject-whole for codec consistency (AD-380-3): the skip section
@@ -890,7 +890,7 @@ impl FileManifest {
     /// Atomically write all entries to `{cache_dir}/index.skfiles`.
     ///
     /// Uses a named temp file in `cache_dir` and renames it into place so
-    /// readers never observe a partial write (AD-380-8, ADR-006).
+    /// readers never observe a partial write (AD-380-8, SEARCH-ADR-006).
     ///
     /// # Errors
     ///

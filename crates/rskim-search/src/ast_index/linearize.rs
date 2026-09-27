@@ -65,7 +65,7 @@ pub(crate) const MAX_AST_NODES: u32 = AstWalkConfig::DEFAULT_MAX_NODES;
 /// Added for OD-394-1 (synthetic-marker line recovery): `start_line` (1-indexed)
 /// and `start_byte` carry the node's source position so `extract.rs` can record
 /// a representative position per emitted synthetic marker in the SAME traversal
-/// that emits it (ADR-006 — one pass, no second detection re-implementation).
+/// that emits it (SEARCH-ADR-006 — one pass, no second detection re-implementation).
 /// `LinearNode` is a transient in-memory intermediate — only n-gram postings and
 /// per-file `StructuralMetrics` are ever serialized (`store/builder.rs`,
 /// `store/format.rs FORMAT_VERSION=2`) — so this addition does NOT change the

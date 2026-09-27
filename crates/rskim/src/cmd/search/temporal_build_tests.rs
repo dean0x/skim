@@ -748,7 +748,7 @@ fn test_rebuild_temporal_window_bucketing() {
 }
 
 // ============================================================================
-// O-C / ADR-003 — Full-history risk stats correctness
+// O-C / SEARCH-ADR-003 — Full-history risk stats correctness
 // ============================================================================
 
 /// O-C: total_commits must count commits outside the 90-day window.
@@ -822,7 +822,7 @@ fn test_risk_row_total_commits_includes_out_of_window_commits() {
 
     assert_eq!(
         risk.total_commits, 3,
-        "total_commits must count ALL commits including those >90 days ago (O-C / ADR-003), \
+        "total_commits must count ALL commits including those >90 days ago (O-C / SEARCH-ADR-003), \
          got {} (regression: windowed 90-day walk used instead of full history)",
         risk.total_commits
     );
@@ -1269,13 +1269,13 @@ fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
 }
 
 // ============================================================================
-// PERFORMANCE (ADR-003): parse_history called exactly once during rebuild
+// PERFORMANCE (SEARCH-ADR-003): parse_history called exactly once during rebuild
 // ============================================================================
 
 /// A counting `TemporalSource` test double that records how many times
 /// `parse_history` was invoked.
 ///
-/// Used by `test_rebuild_temporal_parse_history_called_once` to assert ADR-003's
+/// Used by `test_rebuild_temporal_parse_history_called_once` to assert SEARCH-ADR-003's
 /// grounded regression guard: a single history walk per rebuild, not two
 /// (the prior implementation had a dead second 90-day walk).
 struct CountingSource {
@@ -1809,13 +1809,13 @@ impl rskim_search::TemporalSource for FixedSource {
     }
 }
 
-/// PERFORMANCE (ADR-003): parse_history is invoked exactly ONCE during a
+/// PERFORMANCE (SEARCH-ADR-003): parse_history is invoked exactly ONCE during a
 /// rebuild_temporal_with_source call on a real git repo.
 ///
 /// The pre-fix implementation had a dead second 90-day `parse_history` walk
 /// (Decision O-B). After its removal, a single full-history walk supplies all
 /// data. This test asserts call_count == 1 — the grounded regression guard
-/// required by ADR-003 for the PERFORMANCE acceptance criterion.
+/// required by SEARCH-ADR-003 for the PERFORMANCE acceptance criterion.
 ///
 /// Discriminating: if a second parse_history call is added anywhere in
 /// rebuild_temporal_with_source, the count becomes 2 and this test fails.
@@ -1852,11 +1852,11 @@ fn test_rebuild_temporal_parse_history_called_once() {
         "rebuild_temporal_with_source must succeed on a real git repo, got: {result:?}"
     );
 
-    // ADR-003 grounded regression guard: exactly ONE parse_history call.
+    // SEARCH-ADR-003 grounded regression guard: exactly ONE parse_history call.
     assert_eq!(
         src.count(),
         1,
-        "parse_history must be called exactly ONCE during rebuild (ADR-003 PERFORMANCE guard); \
+        "parse_history must be called exactly ONCE during rebuild (SEARCH-ADR-003 PERFORMANCE guard); \
          got {} calls — a second call indicates a dead extra walk was reintroduced",
         src.count()
     );
@@ -2266,7 +2266,7 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
 /// Without the PF-017 gate in `record_temporal_anchor`, a plain lexical query
 /// whose HEAD changed could trigger an auto-refresh rebuild, and that rebuild
 /// would silently overwrite the anchor set by a prior explicit `--rebuild` —
-/// corrupting the per-worktree isolation invariant (AD-413-16 / ADR-009).
+/// corrupting the per-worktree isolation invariant (AD-413-16 / SEARCH-ADR-009).
 ///
 /// Method:
 /// 1. Create a real git repo so `discover_git_workdir` can find it.

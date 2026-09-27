@@ -17,11 +17,11 @@
 //!   A version mismatch discards the entire cache and cold-starts extraction.
 //!   Any change to the extraction algorithm, AST weight tables, OR the AST size
 //!   cap MUST bump this constant so stale entries are never reused from cache.
-//!   (applies ADR-003)
+//!   (applies SEARCH-ADR-003)
 //! - **Self-pruning:** the cache is rebuilt from scratch each build — only the
 //!   current build's files are inserted, then written atomically.  Deleted or
 //!   renamed files naturally age out.
-//! - **ADR-006 safety:** the cache is written AFTER `ast_builder.build()` and
+//! - **SEARCH-ADR-006 safety:** the cache is written AFTER `ast_builder.build()` and
 //!   BEFORE `new_manifest.save()`.  A skcache write failure must propagate as
 //!   `Err` so the manifest is never saved (self-heal on next query).
 //! - **Corrupt/truncated entry → cache miss:** a bad entry causes only that
@@ -37,13 +37,13 @@
 //!
 //! SHA-256 collision is not a practical threat and the lexical cache already
 //! trusts SHA-256 as sole authority (index.rs comment, line 18-21).  This is
-//! an accepted risk mirroring the existing design. (applies ADR-003)
+//! an accepted risk mirroring the existing design. (applies SEARCH-ADR-003)
 //!
 //! # mtime granularity
 //!
 //! Correctly a non-issue: this cache keys on content SHA, never on mtime.
 //! mtime is stored in `ManifestEntry` as a forward-looking hint only and is
-//! not consulted for any cache decision here. (applies ADR-003)
+//! not consulted for any cache decision here. (applies SEARCH-ADR-003)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -85,7 +85,7 @@ const CACHE_MAGIC: &[u8; 4] = b"SKAC";
 ///   empty entries and the cap raise would be a silent no-op.
 ///
 /// A version mismatch at load time discards the entire cache cleanly so the
-/// first incremental build after any such change re-extracts everything. (applies ADR-003)
+/// first incremental build after any such change re-extracts everything. (applies SEARCH-ADR-003)
 pub const CACHE_FORMAT_VERSION: u8 = 2;
 
 /// Sidecar filename inside the cache directory.
@@ -104,7 +104,7 @@ const MAX_CACHE_ENTRIES: usize = 60_000;
 ///
 /// Guards against forged length prefixes that would request a multi-GB
 /// allocation.  A realistic entry (hundreds of bigrams + trigrams) is well
-/// under a few KB; 1 MiB is a generous upper bound.  (applies ADR-003)
+/// under a few KB; 1 MiB is a generous upper bound.  (applies SEARCH-ADR-003)
 const MAX_ENTRY_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Maximum number of bigrams or trigrams in a single decoded cache entry.
@@ -115,7 +115,7 @@ const MAX_ENTRY_BYTES: usize = 1024 * 1024; // 1 MiB
 /// entry (bigram = 12 bytes) could hold at most 87,381 entries, but realistic
 /// Rust files rarely exceed a few thousand n-grams.  64 KiB-worth is generous.
 /// Using a dedicated constant avoids reusing the unrelated file-count cap and
-/// matches the one-constant-per-concept discipline. (applies ADR-003)
+/// matches the one-constant-per-concept discipline. (applies SEARCH-ADR-003)
 const MAX_NGRAMS_PER_ENTRY: usize = MAX_ENTRY_BYTES / BIGRAM_ENTRY_BYTES; // ~87 K
 
 /// Maximum total file size for `ast_index.skcache` before reading into memory.
@@ -125,7 +125,7 @@ const MAX_NGRAMS_PER_ENTRY: usize = MAX_ENTRY_BYTES / BIGRAM_ENTRY_BYTES; // ~87
 /// project.  256 MiB is a generous whole-file cap that rejects obviously
 /// corrupt or adversarial files without blocking any real build.
 /// The per-entry cap (`MAX_ENTRY_BYTES`) and entry-count cap
-/// (`MAX_CACHE_ENTRIES`) apply inside the file once it is loaded.  (applies ADR-003)
+/// (`MAX_CACHE_ENTRIES`) apply inside the file once it is loaded.  (applies SEARCH-ADR-003)
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 // ============================================================================
@@ -272,7 +272,7 @@ fn decode_entry(buf: &[u8]) -> Option<CachedAstEntry> {
 
     // Sanity-check per-entry n-gram counts using the dedicated per-entry cap
     // (not the whole-file entry-count cap) to prevent giant Vec pre-allocations
-    // from a single forged entry. (applies ADR-003)
+    // from a single forged entry. (applies SEARCH-ADR-003)
     if bigram_count > MAX_NGRAMS_PER_ENTRY || trigram_count > MAX_NGRAMS_PER_ENTRY {
         return None;
     }
@@ -412,7 +412,7 @@ fn decode_file(buf: &[u8]) -> Option<HashMap<String, CachedAstEntry>> {
         let payload_len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
         pos += 4;
 
-        // Reject oversized payloads — prevents allocation bombs. (applies ADR-003)
+        // Reject oversized payloads — prevents allocation bombs. (applies SEARCH-ADR-003)
         if payload_len > MAX_ENTRY_BYTES {
             // Skip this entry; try to continue parsing subsequent entries.
             // We cannot safely skip `payload_len` bytes because the length itself
@@ -455,7 +455,7 @@ fn decode_file(buf: &[u8]) -> Option<HashMap<String, CachedAstEntry>> {
 /// 3. [`AstNgramCache::insert`] during the consume loop — record fresh payloads
 ///    on cache miss.
 /// 4. [`AstNgramCache::save`] after `ast_builder.build()` and BEFORE
-///    `new_manifest.save()` — atomically writes the new skcache. (applies ADR-006)
+///    `new_manifest.save()` — atomically writes the new skcache. (applies SEARCH-ADR-006)
 pub struct AstNgramCache {
     /// Entries keyed by content SHA-256 (64-char hex string).
     entries: HashMap<String, CachedAstEntry>,
@@ -489,7 +489,7 @@ impl AstNgramCache {
         // The per-entry caps (MAX_ENTRY_BYTES, MAX_CACHE_ENTRIES) apply inside
         // `decode_file` after the whole-file read, so an unbounded `fs::read`
         // without this guard would materialise the entire file in RAM first.
-        // (applies ADR-003 — per-file caps are necessary but not sufficient)
+        // (applies SEARCH-ADR-003 — per-file caps are necessary but not sufficient)
         if path
             .metadata()
             .is_ok_and(|m| m.len() > MAX_CACHE_FILE_BYTES)
@@ -530,7 +530,7 @@ impl AstNgramCache {
 
     /// Create a detached empty cache with no backing store.
     ///
-    /// For test helpers and throwaway consumers (e.g. ADR-006 abort tests) that
+    /// For test helpers and throwaway consumers (e.g. SEARCH-ADR-006 abort tests) that
     /// inspect the cache in-memory but never call [`Self::save`].  Calling `save`
     /// on an `empty()` instance will attempt to write to the current directory
     /// (empty path) and likely fail — callers that need `save` must use
@@ -599,8 +599,8 @@ impl AstNgramCache {
     /// Returns `Err` on I/O failure (temp file, write, rename).  The caller
     /// (index.rs `Pipeline::run`) must propagate the error BEFORE calling
     /// `new_manifest.save()`, ensuring the manifest is never saved when the
-    /// skcache write fails.  This preserves the ADR-006 invariant: the next
-    /// query self-heals via full rebuild. (applies ADR-006)
+    /// skcache write fails.  This preserves the SEARCH-ADR-006 invariant: the next
+    /// query self-heals via full rebuild. (applies SEARCH-ADR-006)
     pub fn save(&self) -> Result<()> {
         let path = self.cache_dir.join(CACHE_FILENAME);
         let buf = encode_file(&self.entries);

@@ -813,7 +813,7 @@ pub(super) fn resolve_blast_radius_paths(
     //
     // The empty allowlist that results is the "blast radius contributes nothing"
     // sentinel already understood downstream: `blast_temporal_layer` early-outs
-    // to `empty_output` (ADR-009) and `paths_to_scored_file_ids` returns an empty
+    // to `empty_output` (SEARCH-ADR-009) and `paths_to_scored_file_ids` returns an empty
     // layer, so every blast-radius arm reports zero results — matching what the
     // standalone `--blast-radius` arm already returns for the same target.
     if !partners.is_empty() {

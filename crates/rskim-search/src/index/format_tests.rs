@@ -105,7 +105,7 @@ fn test_v1_header_rejected_with_format_version_message() {
 
 /// Format v2 indexes must be rejected with an actionable 'please rebuild' message.
 ///
-/// This validates the ADR-006 invariant: old-format indexes are rejected cleanly
+/// This validates the SEARCH-ADR-006 invariant: old-format indexes are rejected cleanly
 /// so the staleness check triggers a full rebuild, not corruption.
 #[test]
 fn test_v2_header_rejected_with_please_rebuild_message() {
@@ -137,7 +137,7 @@ fn test_v2_header_rejected_with_please_rebuild_message() {
 
 /// Format v3 indexes must be rejected with an actionable 'please rebuild' message.
 ///
-/// AC3 / ADR-006: After the v3→v4 format bump (#358 Item 2), the v4 reader
+/// AC3 / SEARCH-ADR-006: After the v3→v4 format bump (#358 Item 2), the v4 reader
 /// must reject v3 indexes cleanly so the staleness check triggers a full
 /// rebuild — the old index is NOT corrupted, just incompatible.
 ///
@@ -164,7 +164,7 @@ fn test_v3_header_rejected_with_please_rebuild_message() {
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
-        "v3 rejection must include 'please rebuild' (actionable per ADR-006): {err}"
+        "v3 rejection must include 'please rebuild' (actionable per SEARCH-ADR-006): {err}"
     );
     assert!(
         err.contains("format version") || err.contains("unsupported"),
@@ -202,7 +202,7 @@ fn test_v4_header_rejected_with_please_rebuild_message() {
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
-        "v4 rejection must include 'please rebuild' (actionable per ADR-006): {err}"
+        "v4 rejection must include 'please rebuild' (actionable per SEARCH-ADR-006): {err}"
     );
     assert!(
         err.contains("format version") || err.contains("unsupported"),
@@ -219,7 +219,7 @@ fn test_v4_header_rejected_with_please_rebuild_message() {
 /// of the old unconditional SymbolName).  A v5 on-disk index would therefore
 /// produce mis-ranked results rather than garbage, making clean rejection + self-
 /// heal (via `check_staleness` guard `v < LEXICAL_INDEX_FORMAT_VERSION`) the
-/// correct response (ADR-006, self-heal via existing `v < FORMAT_VERSION` guard).
+/// correct response (SEARCH-ADR-006, self-heal via existing `v < FORMAT_VERSION` guard).
 ///
 /// PF-007 compliance: asserts BOTH discriminating substrings
 /// ("unsupported format version" AND "please rebuild") so the test fails if
@@ -244,7 +244,7 @@ fn test_v5_header_rejected_with_please_rebuild_message() {
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
-        "v5 rejection must include 'please rebuild' (actionable per ADR-006 / AD-411-5): {err}"
+        "v5 rejection must include 'please rebuild' (actionable per SEARCH-ADR-006 / AD-411-5): {err}"
     );
     assert!(
         err.contains("format version") || err.contains("unsupported"),
@@ -260,7 +260,7 @@ fn test_v5_header_rejected_with_please_rebuild_message() {
 /// `delta_token_length` 5th varint per entry for exact-token verification in
 /// `search_exact_intersection`). A v6 on-disk index lacks `token_length` data and
 /// would cause `decode_postings_varint` to desync or read across entry boundaries,
-/// making clean rejection the only safe response (ADR-006, self-heal via the
+/// making clean rejection the only safe response (SEARCH-ADR-006, self-heal via the
 /// existing `v < LEXICAL_INDEX_FORMAT_VERSION` guard in `staleness.rs`).
 ///
 /// PF-007 compliance: asserts BOTH discriminating substrings
@@ -286,7 +286,7 @@ fn test_v6_header_rejected_with_please_rebuild_message() {
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
-        "v6 rejection must include 'please rebuild' (actionable per ADR-006 / AD-411-7): {err}"
+        "v6 rejection must include 'please rebuild' (actionable per SEARCH-ADR-006 / AD-411-7): {err}"
     );
     assert!(
         err.contains("format version") || err.contains("unsupported"),

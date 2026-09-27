@@ -574,12 +574,12 @@ impl NgramIndexReader {
         // unless a validity marker proves byte-identity to a prior verified open
         // (#376, AD-376-1).  The full-blob CRC32 is a fixed per-open cost that
         // scales with `.skpost` size; the marker moves it off the per-query hot
-        // path while preserving the ADR-006 desync guard on any marker miss.
+        // path while preserving the SEARCH-ADR-006 desync guard on any marker miss.
         //
         // Ordering matches builder.rs: postings first, then entries+meta.
         // This catches bit-flips in the .skpost blob that would otherwise
         // yield wrong-but-bounded (doc_id, position) values and silently
-        // mis-rank results (Design Constraint: "fail loud", ADR-006).
+        // mis-rank results (Design Constraint: "fail loud", SEARCH-ADR-006).
         let marker_path = dir.join("index.skverify");
         let current_sig =
             crate::validity::current_signature(&idx_path, &post_path, header.checksum);
@@ -795,7 +795,7 @@ impl NgramIndexReader {
     /// This method now returns the **complete** filtered candidate set (all files
     /// that pass `file_filter` + `lang_filter`).  The caller
     /// (`resolve_paths_and_snippets_verified`) is the **only** truncation gate —
-    /// it applies offset and limit AFTER verification (ADR-001).
+    /// it applies offset and limit AFTER verification (SEARCH-ADR-001).
     ///
     /// Performance note: this incurs O(file_count) file reads on the verify pass.
     /// A concrete measured SLA (AC #15a) bounds this: `"fn"` over 5,000 indexed
@@ -949,7 +949,7 @@ impl NgramIndexReader {
     /// gate (AD-355-2).  When `query.limit` is `Some(n)`, offset+limit are
     /// applied AFTER ranking.
     ///
-    /// # Correctness invariant (AD-372-2) + ADR-007 recall
+    /// # Correctness invariant (AD-372-2) + SEARCH-ADR-007 recall
     ///
     /// A file that contains the literal query token — either as an exact
     /// whole-token or as a **substring** of a longer token — contains every
@@ -958,7 +958,7 @@ impl NgramIndexReader {
     /// set: every true match is in the intersection; no true match can be
     /// dropped.
     ///
-    /// Recall contract (ADR-007): `git grep <query>` is the ground-truth for
+    /// Recall contract (SEARCH-ADR-007): `git grep <query>` is the ground-truth for
     /// search quality.  A file containing the query only as a substring of
     /// longer identifiers (e.g. `test_check_staleness_present`) must still
     /// appear in results, ranked with score 0.0 after BM25F-ranked exact
@@ -1181,7 +1181,7 @@ impl NgramIndexReader {
             // intersection because the query's trigrams appear in the file, but no
             // token_position aligns to the exact query byte-length) → 0.0.
             //
-            // ADR-007: recall must match git-grep, which returns every file whose
+            // SEARCH-ADR-007: recall must match git-grep, which returns every file whose
             // content contains the query as a literal substring — including cases like
             // `check_staleness` appearing inside `test_check_staleness_present`.
             // The token_length gate in `align_whole_token` (AD-411-7) correctly keeps
@@ -1533,7 +1533,7 @@ impl SearchLayer for NgramIndexReader {
     ///
     /// `short_query_fallback` now returns the **full** filtered candidate set (no
     /// internal `.take`); the caller's verify-then-truncate-LAST step is the only
-    /// gate (ADR-001).
+    /// gate (SEARCH-ADR-001).
     ///
     /// # Exact-symbol semantics (AD-372-1 / AD-411-3)
     ///

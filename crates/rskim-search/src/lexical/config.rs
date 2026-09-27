@@ -104,7 +104,7 @@ impl Default for BM25FConfig {
     ///   TypeDef(5) > FnSig(4) > SymbolName(3.5) > Import(3) > FnBody(2) > Other(1) > Comment(0.8) > StringLit(0.5)
     ///
     /// and limits the regression for multi-word queries where call-site frequency
-    /// is a legitimate relevance signal (ADR-007 dog-food gate).  Definition names
+    /// is a legitimate relevance signal (SEARCH-ADR-007 dog-food gate).  Definition names
     /// still rank above call sites (4.0–5.0 vs 2.0), so the core #411 ordering
     /// improvement is preserved.
     fn default() -> Self {

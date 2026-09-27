@@ -940,7 +940,7 @@ fn risk_score_output_always_in_unit_range() {
 // ----------------------------------------------------------------------------
 // AC9 / AD-378-2 (grounding): temporal predict-future-fixes backtest.
 //
-// Methodology (ADR-003): risk is computed from commits BEFORE a cutoff T; each
+// Methodology (SEARCH-ADR-003): risk is computed from commits BEFORE a cutoff T; each
 // file is labelled by whether it received a fix-commit AFTER T (reusing the
 // `is_fix_commit` fix-after-touch classifier); both rankers are scored by
 // precision@N against the held-out future fixes. Wilson+decay MUST score >= the
@@ -1016,7 +1016,7 @@ fn precision_at_n(
     hits as f64 / top.len() as f64
 }
 
-/// AC9 (grounding, ADR-003): Wilson+decay precision@N MUST be >= the bare-ratio
+/// AC9 (grounding, SEARCH-ADR-003): Wilson+decay precision@N MUST be >= the bare-ratio
 /// baseline on a temporal predict-future-fixes backtest. Falsifiable: if the
 /// Wilson volume-weighting were removed (ranker reverts to the bare ratio), the
 /// saturated tiny-sample traps would dominate the top of the ranking, the

@@ -166,7 +166,7 @@ pub(super) fn resolve_ast_scored(
 /// - `blast_file_ids`: pre-resolved co-change FileId allowlist from the caller
 ///   (see `temporal::resolve_blast_radius_file_ids`).  When `Some`, intersects
 ///   with the AST result set BEFORE truncation (avoids PF-006 silent-drop,
-///   applies ADR-006 fail-loud counterpart on the read side).  The caller owns
+///   applies SEARCH-ADR-006 fail-loud counterpart on the read side).  The caller owns
 ///   resolution so the JSON-aware warning lives in one place.
 /// - `temporal_sort` / `temporal_db`: when both are `Some`, the AST matches are
 ///   temporally enriched and re-sorted (hot/cold/risky) before truncation.  When
@@ -260,7 +260,7 @@ pub(super) fn run_ast_standalone(
     //
     // With AND-intersect upstream (AD-374-1) the pool is already small, so K=5
     // is adequate. The K value has no measured corpus basis and is tracked under
-    // #361 per ADR-003.
+    // #361 per SEARCH-ADR-003.
     //
     // Temporal path: the temporal resort needs a wider window so hot files
     // beyond raw rank `limit` can be promoted (AC-F4 temporal contract).
@@ -375,7 +375,7 @@ pub(super) fn run_ast_standalone(
         let rel_path = match sorted.get(idx) {
             Some(p) => p,
             None => {
-                // Out-of-range FileId — warn and drop (ADR-006 counterpart).
+                // Out-of-range FileId — warn and drop (SEARCH-ADR-006 counterpart).
                 eprintln!(
                     "skim search: AST verify gate warning: FileId({idx}) is out of \
                      manifest range (manifest has {} files) — index may be out of sync; \
@@ -804,7 +804,7 @@ fn read_line_at(abs_path: &Path, line_1indexed: u32, max_bytes: u64) -> Option<S
 ///   plus the post-truncation `recover_line`. In the routing use a misclassification
 ///   is NOT harmless — a genuinely-synthetic query classified 'not synthetic' would
 ///   route to `find_first_strict_match`, which returns `None` for synthetic IDs, and
-///   the file would be DROPPED (recall loss, an ADR-007 violation).
+///   the file would be DROPPED (recall loss, an SEARCH-ADR-007 violation).
 /// - It is exact for every live pattern: all 24 real-node patterns carry no
 ///   synthetic ID in any n-gram (→ `false`), and all 5 synthetic patterns are
 ///   single-bigram/zero-trigram (OD-394-2) (→ `true`). So it agrees with

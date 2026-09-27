@@ -163,7 +163,7 @@ impl WorkingTreeDelta {
 /// OD-395-5: a None/None-hint skip is reconciled by path presence alone — the
 /// loop is killed even where the filesystem exposes no mtime/size hints.
 ///
-/// # Performance (AC15 / ADR-003)
+/// # Performance (AC15 / SEARCH-ADR-003)
 ///
 /// Metadata/stat only — zero file content reads and zero SHA. A clean tree
 /// yields a `WorkingTreeDelta` with all-zero counts (`is_dirty() == false`).
@@ -309,7 +309,7 @@ fn scan_working_tree(
 /// validates the header size, magic bytes, and (for the current FORMAT_VERSION)
 /// the .skidx and .skpost file sizes — cheap, no mmap, no CRC verification.
 ///
-/// # Lexical self-heal (ADR-006, #355 Finding 9)
+/// # Lexical self-heal (SEARCH-ADR-006, #355 Finding 9)
 ///
 /// `#355` bumped the LEXICAL index FORMAT_VERSION v2→v3 (bigram→trigram).  Without
 /// this check, a user with an unchanged git HEAD and a v2 `index.skidx` would get a
@@ -317,7 +317,7 @@ fn scan_working_tree(
 /// rebuild the index") instead of an automatic rebuild.  This check reads only the
 /// first 6 bytes of `index.skidx` (same cheap approach as the AST version check) and
 /// reports `NoStoredHead` when the lexical version is below the current version so the
-/// next query self-heals via a full rebuild — matching the documented ADR-006 intent.
+/// next query self-heals via a full rebuild — matching the documented SEARCH-ADR-006 intent.
 pub(super) fn check_staleness(
     cache_dir: &Path,
     project_root: &Path,
@@ -330,7 +330,7 @@ pub(super) fn check_staleness(
 
     // Lexical self-heal: if the on-disk FORMAT_VERSION is older than the current
     // version, return NoStoredHead to trigger a full rebuild so the user does not
-    // see a hard error from NgramIndexReader::open (ADR-006, #355 Finding 9).
+    // see a hard error from NgramIndexReader::open (SEARCH-ADR-006, #355 Finding 9).
     // This is the exact mirror of the AST `index_integrity` check below; both probe
     // format version AND structural size consistency, so a truncated or size-inconsistent
     // artifact also reports stale.
@@ -568,7 +568,7 @@ pub(super) fn auto_refresh_if_stale(
         // Check and self-heal here BEFORE the early return, so that a bare
         // `skim search --hot` (routed via auto_refresh_if_stale) always has
         // fresh temporal data when the lexical index is current.
-        // Non-fatal by ADR-006/D5: temporal failure must NOT fail the query.
+        // Non-fatal by SEARCH-ADR-006/D5: temporal failure must NOT fail the query.
         //
         // Guard ordering (#357 cycle-2 finding 19): `let Some(head)` is evaluated
         // FIRST (short-circuits on non-git dirs where current_head=None BEFORE the
@@ -692,7 +692,7 @@ pub(super) fn auto_refresh_if_stale(
 
     // ── #289 temporal build hook point ───────────────────────────────────────
     // Populate temporal.db AFTER the lexical+AST manifest is persisted.
-    // (applies ADR-006: temporal is a derived satellite; must not be written
+    // (applies SEARCH-ADR-006: temporal is a derived satellite; must not be written
     // off a half-built index)
     //
     // `rebuild_temporal` acquires its own bounded `.skim-build.lock` around

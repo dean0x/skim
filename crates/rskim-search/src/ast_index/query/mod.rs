@@ -12,7 +12,7 @@
 //! - **P2 (scalar IDF cache)**: The `last_lang`/`last_idf` scalar cache
 //!   introduced post-#284 already collapses O(postings) IDF lookups to
 //!   O(distinct-langs-in-run).  The mixed-language bench confirms no thrash.
-//!   Closed-by-#284-refactor; no `LANG_COUNT` constant introduced (ADR-003).
+//!   Closed-by-#284-refactor; no `LANG_COUNT` constant introduced (SEARCH-ADR-003).
 //! - **P3 (capacity sizing)**: `run_ngram_set` starts at `CAPACITY_FLOOR` and
 //!   calls `scores.reserve(n)` before processing each posting list of length
 //!   `n`, growing the map at most once per n-gram instead of pre-allocating

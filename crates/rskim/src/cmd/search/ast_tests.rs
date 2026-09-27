@@ -15,7 +15,7 @@
 //! 8.  Text + --ast intersection (hermetic).
 //! 9.  Self-heal for below-FORMAT_VERSION probe.
 //! 10. Self-heal regression — text + --ast combined path.
-//! 11. --ast + --blast-radius intersection (avoids PF-006, applies ADR-006).
+//! 11. --ast + --blast-radius intersection (avoids PF-006, applies SEARCH-ADR-006).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -183,7 +183,7 @@ fn write_cochange_db(db_path: &Path, file_a: &str, file_b: &str) {
 ///
 /// `std::env::set_var` is not thread-safe in a multi-threaded program.  Callers
 /// MUST be annotated with `#[serial_test::serial]` to prevent concurrent mutation
-/// of `SKIM_CACHE_DIR` (applies ADR-006 fail-loud counterpart: no silent env races).
+/// of `SKIM_CACHE_DIR` (applies SEARCH-ADR-006 fail-loud counterpart: no silent env races).
 fn with_isolated_cache<F>(f: F)
 where
     F: FnOnce(&Path) + std::panic::UnwindSafe,
@@ -1269,7 +1269,7 @@ fn text_ast_combined_is_strict_subset_of_lexical_ac1() {
 /// a stale outcome, triggering the self-heal rebuild path.
 ///
 /// Uses `AstIndexReader::index_version` vs `rskim_search::AST_INDEX_FORMAT_VERSION`
-/// which is the single source of truth (ADR-001, single-source-of-truth compile-time
+/// which is the single source of truth (SEARCH-ADR-001, single-source-of-truth compile-time
 /// assertion in lib.rs).
 #[test]
 fn self_heal_below_format_version_reports_stale() {
@@ -1452,7 +1452,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 }
 
 // ============================================================================
-// Group 11: --ast + --blast-radius intersection (avoids PF-006, applies ADR-006)
+// Group 11: --ast + --blast-radius intersection (avoids PF-006, applies SEARCH-ADR-006)
 // ============================================================================
 
 /// Primary regression guard for ISSUE-2: `--ast <pattern> --blast-radius <file>` (no text
@@ -1476,7 +1476,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 /// 4. Graceful-degrade: blast file with no temporal DB → full AST set, exit 0, no error.
 ///
 /// Strategy: drive `run_ast_standalone` directly with an injected `TemporalDb` (no git
-/// history required) so the test is hermetic and fast (applies ADR-006 counterpart on
+/// history required) so the test is hermetic and fast (applies SEARCH-ADR-006 counterpart on
 /// the read side: fail-loud on desync, not silent drop).
 ///
 /// FIXTURE LIMITATION (honest, per project NO-FAKE-SOLUTIONS rule): The TemporalDb is
@@ -3281,15 +3281,15 @@ fn run_ast_standalone_empty_gate_no_elision_marker_ac11_374() {
 #[test]
 fn ast_gate_reuses_lexical_candidate_pool_k_ac12_374() {
     // AD-374-3: the single named constant must be 5 (no measured corpus basis;
-    // tracked under #361 per ADR-003). A change to this value without #361
+    // tracked under #361 per SEARCH-ADR-003). A change to this value without #361
     // evidence fails this guard test.
     const EXPECTED_K: usize = 5;
     assert_eq!(
         super::super::query::LEXICAL_CANDIDATE_POOL_K,
         EXPECTED_K,
         "AC12: LEXICAL_CANDIDATE_POOL_K must be {EXPECTED_K} (unmeasured heuristic, \
-         tracked under #361 per ADR-003). Changing it without #361 evidence and \
-         corpus measurements violates ADR-003. Update #361 first."
+         tracked under #361 per SEARCH-ADR-003). Changing it without #361 evidence and \
+         corpus measurements violates SEARCH-ADR-003. Update #361 first."
     );
 
     // AC12 POOL-SIZE BOUND: candidate_pool(limit, K) must equal max(K×limit, FLOOR).
@@ -3887,7 +3887,7 @@ fn compound_temporal_weight_inert_byte_identical_ac3() {
 
 /// Ground-truth representative line for each of the 5 synthetic patterns'
 /// exhibiting fixture file (AC10, AC13). Established via empirical dogfood
-/// verification against the built release binary — NOT eyeballed (ADR-003:
+/// verification against the built release binary — NOT eyeballed (SEARCH-ADR-003:
 /// grounded, not assumed). Each matches the AD-394-5 per-pattern rule:
 /// god-function/empty-function -> enclosing function line; empty-catch ->
 /// enclosing catch_clause line; excessive-params -> parameter-list's own

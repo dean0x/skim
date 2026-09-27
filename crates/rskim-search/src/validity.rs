@@ -3,7 +3,7 @@
 //! # Why this exists
 //!
 //! Every `NgramIndexReader::open` / `AstIndexReader::open` re-hashes the **entire**
-//! posting blob with CRC32 before any query runs (#364, ADR-006 desync guard).
+//! posting blob with CRC32 before any query runs (#364, SEARCH-ADR-006 desync guard).
 //! On large corpora that fixed per-open cost dominated query latency (median
 //! 57 ms / p90 77 ms; the floor scaled with `.skpost` size, not result count).
 //!
@@ -16,7 +16,7 @@
 //! miss (absent, unreadable, garbage, or a signature that no longer matches the
 //! files) the full CRC32 still runs and, on success, rewrites the marker.
 //!
-//! # Trust boundary (AD-376-2, ACCEPTED per ADR-006)
+//! # Trust boundary (AD-376-2, ACCEPTED per SEARCH-ADR-006)
 //!
 //! The signature is `(idx_len, idx_mtime_ns, post_len, post_mtime_ns)` AND the
 //! header's already-stored `checksum` **field** (read cheaply from the decoded

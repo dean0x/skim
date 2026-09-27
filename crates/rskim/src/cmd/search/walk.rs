@@ -18,7 +18,7 @@
 //! On a git root (`root/.git` exists), [`walk_metadata`] unions the
 //! ignore-walk output with git-tracked files that the `.gitignore`/hidden-file
 //! rules would otherwise exclude. This ensures `skim search` finds every file
-//! that `git grep` finds (ADR-007 dog-food ground truth). The union is
+//! that `git grep` finds (SEARCH-ADR-007 dog-food ground truth). The union is
 //! **default-on** and runs inside [`walk_metadata`] — the single discovery
 //! funnel — so the index builder and the staleness scan always see the same
 //! file set (AD-379-1). Union entries re-enter the same [`normalize_rel_path`]
@@ -105,7 +105,7 @@ const MINIFY_AVG_LINE_BYTES: usize = 500;
 /// MINIFY_MIN_BYTES AND (2) the first MINIFY_PROBE_BYTES probe is effectively
 /// single-line (newline_count <= 1).  Defined as 8 × MINIFY_PROBE_BYTES (= 64
 /// KiB) so the threshold is grounded in the existing probe-window constant
-/// rather than an arbitrary number (applies ADR-003).  Genuine bundles
+/// rather than an arbitrary number (applies SEARCH-ADR-003).  Genuine bundles
 /// (100s KiB–MBs) remain caught; small generated / data-in-code files
 /// (single-digit KiB, including the 1.4 KiB ticket repro) are indexed.
 pub(super) const MINIFY_MIN_BYTES: usize = 8 * MINIFY_PROBE_BYTES; // 65_536
@@ -337,7 +337,7 @@ fn mtime_from_meta(meta: &std::fs::Metadata) -> Option<u64> {
 /// AD-402-4: Unioned files reuse this core so a classify failure on a unioned
 /// [`WalkEntry`] is caught by the existing `Pipeline::consume` desync-abort
 /// (index.rs:711-725) and the `manifest_count != file_count` commit guard
-/// (index.rs:417-424) — no new ADR-006 code needed.
+/// (index.rs:417-424) — no new SEARCH-ADR-006 code needed.
 fn classify_metadata_core(
     abs_path: &Path,
     meta_opt: Option<std::fs::Metadata>,
@@ -446,7 +446,7 @@ fn classify_tracked_path(abs_path: &Path, root: &Path) -> ClassifyOutcome<WalkEn
 /// assignment in the consumer — the sort key is byte-identical to the
 /// manifest `BTreeMap<String>` key, so `FileId(n)` in the walk corresponds to
 /// `sorted_paths()[n]` in the manifest, the invariant all five FileId
-/// consumers depend on (applies ADR-006 / AD-379-4).
+/// consumers depend on (applies SEARCH-ADR-006 / AD-379-4).
 ///
 /// Selection is also an order-invariant SET function of the complete walked
 /// set: retained membership at the cap depends only on each entry's key,
@@ -605,7 +605,7 @@ fn merge_tracked_union(
 ///
 /// AD-413-12: delegates to `staleness::resolve_git_dir` so the `gitdir:` POINTER has
 /// ONE parser.  Two near-copies drifted (line-scan vs whole-file `strip_prefix`); #413
-/// touches worktree indirection, so the duplicate is removed with it (applies ADR-001).
+/// touches worktree indirection, so the duplicate is removed with it (applies SEARCH-ADR-001).
 /// NOT a claim that all `.git`-path consumers are unified: `walk::discover_project_root`
 /// owns the bounded ANCESTOR walk (a different job, reused by AD-413-14) and
 /// `walk_metadata`'s `.git` existence probe stays local.  `hooks.rs` no longer hand-builds
@@ -761,7 +761,7 @@ fn list_tracked_files(root: &Path) -> Option<Vec<PathBuf>> {
         // skim to read files outside the repository (path traversal / local
         // information disclosure). `classify_metadata_core`'s strip_prefix guard
         // is defense in depth. Delegates to the canonical shared guard
-        // `crate::cmd::is_repo_relative_safe` (applies ADR-008) so all git-path
+        // `crate::cmd::is_repo_relative_safe` (applies SEARCH-ADR-008) so all git-path
         // containment checks stay in one place and cannot drift.
         if !crate::cmd::is_repo_relative_safe(&path) {
             continue;

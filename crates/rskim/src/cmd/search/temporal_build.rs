@@ -13,7 +13,7 @@
 //! assembly and the sync call; all library primitives are imported from
 //! `rskim_search`.  The function is called from the #289 hook point in
 //! `staleness.rs:auto_refresh_if_stale`, after the lexical+AST manifest
-//! persists (applies ADR-006 ordering invariant).
+//! persists (applies SEARCH-ADR-006 ordering invariant).
 //!
 //! # Failure isolation (D5)
 //!
@@ -315,7 +315,7 @@ pub(super) fn build_hotspot_rows(
 ///   total commits" — shown in the `Fix%` column of `--risky`). Intentionally
 ///   distinct from `risk_score` (AD-378-3 two-field separation).
 /// - `total_commits` and `fix_commits` = lifetime counts from [`FileTemporalStats`]
-///   (computed over the full-history walk, not the 90-day window — O-C / ADR-003).
+///   (computed over the full-history walk, not the 90-day window — O-C / SEARCH-ADR-003).
 pub(super) fn build_risk_rows(
     risk_scores: &HashMap<String, rskim_search::FileRiskScores>,
     temporal_stats: &HashMap<String, rskim_search::FileTemporalStats>,
@@ -364,7 +364,7 @@ pub(super) fn build_risk_rows(
 
 /// Rebuild the temporal database after a successful lexical+AST index build.
 ///
-/// # Call site contract (applies ADR-006)
+/// # Call site contract (applies SEARCH-ADR-006)
 ///
 /// This function MUST be called AFTER the lexical+AST manifest is persisted.
 /// The hook point in `staleness.rs:auto_refresh_if_stale` (the "#289 temporal
@@ -405,7 +405,7 @@ pub(super) fn build_risk_rows(
 /// at unit level.  The subdirectory-root route is now live in production: AD-408-5's ghost
 /// anchor (the `ghost_root` binding) is reachable for the first time via `--root <subdir>` (#413).
 ///
-/// # Lookback semantics (O-C / ADR-003)
+/// # Lookback semantics (O-C / SEARCH-ADR-003)
 ///
 /// A single full-history walk (`lookback_days = 0`) supplies all data:
 /// - `compute_file_risk_scores` applies exponential decay internally.
@@ -458,7 +458,7 @@ pub(super) fn rebuild_temporal(
 /// Performs two checks in order:
 /// 1. **Containment guard** via [`crate::cmd::is_repo_relative_safe`] — rejects
 ///    any `rel` with absolute, `..` (ParentDir), or drive-relative (Prefix)
-///    components to mitigate path-traversal risk (applies ADR-008; single
+///    components to mitigate path-traversal risk (applies SEARCH-ADR-008; single
 ///    canonical helper shared with `walk::list_tracked_files` and `heatmap::resolve_diff_files`).
 ///    Git never emits such components in tree-diff output, so no legitimate row
 ///    is dropped by this guard.
@@ -622,7 +622,7 @@ fn backoff_sentinel_matches(cache_dir: &Path, head: &str, shallow: Option<bool>)
 ///
 /// This is the build-time ghost filter (AD-408-1). It runs on freshly-computed
 /// rows *before* [`TemporalDb::sync`] persists them, so the prior DB survives
-/// intact when sync fails and the self-heal invariant holds (applies ADR-006).
+/// intact when sync fails and the self-heal invariant holds (applies SEARCH-ADR-006).
 ///
 /// Hotspot and risk rows are retained only when the file exists on disk as a
 /// regular file; cochange rows survive only when **both** `file_a` and `file_b`
@@ -717,7 +717,7 @@ fn apply_scope_filter(
 /// Inner implementation of `rebuild_temporal` with an injectable `TemporalSource`.
 ///
 /// Separated from `rebuild_temporal` so tests can supply a counting or fake
-/// source (ADR-003 PERFORMANCE criterion: assert parse_history call-count == 1).
+/// source (SEARCH-ADR-003 PERFORMANCE criterion: assert parse_history call-count == 1).
 /// Production always uses `GixSource` via `rebuild_temporal`.
 pub(super) fn rebuild_temporal_with_source(
     src: &dyn rskim_search::TemporalSource,
@@ -848,7 +848,7 @@ pub(super) fn rebuild_temporal_with_source(
     let (mut hotspot_rows, mut risk_rows, mut cochange_rows) = if risk_history.commits.is_empty() {
         (vec![], vec![], vec![])
     } else {
-        // Full-history walk feeds all score computation (O-C / ADR-003).
+        // Full-history walk feeds all score computation (O-C / SEARCH-ADR-003).
         // risk_scores: decay-weighted hotspot/fix_density.
         let risk_scores = rskim_search::compute_file_risk_scores(
             &risk_history.commits,
@@ -873,7 +873,7 @@ pub(super) fn rebuild_temporal_with_source(
 
     // ── Build-time ghost filter (AD-408-1 / AD-408-5) ────────────────────────
     // Applied on freshly-computed rows *before* `db.sync` persists them so the
-    // prior DB survives on failure and the self-heal invariant holds (ADR-006).
+    // prior DB survives on failure and the self-heal invariant holds (SEARCH-ADR-006).
     // See `apply_ghost_filter` for the full invariant documentation.
     //
     // AD-408-5: history paths from `parse_history` are REPO-ROOT-relative
@@ -946,7 +946,7 @@ pub(super) fn rebuild_temporal_with_source(
     // Acquired AFTER compute (pure) to minimise lock hold time.
     // Delegates to `build_lock::acquire` — the SINGLE bounded implementation
     // shared with `build_index` (index.rs). Both callers use the same file,
-    // the same poll interval, and the same deadline (applies ADR-006).
+    // the same poll interval, and the same deadline (applies SEARCH-ADR-006).
     let _lock = super::build_lock::acquire("skim search", cache_dir)?;
 
     // SE-1: the open-failure loud notice fires only on explicit build/rebuild/update.
@@ -1124,7 +1124,7 @@ pub(super) fn rebuild_temporal_with_source(
 /// # Failure isolation (D5)
 ///
 /// Every failure mode returns `Ok(())` with a debug-gated diagnostic: a temporal
-/// failure must never fail the explicit build that triggered it (ADR-006/D5).
+/// failure must never fail the explicit build that triggered it (SEARCH-ADR-006/D5).
 pub(super) fn build_empty_temporal_for_unborn_head(
     src: &dyn rskim_search::TemporalSource,
     root: &Path,
@@ -1214,7 +1214,7 @@ pub(super) fn build_empty_temporal_for_unborn_head(
 /// On success returns `Some(db)`.  On any non-fatal failure, writes the
 /// backoff sentinel (when safe to do so), prints a diagnostic, and returns
 /// `None` so the caller can immediately `return Ok(())` (temporal failure is
-/// non-fatal per ADR-006/D5).
+/// non-fatal per SEARCH-ADR-006/D5).
 ///
 /// `is_loud` gates the open-failure notice for the `Err(other)` arm (SE-1).
 /// `is_shallow` is passed to [`write_backoff_sentinel`] so the two-line
@@ -1440,7 +1440,7 @@ fn record_temporal_anchor(
     // returns the enclosing toplevel, so a `debug_assert_eq!` here would abort
     // debug builds and `cargo test` runs inside the D5-isolated path whose
     // entire contract is "temporal failure must NOT fail the lexical query" —
-    // the worst possible place for a panic (applies ADR-006).  Downgraded to a
+    // the worst possible place for a panic (applies SEARCH-ADR-006).  Downgraded to a
     // debug-gated `eprintln!` using the module's own idiom so the disagreement
     // is observable without crashing anything.
     if crate::debug::is_debug_enabled() {

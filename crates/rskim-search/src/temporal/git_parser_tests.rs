@@ -862,7 +862,7 @@ fn git_rev_parse_head(dir: &Path) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// AC-1: parse_history must return exactly git rev-list --count --no-merges HEAD
-/// commits on the merge fixture (derived in-test, never hardcoded — ADR-003).
+/// commits on the merge fixture (derived in-test, never hardcoded — SEARCH-ADR-003).
 #[test]
 fn test_merge_repo_total_equals_git_rev_list_no_merges() {
     if !git_available() {
@@ -956,7 +956,7 @@ fn test_merge_commit_absent_from_history() {
 // ---------------------------------------------------------------------------
 
 /// AC-2: for each path the skim touch count must equal
-/// git rev-list --count --no-merges --full-history HEAD -- <path> (ADR-003).
+/// git rev-list --count --no-merges --full-history HEAD -- <path> (SEARCH-ADR-003).
 #[test]
 fn test_per_file_counts_match_git_log_no_merges() {
     if !git_available() {

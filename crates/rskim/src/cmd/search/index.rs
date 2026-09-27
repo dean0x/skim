@@ -59,7 +59,7 @@ pub(super) use super::walk::resolve_search_cache_dir;
 /// - `--max-files=<N>` — override the 50,000 file cap (must be ≥ 1)
 /// - `-h` / `--help` — print help text and exit
 ///
-/// # AD-375-2 — `index::run` / `IndexCli` are retained, not deleted (applies ADR-001).
+/// # AD-375-2 — `index::run` / `IndexCli` are retained, not deleted (applies SEARCH-ADR-001).
 ///
 /// As of #375, `skim search index` as a positional subcommand was removed —
 /// `index` is now treated as a query term, not a build trigger.  This function
@@ -208,7 +208,7 @@ pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     // the temporal rebuild (called from staleness.rs) use ONE lock loop with
     // consistent wait message and deadline. The lock is held for the duration of
     // `pipeline.run()` and released when `_lock` drops at function end.
-    // (applies ADR-006: serialises concurrent skim processes)
+    // (applies SEARCH-ADR-006: serialises concurrent skim processes)
     let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;
 
     pipeline.run()
@@ -354,10 +354,10 @@ impl<'cfg> Pipeline<'cfg> {
         let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
         // Capture consume's result rather than propagating with `?` immediately.
         // We MUST join the producer before propagating any error so that a worker-thread
-        // panic is surfaced on BOTH the success path AND the ADR-006 abort path.
+        // panic is surfaced on BOTH the success path AND the SEARCH-ADR-006 abort path.
         // On the abort path, `rx` is consumed (dropped inside `consume`) before we reach
         // the join, so the producer's `tx.send()` has already returned `Err` and the
-        // producer thread has already exited — no deadlock risk. (applies ADR-006)
+        // producer thread has already exited — no deadlock risk. (applies SEARCH-ADR-006)
         let mut new_ast_cache = AstNgramCache::with_dir(&self.cache_dir);
         let consume_result = Self::consume(
             &mut builder,
@@ -369,7 +369,7 @@ impl<'cfg> Pipeline<'cfg> {
         );
 
         // Always join the producer first so a worker-thread panic is surfaced
-        // regardless of whether consume succeeded or aborted (ADR-006 desync).
+        // regardless of whether consume succeeded or aborted (SEARCH-ADR-006 desync).
         // AD-395-2: `JoinHandle<ProducerSkips>` — the join establishes the
         // happens-before edge that makes the producer's local Vecs safe to read
         // here (replaces the prior `Arc<AtomicU32>` load comment).
@@ -402,7 +402,7 @@ impl<'cfg> Pipeline<'cfg> {
         // the file count before we write anything to disk. A mismatch here means
         // the "every file gets exactly one call" contract was broken somewhere in
         // the consume loop. Abort before any write so the old manifest survives
-        // and the next query self-heals. (applies ADR-006)
+        // and the next query self-heals. (applies SEARCH-ADR-006)
         //
         // AD-395-2: skip inserts do NOT touch `new_manifest.entries` so the
         // manifest_count == file_count guard and the FileId↔sorted_paths invariant
@@ -442,7 +442,7 @@ impl<'cfg> Pipeline<'cfg> {
             .build()
             .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
 
-        // Commit ordering (applies ADR-006):
+        // Commit ordering (applies SEARCH-ADR-006):
         // Write the AST n-gram cache AFTER ast_builder.build() and BEFORE
         // new_manifest.save().  A write failure here returns Err so the
         // manifest is never saved — the next query self-heals via full rebuild.
@@ -663,7 +663,7 @@ impl<'cfg> Pipeline<'cfg> {
     /// 3. `new_ast_cache` accumulates payloads for all files in this build (hits
     ///    re-inserted from the prior cache, misses inserted after extraction).
     ///    The caller writes it atomically after `ast_builder.build()` and before
-    ///    `new_manifest.save()`. (applies ADR-006)
+    ///    `new_manifest.save()`. (applies SEARCH-ADR-006)
     pub(super) fn consume(
         builder: &mut NgramIndexBuilder,
         ast_builder: &mut AstIndexBuilder,
@@ -699,11 +699,11 @@ impl<'cfg> Pipeline<'cfg> {
 
             // AST index: resolve payload from cache (hit) or derive fresh (miss).
             // The invariant: EVERY file that passes the lexical stage gets exactly
-            // ONE `add_file_ngrams` call — hit or miss. NEVER skip. (applies ADR-006)
+            // ONE `add_file_ngrams` call — hit or miss. NEVER skip. (applies SEARCH-ADR-006)
             //
             // `pf.sha256` is borrowed here so it can be moved into the ManifestEntry
             // below without a redundant heap clone — the SHA is a 64-char hex string
-            // that only needs to be allocated once per file. (applies ADR-003)
+            // that only needs to be allocated once per file. (applies SEARCH-ADR-003)
             let is_hit = pf.ast_cached.is_some();
             let entry = resolve_ast_entry(
                 new_ast_cache,
@@ -727,7 +727,7 @@ impl<'cfg> Pipeline<'cfg> {
             // old manifest survives and the next query self-heals via a full
             // rebuild. Silently continuing would advance next_file_id and cascade
             // the desync into a committed-but-corrupt index. See the FileId-
-            // alignment invariant in the function doc. (applies ADR-006)
+            // alignment invariant in the function doc. (applies SEARCH-ADR-006)
             if let Err(e) = ast_builder.add_file_ngrams(
                 FileId(next_file_id),
                 pf.lang,
@@ -803,18 +803,18 @@ impl<'cfg> Pipeline<'cfg> {
 /// - **Hit** (`cached.is_some()`): the owned `CachedAstEntry` arrived with the
 ///   `ProcessedFile`; insert it into `new_ast_cache` so it survives to the next
 ///   build, then return a borrow.  Uses `get_or_insert` (Entry API) so the SHA
-///   key is hashed only once — no insert-then-re-probe double-hash. (applies ADR-003)
+///   key is hashed only once — no insert-then-re-probe double-hash. (applies SEARCH-ADR-003)
 ///
 /// - **Miss** (`cached.is_none()`): run `derive_ast_entry` (fail-soft: always
 ///   returns a valid, possibly empty triple), construct a `CachedAstEntry`, insert
 ///   it, and return a borrow.  Empty entries for data-format files are valid cache
-///   entries, not corrupt. (applies ADR-003)
+///   entries, not corrupt. (applies SEARCH-ADR-003)
 ///
 /// # AC7 poison-check note
 ///
 /// A zero-count entry from the cache reaching `add_file_ngrams` will trigger the
 /// desync abort in `add_file_ngrams`'s `check_count_nonzero` guard (applies
-/// ADR-006).  That path is not handled here — `resolve_ast_entry` is intentionally
+/// SEARCH-ADR-006).  That path is not handled here — `resolve_ast_entry` is intentionally
 /// unaware of it, keeping responsibilities separate.
 fn resolve_ast_entry<'cache>(
     new_ast_cache: &'cache mut AstNgramCache,
@@ -848,7 +848,7 @@ fn resolve_ast_entry<'cache>(
 ///
 /// Mtime is stored in the manifest for forward-looking aggressive-mode support
 /// (where mtime mismatch could skip SHA entirely) but is not read here — SHA is
-/// the sole cache authority in safe mode. (applies ADR-003)
+/// the sole cache authority in safe mode. (applies SEARCH-ADR-003)
 ///
 /// Called by the producer thread for each [`WalkEntry`].
 fn read_and_classify(
@@ -888,7 +888,7 @@ fn read_and_classify(
 
     // Always compute SHA — it is the correctness guarantee for both the
     // lexical and AST caches.  Content SHA-256 is the sole cache authority;
-    // mtime is never consulted for cache decisions. (applies ADR-003)
+    // mtime is never consulted for cache decisions. (applies SEARCH-ADR-003)
     let sha = sha256_hex(content.as_bytes());
 
     // Lexical 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
