@@ -392,3 +392,136 @@ limits = [5, 20]
 id = "zod-F004"
 query = "ZodType"
 limits = [5, 20]
+
+# --- structural (--ast) entries, #541 (scoreboard golden-gen --corpus zod --ast) ----------
+# One entry per (pattern, language) where the structural oracle or skim finds a
+# file in this corpus (golden-gen never proposes a vacuous one). precision is
+# "hard" iff the catalog marks the pattern exact; it is frozen here and never
+# re-read from the catalog. The golden-gen counts are proposal-time evidence
+# (release skim 2f2186c), not checked values.
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "zod-ast-call-in-loop-javascript"
+pattern = "call-in-loop"
+lang = "javascript"
+precision = "ratchet"
+
+# golden-gen: oracle files 38; skim files 38
+[[ast]]
+id = "zod-ast-call-in-loop-typescript"
+pattern = "call-in-loop"
+lang = "typescript"
+precision = "ratchet"
+
+# golden-gen: oracle files 12; skim files 12
+[[ast]]
+id = "zod-ast-class-method-typescript"
+pattern = "class-method"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 7; skim files 7
+[[ast]]
+id = "zod-ast-empty-catch-typescript"
+pattern = "empty-catch"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "zod-ast-method-with-body-javascript"
+pattern = "method-with-body"
+lang = "javascript"
+precision = "hard"
+
+# golden-gen: oracle files 51; skim files 51
+[[ast]]
+id = "zod-ast-method-with-body-typescript"
+pattern = "method-with-body"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "zod-ast-nested-loop-typescript"
+pattern = "nested-loop"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 2; skim files 3
+[[ast]]
+id = "zod-ast-numeric-literal-in-expression-tsx"
+pattern = "numeric-literal-in-expression"
+lang = "tsx"
+precision = "ratchet"
+
+# golden-gen: oracle files 119; skim files 119
+[[ast]]
+id = "zod-ast-numeric-literal-in-expression-typescript"
+pattern = "numeric-literal-in-expression"
+lang = "typescript"
+precision = "ratchet"
+
+# golden-gen: oracle files 56; skim files 56
+[[ast]]
+id = "zod-ast-switch-with-cases-typescript"
+pattern = "switch-with-cases"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 5; skim files 5
+[[ast]]
+id = "zod-ast-ternary-expression-tsx"
+pattern = "ternary-expression"
+lang = "tsx"
+precision = "ratchet"
+
+# golden-gen: oracle files 68; skim files 68
+[[ast]]
+id = "zod-ast-ternary-expression-typescript"
+pattern = "ternary-expression"
+lang = "typescript"
+precision = "ratchet"
+
+# golden-gen: oracle files 3; skim files 2
+[[ast]]
+id = "zod-ast-try-catch-tsx"
+pattern = "try-catch"
+lang = "tsx"
+precision = "hard"
+
+# golden-gen: oracle files 41; skim files 41
+[[ast]]
+id = "zod-ast-try-catch-typescript"
+pattern = "try-catch"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "zod-ast-try-finally-typescript"
+pattern = "try-finally"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "zod-ast-unhandled-result-javascript"
+pattern = "unhandled-result"
+lang = "javascript"
+precision = "ratchet"
+
+# golden-gen: oracle files 9; skim files 8
+[[ast]]
+id = "zod-ast-unhandled-result-tsx"
+pattern = "unhandled-result"
+lang = "tsx"
+precision = "ratchet"
+
+# golden-gen: oracle files 270; skim files 270
+[[ast]]
+id = "zod-ast-unhandled-result-typescript"
+pattern = "unhandled-result"
+lang = "typescript"
+precision = "ratchet"

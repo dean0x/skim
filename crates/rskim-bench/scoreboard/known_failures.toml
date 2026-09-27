@@ -75,3 +75,15 @@ issue = "#547"
 check = "order.score_monotone"
 ids = ["skim-F003", "ripgrep-F003", "flask-F003", "zod-F003"]
 note = "ast.rs:243-245 search_ast returns FileId (= path) order; nothing sorts by score"
+
+# --- #546: --ast named patterns match more than their names promise ------------------------
+# try-catch-finally declares two independent bigrams, try_statement -> catch_clause
+# and try_statement -> finally_clause (patterns.rs:288-301), and the verify gate
+# accepts a file where ANY one declared edge is real (compound/reparse.rs:139-230).
+# The structural oracle (#541) requires ONE try_statement carrying both clauses.
+
+[[xfail]]
+issue = "#546"
+check = "structural.precision"
+ids = ["skim-ast-try-catch-finally-javascript"]
+note = "npm/rskim/scripts/postinstall.js: try{}finally{} (:233/:271) wraps a separate try{}catch{} (:273/:275); no try has both clauses"

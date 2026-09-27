@@ -445,3 +445,171 @@ limits = [5, 20]
 id = "skim-F004"
 query = "staleness"
 limits = [5, 20]
+
+# --- structural (--ast) entries, #541 (scoreboard golden-gen --corpus skim --ast) ---------
+# One entry per (pattern, language) where the structural oracle or skim finds a
+# file in this corpus (golden-gen never proposes a vacuous one). precision is
+# "hard" iff the catalog marks the pattern exact; it is frozen here and never
+# re-read from the catalog. The golden-gen counts are proposal-time evidence
+# (release skim 2f2186c), not checked values.
+
+# golden-gen: oracle files 2; skim files 2
+[[ast]]
+id = "skim-ast-call-in-loop-javascript"
+pattern = "call-in-loop"
+lang = "javascript"
+precision = "ratchet"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "skim-ast-class-method-javascript"
+pattern = "class-method"
+lang = "javascript"
+precision = "hard"
+
+# golden-gen: oracle files 5; skim files 5
+[[ast]]
+id = "skim-ast-class-method-typescript"
+pattern = "class-method"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "skim-ast-empty-catch-javascript"
+pattern = "empty-catch"
+lang = "javascript"
+precision = "hard"
+
+# golden-gen: oracle files 25; skim files 25
+[[ast]]
+id = "skim-ast-empty-function-rust"
+pattern = "empty-function"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 79; skim files 79
+[[ast]]
+id = "skim-ast-excessive-params-rust"
+pattern = "excessive-params"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 541; skim files 541
+[[ast]]
+id = "skim-ast-function-with-body-rust"
+pattern = "function-with-body"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 82; skim files 82
+[[ast]]
+id = "skim-ast-god-function-rust"
+pattern = "god-function"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 144; skim files 144
+[[ast]]
+id = "skim-ast-impl-method-rust"
+pattern = "impl-method"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 270; skim files 270
+[[ast]]
+id = "skim-ast-match-with-arms-rust"
+pattern = "match-with-arms"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "skim-ast-method-with-body-javascript"
+pattern = "method-with-body"
+lang = "javascript"
+precision = "hard"
+
+# golden-gen: oracle files 5; skim files 5
+[[ast]]
+id = "skim-ast-method-with-body-typescript"
+pattern = "method-with-body"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 3; skim files 3
+[[ast]]
+id = "skim-ast-numeric-literal-in-expression-javascript"
+pattern = "numeric-literal-in-expression"
+lang = "javascript"
+precision = "ratchet"
+
+# golden-gen: oracle files 380; skim files 380
+[[ast]]
+id = "skim-ast-rust-nested-loop-rust"
+pattern = "rust-nested-loop"
+lang = "rust"
+precision = "ratchet"
+
+# golden-gen: oracle files 12; skim files 12
+[[ast]]
+id = "skim-ast-rust-unsafe-block-rust"
+pattern = "rust-unsafe-block"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "skim-ast-ternary-expression-javascript"
+pattern = "ternary-expression"
+lang = "javascript"
+precision = "ratchet"
+
+# golden-gen: oracle files 3; skim files 3
+[[ast]]
+id = "skim-ast-try-catch-javascript"
+pattern = "try-catch"
+lang = "javascript"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "skim-ast-try-catch-typescript"
+pattern = "try-catch"
+lang = "typescript"
+precision = "hard"
+
+# golden-gen: oracle files 0; skim files 1
+[[ast]]
+id = "skim-ast-try-catch-finally-javascript"
+pattern = "try-catch-finally"
+lang = "javascript"
+precision = "hard"
+
+# golden-gen: oracle files 1; skim files 1
+[[ast]]
+id = "skim-ast-try-finally-javascript"
+pattern = "try-finally"
+lang = "javascript"
+precision = "hard"
+
+# golden-gen: oracle files 3; skim files 3
+[[ast]]
+id = "skim-ast-unhandled-result-javascript"
+pattern = "unhandled-result"
+lang = "javascript"
+precision = "ratchet"
+
+# golden-gen: oracle files 435; skim files 435
+[[ast]]
+id = "skim-ast-unhandled-result-rust"
+pattern = "unhandled-result"
+lang = "rust"
+precision = "ratchet"
+
+# golden-gen: oracle files 4; skim files 4
+[[ast]]
+id = "skim-ast-unhandled-result-typescript"
+pattern = "unhandled-result"
+lang = "typescript"
+precision = "ratchet"
