@@ -27,8 +27,8 @@ fn should_skip_by_flag(middle: &[&str], skip_prefixes: &[&str]) -> bool {
 ///
 /// # Algorithm
 ///
-/// Performs an env-var strip, toolchain strip, and separator split, then
-/// walks the rule table once.  When a skip flag fires on a rule, iteration
+/// Performs an env-var strip, a cargo-toolchain bail, and a separator split,
+/// then walks the rule table once.  When a skip flag fires on a rule, iteration
 /// continues (not returns) — but if a LATER rule then matches, the skipped
 /// more-specific rule suppresses the rewrite (returns `None`).  This keeps
 /// "specific rule said no" authoritative over broader catch-alls.
@@ -56,13 +56,24 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
         return None;
     }
 
-    // Step 2: Strip cargo toolchain prefix (+nightly etc.)
-    let (toolchain, match_tokens) = strip_cargo_toolchain(command_tokens);
+    // Step 2: Bail on a rustup toolchain override (`cargo +nightly test`).
+    //
+    // rustup accepts `+toolchain` only as cargo's first argument, and no rewrite
+    // can put it back there: the rule table keys on the subcommand, and two rules
+    // (`cargo fmt --check`, `cargo fmt -- --check`) rewrite to `skim rustfmt` —
+    // a command line with no `cargo` token at all, where the token has no valid
+    // position and reads as a file path.  Anywhere after the subcommand,
+    // `cargo test` takes it as the `[TESTNAME]` filter and exits 0 having run
+    // nothing.  #317 requires byte-faithful reconstruction or a bail, so bail:
+    // the real command runs untouched, at the cost of compression for this shape.
+    if has_cargo_toolchain_override(command_tokens) {
+        return None;
+    }
 
     // Step 3: Split at `--` separator
-    let sep_pos = split_at_separator(&match_tokens);
-    let before_sep = &match_tokens[..sep_pos];
-    let separator_and_after = &match_tokens[sep_pos..];
+    let sep_pos = split_at_separator(command_tokens);
+    let before_sep = &command_tokens[..sep_pos];
+    let separator_and_after = &command_tokens[sep_pos..];
 
     let mut skipped = false;
 
@@ -182,7 +193,6 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
                 .iter()
                 .chain(rule.rewrite_to.iter())
                 .map(|s| s.to_string())
-                .chain(toolchain.map(String::from))
                 .chain(
                     middle
                         .iter()
@@ -199,7 +209,6 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
                 .iter()
                 .map(|s| s.to_string())
                 .chain(std::iter::once(rule.rewrite_to[0].to_string()))
-                .chain(toolchain.map(String::from))
                 // Emit the full original before_sep: binary name, global flags,
                 // subcommand, and any remaining args.
                 .chain(before_sep.iter().map(|s| s.to_string()))
@@ -293,19 +302,15 @@ pub(super) fn strip_env_vars(tokens: &[&str]) -> usize {
     count
 }
 
-/// Strip cargo toolchain prefix (e.g., `+nightly`).
+/// Return `true` when `tokens` carries a rustup toolchain override for cargo
+/// (e.g. `cargo +nightly test`).
 ///
-/// If tokens[0] is "cargo" and tokens[1] starts with '+', strip tokens[1]
-/// for matching but preserve it for output reconstruction.
-pub(super) fn strip_cargo_toolchain<'a>(tokens: &[&'a str]) -> (Option<&'a str>, Vec<&'a str>) {
-    if tokens.len() >= 2 && tokens[0] == "cargo" && tokens[1].starts_with('+') {
-        let toolchain = Some(tokens[1]);
-        let mut match_tokens = vec![tokens[0]];
-        match_tokens.extend_from_slice(&tokens[2..]);
-        (toolchain, match_tokens)
-    } else {
-        (None, tokens.to_vec())
-    }
+/// Matches only the position rustup itself accepts: `tokens[0] == "cargo"` and
+/// `tokens[1]` starting with `+`.  A `+`-prefixed token anywhere later is the
+/// user's own argument (`cargo test +nightly` is a libtest name filter), so it
+/// is not a toolchain override and must rewrite normally.
+pub(super) fn has_cargo_toolchain_override(tokens: &[&str]) -> bool {
+    matches!(tokens, [first, second, ..] if *first == "cargo" && second.starts_with('+'))
 }
 
 /// Find the index of the first `--` separator.
@@ -442,21 +447,34 @@ mod tests {
     }
 
     // ========================================================================
-    // strip_cargo_toolchain
+    // has_cargo_toolchain_override
     // ========================================================================
 
     #[test]
-    fn test_strip_cargo_toolchain_nightly() {
-        let (tc, tokens) = strip_cargo_toolchain(&["cargo", "+nightly", "test"]);
-        assert_eq!(tc, Some("+nightly"));
-        assert_eq!(tokens, vec!["cargo", "test"]);
+    fn test_has_cargo_toolchain_override_detects_every_spelling() {
+        for spelling in ["+nightly", "+stable", "+1.98", "+1.98.0"] {
+            assert!(
+                has_cargo_toolchain_override(&["cargo", spelling, "test"]),
+                "{spelling} in cargo's first argument position is a toolchain override"
+            );
+        }
     }
 
     #[test]
-    fn test_strip_cargo_toolchain_none() {
-        let (tc, tokens) = strip_cargo_toolchain(&["cargo", "test"]);
-        assert!(tc.is_none());
-        assert_eq!(tokens, vec!["cargo", "test"]);
+    fn test_has_cargo_toolchain_override_absent() {
+        assert!(!has_cargo_toolchain_override(&["cargo", "test"]));
+        assert!(!has_cargo_toolchain_override(&["cargo"]));
+        assert!(!has_cargo_toolchain_override(&[]));
+    }
+
+    /// A `+`-prefixed token after the subcommand is the user's own libtest name
+    /// filter, not a toolchain override — it must keep rewriting normally.
+    #[test]
+    fn test_has_cargo_toolchain_override_ignores_later_plus_token() {
+        assert!(!has_cargo_toolchain_override(&[
+            "cargo", "test", "+nightly"
+        ]));
+        assert!(!has_cargo_toolchain_override(&["rustfmt", "+nightly"]));
     }
 
     // ========================================================================
@@ -505,22 +523,135 @@ mod tests {
     }
 
     // ========================================================================
-    // Cargo toolchain stripping
+    // Cargo toolchain override — #317 bail
     // ========================================================================
 
-    #[test]
-    fn test_cargo_toolchain_nightly() {
-        let result = try_rewrite(&["cargo", "+nightly", "test"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "cargo", "test", "+nightly"]);
+    /// Own a token list the way the engine emits one.
+    fn owned(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Return `true` when a `+toolchain` token sits where cargo, libtest, or the
+    /// rewritten tool will consume it as an argument instead of rustup honouring
+    /// it as a toolchain override.
+    ///
+    /// rustup honours `+toolchain` only as cargo's first argument.  Elsewhere:
+    /// after the subcommand `cargo test` takes it as the `[TESTNAME]` libtest
+    /// filter (exit 0, every test filtered out); in a command line carrying no
+    /// `cargo` token at all — `skim rustfmt +nightly` — rustfmt reads it as a
+    /// file path.  This models the observable hazard rather than token order, so
+    /// it stays meaningful against any future emission shape.
+    fn toolchain_token_is_consumable(tokens: &[String]) -> bool {
+        let Some(plus) = tokens.iter().position(|t| t.starts_with('+')) else {
+            return false;
+        };
+        let Some(cargo) = tokens.iter().position(|t| t == "cargo") else {
+            return true;
+        };
+        if plus < cargo {
+            return true;
+        }
+        let after_cargo = tokens.get(cargo + 1..).unwrap_or_default();
+        match after_cargo
+            .iter()
+            .position(|t| !t.starts_with('-') && !t.starts_with('+'))
+        {
+            Some(offset) => plus > cargo + 1 + offset,
+            None => false,
+        }
+    }
+
+    /// #317: `cargo +nightly test` must BAIL, not rewrite.
+    ///
+    /// INVERTED.  This test formerly asserted `["skim", "cargo", "test",
+    /// "+nightly"]`, pinning as intended the defect it should have caught: both
+    /// reconstruction sites re-appended the stripped toolchain AFTER the
+    /// subcommand.  `cargo test +nightly` is not an error — cargo takes
+    /// `+nightly` as the `[TESTNAME]` libtest filter, so the run reports
+    /// "ok. 0 passed; … 4127 filtered out" and exits 0 on the DEFAULT toolchain:
+    /// a silent false green that executed nothing.  #317 allows byte-faithful
+    /// reconstruction or a bail, and no rewrite has a position for the token, so
+    /// the bail is the fix.  Do not restore the old expectation.
     #[test]
-    fn test_cargo_toolchain_with_env_var() {
-        let result = try_rewrite(&["RUST_LOG=debug", "cargo", "+nightly", "test"]).unwrap();
+    fn test_cargo_toolchain_nightly_bails() {
+        assert!(
+            try_rewrite(&["cargo", "+nightly", "test"]).is_none(),
+            "a cargo toolchain override must produce no rewrite (#317 bail)"
+        );
+    }
+
+    /// #317: an env-var prefix must not hide the toolchain from the bail.
+    ///
+    /// INVERTED.  This test formerly asserted `["RUST_LOG=debug", "skim",
+    /// "cargo", "test", "+nightly"]` — the same post-subcommand misplacement
+    /// behind an env prefix, with the same silent-green `cargo +nightly test`
+    /// consequence.  What it additionally protected is unrelated to the
+    /// toolchain: a caller's env assignments must stay FIRST in the emitted
+    /// command.  That invariant is re-asserted here on the no-toolchain path so
+    /// the inversion does not drop its coverage.
+    #[test]
+    fn test_cargo_toolchain_with_env_var_bails() {
+        assert!(
+            try_rewrite(&["RUST_LOG=debug", "cargo", "+nightly", "test"]).is_none(),
+            "env-var stripping must still expose the toolchain override to the bail"
+        );
+
+        let result = try_rewrite(&["RUST_LOG=debug", "cargo", "test"]).unwrap();
         assert_eq!(
             result.tokens,
-            vec!["RUST_LOG=debug", "skim", "cargo", "test", "+nightly"]
+            vec!["RUST_LOG=debug", "skim", "cargo", "test"],
+            "caller env assignments must stay first in the emitted command"
         );
+    }
+
+    /// The silent-green hazard, asserted on the command that actually RUNS.
+    ///
+    /// For every toolchain spelling and cargo subcommand the rule table covers,
+    /// the effective command — the rewrite when one is emitted, the original when
+    /// the engine bails — must not place the `+toolchain` token anywhere cargo or
+    /// libtest can consume it.  Asserting on the effective command rather than on
+    /// `is_none()` keeps this test honest if a future change makes these shapes
+    /// rewrite again.
+    #[test]
+    fn test_cargo_toolchain_never_reaches_libtest_as_a_filter() {
+        // Positive controls: the two shapes the engine used to emit MUST trip the
+        // predicate, otherwise the sweep below asserts nothing.
+        assert!(
+            toolchain_token_is_consumable(&owned(&[
+                "skim", "cargo", "test", "+nightly", "-p", "rskim", "--bins"
+            ])),
+            "the pre-fix emission must register as consumable"
+        );
+        assert!(
+            toolchain_token_is_consumable(&owned(&["skim", "rustfmt", "+nightly"])),
+            "a toolchain token in a rustfmt command line has no valid position"
+        );
+
+        for spelling in ["+nightly", "+stable", "+1.98"] {
+            for tail in [
+                vec!["test", "-p", "rskim", "--bins"],
+                vec!["test", "--", "--nocapture"],
+                vec!["nextest", "run", "-p", "rskim"],
+                vec!["build"],
+                vec!["check", "-p", "rskim"],
+                vec!["clippy", "-p", "rskim"],
+                vec!["fmt"],
+                vec!["fmt", "--check"],
+                vec!["fmt", "-p", "rskim", "--", "--check"],
+                vec!["audit"],
+            ] {
+                let mut tokens = vec!["cargo", spelling];
+                tokens.extend_from_slice(&tail);
+                let effective = try_rewrite(&tokens)
+                    .map(|r| r.tokens)
+                    .unwrap_or_else(|| owned(&tokens));
+                assert!(
+                    !toolchain_token_is_consumable(&effective),
+                    "{tokens:?} would run as {effective:?}, where {spelling} is \
+                     consumed as an argument instead of a toolchain override"
+                );
+            }
+        }
     }
 
     // ========================================================================
