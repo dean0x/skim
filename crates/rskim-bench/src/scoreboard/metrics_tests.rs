@@ -232,6 +232,44 @@ fn an_ast_entry_plans_a_standalone_ast_call_judged_by_the_structural_oracle() {
 }
 
 #[test]
+fn is_structural_names_exactly_the_ast_entries() {
+    // Every entry kind, including the two that call `--ast` without being
+    // scored by the structural oracle (a standalone `--ast` [[prefix]] and a
+    // text + `--ast` [[pagination]]).
+    let g = golden_with(&format!(
+        "[[ident]]\nid = \"skim-L01\"\nquery = \"x_y\"\ndef = {{ path = \"a.rs\", line = 1 }}\norigin = \"seed\"\n\
+         [[concept]]\nid = \"skim-C01\"\nquery = \"a b\"\nrelevant = 'a'\n\
+         [[lexical]]\nid = \"skim-X01\"\nquery = \"q\"\ncategory = \"short\"\n\
+         [[pagination]]\nid = \"skim-G002\"\nquery = \"x\"\nflags = [\"--ast\", \"try-catch\"]\nlimits = [3]\n\
+         [[prefix]]\nid = \"skim-F001\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n\
+         {}",
+        ast_entry("skim-A1", "try-catch", "tsx", "hard")
+    ));
+    let p = plan(&g).unwrap();
+    assert_eq!(p.len(), 6);
+    for q in &p {
+        assert_eq!(q.is_structural(), q.kind == EntryKind::Ast, "{}", q.id);
+        assert_eq!(
+            q.is_structural(),
+            q.structural_target().is_some(),
+            "{}",
+            q.id
+        );
+        // The structural checks run exactly on the structural entries, and
+        // score monotonicity never on them (their list is path-ordered).
+        assert_eq!(
+            q.runs(CheckId::StructuralRecall),
+            q.is_structural(),
+            "{}",
+            q.id
+        );
+        if q.is_structural() {
+            assert!(!q.runs(CheckId::OrderScoreMonotone), "{}", q.id);
+        }
+    }
+}
+
+#[test]
 fn only_ident_and_concept_entries_measure_text_output() {
     let g = golden_with(
         "[[ident]]\nid = \"skim-L01\"\nquery = \"x_y\"\ndef = { path = \"a.rs\", line = 1 }\norigin = \"seed\"\n\
@@ -760,13 +798,12 @@ fn structural_measurements_ratchet_per_entry_and_unscored_rows_per_pattern() {
 }
 
 #[test]
-fn structural_ratchets_are_exact_and_higher_is_better() {
+fn structural_ratchets_are_exact_and_unscored_rows_are_neutral() {
     for name in [
         "structural.precision.a-ast-1",
         "structural.line_on_match.a-ast-1",
         "structural.intent_recall.a-ast-1",
         "structural.intent_precision.a-ast-1",
-        "structural.unscored_rows.try-catch",
     ] {
         assert_eq!(
             compare_ratchet(name, 0.5, 0.5),
@@ -782,6 +819,26 @@ fn structural_ratchets_are_exact_and_higher_is_better() {
             compare_ratchet(name, 0.5, 0.6),
             RatchetChange::Improved,
             "{name}"
+        );
+    }
+    // No oracle judges unscored rows: a shrink (skim dropped rows, or a new
+    // entry scores them) and a growth (rows in a language no entry scores)
+    // both read `changed`, so the gate asks for a bless and bless needs no
+    // `--accept-regression` reason.
+    let unscored = "structural.unscored_rows.try-catch";
+    assert_eq!(
+        metric_def(unscored).map(|d| d.direction),
+        Some(Direction::Neutral)
+    );
+    assert_eq!(
+        compare_ratchet(unscored, 2.0, 2.0),
+        RatchetChange::Unchanged
+    );
+    for current in [0.0, 1.0, 3.0] {
+        assert_eq!(
+            compare_ratchet(unscored, 2.0, current),
+            RatchetChange::Changed,
+            "2 -> {current}"
         );
     }
     for bare in [

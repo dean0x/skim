@@ -334,11 +334,15 @@ impl SkimRunner {
     /// `skim search --root <root> --json --limit 1000000 --ast <pattern>`:
     /// the pattern's full standalone list (every language) and its
     /// `ast_coverage`. The scoreboard makes this call once per (corpus,
-    /// pattern) and splits the rows among the pattern's `[[ast]]` entries.
+    /// pattern) and splits the rows among the pattern's `[[ast]]` entries,
+    /// and those entries' checks and the unscored-row counts take the list
+    /// to be the pattern's complete answer.
     ///
     /// # Errors
     ///
-    /// As [`SkimRunner::page`], plus a malformed `ast_coverage`.
+    /// As [`SkimRunner::page`], plus a malformed `ast_coverage`, or a list
+    /// that reports `has_more` (truncated at [`FULL_LIST_LIMIT`], so not
+    /// complete).
     pub fn ast_list(&self, root: &Path, pattern: &str) -> anyhow::Result<(AstPage, Timing)> {
         let flags = QueryFlags {
             ast: Some(pattern.to_string()),
@@ -351,6 +355,12 @@ impl SkimRunner {
                 call.label, call.status
             )
         })?;
+        anyhow::ensure!(
+            !page.page.has_more,
+            "{}: the full list reports has_more = true at --limit {FULL_LIST_LIMIT}, so it is not \
+             the pattern's complete answer and cannot be split among its [[ast]] entries",
+            call.label
+        );
         Ok((page, call.timing))
     }
 
@@ -454,7 +464,7 @@ impl SkimRunner {
     /// report `degraded[]`.
     pub fn observe(&self, root: &Path, q: &PlannedQuery) -> anyhow::Result<Observed> {
         anyhow::ensure!(
-            q.kind != EntryKind::Ast,
+            !q.is_structural(),
             "{}: an [[ast]] entry is observed through its pattern's single call \
              (SkimRunner::ast_list), not per entry",
             q.id

@@ -108,6 +108,16 @@ impl PlannedQuery {
         }
     }
 
+    /// Whether this is an `[[ast]]` entry: judged by the structural oracle,
+    /// with its pattern call's rows in its language as its full list, never
+    /// observed on its own. [`plan`] gives exactly the `[[ast]]` entries a
+    /// structural target; a `[[prefix]]` or `[[pagination]]` entry with
+    /// `--ast` in its flags calls skim with `--ast` too, but is not scored by
+    /// the structural oracle.
+    pub fn is_structural(&self) -> bool {
+        self.structural_target().is_some()
+    }
+
     /// The HARD checks that run on this entry, in [`CheckId::ALL`] order.
     pub fn checks(&self) -> Vec<CheckId> {
         CheckId::ALL
@@ -142,13 +152,9 @@ impl PlannedQuery {
             | CheckId::PaginationOrdered
             | CheckId::PaginationHasMoreHonest => self.kind == EntryKind::Pagination,
             CheckId::OrderPrefixConsistent => self.kind == EntryKind::Prefix,
-            CheckId::OrderScoreMonotone => {
-                self.kind != EntryKind::Ast && !self.flags.has_rank_override()
-            }
+            CheckId::OrderScoreMonotone => !self.is_structural() && !self.flags.has_rank_override(),
             CheckId::ResultsUniquePaths => true,
-            CheckId::StructuralRecall | CheckId::StructuralCoverage => {
-                self.structural_target().is_some()
-            }
+            CheckId::StructuralRecall | CheckId::StructuralCoverage => self.is_structural(),
             CheckId::StructuralPrecision => self
                 .structural_target()
                 .is_some_and(|t| t.precision == PrecisionClass::Hard),
@@ -997,16 +1003,20 @@ pub const STRUCTURAL_INTENT_PRECISION: &str = "structural.intent_precision.";
 
 /// Name prefix of `structural.unscored_rows.<pattern>`: skim `--ast` rows no
 /// `[[ast]]` entry of this corpus scores, for every catalog pattern of a
-/// corpus with an `[[ast]]` entry (0 included).
+/// corpus with an `[[ast]]` entry (0 included). Neutral: any move needs a
+/// bless, never a reason (see [`STRUCTURAL_FAMILIES`]).
 pub const STRUCTURAL_UNSCORED_ROWS: &str = "structural.unscored_rows.";
 
 /// The structural RATCHET families (#541), each `(name prefix, definition)`;
 /// the name suffix is an `[[ast]]` id, or a pattern for
-/// [`STRUCTURAL_UNSCORED_ROWS`]. Every value is exact and higher-is-better:
-/// a precision / intent fraction or an anchor count that drops is a
-/// regression. Unscored rows follow [`ORACLE_LESS_ROWS_DEF`]: no oracle
-/// judges them, so a shrink is a regression and a growth an improvement,
-/// and either way the gate asks for a bless.
+/// [`STRUCTURAL_UNSCORED_ROWS`]. Every value is exact. The precision and
+/// intent fractions and the anchor count are higher-is-better: a drop is a
+/// regression, and blessing it needs `--accept-regression`. Unscored rows
+/// are neutral: no oracle judges them, and a move either way has an
+/// ordinary cause (a shrink: a new entry now scores those rows, or skim
+/// stopped returning rows no entry judges; a growth: skim returns rows in a
+/// language no entry scores). So a move reads `changed`: the gate asks for a
+/// bless, and bless needs no reason.
 pub static STRUCTURAL_FAMILIES: [(&str, MetricDef); 5] = [
     (
         STRUCTURAL_PRECISION,
@@ -1048,7 +1058,7 @@ pub static STRUCTURAL_FAMILIES: [(&str, MetricDef); 5] = [
         STRUCTURAL_UNSCORED_ROWS,
         def(
             "structural.unscored_rows.<pattern>",
-            Direction::HigherBetter,
+            Direction::Neutral,
             Tolerance::Exact,
             "ratchet (no oracle)",
         ),
@@ -1391,6 +1401,39 @@ pub struct CorpusEvaluation {
     pub unindexed_hits: BTreeMap<String, u64>,
 }
 
+/// `plan` and `observations` paired entry by entry: observations follow the
+/// plan, one per entry, in order. Everything that walks both checks this
+/// first, so an entry never goes unjudged or is judged by another entry's
+/// rows.
+///
+/// # Errors
+///
+/// The two differ in length, or an observation's id is not its planned
+/// entry's.
+pub fn paired<'a>(
+    plan: &'a [PlannedQuery],
+    observations: &'a [EntryObservation],
+) -> anyhow::Result<impl Iterator<Item = (&'a PlannedQuery, &'a EntryObservation)>> {
+    anyhow::ensure!(
+        plan.len() == observations.len(),
+        "{} planned entries but {} observations",
+        plan.len(),
+        observations.len()
+    );
+    if let Some((q, obs)) = plan
+        .iter()
+        .zip(observations)
+        .find(|(q, obs)| q.id != obs.id)
+    {
+        anyhow::bail!(
+            "observation {} does not match planned entry {}",
+            obs.id,
+            q.id
+        );
+    }
+    Ok(plan.iter().zip(observations))
+}
+
 /// Score one corpus. `structural` holds the structural oracle's answers and
 /// skim's `--ast` calls for the `[[ast]]` entries (empty when there are
 /// none); an `[[ast]]` entry's observation holds skim's rows in its language.
@@ -1407,13 +1450,6 @@ pub fn evaluate(
     observations: &[EntryObservation],
     structural: &StructuralEvidence,
 ) -> anyhow::Result<CorpusEvaluation> {
-    anyhow::ensure!(
-        plan.len() == observations.len(),
-        "{} planned entries but {} observations",
-        plan.len(),
-        observations.len()
-    );
-
     let mut outcomes = Vec::new();
     let mut idents = Vec::new();
     let mut concepts = Vec::new();
@@ -1421,13 +1457,7 @@ pub fn evaluate(
     let mut oracle_less_rows = BTreeMap::new();
     let mut structural_samples = Vec::new();
 
-    for (q, obs) in plan.iter().zip(observations) {
-        anyhow::ensure!(
-            q.id == obs.id,
-            "observation {} does not match planned entry {}",
-            obs.id,
-            q.id
-        );
+    for (q, obs) in paired(plan, observations)? {
         let gt = q
             .lexical_oracle()
             .map(|o| ground_truth(universe.files(), o));

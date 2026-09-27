@@ -332,9 +332,9 @@ fn golden_gen_ast(
     let candidates = golden_gen::generate_ast(corpus, &catalog, &answers, &skim)?;
 
     println!(
-        "# golden-gen --ast proposal for corpus {corpus} at {commit} ({} entr{}; review, then freeze in golden/{corpus}.toml)",
+        "# golden-gen --ast proposal for corpus {corpus} at {commit} ({} {}; review, then freeze in golden/{corpus}.toml)",
         candidates.len(),
-        if candidates.len() == 1 { "y" } else { "ies" }
+        pipeline::entries_noun(candidates.len())
     );
     print!(
         "{}",

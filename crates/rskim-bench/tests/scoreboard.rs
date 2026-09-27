@@ -1594,6 +1594,8 @@ fn every_catalog_pattern_is_called_and_rows_no_entry_scores_are_counted() {
     assert_exit(&h.check(), 0);
 
     // An unscored row that disappears is a RATCHET move, not a silent drop.
+    // No oracle judges unscored rows, so the move is neutral: the gate asks
+    // for a bless, and bless takes it without an --accept-regression reason.
     h.write_response(
         "",
         &["--ast", "deep-nesting"],
@@ -1602,11 +1604,17 @@ fn every_catalog_pattern_is_called_and_rows_no_entry_scores_are_counted() {
     );
     let check = h.check();
     assert_exit(&check, 1);
+    let err = stderr(&check);
     assert!(
-        stderr(&check).contains("structural.unscored_rows.deep-nesting"),
-        "{}",
-        stderr(&check)
+        err.contains(
+            "FAIL structural.unscored_rows.deep-nesting: [fixture] baseline 1 -> current 0 \
+             (changed); bless required"
+        ),
+        "{err}"
     );
+    assert!(!err.contains("regressed"), "{err}");
+    assert_exit(&h.bless(None), 0);
+    assert_exit(&h.check(), 0);
 }
 
 #[test]
@@ -1640,7 +1648,12 @@ fn a_structural_recall_miss_fails_the_gate_and_the_ledger_excuses_it() {
 #[test]
 fn a_coverage_count_that_disagrees_with_the_oracle_is_a_hard_failure() {
     let h = Harness::new();
-    // The oracle sees no universe file over the 1 MiB cap.
+    // A blessed clean state gates green, so the failure below has one cause.
+    h.enable_structural(Some(3), None);
+    h.bless_current();
+    assert_exit(&h.check(), 0);
+
+    // skim now reports a file over the 1 MiB cap; the oracle sees none.
     h.enable_structural(
         Some(3),
         Some(json!({
@@ -1650,14 +1663,70 @@ fn a_coverage_count_that_disagrees_with_the_oracle_is_a_hard_failure() {
             "excluded_by_lang": {"rust": 1}
         })),
     );
+    let check = h.check();
 
-    let run = h.run();
-    assert_exit(&run, 0);
+    assert_exit(&check, 1);
+    let err = stderr(&check);
+    assert!(
+        err.contains(&format!("FAIL structural.coverage [{AST_ID}]")),
+        "{err}"
+    );
+    assert!(
+        err.contains("ast_coverage.size_excluded_files is 1 (by language: rust 1)"),
+        "{err}"
+    );
+    let report = h.report();
     assert_eq!(
-        outcome(&h.report(), AST_ID, "structural.coverage").as_deref(),
+        outcome(&report, AST_ID, "structural.coverage").as_deref(),
         Some("fail")
     );
-    assert_exit(&h.check(), 1);
+    // The coverage check is the gate's only failure: nothing else moved.
+    let failures = gate_failures(&report);
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    let (kind, check_id, ids, _) = &failures[0];
+    assert_eq!(
+        (kind.as_str(), check_id.as_str(), ids.as_slice()),
+        (
+            "unledgered",
+            "structural.coverage",
+            [AST_ID.to_string()].as_slice()
+        )
+    );
+}
+
+#[test]
+fn a_truncated_ast_pattern_list_is_a_harness_error() {
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, AST_ENTRY);
+    // skim says the `--ast` full list goes on past `--limit 1000000`: the rows
+    // it returned are not the pattern's complete answer, so none is scored.
+    h.write_response(
+        "",
+        &["--ast", AST_PATTERN],
+        &format!("l{FULL_LIMIT}_o0.json"),
+        &ast_page_json(
+            &[(
+                Row {
+                    path: "src/loops.rs".to_string(),
+                    line: 3,
+                    content: "for b in 0..2 {".to_string(),
+                },
+                1.0,
+            )],
+            true,
+        ),
+    );
+
+    let run = h.run();
+
+    assert_exit(&run, 2);
+    let err = stderr(&run);
+    assert!(err.contains(&format!("--ast {AST_PATTERN}")), "{err}");
+    assert!(err.contains("has_more"), "{err}");
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
 }
 
 #[test]
@@ -1817,7 +1886,9 @@ fn a_false_positive_guard_in_a_language_the_corpus_has_no_file_in_is_a_harness_e
     assert!(err.contains("golden integrity failed"), "{err}");
     assert!(err.contains("vacuous"), "{err}");
     assert!(
-        err.contains(&format!("{id} (false-positive guard: no scored go file)")),
+        err.contains(&format!(
+            "\n  {id}: vacuous false-positive guard: no scored go file"
+        )),
         "{err}"
     );
     assert!(
