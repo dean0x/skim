@@ -1590,7 +1590,7 @@ async fn test_ac23_graceful_shutdown_drains_and_exits() {
 /// - The client read loop observes EOF (or a transport error) and exits.
 /// - The assertion `elapsed < wall_clock_ceiling` passes.
 ///
-/// ## Why reusing `upstream_timeout` is correct (ADR-003 / PF-005)
+/// ## Why reusing `upstream_timeout` is correct (L3-ADR-003 / PF-005)
 ///
 /// A separate body-idle bound would require an empirically-baseless constant.
 /// Reusing `upstream_timeout` (already justified in config.rs for time-to-headers)
@@ -1620,7 +1620,7 @@ async fn test_ac20_upstream_midstream_stall_terminates_cleanly() {
     });
 
     // Configure a short upstream_timeout so the test finishes fast.
-    // The idle bound reuses upstream_timeout (AD-PXY-20 / ADR-003).
+    // The idle bound reuses upstream_timeout (AD-PXY-20 / L3-ADR-003).
     let upstream_idle_timeout = Duration::from_millis(400);
     let listener = bind_test_listener().await;
     let proxy_addr = listener.local_addr().expect("listener local_addr");

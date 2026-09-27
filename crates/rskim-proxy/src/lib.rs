@@ -21,7 +21,7 @@
 //!
 //! 2. **Never-inflate AND never-lose-information** — the transform seam composes
 //!    #301's `guarded_transform` gate; output bytes ≤ input bytes per stage
-//!    (invariant 2), and all egress engines are lossless-only (ADR-007/#427):
+//!    (invariant 2), and all egress engines are lossless-only (L3-ADR-007/#427):
 //!    information-preserving re-encoding only, no content discarding. The identity
 //!    stage ships with this ticket; #304/#306/#307 plug into the
 //!    [`seam::TransformStage`] trait.

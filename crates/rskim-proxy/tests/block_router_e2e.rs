@@ -13,7 +13,7 @@
 //! 1. **Compressible Anthropic live-zone fixture** — upstream-received body is
 //!    STRICTLY SMALLER than client-sent body (real compression through the running proxy).
 //!    Post-P0.1: fixture uses pretty-printed JSON (JSON minification is the compressible path;
-//!    code blocks are always Passthrough per ADR-007).
+//!    code blocks are always Passthrough per L3-ADR-007).
 //!    DISCRIMINATING: this test would FAIL if the router were the identity stage.
 //!
 //! 2. **Passthrough-only Anthropic fixture** — upstream-received bytes are BYTE-IDENTICAL
@@ -29,7 +29,7 @@
 //!    mapped to Policy::Default.
 //!
 //! 4. **Code fence body byte-identical** — fenced Rust code block passes through
-//!    byte-identical (P0.1 / ADR-007 lossless-only egress).
+//!    byte-identical (P0.1 / L3-ADR-007 lossless-only egress).
 //!    DISCRIMINATING: this test would FAIL if the Code engine arm were restored
 //!    (upstream would receive fewer bytes from AST transform).
 //!
@@ -325,7 +325,7 @@ async fn post_with_bearer(proxy_addr: SocketAddr, body: &[u8]) -> Vec<u8> {
 /// The JSON content is > 64 bytes (above MIN_SIZE_FLOOR) and classifies as Class::Json.
 /// The JSON engine minifies whitespace → strictly smaller upstream body.
 ///
-/// Post-P0.1 (ADR-007): code blocks always pass through byte-identical; this fixture
+/// Post-P0.1 (L3-ADR-007): code blocks always pass through byte-identical; this fixture
 /// uses JSON to remain the "compressible" discriminating fixture.
 ///
 /// IMPORTANT: This fixture MUST produce strictly-smaller output through the router.
@@ -350,7 +350,7 @@ fn compressible_anthropic_body() -> Vec<u8> {
 
 /// Build an Anthropic request body containing a fenced Rust code block.
 ///
-/// Post-P0.1 (ADR-007): code blocks always pass through byte-identical regardless
+/// Post-P0.1 (L3-ADR-007): code blocks always pass through byte-identical regardless
 /// of size, language hint, or Policy. This fixture is used to assert byte-identity
 /// via `test_joint_code_fence_body_byte_identical_upstream`.
 fn code_fence_anthropic_body() -> Vec<u8> {
@@ -406,7 +406,7 @@ fn passthrough_only_anthropic_body() -> Vec<u8> {
 /// produces a strictly smaller output. A router that is merely an identity stage
 /// cannot satisfy `upstream_len < client_len`.
 ///
-/// Post-P0.1 (ADR-007): code blocks always pass through byte-identical; this test
+/// Post-P0.1 (L3-ADR-007): code blocks always pass through byte-identical; this test
 /// uses pretty-printed JSON as the compressible content type. JSON minification
 /// (whitespace removal) is the discriminating compression path.
 ///
@@ -582,7 +582,7 @@ async fn test_joint_subscription_auth_is_byte_identical_upstream() {
 /// AC19 / P0.1 / PF-007 Joint Test 4:
 ///
 /// CODE FENCE Anthropic fixture → upstream-received bytes are BYTE-IDENTICAL to
-/// client-sent bytes (P0.1 / ADR-007 lossless-only egress for code blocks).
+/// client-sent bytes (P0.1 / L3-ADR-007 lossless-only egress for code blocks).
 ///
 /// ## Discriminating property (PF-007 / P0.1)
 ///
@@ -619,10 +619,10 @@ async fn test_joint_code_fence_body_byte_identical_upstream() {
     assert_eq!(
         captured[0].as_slice(),
         client_body.as_slice(),
-        "P0.1/ADR-007/Joint-4 FAIL: code fence body must be byte-identical at upstream. \
+        "P0.1/L3-ADR-007/Joint-4 FAIL: code fence body must be byte-identical at upstream. \
          \n  client ({} bytes)\
          \n  upstream ({} bytes)\
-         \nIf upstream is smaller: Code engine arm was re-introduced (violates ADR-007). \
+         \nIf upstream is smaller: Code engine arm was re-introduced (violates L3-ADR-007). \
          Check engine_for_class in route.rs — Class::Code must return Passthrough.",
         client_body.len(),
         captured[0].len(),

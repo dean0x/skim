@@ -68,7 +68,7 @@ pub struct ProxyEvent {
     ///
     /// Includes upstream latency + forwarding overhead. Does NOT subtract
     /// upstream time; the absolute figure is more useful for analytics.
-    /// Per ADR-003 / PF-005: not used as a CI gate — latency regression
+    /// Per L3-ADR-003 / PF-005: not used as a CI gate — latency regression
     /// detection uses criterion bench baselines (AD-PXY-16).
     ///
     /// Note: [`crate::seam::TransformStage`] transforms are deterministic

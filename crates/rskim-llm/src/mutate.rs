@@ -137,7 +137,7 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
     // We use `assert!` (not `debug_assert!`) so the check is active in release
     // builds as well.  A LeafRef desync cannot be triggered by untrusted input
     // alone — it requires a code bug (e.g., a future refactor passes a LeafRef
-    // derived from a different body).  However, ADR-006 requires that an
+    // derived from a different body).  However, the fail-loud design constraint requires that an
     // unrecoverable desync fails loud rather than silently; and in release the
     // slice index on line 150 would already panic on out-of-bounds, but with
     // a cryptic index-panic message.  Keeping `assert!` gives a clear diagnostic
@@ -151,13 +151,13 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
     assert!(
         msg_idx < body.messages.len(),
         "apply_leaf_mutation: msg_idx {msg_idx} out of bounds (messages.len={}); \
-         LeafRef was not derived from this body (ADR-006)",
+         LeafRef was not derived from this body (unrecoverable invariant)",
         body.messages.len()
     );
 
     // `payload_slot_mut` navigates the typed model to the mutable `&mut String` named
     // by `leaf`, collapsing all structural-mismatch arms to one `NoTextPayload` site
-    // (ADR-001).  The LeafRef was produced by `walk_leaves`, so a mismatch here can
+    // (L3-ADR-001).  The LeafRef was produced by `walk_leaves`, so a mismatch here can
     // only be caused by a code bug, not by untrusted input.
     let slot = payload_slot_mut(body, leaf)?;
     *slot = new_text.to_string();
@@ -173,7 +173,7 @@ fn apply_leaf_mutation(body: &mut AnthropicBody, leaf: &LeafRef, new_text: &str)
 /// not untrusted input.
 ///
 /// Extracts the 4-level nested match / multi-site `NoTextPayload` duplication from
-/// `apply_leaf_mutation` into a single helper with one error site per arm (ADR-001).
+/// `apply_leaf_mutation` into a single helper with one error site per arm (L3-ADR-001).
 fn payload_slot_mut<'b>(body: &'b mut AnthropicBody, leaf: &LeafRef) -> Result<&'b mut String> {
     match leaf {
         LeafRef::MessageString { msg_idx } => match &mut body.messages[*msg_idx].content {

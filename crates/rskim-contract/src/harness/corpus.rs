@@ -142,7 +142,7 @@ pub const ANTHROPIC_LOG_DEDUP: &[u8] = br#"{
 }"#;
 
 /// Anthropic request with a timestamped log block — exercises the oracle's
-/// min/max timestamp-extremes check (Pass 5 / ADR-007 check 3).
+/// min/max timestamp-extremes check (Pass 5 / L3-ADR-007 check 3).
 ///
 /// # Design constraints
 ///

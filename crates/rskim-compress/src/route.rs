@@ -1,8 +1,8 @@
 //! Class → engine dispatch and language-hint routing table (#304 Phase 2, P0.1 #427).
 //!
-//! # P0.1 / ADR-007 — All code blocks pass through losslessly
+//! # P0.1 / L3-ADR-007 — All code blocks pass through losslessly
 //!
-//! Under ADR-007 (lossless-only egress), the proxy MUST NOT apply lossy
+//! Under L3-ADR-007 (lossless-only egress), the proxy MUST NOT apply lossy
 //! transforms to code content. `Class::Code` now routes directly to
 //! `EngineTarget::Passthrough` regardless of language hint. The code engine
 //! (`engines/code.rs`) is deleted; no rskim-core AST transform is applied on
@@ -47,7 +47,7 @@ pub(crate) enum EngineTarget {
     Mixed,
     /// Forward byte-identical; no compressor invoked.
     ///
-    /// Used for: code blocks (P0.1 / ADR-007), data-format hints (yaml/toml/markdown),
+    /// Used for: code blocks (P0.1 / L3-ADR-007), data-format hints (yaml/toml/markdown),
     /// unknown hints, and all `Class::Text` / `Class::Unknown` blocks.
     Passthrough,
 }
@@ -60,7 +60,7 @@ pub(crate) enum EngineTarget {
 ///
 /// # Class routing order
 ///
-/// 1. `Class::Code` → [`EngineTarget::Passthrough`] always (P0.1 / ADR-007).
+/// 1. `Class::Code` → [`EngineTarget::Passthrough`] always (P0.1 / L3-ADR-007).
 ///    Code is NEVER compressed on the egress path regardless of language hint.
 /// 2. `Class::Json` → [`EngineTarget::Json`].
 /// 3. `Class::Log` → [`EngineTarget::Log`].
@@ -73,7 +73,7 @@ pub(crate) fn engine_for_class(
     use rskim_llm::Class;
 
     match class {
-        // P0.1 / ADR-007: code blocks always pass through losslessly on egress.
+        // P0.1 / L3-ADR-007: code blocks always pass through losslessly on egress.
         // Language hint is irrelevant — no code engine exists on this path.
         Class::Code => EngineTarget::Passthrough,
         Class::Json => EngineTarget::Json,
@@ -119,10 +119,10 @@ mod tests {
     use rskim_llm::Class;
 
     // =========================================================================
-    // engine_for_class tests — P0.1 / ADR-007 passthrough for all code (AC8)
+    // engine_for_class tests — P0.1 / L3-ADR-007 passthrough for all code (AC8)
     // =========================================================================
 
-    /// P0.1 / ADR-007: rust hint on a Code block → Passthrough (not Code engine).
+    /// P0.1 / L3-ADR-007: rust hint on a Code block → Passthrough (not Code engine).
     ///
     /// Discriminating: any restoration of Code-engine routing for a rust-hinted block
     /// would break this test, because the result would differ from Passthrough.
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(
             target,
             EngineTarget::Passthrough,
-            "P0.1/ADR-007: rust hint on Code block must route to Passthrough, not Code engine"
+            "P0.1/L3-ADR-007: rust hint on Code block must route to Passthrough, not Code engine"
         );
     }
 
@@ -223,7 +223,7 @@ mod tests {
     // =========================================================================
 
     /// P0.1 discriminating: every documented code-language hint now routes to
-    /// Passthrough on the egress path (ADR-007).
+    /// Passthrough on the egress path (L3-ADR-007).
     ///
     /// Discriminating: any restoration of Code-engine routing for any hint would break
     /// this test, since the result would differ from Passthrough.
@@ -263,7 +263,7 @@ mod tests {
             assert_eq!(
                 target,
                 EngineTarget::Passthrough,
-                "P0.1/ADR-007: hint {:?} on Code block must route to Passthrough, not Code engine",
+                "P0.1/L3-ADR-007: hint {:?} on Code block must route to Passthrough, not Code engine",
                 hint
             );
         }
@@ -309,7 +309,7 @@ mod tests {
 
     /// P0.1 AC: a large (>32 KiB) code block routes to Passthrough regardless of hint.
     ///
-    /// Code blocks route to Passthrough unconditionally (ADR-007) — no prefilter check,
+    /// Code blocks route to Passthrough unconditionally (L3-ADR-007) — no prefilter check,
     /// no engine invocation. The discriminating observable: byte-identical output
     /// regardless of block size.
     #[test]
@@ -358,12 +358,12 @@ mod tests {
 
     #[test]
     fn fence_rust_hint_routes_to_passthrough() {
-        // Code-language hints on fences → Passthrough (P0.1 / ADR-007).
+        // Code-language hints on fences → Passthrough (P0.1 / L3-ADR-007).
         let target = engine_for_fence(Some("rust"));
         assert_eq!(
             target,
             EngineTarget::Passthrough,
-            "fence 'rust' hint must route to Passthrough (ADR-007)"
+            "fence 'rust' hint must route to Passthrough (L3-ADR-007)"
         );
     }
 
