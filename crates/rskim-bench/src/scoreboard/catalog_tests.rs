@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use rskim_oracle::structural::{
-    INTENTS, OracleLang, PatternCoverage, StructuralOracle, UNCLASSIFIED_REASON, UNCOVERED, parse,
-    query_sources,
+    FileMatches, FileReport, INTENTS, LangClass, OracleLang, OracleScratch, PatternCoverage,
+    StructuralOracle, UNCLASSIFIED_REASON, UNCOVERED, extension_classes, query_sources,
 };
 
 use super::*;
@@ -31,20 +31,40 @@ fn catalog_example(pattern: &str) -> &'static str {
         .unwrap_or_else(|| panic!("{pattern} is not a catalog pattern"))
 }
 
+/// The oracle's answers for `source` as a `lang` file, through the per-file
+/// path the scoreboard runs (a path with `lang`'s first extension in the
+/// oracle's own table).
+fn report(lang: OracleLang, source: &str) -> FileReport {
+    let ext = extension_classes()
+        .find(|&(_, class)| class == LangClass::Oracle(lang))
+        .map(|(ext, _)| ext)
+        .unwrap_or_else(|| panic!("no extension for {lang}"));
+    match ORACLE.file_matches(&mut OracleScratch::new(), &format!("fixture.{ext}"), source) {
+        Ok(FileMatches::Scored(report)) => report,
+        other => panic!("fixture.{ext} is not scored: {other:?}"),
+    }
+}
+
 fn lines(pattern: &str, lang: OracleLang, source: &str) -> Vec<u32> {
-    ORACLE
-        .match_lines(pattern, lang, source)
-        .unwrap_or_else(|e| panic!("{pattern}.{lang}: {e:#}"))
+    report(lang, source)
+        .definition
+        .remove(pattern)
+        .unwrap_or_else(|| panic!("no {lang} query for {pattern}"))
 }
 
 fn intent(pattern: &str, lang: OracleLang, source: &str) -> Vec<u32> {
-    ORACLE
-        .intent_lines(pattern, lang, source)
-        .unwrap_or_else(|e| panic!("{pattern} intent ({lang}): {e:#}"))
+    report(lang, source)
+        .intent
+        .remove(pattern)
+        .unwrap_or_else(|| panic!("no {lang} intent oracle for {pattern}"))
 }
 
+/// Whether `source` parses without an ERROR or MISSING node under `lang`'s
+/// grammar (the fixtures are meant to be valid code).
 fn parses_cleanly(lang: OracleLang, source: &str) -> bool {
-    !parse(lang, source).unwrap().root_node().has_error()
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang.grammar()).unwrap();
+    !parser.parse(source, None).unwrap().root_node().has_error()
 }
 
 // ============================================================================

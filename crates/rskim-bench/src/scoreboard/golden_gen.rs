@@ -50,7 +50,7 @@ use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
 use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};
 use crate::scoreboard::metrics::sample;
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
-use crate::scoreboard::structural_metrics::{OracleAnswers, distinct_files, rows_in, unscored_in};
+use crate::scoreboard::structural_metrics::{OracleAnswers, files_in, unscored_in};
 use crate::scoreboard::types::{ResultPage, ResultRow};
 use crate::scoreboard::universe::Universe;
 
@@ -328,7 +328,7 @@ pub fn generate_ast(
         let oracle_files = answers.definition(pattern, lang)?.len();
         let skim_files = skim
             .get(pattern)
-            .map_or(0, |page| distinct_files(&rows_in(page, lang).rows).len());
+            .map_or(0, |page| files_in(page, lang).len());
         if oracle_files == 0 && skim_files == 0 {
             continue;
         }
@@ -357,7 +357,10 @@ pub fn unscored_after<'s>(
         .map(|c| (c.pattern.as_str(), c.lang))
         .collect();
     skim.iter()
-        .map(|(pattern, page)| (pattern.as_str(), unscored_in(pattern, page, &scored)))
+        .map(|(pattern, page)| {
+            let rows: Vec<&ResultRow> = unscored_in(pattern, page, &scored).collect();
+            (pattern.as_str(), rows)
+        })
         .filter(|(_, rows)| !rows.is_empty())
         .collect()
 }

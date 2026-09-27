@@ -175,6 +175,14 @@ fn rows_split_by_extension_keep_skim_order_and_tsx_apart() {
     let tsx = rows_in(&all, OracleLang::Tsx);
     assert_eq!(tsx.rows, vec![row("web/b.tsx", Some(1))]);
     assert!(rows_in(&all, OracleLang::Rust).rows.is_empty());
+    // files_in is rows_in's distinct files, without copying a row.
+    for lang in OracleLang::ALL {
+        assert_eq!(
+            files_in(&all, lang),
+            distinct_files(&rows_in(&all, lang).rows),
+            "{lang}"
+        );
+    }
 }
 
 #[test]
@@ -262,12 +270,11 @@ fn every_row_of_a_pattern_with_no_entry_is_unscored_even_in_an_oracle_language()
     let scored = BTreeSet::from([("rust-nested-loop", OracleLang::Rust)]);
     let god = &patterns["god-function"].page;
     let unscored: Vec<&str> = unscored_in("god-function", god, &scored)
-        .iter()
         .map(|r| r.path.as_str())
         .collect();
     assert_eq!(unscored, ["src/app.py", "src/big.rs"]);
     let nested = &patterns["rust-nested-loop"].page;
-    assert!(unscored_in("rust-nested-loop", nested, &scored).is_empty());
+    assert_eq!(unscored_in("rust-nested-loop", nested, &scored).count(), 0);
 }
 
 #[test]

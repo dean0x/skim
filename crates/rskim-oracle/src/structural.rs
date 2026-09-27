@@ -34,9 +34,16 @@
 //! (`empty-catch`, `empty-function`: zero body elements; `god-function`:
 //! at least 20; `excessive-params`: at least 5 parameters).
 //!
-//! Next to the definition oracle, [`StructuralOracle::intent_lines`] answers
-//! the intent of the two nested-loop patterns: a loop with a loop ancestor
-//! inside the same function.
+//! Next to the definition oracle, the intent oracles ([`INTENTS`], reported
+//! in [`FileReport::intent`]) answer the intent of the two nested-loop
+//! patterns: a loop with a loop ancestor inside the same function, found in
+//! one pass over the tree.
+//!
+//! [`StructuralOracle::file_matches`] parses a file once and answers every
+//! pattern of its language; the parser and query cursor come from an
+//! [`OracleScratch`] the caller keeps per worker thread. A query that needs
+//! more in-progress matches than [`ORACLE_MATCH_LIMIT`] is an error, never a
+//! partial answer.
 //!
 //! # Parse errors
 //!
@@ -56,7 +63,9 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::Context;
-use tree_sitter::{Node, Parser, Query, QueryCursor, QueryMatch, StreamingIterator, Tree};
+use tree_sitter::{
+    Node, Parser, Query, QueryCursor, QueryMatch, StreamingIterator, Tree, TreeCursor,
+};
 
 // ============================================================================
 // Languages (the oracle's own extension → grammar table)
@@ -181,7 +190,7 @@ impl LangClass {
     /// accounting — skim's `ast_size_limit(lang)` is `Some`
     /// (`crates/rskim-core/src/ast_walk.rs:307-329`; the coverage predicate is
     /// `crates/rskim-search/src/ast_index/coverage.rs:185-203`).
-    pub fn counts_toward_size_cap(self) -> bool {
+    fn counts_toward_size_cap(self) -> bool {
         match self {
             LangClass::Oracle(_) | LangClass::Unscored { .. } => true,
             LangClass::NotIndexed { size_capped, .. } => size_capped,
@@ -344,7 +353,7 @@ pub fn extension_classes() -> impl Iterator<Item = (&'static str, LangClass)> {
 pub const AST_SIZE_CAP_BYTES: u64 = 1024 * 1024;
 
 /// Whether a file of `len` bytes is within the AST size cap (≤ 1 MiB).
-pub fn within_size_cap(len: u64) -> bool {
+fn within_size_cap(len: u64) -> bool {
     len <= AST_SIZE_CAP_BYTES
 }
 
@@ -370,7 +379,7 @@ pub fn over_cap_count<'a>(files: impl IntoIterator<Item = (&'a str, u64)>) -> u6
 /// (comments are extras; an attribute annotates the next element rather
 /// than being one). A Rust tail expression is a body element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PostFilter {
+enum PostFilter {
     /// The capture has zero body elements.
     Empty {
         /// Capture name, without `@`.
@@ -779,33 +788,133 @@ pub const INTENTS: &[IntentSpec] = &[
     },
 ];
 
-/// The capture an intent's loop query marks each loop with.
-const LOOP_CAPTURE: &str = "loop";
-
 // ============================================================================
 // The compiled oracle
 // ============================================================================
 
+/// The most in-progress matches one definition query may hold at once
+/// (`QueryCursor::set_match_limit`, whose contract is `0 < limit <= 65536`).
+/// A tree-sitter query cursor otherwise has no limit of its own, and its
+/// capture-list pool misbehaves past 65,535 lists (a `u16` id wraps), so the
+/// bound is explicit and inside the contract. A query holds about one
+/// in-progress match per enclosing node its pattern has started at and not
+/// yet finished, so the need grows with nesting depth. Over the four
+/// scoreboard corpora at their #541 pins no query ever needs more than 3
+/// (the smallest limit none of their 1,181 scored files trips), so 4096
+/// leaves three orders of magnitude of headroom for deeper code while
+/// staying well inside the contract. Past the limit tree-sitter drops
+/// matches, so exceeding it is a harness error naming the query
+/// ([`StructuralOracle::file_matches`]), never a silent miss. It is not in
+/// [`fingerprint`]: it can turn an answer into an error, never change one.
+///
+/// Each [`OracleScratch`] fixes the limit when it is made, and nothing
+/// changes it: tree-sitter enforces the limit by capping how many capture
+/// lists a cursor's pool ever allocates and reuses freed ones first, so a
+/// limit lowered on a cursor whose pool had already grown would not bound
+/// the lists it holds.
+const ORACLE_MATCH_LIMIT: u32 = 4096;
+
+/// The largest match limit tree-sitter's contract allows.
+const MAX_MATCH_LIMIT: u32 = 65_536;
+
+const _: () = assert!(ORACLE_MATCH_LIMIT >= 1 && ORACLE_MATCH_LIMIT <= MAX_MATCH_LIMIT);
+
 struct CompiledQuery {
     spec: &'static OracleQuery,
+    /// `<pattern>.<lang>.scm`, rendered once for errors.
+    file_name: String,
     query: Query,
     match_capture: u32,
     filter: Option<(u32, PostFilter)>,
 }
 
+/// An intent oracle whose node kinds its grammar has.
 struct CompiledIntent {
     spec: &'static IntentSpec,
     lang: OracleLang,
-    query: Query,
-    loop_capture: u32,
 }
 
 /// Every oracle query and intent oracle, compiled once. Cheap to share
-/// across threads (`tree_sitter::Query` is `Send + Sync`); each run creates
-/// its own parser and cursor.
+/// across threads (`tree_sitter::Query` is `Send + Sync`); the parser and
+/// query cursor a run needs live in an [`OracleScratch`], one per worker.
 pub struct StructuralOracle {
     definitions: Vec<CompiledQuery>,
     intents: Vec<CompiledIntent>,
+}
+
+/// The parser and query cursor [`StructuralOracle::file_matches`] works
+/// with, kept from one file to the next so a run allocates them once per
+/// worker rather than once per file (or per query). It holds no answer: any
+/// scratch gives a file the same result. Make one per thread (for example
+/// with rayon's `map_init`).
+pub struct OracleScratch {
+    parser: Parser,
+    /// Its match limit is fixed at creation ([`ORACLE_MATCH_LIMIT`]).
+    cursor: QueryCursor,
+}
+
+impl OracleScratch {
+    /// A fresh parser, and a query cursor limited to
+    /// [`ORACLE_MATCH_LIMIT`] in-progress matches.
+    pub fn new() -> Self {
+        Self::limited(ORACLE_MATCH_LIMIT)
+    }
+
+    /// [`OracleScratch::new`] with another match limit (the tests force the
+    /// limit's error path with it).
+    ///
+    /// # Errors
+    ///
+    /// A limit outside tree-sitter's `1..=65536`.
+    #[cfg(test)]
+    fn with_match_limit(match_limit: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=MAX_MATCH_LIMIT).contains(&match_limit),
+            "match limit {match_limit} is outside tree-sitter's 1..={MAX_MATCH_LIMIT}"
+        );
+        Ok(Self::limited(match_limit))
+    }
+
+    /// A scratch whose cursor holds at most `match_limit` in-progress
+    /// matches, a value inside tree-sitter's contract.
+    fn limited(match_limit: u32) -> Self {
+        let mut cursor = QueryCursor::new();
+        cursor.set_match_limit(match_limit);
+        OracleScratch {
+            parser: Parser::new(),
+            cursor,
+        }
+    }
+
+    /// Parse `source` with `lang`'s grammar.
+    ///
+    /// # Errors
+    ///
+    /// The grammar cannot be loaded, or the parser returns no tree
+    /// (tree-sitter does so only on cancellation or timeout, neither of
+    /// which is set here).
+    fn parse(&mut self, lang: OracleLang, source: &str) -> anyhow::Result<Tree> {
+        self.parser
+            .set_language(&lang.grammar())
+            .with_context(|| format!("loading the {lang} grammar"))?;
+        self.parser
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("tree-sitter returned no tree for {lang} source"))
+    }
+}
+
+impl Default for OracleScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One parsed file: its tree, its text, and a tree cursor over it that
+/// every post-filter's body-element count reuses.
+struct ParsedFile<'t> {
+    tree: &'t Tree,
+    source: &'t str,
+    walk: TreeCursor<'t>,
 }
 
 /// What the oracle says about one file of the scoreboard universe.
@@ -840,8 +949,8 @@ impl StructuralOracle {
     ///
     /// A query that does not compile against its grammar, lacks the `@match`
     /// capture or its post-filter capture, or duplicates another
-    /// `(pattern, language)` pair; an intent boundary kind the grammar does
-    /// not have.
+    /// `(pattern, language)` pair; an intent loop or boundary kind the
+    /// grammar does not have.
     pub fn new() -> anyhow::Result<Self> {
         let definitions = QUERIES
             .iter()
@@ -866,16 +975,121 @@ impl StructuralOracle {
         })
     }
 
-    /// Definition-oracle match lines of `pattern` in `source` parsed as
-    /// `lang`: the first line (1-based) of every match node, sorted and
-    /// de-duplicated.
+    /// Everything the oracle says about one universe file: its class, and for
+    /// a scored file every covered pattern's (and intent's) match lines,
+    /// parsing the file once with `scratch`'s parser.
     ///
     /// # Errors
     ///
-    /// No query registered for `(pattern, lang)`; the parser produced no
-    /// tree; a query hit tree-sitter's in-progress match limit.
-    pub fn match_lines(
+    /// The parser produced no tree, or a definition query needed more
+    /// in-progress matches than `scratch`'s match limit
+    /// ([`ORACLE_MATCH_LIMIT`]), so tree-sitter dropped some; the error names
+    /// `path` and the query file.
+    pub fn file_matches(
         &self,
+        scratch: &mut OracleScratch,
+        path: &str,
+        text: &str,
+    ) -> anyhow::Result<FileMatches> {
+        let lang = match classify(path) {
+            LangClass::Oracle(lang) => lang,
+            other => return Ok(FileMatches::NotScored(other)),
+        };
+        if !within_size_cap(u64::try_from(text.len()).unwrap_or(u64::MAX)) {
+            return Ok(FileMatches::OverSizeCap(lang));
+        }
+        self.report(scratch, lang, text)
+            .map(FileMatches::Scored)
+            .with_context(|| format!("structural oracle on {path}"))
+    }
+
+    /// Parse `source` as `lang` once, then answer every definition query and
+    /// intent oracle of `lang` over the tree.
+    fn report(
+        &self,
+        scratch: &mut OracleScratch,
+        lang: OracleLang,
+        source: &str,
+    ) -> anyhow::Result<FileReport> {
+        let tree = scratch.parse(lang, source)?;
+        let mut file = ParsedFile {
+            tree: &tree,
+            source,
+            walk: tree.walk(),
+        };
+        let mut definition = BTreeMap::new();
+        for compiled in self.definitions.iter().filter(|c| c.spec.lang == lang) {
+            let lines = Self::definition_lines(compiled, &mut scratch.cursor, &mut file)?;
+            definition.insert(compiled.spec.pattern, lines);
+        }
+        let intent = self
+            .intents
+            .iter()
+            .filter(|c| c.lang == lang)
+            .map(|c| Ok((c.spec.pattern, nested_loop_lines(c.spec, &tree)?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        Ok(FileReport {
+            lang,
+            definition,
+            intent,
+        })
+    }
+
+    /// Run the definition query `compiled` over `file` with `cursor`: the
+    /// 1-based first line of every `@match` node of a match its post-filter
+    /// accepts, sorted and de-duplicated.
+    ///
+    /// # Errors
+    ///
+    /// A match lacks its post-filter capture, a line does not fit a `u32`,
+    /// or the query exceeded the cursor's match limit: tree-sitter may then
+    /// have dropped matches, which is a harness error, never a silent miss.
+    fn definition_lines(
+        compiled: &CompiledQuery,
+        cursor: &mut QueryCursor,
+        file: &mut ParsedFile<'_>,
+    ) -> anyhow::Result<Vec<u32>> {
+        let (tree, source) = (file.tree, file.source);
+        let mut lines = Vec::new();
+        {
+            let mut matches = cursor.matches(&compiled.query, tree.root_node(), source.as_bytes());
+            while let Some(m) = matches.next() {
+                if !filter_accepts(compiled, m, &mut file.walk)? {
+                    continue;
+                }
+                for node in captured(m, compiled.match_capture) {
+                    lines.push(first_line(node)?);
+                }
+            }
+        }
+        anyhow::ensure!(
+            !cursor.did_exceed_match_limit(),
+            "oracle query {} needed more than the oracle's match limit of {} in-progress matches, \
+             so tree-sitter dropped matches",
+            compiled.file_name,
+            cursor.match_limit()
+        );
+        lines.sort_unstable();
+        lines.dedup();
+        Ok(lines)
+    }
+}
+
+/// Re-parsing lookups by pattern, for tests: the scoreboard calls
+/// [`StructuralOracle::file_matches`], which parses a file once for every
+/// pattern.
+#[cfg(test)]
+impl StructuralOracle {
+    /// Definition-oracle match lines of `pattern` in `source` parsed as
+    /// `lang`, with `scratch`'s parser and cursor.
+    ///
+    /// # Errors
+    ///
+    /// No query registered for `(pattern, lang)`, or as
+    /// [`StructuralOracle::file_matches`].
+    fn match_lines(
+        &self,
+        scratch: &mut OracleScratch,
         pattern: &str,
         lang: OracleLang,
         source: &str,
@@ -885,19 +1099,22 @@ impl StructuralOracle {
             .iter()
             .find(|c| c.spec.pattern == pattern && c.spec.lang == lang)
             .ok_or_else(|| anyhow::anyhow!("no oracle query for {pattern} in {lang}"))?;
-        let tree = parse(lang, source)?;
-        run_definition(compiled, &tree, source)
+        let tree = scratch.parse(lang, source)?;
+        let mut file = ParsedFile {
+            tree: &tree,
+            source,
+            walk: tree.walk(),
+        };
+        Self::definition_lines(compiled, &mut scratch.cursor, &mut file)
     }
 
-    /// Intent-oracle match lines of `pattern` in `source` parsed as `lang`:
-    /// the first line of every loop that has a loop ancestor inside the same
-    /// function, sorted and de-duplicated.
+    /// Intent-oracle match lines of `pattern` in `source` parsed as `lang`.
     ///
     /// # Errors
     ///
-    /// No intent oracle for `(pattern, lang)`; the parser produced no tree; a
-    /// query hit tree-sitter's in-progress match limit.
-    pub fn intent_lines(
+    /// No intent oracle for `(pattern, lang)`, or as
+    /// [`StructuralOracle::file_matches`].
+    fn intent_lines(
         &self,
         pattern: &str,
         lang: OracleLang,
@@ -908,56 +1125,18 @@ impl StructuralOracle {
             .iter()
             .find(|c| c.spec.pattern == pattern && c.lang == lang)
             .ok_or_else(|| anyhow::anyhow!("no intent oracle for {pattern} in {lang}"))?;
-        let tree = parse(lang, source)?;
-        run_intent(compiled, &tree, source)
-    }
-
-    /// Everything the oracle says about one universe file: its class, and for
-    /// a scored file every covered pattern's (and intent's) match lines,
-    /// parsing the file once.
-    ///
-    /// # Errors
-    ///
-    /// The parser produced no tree, or a query hit tree-sitter's in-progress
-    /// match limit; the error names `path`.
-    pub fn file_matches(&self, path: &str, text: &str) -> anyhow::Result<FileMatches> {
-        let lang = match classify(path) {
-            LangClass::Oracle(lang) => lang,
-            other => return Ok(FileMatches::NotScored(other)),
-        };
-        if !within_size_cap(u64::try_from(text.len()).unwrap_or(u64::MAX)) {
-            return Ok(FileMatches::OverSizeCap(lang));
-        }
-        let tree = parse(lang, text).with_context(|| format!("structural oracle on {path}"))?;
-        let definition = self
-            .definitions
-            .iter()
-            .filter(|c| c.spec.lang == lang)
-            .map(|c| Ok((c.spec.pattern, run_definition(c, &tree, text)?)))
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()
-            .with_context(|| format!("structural oracle on {path}"))?;
-        let intent = self
-            .intents
-            .iter()
-            .filter(|c| c.lang == lang)
-            .map(|c| Ok((c.spec.pattern, run_intent(c, &tree, text)?)))
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()
-            .with_context(|| format!("structural oracle on {path}"))?;
-        Ok(FileMatches::Scored(FileReport {
-            lang,
-            definition,
-            intent,
-        }))
+        let tree = OracleScratch::new().parse(lang, source)?;
+        nested_loop_lines(compiled.spec, &tree)
     }
 }
 
 fn compile_definition(spec: &'static OracleQuery) -> anyhow::Result<CompiledQuery> {
-    let file = spec.file_name();
+    let file_name = spec.file_name();
     let query = Query::new(&spec.lang.grammar(), spec.source)
-        .map_err(|e| anyhow::anyhow!("compiling oracle query {file}: {e}"))?;
-    let match_capture = query
-        .capture_index_for_name(MATCH_CAPTURE)
-        .ok_or_else(|| anyhow::anyhow!("oracle query {file} has no @{MATCH_CAPTURE} capture"))?;
+        .with_context(|| format!("compiling oracle query {file_name}"))?;
+    let match_capture = query.capture_index_for_name(MATCH_CAPTURE).ok_or_else(|| {
+        anyhow::anyhow!("oracle query {file_name} has no @{MATCH_CAPTURE} capture")
+    })?;
     let filter = spec
         .filter
         .map(|f| {
@@ -966,7 +1145,7 @@ fn compile_definition(spec: &'static OracleQuery) -> anyhow::Result<CompiledQuer
                 .map(|index| (index, f))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "oracle query {file} has no @{} capture for its post-filter",
+                        "oracle query {file_name} has no @{} capture for its post-filter",
                         f.capture()
                     )
                 })
@@ -974,6 +1153,7 @@ fn compile_definition(spec: &'static OracleQuery) -> anyhow::Result<CompiledQuer
         .transpose()?;
     Ok(CompiledQuery {
         spec,
+        file_name,
         query,
         match_capture,
         filter,
@@ -982,142 +1162,49 @@ fn compile_definition(spec: &'static OracleQuery) -> anyhow::Result<CompiledQuer
 
 fn compile_intent(spec: &'static IntentSpec, lang: OracleLang) -> anyhow::Result<CompiledIntent> {
     let grammar = lang.grammar();
-    if let Some(kind) = spec
-        .boundary_kinds
-        .iter()
-        .find(|k| grammar.id_for_node_kind(k, true) == 0)
-    {
-        anyhow::bail!(
-            "intent oracle {} ({lang}): boundary kind {kind:?} is not a named node of the grammar",
-            spec.pattern
-        );
+    for (role, kinds) in [("loop", spec.loop_kinds), ("boundary", spec.boundary_kinds)] {
+        if let Some(kind) = kinds
+            .iter()
+            .find(|k| grammar.id_for_node_kind(k, true) == 0)
+        {
+            anyhow::bail!(
+                "intent oracle {} ({lang}): {role} kind {kind:?} is not a named node of the grammar",
+                spec.pattern
+            );
+        }
     }
-    let alternatives: Vec<String> = spec.loop_kinds.iter().map(|k| format!("({k})")).collect();
-    let source = format!("[{}] @{LOOP_CAPTURE}", alternatives.join(" "));
-    let query = Query::new(&grammar, &source)
-        .map_err(|e| anyhow::anyhow!("compiling intent oracle {} ({lang}): {e}", spec.pattern))?;
-    let loop_capture = query
-        .capture_index_for_name(LOOP_CAPTURE)
-        .ok_or_else(|| anyhow::anyhow!("intent oracle {} has no @{LOOP_CAPTURE}", spec.pattern))?;
-    Ok(CompiledIntent {
-        spec,
-        lang,
-        query,
-        loop_capture,
-    })
+    Ok(CompiledIntent { spec, lang })
 }
 
 // ============================================================================
 // Running
 // ============================================================================
 
-/// Parse `source` with `lang`'s grammar using a fresh parser.
-///
-/// # Errors
-///
-/// The grammar cannot be loaded, or the parser returns no tree (tree-sitter
-/// does so only on cancellation or timeout, neither of which is set here).
-pub fn parse(lang: OracleLang, source: &str) -> anyhow::Result<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&lang.grammar())
-        .with_context(|| format!("loading the {lang} grammar"))?;
-    parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow::anyhow!("tree-sitter returned no tree for {lang} source"))
-}
-
-fn run_definition(compiled: &CompiledQuery, tree: &Tree, source: &str) -> anyhow::Result<Vec<u32>> {
-    let spec = compiled.spec;
-    first_lines(
-        &compiled.query,
-        tree,
-        source,
-        spec.pattern,
-        spec.lang,
-        |m| {
-            if !filter_accepts(compiled, m)? {
-                return Ok(Vec::new());
-            }
-            Ok(captured(m, compiled.match_capture).collect())
-        },
-    )
-}
-
-fn filter_accepts(compiled: &CompiledQuery, m: &QueryMatch<'_, '_>) -> anyhow::Result<bool> {
+fn filter_accepts<'t>(
+    compiled: &CompiledQuery,
+    m: &QueryMatch<'_, 't>,
+    walk: &mut TreeCursor<'t>,
+) -> anyhow::Result<bool> {
     let Some((index, filter)) = compiled.filter else {
         return Ok(true);
     };
     let node = captured(m, index).next().ok_or_else(|| {
         anyhow::anyhow!(
             "oracle query {} matched without its @{} capture",
-            compiled.spec.file_name(),
+            compiled.file_name,
             filter.capture()
         )
     })?;
-    Ok(filter.accepts(body_elements(node)))
+    Ok(filter.accepts(body_elements(node, walk)))
 }
 
 /// The body elements of `node`: named, non-extra children that are not
-/// attributes (see [`PostFilter`]).
-fn body_elements(node: Node<'_>) -> usize {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+/// attributes (see [`PostFilter`]), counted with `walk` (any cursor over
+/// `node`'s tree; it is reset to `node`).
+fn body_elements<'t>(node: Node<'t>, walk: &mut TreeCursor<'t>) -> usize {
+    node.named_children(walk)
         .filter(|child| !child.is_extra() && !ATTRIBUTE_KINDS.contains(&child.kind()))
         .count()
-}
-
-fn run_intent(compiled: &CompiledIntent, tree: &Tree, source: &str) -> anyhow::Result<Vec<u32>> {
-    let spec = compiled.spec;
-    first_lines(
-        &compiled.query,
-        tree,
-        source,
-        spec.pattern,
-        compiled.lang,
-        |m| {
-            Ok(captured(m, compiled.loop_capture)
-                .filter(|&node| has_loop_ancestor_in_same_function(node, spec))
-                .collect())
-        },
-    )
-}
-
-/// Run `query` over `tree`: the 1-based first line of every node `select`
-/// picks from a match, sorted and de-duplicated. `pattern` and `lang` name
-/// the query in errors.
-///
-/// # Errors
-///
-/// `select` fails, a line does not fit a `u32`, or the query exceeded
-/// tree-sitter's in-progress match limit: it may have dropped matches, which
-/// is a harness error, never a silent miss.
-fn first_lines<'tree>(
-    query: &Query,
-    tree: &'tree Tree,
-    source: &str,
-    pattern: &str,
-    lang: OracleLang,
-    mut select: impl FnMut(&QueryMatch<'_, 'tree>) -> anyhow::Result<Vec<Node<'tree>>>,
-) -> anyhow::Result<Vec<u32>> {
-    let mut cursor = QueryCursor::new();
-    let mut lines = Vec::new();
-    {
-        let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
-        while let Some(m) = matches.next() {
-            for node in select(m)? {
-                lines.push(first_line(node)?);
-            }
-        }
-    }
-    anyhow::ensure!(
-        !cursor.did_exceed_match_limit(),
-        "oracle query {} exceeded tree-sitter's match limit",
-        scm_file_name(pattern, lang)
-    );
-    lines.sort_unstable();
-    lines.dedup();
-    Ok(lines)
 }
 
 /// The nodes `m` captured under capture `index`, in capture order.
@@ -1131,13 +1218,52 @@ fn captured<'m, 'tree>(
         .map(|c| c.node)
 }
 
-/// Walk `node`'s ancestors (bounded by the tree's depth) up to the nearest
-/// function boundary: true iff a loop kind comes first.
-fn has_loop_ancestor_in_same_function(node: Node<'_>, spec: &IntentSpec) -> bool {
-    std::iter::successors(node.parent(), Node::parent)
-        .map(|ancestor| ancestor.kind())
-        .find(|kind| spec.loop_kinds.contains(kind) || spec.boundary_kinds.contains(kind))
-        .is_some_and(|kind| spec.loop_kinds.contains(&kind))
+/// The intent oracle `spec` over `tree`: the 1-based first line of every
+/// loop whose nearest loop-or-boundary ancestor is a loop, sorted and
+/// de-duplicated. One pre-order pass with a tree cursor carries the "inside
+/// a loop of this function" flag down the tree, so the cost is linear in the
+/// tree's size however deeply it nests (walking each loop's ancestors with
+/// `Node::parent`, which re-descends from the root at every step, is
+/// quadratic in the depth).
+///
+/// # Errors
+///
+/// A line does not fit a `u32`, or the walk does not end within the tree's
+/// node count (a tree-sitter invariant: a cursor enters every node once).
+fn nested_loop_lines(spec: &IntentSpec, tree: &Tree) -> anyhow::Result<Vec<u32>> {
+    let root = tree.root_node();
+    let nodes = root.descendant_count();
+    let mut cursor = root.walk();
+    // Whether the nearest loop-or-boundary strict ancestor of the cursor's
+    // node is a loop; `above` holds the same flag for every node on the path
+    // down to it, restored on the way back up.
+    let mut in_loop = false;
+    let mut above: Vec<bool> = Vec::new();
+    let mut lines = Vec::new();
+    for _ in 0..nodes {
+        let node = cursor.node();
+        let kind = node.kind();
+        let is_loop = spec.loop_kinds.contains(&kind);
+        if is_loop && in_loop && node.is_named() {
+            lines.push(first_line(node)?);
+        }
+        if cursor.goto_first_child() {
+            above.push(in_loop);
+            in_loop = is_loop || (in_loop && !spec.boundary_kinds.contains(&kind));
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                lines.sort_unstable();
+                lines.dedup();
+                return Ok(lines);
+            }
+            in_loop = above
+                .pop()
+                .context("the tree walk rose above the node it entered")?;
+        }
+    }
+    anyhow::bail!("the tree walk did not end within the tree's {nodes} nodes")
 }
 
 /// The 1-based first line of `node`.

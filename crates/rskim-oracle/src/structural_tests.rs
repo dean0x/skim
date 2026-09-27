@@ -9,6 +9,8 @@
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
+use tree_sitter::{Query, QueryCursor};
+
 use super::*;
 
 /// Compiled once: `StructuralOracle` is `Sync`.
@@ -28,7 +30,7 @@ const GOD_FUNCTION_19: &str = "fn big() { let a=1; let b=2; let c=3; let d=4; le
 
 fn lines(pattern: &str, lang: OracleLang, source: &str) -> Vec<u32> {
     ORACLE
-        .match_lines(pattern, lang, source)
+        .match_lines(&mut OracleScratch::new(), pattern, lang, source)
         .unwrap_or_else(|e| panic!("{pattern}.{lang}: {e:#}"))
 }
 
@@ -39,7 +41,11 @@ fn intent(pattern: &str, lang: OracleLang, source: &str) -> Vec<u32> {
 }
 
 fn parses_cleanly(lang: OracleLang, source: &str) -> bool {
-    !parse(lang, source).unwrap().root_node().has_error()
+    !OracleScratch::new()
+        .parse(lang, source)
+        .unwrap()
+        .root_node()
+        .has_error()
 }
 
 // ============================================================================
@@ -59,6 +65,35 @@ fn every_registered_query_compiles_for_its_grammar() {
         }
     }
     assert!(StructuralOracle::new().is_ok());
+}
+
+#[test]
+fn an_intent_node_kind_its_grammar_lacks_fails_to_compile() {
+    // TS/JS kinds on the Rust grammar.
+    static BAD_LOOP: IntentSpec = IntentSpec {
+        pattern: "rust-nested-loop",
+        langs: &[OracleLang::Rust],
+        loop_kinds: &["for_expression", "for_statement"],
+        boundary_kinds: &["function_item"],
+    };
+    static BAD_BOUNDARY: IntentSpec = IntentSpec {
+        pattern: "rust-nested-loop",
+        langs: &[OracleLang::Rust],
+        loop_kinds: &["for_expression"],
+        boundary_kinds: &["function_item", "arrow_function"],
+    };
+    let err = compile_intent(&BAD_LOOP, OracleLang::Rust).err().unwrap();
+    assert!(
+        format!("{err:#}").contains("loop kind \"for_statement\""),
+        "{err:#}"
+    );
+    let err = compile_intent(&BAD_BOUNDARY, OracleLang::Rust)
+        .err()
+        .unwrap();
+    assert!(
+        format!("{err:#}").contains("boundary kind \"arrow_function\""),
+        "{err:#}"
+    );
 }
 
 #[test]
@@ -194,7 +229,10 @@ fn tsx_files_are_parsed_with_the_tsx_grammar() {
     assert_eq!(lines("try-catch-finally", OracleLang::Tsx, src), [2]);
 
     // The per-file wrapper routes `.tsx` to the TSX grammar.
-    match ORACLE.file_matches("src/View.tsx", src).unwrap() {
+    match ORACLE
+        .file_matches(&mut OracleScratch::new(), "src/View.tsx", src)
+        .unwrap()
+    {
         FileMatches::Scored(report) => {
             assert_eq!(report.lang, OracleLang::Tsx);
             assert_eq!(report.definition["try-catch-finally"], [2]);
@@ -418,20 +456,248 @@ fn rust_nested_loop_intent_stops_at_function_boundaries_and_rejects_a_single_loo
 }
 
 #[test]
+fn nested_loop_intent_resumes_after_a_function_boundary_closes() {
+    // The loop after the closure is nested again: leaving the boundary
+    // restores the enclosing loop's context.
+    let ts = "for (;;) {\n  const g = () => {\n    for (;;) {}\n  };\n  for (;;) {}\n}\n";
+    for lang in TS_FAMILY {
+        assert!(parses_cleanly(lang, ts), "{lang}");
+        assert_eq!(intent("nested-loop", lang, ts), [5], "{lang}");
+    }
+    let rust = "fn f() {\n    loop {\n        let g = || {\n            loop {}\n        };\n        loop {}\n    }\n}\n";
+    assert!(parses_cleanly(OracleLang::Rust, rust));
+    assert_eq!(intent("rust-nested-loop", OracleLang::Rust, rust), [6]);
+}
+
+/// A function whose loop (line 2) holds an `if` / `else if` chain of `arms`
+/// arms, each with its own loop (lines 3 to `2 + arms`), then one more arm
+/// whose loop sits behind an arrow function (line `3 + arms`).
+fn deep_else_if_chain(arms: usize) -> String {
+    let mut src = String::from("function f() {\n  for (;;) {\n    if (c0) { for (;;) {} }\n");
+    for arm in 1..arms {
+        src.push_str(&format!("    else if (c{arm}) {{ for (;;) {{}} }}\n"));
+    }
+    src.push_str("    else if (z) { const g = () => { for (;;) {} }; }\n  }\n}\n");
+    src
+}
+
+/// Lines 3 to `2 + arms`: the chain's loops, all inside line 2's loop.
+fn deep_else_if_chain_answer(arms: usize) -> Vec<u32> {
+    (3..3 + u32::try_from(arms).unwrap()).collect()
+}
+
+#[test]
+fn a_deep_else_if_chain_is_answered_in_one_pass() {
+    // Every `else if` nests one level deeper (if_statement > else_clause >
+    // if_statement), so the chain's last loop sits about 6,000 levels down
+    // and each loop's nearest loop ancestor is the outer one at the top.
+    // Walking up with `Node::parent`, which re-descends from the root on
+    // every step, costs O(depth²) per loop: hours at this size. One
+    // pre-order pass with a tree cursor is linear in the tree.
+    const ARMS: usize = 3_000;
+    let src = deep_else_if_chain(ARMS);
+    assert!(parses_cleanly(OracleLang::TypeScript, &src));
+    assert_eq!(
+        intent("nested-loop", OracleLang::TypeScript, &src),
+        deep_else_if_chain_answer(ARMS)
+    );
+    // The per-file path answers the same, and no definition query runs out
+    // of in-progress matches at this depth.
+    let FileMatches::Scored(report) = ORACLE
+        .file_matches(&mut OracleScratch::new(), "src/deep.ts", &src)
+        .unwrap()
+    else {
+        panic!("a small .ts file is scored");
+    };
+    assert_eq!(
+        report.intent["nested-loop"],
+        deep_else_if_chain_answer(ARMS)
+    );
+}
+
+/// The intent answer the way the oracle first computed it: every loop the
+/// query `[(<loop kind>) …] @loop` captures whose ancestors, walked with
+/// `Node::parent`, reach a loop kind before a boundary kind. Quadratic in
+/// the depth, so only for small sources: the reference the one-pass walk
+/// must agree with.
+fn ancestor_walk_intent(spec: &IntentSpec, lang: OracleLang, source: &str) -> Vec<u32> {
+    let tree = OracleScratch::new().parse(lang, source).unwrap();
+    let kinds: Vec<String> = spec.loop_kinds.iter().map(|k| format!("({k})")).collect();
+    let query = Query::new(&lang.grammar(), &format!("[{}] @loop", kinds.join(" "))).unwrap();
+    let mut cursor = QueryCursor::new();
+    let mut lines = BTreeSet::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let nested = std::iter::successors(capture.node.parent(), Node::parent)
+                .map(|ancestor| ancestor.kind())
+                .find(|kind| spec.loop_kinds.contains(kind) || spec.boundary_kinds.contains(kind))
+                .is_some_and(|kind| spec.loop_kinds.contains(&kind));
+            if nested {
+                lines.insert(first_line(capture.node).unwrap());
+            }
+        }
+    }
+    lines.into_iter().collect()
+}
+
+#[test]
+fn the_intent_answer_agrees_with_the_ancestor_walk() {
+    let chain = deep_else_if_chain(40);
+    let ts: &[&str] = &[
+        "function f() {\n  for (const a of xs) {\n    while (ok()) {\n      step();\n    }\n  }\n}\n",
+        "for (;;) {\n  if (x) {\n    for (;;) {}\n  }\n}\n",
+        "for (let i = 0; i < n; i++) {\n  do {\n    y();\n  } while (z);\n}\n",
+        "for (const a of xs) {\n  const g = () => {\n    for (let i = 0; i < 3; i++) {}\n  };\n}\n",
+        "while (x) {\n  function h() {\n    do { y(); } while (z);\n  }\n}\n",
+        "for (;;) {\n  const o = {\n    m() {\n      for (;;) {}\n    },\n  };\n}\n",
+        "for (;;) {\n  function* g() {\n    while (y) {}\n  }\n}\n",
+        "for (;;) {\n  const g = () => {\n    for (;;) {}\n  };\n  for (;;) {}\n}\n",
+        // Error recovery: a broken inner loop header.
+        "for (;;) {\n  for (;; {\n    x();\n  }\n  while (y) {}\n}\n",
+        &chain,
+    ];
+    let rust: &[&str] = &[
+        "fn f() {\n    for i in 0..n {\n        loop {\n            break;\n        }\n    }\n}\n",
+        "fn f() {\n    while a() {\n        if b() {\n            while c() {}\n        }\n    }\n}\n",
+        "fn f() {\n    for i in 0..n {\n        let g = || {\n            for j in 0..m {}\n        };\n    }\n}\n",
+        "fn f() {\n    while go() {\n        fn inner() {\n            loop {}\n        }\n    }\n}\n",
+        "fn f() {\n    loop {\n        let g = || {\n            loop {}\n        };\n        loop {}\n    }\n}\n",
+        "fn f() {\n    for i in 0..n {\n        for j in 0.. {\n    }\n}\n",
+    ];
+    for spec in INTENTS {
+        for &lang in spec.langs {
+            let sources = if lang == OracleLang::Rust { rust } else { ts };
+            for src in sources {
+                assert_eq!(
+                    intent(spec.pattern, lang, src),
+                    ancestor_walk_intent(spec, lang, src),
+                    "{} ({lang}): {src}",
+                    spec.pattern
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_query_over_the_match_limit_is_an_error_naming_it() {
+    // `(try_statement (catch_clause)) @match` holds one in-progress match per
+    // enclosing try until that try's catch clause: three here.
+    let src = "try {\n  try {\n    try { a(); } catch (e) {}\n  } catch (e) {}\n} catch (e) {}\n";
+    assert_eq!(lines("try-catch", OracleLang::TypeScript, src), [1, 2, 3]);
+
+    let mut tight = OracleScratch::with_match_limit(1).unwrap();
+    let err = ORACLE
+        .match_lines(&mut tight, "try-catch", OracleLang::TypeScript, src)
+        .expect_err("three nested matches need three in-progress states");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("try-catch.typescript.scm"), "{msg}");
+    assert!(msg.contains("match limit of 1 "), "{msg}");
+    // The per-file path names the file and the query that tripped.
+    let err = ORACLE
+        .file_matches(
+            &mut OracleScratch::with_match_limit(1).unwrap(),
+            "src/nested.ts",
+            src,
+        )
+        .expect_err("a query over its limit fails the file");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("structural oracle on src/nested.ts"), "{msg}");
+    assert!(msg.contains(".typescript.scm needed more than"), "{msg}");
+
+    // The limit stays inside tree-sitter's contract.
+    assert!(OracleScratch::with_match_limit(0).is_err());
+    assert!(OracleScratch::with_match_limit(MAX_MATCH_LIMIT + 1).is_err());
+    assert!(OracleScratch::with_match_limit(MAX_MATCH_LIMIT).is_ok());
+    assert_eq!(
+        OracleScratch::new().cursor.match_limit(),
+        ORACLE_MATCH_LIMIT
+    );
+}
+
+#[test]
+fn one_scratch_serves_files_of_every_language_in_turn() {
+    let files = [
+        (
+            "src/a.rs",
+            "fn f() {\n    for i in 0..n {\n        for j in 0..m {}\n    }\n}\n",
+        ),
+        (
+            "src/View.tsx",
+            "function View() {\n  try {\n    load();\n  } catch (e) {}\n  return <div>{x}</div>;\n}\n",
+        ),
+        ("src/b.py", "try:\n    a()\nfinally:\n    b()\n"),
+        (
+            "cmd/main.go",
+            "package main\n\nfunc main() {\n\tdefer f()\n\tselect {}\n}\n",
+        ),
+        ("src/c.js", "for (;;) {\n  for (;;) {}\n}\n"),
+        (
+            "src/d.ts",
+            "try {\n  try {\n    try { a(); } catch (e) {}\n  } catch (e) {}\n} catch (e) {}\n",
+        ),
+        (
+            "src/a.rs",
+            "fn f() {\n    for i in 0..n {\n        for j in 0..m {}\n    }\n}\n",
+        ),
+    ];
+    let mut shared = OracleScratch::new();
+    for (path, text) in files {
+        let reused = ORACLE.file_matches(&mut shared, path, text).unwrap();
+        let fresh = ORACLE
+            .file_matches(&mut OracleScratch::new(), path, text)
+            .unwrap();
+        assert_eq!(reused, fresh, "{path}");
+        let FileMatches::Scored(report) = reused else {
+            panic!("{path} is scored");
+        };
+        assert!(
+            report.definition.values().any(|lines| !lines.is_empty()),
+            "{path} matches something, so the comparison means something"
+        );
+    }
+
+    // A run that trips the match limit leaves the scratch usable: the next
+    // file gets its full answer, and the limit still holds after it.
+    let (path, nested) = files[5];
+    let mut tight = OracleScratch::with_match_limit(1).unwrap();
+    assert!(ORACLE.file_matches(&mut tight, path, nested).is_err());
+    let flat = "try { a(); } catch (e) {}\n";
+    assert_eq!(
+        ORACLE.file_matches(&mut tight, "src/e.ts", flat).unwrap(),
+        ORACLE
+            .file_matches(&mut OracleScratch::new(), "src/e.ts", flat)
+            .unwrap()
+    );
+    assert!(ORACLE.file_matches(&mut tight, path, nested).is_err());
+}
+
+#[test]
 fn unknown_pattern_or_language_is_an_error() {
     assert!(
         ORACLE
-            .match_lines("no-such-pattern", OracleLang::Rust, "")
+            .match_lines(
+                &mut OracleScratch::new(),
+                "no-such-pattern",
+                OracleLang::Rust,
+                ""
+            )
             .is_err()
     );
     assert!(
         ORACLE
-            .match_lines("try-catch", OracleLang::Rust, "")
+            .match_lines(&mut OracleScratch::new(), "try-catch", OracleLang::Rust, "")
             .is_err()
     );
     assert!(
         ORACLE
-            .match_lines("deep-nesting", OracleLang::TypeScript, "")
+            .match_lines(
+                &mut OracleScratch::new(),
+                "deep-nesting",
+                OracleLang::TypeScript,
+                ""
+            )
             .is_err()
     );
     assert!(
@@ -562,7 +828,10 @@ fn file_matches_gates_on_the_size_cap_at_the_exact_boundary() {
     let len = usize::try_from(AST_SIZE_CAP_BYTES).unwrap();
     let exact = format!("{head}{}", "x".repeat(len - head.len()));
     assert_eq!(exact.len(), len);
-    match ORACLE.file_matches("src/big.rs", &exact).unwrap() {
+    match ORACLE
+        .file_matches(&mut OracleScratch::new(), "src/big.rs", &exact)
+        .unwrap()
+    {
         FileMatches::Scored(report) => {
             assert_eq!(report.lang, OracleLang::Rust);
             assert_eq!(report.definition["empty-function"], [1]);
@@ -571,7 +840,9 @@ fn file_matches_gates_on_the_size_cap_at_the_exact_boundary() {
     }
     let over = format!("{exact}x");
     assert_eq!(
-        ORACLE.file_matches("src/big.rs", &over).unwrap(),
+        ORACLE
+            .file_matches(&mut OracleScratch::new(), "src/big.rs", &over)
+            .unwrap(),
         FileMatches::OverSizeCap(OracleLang::Rust)
     );
 }
@@ -579,7 +850,10 @@ fn file_matches_gates_on_the_size_cap_at_the_exact_boundary() {
 #[test]
 fn file_matches_reports_every_pattern_of_the_language() {
     let src = "fn f() {\n    for i in 0..n {\n        for j in 0..m {}\n    }\n}\n";
-    let FileMatches::Scored(report) = ORACLE.file_matches("src/lib.rs", src).unwrap() else {
+    let FileMatches::Scored(report) = ORACLE
+        .file_matches(&mut OracleScratch::new(), "src/lib.rs", src)
+        .unwrap()
+    else {
         panic!("a small .rs file is scored");
     };
     let expected: BTreeSet<&str> = QUERIES
@@ -601,11 +875,15 @@ fn file_matches_reports_every_pattern_of_the_language() {
     assert_eq!(report.intent["rust-nested-loop"], [3]);
 
     assert_eq!(
-        ORACLE.file_matches("A.java", "class A {}").unwrap(),
+        ORACLE
+            .file_matches(&mut OracleScratch::new(), "A.java", "class A {}")
+            .unwrap(),
         FileMatches::NotScored(LangClass::Unscored { language: "java" })
     );
     assert_eq!(
-        ORACLE.file_matches("x.json", "{}").unwrap(),
+        ORACLE
+            .file_matches(&mut OracleScratch::new(), "x.json", "{}")
+            .unwrap(),
         FileMatches::NotScored(LangClass::NotIndexed {
             language: Some("json"),
             size_capped: false

@@ -26,7 +26,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Context;
 use rayon::prelude::*;
 use rskim_oracle::structural::{
-    self, FileMatches, INTENTS, LangClass, OracleLang, PatternCoverage, StructuralOracle,
+    self, FileMatches, INTENTS, LangClass, OracleLang, OracleScratch, PatternCoverage,
+    StructuralOracle,
 };
 use serde::{Deserialize, Serialize};
 
@@ -73,12 +74,14 @@ pub struct OracleAnswers {
 impl OracleAnswers {
     /// Run the oracle over every `(path, text)` of a corpus universe: each
     /// file is parsed once, and files are processed in parallel (the oracle
-    /// is `Sync`); the answers do not depend on the order.
+    /// is `Sync`), each rayon worker reusing one [`OracleScratch`] (parser
+    /// and query cursor) from file to file; the answers do not depend on the
+    /// order.
     ///
     /// # Errors
     ///
     /// Any [`StructuralOracle::file_matches`] error (a parser that returns
-    /// no tree, a query over tree-sitter's match limit), naming the file.
+    /// no tree, a query over the oracle's match limit), naming the file.
     pub fn compute<'a>(
         oracle: &StructuralOracle,
         files: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -87,7 +90,9 @@ impl OracleAnswers {
         let over_cap = structural::over_cap_count(files.iter().map(|&(p, t)| (p, t.len() as u64)));
         let reports = files
             .par_iter()
-            .map(|&(path, text)| oracle.file_matches(path, text).map(|m| (path, m)))
+            .map_init(OracleScratch::new, |scratch, &(path, text)| {
+                oracle.file_matches(scratch, path, text).map(|m| (path, m))
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         let mut answers = OracleAnswers {
@@ -194,21 +199,36 @@ pub fn called_patterns(catalog: &[CatalogPattern]) -> Vec<&'static str> {
 // Splitting skim's rows
 // ============================================================================
 
-/// The rows of `page` whose file is in `lang` (by the oracle's extension
-/// table, so `.tsx` is its own language), in skim's order: an `[[ast]]`
-/// entry's full list.
+/// Whether `row`'s file is in `lang` by the oracle's extension table (so
+/// `.tsx` is its own language).
+fn is_in(row: &ResultRow, lang: OracleLang) -> bool {
+    structural::classify(&row.path) == LangClass::Oracle(lang)
+}
+
+/// The rows of `page` whose file is in `lang` ([`is_in`]), in skim's order:
+/// an `[[ast]]` entry's full list.
 pub fn rows_in(page: &ResultPage, lang: OracleLang) -> ResultPage {
     ResultPage {
         rows: page
             .rows
             .iter()
-            .filter(|r| structural::classify(&r.path) == LangClass::Oracle(lang))
+            .filter(|r| is_in(r, lang))
             .cloned()
             .collect(),
         has_more: page.has_more,
         verify_mode: page.verify_mode.clone(),
         degraded: page.degraded.clone(),
     }
+}
+
+/// The distinct files of `page`'s rows in `lang`: the files of
+/// [`rows_in`], without copying a row.
+pub fn files_in(page: &ResultPage, lang: OracleLang) -> BTreeSet<&str> {
+    page.rows
+        .iter()
+        .filter(|r| is_in(r, lang))
+        .map(|r| r.path.as_str())
+        .collect()
 }
 
 /// The rows of skim's `--ast <pattern>` answer `page` that no entry in
@@ -219,14 +239,13 @@ pub fn unscored_in<'p>(
     pattern: &str,
     page: &'p ResultPage,
     scored: &BTreeSet<(&str, OracleLang)>,
-) -> Vec<&'p ResultRow> {
+) -> impl Iterator<Item = &'p ResultRow> {
     page.rows
         .iter()
-        .filter(|r| match structural::classify(&r.path) {
+        .filter(move |r| match structural::classify(&r.path) {
             LangClass::Oracle(lang) => !scored.contains(&(pattern, lang)),
             LangClass::Unscored { .. } | LangClass::NotIndexed { .. } => true,
         })
-        .collect()
 }
 
 /// skim rows no `[[ast]]` entry scores ([`unscored_in`]), per pattern skim
@@ -242,7 +261,7 @@ pub fn unscored_rows<'a>(
     patterns
         .iter()
         .map(|(pattern, call)| {
-            let unscored = unscored_in(pattern, &call.page, &scored).len();
+            let unscored = unscored_in(pattern, &call.page, &scored).count();
             (pattern.clone(), unscored as u64)
         })
         .collect()
