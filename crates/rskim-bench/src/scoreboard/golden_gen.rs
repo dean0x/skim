@@ -1,5 +1,5 @@
-//! `golden-gen`: candidate `[[ident]]` entries for a corpus's golden file
-//! (#203).
+//! `golden-gen`: candidate `[[ident]]` entries (#203) and, with `--ast`,
+//! candidate `[[ast]]` entries (#541) for a corpus's golden file.
 //!
 //! The output is a proposal. It is reviewed, pasted into
 //! `golden/<corpus>.toml` and frozen there; the committed golden file is the
@@ -21,16 +21,41 @@
 //! `rskim_core::Language` appears here only as `extract_symbols`' dispatch
 //! key, chosen from this module's own extension table; nothing here calls
 //! `Language::from_extension`, and nothing here scores skim.
+//!
+//! `[[ast]]` selection ([`generate_ast`]): every `(pattern, language)` the
+//! structural oracle covers whose entry the gate would not refuse as vacuous
+//! (its own rule, [`is_vacuous`]): the oracle matches a file, or skim's
+//! `--ast <pattern>` returns a row in that language, and the corpus has a
+//! scored file in that language. The proposed precision class is `hard`
+//! when the catalog marks the pattern `exact`, `ratchet` otherwise
+//! ([`proposed_class`]); once frozen in the golden file, the class is never
+//! re-read from the catalog. An entry the oracle matches no file for exists
+//! only because skim returns one (a false positive), so it is proposed with
+//! `expect_oracle_empty = true`: a false-positive guard that stays scored
+//! after a fix empties skim's rows.
+//!
+//! `golden-gen --ast` calls skim for every catalog pattern
+//! ([`crate::scoreboard::structural_metrics::called_patterns`]) through the
+//! gate's own call loop (`pipeline::call_patterns`), and reports the rows no
+//! proposed entry would score ([`unscored_after`], the gate's scored set) as
+//! a comment above the proposal.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Context;
+use rskim_oracle::structural::{OracleLang, PatternCoverage};
 use rskim_search::SearchField;
 
 use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
-use crate::scoreboard::golden::{DefSite, hex_sha256};
+use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
+use crate::scoreboard::fmt::sample;
+use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
+use crate::scoreboard::structural_metrics::{
+    OracleAnswers, StructuralTarget, files_in, is_vacuous, lang_rows, scored_pairs, unscored_in,
+};
+use crate::scoreboard::types::{AstPage, ResultRow};
 use crate::scoreboard::universe::Universe;
 
 /// Generated identifier entries per corpus.
@@ -231,6 +256,201 @@ pub fn render_toml(corpus: &str, candidates: &[Candidate]) -> String {
     out
 }
 
+// ============================================================================
+// [[ast]] candidates
+// ============================================================================
+
+/// One proposed `[[ast]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AstCandidate {
+    pub id: String,
+    /// What the entry scores, as the gate will read it once frozen: its
+    /// `expect_oracle_empty` is set when the oracle matches no file, so the
+    /// entry guards skim's false positive (precision) only.
+    pub target: StructuralTarget,
+    /// Files the oracle matches in the target's language (for the reviewer).
+    pub oracle_files: usize,
+    /// Distinct files skim's `--ast <pattern>` returns in that language.
+    pub skim_files: usize,
+}
+
+/// An `[[ast]]` id: `<corpus>-ast-<pattern>-<lang>`. It names the pair, not
+/// a position, so regenerating never renumbers an id the ledger or the
+/// baseline holds.
+pub fn ast_id(corpus: &str, pattern: &str, lang: OracleLang) -> String {
+    format!("{corpus}-ast-{pattern}-{lang}")
+}
+
+/// The class `golden-gen` proposes: `hard` when `catalog` marks `pattern`
+/// `exact` (its n-grams are a reliable subset of every occurrence), else
+/// `ratchet`. The gate never calls this: the class is frozen in golden.
+pub fn proposed_class(catalog: &[CatalogPattern], pattern: &str) -> PrecisionClass {
+    let exact = catalog.iter().any(|p| p.name == pattern && p.exact);
+    if exact {
+        PrecisionClass::Hard
+    } else {
+        PrecisionClass::Ratchet
+    }
+}
+
+/// Every covered `(pattern, language)` of `catalog`, ordered by
+/// `(pattern, language name)`.
+fn covered_pairs(catalog: &[CatalogPattern]) -> Vec<(&'static str, OracleLang)> {
+    let mut pairs: Vec<(&'static str, OracleLang)> = catalog_coverage(catalog)
+        .into_iter()
+        .filter_map(|(pattern, coverage)| match coverage {
+            PatternCoverage::Covered { langs } => Some((pattern, langs)),
+            PatternCoverage::Uncovered { .. } => None,
+        })
+        .flat_map(|(pattern, langs)| langs.into_iter().map(move |lang| (pattern, lang)))
+        .collect();
+    pairs.sort_by_key(|&(pattern, lang)| (pattern, lang.as_str()));
+    pairs
+}
+
+/// Propose `[[ast]]` entries (see the module docs) for the patterns of
+/// `catalog`. `skim` holds skim's `--ast <pattern>` answer per pattern
+/// called; a pattern not in it counts as no rows. A pair is proposed only
+/// if the gate's vacuity rule ([`is_vacuous`]) passes it twice: as an
+/// ordinary entry (the oracle or skim finds a file), then as proposed (a
+/// false-positive guard needs a scored file in its language).
+///
+/// # Errors
+///
+/// A covered pair the oracle has no answer for (an oracle bug).
+pub fn generate_ast(
+    corpus: &str,
+    catalog: &[CatalogPattern],
+    answers: &OracleAnswers,
+    skim: &BTreeMap<String, AstPage>,
+) -> anyhow::Result<Vec<AstCandidate>> {
+    let mut out = Vec::new();
+    for (pattern, lang) in covered_pairs(catalog) {
+        let call = skim.get(pattern);
+        let rows = || call.into_iter().flat_map(|c| lang_rows(&c.page, lang));
+        let ordinary = StructuralTarget {
+            pattern: pattern.to_string(),
+            lang,
+            precision: proposed_class(catalog, pattern),
+            expect_oracle_empty: false,
+        };
+        if is_vacuous(&ordinary, rows(), answers)? {
+            continue;
+        }
+        let oracle_files = answers.definition(pattern, lang)?.len();
+        let target = StructuralTarget {
+            expect_oracle_empty: oracle_files == 0,
+            ..ordinary
+        };
+        if is_vacuous(&target, rows(), answers)? {
+            continue;
+        }
+        out.push(AstCandidate {
+            id: ast_id(corpus, pattern, lang),
+            target,
+            oracle_files,
+            skim_files: call.map_or(0, |c| files_in(&c.page, lang).len()),
+        });
+    }
+    Ok(out)
+}
+
+/// skim rows no candidate scores ([`unscored_in`] over the candidates'
+/// [`scored_pairs`], as the gate reads them), per called pattern with at
+/// least one, in pattern order: what the gate counts in
+/// `structural.unscored_rows.<pattern>` once the proposal is frozen.
+pub fn unscored_after<'s>(
+    candidates: &[AstCandidate],
+    skim: &'s BTreeMap<String, AstPage>,
+) -> Vec<(&'s str, Vec<&'s ResultRow>)> {
+    let scored = scored_pairs(candidates.iter().map(|c| &c.target));
+    skim.iter()
+        .map(|(pattern, call)| {
+            let rows: Vec<&ResultRow> = unscored_in(pattern, &call.page, &scored).collect();
+            (pattern.as_str(), rows)
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
+}
+
+/// TOML comment lines reporting [`unscored_after`] to the reviewer: each
+/// pattern's count and a sample of `path:line` rows, or `none`. A row path
+/// is skim's output, so it is escaped (`comment_safe`) and can neither end
+/// its comment line nor reach the terminal as a control sequence.
+pub fn render_unscored_comment(unscored: &[(&str, Vec<&ResultRow>)]) -> String {
+    if unscored.is_empty() {
+        return "# golden-gen: skim rows no proposed entry scores: none\n".to_string();
+    }
+    let mut out = String::from(
+        "# golden-gen: skim rows no proposed entry scores (the gate counts them in \
+         structural.unscored_rows.<pattern>):\n",
+    );
+    for (pattern, rows) in unscored {
+        let located: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                let path = comment_safe(&r.path);
+                match r.line {
+                    Some(line) => format!("{path}:{line}"),
+                    None => path,
+                }
+            })
+            .collect();
+        out.push_str(&format!(
+            "#   {pattern} {}: {}\n",
+            rows.len(),
+            sample(located.iter().map(String::as_str))
+        ));
+    }
+    out
+}
+
+/// `text` made safe inside a one-line `#` comment: every control character
+/// (a newline would end the comment and start TOML a reviewer might paste
+/// into golden; an ESC would reach the terminal), every Unicode
+/// bidirectional control (it reorders what the reviewer reads), and the
+/// backslash (so the escaping stays unambiguous) is written as its Rust
+/// escape: `\n`, `\u{1b}`, `\u{202e}`, `\\`. Anything else is kept as is.
+fn comment_safe(text: &str) -> String {
+    let escaped = |c: char| {
+        c.is_control()
+            || c == '\\'
+            || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    text.chars()
+        .fold(String::with_capacity(text.len()), |mut out, c| {
+            if escaped(c) {
+                out.extend(c.escape_default());
+            } else {
+                out.push(c);
+            }
+            out
+        })
+}
+
+/// TOML `[[ast]]` entries for `candidates`, each preceded by a review
+/// comment with the oracle's and skim's file counts; a false-positive guard
+/// also gets `expect_oracle_empty = true`.
+pub fn render_ast_toml(candidates: &[AstCandidate]) -> String {
+    let mut out = String::new();
+    for c in candidates {
+        out.push_str(&format!(
+            "\n# golden-gen: oracle files {}; skim files {}\n\
+             [[ast]]\nid = {}\npattern = {}\nlang = {}\nprecision = {}\n",
+            c.oracle_files,
+            c.skim_files,
+            toml_string(&c.id),
+            toml_string(&c.target.pattern),
+            toml_string(c.target.lang.as_str()),
+            toml_string(c.target.precision.as_str()),
+        ));
+        if c.target.expect_oracle_empty {
+            out.push_str("expect_oracle_empty = true\n");
+        }
+    }
+    out
+}
+
 /// A TOML basic string (quoted and escaped by the `toml` crate).
 fn toml_string(s: &str) -> String {
     toml::Value::String(s.to_string()).to_string()
@@ -241,7 +461,8 @@ fn toml_string(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
-    use crate::scoreboard::test_support::FixtureRepo;
+    use crate::scoreboard::test_support::{FixtureRepo, catalog, oracle};
+    use crate::scoreboard::types::{AstCoverage, ResultPage, VerifyMode};
     use crate::scoreboard::universe::GitIsolation;
 
     fn site(name: &str, path: &str, line: u32) -> DefinitionSite {
@@ -543,6 +764,308 @@ mod tests {
                 commit: &sha,
                 universe: Some(&universe),
                 ledger: &[],
+                catalog: catalog(),
+            },
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    // --- [[ast]] candidates --------------------------------------------------------
+
+    fn ast_answers(files: &[(&str, &str)]) -> OracleAnswers {
+        OracleAnswers::compute(oracle(), files.iter().copied()).unwrap()
+    }
+
+    /// skim's `--ast <pattern>` answer: one row per path, line 1.
+    fn skim_rows(paths: &[&str]) -> AstPage {
+        AstPage {
+            page: ResultPage {
+                rows: paths
+                    .iter()
+                    .map(|p| ResultRow {
+                        path: p.to_string(),
+                        score: 1.0,
+                        line: Some(1),
+                        snippet: Vec::new(),
+                    })
+                    .collect(),
+                has_more: false,
+                verify_mode: VerifyMode::Substring,
+                degraded: Vec::new(),
+            },
+            coverage: AstCoverage::default(),
+        }
+    }
+
+    #[test]
+    fn ast_ids_name_the_pattern_and_language_pair() {
+        assert_eq!(
+            ast_id("zod", "try-catch", OracleLang::Tsx),
+            "zod-ast-try-catch-tsx"
+        );
+        assert_eq!(
+            ast_id("skim", "rust-nested-loop", OracleLang::Rust),
+            "skim-ast-rust-nested-loop-rust"
+        );
+    }
+
+    #[test]
+    fn the_proposed_class_follows_the_catalog_exact_flag() {
+        assert_eq!(proposed_class(catalog(), "try-catch"), PrecisionClass::Hard);
+        assert_eq!(
+            proposed_class(catalog(), "try-catch-finally"),
+            PrecisionClass::Hard
+        );
+        assert_eq!(
+            proposed_class(catalog(), "rust-nested-loop"),
+            PrecisionClass::Ratchet
+        );
+        assert_eq!(
+            proposed_class(catalog(), "call-in-loop"),
+            PrecisionClass::Ratchet
+        );
+        assert_eq!(
+            proposed_class(catalog(), "no-such-pattern"),
+            PrecisionClass::Ratchet
+        );
+        // The flag comes from the catalog passed in, not from skim's.
+        let flipped = [CatalogPattern {
+            name: "rust-nested-loop",
+            exact: true,
+            example: "",
+        }];
+        assert_eq!(
+            proposed_class(&flipped, "rust-nested-loop"),
+            PrecisionClass::Hard
+        );
+        assert_eq!(
+            proposed_class(&flipped, "try-catch"),
+            PrecisionClass::Ratchet
+        );
+    }
+
+    #[test]
+    fn ast_candidates_are_the_non_vacuous_pairs_of_the_corpus_languages() {
+        let answers = ast_answers(&[
+            (
+                "src/nested.rs",
+                "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {}\n    }\n}\n",
+            ),
+            ("web/a.ts", "try {\n  go();\n} catch (e) {}\n"),
+            // A try/finally wrapping a separate try/catch: no single try
+            // carries both clauses (the #546 shape).
+            (
+                "web/b.js",
+                "try { try { a(); } catch (e) {} } finally { b(); }\n",
+            ),
+        ]);
+        // skim returns the JS file for try-catch-finally although the oracle
+        // does not match it: a skim-only entry is non-vacuous and proposed.
+        let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/b.js"]))]);
+        let got = generate_ast("skim", catalog(), &answers, &skim).unwrap();
+        let pairs: Vec<(&str, &str, usize, usize)> = got
+            .iter()
+            .map(|c| {
+                (
+                    c.target.pattern.as_str(),
+                    c.target.lang.as_str(),
+                    c.oracle_files,
+                    c.skim_files,
+                )
+            })
+            .collect();
+        assert!(
+            pairs.contains(&("try-catch-finally", "javascript", 0, 1)),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("rust-nested-loop", "rust", 1, 0)),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("try-catch", "typescript", 1, 0)),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs.contains(&("try-catch", "javascript", 1, 0)),
+            "{pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|p| p.0 == "god-function"),
+            "vacuous: neither the oracle nor skim finds one: {pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|p| p.1 == "tsx"),
+            "no .tsx file in the corpus: {pairs:?}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|p| p.0 == "go-select" || p.0 == "python-try-except"),
+            "no Go or Python file in the corpus: {pairs:?}"
+        );
+        let mut sorted = pairs.clone();
+        sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        assert_eq!(pairs, sorted, "ordered by (pattern, language name)");
+        assert_eq!(
+            generate_ast("skim", catalog(), &answers, &skim).unwrap(),
+            got
+        );
+
+        // Exactly the entries the oracle matches nothing for are proposed as
+        // false-positive guards.
+        let guards: Vec<&str> = got
+            .iter()
+            .filter(|c| c.target.expect_oracle_empty)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(guards, ["skim-ast-try-catch-finally-javascript"]);
+        assert!(
+            got.iter()
+                .all(|c| c.target.expect_oracle_empty == (c.oracle_files == 0))
+        );
+    }
+
+    #[test]
+    fn rows_no_proposed_entry_scores_are_reported_per_pattern() {
+        let answers = ast_answers(&[
+            (
+                "src/nested.rs",
+                "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {}\n    }\n}\n",
+            ),
+            ("web/a.ts", "try {\n  go();\n} catch (e) {}\n"),
+        ]);
+        // skim is called for every catalog pattern. deep-nesting has no
+        // oracle, god-function has no entry for Python, and the corpus has
+        // no .tsx file, so no try-catch entry scores `web/b.tsx`.
+        let skim = BTreeMap::from([
+            (
+                "rust-nested-loop".to_string(),
+                skim_rows(&["src/nested.rs"]),
+            ),
+            (
+                "deep-nesting".to_string(),
+                skim_rows(&["src/nested.rs", "lib/C.java"]),
+            ),
+            ("god-function".to_string(), skim_rows(&["app.py"])),
+            ("go-select".to_string(), skim_rows(&[])),
+            (
+                "try-catch".to_string(),
+                skim_rows(&["web/a.ts", "web/b.tsx"]),
+            ),
+        ]);
+        let candidates = generate_ast("skim", catalog(), &answers, &skim).unwrap();
+        let unscored = unscored_after(&candidates, &skim);
+        let got: Vec<(&str, Vec<&str>)> = unscored
+            .iter()
+            .map(|(p, rows)| (*p, rows.iter().map(|r| r.path.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("deep-nesting", vec!["src/nested.rs", "lib/C.java"]),
+                ("god-function", vec!["app.py"]),
+                ("try-catch", vec!["web/b.tsx"]),
+            ],
+            "patterns with no unscored row are left out"
+        );
+
+        let comment = render_unscored_comment(&unscored);
+        assert!(comment.lines().all(|l| l.starts_with('#')), "{comment}");
+        assert!(
+            comment.contains("structural.unscored_rows.<pattern>"),
+            "{comment}"
+        );
+        assert!(
+            comment.contains("#   deep-nesting 2: src/nested.rs:1, lib/C.java:1"),
+            "{comment}"
+        );
+        assert!(
+            comment.contains("#   try-catch 1: web/b.tsx:1"),
+            "{comment}"
+        );
+        assert_eq!(
+            render_unscored_comment(&[]),
+            "# golden-gen: skim rows no proposed entry scores: none\n"
+        );
+    }
+
+    #[test]
+    fn a_row_path_cannot_break_out_of_its_comment_line() {
+        // A newline would end the comment and start TOML a reviewer might
+        // paste into golden; an ESC would reach the terminal; a bidi control
+        // would reorder what the reviewer reads.
+        let hostile = "src/a\n[[ast]]\nid = \"injected\"\r\x1b[2J\u{202e}.rs";
+        let page = skim_rows(&[hostile, "src\\b.rs", "src/plain.rs"]);
+        let rows: Vec<&ResultRow> = page.page.rows.iter().collect();
+        let comment = render_unscored_comment(&[("deep-nesting", rows)]);
+
+        assert_eq!(comment.lines().count(), 2, "{comment}");
+        assert!(comment.lines().all(|l| l.starts_with('#')), "{comment}");
+        assert!(
+            !comment.chars().any(|c| c.is_control() && c != '\n'),
+            "{comment:?}"
+        );
+        assert!(!comment.contains('\u{202e}'), "{comment:?}");
+        assert!(
+            comment.contains(
+                r#"#   deep-nesting 3: src/a\n[[ast]]\nid = "injected"\r\u{1b}[2J\u{202e}.rs:1, src\\b.rs:1, src/plain.rs:1"#
+            ),
+            "{comment}"
+        );
+        // A TOML parser sees comments only.
+        let golden = parse_golden(&format!(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n{comment}"
+        ))
+        .unwrap();
+        assert!(golden.asts.is_empty(), "{golden:?}");
+    }
+
+    #[test]
+    fn rendered_ast_candidates_are_integrity_clean_golden_entries() {
+        let answers = ast_answers(&[("web/a.ts", "try {\n  go();\n} catch (e) {}\n")]);
+        // skim's try-catch-finally row is a false positive: a guard entry.
+        let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/a.ts"]))]);
+        let got = generate_ast("skim", catalog(), &answers, &skim).unwrap();
+        assert!(got.iter().any(|c| c.target.expect_oracle_empty));
+        assert!(got.iter().any(|c| !c.target.expect_oracle_empty));
+        let rendered = render_ast_toml(&got);
+        assert_eq!(
+            rendered.matches("expect_oracle_empty = true").count(),
+            got.iter().filter(|c| c.target.expect_oracle_empty).count(),
+            "{rendered}"
+        );
+        let golden = parse_golden(&format!(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n{rendered}"
+        ))
+        .unwrap();
+        assert_eq!(golden.asts.len(), got.len());
+        for (entry, candidate) in golden.asts.iter().zip(&got) {
+            assert_eq!(
+                (
+                    entry.id.as_str(),
+                    entry.pattern.as_str(),
+                    entry.lang,
+                    entry.precision,
+                    entry.expect_oracle_empty
+                ),
+                (
+                    candidate.id.as_str(),
+                    candidate.target.pattern.as_str(),
+                    candidate.target.lang,
+                    candidate.target.precision,
+                    candidate.target.expect_oracle_empty
+                )
+            );
+        }
+        let violations = check_integrity(
+            &golden,
+            &IntegrityContext {
+                corpus: "skim",
+                commit: "b8a0a79463382347820f1c2572bde37b68e87c76",
+                universe: None,
+                ledger: &[],
+                catalog: catalog(),
             },
         );
         assert!(violations.is_empty(), "{violations:?}");

@@ -295,7 +295,7 @@ fn phrase_near_matches(words: &[String], tokens: &[&str], span: usize) -> bool {
 // ============================================================================
 
 /// One language: the display name, its file extensions (the oracle's copy of
-/// `rskim_core::Language::from_extension`, `crates/rskim-core/src/types.rs:55-80`)
+/// `rskim_core::Language::from_extension`, `crates/rskim-core/src/types.rs`)
 /// and the extra `--lang` names the CLI accepts for it
 /// (`parse_lang_value`, `crates/rskim/src/cmd/search/mod.rs:496-527`).
 struct LangSpec {
@@ -885,6 +885,53 @@ mod tests {
     fn lang_rejects_unknown_values() {
         assert!(LangFilter::parse("haskell").is_err());
         assert!(LangFilter::parse("").is_err());
+    }
+
+    /// `LANGS` and the structural oracle's extension table
+    /// (`rskim_oracle::structural::extension_classes`) are two copies of
+    /// skim's `Language::from_extension` table. They must list the same
+    /// extensions under the same language names, with one documented
+    /// exception: the structural oracle parses `.tsx` with the TSX grammar,
+    /// so its language there is `tsx`, where skim's is `typescript`.
+    #[test]
+    fn langs_agree_with_the_structural_oracles_extension_table() {
+        use std::collections::BTreeMap;
+
+        use rskim_oracle::structural::{LangClass, extension_classes};
+
+        let structural: Vec<(&str, &str)> = extension_classes()
+            .map(|(ext, class)| {
+                let language = match class {
+                    LangClass::Oracle(lang) => lang.as_str(),
+                    LangClass::Unscored { language } => language,
+                    LangClass::NotIndexed { language, .. } => language.unwrap_or("-"),
+                };
+                (ext, language)
+            })
+            .collect();
+        let lexical: Vec<(&str, &str)> = LANGS
+            .iter()
+            .flat_map(|l| l.extensions.iter().map(move |&ext| (ext, l.language)))
+            .collect();
+
+        let structural_map: BTreeMap<&str, &str> = structural.iter().copied().collect();
+        let lexical_map: BTreeMap<&str, &str> = lexical.iter().copied().collect();
+        assert_eq!(
+            structural_map.len(),
+            structural.len(),
+            "an extension listed twice"
+        );
+        assert_eq!(
+            lexical_map.len(),
+            lexical.len(),
+            "an extension listed twice"
+        );
+
+        assert_eq!(lexical_map.get("tsx"), Some(&"typescript"));
+        assert_eq!(structural_map.get("tsx"), Some(&"tsx"));
+        let mut expected = lexical_map;
+        expected.insert("tsx", "tsx");
+        assert_eq!(structural_map, expected);
     }
 
     // --- ground truth -----------------------------------------------------------

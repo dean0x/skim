@@ -5,13 +5,15 @@
 //! - every map is a [`BTreeMap`] or a struct (the workspace `serde_json` has
 //!   `preserve_order`, so insertion order would otherwise leak into output);
 //! - every list is sorted before it is stored;
-//! - floats are rounded to 4 decimal places ([`round4`]);
+//! - floats are rounded to 4 decimal places
+//!   ([`crate::scoreboard::fmt::round4`]);
 //! - paths are repo-relative, and nothing records a timestamp, a binary
 //!   version, or a machine path.
 //!
 //! `report.md` is the step summary (`$GITHUB_STEP_SUMMARY`): the vision's
 //! scoreboard table (metric | bar | current | baseline | status), the gate
-//! failures, and the HARD tallies.
+//! failures, the HARD tallies, each corpus's structural (`--ast`) table, and
+//! the catalog patterns no structural entry scores.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -22,15 +24,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::baseline::Baseline;
 use crate::scoreboard::metrics::{self, Beat, ConceptSample, IdentSample, RatchetChange};
+use crate::scoreboard::structural_metrics::{
+    CoverageComparison, StructuralSample, UncoveredCause, UncoveredPattern,
+};
 use crate::scoreboard::types::CheckId;
 
 /// `report.json` schema version; `bless` refuses any other.
 pub const REPORT_SCHEMA: u32 = 1;
-
-/// Round to 4 decimal places (report and baseline floats).
-pub fn round4(x: f64) -> f64 {
-    (x * 10_000.0).round() / 10_000.0
-}
 
 // ============================================================================
 // report.json
@@ -50,6 +50,10 @@ pub struct Report {
     /// One entry per corpus, in `corpora.toml` order.
     pub corpora: Vec<CorpusReport>,
     pub aggregate: AggregateReport,
+    /// Catalog patterns no `[[ast]]` entry of this run scores, sorted by
+    /// name (they stay under SEARCH-ADR-007 manual dog-food).
+    #[serde(default)]
+    pub uncovered_patterns: Vec<UncoveredPattern>,
     pub gate: GateReport,
     /// INFO only — the one section allowed to differ between runs. Always
     /// the last key.
@@ -62,7 +66,10 @@ pub struct Report {
 pub struct CorpusReport {
     pub name: String,
     pub commit: String,
-    /// SHA-256 of this corpus's golden file bytes.
+    /// This corpus's golden digest
+    /// ([`crate::scoreboard::golden::golden_digest`]): the SHA-256 of its
+    /// golden file's bytes, with the structural-oracle fingerprint folded in
+    /// when the file has `[[ast]]` entries.
     pub golden_sha256: String,
     pub universe: UniverseReport,
     pub coverage: CoverageReport,
@@ -70,8 +77,26 @@ pub struct CorpusReport {
     pub checks: Vec<CheckRecord>,
     /// RATCHET values by metric name.
     pub ratchet: BTreeMap<String, f64>,
+    /// The `[[ast]]` entries' measurements (their HARD outcomes are in
+    /// `checks`, their RATCHET values in `ratchet`).
+    #[serde(default)]
+    pub structural: StructuralReport,
     /// INFO: never gated.
     pub info: CorpusInfo,
+}
+
+/// One corpus's structural (`--ast`) section (#541).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuralReport {
+    /// skim's `ast_coverage` next to the oracle's over-cap count; absent
+    /// when the corpus has no `[[ast]]` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageComparison>,
+    /// Per `[[ast]]` entry (corpus, pattern, lang), in golden order.
+    pub entries: Vec<StructuralSample>,
+    /// skim `--ast` rows in a language no entry scores, per pattern called.
+    pub unscored_rows: BTreeMap<String, u64>,
 }
 
 /// Oracle universe vs skim's index.
@@ -277,18 +302,36 @@ pub struct LatencyReport {
     pub corpora: BTreeMap<String, LatencyStats>,
 }
 
-/// Latency percentiles over one corpus's skim query calls.
+/// One corpus's latency (INFO): its golden entries' skim calls, its
+/// `--ast <pattern>` calls, and its structural oracle pass.
+///
+/// `calls`, the percentiles and `entries_wall_ms` cover the golden entries'
+/// own calls only, so they stay comparable with a run that makes no pattern
+/// call; an `[[ast]]` entry makes none of its own (its rows come from its
+/// pattern's call, timed in `pattern_calls_wall_ms`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LatencyStats {
+    /// The golden entries' own skim calls.
     pub calls: u64,
     pub wall_ms_p50: f64,
     pub wall_ms_p95: f64,
     /// From the JSON `duration_ms` field, when the envelope carries it.
     pub duration_ms_p50: Option<f64>,
     pub duration_ms_p95: Option<f64>,
-    /// Total wall-clock milliseconds of every call behind each golden entry.
+    /// Total wall-clock milliseconds of every call behind each golden entry
+    /// that makes its own calls.
     pub entries_wall_ms: BTreeMap<String, f64>,
+    /// Wall-clock milliseconds of each `--ast <pattern>` call, by pattern:
+    /// one call per catalog pattern on a corpus with an `[[ast]]` entry,
+    /// shared by that pattern's entries. Absent when there is none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pattern_calls_wall_ms: BTreeMap<String, f64>,
+    /// Wall-clock milliseconds of the structural oracle's pass over the
+    /// corpus universe. Absent when the corpus has no `[[ast]]` entry (the
+    /// oracle does not run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_oracle_wall_ms: Option<f64>,
 }
 
 impl Report {
@@ -443,19 +486,40 @@ pub fn render_markdown(report: &Report, baseline: Option<&Baseline>) -> String {
                 .and_then(|b| b.corpora.get(&c.name))
                 .map(|b| &b.ratchet),
         );
+        structural_table(&mut md, &c.structural);
     }
+    uncovered_section(&mut md, &report.uncovered_patterns);
 
+    latency_section(&mut md, &report.latency);
+    md
+}
+
+/// The latency table (INFO): the golden entries' calls, then the
+/// `--ast <pattern>` calls and the structural oracle pass (both `—` when
+/// the corpus has no `[[ast]]` entry).
+fn latency_section(md: &mut String, latency: &LatencyReport) {
     let _ = writeln!(md, "## Latency (INFO, never gated)\n");
-    let _ = writeln!(md, "| corpus | calls | wall p50 ms | wall p95 ms |");
-    let _ = writeln!(md, "|---|---|---|---|");
-    for (name, l) in &report.latency.corpora {
+    let _ = writeln!(
+        md,
+        "| corpus | entry calls | wall p50 ms | wall p95 ms | pattern calls | pattern calls ms | structural oracle ms |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|");
+    let ms_or_dash = |ms: Option<f64>| ms.map_or_else(|| "—".to_string(), |ms| format!("{ms:.1}"));
+    for (name, l) in &latency.corpora {
+        // Summed only when there is a call: an empty f64 sum is -0.0.
+        let pattern_ms = (!l.pattern_calls_wall_ms.is_empty())
+            .then(|| l.pattern_calls_wall_ms.values().sum::<f64>());
         let _ = writeln!(
             md,
-            "| {name} | {} | {:.1} | {:.1} |",
-            l.calls, l.wall_ms_p50, l.wall_ms_p95
+            "| {name} | {} | {:.1} | {:.1} | {} | {} | {} |",
+            l.calls,
+            l.wall_ms_p50,
+            l.wall_ms_p95,
+            l.pattern_calls_wall_ms.len(),
+            ms_or_dash(pattern_ms),
+            ms_or_dash(l.structural_oracle_wall_ms)
         );
     }
-    md
 }
 
 fn ratchet_table(
@@ -492,6 +556,106 @@ fn ratchet_table(
     md.push('\n');
 }
 
+/// One corpus's structural table: per `[[ast]]` entry, the oracle and skim
+/// file counts, file-level recall / precision (and intent, for the nested
+/// loops), and the rows anchored on an oracle match line. A false-positive
+/// guard's class cell says so, and a legend under the table explains it.
+fn structural_table(md: &mut String, s: &StructuralReport) {
+    if s.entries.is_empty() {
+        return;
+    }
+    let _ = writeln!(md, "### Structural (`--ast`)\n");
+    if let Some(c) = &s.coverage {
+        let list = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>().join(" / ");
+        let _ = writeln!(
+            md,
+            "AST size cap: skim `size_excluded_files` {} · oracle over-cap {} · skim undetermined {}\n",
+            list(&c.skim_size_excluded_files),
+            c.oracle_over_cap,
+            list(&c.skim_undetermined_files)
+        );
+    }
+    let _ = writeln!(
+        md,
+        "| entry | pattern | lang | class | oracle files | skim files | recall | precision | intent recall | intent precision | line on match |"
+    );
+    let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|---|");
+    for e in &s.entries {
+        entry_row(md, e);
+    }
+    if s.entries.iter().any(|e| e.expect_oracle_empty) {
+        let _ = writeln!(
+            md,
+            "\nFP guard: a false-positive guard (`expect_oracle_empty = true`). Its oracle matches no file by \
+             declaration, so it guards precision only; oracle 0 / skim 0 is its fixed state."
+        );
+    }
+    let unscored: Vec<String> = s
+        .unscored_rows
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(pattern, n)| format!("{pattern} {n}"))
+        .collect();
+    if !unscored.is_empty() {
+        let _ = writeln!(
+            md,
+            "\nUnscored `--ast` rows (a language no entry scores): {}",
+            unscored.join(", ")
+        );
+    }
+    md.push('\n');
+}
+
+/// One `[[ast]]` entry's row of [`structural_table`]; a false-positive
+/// guard's class cell carries [`FP_GUARD_MARKER`], and a measurement the
+/// entry has none of reads `—`.
+fn entry_row(md: &mut String, e: &StructuralSample) {
+    let guard = if e.expect_oracle_empty {
+        FP_GUARD_MARKER
+    } else {
+        ""
+    };
+    let opt = |v: Option<f64>| v.map_or_else(|| "—".to_string(), fmt_value);
+    let _ = writeln!(
+        md,
+        "| `{}` | {} | {} | {}{guard} | {} | {} | {} | {} | {} | {} | {} |",
+        e.id,
+        e.pattern,
+        e.lang,
+        e.precision_class.as_str(),
+        e.oracle_files,
+        e.skim_files,
+        fmt_value(e.recall),
+        fmt_value(e.precision),
+        opt(e.intent_recall),
+        opt(e.intent_precision),
+        e.line_on_match
+    );
+}
+
+/// The catalog patterns no structural entry scores, each with its cause and
+/// reason (nothing when every pattern is scored).
+fn uncovered_section(md: &mut String, uncovered: &[UncoveredPattern]) {
+    if uncovered.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        md,
+        "## Uncovered structural patterns (manual dog-food, SEARCH-ADR-007)\n"
+    );
+    for p in uncovered {
+        let cause = match p.cause {
+            UncoveredCause::NoOracle => "no oracle",
+            UncoveredCause::NoEntry => "no entry",
+        };
+        let _ = writeln!(md, "- `{}` ({cause}): {}", p.name, md_escape(&p.reason));
+    }
+    md.push('\n');
+}
+
+/// Appended to a false-positive guard's class cell in the structural table.
+const FP_GUARD_MARKER: &str = ", FP guard";
+
 fn fmt_value(v: f64) -> String {
     if v.fract() == 0.0 {
         format!("{v:.0}")
@@ -513,13 +677,6 @@ fn md_escape(s: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
-
-    #[test]
-    fn round4_keeps_four_decimal_places() {
-        assert_eq!(round4(1.0 / 3.0), 0.3333);
-        assert_eq!(round4(2.0 / 3.0), 0.6667);
-        assert_eq!(round4(0.5), 0.5);
-    }
 
     #[test]
     fn gate_failure_line_names_check_and_ids() {
@@ -568,6 +725,7 @@ mod tests {
                 ("ident.mrr".to_string(), 0.9),
                 ("ident.mrr.baseline_alpha".to_string(), 0.5),
             ]),
+            structural: StructuralReport::default(),
             info: CorpusInfo {
                 oracle_skipped_by_reason: BTreeMap::new(),
                 unindexed_hits: BTreeMap::new(),
@@ -584,6 +742,7 @@ mod tests {
                 ratchet: corpus.ratchet.clone(),
             },
             corpora: vec![corpus],
+            uncovered_patterns: Vec::new(),
             gate: GateReport {
                 status: GateStatus::Pass,
                 failures: Vec::new(),
@@ -623,6 +782,277 @@ mod tests {
             .unwrap()
             .replacen("\"schema\": 1", "\"schema\": 9", 1);
         assert!(Report::parse(&other).is_err());
+    }
+
+    fn structural_report() -> Report {
+        use crate::scoreboard::golden::PrecisionClass;
+        use rskim_oracle::structural::OracleLang;
+        let mut r = minimal_report();
+        let entry =
+            |id: &str, pattern: &str, lang, intent: Option<(u64, f64, f64)>| StructuralSample {
+                id: id.to_string(),
+                pattern: pattern.to_string(),
+                lang,
+                precision_class: PrecisionClass::Hard,
+                expect_oracle_empty: false,
+                oracle_files: 3,
+                skim_files: 4,
+                recall: 1.0,
+                precision: 0.75,
+                intent_files: intent.map(|i| i.0),
+                intent_recall: intent.map(|i| i.1),
+                intent_precision: intent.map(|i| i.2),
+                line_on_match: 2,
+            };
+        r.corpora[0].structural = StructuralReport {
+            coverage: Some(CoverageComparison {
+                oracle_over_cap: 2,
+                skim_size_excluded_files: vec![2],
+                skim_undetermined_files: vec![0],
+            }),
+            entries: vec![
+                entry(
+                    "skim-ast-rust-nested-loop-rust",
+                    "rust-nested-loop",
+                    OracleLang::Rust,
+                    Some((110, 0.9, 0.3)),
+                ),
+                entry(
+                    "skim-ast-try-catch-typescript",
+                    "try-catch",
+                    OracleLang::TypeScript,
+                    None,
+                ),
+                StructuralSample {
+                    expect_oracle_empty: true,
+                    oracle_files: 0,
+                    skim_files: 1,
+                    precision: 0.0,
+                    line_on_match: 0,
+                    ..entry(
+                        "skim-ast-try-catch-finally-javascript",
+                        "try-catch-finally",
+                        OracleLang::JavaScript,
+                        None,
+                    )
+                },
+            ],
+            unscored_rows: BTreeMap::from([
+                ("try-catch".to_string(), 0),
+                ("rust-nested-loop".to_string(), 7),
+            ]),
+        };
+        r.uncovered_patterns = vec![UncoveredPattern {
+            name: "deep-nesting".to_string(),
+            cause: UncoveredCause::NoOracle,
+            reason: "threshold | not stated".to_string(),
+        }];
+        r
+    }
+
+    #[test]
+    fn the_structural_section_carries_the_ac4_fields_and_omits_absent_intent() {
+        let r = structural_report();
+        let json: serde_json::Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+        let entries = &json["corpora"][0]["structural"]["entries"];
+        let nested = entries[0].as_object().unwrap();
+        for key in [
+            "oracle_files",
+            "skim_files",
+            "recall",
+            "precision",
+            "intent_recall",
+            "intent_precision",
+            "line_on_match",
+        ] {
+            assert!(nested.contains_key(key), "{key}");
+        }
+        let plain = entries[1].as_object().unwrap();
+        for key in ["intent_files", "intent_recall", "intent_precision"] {
+            assert!(!plain.contains_key(key), "{key} is omitted when None");
+        }
+        // A false-positive guard says so; an ordinary entry has no such key.
+        assert_eq!(entries[2]["expect_oracle_empty"], true);
+        for ordinary in [nested, plain] {
+            assert!(!ordinary.contains_key("expect_oracle_empty"));
+        }
+        assert_eq!(
+            json["corpora"][0]["structural"]["coverage"]["oracle_over_cap"],
+            2
+        );
+        assert_eq!(
+            json["uncovered_patterns"][0],
+            serde_json::json!({"name": "deep-nesting", "cause": "no_oracle", "reason": "threshold | not stated"})
+        );
+        // Unscored rows serialize in key order, whatever the insertion order.
+        let unscored: Vec<&String> = json["corpora"][0]["structural"]["unscored_rows"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(unscored, ["rust-nested-loop", "try-catch"]);
+        // latency stays the last key.
+        let top: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(top.last().map(|k| k.as_str()), Some("latency"));
+    }
+
+    #[test]
+    fn a_structural_report_round_trips_byte_for_byte() {
+        let r = structural_report();
+        let first = r.to_json().unwrap();
+        assert_eq!(Report::parse(&first).unwrap(), r);
+        assert_eq!(Report::parse(&first).unwrap().to_json().unwrap(), first);
+        assert_eq!(structural_report().to_json().unwrap(), first);
+        // A corpus with no [[ast]] entry has no coverage key.
+        let plain = minimal_report().to_json().unwrap();
+        assert!(!plain.contains("oracle_over_cap"), "{plain}");
+    }
+
+    #[test]
+    fn a_report_from_before_the_structural_section_still_parses() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&minimal_report().to_json().unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("uncovered_patterns");
+        json["corpora"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("structural");
+        let parsed = Report::parse(&json.to_string()).unwrap();
+        assert_eq!(parsed, minimal_report());
+    }
+
+    #[test]
+    fn markdown_shows_each_corpus_structural_table_and_the_uncovered_patterns() {
+        let md = render_markdown(&structural_report(), None);
+        assert!(md.contains("### Structural (`--ast`)"), "{md}");
+        assert!(
+            md.contains("AST size cap: skim `size_excluded_files` 2 · oracle over-cap 2"),
+            "{md}"
+        );
+        let row = md
+            .lines()
+            .find(|l| l.starts_with("| `skim-ast-rust-nested-loop-rust` "))
+            .unwrap();
+        assert_eq!(
+            row,
+            "| `skim-ast-rust-nested-loop-rust` | rust-nested-loop | rust | hard | 3 | 4 | 1 | 0.7500 | 0.9000 | 0.3000 | 2 |"
+        );
+        let plain = md
+            .lines()
+            .find(|l| l.starts_with("| `skim-ast-try-catch-typescript` "))
+            .unwrap();
+        assert!(plain.ends_with("| — | — | 2 |"), "{plain}");
+        // A false-positive guard is marked in its class cell and explained
+        // once under the table.
+        let guard = md
+            .lines()
+            .find(|l| l.starts_with("| `skim-ast-try-catch-finally-javascript` "))
+            .unwrap();
+        assert_eq!(
+            guard,
+            "| `skim-ast-try-catch-finally-javascript` | try-catch-finally | javascript | hard, FP guard | 0 | 1 | 1 | 0 | — | — | 0 |"
+        );
+        assert_eq!(md.matches("\nFP guard: ").count(), 1, "{md}");
+        assert!(
+            md.contains("Unscored `--ast` rows (a language no entry scores): rust-nested-loop 7")
+        );
+        assert!(md.contains("## Uncovered structural patterns"), "{md}");
+        assert!(
+            md.contains("- `deep-nesting` (no oracle): threshold \\| not stated"),
+            "{md}"
+        );
+        // No structural section without [[ast]] entries.
+        let plain_md = render_markdown(&minimal_report(), None);
+        assert!(!plain_md.contains("Structural"), "{plain_md}");
+    }
+
+    #[test]
+    fn markdown_explains_fp_guards_only_when_an_entry_is_one() {
+        let mut r = structural_report();
+        r.corpora[0]
+            .structural
+            .entries
+            .retain(|e| !e.expect_oracle_empty);
+        let md = render_markdown(&r, None);
+        assert!(md.contains("### Structural (`--ast`)"), "{md}");
+        assert!(!md.contains("FP guard"), "{md}");
+    }
+
+    fn latency(pattern_calls: &[(&str, f64)], oracle_ms: Option<f64>) -> LatencyStats {
+        LatencyStats {
+            calls: 3,
+            wall_ms_p50: 2.0,
+            wall_ms_p95: 4.3,
+            duration_ms_p50: None,
+            duration_ms_p95: None,
+            entries_wall_ms: BTreeMap::from([("skim-L01".to_string(), 6.5)]),
+            pattern_calls_wall_ms: pattern_calls
+                .iter()
+                .map(|(p, ms)| (p.to_string(), *ms))
+                .collect(),
+            structural_oracle_wall_ms: oracle_ms,
+        }
+    }
+
+    #[test]
+    fn latency_without_structural_work_serializes_no_structural_keys() {
+        let plain = serde_json::to_value(latency(&[], None)).unwrap();
+        let keys: Vec<&str> = plain
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "calls",
+                "wall_ms_p50",
+                "wall_ms_p95",
+                "duration_ms_p50",
+                "duration_ms_p95",
+                "entries_wall_ms"
+            ]
+        );
+        // A latency section from before the fields existed still parses.
+        let old = r#"{"calls": 1, "wall_ms_p50": 1.0, "wall_ms_p95": 1.0,
+            "duration_ms_p50": null, "duration_ms_p95": null, "entries_wall_ms": {}}"#;
+        let parsed: LatencyStats = serde_json::from_str(old).unwrap();
+        assert!(parsed.pattern_calls_wall_ms.is_empty());
+        assert_eq!(parsed.structural_oracle_wall_ms, None);
+
+        let structural = latency(&[("try-catch", 1.5)], Some(812.3));
+        let json = serde_json::to_value(&structural).unwrap();
+        assert_eq!(json["pattern_calls_wall_ms"]["try-catch"], 1.5);
+        assert_eq!(json["structural_oracle_wall_ms"], 812.3);
+        assert_eq!(
+            serde_json::from_value::<LatencyStats>(json).unwrap(),
+            structural
+        );
+    }
+
+    #[test]
+    fn markdown_latency_table_shows_pattern_calls_and_the_oracle_pass() {
+        let mut r = minimal_report();
+        r.latency.corpora = BTreeMap::from([
+            (
+                "skim".to_string(),
+                latency(&[("go-select", 1.2), ("try-catch", 2.5)], Some(812.3)),
+            ),
+            ("zod".to_string(), latency(&[], None)),
+        ]);
+        let md = render_markdown(&r, None);
+        assert!(
+            md.contains(
+                "| corpus | entry calls | wall p50 ms | wall p95 ms | pattern calls | pattern calls ms | structural oracle ms |"
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains("| skim | 3 | 2.0 | 4.3 | 2 | 3.7 | 812.3 |"),
+            "{md}"
+        );
+        assert!(md.contains("| zod | 3 | 2.0 | 4.3 | 0 | — | — |"), "{md}");
     }
 
     #[test]

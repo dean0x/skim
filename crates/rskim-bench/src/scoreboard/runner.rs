@@ -21,16 +21,18 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::Instant;
 
 use anyhow::Context;
+use rskim_oracle::structural::OracleLang;
 use serde_json::Value;
 
 use crate::scoreboard::MAX_PAGES;
 use crate::scoreboard::golden::{QueryFlags, pagination_bound, within_pagination_bound};
 use crate::scoreboard::metrics::PlannedQuery;
-use crate::scoreboard::types::{Arm, EntryKind, ResultPage, StatsSnapshot};
+use crate::scoreboard::structural_metrics::rows_in;
+use crate::scoreboard::types::{Arm, AstPage, EntryKind, ResultPage, StatsSnapshot};
 use crate::scoreboard::universe::GitIsolation;
 
 /// Per-subprocess timeout (seconds).
@@ -211,11 +213,35 @@ pub struct EntryObservation {
     pub text: Option<TextOutput>,
 }
 
+impl EntryObservation {
+    /// An `[[ast]]` entry's observation: the rows of its pattern's
+    /// `--ast <pattern>` answer `call` in `lang` ([`rows_in`]) as its full
+    /// list, and nothing else (the entry is never observed on its own).
+    pub fn for_ast(id: &str, call: &AstPage, lang: OracleLang) -> Self {
+        EntryObservation {
+            id: id.to_string(),
+            full: rows_in(&call.page, lang),
+            sweeps: Vec::new(),
+            limited: Vec::new(),
+            text: None,
+        }
+    }
+}
+
 /// An observation plus the timings of every call behind it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Observed {
     pub observation: EntryObservation,
     pub timings: Vec<Timing>,
+}
+
+/// One parsed JSON call.
+struct JsonCall {
+    value: Value,
+    /// The root-free call description, for error messages.
+    label: String,
+    status: ExitStatus,
+    timing: Timing,
 }
 
 // ============================================================================
@@ -312,6 +338,58 @@ impl SkimRunner {
         limit: u32,
         offset: u64,
     ) -> anyhow::Result<(ResultPage, Timing)> {
+        let call = self.json(root, query, flags, limit, offset)?;
+        let page = ResultPage::from_json(arm, &call.value).with_context(|| {
+            format!(
+                "{}: unexpected {arm:?} JSON envelope ({})",
+                call.label, call.status
+            )
+        })?;
+        Ok((page, call.timing))
+    }
+
+    /// `skim search --root <root> --json --limit 1000000 --ast <pattern>`:
+    /// the pattern's full standalone list (every language) and its
+    /// `ast_coverage`. The scoreboard makes this call once per (corpus,
+    /// pattern) and splits the rows among the pattern's `[[ast]]` entries,
+    /// and those entries' checks and the unscored-row counts take the list
+    /// to be the pattern's complete answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`SkimRunner::page`], plus a malformed `ast_coverage`, or a list
+    /// that reports `has_more` (truncated at [`FULL_LIST_LIMIT`], so not
+    /// complete).
+    pub fn ast_list(&self, root: &Path, pattern: &str) -> anyhow::Result<(AstPage, Timing)> {
+        let flags = QueryFlags {
+            ast: Some(pattern.to_string()),
+            ..QueryFlags::default()
+        };
+        let call = self.json(root, None, &flags, FULL_LIST_LIMIT, 0)?;
+        let page = AstPage::from_json(&call.value).with_context(|| {
+            format!(
+                "{}: unexpected standalone --ast JSON envelope ({})",
+                call.label, call.status
+            )
+        })?;
+        anyhow::ensure!(
+            !page.page.has_more,
+            "{}: the full list reports has_more = true at --limit {FULL_LIST_LIMIT}, so it is not \
+             the pattern's complete answer and cannot be split among its [[ast]] entries",
+            call.label
+        );
+        Ok((page, call.timing))
+    }
+
+    /// Run one JSON query and parse stdout as JSON.
+    fn json(
+        &self,
+        root: &Path,
+        query: Option<&str>,
+        flags: &QueryFlags,
+        limit: u32,
+        offset: u64,
+    ) -> anyhow::Result<JsonCall> {
         let label = query_label(query, flags, limit, offset);
         let args = search_args(root, query, flags, limit, offset);
         let (out, wall_ms) = self.exec(&args, &label)?;
@@ -324,17 +402,16 @@ impl SkimRunner {
                 excerpt(&out.stderr)
             )
         })?;
-        let page = ResultPage::from_json(arm, &value).with_context(|| {
-            format!("{label}: unexpected {arm:?} JSON envelope ({})", out.status)
-        })?;
         let duration_ms = value.get("duration_ms").and_then(Value::as_u64);
-        Ok((
-            page,
-            Timing {
+        Ok(JsonCall {
+            value,
+            label,
+            status: out.status,
+            timing: Timing {
                 wall_ms,
                 duration_ms,
             },
-        ))
+        })
     }
 
     /// Sweep `--offset 0, L, 2L, …` at `limit` until `has_more` is false or
@@ -388,18 +465,27 @@ impl SkimRunner {
         ))
     }
 
-    /// Run every call `q` needs: the full list; for `[[pagination]]`, one
-    /// sweep per limit (after checking an oracle-less full list against the
-    /// pagination bound); for `[[prefix]]`, one limited list per limit; for
-    /// `[[ident]]` / `[[concept]]`, one text-mode run.
+    /// Run every call a non-`[[ast]]` entry `q` needs: the full list; for
+    /// `[[pagination]]`, one sweep per limit (after checking an oracle-less
+    /// full list against the pagination bound); for `[[prefix]]`, one
+    /// limited list per limit; for `[[ident]]` / `[[concept]]`, one
+    /// text-mode run.
     ///
     /// # Errors
     ///
-    /// Any call error; an oracle-less (`--ast` / `--blast-radius`)
-    /// pagination entry whose full list exceeds `min(limits) × (MAX_PAGES −
-    /// 1)` — golden integrity cannot bound those in advance; or an entry
-    /// that ranks by temporal data whose pages report `degraded[]`.
+    /// An `[[ast]]` entry (its rows come from its pattern's single
+    /// [`SkimRunner::ast_list`] call); any call error; an oracle-less
+    /// (`--ast` / `--blast-radius`) pagination entry whose full list exceeds
+    /// `min(limits) × (MAX_PAGES − 1)` — golden integrity cannot bound those
+    /// in advance; or an entry that ranks by temporal data whose pages
+    /// report `degraded[]`.
     pub fn observe(&self, root: &Path, q: &PlannedQuery) -> anyhow::Result<Observed> {
+        anyhow::ensure!(
+            !q.is_structural(),
+            "{}: an [[ast]] entry is observed through its pattern's single call \
+             (SkimRunner::ast_list), not per entry",
+            q.id
+        );
         let mut timings = Vec::new();
         let query = q.query.as_deref();
         let (full, t) = self.page(root, q.arm, query, &q.flags, FULL_LIST_LIMIT, 0)?;
@@ -723,6 +809,22 @@ mod tests {
         // Without a requested ranking, degraded[] is lexical.silent_fn's input.
         let lexical = observation(plain, page(vec![temporal]), vec![], vec![]);
         ensure_ranking_applied(plain, &lexical).unwrap();
+    }
+
+    #[test]
+    fn an_ast_entry_is_never_observed_on_its_own() {
+        let golden = crate::scoreboard::golden::parse_golden(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
+             [[ast]]\nid = \"skim-ast-try-catch-tsx\"\npattern = \"try-catch\"\nlang = \"tsx\"\nprecision = \"hard\"\n",
+        )
+        .unwrap();
+        let plan = crate::scoreboard::metrics::plan(&golden).unwrap();
+        // The binary does not exist: the refusal comes before any call.
+        let runner = SkimRunner::new("/nonexistent/skim", SkimSandbox::new("/sb"));
+        let err = runner
+            .observe(Path::new("/c"), &plan[0])
+            .expect_err("an [[ast]] entry's rows come from its pattern's call");
+        assert!(format!("{err:#}").contains("ast_list"), "{err:#}");
     }
 
     #[test]
