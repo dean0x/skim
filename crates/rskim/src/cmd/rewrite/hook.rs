@@ -243,6 +243,77 @@ fn log_drift_warnings(
     }
 }
 
+/// Stamp discriminator for the declined-multiline signal (`warn_once_daily`'s `kind`).
+///
+/// Deliberately distinct from the four drift kinds (`version`, `binary`,
+/// `commit`, `unpinned`) so a decline and a drift warning can never suppress
+/// one another — each `kind` owns its own `.hook-{kind}-warned-{agent}` stamp.
+const DECLINED_MULTILINE_KIND: &str = "declined-multiline";
+
+/// Record to hook.log that a rewrite was declined because the command is
+/// multi-line — rate-limited to one line per agent per day.
+///
+/// ## ADR-011 classification: CLASS 2 (no-loss)
+///
+/// Declining the rewrite means no hook response is emitted, so the agent runs
+/// the user's ORIGINAL command unmodified: the reader sees the real tool's
+/// bytes in full, with nothing elided, substituted or re-encoded. Zero loss, so
+/// this is a class-2 no-loss banner, NOT a class-1 loss-bearing marker. It
+/// therefore carries no elision count and no `SKIM_PASSTHROUGH=1` hint, which
+/// class 1 mandates and which would be meaningless here.
+///
+/// ADR-011 is a taxonomy of **stderr** notices, so a hook.log write is outside
+/// its scope — which is why this write is UNCONDITIONAL rather than
+/// `SKIM_DEBUG`-gated, without contradicting class 2's debug-gating rule. The
+/// classification still decides the channel, twice over: class 2 forbids an
+/// unconditional stderr notice, and hook mode forbids stderr at ANY gating
+/// (zero-stderr invariant, GRANITE #361 Bug 3 — see `warn_once_daily` and
+/// `hook_log::log_hook_warning`). hook.log is the only permitted sink.
+/// ADR-013 independently forbids surfacing this in band in the hook response.
+/// Do not move it to stderr, and do not re-classify it as a marker.
+///
+/// ## Why rate-limited rather than per-occurrence
+///
+/// Agents that bundle several shell commands into one multi-line string hit
+/// this bail on potentially every tool call. A per-occurrence line would grow
+/// hook.log without bound and drown the signal it exists to provide.
+///
+/// ## What this does NOT deliver (partial mitigation of #337, not a closure)
+///
+/// A daily line tells an operator that the class of thing is happening; it does
+/// not name the specific declined command. That is deliberate: the command text
+/// is unbounded and routinely carries credentials, so writing it on every
+/// decline would turn hook.log into a secret sink. `SKIM_HOOK_AUDIT=1` is the
+/// existing opt-in channel that records each command (to hook-audit.log), and
+/// the message points at it.
+///
+/// ## Scope: only the multi-line trigger is named
+///
+/// `command_needs_passthrough` returns a bare `bool` over 8+ distinct triggers
+/// (heredocs, `$(…)`, backticks, unmatched quotes, whitespace that does not
+/// survive split+rejoin, …), so the reason cannot be read off it. Naming those
+/// reasons here would mean re-implementing `rewrite_would_corrupt`'s predicate
+/// set in a second place, where the two copies desync on the next edit
+/// (PF-025). So the caller re-tests exactly one condition — the interior
+/// newline this signal was measured against — and every other bail reason stays
+/// silent. Widening this means widening `rewrite_would_corrupt`'s return type in
+/// `compound.rs`, not adding predicates here.
+fn log_declined_multiline(agent_name: &str) {
+    let Some(cache_dir) = crate::cmd::resolve_cache_dir() else {
+        return;
+    };
+    warn_once_daily(
+        &cache_dir,
+        DECLINED_MULTILINE_KIND,
+        agent_name,
+        "rewrite declined: multi-line command (interior newline) — the original command \
+         runs unmodified, so no output is lost, but skim did not compress it; send each \
+         command as its own single-line invocation to get compression. Rate-limited to one \
+         line per agent per day (a class, not a count); set SKIM_HOOK_AUDIT=1 to record each \
+         declined command in hook-audit.log (#337)",
+    );
+}
+
 // ============================================================================
 // Response writing helper
 // ============================================================================
@@ -466,6 +537,19 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     // commands that would corrupt tokenization) still cause a bail-out.
     if command_needs_passthrough(&command) {
         audit_hook(&command, false, "");
+        // F12 — the bail used to be completely silent: 0 B stdout, 0 B stderr,
+        // exit 0, nothing in the cache dir, so a declined rewrite was
+        // indistinguishable from "nothing to rewrite". Record it to hook.log.
+        //
+        // `trim_end()` mirrors `command_needs_passthrough` exactly: a command
+        // with only TRAILING newlines is trimmed before the corruption test and
+        // does NOT bail (measured — `"cargo test\n"` still rewrites), so only an
+        // interior newline reaches here. See `log_declined_multiline` for the
+        // ADR-011 classification (class 2, hook.log never stderr) and for why
+        // the other `command_needs_passthrough` triggers stay silent.
+        if command.trim_end().contains('\n') {
+            log_declined_multiline(agent_kind.cli_name());
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
