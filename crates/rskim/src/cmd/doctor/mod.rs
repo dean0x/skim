@@ -148,7 +148,7 @@ fn scan_path_for_skim(running_path: Option<&std::path::Path>) -> Vec<PathEntry> 
 
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join("skim");
-        if !is_executable(&candidate) {
+        if !crate::runner::is_executable(&candidate) {
             continue;
         }
 
@@ -180,21 +180,6 @@ fn scan_path_for_skim(running_path: Option<&std::path::Path>) -> Vec<PathEntry> 
     }
 
     entries
-}
-
-/// Return true when `path` points to an executable regular file.
-fn is_executable(path: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
 }
 
 /// Combined binary info resolved in a single `--version` invocation.

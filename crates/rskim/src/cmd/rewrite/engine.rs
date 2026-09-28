@@ -70,6 +70,38 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
         return None;
     }
 
+    // Step 2b: Bail when the target program cannot be resolved as a binary.
+    //
+    // Every rewrite in the table replaces the program the shell would have run
+    // with `skim <program> …`, and skim then spawns `<program>` itself through
+    // `std::process::Command`.  When nothing on PATH answers to that name the
+    // rewritten command cannot run at all, so the rewrite does not degrade the
+    // reader's view — it destroys the answer.  Measured on the host that
+    // motivated this bail, where Claude Code supplies `rg` as a shell FUNCTION
+    // with no `rg` binary anywhere: `rg -n 'fn main' crates/` returns 20711
+    // bytes and exit 0, while the rewrite `skim rg -n 'fn main' crates/`
+    // returns 0 bytes and exit 1 — and exit 1 is also ripgrep's own no-matches
+    // code, so "your search tool is missing" is indistinguishable from "your
+    // pattern matched nothing".  #317 requires byte-faithful reconstruction or
+    // a bail, so bail: the real command runs untouched, at the cost of
+    // compression for this shape — which for a byte-faithful RawPassthrough
+    // tool like `rg` is measured at exactly zero (458 B in, 458 B out,
+    // identical sha256; ADR-009).  SEE: PF-038.
+    //
+    // GLOBAL rather than per-rule, for two independent reasons.  The predicate
+    // is program-agnostic: it asks nothing about which rule would fire, only
+    // whether the token the shell would have executed is spawnable.  And
+    // `RewriteRule` structurally cannot express it — every one of its seven
+    // fields is a compile-time constant (`&'static [&'static str]`, `bool`, or
+    // a `Copy` enum), so no rule can carry a runtime probe.
+    //
+    // Placed after Step 1's env strip so the probe sees the COMMAND token
+    // rather than a leading `VAR=value` assignment, which would be
+    // unresolvable for every env-prefixed command.
+    if target_program_is_unresolvable(command_tokens) {
+        return None;
+    }
+
     // Step 3: Split at `--` separator
     let sep_pos = split_at_separator(command_tokens);
     let before_sep = &command_tokens[..sep_pos];
@@ -300,6 +332,68 @@ pub(super) fn strip_env_vars(tokens: &[&str]) -> usize {
     }
 
     count
+}
+
+/// Return `true` when the program `command_tokens` would run cannot be resolved.
+///
+/// `command_tokens[0]` is both the program the shell would have executed and the
+/// program skim spawns after a rewrite, so it is the only token whose
+/// resolvability the decision depends on.  An empty slice is not "unresolvable":
+/// [`try_rewrite`] has already returned for that case, and answering "no bail"
+/// keeps this predicate total rather than panicking on an index.
+fn target_program_is_unresolvable(command_tokens: &[&str]) -> bool {
+    command_tokens
+        .first()
+        .is_some_and(|program| !target_program_resolves(program))
+}
+
+/// Resolvability verdict consumed by [`try_rewrite`]'s Step 2b bail.
+///
+/// See [`crate::runner::program_resolves`] for what this question does and does
+/// not answer — in short, "would `Command::new(p)` find it?", never "would the
+/// shell run something for `p`?".
+#[cfg(not(test))]
+fn target_program_resolves(program: &str) -> bool {
+    crate::runner::program_resolves(program)
+}
+
+/// Unit-test form of [`target_program_resolves`]: honours
+/// [`RESOLVER_OVERRIDE`], and assumes the program resolves when none is set.
+#[cfg(test)]
+fn target_program_resolves(program: &str) -> bool {
+    RESOLVER_OVERRIDE.get().is_none_or(|probe| probe(program))
+}
+
+/// The Step 2b resolvability probe a test installs into [`RESOLVER_OVERRIDE`].
+///
+/// Named rather than spelled inline at the `Cell` so the override reads as
+/// `Option<ResolverProbe>` — a probe, or the default verdict — and so the
+/// nested pointer type stays under `clippy::type_complexity`.
+#[cfg(test)]
+type ResolverProbe = fn(&str) -> bool;
+
+#[cfg(test)]
+thread_local! {
+    /// Resolvability verdict override for the Step 2b bail — `None` by default.
+    ///
+    /// **Why unit-test builds default to "it resolves".**  Step 2b is the one
+    /// part of [`try_rewrite`] that is a function of the HOST rather than of the
+    /// token stream; every other test of this engine — here, and in `rules.rs`,
+    /// `tests.rs` and `compound.rs` — asserts a property of the rule table.
+    /// Measured on the development host: 30 of the 64 distinct programs the rule
+    /// table names (`aws`, `gradle`, `jest`, `mysql`, `psql`, `rg`, `tsc`, …) do
+    /// not resolve as binaries.  Wiring the real probe straight into the test
+    /// build would therefore make those table assertions pass or fail according
+    /// to what happens to be installed — a test that stops testing without ever
+    /// going red (PF-025).  The override keeps them pure, and lets Step 2b
+    /// itself be asserted directly, with a positive control on the same tokens.
+    ///
+    /// A THREAD-LOCAL rather than a global: libtest runs each test on its own
+    /// thread, so per-thread state cannot be raced by tests running
+    /// concurrently under `RUST_TEST_THREADS`.  Same rationale, and the same
+    /// shape, as `cmd::search::walk::ENUM_CALL_COUNT`.
+    static RESOLVER_OVERRIDE: std::cell::Cell<Option<ResolverProbe>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Return `true` when `tokens` carries a rustup toolchain override for cargo
@@ -934,6 +1028,114 @@ mod tests {
         assert!(
             env_vars_contain_passthrough(&["RUST_LOG=debug", "SKIM_PASSTHROUGH=1"]),
             "SKIM_PASSTHROUGH=1 among other env vars must return true"
+        );
+    }
+
+    // ========================================================================
+    // Step 2b — unresolvable target bails (#317, PF-038)
+    // ========================================================================
+
+    /// Install `probe` as the Step 2b resolvability verdict for `body`.
+    ///
+    /// The verdict is INJECTED rather than measured, so every test below says
+    /// nothing at all about which tools happen to be installed on the host
+    /// running it.  A panic inside `body` leaves the override set on this
+    /// thread; that is harmless because libtest gives each test its own thread
+    /// and the test has already failed.
+    fn with_resolver<T>(probe: fn(&str) -> bool, body: impl FnOnce() -> T) -> T {
+        RESOLVER_OVERRIDE.set(Some(probe));
+        let out = body();
+        RESOLVER_OVERRIDE.set(None);
+        out
+    }
+
+    /// A resolver that accepts exactly one name, used to prove WHICH token the
+    /// bail probes.
+    fn resolves_only_cargo(program: &str) -> bool {
+        program == "cargo"
+    }
+
+    /// A rule-matching command whose target cannot be resolved must not
+    /// rewrite — and the SAME tokens must rewrite when it can.
+    ///
+    /// The pair is the point.  A bare `is_none()` assertion would pass just as
+    /// green if the `rg` rule were deleted, if a skip flag fired, or if the
+    /// tokens simply matched nothing — the vacuity class PF-025 exists to catch.
+    /// Holding the tokens fixed and moving only the resolvability verdict
+    /// isolates Step 2b as the cause of the decline.
+    #[test]
+    fn test_unresolvable_program_declines_rewrite() {
+        let tokens = ["rg", "-n", "pattern", "crates/"];
+
+        // Positive control: with the target resolvable, these tokens DO rewrite.
+        let control = with_resolver(|_| true, || try_rewrite(&tokens))
+            .expect("control: rg must rewrite while its binary resolves");
+        assert_eq!(
+            control.tokens,
+            vec!["skim", "rg", "-n", "pattern", "crates/"],
+            "the control must exercise a real rewrite, or the negative below \
+             asserts nothing"
+        );
+
+        // Step 2b: same tokens, unresolvable target → no rewrite at all, so the
+        // caller emits the command unchanged and the real `rg` runs.
+        assert!(
+            with_resolver(|_| false, || try_rewrite(&tokens)).is_none(),
+            "an unresolvable target must produce no rewrite (#317 bail, PF-038)"
+        );
+    }
+
+    /// Step 2b is GLOBAL: it consults no rule, so it fires for every tool
+    /// family — including the `cat`/`head`/`tail` custom handlers, which are
+    /// reached below the rule walk — and it survives an env-var prefix.
+    #[test]
+    fn test_unresolvable_bail_is_program_agnostic() {
+        for tokens in [
+            vec!["git", "status"],
+            vec!["cargo", "test"],
+            vec!["grep", "-rn", "pattern"],
+            vec!["cat", "file.ts"],
+            vec!["head", "-n", "20", "file.py"],
+            vec!["RUST_LOG=debug", "cargo", "test"],
+        ] {
+            assert!(
+                with_resolver(|_| true, || try_rewrite(&tokens)).is_some(),
+                "control: {tokens:?} must rewrite while its target resolves"
+            );
+            assert!(
+                with_resolver(|_| false, || try_rewrite(&tokens)).is_none(),
+                "{tokens:?} must not rewrite when its target cannot be resolved"
+            );
+        }
+    }
+
+    /// The bail probes the COMMAND token, not a leading env assignment.
+    ///
+    /// A resolver that accepts only `cargo` still lets this rewrite through,
+    /// which is only possible if the probed token was `cargo` rather than
+    /// `RUST_LOG=debug`.  Probing the assignment would make every env-prefixed
+    /// command unresolvable and silently disable rewriting for all of them.
+    #[test]
+    fn test_unresolvable_bail_probes_the_command_not_the_env_prefix() {
+        let result = with_resolver(resolves_only_cargo, || {
+            try_rewrite(&["RUST_LOG=debug", "cargo", "test"])
+        })
+        .expect("cargo resolves, so the env-prefixed command must still rewrite");
+
+        assert_eq!(
+            result.tokens,
+            vec!["RUST_LOG=debug", "skim", "cargo", "test"],
+            "Step 2b must sit after the env strip and probe `cargo`"
+        );
+    }
+
+    /// `target_program_is_unresolvable` is total: an empty token slice is not
+    /// a bail, it is simply not this predicate's business.
+    #[test]
+    fn test_target_program_is_unresolvable_on_empty_tokens() {
+        assert!(
+            !with_resolver(|_| false, || target_program_is_unresolvable(&[])),
+            "an empty token slice must not be reported as unresolvable"
         );
     }
 }

@@ -38,8 +38,10 @@
 // Infrastructure module — consumers arrive in later Phase B tickets.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use std::{io, thread};
 
@@ -424,6 +426,146 @@ pub(crate) fn is_spawn_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<RunnerError>()
         .map(|e| matches!(e, RunnerError::SpawnFailed { .. }))
         .unwrap_or(false)
+}
+
+/// Return true when `path` points to an executable regular file.
+///
+/// Shared by [`program_resolves`]'s `PATH` walk and by `cmd::doctor`'s scan for
+/// `skim` binaries on `PATH`, which previously carried a private copy of this
+/// body.  Deliberately not a full `execvp` emulation: there is no `PATHEXT`
+/// handling, and on a non-unix target it checks only that the path is a regular
+/// file.  Good enough for a unix probe, which is the only platform whose
+/// behaviour either caller depends on.
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Memoised [`program_resolves`] verdicts, keyed by the program string.
+static PROGRAM_RESOLVES_CACHE: OnceLock<RwLock<HashMap<String, bool>>> = OnceLock::new();
+
+/// Return `true` when `program` names something [`Command::new`] can spawn.
+///
+/// # What this answers — and what it does not
+///
+/// This probe answers exactly one question: **"would `Command::new(program)`
+/// find it?"**  It does **not** answer *"would the shell run something for
+/// `program`?"*, and the distance between those two questions is the whole
+/// reason this doc comment is long:
+///
+/// 1. `main()` calls `strip_skim_wrappers_from_path()` as its very first
+///    statement, so every caller here observes an **already-modified** `PATH` —
+///    `~/.skim/bin` has been removed from it.  That is the correct `PATH` to
+///    probe, because it is the one the eventual spawn will search, but it is not
+///    the `PATH` the user's shell used when it decided what `program` meant.
+/// 2. A shell **function**, alias or builtin is invisible to any `PATH` probe
+///    **by construction**.  On the host that motivated this helper, `rg` is a
+///    Claude Code shell function with no `rg` binary anywhere on `PATH`: the
+///    command the user typed works and returns 20711 bytes of results, while
+///    `Command::new("rg")` cannot resolve it at all.  Nothing reachable from a
+///    `PATH` walk can see a function, so no amount of care inside this function
+///    closes that gap.
+///
+/// A `false` from here therefore means "**skim** cannot spawn this", which is
+/// the question a rewrite decision actually needs answered — skim spawns through
+/// [`Command`], which performs `PATH` lookup only and can never reach a shell
+/// function either.  It is a **deliberate conservative approximation**, correct
+/// in the direction that matters: a false `false` costs compression (the real
+/// command runs untouched), while a false `true` costs the reader their answer.
+/// Do not "fix" this into a shell-aware probe — a shell-aware answer would be
+/// the wrong answer for this caller, because skim would still fail to spawn what
+/// the shell can run.  SEE: PF-038.
+///
+/// # Resolution rules
+///
+/// A `program` containing `/` is an explicit path and is stat'd directly rather
+/// than searched on `PATH`, mirroring
+/// [`CommandRunner::run_with_env_node_fallback`]'s rule ("the caller has a
+/// specific binary in mind").  Like that rule, the check is `/` only, so a
+/// Windows `\`-separated path falls through to the `PATH` search; both sites
+/// share that limitation rather than diverging.  An empty `PATH` *element* means
+/// the current directory, as POSIX requires and as `execvp` implements, so
+/// `split_paths` is left to produce it.  An absent `PATH` **variable** reads as
+/// unresolvable: reachability cannot be verified, and for a caller deciding
+/// whether to rewrite, declining is the safe direction.
+///
+/// # Caching
+///
+/// Verdicts are memoised because `cmd::rewrite::compound::try_rewrite_compound`
+/// calls `try_rewrite` once per pipeline segment, so an uncached probe would
+/// re-walk `PATH` several times for a single command.  The cache lives for the
+/// process and is never invalidated: skim does not mutate `PATH` after `main()`'s
+/// first statement, and does not run long enough for a tool to be installed
+/// underneath it.  A **poisoned** lock degrades to "assume it resolves" — the
+/// behaviour before this probe existed — rather than panicking, because this
+/// code runs inside a PreToolUse hook where a panic is a failed hook.
+pub(crate) fn program_resolves(program: &str) -> bool {
+    cached_verdict(program, |p| {
+        resolves_in(p, std::env::var_os("PATH").as_deref())
+    })
+}
+
+/// Memoising wrapper around a resolvability `probe`.
+///
+/// Split from [`program_resolves`] so the caching contract can be tested
+/// directly: a test can supply a probe that panics if called and assert that a
+/// second lookup is served from the cache.  Asserting only that repeated calls
+/// agree would pass with no cache at all.
+fn cached_verdict(program: &str, probe: impl FnOnce(&str) -> bool) -> bool {
+    let cache = PROGRAM_RESOLVES_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    // Fast path under a shared read lock.  The critical section is one lookup.
+    match cache.read() {
+        Ok(hits) => {
+            if let Some(&verdict) = hits.get(program) {
+                return verdict;
+            }
+        }
+        // Poisoned: degrade to the pre-probe behaviour instead of panicking.
+        Err(_) => return true,
+    }
+
+    // Probe with no lock held.  A filesystem walk must not run inside a critical
+    // section, and a duplicated concurrent probe is cheaper than serialising
+    // every caller behind one writer.
+    let verdict = probe(program);
+
+    if let Ok(mut hits) = cache.write() {
+        hits.insert(program.to_string(), verdict);
+    }
+
+    verdict
+}
+
+/// `PATH`-resolution core of [`program_resolves`], with `PATH` passed in.
+///
+/// Separated so the resolution rules can be unit-tested hermetically against a
+/// synthetic `PATH`: reading the process environment would make those tests
+/// depend on what happens to be installed on the host, and writing it is
+/// `unsafe` in a multi-threaded test binary.
+fn resolves_in(program: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
+    if program.is_empty() {
+        return false;
+    }
+
+    if program.contains('/') {
+        return is_executable(std::path::Path::new(program));
+    }
+
+    let Some(path_var) = path_var else {
+        return false;
+    };
+
+    std::env::split_paths(path_var).any(|dir| is_executable(&dir.join(program)))
 }
 
 /// Maximum bytes we will read from a single pipe (64 MiB).
@@ -1277,6 +1419,206 @@ mod tests {
             output.stdout.len() >= MAX_OUTPUT_BYTES - 64 * 1024,
             "the reader must receive the bytes that fit, not a discarded buffer; got {}",
             output.stdout.len()
+        );
+    }
+
+    // ========================================================================
+    // program_resolves / resolves_in / cached_verdict — #317 bail input, PF-038
+    // ========================================================================
+
+    /// A program name no filesystem on any platform can answer to.
+    ///
+    /// A NUL byte is forbidden in a POSIX pathname and in a Windows path, so
+    /// this name cannot be installed — not now, and not by a later `brew
+    /// install`.  Deliberately NOT a plausible-but-absent tool (`rg`, `psql`):
+    /// a negative assertion keyed on "not installed on this host" silently
+    /// becomes a different assertion the day someone installs it, which is the
+    /// PF-025 class of test that stops testing without ever going red.
+    const IMPOSSIBLE_PROGRAM: &str = "skim\0no-such-program";
+
+    /// Create an executable stub named `name` inside `dir` and return its path.
+    #[cfg(unix)]
+    fn make_executable(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the stub executable");
+        path
+    }
+
+    /// The `PATH` walk finds an executable regular file — and nothing else.
+    ///
+    /// The three negative arms matter individually: a non-executable regular
+    /// file, a directory bearing the program's name, and an absent name are all
+    /// things a naive `Path::exists()` probe would accept.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolves_in_finds_only_an_executable_regular_file_on_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path();
+
+        make_executable(bin, "runnable");
+        std::fs::write(bin.join("not-executable"), b"data").expect("write plain file");
+        std::fs::create_dir(bin.join("a-directory")).expect("mkdir");
+
+        let path_var = bin.as_os_str();
+
+        assert!(
+            resolves_in("runnable", Some(path_var)),
+            "an executable regular file on PATH must resolve"
+        );
+        assert!(
+            !resolves_in("not-executable", Some(path_var)),
+            "a regular file without an execute bit must NOT resolve"
+        );
+        assert!(
+            !resolves_in("a-directory", Some(path_var)),
+            "a directory must NOT resolve, however it is named"
+        );
+        assert!(
+            !resolves_in("absent", Some(path_var)),
+            "a name present in no PATH directory must NOT resolve"
+        );
+    }
+
+    /// A name that cannot exist resolves nowhere — against the real `PATH`.
+    #[test]
+    fn test_program_resolves_rejects_a_name_that_cannot_exist() {
+        assert!(
+            !resolves_in(IMPOSSIBLE_PROGRAM, std::env::var_os("PATH").as_deref()),
+            "a NUL-bearing name is unrepresentable as a filename, so no PATH \
+             directory can hold it"
+        );
+        assert!(
+            !program_resolves(IMPOSSIBLE_PROGRAM),
+            "the cached public entry point must agree with the uncached core"
+        );
+    }
+
+    /// The explicit-path rule, mirrored from `run_with_env_node_fallback`.
+    ///
+    /// Three arms, and the third is the load-bearing one.  An ABSENT absolute
+    /// path cannot distinguish the rule from its absence — `Path::join` with an
+    /// absolute path discards the base, so a `PATH` search would reach the same
+    /// missing file and return the same `false`.  A RELATIVE `/`-bearing name
+    /// does distinguish it: the stub below sits under a directory on the
+    /// supplied `PATH`, so a probe that ignored the rule and searched `PATH`
+    /// would find it, while the rule resolves it against the process cwd, where
+    /// it is absent.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolves_in_honours_the_explicit_path_rule() {
+        let real = tempfile::tempdir().expect("tempdir");
+        let decoy = tempfile::tempdir().expect("tempdir");
+
+        // Arm 1 — an explicit path that exists resolves without consulting PATH.
+        let tool = make_executable(real.path(), "tool");
+        let tool_str = tool.to_str().expect("tempdir paths are UTF-8 here");
+        assert!(
+            resolves_in(tool_str, Some(std::ffi::OsStr::new(""))),
+            "an explicit path is stat'd directly, so it resolves with an empty PATH"
+        );
+
+        // Arm 2 — an explicit path that does not exist is unresolvable.
+        let missing = real.path().join("absent-tool");
+        let missing_str = missing.to_str().expect("tempdir paths are UTF-8 here");
+        assert!(
+            !resolves_in(missing_str, Some(decoy.path().as_os_str())),
+            "an explicit path that does not exist must be unresolvable"
+        );
+
+        // Arm 3 — the discriminating one: a relative `/`-bearing name must NOT
+        // be looked up under the PATH directories.
+        let nested = decoy.path().join("skim-f2-sub");
+        std::fs::create_dir(&nested).expect("mkdir the nested stub directory");
+        make_executable(&nested, "tool");
+        assert!(
+            !resolves_in("skim-f2-sub/tool", Some(decoy.path().as_os_str())),
+            "a relative explicit path must resolve against the cwd, never be \
+             joined onto each PATH directory — `skim-f2-sub/tool` exists under \
+             the supplied PATH and must not be substituted"
+        );
+    }
+
+    /// An absent `PATH` variable and an empty program name both read as
+    /// unresolvable.
+    ///
+    /// For a caller deciding whether to rewrite, "cannot verify" must resolve to
+    /// "decline": the cost is forfeited compression, not a lost answer.
+    #[test]
+    fn test_resolves_in_unverifiable_inputs_are_unresolvable() {
+        assert!(
+            !resolves_in("sh", None),
+            "with no PATH variable, reachability cannot be verified"
+        );
+        assert!(
+            !resolves_in("", std::env::var_os("PATH").as_deref()),
+            "an empty program name names nothing"
+        );
+    }
+
+    /// A memoised verdict is served from the cache rather than re-probed.
+    ///
+    /// The second and later lookups pass a probe that panics if it runs, so this
+    /// asserts the caching contract itself.  Asserting only that repeated calls
+    /// agree would pass with no cache at all — the vacuity PF-025 warns about.
+    /// Both a `true` and a `false` key are exercised, so a single-slot or
+    /// verdict-losing cache cannot pass either.
+    #[test]
+    fn test_cached_verdict_serves_repeated_lookups_without_reprobing() {
+        // The cache is process-global and shared with every other test in this
+        // binary, so these keys are chosen to collide with nothing real.
+        let hit = "skim-f2-cache-probe-hit";
+        let miss = "skim-f2-cache-probe-miss";
+
+        assert!(
+            cached_verdict(hit, |_: &str| -> bool { true }),
+            "the first lookup must consult the probe"
+        );
+        assert!(
+            !cached_verdict(miss, |_: &str| -> bool { false }),
+            "the first lookup must consult the probe"
+        );
+
+        for _ in 0..3 {
+            assert!(
+                cached_verdict(hit, |_: &str| -> bool {
+                    panic!("a cached verdict must not re-probe")
+                }),
+                "a memoised `true` must stay true"
+            );
+            assert!(
+                !cached_verdict(miss, |_: &str| -> bool {
+                    panic!("a cached verdict must not re-probe")
+                }),
+                "a memoised `false` must stay false, and must not be served \
+                 another key's verdict"
+            );
+        }
+    }
+
+    /// `is_executable` is the body `cmd::doctor` used to carry privately.
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_distinguishes_mode_and_file_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = make_executable(dir.path(), "exe");
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"data").expect("write plain file");
+
+        assert!(
+            is_executable(&exe),
+            "a mode-0o755 regular file is executable"
+        );
+        assert!(
+            !is_executable(&plain),
+            "a regular file with no execute bit is not"
+        );
+        assert!(!is_executable(dir.path()), "a directory is not");
+        assert!(
+            !is_executable(&dir.path().join("absent")),
+            "a missing path is not"
         );
     }
 }
