@@ -47,9 +47,24 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 mod common;
 
+/// A skim command whose rewrite verdicts are a function of the tokens alone.
+///
+/// See [`common::rewrite_stub_path`]: `try_rewrite`'s Step 2b declines to
+/// rewrite `<tool> …` when nothing named `<tool>` can be spawned (#317,
+/// PF-038), and 12 of this file's rewrite assertions name a tool no host is
+/// obliged to have — `gmake`, `playwright`, `cypress`, `gradle`, `mvn`,
+/// `rubocop`, `swiftlint`, … .  Measured against a host that has none of them:
+/// 10 change verdict without the stub `PATH`, and the two `prettier --check`
+/// sites do not, because `is_segment_ack` short-circuits ahead of
+/// `try_rewrite`.
+///
+/// The `PATH` changes nothing for the step-2 handler invocations beside them:
+/// each pipes a fixture and is served by `should_read_stdin` rather than a
+/// spawn, measured byte-identical with and without it.
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd.env("PATH", common::rewrite_stub_path());
     cmd
 }
 

@@ -9,13 +9,35 @@ use std::fs;
 use tempfile::TempDir;
 mod common;
 
+/// A skim command whose rewrite verdicts are a function of the tokens alone.
+///
+/// `try_rewrite`'s Step 2b declines to rewrite `<tool> …` when nothing named
+/// `<tool>` can be spawned (#317, PF-038), which makes an unadorned
+/// `common::skim` verdict a function of the host: on the machine this helper
+/// was added on, 30
+/// of the 64 programs the rule table names resolve nowhere.  Routing every
+/// invocation in this file through [`common::rewrite_stub_path`] makes the
+/// verdicts identical on every host — including for tools not exercised here
+/// yet, so a test added later inherits the guarantee instead of silently
+/// becoming host-dependent.
+///
+/// The three sites this closes today are `go test ./...`, and the
+/// `rg pattern` / `rg pattern | head` pipe-source pair, whose discrimination
+/// collapses when `rg` resolves nowhere: both halves then decline, for reasons
+/// neither test is about (PF-025).
+fn skim_cmd() -> assert_cmd::Command {
+    let mut cmd = common::skim();
+    cmd.env("PATH", common::rewrite_stub_path());
+    cmd
+}
+
 // ============================================================================
 // Standard rewrites
 // ============================================================================
 
 #[test]
 fn test_rewrite_cargo_test_with_separator() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cargo", "test", "--", "--nocapture"])
         .assert()
         .success()
@@ -26,7 +48,7 @@ fn test_rewrite_cargo_test_with_separator() {
 fn test_rewrite_ls_no_match() {
     // NOTE: bare `ls` now matches the catch-all rule (B.1) added in v2.5.1 and
     // IS rewritten to `skim ls` (v2.8.0 flat dispatch: was `skim file ls`).  Updated from the original no-match expectation.
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "ls"])
         .assert()
         .success()
@@ -35,7 +57,7 @@ fn test_rewrite_ls_no_match() {
 
 #[test]
 fn test_rewrite_cargo_build() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cargo", "build"])
         .assert()
         .success()
@@ -44,7 +66,7 @@ fn test_rewrite_cargo_build() {
 
 #[test]
 fn test_rewrite_go_test_with_path() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "go", "test", "./..."])
         .assert()
         .success()
@@ -53,7 +75,7 @@ fn test_rewrite_go_test_with_path() {
 
 #[test]
 fn test_rewrite_pytest_with_flag() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "pytest", "-v"])
         .assert()
         .success()
@@ -66,7 +88,7 @@ fn test_rewrite_pytest_with_flag() {
 
 #[test]
 fn test_rewrite_with_env_var() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "RUST_LOG=debug", "cargo", "test"])
         .assert()
         .success()
@@ -87,7 +109,7 @@ fn test_rewrite_with_env_var() {
 /// argument, so there is no position for it in a rewrite; #317 takes the bail.
 #[test]
 fn test_rewrite_cargo_toolchain_nightly_bails() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cargo", "+nightly", "test"])
         .assert()
         .code(1)
@@ -101,7 +123,7 @@ fn test_rewrite_cargo_toolchain_nightly_bails() {
 /// covered is asserted without a toolchain by `test_rewrite_with_env_var`.
 #[test]
 fn test_rewrite_env_var_with_toolchain_bails() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "RUST_LOG=debug", "cargo", "+nightly", "test"])
         .assert()
         .code(1)
@@ -115,7 +137,7 @@ fn test_rewrite_env_var_with_toolchain_bails() {
 #[test]
 fn test_rewrite_compound_and_and() {
     // Both segments should be rewritten
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cargo", "test", "&&", "cargo", "build"])
         .assert()
         .success()
@@ -127,7 +149,7 @@ fn test_rewrite_compound_and_and() {
 #[test]
 fn test_rewrite_compound_pipe_never_rewritten() {
     // #317 (user-approved): pipe expressions are never rewritten — exit 1.
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test | head\n")
         .assert()
@@ -137,7 +159,7 @@ fn test_rewrite_compound_pipe_never_rewritten() {
 
 #[test]
 fn test_rewrite_compound_semicolon() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cargo", "test", ";", "echo", "done"])
         .assert()
         .success()
@@ -149,7 +171,7 @@ fn test_rewrite_compound_semicolon() {
 #[test]
 fn test_rewrite_compound_bail_on_subshell() {
     // $( triggers bail — exit 1
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("$(command) && cargo test\n")
         .assert()
@@ -159,7 +181,7 @@ fn test_rewrite_compound_bail_on_subshell() {
 #[test]
 fn test_rewrite_compound_suggest_mode() {
     // Suggest mode should include compound: true for compound commands
-    common::skim()
+    skim_cmd()
         .args([
             "rewrite",
             "--suggest",
@@ -182,7 +204,7 @@ fn test_rewrite_compound_suggest_mode() {
 #[test]
 fn test_rewrite_compound_or_or() {
     // || operator should work in integration tests
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test || echo fail\n")
         .assert()
@@ -195,7 +217,7 @@ fn test_rewrite_compound_or_or() {
 #[test]
 fn test_rewrite_compound_no_spaces_around_operator() {
     // Operators without surrounding spaces (e.g., cargo test&&cargo build)
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test&&cargo build\n")
         .assert()
@@ -208,7 +230,7 @@ fn test_rewrite_compound_no_spaces_around_operator() {
 #[test]
 fn test_rewrite_compound_escaped_quotes() {
     // Escaped double quotes inside a quoted string should not break splitting
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("echo \"say \\\"hello\\\"\" && cargo test\n")
         .assert()
@@ -220,7 +242,7 @@ fn test_rewrite_compound_escaped_quotes() {
 fn test_rewrite_compound_mixed_pipe_and_sequential() {
     // Mixed pipe + sequential: ANY top-level pipe makes the whole expression
     // pass through untouched (#317) — exit 1.
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test && cargo build | head\n")
         .assert()
@@ -231,7 +253,7 @@ fn test_rewrite_compound_mixed_pipe_and_sequential() {
 #[test]
 fn test_rewrite_compound_bail_on_variable_expansion() {
     // ${ triggers bail — exit 1
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("${CARGO:-cargo} test && echo done\n")
         .assert()
@@ -244,7 +266,7 @@ fn test_rewrite_compound_bail_on_variable_expansion() {
 
 #[test]
 fn test_rewrite_redirect_stderr_to_stdout() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test 2>&1\n")
         .assert()
@@ -256,7 +278,7 @@ fn test_rewrite_redirect_stderr_to_stdout() {
 fn test_rewrite_redirect_stderr_to_stdout_pipe() {
     // #317: pipes never rewrite — redirects in the producer are preserved
     // implicitly because the ORIGINAL command runs unchanged.
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test 2>&1 | head\n")
         .assert()
@@ -266,7 +288,7 @@ fn test_rewrite_redirect_stderr_to_stdout_pipe() {
 
 #[test]
 fn test_rewrite_redirect_stderr_to_stdout_compound() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test 2>&1 && cargo build\n")
         .assert()
@@ -278,7 +300,7 @@ fn test_rewrite_redirect_stderr_to_stdout_compound() {
 
 #[test]
 fn test_rewrite_redirect_stderr_to_devnull() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test 2>/dev/null\n")
         .assert()
@@ -291,7 +313,7 @@ fn test_rewrite_redirect_stderr_to_devnull() {
 /// CLI bail contract: `.failure()` + empty stdout.
 #[test]
 fn test_rewrite_redirect_stdout_to_file() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test > output.txt\n")
         .assert()
@@ -303,7 +325,7 @@ fn test_rewrite_redirect_stdout_to_file() {
 /// CLI bail contract: `.failure()` + empty stdout.
 #[test]
 fn test_rewrite_redirect_both_to_file() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test &> output.txt\n")
         .assert()
@@ -315,7 +337,7 @@ fn test_rewrite_redirect_both_to_file() {
 /// motivating bug from the issue.
 #[test]
 fn test_rewrite_redirect_stdout_json_file() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("gh api repos/o/r/x > out.json\n")
         .assert()
@@ -326,7 +348,7 @@ fn test_rewrite_redirect_stdout_json_file() {
 /// D2 (#370): `>> out.json` (append redirect) must also bail.
 #[test]
 fn test_rewrite_redirect_stdout_json_append() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("gh api repos/o/r/x >> out.json\n")
         .assert()
@@ -355,7 +377,7 @@ fn test_rewrite_redirect_stdout_json_append() {
 /// CLI bail contract: exit 1 + empty stdout (avoids PF-004 false-negative).
 #[test]
 fn test_rewrite_redirect_fd_dup_with_trailing_char_bails() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cmd >&2x\n")
         .assert()
@@ -369,7 +391,7 @@ fn test_rewrite_redirect_fd_dup_with_trailing_char_bails() {
 /// CLI bail contract: exit 1 + empty stdout (avoids PF-004 false-negative).
 #[test]
 fn test_rewrite_redirect_backslash_desync_bails() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("grep x\\' file > out z\\'z\n")
         .assert()
@@ -380,7 +402,7 @@ fn test_rewrite_redirect_backslash_desync_bails() {
 #[test]
 fn test_rewrite_redirect_git_with_skip_flags() {
     // Redirect must not trigger skip_if_flag_prefix (--porcelain, --stat, etc.)
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("git status 2>&1\n")
         .assert()
@@ -396,7 +418,7 @@ fn test_rewrite_redirect_git_with_skip_flags() {
 /// The log handler detects --format via user_has_flag and passthroughs to git.
 #[test]
 fn test_rewrite_git_log_format_rewrites() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "log", "--format=%H"])
         .assert()
         .success()
@@ -405,7 +427,7 @@ fn test_rewrite_git_log_format_rewrites() {
 
 #[test]
 fn test_rewrite_git_status_success() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "status"])
         .assert()
         .success()
@@ -416,7 +438,7 @@ fn test_rewrite_git_status_success() {
 /// The diff handler detects --stat via user_has_flag and passthroughs to git.
 #[test]
 fn test_rewrite_git_diff_stat_rewrites() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "diff", "--stat"])
         .assert()
         .success()
@@ -426,7 +448,7 @@ fn test_rewrite_git_diff_stat_rewrites() {
 /// `git diff --staged` rewrites after engine strict-match fix (AD-RW-1).
 #[test]
 fn test_rewrite_git_diff_staged_rewrites() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "diff", "--staged"])
         .assert()
         .success()
@@ -436,7 +458,7 @@ fn test_rewrite_git_diff_staged_rewrites() {
 /// `git diff --name-only` rewrites (AD-RW-4: --name-only removed from skip list).
 #[test]
 fn test_rewrite_git_diff_name_only_rewrites() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "diff", "--name-only"])
         .assert()
         .success()
@@ -446,7 +468,7 @@ fn test_rewrite_git_diff_name_only_rewrites() {
 /// `git show HEAD` rewrites (new rule, AD-GIT-5).
 #[test]
 fn test_rewrite_git_show_rewrites() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "show", "HEAD"])
         .assert()
         .success()
@@ -456,7 +478,7 @@ fn test_rewrite_git_show_rewrites() {
 /// `git show HEAD:src/main.rs` rewrites (new rule, AD-GIT-5).
 #[test]
 fn test_rewrite_git_show_file_content_rewrites() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "show", "HEAD:src/main.rs"])
         .assert()
         .success()
@@ -466,7 +488,7 @@ fn test_rewrite_git_show_file_content_rewrites() {
 /// `git worktree list` is AlreadyCompact (AD-RW-2/AD-RW-3): exits 0 and prints original.
 #[test]
 fn test_rewrite_git_worktree_list_already_compact() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "worktree", "list"])
         .assert()
         .success()
@@ -476,7 +498,7 @@ fn test_rewrite_git_worktree_list_already_compact() {
 /// `git worktree list --porcelain` is also AlreadyCompact (prefix match).
 #[test]
 fn test_rewrite_git_worktree_list_porcelain_already_compact() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "git", "worktree", "list", "--porcelain"])
         .assert()
         .success()
@@ -487,7 +509,7 @@ fn test_rewrite_git_worktree_list_porcelain_already_compact() {
 /// show segment is rewritten (AD-RW-2 compound behavior uses original try_rewrite_compound).
 #[test]
 fn test_rewrite_compound_worktree_list_and_git_show() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("git worktree list && git show HEAD\n")
         .assert()
@@ -501,7 +523,7 @@ fn test_rewrite_compound_worktree_list_and_git_show() {
 
 #[test]
 fn test_suggest_mode_match() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "--suggest", "cargo", "test"])
         .assert()
         .success()
@@ -513,7 +535,7 @@ fn test_suggest_mode_match() {
 fn test_suggest_mode_no_match() {
     // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) — use `echo`
     // as a stable non-rewritable example.
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "--suggest", "echo", "hello"])
         .assert()
         .success()
@@ -526,7 +548,7 @@ fn test_suggest_mode_no_match() {
 
 #[test]
 fn test_rewrite_stdin_cargo_test() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("cargo test\n")
         .assert()
@@ -540,7 +562,7 @@ fn test_rewrite_stdin_cargo_test() {
 
 #[test]
 fn test_rewrite_cat_code_file() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cat", "src/main.rs"])
         .assert()
         .success()
@@ -551,7 +573,7 @@ fn test_rewrite_cat_code_file() {
 /// so the execution path can emit a transparency marker when the view differs from raw bytes.
 #[test]
 fn test_rewrite_cat_includes_origin_tag() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cat", "src/main.rs"])
         .assert()
         .success()
@@ -560,7 +582,7 @@ fn test_rewrite_cat_includes_origin_tag() {
 
 #[test]
 fn test_rewrite_cat_squeeze_blanks() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cat", "-s", "file.ts"])
         .assert()
         .success()
@@ -569,7 +591,7 @@ fn test_rewrite_cat_squeeze_blanks() {
 
 #[test]
 fn test_rewrite_cat_line_numbers_rejected() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cat", "-n", "file.ts"])
         .assert()
         .failure();
@@ -577,7 +599,7 @@ fn test_rewrite_cat_line_numbers_rejected() {
 
 #[test]
 fn test_rewrite_head_with_count() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "head", "-20", "file.ts"])
         .assert()
         .success()
@@ -587,7 +609,7 @@ fn test_rewrite_head_with_count() {
 
 #[test]
 fn test_rewrite_head_n_space() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "head", "-n", "50", "file.py"])
         .assert()
         .success()
@@ -597,7 +619,7 @@ fn test_rewrite_head_n_space() {
 
 #[test]
 fn test_rewrite_tail_with_count() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "tail", "-20", "file.rs"])
         .assert()
         .success()
@@ -607,7 +629,7 @@ fn test_rewrite_tail_with_count() {
 
 #[test]
 fn test_rewrite_tail_non_code_rejected() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "tail", "-20", "data.csv"])
         .assert()
         .failure();
@@ -615,7 +637,7 @@ fn test_rewrite_tail_non_code_rejected() {
 
 #[test]
 fn test_rewrite_cat_non_code_rejected() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cat", "data.csv"])
         .assert()
         .failure();
@@ -627,7 +649,7 @@ fn test_rewrite_cat_non_code_rejected() {
 
 #[test]
 fn test_rewrite_nextest() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "cargo", "nextest", "run"])
         .assert()
         .success()
@@ -640,7 +662,7 @@ fn test_rewrite_nextest() {
 
 #[test]
 fn test_suggest_mode_stdin_match() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "--suggest"])
         .write_stdin("cargo test\n")
         .assert()
@@ -652,7 +674,7 @@ fn test_suggest_mode_stdin_match() {
 fn test_suggest_mode_stdin_no_match() {
     // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) — use `echo`
     // as a stable non-rewritable example.
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "--suggest"])
         .write_stdin("echo hello\n")
         .assert()
@@ -666,7 +688,7 @@ fn test_suggest_mode_stdin_no_match() {
 
 #[test]
 fn test_rewrite_help() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "--help"])
         .assert()
         .success()
@@ -676,7 +698,7 @@ fn test_rewrite_help() {
 
 #[test]
 fn test_rewrite_short_help() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "-h"])
         .assert()
         .success()
@@ -691,7 +713,7 @@ fn test_rewrite_short_help() {
 /// consumed by `head` and rewriting would break the pipeline.  (AD-RW-2)
 #[test]
 fn test_find_pipe_not_rewritten() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("find . -name foo | head\n")
         .assert()
@@ -701,7 +723,7 @@ fn test_find_pipe_not_rewritten() {
 /// `rg pattern | head` must NOT be rewritten on the pipe source. (AD-RW-2)
 #[test]
 fn test_rg_pipe_not_rewritten() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("rg pattern | head\n")
         .assert()
@@ -711,7 +733,7 @@ fn test_rg_pipe_not_rewritten() {
 /// Standalone `find . -name foo` (no pipe) SHOULD still be rewritten.
 #[test]
 fn test_find_standalone_rewritten() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("find . -name foo\n")
         .assert()
@@ -722,7 +744,7 @@ fn test_find_standalone_rewritten() {
 /// Standalone `rg pattern` (no pipe) SHOULD still be rewritten.
 #[test]
 fn test_rg_standalone_rewritten() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("rg pattern\n")
         .assert()
@@ -734,7 +756,7 @@ fn test_rg_standalone_rewritten() {
 /// Pipe-source exclusion only applies to `|`, not `||` or `&&`.
 #[test]
 fn test_find_or_chain_still_rewritten() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("find . || echo fail\n")
         .assert()
@@ -749,7 +771,7 @@ fn test_find_or_chain_still_rewritten() {
 /// `ls --help` must NOT be rewritten — informational invocations pass through.
 #[test]
 fn test_rewrite_ls_help_passthrough() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("ls --help\n")
         .assert()
@@ -759,7 +781,7 @@ fn test_rewrite_ls_help_passthrough() {
 /// `grep --version` must NOT be rewritten.
 #[test]
 fn test_rewrite_grep_version_passthrough() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("grep --version\n")
         .assert()
@@ -769,7 +791,7 @@ fn test_rewrite_grep_version_passthrough() {
 /// `ls | head` — catch-all ls rule is excluded on pipe source (AD-RW-2).
 #[test]
 fn test_rewrite_ls_pipe_excluded() {
-    common::skim()
+    skim_cmd()
         .arg("rewrite")
         .write_stdin("ls | head\n")
         .assert()
@@ -781,7 +803,7 @@ fn test_rewrite_ls_pipe_excluded() {
 fn test_rewrite_ls_catch_all_matches() {
     // NOTE: bare `ls` matches the catch-all rule (B.1) added in v2.5.1 and
     // IS rewritten to `skim ls` when NOT on the source side of a pipe (v2.8.0 flat dispatch).
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "ls"])
         .assert()
         .success()
@@ -906,7 +928,7 @@ fn test_rewrite_tail_full_mode_content_byte_identical_to_raw_tail() {
     let file_str = file.to_str().unwrap();
 
     // Obtain the rewritten command string.
-    let rewrite_out = common::skim()
+    let rewrite_out = skim_cmd()
         .args(["rewrite", "tail", "-5", file_str])
         .output()
         .unwrap();
@@ -964,7 +986,7 @@ fn test_rewrite_head_full_mode_content_byte_identical_to_raw_head() {
     let file_str = file.to_str().unwrap();
 
     // Obtain the rewritten command string.
-    let rewrite_out = common::skim()
+    let rewrite_out = skim_cmd()
         .args(["rewrite", "head", "-20", file_str])
         .output()
         .unwrap();
@@ -1012,7 +1034,7 @@ fn test_rewrite_head_full_mode_content_byte_identical_to_raw_head() {
 #[test]
 fn test_rewrite_tail_signed_plus_count_exits_nonzero() {
     // A real file is not required — is_code_file only checks the extension.
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "tail", "-n", "+5", "example.rs"])
         .assert()
         .failure()
@@ -1026,9 +1048,167 @@ fn test_rewrite_tail_signed_plus_count_exits_nonzero() {
 /// After fix: output contains `--max-lines 10` (POSIX default).
 #[test]
 fn test_rewrite_head_bare_no_count_contains_default_max_lines_10() {
-    common::skim()
+    skim_cmd()
         .args(["rewrite", "head", "example.rs"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--max-lines 10"));
+}
+
+// ============================================================================
+// Rot guard for the PATH-hermetic rewrite harness (#317 Step 2b / PF-038)
+// ============================================================================
+
+/// `common::REWRITE_*_PROGRAMS` must name exactly the programs the engine can
+/// rewrite — no more, no less.
+///
+/// # Why a guard test rather than a derived list
+///
+/// `rskim` is bin-only (no `src/lib.rs`), so an integration test binary cannot
+/// `use` the rule table as data; the harness's list is a literal, and a literal
+/// silently rots the day a rule is added.  This test is where that rot becomes
+/// loud: it re-derives both lists from the engine source that defines them and
+/// fails naming the difference.  Keeping the derivation HERE rather than inside
+/// `common::` also keeps the two `include_str!` bodies out of the ~90 test
+/// binaries that compile `common` but never rewrite anything.
+///
+/// # Why it cannot pass vacuously
+///
+/// A scan that stops matching returns an EMPTY set, which no longer equals a
+/// 64-entry literal — so a format change in `rules.rs` fails this test instead
+/// of quietly shrinking the stub set back toward host dependence (PF-025).  The
+/// `unparsed` arm catches the narrower case where a `prefix:` field is still
+/// recognisable but its first token is not on the same line.
+#[test]
+fn test_rewrite_target_program_lists_match_the_engine() {
+    const RULES_SRC: &str = include_str!("../src/cmd/rewrite/rules.rs");
+    const ENGINE_SRC: &str = include_str!("../src/cmd/rewrite/engine.rs");
+
+    // --- Rule table: one program per `prefix:` field head. -----------------
+    let mut scanned_rules: Vec<&str> = Vec::new();
+    let mut unparsed: Vec<&str> = Vec::new();
+    for line in RULES_SRC.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("prefix: &[") else {
+            continue;
+        };
+        // `prefix: &[&'a str],` is the field TYPE in a function signature, not
+        // a rule value.  A leading `&` is what tells the two apart.
+        if rest.starts_with('&') {
+            continue;
+        }
+        match rest.strip_prefix('"').and_then(|r| r.split('"').next()) {
+            Some(program) if !program.is_empty() => scanned_rules.push(program),
+            _ => unparsed.push(line.trim()),
+        }
+    }
+    assert!(
+        unparsed.is_empty(),
+        "a `prefix:` field in rules.rs no longer carries its first token on the \
+         same line, so this scan cannot read it and the harness stub set would \
+         silently shrink. Teach the scan the new shape. Offending lines: \
+         {unparsed:?}"
+    );
+
+    // --- Custom handlers: the `try_custom_handlers` dispatch arms. ----------
+    let scanned_handlers: Vec<&str> = ENGINE_SRC
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim_start();
+            let rest = t.strip_prefix('"')?;
+            let (program, tail) = rest.split_once('"')?;
+            tail.trim_start()
+                .starts_with("=> try_rewrite_")
+                .then_some(program)
+        })
+        .collect();
+
+    // --- Compare, as sorted deduplicated sets. -----------------------------
+    // A nested `fn` rather than a closure: a closure cannot express that the
+    // borrow in the returned `Vec` is the SAME one it took in, so inference
+    // gives the argument and the return distinct lifetimes and rejects it.
+    fn sorted(mut v: Vec<&str>) -> Vec<&str> {
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    assert_eq!(
+        sorted(scanned_rules),
+        sorted(common::REWRITE_RULE_TABLE_PROGRAMS.to_vec()),
+        "common::REWRITE_RULE_TABLE_PROGRAMS no longer matches the `prefix:` \
+         heads in cmd/rewrite/rules.rs (left = the table, right = the list). A \
+         program only in the table is one whose rewrite tests are host-\
+         dependent under Step 2b (#317, PF-038) until it is added; a program \
+         only in the list is dead weight. Update the list in \
+         tests/common/mod.rs."
+    );
+    assert_eq!(
+        sorted(scanned_handlers),
+        sorted(common::REWRITE_CUSTOM_HANDLER_PROGRAMS.to_vec()),
+        "common::REWRITE_CUSTOM_HANDLER_PROGRAMS no longer matches the \
+         `try_custom_handlers` dispatch arms in cmd/rewrite/engine.rs (left = \
+         the arms, right = the list). Step 2b gates these exactly like a table \
+         rule, so a new handler needs an entry. Update the list in \
+         tests/common/mod.rs."
+    );
+}
+
+/// The harness `PATH` delivers its one guarantee: every rewritable program
+/// resolves for a spawned skim.
+///
+/// This is the property all four rewrite test files depend on, asserted once
+/// and directly rather than inferred from 61 downstream verdicts.  Without it,
+/// a helper that silently produced no stubs at all (an empty `TempDir`, a
+/// `PATH` that failed to prepend) would leave every one of those verdicts
+/// host-dependent while this file stayed green on a well-stocked machine.
+///
+/// `./gradlew` and `./mvnw` are excluded by construction: `resolves_in` treats a
+/// `/`-bearing program as an explicit path stat'd against the child's cwd and
+/// never searches `PATH`, so no directory on `PATH` can serve them.  That is a
+/// real gap in the harness, and it is asserted as such below rather than left
+/// for a reader to discover — a test that rewrites `./gradlew build` needs a
+/// stub in a `.current_dir()` of its own.
+#[cfg(unix)]
+#[test]
+fn test_rewrite_stub_path_makes_every_rewritable_program_resolvable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dirs: Vec<std::path::PathBuf> =
+        std::env::split_paths(common::rewrite_stub_path()).collect();
+    assert!(
+        dirs.len() > 1,
+        "the harness PATH must PREPEND to the inherited one, not replace it — \
+         the tests still need git, sh and the real toolchain"
+    );
+
+    let resolves = |program: &str| {
+        dirs.iter().any(|dir| {
+            std::fs::metadata(dir.join(program))
+                .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+                .unwrap_or(false)
+        })
+    };
+
+    let (explicit, searchable): (Vec<&&str>, Vec<&&str>) = common::REWRITE_RULE_TABLE_PROGRAMS
+        .iter()
+        .chain(common::REWRITE_CUSTOM_HANDLER_PROGRAMS)
+        .partition(|p| p.contains('/'));
+
+    let unresolvable: Vec<&&str> = searchable
+        .iter()
+        .copied()
+        .filter(|p| !resolves(p))
+        .collect();
+    assert!(
+        unresolvable.is_empty(),
+        "these rewritable programs resolve nowhere on the harness PATH, so \
+         Step 2b will decline to rewrite them and every assertion about them \
+         is host-dependent: {unresolvable:?}"
+    );
+
+    assert_eq!(
+        explicit,
+        vec![&"./gradlew", &"./mvnw"],
+        "the set of rewritable programs a PATH cannot serve has changed. Each \
+         new `/`-bearing entry is a hole in this harness, not a passing case."
+    );
 }
