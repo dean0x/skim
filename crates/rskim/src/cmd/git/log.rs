@@ -3,19 +3,22 @@
 use std::process::ExitCode;
 
 use crate::cmd::execution as exec;
-use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
+use crate::cmd::{OutputFormat, extract_output_format};
 use crate::output::canonical::GitResult;
 use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
-use super::run_passthrough;
-
 /// Run `git log` with compression.
 ///
-/// Flag-aware passthrough: if user has `--format` or `--pretty` (custom
-/// format strings that cannot be parsed generically), pass through unmodified.
-/// `--oneline` is handled by stripping it and injecting the equivalent
-/// `--format` flag instead — see `injected_log_format`.
+/// Flag-aware passthrough lives one level up: `--format` and `--pretty` (custom
+/// format strings that cannot be parsed generically) are two entries in
+/// `super::MACHINE_CONTRACT_FLAGS`, so a `git log` carrying either never
+/// reaches this function.  That gate is also what keeps `--stat`, `--numstat`,
+/// `--name-only`, `--name-status`, `--shortstat` and `--graph` out — the six
+/// flags whose output this handler used to discard silently (ADR-022).
+///
+/// `--oneline` is *not* in that set: it is handled here by stripping it and
+/// injecting the equivalent `--format` flag — see `injected_log_format`.
 ///
 /// Large-output degrade (ADR-002 / reliability-01 / #317): when `git log`
 /// output exceeds the 64 MiB pipe cap, this function emits the bytes read so
@@ -28,10 +31,6 @@ pub(super) fn run_log(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    if user_has_flag(args, &["--format", "--pretty"]) {
-        return run_passthrough(global_flags, "log", args, show_stats, rec);
-    }
-
     // Strip --oneline — handler injects the equivalent --format flag.
     let stripped_args: Vec<String> = args
         .iter()
@@ -274,6 +273,22 @@ fn injected_log_format(args: &[String]) -> &'static str {
 /// with `diff`, `index`, `@`, `+`, `-`, etc. — none of which are all-hex.
 /// This filter prevents patch-body lines from inflating the commit count
 /// (reliability-09).
+///
+/// # It reads a *prefix*, so any prefix git prepends defeats it
+///
+/// `split_once(' ')` takes whatever precedes the first space as the candidate
+/// hash, so a rail character in front of the SHA is enough: under `--graph`
+/// every commit line begins `* <hash>`, the candidate becomes `"*"`, no line
+/// matches, and `parse_log` reports `no commits` for a non-empty range —
+/// measured at `c2b4378` as 15 bytes of stdout, exit 0, empty stderr, for a
+/// 3-commit range.  That is not a lossy summary but an *inverted answer*: a
+/// reader records absence as positive evidence (the PF-021 shape).
+///
+/// `--graph` is therefore in `super::MACHINE_CONTRACT_FLAGS` and cannot reach
+/// this function.  Widening this predicate instead was considered and rejected:
+/// it would produce a reflowed graph whose rails no longer align, whereas the
+/// gate serves git's own bytes.  Any *new* decorating flag needs the same
+/// treatment — an entry in that set, not a looser prefix rule here.
 fn is_commit_line(line: &str) -> bool {
     line.split_once(' ')
         .map(|(hash, _)| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
