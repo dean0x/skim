@@ -10,12 +10,19 @@ use crate::runner::CommandRunner;
 
 /// Run `git log` with compression.
 ///
-/// Flag-aware passthrough lives one level up: `--format` and `--pretty` (custom
-/// format strings that cannot be parsed generically) are two entries in
-/// `super::MACHINE_CONTRACT_FLAGS`, so a `git log` carrying either never
-/// reaches this function.  That gate is also what keeps `--stat`, `--numstat`,
-/// `--name-only`, `--name-status`, `--shortstat` and `--graph` out — the six
-/// flags whose output this handler used to discard silently (ADR-022).
+/// Flag-aware passthrough lives one level up: `--format`, `--pretty`, `--stat`,
+/// `--numstat`, `--name-only`, `--name-status`, `--shortstat`, `--raw` and
+/// `--graph` are entries in `super::MACHINE_CONTRACT_FLAGS` — the flags whose
+/// output this handler used to discard silently (ADR-022).
+///
+/// **That gate is disarmed by `--json`, so which of them reach this function
+/// depends on the caller's view flag, and the two halves differ.**  With
+/// `--json`, the flags that reshape the commit line
+/// ([`COMMIT_SHAPE_BREAKING_FLAGS`] — `--format`, `--pretty`, `--graph`, `-z` /
+/// `--null`) keep the gate armed and still never arrive, because the envelope
+/// this handler would build for them is false rather than merely lossy.  The
+/// stat family does arrive, and `parse_log` drops its blocks under a disclosed
+/// ADR-011 class-1 count.  Without `--json` nothing in the set arrives at all.
 ///
 /// `--oneline` is *not* in that set: it is handled here by stripping it and
 /// injecting the equivalent `--format` flag — see `injected_log_format`.
@@ -284,15 +291,95 @@ fn injected_log_format(args: &[String]) -> &'static str {
 /// 3-commit range.  That is not a lossy summary but an *inverted answer*: a
 /// reader records absence as positive evidence (the PF-021 shape).
 ///
-/// `--graph` is therefore in `super::MACHINE_CONTRACT_FLAGS` and cannot reach
-/// this function.  Widening this predicate instead was considered and rejected:
-/// it would produce a reflowed graph whose rails no longer align, whereas the
-/// gate serves git's own bytes.  Any *new* decorating flag needs the same
-/// treatment — an entry in that set, not a looser prefix rule here.
+/// `--graph` is therefore kept away from this function by **two** gates, and
+/// both are load-bearing: it is in `super::MACHINE_CONTRACT_FLAGS`, *and* it is
+/// in [`COMMIT_SHAPE_BREAKING_FLAGS`] so that `--json` does not stand the first
+/// gate down.  The set membership alone was not enough — measured at `69d7d57`,
+/// `skim git log --graph --json -n 2` reported `no commits` over a two-commit
+/// range, because `--json` disarmed the gate and routed the rails straight back
+/// here.
+///
+/// Widening this predicate instead was considered and rejected: it would produce
+/// a reflowed graph whose rails no longer align, whereas the gate serves git's
+/// own bytes.  Any *new* decorating flag needs the same treatment — an entry in
+/// **both** sets, not a looser prefix rule here.
 fn is_commit_line(line: &str) -> bool {
     line.split_once(' ')
         .map(|(hash, _)| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
         .unwrap_or(false)
+}
+
+/// Contract flags that break the **commit-line shape** [`is_commit_line`]
+/// matches, so `parse_log` can model nothing at all and the `--json` envelope
+/// it would produce is FALSE rather than merely lossy.
+///
+/// # Membership rule: replaces / re-separates / prefixes — not "appends beside"
+///
+/// `parse_log` reads exactly one shape: the `%h`-prefixed line [`run_log`]
+/// *itself* injects via [`injected_log_format`].  Three mechanisms destroy it,
+/// and each member is here for exactly one of them:
+///
+/// - **replaces the format** — `--format`, `--pretty` carry a *user-supplied*
+///   format string that git resolves last-wins, so it overrides the injected
+///   one and skim cannot know what the result encodes.  Measured: a bare `%H`
+///   emits a 40-hex SHA with no space, `is_commit_line` needs one, so every
+///   line is filtered out and the envelope asserts `no commits` over a
+///   two-commit range.  `--format=%H %s` would have parsed *by luck*; that the
+///   answer depends on a string skim never reads is the whole argument for
+///   serving raw.
+/// - **replaces the record separator** — `-z` / `--null` terminate each commit
+///   with NUL, so `output.lines()` sees the entire range as ONE line.  Measured
+///   the worst of the four: the envelope claims `1 commit` for two *and*
+///   smuggles a raw NUL into a JSON string value (`"…<t>\u0000a044f4e…"`), and
+///   the class-1 marker degrades to the countless wording — the mechanism that
+///   broke the count also broke the counter.
+/// - **prefixes the line** — `--graph` writes `* <hash>`, so
+///   `split_once(' ')` takes `"*"` as the candidate hash.  See
+///   [`is_commit_line`] for the measurement.
+///
+/// The stat family (`--stat`, `--shortstat`, `--numstat`, `--name-only`,
+/// `--name-status`, `--raw`) is deliberately **absent**.  Those append a block
+/// *beside* the commit line rather than reshaping it, so the count stays true
+/// and the dropped block is disclosed with an exact ADR-011 class-1 count
+/// (measured: `13 lines omitted (2 of 15 shown)` for `--stat`).  That is the
+/// disclosed-lossy route `cli_git_contract_flags.rs`'s
+/// `json_with_a_contract_flag_still_serves_skims_envelope` and
+/// `lossy_json_route_still_fires_its_class_one_marker` bless; arming the gate
+/// for them is a separate decision, not this one.
+///
+/// # Why the list lives here and not beside `MACHINE_CONTRACT_FLAGS`
+///
+/// The two sets answer different questions with different owners.
+/// `MACHINE_CONTRACT_FLAGS` asks "did the caller name a machine contract?" —
+/// a question about *intent*, global to every git subcommand, which is why
+/// `--format` / `--pretty` were hoisted out of this file into it.  This set
+/// asks "can `parse_log` read it?" — a question about *this parser's* limits,
+/// answerable only where `is_commit_line` is in view.  Every member must also
+/// be a machine-contract flag or the gate never sees the argv; that subset
+/// relation is pinned by
+/// `super::tests::commit_shape_breaking_flags_are_a_subset_of_the_contract_set`.
+const COMMIT_SHAPE_BREAKING_FLAGS: &[&str] = &["--format", "--pretty", "--graph", "--null"];
+
+/// Short option characters that break the commit-line shape when they appear
+/// **anywhere inside** a single-dash cluster.
+///
+/// `z` is the only member, for the record-separator reason given in
+/// [`COMMIT_SHAPE_BREAKING_FLAGS`].  Cluster-aware for the same reason
+/// `super::CONTRACT_SHORT_OPTS` is: an exact-token matcher here would be
+/// *weaker* than the gate it narrows, which is a false negative manufactured by
+/// the fix.
+const COMMIT_SHAPE_BREAKING_SHORTS: &[char] = &['z'];
+
+/// Whether `args` carry a flag whose payload `parse_log` provably cannot read.
+///
+/// Consulted by `super::json_envelope_would_misreport`, which is where the
+/// decision this predicate feeds is documented.
+pub(super) fn commit_shape_is_broken_by(args: &[String]) -> bool {
+    super::args_match_flag_set(
+        args,
+        COMMIT_SHAPE_BREAKING_FLAGS,
+        COMMIT_SHAPE_BREAKING_SHORTS,
+    )
 }
 
 /// Parse formatted `git log` output into a compressed GitResult.

@@ -1149,3 +1149,372 @@ fn lossy_json_route_still_fires_its_class_one_marker() {
         show(&skim.stderr)
     );
 }
+
+// ============================================================================
+// No contract flag + `--json` may yield a FALSE envelope
+// ============================================================================
+//
+// The SECOND regression this gate produced, found after landing.  `--json`
+// disarms the gate (see the section above), and on `git log` that routes the
+// contract payload into `parse_log`, whose `is_commit_line` filter is written
+// for the `%h`-shaped format `run_log` injects *for itself*.  A payload that
+// filter cannot read is not summarised badly — it is summarised as ABSENT.
+//
+// Measured at `69d7d57` on this fixture, all four at exit 0 with the ADR-011
+// class-1 marker firing:
+//
+//   skim git log --graph     -n 3 --json  ->  "summary": "no commits"
+//   skim git log --format=%H -n 3 --json  ->  "summary": "no commits"
+//   skim git log --pretty=%H -n 3 --json  ->  "summary": "no commits"
+//   skim git log -z          -n 3 --json  ->  "summary": "1 commit"
+//
+// `"no commits"` over a three-commit range is not a lossy view of three
+// commits, it is the opposite answer — a reader records absence as positive
+// evidence (the PF-021 shape).  And a *disclosed* false claim is worse than an
+// undisclosed one: the marker tells the reader that bytes were withheld, which
+// invites them to trust the summary that remains.  `-z` is the worst of the
+// four on that axis, because the mechanism that broke the count also broke the
+// counter — `output.lines()` sees the NUL-joined range as one line, so the
+// marker degrades to the countless wording and cannot state a shortfall.
+//
+// # Why this section does NOT call `assert_gate_is_observable`
+//
+// [`LOG_RENDER_FLOOR`] exists because a byte-identity assertion on the TEXT
+// path also passes on an unfixed binary whenever the ADR-001 net-savings guard
+// elects raw on its own.  That cannot happen here: `run_log`'s
+// `OutputFormat::Json` arm never consults `savings_decision` at all — JSON is
+// exempt from *substitution* (ADR-011) — so an unfixed binary serves its
+// envelope regardless of byte counts.  On this path the floor would be a
+// precondition that measures nothing.
+
+/// `cmd/git/mod.rs::MACHINE_CONTRACT_FLAGS`, mirrored, plus the `-z` cluster
+/// short from its companion `CONTRACT_SHORT_OPTS`.
+///
+/// `rskim` is bin-only (no `src/lib.rs`), so an integration test cannot import
+/// the const and this list is a hand mirror.  The drift barrier is on the other
+/// side: `mod.rs::tests::contract_flag_set_is_mirrored_by_the_integration_test`
+/// pins the set's size and names this file, so adding an entry there fails until
+/// it is added here.
+///
+/// `--format` and `--pretty` carry a value because that is the only form git
+/// accepts on `log`; `user_has_flag`'s `=` rule makes the bare and valued
+/// spellings the same entry, which
+/// `mod.rs::tests::every_contract_flag_is_recognised_alone` covers.
+const CONTRACT_FLAGS: &[&str] = &[
+    "--porcelain",
+    "--null",
+    "-z",
+    "--stat",
+    "--shortstat",
+    "--numstat",
+    "--name-only",
+    "--name-status",
+    "--raw",
+    "--check",
+    "--quiet",
+    "-q",
+    "--exit-code",
+    "--graph",
+    "--format=%H",
+    "--pretty=%H",
+];
+
+/// The `log` contract flags whose payload `parse_log` provably cannot read.
+///
+/// Mirrors `log.rs::COMMIT_SHAPE_BREAKING_FLAGS` plus its `-z` short.  Each
+/// member reshapes the commit LINE — replaces the format, replaces the record
+/// separator, or prefixes it — as opposed to appending a block beside it, which
+/// is what the stat family does and why the stat family is absent.
+const LOG_SHAPE_BREAKING: &[&str] = &["--format=%H", "--pretty=%H", "--graph", "-z"];
+
+/// Read the commit count out of a `parse_log` summary.
+///
+/// `parse_log` emits exactly three spellings — `no commits`, `1 commit`,
+/// `{n} commits` — so an unrecognised one is a renderer change this test must
+/// fail on rather than silently skip (PF-025: an assertion that quietly stops
+/// applying is worse than one that fails).
+fn commits_claimed(summary: &str, label: &str) -> usize {
+    match summary {
+        "no commits" => 0,
+        "1 commit" => 1,
+        other => other
+            .strip_suffix(" commits")
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "`skim git {label}`: unrecognised `git log` summary spelling \
+                     {other:?} — `parse_log`'s renderer changed, so this test can \
+                     no longer read the claim it exists to check"
+                )
+            }),
+    }
+}
+
+/// How many commits the fixture actually has, obtained without skim and
+/// without any format flag.
+///
+/// Derived rather than hard-coded (PF-031) and independent of every mechanism
+/// under test: `rev-list --count` cannot inherit `is_commit_line`'s blindness.
+fn fixture_commit_count(repo: &std::path::Path) -> usize {
+    let out = raw_git(repo, &["rev-list", "--count", "HEAD"]);
+    assert!(
+        out.status.success(),
+        "`git rev-list --count HEAD` must succeed"
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("`git rev-list --count` must print an integer")
+}
+
+/// Every contract flag on `git log` with `--json`: whatever is served, it must
+/// not state something false.
+///
+/// Two admissible outcomes, and the test asserts the CLAIM in both:
+///
+/// - a JSON envelope, whose commit count must equal ground truth; or
+/// - git's own bytes, which must be byte-identical to `git log <flag>` without
+///   `--json` — the skim-only token must never reach git.
+///
+/// Asserting the count rather than the exit code is the whole point: every one
+/// of the four measured defects exited **0**, so an exit-code test passes
+/// against all of them.  Asserting the count also keeps the stat family in
+/// scope rather than exempting it — `--stat` and its siblings drop their blocks
+/// under a disclosed class-1 count, but the number of commits they report is
+/// still required to be true here.
+#[test]
+fn no_contract_flag_with_json_yields_a_false_log_envelope() {
+    let (_dir, repo) = contract_repo();
+    let expected = fixture_commit_count(&repo);
+    assert!(
+        expected >= 2,
+        "the fixture must carry at least two commits, or a `1 commit` claim \
+         would be indistinguishable from the truth and `-z`'s defect would pass \
+         (PF-027: widen the fixture, do not weaken the assertion); got {expected}"
+    );
+
+    for &flag in CONTRACT_FLAGS {
+        let bare = vec!["log", flag, "-n", "3"];
+        let args = vec!["log", flag, "-n", "3", "--json"];
+        let label = args.join(" ");
+        let raw = raw_git(&repo, &bare);
+        let skim = served(&repo, &args);
+
+        // A non-zero raw exit has two causes here and neither is skim's to
+        // answer: git rejects the flag on `log` (`--porcelain`, `--null`), or
+        // the flag IS an exit-code contract (`--exit-code`).  Neither reaches
+        // an envelope, so there is no claim to check — only that skim also
+        // fails.
+        //
+        // FAILURE, not git's exact code.  `cmd/git/mod.rs::map_exit_code` is
+        // `Some(0) => SUCCESS, _ => FAILURE`, so the whole git family collapses
+        // every non-zero child status to 1 and cannot forward git's `128`
+        // ("unrecognized argument") or `129` ("unknown option").  That is
+        // pre-existing, uniform across the armed and disarmed paths, and
+        // orthogonal to this gate — CLAUDE.md's exit-code section scopes
+        // child-code forwarding to the *wrapped build tools*, which the git
+        // family is not.  Asserting equality here would pin a contract skim
+        // does not offer; asserting failure pins the one it does.
+        if !raw.status.success() {
+            assert!(
+                !skim.status.success(),
+                "`skim git {label}`: `git {}` exits {:?}, so skim must fail too \
+                 rather than inventing an answer.\n  stdout: {}\n  stderr: {}",
+                bare.join(" "),
+                raw.status.code(),
+                show(&skim.stdout),
+                show(&skim.stderr)
+            );
+            continue;
+        }
+
+        assert_eq!(
+            skim.status.code(),
+            Some(0),
+            "`skim git {label}`: `git {}` succeeds, so skim must too.\n  stderr: {}",
+            bare.join(" "),
+            show(&skim.stderr)
+        );
+
+        let text = String::from_utf8_lossy(&skim.stdout).into_owned();
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(envelope) if envelope.get("summary").is_some() => {
+                let summary = envelope["summary"].as_str().unwrap_or_else(|| {
+                    panic!("`skim git {label}`: `summary` must be a string: {text}")
+                });
+                assert_eq!(
+                    commits_claimed(summary, &label),
+                    expected,
+                    "`skim git {label}`: the envelope claims {summary:?} for a \
+                     {expected}-commit range.  A machine-readable envelope may be \
+                     terse; it may not be WRONG.\n  raw ({} B): {}\n  envelope: {text}",
+                    raw.stdout.len(),
+                    show(&raw.stdout)
+                );
+                assert_eq!(
+                    envelope["details"].as_array().map(Vec::len),
+                    Some(expected),
+                    "`skim git {label}`: `details` must carry one entry per commit \
+                     claimed, or a NUL-joined record passes by claiming a count \
+                     that matches its own collapsed detail list.\n  envelope: {text}"
+                );
+            }
+            // No envelope: the gate stayed armed and git's own bytes were
+            // served.  Byte-identity is the claim to check, and stdout alone is
+            // not enough — the `--json` token must not have reached git.
+            _ => {
+                assert_eq!(
+                    skim.stdout,
+                    raw.stdout,
+                    "`skim git {label}`: no envelope was served, so the payload \
+                     must be git's own bytes for `git {}` — a skim-only flag must \
+                     never reach git.\n  raw  ({} B): {}\n  skim ({} B): {}",
+                    bare.join(" "),
+                    raw.stdout.len(),
+                    show(&raw.stdout),
+                    skim.stdout.len(),
+                    show(&skim.stdout)
+                );
+            }
+        }
+    }
+}
+
+/// The four shape-breaking `log` flags serve git's own bytes, on both
+/// descriptors.
+///
+/// The mechanism half of the fix, named so a reverted narrowing fails with the
+/// flag in the message rather than as a count mismatch one layer away.  Also
+/// pins the ADR-011 classification: serving raw here loses nothing relative to
+/// git, so it is class 2 — debug-gated — and `served()` removes `SKIM_DEBUG`,
+/// so any stderr byte skim adds by default would be a misclassification.
+#[test]
+fn shape_breaking_log_flags_with_json_serve_gits_own_bytes() {
+    let (_dir, repo) = contract_repo();
+
+    for &flag in LOG_SHAPE_BREAKING {
+        let bare = vec!["log", flag, "-n", "3"];
+        let raw = raw_git(&repo, &bare);
+        assert!(
+            raw.status.success() && !raw.stdout.is_empty(),
+            "precondition: `git {}` must produce output, or this case proves \
+             nothing",
+            bare.join(" ")
+        );
+
+        let args = vec!["log", flag, "-n", "3", "--json"];
+        let label = args.join(" ");
+        let skim = served(&repo, &args);
+
+        assert_eq!(
+            skim.stdout,
+            raw.stdout,
+            "`skim git {label}`: `parse_log` cannot read a {flag} payload, so the \
+             gate must stay armed and serve git's bytes for `git {}`.\n  \
+             raw  ({} B): {}\n  skim ({} B): {}",
+            bare.join(" "),
+            raw.stdout.len(),
+            show(&raw.stdout),
+            skim.stdout.len(),
+            show(&skim.stdout)
+        );
+        assert_eq!(
+            skim.status.code(),
+            raw.status.code(),
+            "`skim git {label}`: exit status must match the raw tool's"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&skim.stderr),
+            String::from_utf8_lossy(&raw.stderr),
+            "`skim git {label}`: this is a lossless raw serve, so every skim \
+             notice on it is ADR-011 class-2 and debug-gated — zero added bytes \
+             by default"
+        );
+    }
+}
+
+/// Across `log`, `diff` and `status`: an envelope must never report an EMPTY
+/// payload for a non-empty one.
+///
+/// The generalisable half of the same defect, stated once for the whole
+/// population rather than per subcommand.  There is exactly one legitimate way
+/// to serve an empty modelled payload — carry git's own bytes beside it, which
+/// is what `run_diff`'s empty-parse branch does in its `raw` field (PF-037's
+/// resolution: an empty parse is a successful parse of zero files, not a
+/// failure).  So `raw` is the escape, and it must hold git's bytes **verbatim**
+/// rather than merely exist: a field documented to carry a tool's raw bytes and
+/// filled with something else is PF-037 rule (3).
+///
+/// Measured at `69d7d57`: `diff` satisfies this for all six of its record and
+/// stat flags, `status` satisfies it for all three of its, and `log --graph`
+/// was the sole violation — `details: []` with no `raw` field at all.
+#[test]
+fn no_contract_flag_with_json_reports_an_empty_payload_for_a_non_empty_one() {
+    let (_dir, repo) = contract_repo();
+
+    for subcmd in ["log", "diff", "status"] {
+        // `diff` and `status` read the dirty working tree the fixture leaves;
+        // `log` needs a bound or it walks the whole history.
+        let tail: &[&str] = if subcmd == "log" { &["-n", "3"] } else { &[] };
+
+        for &flag in CONTRACT_FLAGS {
+            let mut bare = vec![subcmd, flag];
+            bare.extend_from_slice(tail);
+            let raw = raw_git(&repo, &bare);
+            // Nothing to under-report: git either refused the flag or wrote
+            // nothing. Both are covered by the per-subcommand tests above.
+            if !raw.status.success() || raw.stdout.is_empty() {
+                continue;
+            }
+
+            let mut args = bare.clone();
+            args.push("--json");
+            let label = args.join(" ");
+            let skim = served(&repo, &args);
+            let text = String::from_utf8_lossy(&skim.stdout).into_owned();
+            let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&text) else {
+                // Git's own bytes were served; byte-identity is asserted by
+                // `no_contract_flag_with_json_yields_a_false_log_envelope`.
+                continue;
+            };
+
+            // The modelled payload: `details` for the `GitResult` subcommands,
+            // `files` for `git diff`'s own envelope.
+            let modelled = envelope
+                .get("details")
+                .or_else(|| envelope.get("files"))
+                .and_then(serde_json::Value::as_array);
+            let claims_empty = modelled.is_some_and(Vec::is_empty)
+                || envelope
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| s.starts_with("no "));
+            if !claims_empty {
+                continue;
+            }
+
+            let carried = envelope
+                .get("raw")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`skim git {label}`: the envelope reports an EMPTY payload \
+                         while `git {}` wrote {} B.  An empty modelled payload is \
+                         admissible only when git's own bytes are carried in `raw`; \
+                         here there is no `raw` field, so absence is served as \
+                         evidence.\n  raw: {}\n  envelope: {text}",
+                        bare.join(" "),
+                        raw.stdout.len(),
+                        show(&raw.stdout)
+                    )
+                });
+            assert_eq!(
+                carried.as_bytes(),
+                raw.stdout.as_slice(),
+                "`skim git {label}`: `raw` must carry git's own bytes for \
+                 `git {}` verbatim, or the contract was lost inside the envelope",
+                bare.join(" ")
+            );
+        }
+    }
+}

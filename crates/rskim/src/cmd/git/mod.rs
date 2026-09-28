@@ -85,13 +85,16 @@ pub(crate) fn run(
         // arm rather than in a separate const keeps the gate's domain and the
         // dispatch table the same list, so the two cannot drift.
         //
-        // `--json` DISARMS it — see [`caller_requested_json`].  The gate is
-        // keyed on what the caller typed, and `--json` is also something the
-        // caller typed; what it names is skim's own machine contract rather
-        // than git's, so honouring it is not the false negative the asymmetry
-        // warns about.
+        // `--json` DISARMS it, but only where the handler on the other side can
+        // actually model the flagged payload — see [`json_disarms_the_gate`].
+        // The gate is keyed on what the caller typed, and `--json` is also
+        // something the caller typed; what it names is skim's own machine
+        // contract rather than git's, so honouring it is not the false negative
+        // the asymmetry warns about — *provided the envelope it produces is
+        // true*.  Where it would not be, the gate stays armed.
         "status" | "diff" | "fetch" | "log" | "show" | "commit" | "push"
-            if has_machine_contract_flag(subcmd_args) && !caller_requested_json(subcmd_args) =>
+            if has_machine_contract_flag(subcmd_args)
+                && !json_disarms_the_gate(subcmd.as_str(), subcmd_args) =>
         {
             run_passthrough(&global_flags, subcmd.as_str(), subcmd_args, show_stats, rec)
         }
@@ -239,15 +242,30 @@ const CONTRACT_SHORT_OPTS: &[char] = &['z'];
 /// contract — see [`MACHINE_CONTRACT_FLAGS`] for the set and the asymmetry that
 /// governs it.
 fn has_machine_contract_flag(args: &[String]) -> bool {
-    if user_has_flag(args, MACHINE_CONTRACT_FLAGS) {
+    args_match_flag_set(args, MACHINE_CONTRACT_FLAGS, CONTRACT_SHORT_OPTS)
+}
+
+/// Whether `args` carry any of `longs` as a whole token (or `<token>=<value>`),
+/// or any of `shorts` **anywhere inside** a single-dash cluster.
+///
+/// Shared by [`has_machine_contract_flag`] and
+/// [`log::commit_shape_is_broken_by`], which ask different questions of the
+/// same argv and must not disagree about what "carries a flag" means.  Two
+/// independent cluster scans are how such a pair drifts apart — the same
+/// reasoning `log.rs`'s `is_oneline_flag` doc comment gives for routing its two
+/// readers through one predicate.
+///
+/// Like every matcher in this module it is deliberately **not**
+/// separator-aware: see [`MACHINE_CONTRACT_FLAGS`] for why over-inclusion is
+/// the safe direction on both sides of this gate.
+fn args_match_flag_set(args: &[String], longs: &[&str], shorts: &[char]) -> bool {
+    if user_has_flag(args, longs) {
         return true;
     }
     // Single-dash clusters: `-z`, `-sz`, `-zs`, `-bz`, …  The `starts_with('-')`
     // guard makes byte index 1 a char boundary, so the slice cannot panic.
     args.iter().any(|a| {
-        a.starts_with('-')
-            && !a.starts_with("--")
-            && a[1..].chars().any(|c| CONTRACT_SHORT_OPTS.contains(&c))
+        a.starts_with('-') && !a.starts_with("--") && a[1..].chars().any(|c| shorts.contains(&c))
     })
 }
 
@@ -296,6 +314,86 @@ fn caller_requested_json(args: &[String]) -> bool {
     args.iter()
         .take_while(|a| a.as_str() != "--")
         .any(|a| a.as_str() == "--json")
+}
+
+/// Whether the caller's `--json` stands the machine-contract gate down.
+///
+/// Two conditions, and the second is the narrowing this function exists for:
+/// the caller typed skim's `--json` ([`caller_requested_json`]), **and** the
+/// handler on the other side of the gate can model the flagged payload well
+/// enough for its envelope to be *true* ([`json_envelope_would_misreport`]).
+fn json_disarms_the_gate(subcmd: &str, args: &[String]) -> bool {
+    caller_requested_json(args) && !json_envelope_would_misreport(subcmd, args)
+}
+
+/// Whether the `--json` envelope this `(subcmd, argv)` would produce states
+/// something **false** — in which case `--json` must NOT disarm the gate.
+///
+/// # The `--mode` precedent, applied to `--json`
+///
+/// [`strip_git_view_flags`] records why `--mode` keeps the gate armed: it
+/// "selects a view of *source code*, and a `--stat` / `--numstat` /
+/// `--porcelain` payload is not source code — there is no view to select.
+/// Disarming the gate for it instead would hand a stat payload to the AST
+/// pipeline, which is F6 rebuilt."  That reasoning was never applied to
+/// `--json`, and it transfers exactly: skim's envelope is a serialisation of
+/// the handler's **parsed model**, and a parsed model exists only where the
+/// handler's parser can read the payload.  Where it cannot, disarming hands a
+/// contract payload to a parser that discards it — F6 rebuilt inside a JSON
+/// envelope.
+///
+/// # Why this is keyed on the (subcommand, flag) PAIR and not on the flag
+///
+/// Blindness is a property of the *parser*, not of the flag.  `--stat` is a
+/// contract flag on both `diff` and `log`, and the two handlers answer it
+/// completely differently: `run_diff`'s empty-parse branch carries git's own
+/// `--stat` bytes verbatim in a `raw` field (measured — the envelope for
+/// `git diff --stat --json` is `{"files": [], "raw": " src/a.rs | 3 +--\n…"}`,
+/// pinned by
+/// `cli_git_contract_flags.rs::diff_contract_flag_with_json_carries_gits_own_bytes_in_the_envelope`),
+/// while `parse_log` has no equivalent and reports `no commits`.  A flag-keyed
+/// predicate would therefore have to arm the gate on `diff --stat --json` too,
+/// taking a working envelope away from a caller for no fidelity gain.
+///
+/// # `log` is the one blind parser, and only for the shape-breaking flags
+///
+/// Measured on a hermetic 3-commit fixture at `69d7d57` (every `log` row below
+/// is byte-identical to raw git *without* `--json`, so the disarm is the sole
+/// cause of each divergence):
+///
+/// ```text
+/// argv                              raw      served   envelope claim
+/// log --graph      -n 2             369 B     69 B    "no commits"   ← FALSE
+/// log --format=%H  -n 2              82 B     69 B    "no commits"   ← FALSE
+/// log --pretty=%H  -n 2              82 B     69 B    "no commits"   ← FALSE
+/// log -z           -n 2             347 B    269 B    "1 commit"     ← FALSE
+/// log --stat       -n 2             605 B    266 B    "2 commits"      true
+/// log --numstat    -n 2             470 B    266 B    "2 commits"      true
+/// ```
+///
+/// The split is mechanical, not a judgement call.  `parse_log` reads exactly
+/// one shape — the `%h`-prefixed line `run_log` *itself* injects — so a flag
+/// that **replaces** that format (`--format`, `--pretty`), **replaces its
+/// record separator** (`-z`, `--null`), or **prefixes** it (`--graph`) leaves
+/// nothing for `is_commit_line` to match and the count collapses to a false
+/// one.  A flag that merely **appends a block beside** it (the stat family)
+/// leaves the count correct; the block is dropped, and that drop is disclosed
+/// with an exact ADR-011 class-1 count (`13 lines omitted (2 of 15 shown)`).
+/// Those two groups are `log.rs`'s business, so the list lives beside
+/// `is_commit_line` — see [`log::commit_shape_is_broken_by`].
+///
+/// # What arming costs, and why it is the right trade
+///
+/// The caller asked for JSON and receives git's own bytes instead.  That is the
+/// same complaint the `show` / `fetch` gates already carry, and it is honest:
+/// raw bytes with no claim attached beat an envelope asserting `no commits`
+/// over a two-commit range.  `run_passthrough` records
+/// `parse_tier == "passthrough"`, so the ADR-001 guard is skipped rather than
+/// consulted, and the served bytes are byte-identical to raw git — a lossless
+/// raw fallback, hence ADR-011 class 2 and the existing debug-gated banner
+/// rather than a new unconditional marker.
+fn json_envelope_would_misreport(subcmd: &str, args: &[String]) -> bool {
+    subcmd == "log" && log::commit_shape_is_broken_by(args)
 }
 
 /// Remove skim's own view flags from an argv bound for the real `git` binary.
@@ -1288,6 +1386,33 @@ mod tests {
         tokens.iter().map(|t| (*t).to_string()).collect()
     }
 
+    /// The integration mirror of this set must be updated along with it.
+    ///
+    /// `crates/rskim/tests/cli_git_contract_flags.rs::CONTRACT_FLAGS` hand-mirrors
+    /// this const because `rskim` is bin-only (no `src/lib.rs`), so an
+    /// integration test cannot import a private item from it.  A new entry here
+    /// is silently *unexercised* by the three matrix tests over there unless the
+    /// mirror grows too — the failure mode being an added contract flag that
+    /// nothing checks for a false `--json` envelope, which is this very defect.
+    /// Pinning the count is what makes that omission loud.
+    #[test]
+    fn contract_flag_set_is_mirrored_by_the_integration_test() {
+        assert_eq!(
+            MACHINE_CONTRACT_FLAGS.len(),
+            15,
+            "MACHINE_CONTRACT_FLAGS changed size.  Mirror the change in \
+             crates/rskim/tests/cli_git_contract_flags.rs::CONTRACT_FLAGS, decide \
+             whether the new flag belongs in log.rs::COMMIT_SHAPE_BREAKING_FLAGS \
+             as well, and update this count."
+        );
+        assert_eq!(
+            CONTRACT_SHORT_OPTS.len(),
+            1,
+            "CONTRACT_SHORT_OPTS changed size — the same mirror applies, and the \
+             mirror carries the shorts as explicit argv tokens (`-z`)."
+        );
+    }
+
     /// Every flag in the closed set is recognised on its own.
     ///
     /// Enumerated from the const rather than hand-listed, so a future entry
@@ -1483,31 +1608,171 @@ mod tests {
         }
     }
 
-    /// The gate stands down when a contract flag is paired with `--json`.
+    /// The gate stands down when a contract flag is paired with `--json` **and**
+    /// the handler can model the payload.
     ///
     /// Before this guard, `skim git status --porcelain --json` exited 1 with
     /// `error: unknown option 'json'` and 0 B on stdout, against a 2 500 B
     /// envelope at exit 0 on `c2b4378`.
+    ///
+    /// Asserted through [`json_disarms_the_gate`] — the predicate the dispatch
+    /// arm actually consults — rather than through `caller_requested_json`.
+    /// The earlier spelling asserted only the latter and therefore passed on
+    /// `--json --graph`, whose envelope claimed `no commits` over a two-commit
+    /// range: it read as coverage of the disarm while pinning nothing about it.
     #[test]
     fn gate_stands_down_when_the_caller_asked_for_json() {
-        for shape in [
-            vec!["--porcelain", "--json"],
-            vec!["--porcelain=v2", "--json"],
-            vec!["-z", "--json"],
-            vec!["-sz", "--json"],
-            vec!["--stat", "-n", "3", "--json"],
-            vec!["--json", "--graph"],
-            vec!["--quiet", "--json"],
+        for (subcmd, shape) in [
+            ("status", vec!["--porcelain", "--json"]),
+            ("status", vec!["--porcelain=v2", "--json"]),
+            ("status", vec!["-z", "--json"]),
+            ("status", vec!["-sz", "--json"]),
+            ("log", vec!["--stat", "-n", "3", "--json"]),
+            ("log", vec!["--quiet", "--json"]),
+            ("diff", vec!["--stat", "--json"]),
+            ("diff", vec!["--numstat", "--json"]),
+            // `diff` is not `log`: the same flags that keep the gate armed on
+            // `log` disarm it here, because `parse_diff`'s empty-parse branch
+            // carries git's own bytes in `raw`.
+            ("diff", vec!["--graph", "--json"]),
+            ("diff", vec!["-z", "--json"]),
         ] {
             let args = argv(&shape);
             assert!(
                 has_machine_contract_flag(&args),
-                "{shape:?}: precondition — the contract flag must still match, \
-                 or this test proves nothing about the `--json` guard"
+                "{subcmd} {shape:?}: precondition — the contract flag must still \
+                 match, or this test proves nothing about the `--json` guard"
+            );
+            assert!(
+                json_disarms_the_gate(subcmd, &args),
+                "{subcmd} {shape:?}: `--json` must disarm the gate"
+            );
+        }
+    }
+
+    /// `--json` does NOT disarm the gate for a `log` flag whose payload
+    /// `parse_log` cannot read.
+    ///
+    /// The second regression this gate produced, found after landing.  Measured
+    /// at `69d7d57`: each argv below served an envelope stating something
+    /// **false** — `no commits` for `--graph` / `--format` / `--pretty` over a
+    /// two-commit range, and `1 commit` for `-z` over the same range — at exit
+    /// 0, inside skim's own machine-readable format.  The ADR-011 marker fired,
+    /// so the loss was disclosed; the *claim* was still wrong, and a disclosed
+    /// false claim is worse than an undisclosed one because the marker invites
+    /// the reader to trust what remains.
+    ///
+    /// Asserting the whole conjunction, not just the new half: the contract flag
+    /// must match, the caller must have typed `--json`, and the gate must still
+    /// fire.  Without the first two the test would pass on an argv the gate was
+    /// never asked about.
+    #[test]
+    fn json_does_not_disarm_the_gate_for_a_payload_log_cannot_read() {
+        for shape in [
+            vec!["--format=%H", "--json"],
+            vec!["--format", "%H", "--json"],
+            vec!["--pretty=%H", "--json"],
+            vec!["--pretty", "--json"],
+            vec!["--graph", "--json"],
+            vec!["--json", "--graph"],
+            vec!["-z", "--json"],
+            vec!["-sz", "--json"],
+            vec!["--null", "--json"],
+            // Alongside a flag that would have disarmed on its own: the
+            // shape-breaking flag is what decides, not the argv's other members.
+            vec!["--stat", "--graph", "--json"],
+            vec!["--name-only", "--format=%H", "--json"],
+        ] {
+            let args = argv(&shape);
+            assert!(
+                has_machine_contract_flag(&args),
+                "log {shape:?}: precondition — the gate must be armed at all"
             );
             assert!(
                 caller_requested_json(&args),
-                "{shape:?}: `--json` must disarm the gate"
+                "log {shape:?}: precondition — the caller must have typed `--json`"
+            );
+            assert!(
+                !json_disarms_the_gate("log", &args),
+                "log {shape:?}: `parse_log` cannot read this payload, so the \
+                 envelope would be false and the gate must stay armed"
+            );
+        }
+    }
+
+    /// The narrowing is scoped to `log` and to the shape-breaking flags only.
+    ///
+    /// Two directions, because a predicate that fires too widely is the mirror
+    /// defect: it takes a working envelope away from a caller for no fidelity
+    /// gain.  `diff --stat --json` in particular is pinned end-to-end by
+    /// `cli_git_contract_flags.rs::diff_contract_flag_with_json_carries_gits_own_bytes_in_the_envelope`.
+    #[test]
+    fn misreport_predicate_is_scoped_to_log_and_to_shape_breaking_flags() {
+        // Same flags, every other subcommand: the parser there is not blind.
+        for subcmd in ["status", "diff", "fetch", "show", "commit", "push"] {
+            for shape in [
+                vec!["--format=%H"],
+                vec!["--pretty=%H"],
+                vec!["--graph"],
+                vec!["-z"],
+                vec!["--null"],
+            ] {
+                assert!(
+                    !json_envelope_would_misreport(subcmd, &argv(&shape)),
+                    "{subcmd} {shape:?}: blindness is a property of `parse_log`, \
+                     not of the flag — only `log` may be narrowed"
+                );
+            }
+        }
+        // On `log`, the flags that append a block beside the commit line keep
+        // their disclosed-lossy envelope.
+        for shape in [
+            vec!["--stat"],
+            vec!["--shortstat"],
+            vec!["--numstat"],
+            vec!["--name-only"],
+            vec!["--name-status"],
+            vec!["--raw"],
+            vec!["--check"],
+            vec!["--quiet"],
+            vec!["-q"],
+            vec!["--exit-code"],
+            vec!["--porcelain"],
+            vec![],
+        ] {
+            assert!(
+                !json_envelope_would_misreport("log", &argv(&shape)),
+                "log {shape:?}: this flag leaves the commit-line shape intact, \
+                 so its envelope is lossy-but-true and stays disclosed"
+            );
+        }
+    }
+
+    /// Every shape-breaking flag must also be a machine-contract flag.
+    ///
+    /// The narrowing only has effect inside the gate's own arm, so a member
+    /// that is not in [`MACHINE_CONTRACT_FLAGS`] is dead code that reads as
+    /// protection.  `-z` is covered via [`CONTRACT_SHORT_OPTS`] rather than the
+    /// long set, so it is asserted through the predicate instead of by
+    /// membership.
+    #[test]
+    fn commit_shape_breaking_flags_are_a_subset_of_the_contract_set() {
+        for shape in [
+            vec!["--format=%H"],
+            vec!["--pretty=%H"],
+            vec!["--graph"],
+            vec!["--null"],
+            vec!["-z"],
+        ] {
+            let args = argv(&shape);
+            assert!(
+                log::commit_shape_is_broken_by(&args),
+                "{shape:?}: precondition — must be shape-breaking"
+            );
+            assert!(
+                has_machine_contract_flag(&args),
+                "{shape:?} is shape-breaking but NOT a machine-contract flag, so \
+                 the gate never sees it and the narrowing cannot fire"
             );
         }
     }
