@@ -9,6 +9,162 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Machine-contract flags on `skim git` now serve git's own bytes verbatim** (#576,
+  ADR-022) — `--porcelain` (including `=v1`/`=v2`), `--null`/`-z` (matched anywhere in a
+  single-dash cluster, so `git status -sz` counts), `--stat`, `--shortstat`, `--numstat`,
+  `--name-only`, `--name-status`, `--raw`, `--check`, `--quiet`/`-q`, `--exit-code`,
+  `--graph`, `--format` and `--pretty` are now checked ahead of every git handler, and the
+  invocation forwards git's stdout and exit code unchanged. Measured before this:
+  `skim git log --stat -n 3` served **374 B against 32,733 B** of raw git at exit 0 with
+  **nothing on stderr**, and `--stat`, `--shortstat`, `--numstat`, `--name-only` and
+  `--name-status` all served the *same* 374 B — the flag was swallowed without a trace;
+  `git log --graph -n 3` served `log no commits` for a three-commit range;
+  `git status --porcelain=v2 --branch` served a 97 B prose summary in place of 215 B of v2
+  records. `git diff --quiet` now writes nothing on either stream and forwards 0/1 (#576).
+
+  **Why a gate and not more tuning:** every git invocation that previously came through
+  byte-identical did so by coincidence of three blunt mechanisms — the net-savings byte
+  comparison, "non-zero exit forwards raw", and an empty-parse early return on the diff
+  path. None of them is about output *format*, so the passing cases were not correct, they
+  were lucky, and any change to a renderer's byte count silently converted one of them
+  into a corrupted machine contract.
+
+  **Cost:** these invocations are no longer compressed. `--json` disarms the gate, so
+  `skim git status --porcelain --json` still returns skim's envelope — all 16 `status`
+  cells are unchanged — but the disarm is **narrowed on `log`**: for the four flags whose
+  payload `parse_log` cannot read (`--format`, `--pretty`, `--graph` and `--null`/`-z`)
+  `--json` no longer disarms, because disarming there served a *false* envelope at exit 0
+  — `skim git log --graph --json` claimed `no commits` over a three-commit range — and
+  those four now serve git's own bytes instead. `--mode` keeps the
+  gate armed and is dropped from the argv forwarded to git. Over-inclusion is deliberate:
+  the gate is not `--`-separator-aware and `-z` matches inside any cluster, so a pathspec
+  named `--stat` or a `git log -Szebra` pickaxe also serves raw. A false positive costs
+  only compression; a false negative reshapes a machine contract into prose.
+
+  **One correction to the original report:** no ahead/behind counts were being dropped —
+  `# branch.ab +2 -1` did render as `[ahead 2, behind 1]`, correctly and in order. What
+  reaches the reader now is the whole `--porcelain=v2` stream, including `# branch.oid`,
+  for which no renderer existed at all.
+
+- **`skim git show <rev>:<path>` serves the blob's exact bytes by default** (ADR-022,
+  superseding `AD-GIT-SHOW-PSEUDO`) — `<rev>:<path>` is git's blob-extraction syntax and
+  its contract is the file's historical bytes, but the path ran `Mode::Pseudo`
+  unconditionally: 18 of 50 lines differed on the reported TypeScript blob (`ok: boolean;`
+  served as `ok`), with **zero bytes on stderr** even under `SKIM_DEBUG=1`. Three things
+  move together — the default is verbatim; `--mode=<m>` now selects a transformed view on
+  this subcommand, where it previously reached the child git as
+  `fatal: unrecognized argument: --mode=full` (exit 1, no stdout); and a transformed view
+  now emits the unconditional class-1 lossy-view marker, which had no call site anywhere
+  under `cmd/git/`. **Scope: valid-UTF-8 blobs only.** skim reads the child's stdout as
+  UTF-8 with lossy replacement, so a blob that is not valid UTF-8 still arrives with
+  `U+FFFD` substituted before this handler sees it — pre-existing, upstream of this
+  change, tracked separately.
+
+### Fixed
+
+- **`--mode=pseudo` no longer destroys TypeScript type-level declarations** — an interface
+  or type-literal member was served as a bare name, so
+  `interface Config { name: string; value: number }` came out as
+  `interface Config { name; value }`: unparseable (`tsc` TS1131/TS1128/TS1109/TS1005) and,
+  worse, collapsing semantically disjoint union members onto identical bytes —
+  `{ amount: number; currency: "USD" }` and its sibling both rendered `| { amount
+  currency }`. A member's type annotation and `readonly` are now preserved on
+  `property_signature` and `index_signature` (in class bodies and mapped types too), as is
+  the member-separator `;` inside an `object_type`/`interface_body`. Class **field**
+  annotations stay stripped, unchanged: there the body still shows the name and
+  initializer, whereas an interface member's annotation is the whole declaration.
+
+  **Rust: no CLI-visible change.** The same unconditional `;` strip removed declaration
+  terminators — a bodyless `fn` signature, a unit or tuple `struct`, a trait associated
+  type — and the array-length `;` in `[u8; 32]`, all now preserved, along with a golden
+  snapshot that had blessed the invalid render. **No `skim <file>.rs --mode=pseudo` output
+  moves:** restoring those semicolons is token-neutral (measured 1,129 → 1,129 tokens,
+  0.0%), so the net-savings guard serves the raw file at every input size. This one is for
+  `rskim-core` library consumers. Rust pseudo output still does not re-parse as a whole —
+  `use`, `let`, `const`, `static`, `mod foo;`, `type T = U;` and expression statements keep
+  losing their `;` — which is pre-existing and tracked separately.
+
+- **`skim npm ls` keeps each package's name and version** — a healthy tree rendered as
+  `npm list 1 total 0 flagged`: two integers and nothing else. The version was read and
+  then referenced only inside the `problems` branch, so a dependency with no problems
+  contributed to the total and was otherwise dropped — the identity the command is run to
+  learn. Both the JSON tier and the text tier now name every listed dependency as
+  `name@version`. Known narrowing: nesting depth is flattened, so `│ └── b@2.0.0` and
+  `└── b@2.0.0` both render as `b@2.0.0`.
+
+- **`skim git push` renders both sides of a refspec** — only the source side reached the
+  reader, so `git push origin feature:main` reported `feature` and never named the ref that
+  was written: the half most likely to be the mistake. An asymmetric refspec now renders as
+  `feature -> main`; a symmetric one still renders as a single short name. The same change
+  fixes the deletion render, which was blank — git's porcelain delete line has an **empty**
+  source side, so `skim git push --delete origin topic` printed ` -  [deleted]` without
+  saying what had been deleted.
+
+- **`skim gh run list` renders run IDs that `gh` accepts** — each run's `databaseId` was
+  prefixed with `#`. A `databaseId` is not an issue number: `gh run view '#36362655859'`
+  returns HTTP 404 where the bare form resolves, and a bare `#12345` pasted into a GitHub
+  comment autolinks an unrelated issue or PR. Run IDs now render bare; `gh issue list` and
+  `gh pr list` keep their `#`, where the field really is `number`. **This narrows a net
+  expansion without closing it:** `skim gh run list` still serves more bytes than raw
+  `gh run list` (536 B before, 533 B after, against 532 B raw), and the net-savings guard
+  structurally cannot see it — with no raw override its baseline is the 960 B of JSON skim
+  itself requested, so it reports a saving on a view larger than what the reader would
+  otherwise have received. Tracked separately.
+
+- **`skim <file> --debug` and `skim <file> --passthrough` are honoured** — the flag zone
+  stopped at the first token not starting with `-`, which on a file operation is the file,
+  so both flags were accepted and did nothing: `--passthrough` after the filename produced
+  output byte-identical to passing no flag at all. `skim --mode structure --passthrough
+  <file>` was ignored too, because the space form of `--mode` leaves a bare `structure` in
+  the zone and the scan stopped there, while `--mode=structure` happened to work. The zone
+  now ends at the first positional only when that positional is a known subcommand, so
+  `skim grep -e --passthrough f` still hands `--passthrough` to grep as pattern data. The
+  PATH-wrapper surface deliberately keeps the old rule — under a `~/.skim/bin/<tool>`
+  symlink every argument belongs to the wrapped tool; use `SKIM_PASSTHROUGH=1` there.
+
+- **The rewrite engine declines a command whose target binary cannot be resolved** — `rg …`
+  was rewritten to `skim rg …` whether or not anything named `rg` could be found, replacing
+  a working command with one that fails: `error: 'rg' not found`, exit 1 — a code that
+  collides with ripgrep's own "no matches", so a caller reading `$?` could not tell "not
+  installed" from "nothing found". Such a command is now left alone and the real command
+  runs untouched. Documented limitation: the probe answers *"would `Command::new(p)` find
+  it?"*, not *"would the shell run something for `p`?"* — a shell function or alias is
+  invisible to a PATH probe by construction.
+
+- **A declined rewrite is no longer entirely invisible** — when the hook declines a command
+  it cannot reconstruct byte-faithfully it exited leaving no trace at all: nothing on
+  stderr, nothing in `hook.log`, nothing in the cache dir. An agent whose every command was
+  declined looked exactly like one whose commands were all being compressed. The multi-line
+  (interior-newline) case now writes one line to `hook.log`, rate-limited to one per agent
+  per day. The decline itself was and remains correct: the original command runs unmodified,
+  so nothing is lost but compression. **Partial mitigation of #337, not its closure, on two
+  axes.** The line names the *class* of decline and never the command — command text is
+  unbounded and routinely carries credentials, so logging it on every decline would turn
+  `hook.log` into a secret sink; `SKIM_HOOK_AUDIT=1` remains the opt-in that records each
+  command to `hook-audit.log`. And only the interior-newline trigger is named: heredocs,
+  `$(…)`, backticks, unmatched quotes and the other bail reasons still decline silently.
+
+- **Raw passthrough no longer appends a byte the tool never wrote** — on the net-savings
+  guard's raw-serve verdict skim appended a newline to any output that did not already end
+  in one. Measured through `skim curl` on a `file://` body: **28 B served against 27 B**
+  raw, and on a one-byte body **2 B against 1 B** — 100% overhead, at exit 0 with nothing
+  on stderr. That verdict now forwards the tool's bytes exactly. It matters most for
+  NUL-delimited and other non-newline-terminated streams, where the appended byte is a
+  malformed final record. The sinks that deliberately ensure a trailing newline are
+  unchanged.
+
+- **The `skim git diff` line-number column now says which axis it indexes** (documentation
+  only) — the enriched render prints one number column over two coordinate spaces and named
+  neither. On the pinned fixture it reads `1, 2, 3, 4, 2, 3, 4, 5, 6, 7`: `2`, `3` and `4`
+  each appear twice and the sequence runs backward at one boundary, so the obvious reading
+  (a single monotonic counter) is wrong. Documented convention: a `-` line's number indexes
+  the old file, a `+` or context line's indexes the new one, and a `~` breadcrumb line
+  carries no number. No code changed, and a second column stays closed — it needs 76 B
+  where three fixtures measure raw-diff margins of 68, 63 and 54 B. On a single-hunk file
+  the `@@` header is withheld, so there the prefix is the only cue.
+
+### Changed
+
 - **Multi-file batch runs no longer attribute a shared disclosure marker's cost to one
   arbitrary file** (#561) — a multi-file run (`skim <glob>` / `skim dir/`) emits exactly
   one aggregate disclosure marker on stderr for the whole run when any file's rendered

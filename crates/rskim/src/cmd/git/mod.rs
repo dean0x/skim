@@ -5,6 +5,10 @@
 //! passthrough: when the user already specifies a compact format flag,
 //! output is passed through unmodified.
 //!
+//! That flag-awareness is one shared gate, not a per-subcommand habit — see
+//! [`MACHINE_CONTRACT_FLAGS`], which is evaluated in [`run`] ahead of dispatch
+//! and therefore ahead of every ADR-001 net-savings verdict (ADR-022).
+//!
 //! The `diff` subcommand uses an AST-aware pipeline (#103): it parses
 //! unified diff output, overlays changed line ranges on tree-sitter ASTs,
 //! and renders changed nodes with full function boundaries and standard
@@ -22,8 +26,8 @@ mod status;
 
 use std::process::ExitCode;
 
-use crate::cmd::OutputFormat;
 use crate::cmd::execution as exec;
+use crate::cmd::{OutputFormat, user_has_flag};
 use crate::output::canonical::GitResult;
 use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
@@ -69,6 +73,31 @@ pub(crate) fn run(
     };
 
     match subcmd.as_str() {
+        // ADR-022 — the machine-contract passthrough gate.  It sits ahead of
+        // every handler, and therefore ahead of every ADR-001 net-savings
+        // verdict any of them applies.
+        //
+        // Scoped to the subcommands that have a compressing handler: the
+        // `other` arm below already forwards unknown subcommands raw, and it
+        // does so through `run_raw_passthrough`, which STREAMS.  Routing them
+        // here instead would trade streaming for buffering and give up the
+        // PF-021 early-close guarantees for no gain.  Listing the names in this
+        // arm rather than in a separate const keeps the gate's domain and the
+        // dispatch table the same list, so the two cannot drift.
+        //
+        // `--json` DISARMS it, but only where the handler on the other side can
+        // actually model the flagged payload — see [`json_disarms_the_gate`].
+        // The gate is keyed on what the caller typed, and `--json` is also
+        // something the caller typed; what it names is skim's own machine
+        // contract rather than git's, so honouring it is not the false negative
+        // the asymmetry warns about — *provided the envelope it produces is
+        // true*.  Where it would not be, the gate stays armed.
+        "status" | "diff" | "fetch" | "log" | "show" | "commit" | "push"
+            if has_machine_contract_flag(subcmd_args)
+                && !json_disarms_the_gate(subcmd.as_str(), subcmd_args) =>
+        {
+            run_passthrough(&global_flags, subcmd.as_str(), subcmd_args, show_stats, rec)
+        }
         "status" => status::run_status(&global_flags, subcmd_args, show_stats, rec),
         "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats, rec),
         "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, rec),
@@ -92,6 +121,394 @@ pub(crate) fn run(
             super::run_raw_passthrough("git", &all_args, &[])
         }
     }
+}
+
+// ============================================================================
+// Machine-contract passthrough gate (ADR-022)
+// ============================================================================
+
+/// Flags whose presence makes the invocation's output a **machine contract**:
+/// git's own bytes are served raw, unconditionally, ahead of and independent of
+/// the ADR-001 net-savings verdict.
+///
+/// # Why a flag list and not a measurement
+///
+/// "This output format is a machine contract" is a question about the caller's
+/// *intent*, and the ADR-001 byte comparison structurally cannot answer it.
+/// Before this gate existed, every git invocation that came through
+/// byte-identical did so by coincidence of two blunt mechanisms: the
+/// net-savings size guard, which protects a format only while compression
+/// happens to lose and therefore reverses when the repository state changes,
+/// and "non-zero exit ⇒ forward raw", which protects only failing invocations.
+/// Measured at `c2b4378`: `skim git log --stat -n 3` served **374 B** against
+/// **32 733 B** of raw git with **zero** bytes on stderr, and all five of
+/// `--stat` / `--shortstat` / `--numstat` / `--name-only` / `--name-status`
+/// produced the *same* 374 B, i.e. the flag was swallowed without a trace.
+///
+/// # The error modes are asymmetric, so over-inclusion is the safe direction
+///
+/// A **false positive** costs nothing that matters.  The reader is served the
+/// raw git bytes, which is byte-faithful by construction, and it is also
+/// *guard-neutral*: [`run_passthrough`] records `parse_tier == "passthrough"`,
+/// which skips the ADR-001 guard entirely rather than being graded by it.  The
+/// only cost is the compression skim would otherwise have applied.
+///
+/// A **false negative** is the whole defect class.  A NUL-delimited,
+/// tab-framed, or exit-code-bearing stream gets reshaped into prose — silently,
+/// at exit 0, with no ADR-011 class-1 marker — and whatever parses it
+/// downstream reads either garbage or, worse, a plausible wrong answer.
+///
+/// So when a flag's status is arguable, it belongs in this list.  Two
+/// deliberate consequences of that asymmetry:
+///
+/// - The gate is **not** separator-aware — it does not route through
+///   `args_before_separator` — so a pathspec literally named `--stat` after a
+///   bare `--` also serves raw.  Separator-awareness could only turn a match
+///   into a miss, i.e. only manufacture false negatives.
+/// - Short-cluster matching (see [`CONTRACT_SHORT_OPTS`]) scans every character
+///   of a single-dash token, so `git log -Szebra` — the pickaxe, whose value
+///   merely happens to contain a `z` — also serves raw.
+///
+/// # Adding a flag
+///
+/// One entry here, and it applies to every git subcommand skim compresses.
+/// That is the point of hoisting: the two per-command spellings this replaced
+/// (`git diff`'s stat family and `git log`'s `--format`/`--pretty`) meant the
+/// same flags were a contract for one subcommand and swallowed by its sibling.
+/// `cmd/git/show.rs` keeps its own `PASSTHROUGH_FLAGS` list, which this gate
+/// now reaches first.  This set is a strict superset of it, so `git show` is
+/// unaffected — `--raw` was the last entry show carried alone, and it is
+/// hoisted here rather than given a third spelling there.
+const MACHINE_CONTRACT_FLAGS: &[&str] = &[
+    // Record formats git documents as stable for scripts.  `user_has_flag`'s
+    // `=` rule makes `--porcelain` cover `--porcelain=v1` and `=v2` too.
+    "--porcelain",
+    // Long form of `-z`; `cmd/git/status.rs` already classes it with `-z`.
+    "--null",
+    // Fixed-column and tab-framed summaries.  A renderer that reflows these
+    // columns changes the field boundaries a caller splits on.
+    "--stat",
+    "--shortstat",
+    "--numstat",
+    "--name-only",
+    "--name-status",
+    // git's diff *record* format, `:100644 100644 <pre> <post> M\tpath` —
+    // colon-prefixed, tab-delimited, fixed field order, a format that exists to
+    // be split on.  `cmd/git/show.rs`'s `PASSTHROUGH_FLAGS` has always carried
+    // it, so `--raw` was a contract on one subcommand and swallowed by its
+    // siblings: measured at `c2b4378`, `git log --raw -n 3` served the same
+    // 324 B as `--stat` against 1 695 B of raw git, while `git show --raw HEAD`
+    // was already byte-exact at 564 B.
+    "--raw",
+    "--check",
+    // Exit-code and silence contracts: the answer is the status, not the text,
+    // so any byte skim adds is output the caller explicitly asked not to get.
+    // `-q` is git's documented short form of `--quiet` on push/fetch/commit.
+    "--quiet",
+    "-q",
+    "--exit-code",
+    // Topology rendering: the `*`, `|` and `\` rails ARE the payload.  Measured
+    // at `c2b4378`, dropping this flag was worse than lossy — `git log --graph`
+    // over a 3-commit range served `log no commits` (15 B), because `--graph`
+    // prefixes each commit with `* `, which the `%h`-shaped `is_commit_line`
+    // filter rejects.  An absence read as evidence (the PF-021 shape).
+    "--graph",
+    // Caller-supplied format strings: skim cannot know what they encode, so it
+    // cannot know what reshaping them destroys.  Hoisted from `log.rs`.
+    "--format",
+    "--pretty",
+];
+
+/// Short option characters that make the output a machine contract when they
+/// appear **anywhere inside** a single-dash cluster.
+///
+/// Cluster-aware on purpose.  `git status -sz` is a real invocation (measured:
+/// raw 13 B) whose `-z` an exact-token match would miss, and
+/// `cmd/git/status.rs`'s `CONFLICTING_SHORT_OPTS` scan is already cluster-aware
+/// — so an exact-token gate here would be *weaker* than what already ships,
+/// i.e. a regression introduced by the fix rather than a pre-existing gap.
+///
+/// `z` is the only member.  The set's other single-dash flag, `-q`, is matched
+/// as an exact token in [`MACHINE_CONTRACT_FLAGS`] instead, because git users
+/// bundle `-z` (`git status -sz`) and do not bundle `-q`; listing `q` here as
+/// well would only widen the false-positive surface with no case to serve.
+///
+/// `-s` (`--short`) is deliberately **absent** — short format is a human-facing
+/// rendering that `cmd/git/status.rs` translates faithfully, and adding it here
+/// would turn `skim git status -sb` into raw passthrough.
+const CONTRACT_SHORT_OPTS: &[char] = &['z'];
+
+/// Whether `args` carry a flag that makes this invocation's output a machine
+/// contract — see [`MACHINE_CONTRACT_FLAGS`] for the set and the asymmetry that
+/// governs it.
+fn has_machine_contract_flag(args: &[String]) -> bool {
+    args_match_flag_set(args, MACHINE_CONTRACT_FLAGS, CONTRACT_SHORT_OPTS)
+}
+
+/// Whether `args` carry any of `longs` as a whole token (or `<token>=<value>`),
+/// or any of `shorts` **anywhere inside** a single-dash cluster.
+///
+/// Shared by [`has_machine_contract_flag`] and
+/// [`log::commit_shape_is_broken_by`], which ask different questions of the
+/// same argv and must not disagree about what "carries a flag" means.  Two
+/// independent cluster scans are how such a pair drifts apart — the same
+/// reasoning `log.rs`'s `is_oneline_flag` doc comment gives for routing its two
+/// readers through one predicate.
+///
+/// Like every matcher in this module it is deliberately **not**
+/// separator-aware: see [`MACHINE_CONTRACT_FLAGS`] for why over-inclusion is
+/// the safe direction on both sides of this gate.
+fn args_match_flag_set(args: &[String], longs: &[&str], shorts: &[char]) -> bool {
+    if user_has_flag(args, longs) {
+        return true;
+    }
+    // Single-dash clusters: `-z`, `-sz`, `-zs`, `-bz`, …  The `starts_with('-')`
+    // guard makes byte index 1 a char boundary, so the slice cannot panic.
+    args.iter().any(|a| {
+        a.starts_with('-') && !a.starts_with("--") && a[1..].chars().any(|c| shorts.contains(&c))
+    })
+}
+
+/// Whether the caller typed skim's own `--json` view flag, which **disarms**
+/// the machine-contract gate.
+///
+/// # Why a contract flag plus `--json` is not a gate miss
+///
+/// ADR-022 keys the gate on "flags and syntax the caller typed", and its
+/// over-inclusion asymmetry rests on what a false negative costs: a contract
+/// stream "gets reshaped into prose — silently, at exit 0, with no ADR-011
+/// class-1 marker".  Neither half of that holds here.  `--json` is itself a
+/// flag the caller typed, and what it asks for is *skim's* machine contract —
+/// the JSON envelope, emitted through `exec::emit_json_envelope` with its
+/// mandatory [`Completeness`] declaration and class-1 marker.  So the reader
+/// is not silently served prose; they are served the machine-readable format
+/// they requested, under disclosure.
+///
+/// The gate as first landed fired ahead of every handler, while `--json` is
+/// extracted *inside* handlers by `extract_output_format`, and
+/// [`run_passthrough`] forwarded the caller's argv to git unfiltered.  So a
+/// skim-only flag reached git and git rejected the whole invocation.  Measured
+/// on this branch before this guard existed:
+///
+/// ```text
+/// $ skim git status --porcelain --json
+/// error: unknown option `json'
+/// exit=1                                      (0 B on stdout)
+/// ```
+///
+/// against `c2b4378`, which served a 2 500 B envelope at exit 0.  Every
+/// (contract flag × compressed subcommand) pair was affected, which is what
+/// made `README.md`'s "All subcommands support `--json`" false.
+///
+/// # Acceptance rule
+///
+/// Mirrors [`crate::cmd::extract_json_flag`] exactly — a bare `--json` token,
+/// and only **before** a POSIX `--` separator — because that is the function
+/// the handler on the other side of this guard uses to extract the flag.  The
+/// two must agree: a guard that disarmed on `-- --json` would route a
+/// *pathspec* into a handler that forwards it to git unchanged, answering a
+/// question git answers differently.  Pinned against that function by
+/// `json_request_predicate_matches_extract_json_flag`, and non-allocating so
+/// the guard costs nothing on the gated path.
+fn caller_requested_json(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a.as_str() == "--json")
+}
+
+/// Whether the caller's `--json` stands the machine-contract gate down.
+///
+/// Two conditions, and the second is the narrowing this function exists for:
+/// the caller typed skim's `--json` ([`caller_requested_json`]), **and** the
+/// handler on the other side of the gate can model the flagged payload well
+/// enough for its envelope to be *true* ([`json_envelope_would_misreport`]).
+fn json_disarms_the_gate(subcmd: &str, args: &[String]) -> bool {
+    caller_requested_json(args) && !json_envelope_would_misreport(subcmd, args)
+}
+
+/// Whether the `--json` envelope this `(subcmd, argv)` would produce states
+/// something **false** — in which case `--json` must NOT disarm the gate.
+///
+/// # The `--mode` precedent, applied to `--json`
+///
+/// [`strip_git_view_flags`] records why `--mode` keeps the gate armed: it
+/// "selects a view of *source code*, and a `--stat` / `--numstat` /
+/// `--porcelain` payload is not source code — there is no view to select.
+/// Disarming the gate for it instead would hand a stat payload to the AST
+/// pipeline, which is F6 rebuilt."  That reasoning was never applied to
+/// `--json`, and it transfers exactly: skim's envelope is a serialisation of
+/// the handler's **parsed model**, and a parsed model exists only where the
+/// handler's parser can read the payload.  Where it cannot, disarming hands a
+/// contract payload to a parser that discards it — F6 rebuilt inside a JSON
+/// envelope.
+///
+/// # Why this is keyed on the (subcommand, flag) PAIR and not on the flag
+///
+/// Blindness is a property of the *parser*, not of the flag.  `--stat` is a
+/// contract flag on both `diff` and `log`, and the two handlers answer it
+/// completely differently: `run_diff`'s empty-parse branch carries git's own
+/// `--stat` bytes verbatim in a `raw` field (measured — the envelope for
+/// `git diff --stat --json` is `{"files": [], "raw": " src/a.rs | 3 +--\n…"}`,
+/// pinned by
+/// `cli_git_contract_flags.rs::diff_contract_flag_with_json_carries_gits_own_bytes_in_the_envelope`),
+/// while `parse_log` has no equivalent and reports `no commits`.  A flag-keyed
+/// predicate would therefore have to arm the gate on `diff --stat --json` too,
+/// taking a working envelope away from a caller for no fidelity gain.
+///
+/// # `log` is the one blind parser, and only for the shape-breaking flags
+///
+/// Measured on a hermetic 3-commit fixture at `69d7d57` (every `log` row below
+/// is byte-identical to raw git *without* `--json`, so the disarm is the sole
+/// cause of each divergence):
+///
+/// ```text
+/// argv                              raw      served   envelope claim
+/// log --graph      -n 2             369 B     69 B    "no commits"   ← FALSE
+/// log --format=%H  -n 2              82 B     69 B    "no commits"   ← FALSE
+/// log --pretty=%H  -n 2              82 B     69 B    "no commits"   ← FALSE
+/// log -z           -n 2             347 B    269 B    "1 commit"     ← FALSE
+/// log --stat       -n 2             605 B    266 B    "2 commits"      true
+/// log --numstat    -n 2             470 B    266 B    "2 commits"      true
+/// ```
+///
+/// The split is mechanical, not a judgement call.  `parse_log` reads exactly
+/// one shape — the `%h`-prefixed line `run_log` *itself* injects — so a flag
+/// that **replaces** that format (`--format`, `--pretty`), **replaces its
+/// record separator** (`-z`, `--null`), or **prefixes** it (`--graph`) leaves
+/// nothing for `is_commit_line` to match and the count collapses to a false
+/// one.  A flag that merely **appends a block beside** it (the stat family)
+/// leaves the count correct; the block is dropped, and that drop is disclosed
+/// with an exact ADR-011 class-1 count (`13 lines omitted (2 of 15 shown)`).
+/// Those two groups are `log.rs`'s business, so the list lives beside
+/// `is_commit_line` — see [`log::commit_shape_is_broken_by`].
+///
+/// # What arming costs, and why it is the right trade
+///
+/// The caller asked for JSON and receives git's own bytes instead.  That is the
+/// same complaint the `show` / `fetch` gates already carry, and it is honest:
+/// raw bytes with no claim attached beat an envelope asserting `no commits`
+/// over a two-commit range.  `run_passthrough` records
+/// `parse_tier == "passthrough"`, so the ADR-001 guard is skipped rather than
+/// consulted, and the served bytes are byte-identical to raw git — a lossless
+/// raw fallback, hence ADR-011 class 2 and the existing debug-gated banner
+/// rather than a new unconditional marker.
+fn json_envelope_would_misreport(subcmd: &str, args: &[String]) -> bool {
+    subcmd == "log" && log::commit_shape_is_broken_by(args)
+}
+
+/// Remove skim's own view flags from an argv bound for the real `git` binary.
+///
+/// Returns `Some((forwarded, dropped))` when at least one token was removed,
+/// and `None` — allocation-free — when the argv is already clean.  `None` is
+/// the common case, and it keeps every currently-gated invocation
+/// byte-for-byte unchanged.
+///
+/// # The set, and why it is narrower than `dispatch::strip_skim_flags`
+///
+/// Exactly the two flags `CLAUDE.md` documents as "additionally stripped for
+/// `git` only": a bare `--json` and `--mode` / `--mode=<val>`.  Those are the
+/// two that git handlers extract for themselves (`extract_output_format`,
+/// `extract_diff_mode`), which is what makes them provably skim-only on this
+/// tool.
+///
+/// The general helper also strips `--max-lines`, `--tokens` and
+/// `--last-lines`.  Those are deliberately left alone.  No git handler
+/// implements them — measured on `c2b4378` and on this branch,
+/// `skim git log -n 2 --max-lines 10` is `fatal: ambiguous argument '10'`
+/// with or without a contract flag — so stripping them here would convert a
+/// hard error into a silently **unbounded** serve, manufacturing the exact
+/// ADR-016 defect that "a bound the tool can exceed is not a bound" names.
+/// That gap is real, pre-existing and wider than this gate; widening this set
+/// is not how to close it.
+///
+/// # What actually reaches this function with something to drop
+///
+/// `--mode` is the case that needs it, and it gets the **opposite** answer to
+/// `--json`: the gate keeps firing and the token is dropped.  `--mode` selects
+/// a view of *source code*, and a `--stat` / `--numstat` / `--porcelain`
+/// payload is not source code — there is no view to select.  Disarming the
+/// gate for it instead would hand a stat payload to the AST pipeline, which is
+/// F6 rebuilt: `git diff --no-color --stat` carries no `diff --git` header for
+/// `parse_diff` to find.
+///
+/// `--json` reaches here only from the per-command gates this module does not
+/// own — `show.rs`'s `PASSTHROUGH_FLAGS` and `ShowMode::MultiRef`, and
+/// `fetch.rs`'s `--dry-run`/`--quiet` — where it was already a hard error
+/// before the shared gate existed (measured at `c2b4378`:
+/// `skim git show --raw --json HEAD` → `fatal: unrecognized argument: --json`,
+/// exit 1).  Stripping upgrades those to a lossless raw serve.  The complete
+/// fix is to disarm *those* gates on `--json` the way this one now is, which
+/// is outside this change's file scope.
+///
+/// # POSIX `--`
+///
+/// Nothing is dropped at or after a bare `--`, matching `extract_json_flag`,
+/// `extract_diff_mode` and `dispatch::strip_skim_flags`.  After the separator
+/// these tokens are pathspecs, and `git status --porcelain -- --json` is a
+/// real invocation whose answer (git matches no such path) both binaries
+/// already give correctly.
+fn strip_git_view_flags(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    // Fast path: skip the walk when no candidate token is present before `--`.
+    let has_candidate = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a.as_str() == "--json" || a.as_str() == "--mode" || a.starts_with("--mode="));
+    if !has_candidate {
+        return None;
+    }
+
+    let mut forwarded: Vec<String> = Vec::with_capacity(args.len());
+    let mut dropped: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut past_separator = false;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        if past_separator {
+            forwarded.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        match arg.as_str() {
+            "--" => {
+                past_separator = true;
+                forwarded.push(arg.clone());
+                i += 1;
+            }
+            "--json" => {
+                dropped.push(arg.clone());
+                i += 1;
+            }
+            // `--mode <val>`: the value token belongs to the flag, so it goes
+            // too.  Leaving it behind hands git an orphan positional that it
+            // reads as a revision — `fatal: ambiguous argument 'full'`, the
+            // same class of failure one token further along.
+            "--mode" => {
+                dropped.push(arg.clone());
+                i += 1;
+                if i < args.len() && !args[i].starts_with('-') {
+                    dropped.push(args[i].clone());
+                    i += 1;
+                }
+            }
+            other if other.starts_with("--mode=") => {
+                dropped.push(arg.clone());
+                i += 1;
+            }
+            _ => {
+                forwarded.push(arg.clone());
+                i += 1;
+            }
+        }
+    }
+
+    debug_assert!(
+        !dropped.is_empty(),
+        "has_candidate was true, so the walk must have dropped at least one token"
+    );
+    Some((forwarded, dropped))
 }
 
 // ============================================================================
@@ -319,7 +736,30 @@ pub(super) fn run_passthrough(
 ) -> anyhow::Result<ExitCode> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.push(subcmd.to_string());
-    full_args.extend_from_slice(args);
+    // skim's own view flags are not git flags, and this function is the shared
+    // sink every raw-serve path funnels through — the ADR-022 gate above plus
+    // the five per-command gates in `show.rs`, `fetch.rs`, `commit.rs` and
+    // `push.rs`.  Filtering here rather than at each gate means a call site
+    // cannot reintroduce the defect by forgetting to filter, and a future
+    // narrowing of `MACHINE_CONTRACT_FLAGS` cannot bring it back.
+    match strip_git_view_flags(args) {
+        Some((forwarded, dropped)) => {
+            // ADR-011 class-2, so `SKIM_DEBUG`-gated: the reader receives
+            // git's own bytes for a payload that has no skim view to select,
+            // which is a lossless raw fallback and not a loss-bearing one.
+            // `cli_git_contract_flags.rs::assert_byte_identical` pins that
+            // classification for every gated invocation by comparing BOTH
+            // descriptors against the raw control, so promoting this to an
+            // unconditional marker is a contract change, not a tweak.
+            let safe = crate::cmd::sanitize_for_display(&dropped.join(" "));
+            crate::debug_log!(
+                "skim git {subcmd}: '{safe}' is a skim view flag, not a git flag — \
+                 serving git's own output for this machine-contract format"
+            );
+            full_args.extend(forwarded);
+        }
+        None => full_args.extend_from_slice(args),
+    }
 
     let runner = CommandRunner::new();
     let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
@@ -529,7 +969,19 @@ where
                         // Emit the user's raw output if available (C-7), otherwise
                         // emit the internal command raw; record under "passthrough" tier.
                         let emit_raw = raw_override.as_deref().unwrap_or(&raw);
-                        let (tier, status) = exec::emit_raw_passthrough(emit_raw)?;
+                        // Byte-exact: `emit_raw` is git's own stdout, and a
+                        // newline git never wrote is a divergence from raw that
+                        // no ADR-011 marker discloses.  Unreachable today —
+                        // every non-newline-terminated git format (`-z`,
+                        // `--null`, `--pretty=format:`, `--format=`) is in
+                        // `MACHINE_CONTRACT_FLAGS`, so the ADR-022 gate serves
+                        // it raw ahead of dispatch and it never reaches this
+                        // verdict.  Kept and routed here for the same reason
+                        // `status.rs` keeps its now-unreachable flag-stripping
+                        // arms: a future narrowing of the gate would return the
+                        // leak.  See `exec::emit_raw_passthrough_exact` for the
+                        // measurements on both arms.
+                        let (tier, status) = exec::emit_raw_passthrough_exact(emit_raw)?;
                         if status == exec::StdoutStatus::PipeClosed {
                             return Ok(exec::pipe_closed_exit());
                         }
@@ -924,5 +1376,538 @@ mod tests {
             scrubbed.contains("github.com/org/repo.git"),
             "host/path must be preserved; got: {scrubbed}"
         );
+    }
+
+    // ========================================================================
+    // Machine-contract passthrough gate (ADR-022)
+    // ========================================================================
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|t| (*t).to_string()).collect()
+    }
+
+    /// The integration mirror of this set must be updated along with it.
+    ///
+    /// `crates/rskim/tests/cli_git_contract_flags.rs::CONTRACT_FLAGS` hand-mirrors
+    /// this const because `rskim` is bin-only (no `src/lib.rs`), so an
+    /// integration test cannot import a private item from it.  A new entry here
+    /// is silently *unexercised* by the three matrix tests over there unless the
+    /// mirror grows too — the failure mode being an added contract flag that
+    /// nothing checks for a false `--json` envelope, which is this very defect.
+    /// Pinning the count is what makes that omission loud.
+    #[test]
+    fn contract_flag_set_is_mirrored_by_the_integration_test() {
+        assert_eq!(
+            MACHINE_CONTRACT_FLAGS.len(),
+            15,
+            "MACHINE_CONTRACT_FLAGS changed size.  Mirror the change in \
+             crates/rskim/tests/cli_git_contract_flags.rs::CONTRACT_FLAGS, decide \
+             whether the new flag belongs in log.rs::COMMIT_SHAPE_BREAKING_FLAGS \
+             as well, and update this count."
+        );
+        assert_eq!(
+            CONTRACT_SHORT_OPTS.len(),
+            1,
+            "CONTRACT_SHORT_OPTS changed size — the same mirror applies, and the \
+             mirror carries the shorts as explicit argv tokens (`-z`)."
+        );
+    }
+
+    /// Every flag in the closed set is recognised on its own.
+    ///
+    /// Enumerated from the const rather than hand-listed, so a future entry
+    /// cannot be added without the predicate being exercised on it.
+    #[test]
+    fn every_contract_flag_is_recognised_alone() {
+        for &flag in MACHINE_CONTRACT_FLAGS {
+            assert!(
+                has_machine_contract_flag(&argv(&[flag])),
+                "'{flag}' is in MACHINE_CONTRACT_FLAGS but the predicate misses it"
+            );
+        }
+    }
+
+    /// `--porcelain=v1` / `=v2` are the same contract as bare `--porcelain`.
+    ///
+    /// This is what `user_has_flag`'s `=` rule buys, and it is the whole of
+    /// F9: `git status --porcelain=v2 --branch` is a stability contract, so
+    /// every `#`-prefixed header line — `# branch.oid` included, which has no
+    /// prefix match anywhere in `status.rs` — must reach the reader verbatim.
+    #[test]
+    fn porcelain_matches_its_versioned_forms() {
+        for form in ["--porcelain", "--porcelain=v1", "--porcelain=v2"] {
+            assert!(
+                has_machine_contract_flag(&argv(&[form, "--branch"])),
+                "'{form}' must be recognised as a machine contract"
+            );
+        }
+        // `--no-porcelain` is the opposite request and must NOT match.
+        assert!(!has_machine_contract_flag(&argv(&["--no-porcelain"])));
+    }
+
+    /// `-z` is matched inside a bundled short cluster, not only as a lone token.
+    ///
+    /// `git status -sz` is a real invocation.  `status.rs`'s own
+    /// `CONFLICTING_SHORT_OPTS` scan is already cluster-aware, so an
+    /// exact-token gate here would be *weaker* than the shipped behaviour — a
+    /// regression introduced by this fix rather than a pre-existing gap.
+    #[test]
+    fn contract_shorts_are_matched_inside_a_cluster() {
+        for cluster in ["-z", "-sz", "-zs", "-uz", "-bz"] {
+            assert!(
+                has_machine_contract_flag(&argv(&[cluster])),
+                "cluster '{cluster}' contains a contract short and must match"
+            );
+        }
+    }
+
+    /// `-s` / `--short` / `--long` are NOT contracts and must not be gated.
+    ///
+    /// Short format is a human-facing rendering that `status.rs` translates
+    /// faithfully; gating it would turn `skim git status -sb` — which has its
+    /// own pinned test — into raw passthrough.  `--oneline` is excluded for the
+    /// same reason: `log.rs` answers it by injecting an equivalent `--format`.
+    #[test]
+    fn non_contract_flags_are_not_gated() {
+        for args in [
+            vec!["-s"],
+            vec!["-sb"],
+            vec!["-b"],
+            vec!["--short"],
+            vec!["--long"],
+            vec!["--oneline"],
+            vec!["--oneline", "-n", "3"],
+            vec!["--cached"],
+            vec!["--mode", "full"],
+            vec!["-U100000"],
+            vec!["HEAD~1..HEAD"],
+            vec![],
+        ] {
+            assert!(
+                !has_machine_contract_flag(&argv(&args)),
+                "{args:?} carries no machine-contract flag but the gate fired"
+            );
+        }
+    }
+
+    /// The gate is deliberately NOT separator-aware (ADR-022).
+    ///
+    /// A pathspec literally named `--stat` after a bare `--` serves raw.  That
+    /// is a false positive, and a false positive costs only the compression
+    /// skim would have applied — the reader still gets git's own bytes, and
+    /// `run_passthrough` records `parse_tier == "passthrough"`, which skips the
+    /// ADR-001 guard rather than being graded by it.  Routing through
+    /// `args_before_separator` could only turn a match into a miss, i.e. only
+    /// manufacture the failure mode that IS the defect class.
+    ///
+    /// Pinning it stops a later "correctness" edit from narrowing the gate.
+    #[test]
+    fn gate_is_not_separator_aware_by_design() {
+        assert!(has_machine_contract_flag(&argv(&["--", "--stat"])));
+        assert!(has_machine_contract_flag(&argv(&["--", "-z"])));
+    }
+
+    /// `--raw` is recognised **in position**, next to the args it really ships
+    /// with, on each subcommand where it is a git flag.
+    ///
+    /// [`every_contract_flag_is_recognised_alone`] already covers every entry
+    /// as a lone token, so this deliberately covers what that cannot: the flag
+    /// surrounded by neighbours, in the three argv shapes the defect was
+    /// measured through.  Before this entry existed `git log --raw -n 3` served
+    /// 324 B against 1 695 B of raw git — byte-identical to what `--stat`
+    /// served, the signature of the flag being swallowed rather than honoured —
+    /// while `git show --raw HEAD` was already byte-exact, because
+    /// `show.rs`'s `PASSTHROUGH_FLAGS` carried `--raw` and no sibling's list
+    /// did.  That split is what this entry closes.
+    #[test]
+    fn raw_record_format_is_a_contract_on_every_subcommand() {
+        for args in [
+            vec!["--raw", "-n", "3"],  // git log --raw -n 3
+            vec!["--raw", "--cached"], // git diff --raw --cached
+            vec!["--raw", "HEAD"],     // git show --raw HEAD
+            vec!["--cached", "--raw"], // trailing position
+            vec!["-n", "3", "--raw", "--no-renames"],
+        ] {
+            assert!(
+                has_machine_contract_flag(&argv(&args)),
+                "{args:?} carries `--raw`, a tab-delimited record format, but the gate missed it"
+            );
+        }
+    }
+
+    /// `--raw` matches as a whole token, not as a prefix of a longer flag.
+    ///
+    /// `user_has_flag` matches an entry exactly or followed by `=`, so a longer
+    /// flag that merely *starts* with `raw` cannot be captured by this entry.
+    /// Neither token below is real git — both are rejected with
+    /// "unrecognized argument" (measured) — so this pins the matcher's
+    /// discipline rather than a live invocation: it is the barrier against the
+    /// `=` rule being loosened into a bare `starts_with`, which would silently
+    /// widen every entry in the set, not just this one.
+    #[test]
+    fn raw_does_not_match_a_longer_flag_by_prefix() {
+        assert!(!has_machine_contract_flag(&argv(&["--rawest"])));
+        assert!(!has_machine_contract_flag(&argv(&["--no-raw"])));
+    }
+
+    /// A lone `-` is not a cluster and must not panic the byte slice.
+    #[test]
+    fn bare_dash_tokens_are_inert() {
+        assert!(!has_machine_contract_flag(&argv(&["-"])));
+        assert!(!has_machine_contract_flag(&argv(&["--"])));
+        assert!(!has_machine_contract_flag(&argv(&[""])));
+    }
+
+    // ========================================================================
+    // `--json` disarms the gate (ADR-022 regression)
+    // ========================================================================
+
+    /// Argv shapes where the two predicates must agree, spanning both answers.
+    ///
+    /// Shared by [`json_request_predicate_matches_extract_json_flag`] and the
+    /// two gate-behaviour tests, so a shape cannot be covered by one and
+    /// missed by the others.
+    const JSON_SHAPES: &[&[&str]] = &[
+        &["--json"],
+        &["--porcelain", "--json"],
+        &["--json", "--porcelain"],
+        &["--stat", "-n", "3", "--json"],
+        &["--json", "--", "src/a.rs"],
+        // Not skim's flag: after the separator it is a pathspec.
+        &["--", "--json"],
+        &["--porcelain", "--", "--json"],
+        // Not skim's flag: `--json=v` is a tool-owned form, never stripped.
+        &["--json=title"],
+        &["--porcelain", "--json=title"],
+        // No `--json` at all.
+        &["--porcelain"],
+        &["--stat", "-n", "3"],
+        &[],
+    ];
+
+    /// [`caller_requested_json`] must accept exactly what
+    /// [`crate::cmd::extract_json_flag`] accepts.
+    ///
+    /// This is the drift barrier that lets the guard be a non-allocating scan
+    /// instead of a call into that function.  The two agreeing is what makes
+    /// the handoff sound: the guard stands the gate down precisely when the
+    /// handler on the other side will extract the flag.  Were they to
+    /// disagree, `-- --json` would be routed into a handler that forwards a
+    /// pathspec to git unchanged — a different answer than git's own.
+    #[test]
+    fn json_request_predicate_matches_extract_json_flag() {
+        for shape in JSON_SHAPES {
+            let args = argv(shape);
+            let (_filtered, extracted) = crate::cmd::extract_json_flag(&args);
+            assert_eq!(
+                caller_requested_json(&args),
+                extracted,
+                "{shape:?}: the gate guard and `extract_json_flag` must agree \
+                 on whether the caller typed skim's `--json`"
+            );
+        }
+    }
+
+    /// The gate stands down when a contract flag is paired with `--json` **and**
+    /// the handler can model the payload.
+    ///
+    /// Before this guard, `skim git status --porcelain --json` exited 1 with
+    /// `error: unknown option 'json'` and 0 B on stdout, against a 2 500 B
+    /// envelope at exit 0 on `c2b4378`.
+    ///
+    /// Asserted through [`json_disarms_the_gate`] — the predicate the dispatch
+    /// arm actually consults — rather than through `caller_requested_json`.
+    /// The earlier spelling asserted only the latter and therefore passed on
+    /// `--json --graph`, whose envelope claimed `no commits` over a two-commit
+    /// range: it read as coverage of the disarm while pinning nothing about it.
+    #[test]
+    fn gate_stands_down_when_the_caller_asked_for_json() {
+        for (subcmd, shape) in [
+            ("status", vec!["--porcelain", "--json"]),
+            ("status", vec!["--porcelain=v2", "--json"]),
+            ("status", vec!["-z", "--json"]),
+            ("status", vec!["-sz", "--json"]),
+            ("log", vec!["--stat", "-n", "3", "--json"]),
+            ("log", vec!["--quiet", "--json"]),
+            ("diff", vec!["--stat", "--json"]),
+            ("diff", vec!["--numstat", "--json"]),
+            // `diff` is not `log`: the same flags that keep the gate armed on
+            // `log` disarm it here, because `parse_diff`'s empty-parse branch
+            // carries git's own bytes in `raw`.
+            ("diff", vec!["--graph", "--json"]),
+            ("diff", vec!["-z", "--json"]),
+        ] {
+            let args = argv(&shape);
+            assert!(
+                has_machine_contract_flag(&args),
+                "{subcmd} {shape:?}: precondition — the contract flag must still \
+                 match, or this test proves nothing about the `--json` guard"
+            );
+            assert!(
+                json_disarms_the_gate(subcmd, &args),
+                "{subcmd} {shape:?}: `--json` must disarm the gate"
+            );
+        }
+    }
+
+    /// `--json` does NOT disarm the gate for a `log` flag whose payload
+    /// `parse_log` cannot read.
+    ///
+    /// The second regression this gate produced, found after landing.  Measured
+    /// at `69d7d57`: each argv below served an envelope stating something
+    /// **false** — `no commits` for `--graph` / `--format` / `--pretty` over a
+    /// two-commit range, and `1 commit` for `-z` over the same range — at exit
+    /// 0, inside skim's own machine-readable format.  The ADR-011 marker fired,
+    /// so the loss was disclosed; the *claim* was still wrong, and a disclosed
+    /// false claim is worse than an undisclosed one because the marker invites
+    /// the reader to trust what remains.
+    ///
+    /// Asserting the whole conjunction, not just the new half: the contract flag
+    /// must match, the caller must have typed `--json`, and the gate must still
+    /// fire.  Without the first two the test would pass on an argv the gate was
+    /// never asked about.
+    #[test]
+    fn json_does_not_disarm_the_gate_for_a_payload_log_cannot_read() {
+        for shape in [
+            vec!["--format=%H", "--json"],
+            vec!["--format", "%H", "--json"],
+            vec!["--pretty=%H", "--json"],
+            vec!["--pretty", "--json"],
+            vec!["--graph", "--json"],
+            vec!["--json", "--graph"],
+            vec!["-z", "--json"],
+            vec!["-sz", "--json"],
+            vec!["--null", "--json"],
+            // Alongside a flag that would have disarmed on its own: the
+            // shape-breaking flag is what decides, not the argv's other members.
+            vec!["--stat", "--graph", "--json"],
+            vec!["--name-only", "--format=%H", "--json"],
+        ] {
+            let args = argv(&shape);
+            assert!(
+                has_machine_contract_flag(&args),
+                "log {shape:?}: precondition — the gate must be armed at all"
+            );
+            assert!(
+                caller_requested_json(&args),
+                "log {shape:?}: precondition — the caller must have typed `--json`"
+            );
+            assert!(
+                !json_disarms_the_gate("log", &args),
+                "log {shape:?}: `parse_log` cannot read this payload, so the \
+                 envelope would be false and the gate must stay armed"
+            );
+        }
+    }
+
+    /// The narrowing is scoped to `log` and to the shape-breaking flags only.
+    ///
+    /// Two directions, because a predicate that fires too widely is the mirror
+    /// defect: it takes a working envelope away from a caller for no fidelity
+    /// gain.  `diff --stat --json` in particular is pinned end-to-end by
+    /// `cli_git_contract_flags.rs::diff_contract_flag_with_json_carries_gits_own_bytes_in_the_envelope`.
+    #[test]
+    fn misreport_predicate_is_scoped_to_log_and_to_shape_breaking_flags() {
+        // Same flags, every other subcommand: the parser there is not blind.
+        for subcmd in ["status", "diff", "fetch", "show", "commit", "push"] {
+            for shape in [
+                vec!["--format=%H"],
+                vec!["--pretty=%H"],
+                vec!["--graph"],
+                vec!["-z"],
+                vec!["--null"],
+            ] {
+                assert!(
+                    !json_envelope_would_misreport(subcmd, &argv(&shape)),
+                    "{subcmd} {shape:?}: blindness is a property of `parse_log`, \
+                     not of the flag — only `log` may be narrowed"
+                );
+            }
+        }
+        // On `log`, the flags that append a block beside the commit line keep
+        // their disclosed-lossy envelope.
+        for shape in [
+            vec!["--stat"],
+            vec!["--shortstat"],
+            vec!["--numstat"],
+            vec!["--name-only"],
+            vec!["--name-status"],
+            vec!["--raw"],
+            vec!["--check"],
+            vec!["--quiet"],
+            vec!["-q"],
+            vec!["--exit-code"],
+            vec!["--porcelain"],
+            vec![],
+        ] {
+            assert!(
+                !json_envelope_would_misreport("log", &argv(&shape)),
+                "log {shape:?}: this flag leaves the commit-line shape intact, \
+                 so its envelope is lossy-but-true and stays disclosed"
+            );
+        }
+    }
+
+    /// Every shape-breaking flag must also be a machine-contract flag.
+    ///
+    /// The narrowing only has effect inside the gate's own arm, so a member
+    /// that is not in [`MACHINE_CONTRACT_FLAGS`] is dead code that reads as
+    /// protection.  `-z` is covered via [`CONTRACT_SHORT_OPTS`] rather than the
+    /// long set, so it is asserted through the predicate instead of by
+    /// membership.
+    #[test]
+    fn commit_shape_breaking_flags_are_a_subset_of_the_contract_set() {
+        for shape in [
+            vec!["--format=%H"],
+            vec!["--pretty=%H"],
+            vec!["--graph"],
+            vec!["--null"],
+            vec!["-z"],
+        ] {
+            let args = argv(&shape);
+            assert!(
+                log::commit_shape_is_broken_by(&args),
+                "{shape:?}: precondition — must be shape-breaking"
+            );
+            assert!(
+                has_machine_contract_flag(&args),
+                "{shape:?} is shape-breaking but NOT a machine-contract flag, so \
+                 the gate never sees it and the narrowing cannot fire"
+            );
+        }
+    }
+
+    /// `--json` that is NOT skim's flag leaves the gate armed.
+    ///
+    /// Two shapes, one reason each: after a bare `--` the token is a pathspec,
+    /// and `--json=<value>` is a tool-owned form skim never claims.  Both must
+    /// still be served raw, because the caller asked for no skim view at all.
+    #[test]
+    fn gate_stays_armed_for_json_that_is_not_skims_flag() {
+        for shape in [
+            vec!["--porcelain", "--", "--json"],
+            vec!["--stat", "--", "--json"],
+            vec!["--porcelain", "--json=title"],
+        ] {
+            let args = argv(&shape);
+            assert!(has_machine_contract_flag(&args), "{shape:?}: precondition");
+            assert!(
+                !caller_requested_json(&args),
+                "{shape:?}: this `--json` is not skim's view flag, so the gate \
+                 must stay armed and serve git's own bytes"
+            );
+        }
+    }
+
+    // ========================================================================
+    // strip_git_view_flags — skim view flags must never reach git
+    // ========================================================================
+
+    /// A clean argv returns `None`, so no allocation and no behaviour change.
+    ///
+    /// This is what keeps every invocation G already pinned byte-for-byte
+    /// identical: the filter is inert unless there is something to filter.
+    #[test]
+    fn strip_git_view_flags_is_none_on_a_clean_argv() {
+        for shape in [
+            vec!["--porcelain"],
+            vec!["--stat", "-n", "3"],
+            vec!["--quiet", "--", "src/a.rs"],
+            vec!["-z"],
+            vec!["--", "--json"],
+            vec!["--", "--mode=full"],
+            vec!["--json=title"],
+            vec![],
+        ] {
+            assert!(
+                strip_git_view_flags(&argv(&shape)).is_none(),
+                "{shape:?} carries no skim view flag before `--`, so the filter \
+                 must be inert"
+            );
+        }
+    }
+
+    /// Both `--mode` spellings are dropped, and the space form takes its value.
+    ///
+    /// Leaving the value behind is the same defect one token later: git reads
+    /// the orphan `full` as a revision and fails with
+    /// `fatal: ambiguous argument 'full'`.
+    #[test]
+    fn strip_git_view_flags_drops_mode_with_its_value() {
+        for (shape, expect_forwarded, expect_dropped) in [
+            (
+                vec!["--stat", "--mode=full"],
+                vec!["--stat"],
+                vec!["--mode=full"],
+            ),
+            (
+                vec!["--stat", "--mode", "pseudo"],
+                vec!["--stat"],
+                vec!["--mode", "pseudo"],
+            ),
+            (
+                vec!["--mode", "full", "--numstat", "HEAD~1..HEAD"],
+                vec!["--numstat", "HEAD~1..HEAD"],
+                vec!["--mode", "full"],
+            ),
+            // A `--mode` whose value is missing must not consume a later flag.
+            (vec!["--stat", "--mode"], vec!["--stat"], vec!["--mode"]),
+            (vec!["--mode", "--stat"], vec!["--stat"], vec!["--mode"]),
+            (
+                vec!["--stat", "--json", "--mode=full"],
+                vec!["--stat"],
+                vec!["--json", "--mode=full"],
+            ),
+        ] {
+            let (forwarded, dropped) = strip_git_view_flags(&argv(&shape))
+                .unwrap_or_else(|| panic!("{shape:?} must drop at least one token"));
+            assert_eq!(
+                forwarded,
+                argv(&expect_forwarded),
+                "forwarded for {shape:?}"
+            );
+            assert_eq!(dropped, argv(&expect_dropped), "dropped for {shape:?}");
+        }
+    }
+
+    /// Everything at and after a bare `--` is forwarded verbatim.
+    #[test]
+    fn strip_git_view_flags_keeps_everything_after_the_separator() {
+        let args = argv(&["--stat", "--mode=full", "--", "--json", "--mode=pseudo"]);
+        let (forwarded, dropped) = strip_git_view_flags(&args).expect("must drop `--mode=full`");
+        assert_eq!(
+            forwarded,
+            argv(&["--stat", "--", "--json", "--mode=pseudo"])
+        );
+        assert_eq!(dropped, argv(&["--mode=full"]));
+    }
+
+    /// The bound flags are NOT stripped — stripping them would breach ADR-016.
+    ///
+    /// No git handler implements `--max-lines` / `--tokens` / `--last-lines`
+    /// (measured: `skim git log -n 2 --max-lines 10` is
+    /// `fatal: ambiguous argument '10'` on `c2b4378` and on this branch, with
+    /// or without a contract flag).  Dropping them would turn that hard error
+    /// into a silently **unbounded** serve, which is precisely the "a bound the
+    /// tool can exceed is not a bound" defect ADR-016 exists to prevent.
+    ///
+    /// Pinned from this side so a later "complete the set against
+    /// `dispatch::strip_skim_flags`" edit has to argue with the reason rather
+    /// than discover it.
+    #[test]
+    fn strip_git_view_flags_does_not_strip_the_bound_flags() {
+        for shape in [
+            vec!["--stat", "--max-lines", "10"],
+            vec!["--stat", "--max-lines=10"],
+            vec!["--stat", "--tokens", "500"],
+            vec!["--stat", "--last-lines", "10"],
+            vec!["--stat", "--line-numbers"],
+        ] {
+            assert!(
+                strip_git_view_flags(&argv(&shape)).is_none(),
+                "{shape:?}: these are not this filter's business — dropping them \
+                 would serve unbounded output to a caller who asked for a bound"
+            );
+        }
     }
 }

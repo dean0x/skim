@@ -966,20 +966,27 @@ pub(crate) fn rewrite_origin() -> Option<String> {
 ///
 /// - `pseudo` removes NO body in any language, and exactly one class in EVERY
 ///   language: non-doc comments. Beyond that it varies. TypeScript drops
-///   decorators, `readonly`/`abstract`, variable/property annotations and
-///   semicolons; JavaScript drops decorators and semicolons; Python drops
-///   decorators, parameter/variable annotations and the `self`/`cls` receiver;
-///   Java, C#, Kotlin and Swift drop annotations, generics and non-visibility
-///   modifiers; C and C++ drop linkage and cv-qualifier keywords (C++ also
-///   access specifiers and template parameter lists); Rust and SQL drop
-///   statement semicolons and nothing else; **Go, Ruby and Bash drop nothing at
-///   all beyond comments**. That last group is why the clause says "any syntax
+///   decorators, `abstract`, class-FIELD annotations and their `readonly`, and
+///   statement semicolons — but keeps a type-level member's annotation and
+///   `readonly` (`property_signature`, `index_signature`) and the `;` that
+///   separates members of an `object_type`/`interface_body`; JavaScript drops
+///   decorators and semicolons; Python drops decorators, parameter/variable
+///   annotations and the `self`/`cls` receiver; Java, C#, Kotlin and Swift drop
+///   annotations, generics and non-visibility modifiers; C and C++ drop linkage
+///   and cv-qualifier keywords (C++ also access specifiers and template
+///   parameter lists); SQL drops statement semicolons and nothing else, and Rust
+///   drops statement semicolons only — its declaration terminators (bodyless
+///   `fn` signature, unit/tuple `struct`, trait associated `type`) and the
+///   array-length `;` of `[u8; 32]` are preserved; **Go, Ruby and Bash drop
+///   nothing at all beyond comments**. That last group is why the clause says "any syntax
 ///   noise" instead of naming constructs: `"annotations, decorators removed"`
 ///   was affirmatively false for seven of the fifteen tree-sitter languages, and
 ///   worst for Rust, which HAS attributes and generics and keeps every one of
 ///   them (`753976d` emptied Rust's `strip_kinds`; see also ADR-007 for return
 ///   types, E1/ADR-008 for TypeScript parameter annotations — Python's are still
-///   stripped, its grammar spelling both positions `type`).
+///   stripped, its grammar spelling both positions `type`; TypeScript's
+///   type-level members are deliberately NOT filed under ADR-007, since there
+///   the annotation IS the declaration rather than decoration on one).
 /// - `minimal` removes no body either, and removes comments under the very same
 ///   `is_removable_comment` rules `pseudo` uses: doc comments, shebangs,
 ///   comments inside function bodies and — since #476, in EVERY language, not

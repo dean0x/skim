@@ -89,6 +89,122 @@ fn looks_like_file_or_glob(token: &str) -> bool {
     token == "-" || token.contains(['.', '/', '\\']) || token.contains(multi::GLOB_METACHARACTERS)
 }
 
+/// Index of the first *positional* token in `args` (argv with `argv[0]` already
+/// dropped), or `None` when there is none.
+///
+/// A token is positional only if it is neither a flag nor the separate-token
+/// **value** of a preceding value-taking flag.  `starts_with('-')` alone cannot
+/// tell those apart: in `--mode structure file.ts` the token `structure` does
+/// not start with `-` yet is not a positional, and treating it as one is
+/// precisely the bug this function exists to prevent (F11).  Value-taking flags
+/// come from [`is_flag_with_value`] — the single existing table — so no second
+/// flag-arity list is introduced here.
+///
+/// A POSIX `--` ends the scan with `None`: everything after it is data, never a
+/// token skim routes on.
+///
+/// PURITY: a total function of the already-materialised slice.  No I/O, no env
+/// reads, no allocation, spawns nothing — so it is safe to call before
+/// `THREADS_SPAWNED` is set (see [`strip_skim_wrappers_from_path`]).
+fn first_positional(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+
+        // CRITICAL: `--` must be checked before `starts_with('-')`.
+        // Without this, `skim -- test` would skip `--`, find `test`,
+        // and incorrectly route to Subcommand.
+        if arg == "--" {
+            return None;
+        }
+
+        if arg.starts_with('-') {
+            if arg.contains('=') {
+                // `--flag=value` carries its value in the same token — skip one.
+                i += 1;
+            } else if is_flag_with_value(arg) {
+                i += 2; // skip the flag AND its separate-token value
+            } else {
+                i += 1; // boolean flag
+            }
+            continue;
+        }
+
+        // Found a positional argument
+        return Some(i);
+    }
+
+    None
+}
+
+/// Whether `token`, appearing as the first positional, routes to a subcommand
+/// rather than to a file operation.
+///
+/// This is exactly the conjunction [`resolve_invocation`] applies, and both call
+/// it — file-like shapes win over a same-named subcommand, so `skim ./grep`
+/// still reads a file.  Sharing the predicate is the point: the skim-flag zone
+/// must stop on precisely the tokens for which `resolve_invocation` hands the
+/// remaining argv to another program, and a second copy of the rule could drift
+/// away from that guarantee (security-5).
+///
+/// PURITY: same contract as [`first_positional`] — pure, allocation-free, spawns
+/// nothing.  `cmd::is_known_subcommand` is a `binary_search` over a `'static`
+/// array.
+fn is_subcommand_token(token: &str) -> bool {
+    !looks_like_file_or_glob(token) && cmd::is_known_subcommand(token)
+}
+
+/// The sub-slice of `pre_sep` in which skim's **own** flags (`--debug`,
+/// `--passthrough`) are legal on a **skim-typed** command line (`skim …`).
+/// [`wrapper_flag_zone`] is the rule for the PATH-wrapper surface.
+///
+/// `pre_sep` is argv without `argv[0]` and already truncated at the first POSIX
+/// `--`.  The zone is then bounded by one further rule:
+///
+/// | first positional in `pre_sep`        | zone            | why |
+/// |--------------------------------------|-----------------|-----|
+/// | none (all flags)                     | all of `pre_sep`| nothing else owns these args |
+/// | a subcommand token (`grep`, `git`)   | `..idx`         | the wrapped tool owns everything from `idx` on — **security-5** |
+/// | anything else (a file / path / glob) | all of `pre_sep`| `Invocation::FileOperation`; no other program receives these args |
+///
+/// The middle row is the security property: `skim grep -e --passthrough f` must
+/// leave `--passthrough` alone, because it is grep's `-e` *pattern data*.  If it
+/// were consumed, `strip_skim_flags` would also delete it from grep's argv, so
+/// grep would search stdin for the filename — a wrong answer with exit 0 and no
+/// diagnostic.  Because [`is_subcommand_token`] is the same predicate
+/// `resolve_invocation` routes on, the zone provably stops wherever a
+/// `Invocation::Subcommand` dispatch would forward argv onward, and widens only
+/// where it would not.
+///
+/// PURITY: pure, allocation-free, spawns nothing (see [`first_positional`]).
+fn skim_flag_zone(pre_sep: &[String]) -> &[String] {
+    match first_positional(pre_sep) {
+        Some(idx) if is_subcommand_token(pre_sep[idx].as_str()) => &pre_sep[..idx],
+        _ => pre_sep,
+    }
+}
+
+/// The skim-flag zone on the **PATH-wrapper** surface: the leading run of
+/// flags, and nothing past the first non-flag token.
+///
+/// This is the pre-F11 rule, kept verbatim and scoped to the one surface where
+/// it is the correct rule.  Under a `~/.skim/bin/<tool>` symlink `argv[0]` is
+/// the tool, so *every* argument is the tool's and there is no positional that
+/// [`is_subcommand_token`] could recognise — [`skim_flag_zone`] would therefore
+/// widen to the whole command line.  Measured consequence of widening here:
+/// `docker run img cmd --passthrough` would flip skim into passthrough mode on
+/// a token that is the containerised command's own argument, and
+/// `strip_skim_flags` would then delete it from docker's argv — security-5's
+/// harm, on the other surface.  `SKIM_PASSTHROUGH=1` is the documented control
+/// for wrapper invocations.
+///
+/// PURITY: pure, allocation-free, spawns nothing (see [`first_positional`]).
+fn wrapper_flag_zone(pre_sep: &[String]) -> &[String] {
+    let leading = pre_sep.iter().take_while(|a| a.starts_with('-')).count();
+    &pre_sep[..leading]
+}
+
 /// Pre-parse `std::env::args()` to decide whether to route to a subcommand
 /// or fall through to the existing file operation path.
 ///
@@ -109,43 +225,11 @@ fn resolve_invocation() -> anyhow::Result<Invocation> {
     // Skip argv[0] (the binary name)
     let args = &raw_args[1..];
 
-    let mut first_positional: Option<(usize, &str)> = None;
-    let mut i = 0;
-
-    while i < args.len() {
-        let arg = &args[i];
-
-        // CRITICAL: `--` must be checked before `starts_with('-')`.
-        // Without this, `skim -- test` would skip `--`, find `test`,
-        // and incorrectly route to Subcommand.
-        if arg == "--" {
-            return Ok(Invocation::FileOperation);
-        }
-
-        if arg.starts_with('-') {
-            // Check for `--flag=value` (value embedded in same token — skip nothing)
-            if arg.contains('=') {
-                i += 1;
-                continue;
-            }
-            // Check if this flag consumes the next token
-            if is_flag_with_value(arg) {
-                i += 2; // skip flag + its value
-                continue;
-            }
-            // Boolean flag — skip it
-            i += 1;
-            continue;
-        }
-
-        // Found a positional argument
-        first_positional = Some((i, arg));
-        break;
-    }
-
-    let Some((pos_idx, positional)) = first_positional else {
+    // Shared with the skim-flag zone in `main()` so the two cannot drift.
+    let Some(pos_idx) = first_positional(args) else {
         return Ok(Invocation::FileOperation);
     };
+    let positional = args[pos_idx].as_str();
 
     // File-like heuristics: if it looks like a file/path/glob, treat as file
     if looks_like_file_or_glob(positional) {
@@ -154,7 +238,7 @@ fn resolve_invocation() -> anyhow::Result<Invocation> {
 
     // Known subcommand check — subcommands always take priority.
     // Use `skim ./name` or a full path to read a file that shares a subcommand name.
-    if cmd::is_known_subcommand(positional) {
+    if is_subcommand_token(positional) {
         let name = positional.to_string();
         let remaining_args: Vec<String> = args[pos_idx + 1..].to_vec();
         return Ok(Invocation::Subcommand {
@@ -634,19 +718,24 @@ fn extract_argv0_stem(argv0: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The wrapped tool this process is standing in for, from `argv[0]` alone.
+///
+/// `Some("git")` when invoked as `~/.skim/bin/git`; `None` for a `skim`-typed
+/// invocation.  Sole composition of [`extract_argv0_stem`] + [`detect_argv0_for`]
+/// — both [`detect_argv0_dispatch`] and the skim-flag zone in `main()` go through
+/// it, so the two cannot disagree about which surface is live.
+fn wrapper_tool_from_argv0() -> Option<String> {
+    let stem = extract_argv0_stem(&std::env::args().next()?)?;
+    detect_argv0_for(&stem).then_some(stem)
+}
+
 /// Detect argv[0]-based dispatch for symlink invocations.
 ///
 /// When the binary is invoked as `~/.skim/bin/git`, this returns
 /// `Some(("git", remaining_args))`. Returns `None` for normal invocations.
 fn detect_argv0_dispatch() -> Option<(String, Vec<String>)> {
-    let mut args = std::env::args();
-    let argv0 = args.next()?;
-    let stem = extract_argv0_stem(&argv0)?;
-    if detect_argv0_for(&stem) {
-        Some((stem, args.collect()))
-    } else {
-        None
-    }
+    let tool = wrapper_tool_from_argv0()?;
+    Some((tool, std::env::args().skip(1).collect()))
 }
 
 /// Extract and validate `--session-id=VALUE` from a command-line argument iterator.
@@ -926,23 +1015,41 @@ fn main() -> ExitCode {
     // would enable passthrough AND strip_skim_flags would drop the token, so
     // grep received `["-e", "file"]` — the pattern arg was corrupted.
     //
-    // Fix: collect once, stop at POSIX `--` (same logic as
+    // Two cuts, in order.  First: stop at POSIX `--` (same logic as
     // `cmd::rewrite::args_before_separator`, inlined here because the `rewrite`
-    // module is private), then stop at the first non-`--flag` token (the
-    // subcommand or file argument).  A skim flag is only legal before the first
-    // positional argument.
+    // module is private).  Second: the per-surface zone rule.
+    //
+    // F11: the second cut used to be `take_while(|a| a.starts_with('-'))` on
+    // both surfaces, and on a skim-typed command line that is not a positional
+    // test at all — it could not tell a subcommand (must stop) from a file (must
+    // not) from the separate-token value of a preceding flag (not a positional
+    // in the first place).  So `skim f.ts --passthrough` and
+    // `skim --mode structure --passthrough f.ts` both dropped the flag, silently,
+    // exit 0.  `skim_flag_zone` keys on `resolve_invocation`'s own classification
+    // instead, which is what preserves security-5.
+    //
+    // The rule is surface-scoped because the two surfaces ask different
+    // questions: on a skim-typed line the args before a wrapped tool's name are
+    // skim's, while under a `~/.skim/bin/<tool>` symlink every arg is the tool's.
+    // See `wrapper_flag_zone` for the measured shape that keeps them apart.
     let argv_for_flags: Vec<String> = std::env::args().skip(1).collect();
     let sep_pos = argv_for_flags
         .iter()
         .position(|a| a == "--")
         .unwrap_or(argv_for_flags.len());
     let pre_sep = &argv_for_flags[..sep_pos];
-    // Collect skim-flag-zone tokens (before the first positional arg or `--`)
-    // into a Vec so we can scan it twice without reconstructing the iterator.
-    let skim_flag_zone: Vec<&String> = pre_sep.iter().take_while(|a| a.starts_with('-')).collect();
+    // Borrowed slice, scanned twice below — no allocation, no iterator to rebuild.
+    let flag_zone = if wrapper_tool_from_argv0().is_some() {
+        wrapper_flag_zone(pre_sep)
+    } else {
+        skim_flag_zone(pre_sep)
+    };
 
-    // Extract --debug before routing so it applies to all subcommands.
-    if skim_flag_zone.iter().any(|a| a.as_str() == "--debug") {
+    // Extract --debug before routing so it applies to the whole run, not just
+    // the file-operation path.  Scope is the flag zone, so `skim --debug stats`
+    // is honoured while `skim stats --debug` is the `stats` subcommand's own
+    // flag — measured, and deliberate: see `skim_flag_zone`.
+    if flag_zone.iter().any(|a| a.as_str() == "--debug") {
         debug::force_enable_debug();
     }
 
@@ -954,7 +1061,7 @@ fn main() -> ExitCode {
     // below. strip_skim_wrappers_from_path() asserts THREADS_SPAWNED is still
     // false at the top of main(), so any future reordering that moves code
     // below THREADS_SPAWNED will be caught by that assertion.
-    if skim_flag_zone.iter().any(|a| a.as_str() == "--passthrough") {
+    if flag_zone.iter().any(|a| a.as_str() == "--passthrough") {
         cmd::set_passthrough_flag();
     }
 
@@ -1719,6 +1826,274 @@ mod tests {
                 is_flag_with_value(flag),
                 "If {flag} does not consume its value, `skim {flag} cargo` would \
                  incorrectly route to the 'cargo' subcommand."
+            );
+        }
+    }
+
+    // ========================================================================
+    // F11: first_positional / is_subcommand_token / skim_flag_zone
+    //
+    // The zone bounds which argv positions skim reads its OWN flags from.
+    // Before F11 it was `take_while(|a| a.starts_with('-'))`, which is not a
+    // positional test: it stopped at the separate-token VALUE of a preceding
+    // flag, and it could not tell a subcommand (must stop — security-5) from a
+    // file (must not).  Measured against the 2.11.0 baseline: both
+    // `skim f.ts --passthrough` and `skim --mode structure --passthrough f.ts`
+    // served the compressed 739-byte view instead of the 1151-byte raw file,
+    // exit 0, no diagnostic.
+    //
+    // Assertions below are on the observable both consumers compute — "is this
+    // flag inside the zone `main()` scans" — not on the scan's internals.
+    // ========================================================================
+
+    /// Mirror of `main()`'s two cuts over an argv with `argv[0]` already
+    /// dropped: truncate at POSIX `--`, then take the skim-flag zone.  This is
+    /// byte-for-byte the slice `main()` hands to the `--debug` and
+    /// `--passthrough` scans.
+    fn zone(args: &[&str]) -> Vec<String> {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let sep = owned.iter().position(|a| a == "--").unwrap_or(owned.len());
+        skim_flag_zone(&owned[..sep]).to_vec()
+    }
+
+    /// Does `main()` honour `flag` for this argv?
+    fn honours(args: &[&str], flag: &str) -> bool {
+        zone(args).iter().any(|a| a.as_str() == flag)
+    }
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// An all-flags argv has no positional at all.
+    #[test]
+    fn test_first_positional_none_when_all_flags() {
+        assert_eq!(
+            first_positional(&owned(&["--debug", "--passthrough"])),
+            None
+        );
+        assert_eq!(first_positional(&owned(&[])), None);
+    }
+
+    /// The first token being a positional is index 0 (the `skim grep …` shape).
+    #[test]
+    fn test_first_positional_at_index_zero() {
+        assert_eq!(first_positional(&owned(&["grep", "-e", "pat"])), Some(0));
+    }
+
+    /// F11 core: the separate-token value of a value-taking flag is NOT a
+    /// positional.  `structure` belongs to `--mode`; the positional is `f.ts`.
+    #[test]
+    fn test_first_positional_skips_separate_token_flag_value() {
+        assert_eq!(
+            first_positional(&owned(&["--mode", "structure", "--passthrough", "f.ts"])),
+            Some(3),
+            "`structure` is --mode's value, not a positional"
+        );
+    }
+
+    /// The `--flag=value` form carries its value in one token — skip one, not two.
+    #[test]
+    fn test_first_positional_equals_form_skips_one_token() {
+        assert_eq!(
+            first_positional(&owned(&["--mode=structure", "f.ts"])),
+            Some(1)
+        );
+    }
+
+    /// A value-taking flag with its value missing must not index past the end.
+    #[test]
+    fn test_first_positional_tolerates_truncated_value_flag() {
+        assert_eq!(first_positional(&owned(&["--mode"])), None);
+        assert_eq!(first_positional(&owned(&["-j"])), None);
+    }
+
+    /// `--` ends the scan: everything after it is data, never a routing token.
+    /// This is why `skim -- test` reads a file called `test` (see the CRITICAL
+    /// comment in `first_positional`).
+    #[test]
+    fn test_first_positional_stops_at_separator() {
+        assert_eq!(first_positional(&owned(&["--", "test"])), None);
+        assert_eq!(first_positional(&owned(&["--debug", "--", "grep"])), None);
+    }
+
+    /// `-` (stdin) is consumed as a flag by the scan, so it yields no positional
+    /// — preserving `skim -` as a file operation.
+    #[test]
+    fn test_first_positional_treats_bare_dash_as_flag() {
+        assert_eq!(first_positional(&owned(&["-"])), None);
+    }
+
+    /// A registered subcommand routes to a subcommand …
+    #[test]
+    fn test_is_subcommand_token_accepts_known_names() {
+        for name in ["grep", "git", "cargo", "stats"] {
+            assert!(
+                is_subcommand_token(name),
+                "precondition: {name} must be a known subcommand"
+            );
+        }
+    }
+
+    /// … but a file-like shape wins over a same-named subcommand, so
+    /// `skim ./grep` reads a file and its trailing skim flags stay skim's.
+    #[test]
+    fn test_is_subcommand_token_rejects_file_like_and_unknown() {
+        for token in ["./grep", "grep.ts", "src/grep", "gr*p", "-", "unknownword"] {
+            assert!(
+                !is_subcommand_token(token),
+                "{token} must not be treated as a subcommand token"
+            );
+        }
+    }
+
+    /// No positional → the whole pre-`--` slice is skim's.
+    #[test]
+    fn test_zone_is_whole_slice_without_positional() {
+        assert_eq!(
+            zone(&["--debug", "--passthrough"]),
+            owned(&["--debug", "--passthrough"])
+        );
+    }
+
+    /// security-5: a subcommand positional ends the zone AT that token, so a
+    /// flag-shaped data argument reaches the wrapped tool untouched.
+    /// `skim grep -e --passthrough f` — `--passthrough` is grep's `-e` pattern.
+    #[test]
+    fn test_zone_stops_at_subcommand_positional() {
+        assert!(zone(&["grep", "-e", "--passthrough", "f.txt"]).is_empty());
+        assert!(!honours(
+            &["grep", "-e", "--passthrough", "f.txt"],
+            "--passthrough"
+        ));
+        assert!(!honours(
+            &["git", "status", "--passthrough"],
+            "--passthrough"
+        ));
+        assert!(!honours(&["stats", "--debug"], "--debug"));
+        // A flag BEFORE the subcommand is still skim's.
+        assert_eq!(
+            zone(&["-j", "4", "git", "status", "--passthrough"]),
+            owned(&["-j", "4"])
+        );
+        assert!(honours(
+            &["--passthrough", "git", "status"],
+            "--passthrough"
+        ));
+    }
+
+    /// F11 manifestation 1: a flag AFTER a file positional is honoured.
+    #[test]
+    fn test_zone_honours_flag_after_file_positional() {
+        assert!(honours(&["sample.ts", "--passthrough"], "--passthrough"));
+        assert!(honours(&["sample.ts", "--debug"], "--debug"));
+        assert!(honours(&["src/", "--passthrough"], "--passthrough"));
+        assert!(honours(&["./grep", "--passthrough"], "--passthrough"));
+    }
+
+    /// F11 manifestation 2: a flag after a separate-token flag VALUE is
+    /// honoured — the flag is before the positional, so "after the first
+    /// positional" never described this case.
+    #[test]
+    fn test_zone_honours_flag_after_separate_token_flag_value() {
+        assert!(honours(
+            &["--mode", "structure", "--passthrough", "sample.ts"],
+            "--passthrough"
+        ));
+        assert!(honours(
+            &["--mode", "structure", "--debug", "sample.ts"],
+            "--debug"
+        ));
+        // The `=` form already worked; it must keep working.
+        assert!(honours(
+            &["--mode=structure", "--passthrough", "sample.ts"],
+            "--passthrough"
+        ));
+    }
+
+    /// POSIX `--` still ends the zone: a file literally named `--passthrough`
+    /// is a filename, never a skim flag.
+    #[test]
+    fn test_zone_respects_end_of_options_separator() {
+        assert!(!honours(
+            &["--", "--passthrough", "sample.ts"],
+            "--passthrough"
+        ));
+        assert!(honours(
+            &["--passthrough", "--", "sample.ts"],
+            "--passthrough"
+        ));
+    }
+
+    /// The wrapper surface keeps the pre-F11 rule: nothing past the first
+    /// non-flag token.  Under a `~/.skim/bin/<tool>` symlink every argument is
+    /// the tool's, so `docker run img cmd --passthrough` must not flip skim's
+    /// mode and must not lose the token from docker's argv.
+    #[test]
+    fn test_wrapper_zone_stops_at_the_first_non_flag_token() {
+        let f = |args: &[&str], flag: &str| {
+            let argv = owned(args);
+            wrapper_flag_zone(&argv).iter().any(|a| a.as_str() == flag)
+        };
+        assert!(!f(&["run", "img", "cmd", "--passthrough"], "--passthrough"));
+        assert!(!f(&["status", "--passthrough"], "--passthrough"));
+        assert!(!f(&["pattern", "--passthrough"], "--passthrough"));
+        assert!(!f(&["install", "--debug"], "--debug"));
+        // Leading flags stay in the zone, exactly as before F11.
+        assert!(f(&["--passthrough", "foo"], "--passthrough"));
+        assert!(f(&["-e", "--passthrough", "f"], "--passthrough"));
+        assert_eq!(wrapper_flag_zone(&owned(&[])).len(), 0);
+    }
+
+    /// The two surface rules agree except where a skim-typed line has a
+    /// non-subcommand positional — the whole of F11's widening.  Anything the
+    /// wrapper rule admits, the skim rule admits too (it is never narrower),
+    /// so scoping cannot re-break a skim-typed invocation.
+    #[test]
+    fn test_skim_zone_is_never_narrower_than_the_wrapper_zone() {
+        let argvs: &[&[&str]] = &[
+            &["--debug", "--passthrough"],
+            &["grep", "-e", "--passthrough", "f.txt"],
+            &["sample.ts", "--passthrough"],
+            &["--mode", "structure", "--passthrough", "sample.ts"],
+            &["-j", "4", "git", "status"],
+            &["run", "img", "cmd", "--passthrough"],
+            &[],
+        ];
+        for argv in argvs {
+            let args = owned(argv);
+            assert!(
+                skim_flag_zone(&args).len() >= wrapper_flag_zone(&args).len(),
+                "skim-typed zone must never be narrower than the wrapper zone \
+                 for {argv:?}"
+            );
+        }
+    }
+
+    /// The zone widens only where `resolve_invocation` would route to
+    /// `FileOperation` — i.e. never where argv is forwarded to another program.
+    /// This is the structural statement of the security-5 guarantee: both sites
+    /// consult `is_subcommand_token`, so they cannot disagree.
+    #[test]
+    fn test_zone_never_widens_on_a_subcommand_route() {
+        let argvs: &[&[&str]] = &[
+            &["grep", "-e", "--passthrough", "f.txt"],
+            &["git", "status", "--passthrough"],
+            &["cargo", "check", "--passthrough"],
+            &["stats", "--debug"],
+            &["-j", "4", "git", "status", "--debug"],
+        ];
+        for argv in argvs {
+            let args = owned(argv);
+            let idx = first_positional(&args).expect("each case has a positional");
+            assert!(
+                is_subcommand_token(args[idx].as_str()),
+                "precondition: {argv:?} must route to a subcommand"
+            );
+            assert_eq!(
+                zone(argv).len(),
+                idx,
+                "zone must end exactly at the subcommand token for {argv:?}"
             );
         }
     }

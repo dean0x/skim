@@ -1546,6 +1546,21 @@ fn record_patch_emission(
 ///
 /// `\` (no-newline marker) and unknown prefixes are written verbatim with no
 /// line number, contribute zero delta to either counter, and yield `None`.
+///
+/// # The convention this establishes for the reader
+///
+/// One number column carries TWO coordinate spaces, and the prefix byte is the
+/// only thing that says which: `-` numbers index the OLD file, `+` and space
+/// numbers index the NEW one.  The column therefore repeats, and runs backward
+/// across a `-`/`+` boundary — the two axes interleaving, not a misnumbering.
+/// Nothing in the output names them: a second column is foreclosed on budget
+/// (it needs 76 B against a measured margin of 68 B or less — `TWO_COLUMN_BYTES`
+/// in `tests/cli_git_diff_budget.rs`, ADR-003), so the convention is documented
+/// rather than displayed, in `print_diff_help`'s `LINE NUMBERS` block and in the
+/// README's `skim git diff` entry.  [`write_hunk_boundary`] withholds `@@` on a
+/// single-hunk file, which drops the last in-band hint that two spaces exist —
+/// so the convention is least discoverable exactly where it is most needed, and
+/// the docs say so.
 fn emit_patch_line(
     output: &mut String,
     patch_line: &str,

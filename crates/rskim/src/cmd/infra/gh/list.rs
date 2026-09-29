@@ -310,10 +310,55 @@ fn elapsed_label(started: Option<&str>, updated: Option<&str>, finished: bool) -
 // Tier 1: JSON array parsing
 // ============================================================================
 
+/// Build a list row's label from whichever identifier field the entry carries.
+///
+/// The `#` prefix is a property of **which field matched**, not of a
+/// fallthrough order, because `number` and `databaseId` are different kinds of
+/// identifier and only one of them is an issue number:
+///
+/// - **`number`** (`gh issue list`, `gh pr list`) is an issue/PR number. `#123`
+///   is how GitHub writes one, it autolinks to the right thing in a comment,
+///   and `gh issue view 123` accepts it. Rendered `#{number}`.
+/// - **`databaseId`** (`gh run list`) is a workflow-run ID. The `#` makes it
+///   wrong twice over: `gh run view '#36362655859'` returns **HTTP 404** while
+///   the bare `36362655859` resolves (measured), and a bare `#36362655859` in a
+///   GitHub comment autolinks an unrelated issue or PR. Rendered bare, exactly
+///   as `gh run list`'s own ID column prints it.
+///
+/// Precedence when an entry carries **both** keys: `number` wins. A row with a
+/// `number` is an issue or a PR, which is the more specific claim, and keeping
+/// `number` first leaves every `pr list` / `issue list` label byte-identical to
+/// what the previous `.or_else()` chain produced. [`RUN_LIST_FIELDS`] never
+/// requests `number`, so on that route this arm is unreachable; it is reachable
+/// only through the piped-JSON path (`gh … | skim gh`, see
+/// `super::parse_impl_with_auto_detect`), where an arbitrary array arrives.
+///
+/// **Neither** key present — or one present but not a `u64`, which is the same
+/// thing for untrusted network input: the placeholder `item`, unchanged by this
+/// fix. No `run list` row can reach it from skim's own injection (`databaseId`
+/// is requested unconditionally and observed in every row), so this too is a
+/// piped-JSON case, and saying "no identifier" is better than inventing one.
+///
+/// Both `.get("…")` accesses are written out literally rather than hoisted into
+/// a helper closure: `test_json_field_list_no_dropped_fields` greps this file
+/// for `.get("<field>")` per injected field name, and that lint is the reason
+/// `conclusion` was caught being requested but never read.
+fn json_entry_label(entry: &serde_json::Value) -> String {
+    let number = entry.get("number").and_then(|v| v.as_u64());
+    let database_id = entry.get("databaseId").and_then(|v| v.as_u64());
+
+    match (number, database_id) {
+        (Some(number), _) => format!("#{number}"),
+        (None, Some(database_id)) => database_id.to_string(),
+        (None, None) => "item".to_string(),
+    }
+}
+
 /// Convert a single JSON entry from a `gh` list response into an [`InfraItem`].
 ///
 /// Handles field name alternatives used by different `gh` subcommands:
-/// - Label: `number` (issues/PRs) or `databaseId` (runs)
+/// - Label: `number` (issues/PRs) or `databaseId` (runs) — see
+///   [`json_entry_label`], which is also where the `#` prefix is decided
 /// - Title: `title` (issues/PRs) or `displayTitle` (runs)
 /// - State: `state` (issues/PRs) or `status` (runs)
 /// - Conclusion: `conclusion` (run list only; appended to status as `status/conclusion`)
@@ -324,14 +369,12 @@ fn elapsed_label(started: Option<&str>, updated: Option<&str>, finished: bool) -
 ///   order of `gh run list`'s own table). Each is omitted when absent or
 ///   empty, so `pr list` and `issue list` render exactly as before.
 ///
-/// Returns `None` if neither label alternative is present.
+/// Total: an entry carrying neither label alternative still renders, under the
+/// placeholder label [`json_entry_label`] returns for that case. The
+/// `Option` return exists for the `filter_map` at the call site, not because
+/// a missing identifier drops the row.
 fn json_entry_to_infra_item(entry: &serde_json::Value) -> Option<InfraItem> {
-    let label = entry
-        .get("number")
-        .and_then(|v| v.as_u64())
-        .or_else(|| entry.get("databaseId").and_then(|v| v.as_u64()))
-        .map(|n| format!("#{n}"))
-        .unwrap_or_else(|| "item".to_string());
+    let label = json_entry_label(entry);
 
     let title = entry
         .get("title")
@@ -475,6 +518,29 @@ pub(super) fn try_parse_json_list(trimmed: &str) -> Option<InfraResult> {
 ///
 /// Falls back to regex matching `<number>\t<rest>` lines when JSON is not
 /// available. Returns `None` if no such lines are found.
+///
+/// # Why this tier keeps the `#` that [`json_entry_label`] drops
+///
+/// The two tiers are not rendering the same identifier two ways. [`RE_GH_TAB_ROW`]
+/// is anchored `^(\d+)\t`, so it matches only a row whose **first**
+/// tab-separated column is numeric. `gh run list` prints its columns in the
+/// order `STATUS CONCLUSION TITLE WORKFLOW BRANCH EVENT ID ELAPSED AGE`, so
+/// every run row begins with `completed` / `in_progress` and the ID sits in
+/// column 7 — measured against real `gh run list -L 3` output, **no** run row
+/// matches this anchor, and a run that cannot match cannot be labelled. The
+/// rows that do match are `gh pr list` / `gh issue list`, whose leading column
+/// genuinely is `number`, and for those `#123` is correct.
+///
+/// So the prefix here is decided by the anchor, which is the same
+/// which-field-matched property the JSON tier's `match` now states explicitly.
+/// This tier cannot state it explicitly: it has no subcommand context to key on
+/// (`CommandOutput` carries no argv, and its own docs record that adding a field
+/// would touch ~20 construction sites), and the catch-all dispatch arm in
+/// `super::run` routes *every* other `gh` subcommand through here. The
+/// assumption is therefore load-bearing and pinned:
+/// `test_regex_tier_declines_real_run_list_text` goes red if `gh` moves the ID
+/// to the first column or the anchor is loosened to find a numeric column
+/// anywhere in a row, at which point the two tiers must be reconciled for real.
 pub(super) fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
 
@@ -758,6 +824,121 @@ mod tests {
         let json = r#"[{"number": 42, "title": "Fix login", "state": "OPEN"}]"#;
         let result = try_parse_json_list(json).expect("must parse");
         assert_eq!(result.items[0].value, "Fix login (open)");
+    }
+
+    // ========================================================================
+    // F10: `#` belongs to `number`, not to every identifier
+    // ========================================================================
+
+    /// A `run list` row's `databaseId` renders **bare**.
+    ///
+    /// The `#` is not cosmetic: measured against the live API,
+    /// `gh run view '#36362655859'` returns `HTTP 404: Not Found` while
+    /// `gh run view 36362655859` resolves, so the prefixed form is unusable as
+    /// an argument to the very next command a reader would run. The assertion
+    /// is byte-for-byte on the whole label rather than a `!contains('#')`
+    /// proxy, because a title may legitimately carry a `#` (avoids PF-025).
+    #[test]
+    fn test_run_list_label_has_no_hash_prefix() {
+        // The exact field set `RUN_LIST_FIELDS` injects, with a real run ID.
+        let json = r#"[
+            {"databaseId": 36362655859, "displayTitle": "feat(bench): scoreboard oracle",
+             "status": "completed", "conclusion": "success",
+             "workflowName": "CI", "headBranch": "main", "event": "push",
+             "startedAt": "2026-09-28T00:16:20Z", "updatedAt": "2026-09-28T00:33:40Z"}
+        ]"#;
+        let result = try_parse_json_list(json).expect("run list must parse");
+
+        assert_eq!(
+            result.items[0].label, "36362655859",
+            "a workflow-run ID must render exactly as `gh run list`'s own ID \
+             column prints it — `#`-prefixing it is an HTTP 404 in `gh run view`"
+        );
+        // The label is what the reader is actually served, so assert at that
+        // level too and not only on the parsed item.
+        let view: &str = result.as_ref();
+        assert!(
+            !view.contains("#36362655859"),
+            "the served view still carries the prefixed run ID:\n{view}"
+        );
+    }
+
+    /// The other half of the same fix: `number` is an issue/PR number and keeps
+    /// its `#`. Without this, "drop the prefix" is indistinguishable from
+    /// "drop the prefix everywhere", which would break `pr list` / `issue list`.
+    #[test]
+    fn test_issue_list_label_keeps_hash_prefix() {
+        let json = r#"[{"number": 42, "title": "Login fails on mobile", "state": "OPEN"}]"#;
+        let result = try_parse_json_list(json).expect("issue list must parse");
+        assert_eq!(result.items[0].label, "#42");
+    }
+
+    /// Pins the label semantics for the rows that carry neither key, both keys,
+    /// or a non-integer one, so the fallthrough behaviour is stated rather than
+    /// incidental to a chain's ordering.
+    ///
+    /// All three shapes are reachable only through the piped-JSON path
+    /// (`gh … | skim gh`, `super::parse_impl_with_auto_detect`): skim's own
+    /// injection requests `number` for `pr`/`issue list` and `databaseId` for
+    /// `run list`, never both and never neither.
+    #[test]
+    fn test_json_label_fallbacks_are_pinned_not_incidental() {
+        // Neither key: a placeholder, never an invented identifier.
+        let neither = r#"[{"displayTitle": "no identifier at all", "status": "completed"}]"#;
+        let result = try_parse_json_list(neither).expect("an ID-less row still renders");
+        assert_eq!(result.items[0].label, "item");
+
+        // Both keys: `number` wins, so every pr/issue label is byte-identical
+        // to what the pre-F10 `.or_else()` chain produced.
+        let both = r#"[{"number": 42, "databaseId": 36362655859, "title": "carries both"}]"#;
+        let result = try_parse_json_list(both).expect("must parse");
+        assert_eq!(result.items[0].label, "#42");
+
+        // Untrusted input: a stringly-typed ID is not a `u64`, so it is not an
+        // identifier, and the row renders under the placeholder rather than
+        // interpolating whatever the network sent.
+        let wrong_type = r#"[{"databaseId": "36362655859", "displayTitle": "string id"}]"#;
+        let result = try_parse_json_list(wrong_type).expect("must parse");
+        assert_eq!(result.items[0].label, "item");
+    }
+
+    /// The regex tier cannot label a run ID at all, which is why the JSON-tier
+    /// fix above is the whole of the fix for this route.
+    ///
+    /// `RE_GH_TAB_ROW` is anchored `^(\d+)\t` and `gh run list` prints
+    /// `STATUS CONCLUSION TITLE WORKFLOW BRANCH EVENT ID ELAPSED AGE`, so a run
+    /// row begins with a status word and its ID sits in column 7. This is the
+    /// tripwire for that assumption: if `gh` moves the ID to the first column,
+    /// or the anchor is loosened to find a numeric column anywhere in a row,
+    /// this goes red and the `#` at the label site starts reaching run IDs —
+    /// at which point the tiers need reconciling for real, which needs
+    /// subcommand context this tier does not have.
+    #[test]
+    fn test_regex_tier_declines_real_run_list_text() {
+        // Verbatim shape of `gh run list -L 3`; the separators are real tabs.
+        let text = "completed\tsuccess\tfeat(bench): scoreboard structural oracle\tCI\tmain\tpush\t36362655859\t17m20s\t2026-09-28T00:33:40Z\n\
+                    completed\tfailure\tAdd dark mode toggle\tCI\tfeat/dark\tpull_request\t36361528580\t14m50s\t2026-09-28T00:15:19Z\n\
+                    in_progress\t\tDeploy to staging\tDeploy\tmain\tworkflow_dispatch\t36360400567\t45s\t2026-09-27T23:57:16Z\n";
+
+        assert!(
+            try_parse_regex(text).is_none(),
+            "no `gh run list` row starts with its ID, so this tier must decline \
+             rather than label one; if it now parses, the `#` prefix is reaching \
+             run IDs and must be reconciled with json_entry_label"
+        );
+    }
+
+    /// Non-vacuity control for the test above: the tier is alive and does
+    /// prefix a row whose leading column is a genuine issue/PR number, so that
+    /// `None` is a statement about `gh run list`'s column order and not about a
+    /// parser that declines everything (avoids PF-025 — a test satisfied by the
+    /// safe fallback cannot detect the capability's removal).
+    #[test]
+    fn test_regex_tier_labels_a_leading_number_column_with_a_hash() {
+        let text = "42\tFix login bug\tOPEN\n57\tAdd dark mode\tOPEN\n";
+        let result = try_parse_regex(text).expect("a leading numeric column must parse");
+        let labels: Vec<&str> = result.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["#42", "#57"]);
     }
 
     // ========================================================================

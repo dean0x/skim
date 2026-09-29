@@ -174,23 +174,164 @@ fn make_hermetic_dirty_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+// ============================================================================
+// Hermetic git environment (PF-009 / PF-026)
+// ============================================================================
+
+/// Git's config search path, pinned to nothing (PF-009).
+///
+/// A repo-local `git config` cannot make a fixture hermetic on its own: `git
+/// init` and every later git invocation still read `~/.gitconfig` and
+/// `/etc/gitconfig`, so `status.showUntrackedFiles`, `core.autocrlf` and
+/// `color.ui = always` each move bytes an assertion compares.  `/dev/null` is a
+/// readable, empty config file, which is what makes it a valid value for the two
+/// path variables rather than merely an absent one.
+///
+/// `NO_COLOR` is listed because [`common::skim`] sets it on the subject; a raw
+/// control that did not see the same value would be a *different* environment,
+/// which is a worse contaminant than leaving both unpinned (PF-026).
+const HERMETIC_GIT_ENV: &[(&str, &str)] = &[
+    ("GIT_CONFIG_GLOBAL", "/dev/null"), // ~/.gitconfig
+    ("GIT_CONFIG_SYSTEM", "/dev/null"), // /etc/gitconfig
+    ("GIT_CONFIG_NOSYSTEM", "1"),       // belt-and-braces for older git
+    ("NO_COLOR", "1"),
+];
+
+/// Env vars stripped because they do what a pinned config setting would do.
+const HERMETIC_GIT_REMOVED: &[&str] = &["GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_PAGER"];
+
+/// The raw control: a `git` that cannot see the developer's configuration.
+///
+/// PF-026: an unpinned control is worse than an unpinned subject, because it is
+/// the baseline every assertion is measured against.
+fn hermetic_git() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for (var, value) in HERMETIC_GIT_ENV {
+        cmd.env(var, value);
+    }
+    for var in HERMETIC_GIT_REMOVED {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Run a git setup step under [`hermetic_git`], failing loud as a *setup* error.
+///
+/// Deliberately a sibling of `git_in` rather than a replacement for it.  `git_in`
+/// is consumed by [`make_hermetic_fetch_repo`], whose clone-and-track dance this
+/// campaign has no way to re-verify (no `cargo` may run from the agent that
+/// wrote this), and silently changing the environment a passing fixture builds
+/// under is the PF-009 failure mode in reverse.  New fixtures get the pinned
+/// environment; existing ones keep the one they were verified under.
+fn hermetic_git_in(dir: &std::path::Path, args: &[&str]) {
+    let step = args.join(" ");
+    let out = hermetic_git()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|e| panic!("hermetic setup: `git {step}` spawn failed: {e}"));
+    assert!(
+        out.status.success(),
+        "hermetic setup: `git {step}` failed;\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The subject: `skim` with the same pinned git environment, both escape
+/// hatches removed.
+///
+/// `skim git …` spawns git as a child and that child inherits this environment,
+/// so pinning one side only would compare two git invocations made under
+/// different configurations.  `SKIM_PASSTHROUGH` would make every fidelity
+/// assertion vacuously true; `SKIM_DEBUG` would add ADR-011 class-2 banners to a
+/// stderr that assertions here require to carry class-1 markers and nothing else.
+fn hermetic_skim() -> assert_cmd::Command {
+    let mut cmd = common::skim();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd.env_remove("SKIM_DEBUG");
+    for (var, value) in HERMETIC_GIT_ENV {
+        cmd.env(var, value);
+    }
+    for var in HERMETIC_GIT_REMOVED {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// ADR-022: `--porcelain` is a machine contract, so git's own bytes are served.
+///
+/// `has_machine_contract_flag` (`cmd/git/mod.rs`) matches `--porcelain` in
+/// `run`, *above* the dispatch table, so the invocation never reaches
+/// `run_status` at all — the flag is no longer stripped, no summary is rendered,
+/// and the second `git status` subprocess that used to supply the net-savings
+/// baseline is not spawned.
+///
+/// # What this assertion can and cannot distinguish
+///
+/// Stated rather than implied, because the honest answer is "less than the name
+/// suggests".  Measured on this fixture at `c2b4378`, *before* the gate existed:
+/// raw `git status --porcelain` is **13 B** (`?? dirty.txt`) and skim served the
+/// same 13 B, byte-identical — because the summary render is **55 B**
+/// (`status 1 untracked` + branch + untracked lines) and the ADR-001 net-savings
+/// comparison therefore elected raw on its own.  So on a 13 B fixture no
+/// assertion about stdout can tell a working gate from ADR-022's "lucky, not
+/// correct" coincidence; both mechanisms produce the same bytes, which is
+/// exactly why the reframing in ADR-022 was needed.
+///
+/// Byte-identity is still a real strengthening over the `is_empty().not()` this
+/// test used to carry, and it is the shape its two siblings' names claim: a
+/// non-empty assertion passes against the 55 B summary, against a reflowed
+/// column layout, and against the extra `\n` after a NUL terminator that F13
+/// fixes.  What it does *not* do is make the gate observable.  The sized,
+/// gate-observable matrix — where raw exceeds the render so the two mechanisms
+/// disagree — lives in `tests/cli_git_contract_flags.rs` behind its own
+/// `assert_gate_is_observable` precondition.  Do not widen this fixture to
+/// duplicate it (PF-027).
 #[test]
-fn test_skim_git_status_porcelain_compresses() {
-    // Run against a hermetic dirty repo so --porcelain output is non-empty.
-    //
-    // --porcelain is stripped by the status handler; the handler runs `git status`
-    // and the net-savings guard compares against the raw porcelain output.
-    // With non-empty raw output the guard may keep the compressed form or pass
-    // through verbatim — either way the output is non-empty and the command exits 0.
-    // IMPORTANT: the porcelain flag is stripped to avoid fabricating machine-readable
-    // output; the raw porcelain lines appear in passthrough if the guard fires.
+fn test_skim_git_status_porcelain_passthrough() {
     let (_dir, repo) = make_hermetic_dirty_repo();
-    common::skim()
+
+    let raw = hermetic_git()
+        .args(["status", "--porcelain"])
+        .current_dir(&repo)
+        .output()
+        .expect("raw control `git status --porcelain` must spawn");
+    assert!(
+        raw.status.success(),
+        "raw control failed; stderr={}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    // The fixture's own precondition: an empty control would make the byte
+    // comparison below hold for a subject that printed nothing at all.
+    assert!(
+        !raw.stdout.is_empty(),
+        "PRECONDITION FAILED: raw `git status --porcelain` is empty, so the \
+         byte comparison would pass against a subject that served no bytes. \
+         The fixture's untracked file stopped being reported — repair the \
+         fixture, do not weaken the assertion"
+    );
+
+    let served = hermetic_skim()
         .args(["git", "status", "--porcelain"])
         .current_dir(&repo)
-        .assert()
-        .success()
-        .stdout(predicate::str::is_empty().not());
+        .output()
+        .expect("subject `skim git status --porcelain` must spawn");
+
+    assert_eq!(
+        served.stdout,
+        raw.stdout,
+        "`git status --porcelain` is a machine contract, so skim must deliver \
+         git's own stdout bytes.\n  raw  ({} B): {:?}\n  skim ({} B): {:?}",
+        raw.stdout.len(),
+        String::from_utf8_lossy(&raw.stdout),
+        served.stdout.len(),
+        String::from_utf8_lossy(&served.stdout),
+    );
+    assert_eq!(
+        served.status.code(),
+        raw.status.code(),
+        "exit status must match the raw tool's"
+    );
 }
 
 #[test]
@@ -1196,35 +1337,171 @@ fn test_skim_git_show_file_content_unsupported_ext_passthrough() {
     );
 }
 
-/// Fix D (fix/rewrite-hook-falseneg, AD-GIT-SHOW-PSEUDO): `git show <ref>:<file>`
-/// must use Pseudo mode (preserves function bodies), NOT Structure mode (collapses
-/// them to `{...}`).  This drives the real production path (`run_show_file_content`,
-/// show.rs) end-to-end against a committed fixture and is the PF-007 guard for the
-/// mode constant: it FAILS if that site reverts to Structure.
+/// The token [`PSEUDO_BLOB`] carries in its module-level comments so that
+/// `--mode=pseudo` has something visible to remove.
 ///
-/// The asserted tokens live ONLY inside function bodies in the fixture (not in any
-/// signature, doc comment, `use`, or struct field), so Structure mode — which keeps
-/// signatures and imports — strips every one of them.  Their presence proves Pseudo
-/// is live in production, not merely at the transform layer.
+/// Named as a constant because the lever has two halves — present in the
+/// source, absent from the served view — and a literal repeated at both
+/// assertion sites could drift so that one of them silently stopped matching.
+const PSEUDO_STRIP_MARKER: &str = "PSEUDO_STRIPS_THIS";
+
+/// A char-bounded prefix for an assertion message.
+///
+/// Used in place of `&s[..n]`, which panics when `n` lands inside a multi-byte
+/// character — turning an informative test failure into a confusing one.
+fn first_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// A Rust blob purpose-built so `--mode=pseudo` visibly transforms it.
+///
+/// Three properties are load-bearing, and none of them is incidental:
+///
+/// - **The three body tokens are the ones this test has always asserted**
+///   (`find_user_by_username`, `Invalid credentials`, `duration_since`). Each
+///   appears only inside a function body — never in a signature, doc comment,
+///   `use` or field — so `--mode=structure`, which keeps signatures and
+///   imports, strips every one.
+/// - **[`PSEUDO_STRIP_MARKER`] sits in MODULE-LEVEL comments, not in a function
+///   body.** Measured against `target/skim-baseline-c2b4378`: pseudo removes
+///   non-doc comments *between items* and leaves comments *inside a body*
+///   alone. That distinction is the whole reason this test went vacuous — the
+///   committed fixture it used to read (`fixtures/cmd/git/show_file.rs`, 1916 B)
+///   carries its only non-doc comment inside `sign_jwt`'s body, so pseudo saved
+///   nothing on it, the ADR-001 guard served raw, and every assertion below
+///   would have been answered by the source file itself.
+/// - **The margin is wide and campaign-insensitive.** Measured on the uncharged
+///   git-show path: 974 B raw → 604 B under pseudo, 370 B of headroom over the
+///   guard. The blob deliberately contains no `function_signature_item`,
+///   no trailing-`;` `struct_item` and no `associated_type`, which are the three
+///   node kinds F1c adds bytes back to, and no TypeScript at all, which is what
+///   F1/F1b touch — so this fixture's headroom does not move when the rest of
+///   the batch lands. A TypeScript fixture's would: `show.rs`'s own
+///   `BLOB_FIXTURE` was measured at 442 B → 338 B (104 B headroom) *before* F1
+///   restored four member annotations and F1b four separator semicolons.
+const PSEUDO_BLOB: &str = "\
+//! Authentication helpers for the fixture crate.
+
+// PSEUDO_STRIPS_THIS: a module-level non-doc comment, deliberately long enough
+// that removing it is a visible saving and not a rounding error in the guard.
+// PSEUDO_STRIPS_THIS: a second module-level run, for the same reason.
+
+/// Look a user up and check the supplied password.
+pub fn handle_login(username: &str, password: &str) -> Result<String, String> {
+    let user = find_user_by_username(username)?;
+    if user.password_hash != hash_password(password) {
+        return Err(\"Invalid credentials\".to_string());
+    }
+    Ok(sign_token(&user.name))
+}
+
+// PSEUDO_STRIPS_THIS: another module-level run between two items.
+// PSEUDO_STRIPS_THIS: and one more line to widen the margin further.
+
+/// Seconds since the Unix epoch, saturating at zero.
+pub fn issued_at() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+";
+
+/// A hermetic repo holding [`PSEUDO_BLOB`] as `src/auth.rs` in one commit.
+///
+/// PF-031: no SHA is pinned and no repository history is read. The commit is
+/// created here and addressed as `HEAD`, so the test is immune to CI's depth-1
+/// checkout and to this repository's squash-merge policy.
+fn pseudo_blob_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).expect("create src dir");
+    std::fs::write(repo.join("src/auth.rs"), PSEUDO_BLOB).expect("write blob");
+
+    // PF-009: `-b main` pins the initial branch from creation rather than
+    // inheriting the host's `init.defaultBranch`.
+    hermetic_git_in(dir.path(), &["init", "-b", "main", repo.to_str().unwrap()]);
+    hermetic_git_in(&repo, &["config", "user.email", "test@t.invalid"]);
+    hermetic_git_in(&repo, &["config", "user.name", "Test"]);
+    hermetic_git_in(&repo, &["config", "commit.gpgsign", "false"]);
+    hermetic_git_in(&repo, &["config", "core.autocrlf", "false"]);
+    hermetic_git_in(&repo, &["add", "-A"]);
+    hermetic_git_in(&repo, &["commit", "--no-verify", "-m", "fixture"]);
+
+    (dir, repo)
+}
+
+/// ADR-022: an opt-in `--mode` on `git show <rev>:<path>` really does transform.
+///
+/// # Why the explicit flag is load-bearing
+///
+/// This test used to run `git show <rev>:<path>` with no flag at all, when that
+/// site applied `Mode::Pseudo` unconditionally (`AD-GIT-SHOW-PSEUDO`, "Fix D"),
+/// and it described itself as the PF-007 guard for that mode constant. ADR-022
+/// supersedes that decision: blob extraction is a machine contract, the default
+/// is now `FileContentView::Verbatim`, and the mode constant the old comment
+/// guarded no longer exists — the mode comes from the caller. Without
+/// `--mode=pseudo` the served bytes *are* the source file, which contains all
+/// three body tokens, so the flagless form passes whatever mode is live
+/// (including a silent reversion to `Structure`) and asserts nothing. PF-025.
+///
+/// What the explicit flag restores is the thing the new design actually needs
+/// guarded: that `--mode` is parsed by skim rather than leaked to the child git
+/// (at `c2b4378` it was leaked, and `--mode=pseudo` died with
+/// `fatal: unrecognized argument: --mode=pseudo`, exit 1, zero stdout), and
+/// that the view it selects is genuinely lossy and genuinely served.
+///
+/// # The discriminating lever
+///
+/// Asserting that body tokens are *present* is weak on its own — the verbatim
+/// fallback contains them too, and so does the ADR-001 raw fallback. The
+/// discriminating half is [`PSEUDO_STRIP_MARKER`], a module-level non-doc
+/// comment that is asserted **present in the raw blob and absent from the served
+/// view**. No path that serves git's bytes can satisfy that: verbatim,
+/// unsupported-language, transform-failure and guardrail-fallback all emit the
+/// source, and the source contains the marker. Only a real pseudo render can.
+///
+/// # Precondition (PF-025 — asserted, not assumed)
+///
+/// The ADR-011 class-1 marker on stderr is checked *first*. Its absence means
+/// the ADR-001 guard elected raw, in which case stdout is the source file and
+/// the lever below would report a product failure for a fixture problem. A
+/// failure there reads "re-derive the fixture", never "the product regressed".
 #[test]
 fn test_skim_git_show_file_content_pseudo_preserves_bodies() {
-    let output = common::skim()
-        .args([
-            "git",
-            "show",
-            "HEAD:crates/rskim/tests/fixtures/cmd/git/show_file.rs",
-        ])
+    let (_dir, repo) = pseudo_blob_repo();
+
+    let output = hermetic_skim()
+        .args(["git", "show", "--mode=pseudo", "HEAD:src/auth.rs"])
+        .current_dir(&repo)
         .output()
         .unwrap();
 
+    let stdout = String::from_utf8(output.stdout).expect("served bytes must be UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr must be UTF-8");
+
     assert!(
         output.status.success(),
-        "skim git show of a committed .rs file should exit 0; got exit code {:?}",
+        "`skim git show --mode=pseudo <rev>:<path>` must exit 0. At c2b4378 the \
+         flag reached the child git and this was exit 1 with \
+         `fatal: unrecognized argument: --mode=pseudo`.\n  exit={:?}\n  \
+         stderr={stderr}",
         output.status.code()
     );
 
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    // ---- precondition: the lossy view was actually served ----
+    assert!(
+        stderr.contains("[skim] pseudo view:"),
+        "PRECONDITION FAILED: no ADR-011 class-1 marker on stderr, so the \
+         ADR-001 guard elected raw and stdout is the source file. Every \
+         assertion below would then be answered by the blob itself (PF-025). \
+         Re-derive PSEUDO_BLOB so pseudo saves more than the guard's margin; \
+         do not weaken the assertions.\n  stdout ({} B): {}\n  stderr: {stderr}",
+        stdout.len(),
+        first_chars(&stdout, 400)
+    );
 
+    // ---- half one: pseudo keeps bodies, so this is not Structure ----
     for token in [
         "find_user_by_username",
         "Invalid credentials",
@@ -1232,11 +1509,28 @@ fn test_skim_git_show_file_content_pseudo_preserves_bodies() {
     ] {
         assert!(
             stdout.contains(token),
-            "Pseudo-mode `git show` must preserve body token {token:?} \
-             (Structure mode would strip it); got: {}",
-            &stdout[..stdout.len().min(600)]
+            "`--mode=pseudo` must preserve body token {token:?}; \
+             `--mode=structure` would strip it, and two modes that produced the \
+             same bytes would make `--mode` a flag with nothing behind it.\n  \
+             got: {}",
+            first_chars(&stdout, 600)
         );
     }
+
+    // ---- half two: pseudo strips, so this is not the verbatim blob ----
+    assert!(
+        PSEUDO_BLOB.contains(PSEUDO_STRIP_MARKER),
+        "PRECONDITION FAILED: PSEUDO_BLOB no longer carries \
+         {PSEUDO_STRIP_MARKER:?}, so the absence asserted next is vacuous"
+    );
+    assert!(
+        !stdout.contains(PSEUDO_STRIP_MARKER),
+        "`--mode=pseudo` must remove module-level non-doc comments, so \
+         {PSEUDO_STRIP_MARKER:?} must NOT survive. Its presence means git's own \
+         bytes reached stdout — the verbatim contract answering a request for a \
+         transformed view.\n  got: {}",
+        first_chars(&stdout, 600)
+    );
 }
 
 // ============================================================================
@@ -1745,7 +2039,7 @@ fn arch15_git_log_json_stdout_is_valid_json() {
         panic!(
             "arch15: skim git log --json must emit valid JSON on stdout\n\
              parse error: {e}\n\
-             stdout (first 600 chars):\n{}",
+             stdout (first 600 bytes):\n{}",
             &stdout[..stdout.len().min(600)]
         )
     });
@@ -1759,7 +2053,7 @@ fn arch15_git_log_json_stdout_is_valid_json() {
     assert!(
         !contains_bare_skim_marker,
         "arch15: stdout must not contain a bare [skim] marker outside the JSON document\n\
-         stdout (first 600 chars):\n{}",
+         stdout (first 600 bytes):\n{}",
         &stdout[..stdout.len().min(600)]
     );
 }

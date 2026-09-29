@@ -92,10 +92,14 @@ let result = transform(code, Language::Python, Mode::Minimal)?;
 ```
 
 ### Pseudo Mode (reduction unverified)
-Strips syntactic noise — type annotations, decorators, semicolons — while
-preserving logic flow, names, values, visibility modifiers, and function return
-types. What is stripped varies by language: TypeScript and Rust keep parameter
-types, and Rust removes only statement semicolons and non-doc comments.
+Strips syntactic noise — type annotations, decorators, statement semicolons —
+while preserving logic flow, names, values, visibility modifiers, and function
+return types. What is stripped varies by language: TypeScript and Rust keep
+parameter types; TypeScript also keeps its type-level member annotations
+(interface / type-literal members and index signatures, with their `readonly`)
+and the `;` that separates them; and Rust removes only statement semicolons —
+its declaration terminators and the array-length `;` of `[u8; 32]` survive —
+plus non-doc comments.
 
 ```rust
 let result = transform(code, Language::TypeScript, Mode::Pseudo)?;

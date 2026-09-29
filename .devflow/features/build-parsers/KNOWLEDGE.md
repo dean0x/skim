@@ -1,7 +1,7 @@
 ---
 feature: build-parsers
 name: Build Tool Output Parsers
-description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, elision_marker_unbounded, compressed_output_hint, failure_context_body, parse_failure_details, compress-never-truncate, rewrite-hook, Fix A, Fix B, Fix C, Fix E, should_emit_compressed_hint, BENIGN_EXIT1_PROGRAMS, no_rule_silently_drops_prefix_flags, WRAPPER_REINJECTS, acknowledge, is_segment_ack, ACK_PREFIX_PATTERNS, command_needs_passthrough, rewrite_would_corrupt, SavingsDecision, savings_decision, emit_raw_passthrough, skip_net_savings_guard, build_cargo_args, cargo_expected_exit_codes, is_nextest, strip_session_id_flag, nextest, cargo-nextest."
+description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, elision_marker_unbounded, compressed_output_hint, failure_context_body, parse_failure_details, compress-never-truncate, rewrite-hook, Fix A, Fix B, Fix C, Fix E, should_emit_compressed_hint, BENIGN_EXIT1_PROGRAMS, no_rule_silently_drops_prefix_flags, WRAPPER_REINJECTS, acknowledge, is_segment_ack, ACK_PREFIX_PATTERNS, command_needs_passthrough, rewrite_would_corrupt, SavingsDecision, savings_decision, emit_raw_passthrough, skip_net_savings_guard, build_cargo_args, cargo_expected_exit_codes, is_nextest, strip_session_id_flag, nextest, cargo-nextest, program_resolves, target_program_is_unresolvable, target_program_resolves, cached_verdict, resolves_in, PF-038."
 category: component-patterns
 directories: [crates/rskim/src/cmd/build/, crates/rskim/src/cmd/]
 referencedFiles:
@@ -29,8 +29,8 @@ referencedFiles:
   - crates/rskim/src/cmd/rewrite/engine.rs
   - crates/rskim/src/cmd/rewrite/hook.rs
 created: 2026-05-14
-updated: 2026-06-27
-version: 18
+updated: 2026-09-29
+version: 19
 ---
 
 # Build Tool Output Parsers
@@ -545,7 +545,7 @@ Categories recognized as indefinite:
 
 ## Rewrite Engine — Fix A through Fix F (PR #340)
 
-PR #340 fixed a class of silent false-negatives in the command-rewrite hook. Six fixes span both the rewrite engine (PreToolUse hook and `skim rewrite` CLI) and the shared tool handlers (both hook and PATH-wrapper surfaces).
+PR #340 fixed a class of silent false-negatives in the command-rewrite hook. Six fixes span both the rewrite engine (PreToolUse hook and `skim rewrite` CLI) and the shared tool handlers (both hook and PATH-wrapper surfaces). A later, independent addition — the PF-038 global PATH-resolvability bail — adds a fourth rewrite-engine-only mechanism alongside Fix A/C/E; see its own section after Fix F below.
 
 ### Fix A — Flag-Drop Root Cause + Recurrence Guard
 
@@ -584,17 +584,37 @@ Multi-line `git commit` messages with a heredoc were previously being merged int
 
 **Implementation**: `command_needs_passthrough(cmd: &str) -> bool` in `cmd/rewrite/compound.rs` trims trailing whitespace before delegating to `rewrite_would_corrupt`. Applied at BOTH engine entry points — the agent hook (`hook.rs`) and the `skim rewrite` CLI path. The `rewrite_would_corrupt` function retains the strict `contains('\n')` check for the CLI path; `command_needs_passthrough` is the hook-layer guard only.
 
+**F12 (2026-09-29) — the bail is no longer silent.** When `command_needs_passthrough` declines a hook-mode rewrite specifically because of an interior newline, `hook.rs::log_declined_multiline` now records a rate-limited line to `hook.log` (never stderr — hook mode's zero-stderr invariant). Before this, the bail produced 0 B stdout, 0 B stderr, exit 0, and an empty cache dir — indistinguishable from "nothing to rewrite." ADR-011 class 2 (no loss: the original command still runs unmodified). The message deliberately omits the declined command text (unbounded, may carry credentials); `SKIM_HOOK_AUDIT=1` remains the channel that records the actual command, in `hook-audit.log`. See the `hook-binary-pinning` feature knowledge for the `warn_once_daily` keying details this reuses.
+
 ### Fix D — (Not directly in rewrite engine; covers shared handler corrections)
 
 Fix D corrects stderr-error forwarding for grep/rg exit ≥ 2 (already provided by #317's `forward_stderr`; PR #340 made the hint exit-code-aware via Fix B which surfaces it correctly).
 
 ### Fix E — Pipe-Source Passthrough (global pipe short-circuit)
 
-Commands appearing as the _source_ side of a pipe (`ls | head`, `git diff | head`, `rg pat | head`) are NEVER rewritten. This is enforced GLOBALLY in `compound.rs`: `try_rewrite_compound` checks `has_pipe_operator` on the full segment list and returns `None` immediately if any pipe is present, so the entire pipeline passes through untouched. No per-rule field controls this.
+Commands appearing as the _source_ side of a pipe (`ls | head`, `git diff | head`, `rg pat | head`) are NEVER rewritten, with **one exception**: a bare `<cmd> | cat` (exactly two segments, no redirects on the source, consumer is the literal token `cat` with no arguments). This is enforced GLOBALLY in `compound.rs`: `try_rewrite_compound` checks `has_pipe_operator(segments) && !is_bare_cat_pipeline(segments)` and returns `None` when that holds, so every OTHER pipe shape passes through untouched. No per-rule field controls this. `| cat > f`, `| cat | tee f`, and `| cat -n` are not bare and still refuse — `is_bare_cat_pipeline` re-checks `command_needs_exact_bytes` on the rejoined text before conceding the exception. Full mechanism and rationale: `hook-binary-pinning` feature knowledge, "The `| cat` Pipeline Exception."
 
 ### Fix F — (Shared handler correctness for additional tools)
 
 Additional lint handler fixes (gofmt, prettier, rustfmt) that affect both the hook/rewrite surface and the PATH-wrapper surface.
+
+## PF-038 — Global PATH-Resolvability Bail (`try_rewrite` Step 2b)
+
+A fourth rewrite-engine-only bail, added independently of PR #340's Fix A–F (landed 2026-09-29, `a2983e9`). `try_rewrite` in `cmd/rewrite/engine.rs` now returns `None` (no rewrite) when the program the rewritten command would spawn cannot be resolved on `PATH` — a check inserted between Step 2 (the `+toolchain` bail) and Step 3 (the rule-matching loop), so it runs before any rule is even considered.
+
+**The defect this closes**: every rewrite rule replaces the program the shell would have run with `skim <program> …`, and skim spawns `<program>` itself via `std::process::Command`. When nothing on `PATH` answers to that name, the rewrite doesn't degrade the reader's view — it destroys the answer. Measured on the host that motivated this: Claude Code ships `rg` as a shell **function** re-execing the agent binary, with no `rg` binary anywhere on `PATH`. `rg -n 'fn main' crates/` (unrewritten) returns 20711 bytes at exit 0; the rewrite `skim rg -n 'fn main' crates/` returns 0 bytes at exit 1 — and exit 1 is also ripgrep's own no-matches code, so "your search tool is missing" is indistinguishable from "your pattern matched nothing." #317 requires byte-faithful reconstruction or a bail; this bails.
+
+**`runner::program_resolves(program) -> bool`** (in `crates/rskim/src/runner.rs`, alongside `CommandRunner`) is the probe. It answers exactly one question — "would `Command::new(program)` find it?" — never "would the shell run something for `program`?". Two things a `PATH` walk structurally cannot see, both false-`true` risks the function accepts as the safe direction (a missed bail costs a hard failure later; a spurious bail only costs a missed optimization):
+1. `main()` calls `strip_skim_wrappers_from_path()` before anything else, so the probe sees `PATH` with `~/.skim/bin` already removed — correct for the eventual spawn, but not the `PATH` the user's shell used to resolve `program` in the first place.
+2. A shell function, alias, or builtin is invisible to any `PATH` probe by construction — the exact `rg` case above.
+
+**Resolution rules** (`resolves_in`, unit-testable against a synthetic `PATH`): a `program` containing `/` is stat'd directly as an explicit path (mirrors `CommandRunner::run_with_env_node_fallback`'s "the caller has a specific binary in mind" rule); an **absent** `PATH` variable reads as unresolvable (declining is the safe default when reachability can't be verified); an **empty** `PATH` element means the current directory, per POSIX/`execvp`. Windows `\`-separated absolute paths are not recognized as explicit paths (only `/` is checked) and fall through to the `PATH` search.
+
+**Global, not per-rule** — for two independent reasons. The predicate is program-agnostic: it asks nothing about which rule would fire, only whether the token the shell would have executed is spawnable. And `RewriteRule` structurally cannot express it: every one of its fields is a compile-time constant (`&'static [&'static str]`, `bool`, or a `Copy` enum), so no rule can carry a runtime probe.
+
+**Cached, process-lifetime, never invalidated** (`cached_verdict`, an `RwLock<HashMap<String, bool>>` behind a `OnceLock`). `compound.rs::try_rewrite_compound` calls `try_rewrite` once per pipeline segment, so an uncached probe would re-walk `PATH` several times for one command. A poisoned lock degrades to "assume it resolves" (the pre-probe behaviour) rather than panicking — this code runs inside a PreToolUse hook, where a panic is a failed hook.
+
+**Rewrite-engine-only, exactly like Fix A/C/E.** `try_rewrite` (and therefore Step 2b) is called from `compound.rs`, `cmd/rewrite/mod.rs` (the `skim rewrite` CLI), and `hook.rs` — never from `dispatch.rs`'s wrapper-surface dispatch. A PATH-wrapper invocation of an unresolvable tool fails later, at the actual spawn, through the ordinary `SpawnFailed`/`is_spawn_error` path — this bail has no wrapper-surface analogue because wrappers never decide whether to rewrite in the first place.
 
 ## Already-Compact Command Acknowledgement (`cmd/rewrite/acknowledge.rs`)
 
@@ -698,7 +718,9 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **Printing `[skim] compressed output (exit 1)` for grep/rg/diff exit 1**: these are benign informational results (no match / files differ). Only exit ≥ 2 for these tools is a real error. The `BENIGN_EXIT1_PROGRAMS` constant in `cmd/execution.rs` and `should_emit_compressed_hint` govern this — do not inline the hint decision at call sites.
 
-- **Rewriting commands with interior newlines**: `command_needs_passthrough` detects interior newlines and bails. Do not strip or normalize the command string before calling it — trailing newlines are benign but interior newlines indicate multi-line commands that `split_whitespace` would corrupt. Apply `command_needs_passthrough` on the raw hook-input string.
+- **Rewriting commands with interior newlines**: `command_needs_passthrough` detects interior newlines and bails. Do not strip or normalize the command string before calling it — trailing newlines are benign but interior newlines indicate multi-line commands that `split_whitespace` would corrupt. Apply `command_needs_passthrough` on the raw hook-input string. Since F12, the hook-mode bail is no longer silent for this specific trigger: it logs a rate-limited signal to `hook.log` (never the declined command text) — see the Fix C section above.
+
+- **Rewriting a command whose target program cannot be resolved on `PATH`**: PF-038's Step 2b bail (`target_program_is_unresolvable` / `runner::program_resolves`) exists precisely because a rewrite that cannot spawn its target destroys the answer rather than degrading it. Do not bypass Step 2b's placement (before the rule-matching loop) or attempt to special-case it per rule — `RewriteRule` cannot carry a runtime probe by construction.
 
 - **Adding new already-compact commands to the rewrite rule table instead of `ACK_PREFIX_PATTERNS`**: commands with near-zero output (e.g. format-check commands on a clean codebase) belong in `acknowledge.rs`. If the skim header overhead exceeds the compression gain, the command should be ACKed, not wrapped.
 
@@ -764,7 +786,7 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **`is_segment_ack` uses prefix matching, not exact matching**: `["prettier", "--check"]` ACKs ALL `prettier --check ...` invocations, including those with file arguments. The decision to ACK the entire prefix family is deliberate (AD-RW-11) — compression overhead exceeds the gain for these tools regardless of file arguments.
 
-- **The two interception surfaces (hook/rewrite vs. PATH wrappers) do NOT both benefit from Fix A/C/E**: Fix A (flag preservation) and Fix C (interior newline detection) are rewrite-engine properties — they apply to the PreToolUse hook and `skim rewrite` CLI. They do not apply to PATH wrappers, where `try_rewrite` is never called and flags arrive as ordinary argv. Fix B (hint suppression) and Fix F (handler corrections) affect the shared per-tool handlers, so they benefit both surfaces. Tests that drive the `--hook`/rewrite path do not exercise the wrapper path and vice versa.
+- **The two interception surfaces (hook/rewrite vs. PATH wrappers) do NOT both benefit from Fix A/C/E — and PF-038 is a fourth rewrite-engine-only mechanism, not a third**: Fix A (flag preservation), Fix C (interior newline detection), and PF-038 (global PATH-resolvability bail, `try_rewrite` Step 2b) are all rewrite-engine properties — they apply to the PreToolUse hook, `compound.rs`'s segment splitting, and the `skim rewrite` CLI, all of which call `try_rewrite`. None of the three apply to PATH wrappers, where `try_rewrite` is never called, flags arrive as ordinary argv, and an unresolvable program simply fails later at the real spawn. Fix B (hint suppression) and Fix F (handler corrections) affect the shared per-tool handlers, so they benefit both surfaces. Tests that drive the `--hook`/rewrite path do not exercise the wrapper path and vice versa.
 
 - **The net-savings guard baselines against `raw_output`, not `stdout`**: for test runners in `run_test_runner`, `raw_output` is the combined stdout+stderr after ANSI stripping. For build parsers in `run_parsed_command`, `raw_cow` is the same combined stream. Both match what the user would see if skim were bypassed entirely.
 
@@ -788,12 +810,12 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 - `crates/rskim/src/cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
 - `crates/rskim/src/cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable via `binary_search`), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
 - `crates/rskim/src/cmd/test_utils.rs` — standalone test helper module (compiled under `#[cfg(test)]` gate): `make_output`, `make_output_full`, `make_output_stderr`, `load_fixture` (with `Component::Normal` traversal guard); import as `crate::cmd::test_utils`; renamed from `test_support` in PR #126
-- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless unit struct, `#[derive(Default)]`), `CommandOutput`, `ChildGuard` (kill-on-drop RAII), `is_spawn_error`, `MAX_OUTPUT_BYTES` (64 MiB); no timeout, no `RunnerError::Timeout`
+- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless unit struct, `#[derive(Default)]`), `CommandOutput`, `ChildGuard` (kill-on-drop RAII), `is_spawn_error`, `MAX_OUTPUT_BYTES` (64 MiB); no timeout, no `RunnerError::Timeout`; `program_resolves` (PF-038 PATH-resolvability probe), `cached_verdict`/`PROGRAM_RESOLVES_CACHE` (process-lifetime memoisation), `resolves_in` (testable core)
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command(tokens: &[&str]) -> bool`; program-aware daemon/streaming detection with env-var prefix stripping; consumed by the rewrite hook path and by `dispatch()`'s `run_inherited_passthrough` gate
 - `crates/rskim/src/cmd/rewrite/rules.rs` — declarative rewrite rules; `all_rules()` iterator; structural guard `no_rule_silently_drops_prefix_flags` with `WRAPPER_REINJECTS` allowlist (#340, Fix A); `check_rule_for_flag_drop` helper; `cargo nextest run` rewrite preserves `"run"` token (#367)
 - `crates/rskim/src/cmd/rewrite/compound.rs` — `command_needs_passthrough` (hook-layer guard); `rewrite_would_corrupt` (strict check); `split_compound`, `try_rewrite_compound`, `has_pipe_operator` (global pipe passthrough — Fix E)
 - `crates/rskim/src/cmd/rewrite/acknowledge.rs` — `ACK_PREFIX_PATTERNS` (already-compact command list, AD-RW-11); `is_segment_ack(tokens: &[&str]) -> bool` (prefix match)
-- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite`, `try_custom_handlers`, `strip_env_vars`, `strip_cargo_toolchain`, `split_at_separator`
+- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite` (Step 2b: `target_program_is_unresolvable` / `target_program_resolves` — PF-038 global PATH-resolvability bail, `#[cfg(test)]`-overridable via `RESOLVER_OVERRIDE`), `try_custom_handlers`, `strip_env_vars`, `strip_cargo_toolchain`, `split_at_separator`
 - `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode`, `parse_agent_flag`, `audit_hook`; `inject_session_id_into_parts` removed (#350); session attribution via `write_session_id` sidecar only
 - `crates/rskim/src/cmd/test/cargo.rs` — `run(args, is_nextest, show_stats, rec)` for `skim cargo test` and `skim cargo nextest run`; `build_cargo_args(args, is_nextest)` and `cargo_expected_exit_codes(is_nextest)` as pure extracted helpers (#367); `parse_failure_details` state machine for stable-toolchain `---- name stdout/stderr ----` blocks (#317)
 - `crates/rskim/src/cmd/test/shared.rs` — `run_test_runner`, `scrape_failures`, `failure_context_body`, `emit_failure_context` (#317), `try_read_stdin`, `TestKind`, `ExitSource`, `ArgPreparation`, `TestRunnerConfig`; net-savings guard applied in `run_test_runner` (#350); passthrough arm now uses `resolve_exit_code(0, exit_source)` not hardcoded FAILURE (#350 Cluster D)
@@ -804,7 +826,7 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - `crates/rskim/src/output/mod.rs` — owns `ParseResult<T>`, the type returned by all three-tier parsers across the whole codebase (lint, test, infra, build); `emit_markers` debug gate; `elision_marker`/`elision_marker_unbounded` (#317)
 - `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult` (with `context` safety net), `GitResult`, `LintResult`, `ShowCommitResult`
-- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless, ADR-008), `CommandOutput`, `ChildGuard` (kill-on-drop), `is_spawn_error`; no internal timeout, no `RunnerError::Timeout`
+- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless, ADR-008), `CommandOutput`, `ChildGuard` (kill-on-drop), `is_spawn_error`; no internal timeout, no `RunnerError::Timeout`; `program_resolves` (PF-038) — consumed by the rewrite engine's Step 2b bail, not by any build-parser handler directly
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command`; guards daemon/streaming commands from being captured; consumed by `dispatch()` and the rewrite hook path
 - `crates/rskim/src/cmd/lint/` — sibling module using the same three-tier pattern with `LintResult` instead of `BuildResult`; lint parsers use `run_tool<T>` (via `run_parsed_command_with_mode` in `execution.rs`) rather than `run_parsed_command`
 - `crates/rskim/src/cmd/test/` — sibling module using the same three-tier pattern with `TestResult`; cargo.rs uses `run_parsed_command_with_exit` directly; nextest uses `is_nextest=true` explicitly threaded from `dispatch_cargo`
