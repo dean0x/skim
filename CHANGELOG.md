@@ -30,7 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into a corrupted machine contract.
 
   **Cost:** these invocations are no longer compressed. `--json` disarms the gate, so
-  `skim git status --porcelain --json` still returns skim's envelope; `--mode` keeps the
+  `skim git status --porcelain --json` still returns skim's envelope — all 16 `status`
+  cells are unchanged — but the disarm is **narrowed on `log`**: for the four flags whose
+  payload `parse_log` cannot read (`--format`, `--pretty`, `--graph` and `--null`/`-z`)
+  `--json` no longer disarms, because disarming there served a *false* envelope at exit 0
+  — `skim git log --graph --json` claimed `no commits` over a three-commit range — and
+  those four now serve git's own bytes instead. `--mode` keeps the
   gate armed and is dropped from the argv forwarded to git. Over-inclusion is deliberate:
   the gate is not `--`-separator-aware and `-z` matches inside any cluster, so a pathspec
   named `--stat` or a `git log -Szebra` pickaxe also serves raw. A false positive costs

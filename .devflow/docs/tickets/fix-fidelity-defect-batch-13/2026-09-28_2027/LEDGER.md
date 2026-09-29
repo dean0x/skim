@@ -35,9 +35,42 @@ survives both squash-merge and branch deletion. Do not write a bare SHA or a
 
 Status vocabulary is closed: `TODO` · `IN-PROGRESS` · `LANDED` · `DROPPED`.
 
+**Line-number convention — which tree a citation speaks about.** Two fields cite the
+**base SHA** and the rest cite the **current tree**, and nothing used to say so, which made
+every later sweep re-litigate whether a "stale" line was stale or historical. The rule, now
+stated once: `Root cause` and `BEFORE (measured at c2b4378)` cite positions **as they were
+at `c2b4378`** — they are the pre-fix evidence and must NOT be refreshed, because a
+`Root cause` pointer refreshed to a post-fix line no longer points at the defect.
+`Precondition`, `Acceptance (argv)`, `AFTER (required)`, `Regression test` and `Re-bless`
+cite the **current tree** and must be verified against it. A citation that changes tree
+without saying which one it moved to is the defect; a `c2b4378` line that no longer
+resolves is not. (This is the repository's own PF-033 lesson — *name the coordinate space
+whenever you state a coordinate* — applied to the ledger rather than to elision markers.)
+
+**Acceptance-command convention: the `Acceptance (argv)` blocks below assume `bash`-style
+word splitting.** They are written for `bash`, and several of them break as *literally*
+written under this machine's default shell, `zsh`. Five separate agents hit this
+independently during the campaign, which is why it is stated once here rather than
+per-block. Two traps account for all of it:
+
+1. **Word splitting.** `zsh` does not split unquoted parameter expansions on `IFS`, so an
+   argument list carried in a variable — `"$GIT" $C commit …`, `"$B" git $c`, the `set --`
+   case loops — arrives as **one** argument where `bash` would pass several, and `git`
+   rejects it.
+2. **The `:t` colon trap.** In `zsh` a `:` directly following a parameter expansion is
+   read as a history/glob modifier (`:t`, `:h`, `:r`), so a refspec assembled through an
+   unquoted expansion — `$src:refs/heads/$dst` — can be rewritten or rejected instead of
+   passed through. Quote the whole word, or build it before the expansion.
+
+Run these blocks under `bash` (`bash -c '…'`, or a script with a `#!/bin/bash` shebang),
+or `setopt shwordsplit` in an interactive `zsh` first. The individual blocks are
+deliberately **not** rewritten to be shell-agnostic: they are the commands as measured,
+and re-typing them to suit a second shell would put the recorded figures and the recorded
+argv out of correspondence.
+
 ## Commits (branch-local)
 
-**These 13 SHAs exist only on `fix/fidelity-defect-batch-13`. They will not resolve on
+**These 15 SHAs exist only on `fix/fidelity-defect-batch-13`. They will not resolve on
 `main` after the squash-merge, and they disappear entirely when the branch is deleted. A
 durable link-back needs a PR-scoped permalink — `/pull/<N>/commits/<sha>` — never a bare
 SHA.** This is the same rule the paragraph above states; it is restated here because this
@@ -58,10 +91,18 @@ is the table a reviewer will copy SHAs out of.
 | 11 | `9a73593` | fix(rewrite): signal the interior-newline bail to hook.log | F12 |
 | 12 | `48ded28` | fix(cli): honour skim's own flags after a positional argument | F11 |
 | 13 | `69d7d57` | docs: document the diff line-number axis convention and this batch's doc debt | F5 |
+| 14 | `0194bea` | fix(git): stop --json disarming the gate for payloads log cannot parse | G (`--json` addendum) |
+| 15 | `44b41ed` | chore: campaign ledger, tracking issue and CHANGELOG for the fidelity batch | (campaign artifacts) |
 
-**Deviation from the plan: 13 commits, not 16.** The plan's table wanted one commit per
-fix. A reviewer comparing the two counts should not read the difference as work gone
-missing — it is **five file collisions**, and path-scoped staging cannot split a file
+**Corrected: the branch carries 15 commits, not 13.** The table above predated commits
+**14** (`0194bea`, the second `--json` fix — the narrowing recorded in G's `--json`
+addendum) and **15** (`44b41ed`, this ledger plus the tracking issue and the CHANGELOG
+entry), both of which landed after the table was written. Re-verified at HEAD `44b41ed`:
+`git rev-list --count main..HEAD` returns **15**.
+
+**Deviation from the plan: 15 commits, of which 13 carry the fixes — not 16.** The plan's
+table wanted one commit per fix. A reviewer comparing the two counts should not read the
+difference as work gone missing — it is **five file collisions**, and path-scoped staging cannot split a file
 while hunk-level staging is interactive and therefore unavailable to this workflow:
 
 | File | Fixes that collide in it |
@@ -108,7 +149,7 @@ the rest of F5's doc sweep across commits **6** (`tests/cli_git.rs`) and **12**
 | F4 | HIGH | C8 | `git show <rev>:<path>` byte-faithful + honours `--mode` + class-1 marker | `crates/rskim/src/cmd/git/show.rs` | TP-7 | LANDED |
 | F3 | BLOCKING | C9 | `npm ls` keeps package versions | `crates/rskim/src/cmd/pkg/npm/ls.rs` | TP-6 | LANDED |
 | F10 | MED | C10 | `gh run list` stops prepending `#` | `crates/rskim/src/cmd/infra/gh/list.rs` | TP-13 | LANDED |
-| F2 | BLOCKING | C11 | `rg` rewrite declines when binary unresolvable | `crates/rskim/src/cmd/rewrite/engine.rs`, `runner.rs` | TP-5 | LANDED |
+| F2 | BLOCKING | C11 | `rg` rewrite declines when binary unresolvable | `crates/rskim/src/cmd/rewrite/engine.rs`, `crates/rskim/src/runner.rs` | TP-5 | LANDED |
 | F12 | MED | C12 | interior-newline rewrite bail emits a signal | `crates/rskim/src/cmd/rewrite/hook.rs` | TP-15 | LANDED |
 | F11 | MED | C13 | `--debug`/`--passthrough` honoured after positional | `crates/rskim/src/main.rs` | TP-14 | LANDED |
 | F5 | HIGH | C14 | diff line-number axis convention documented | docs only | TP-8 | LANDED |
@@ -170,9 +211,14 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   close the hole. The `changed_content` surface at `:232` is a second hole of the same
   shape; if it is not closed in this commit, say so in the commit message rather than
   leaving the reader to infer that one `assert!` closed both.
-- **Regression test:** `rskim` · `tests/cli_git_diff_modes.rs::assert_render_fidelity_rejects_empty_emissions`
-  (new; a negative test that hands the helper an empty render and expects a panic, via
-  `std::panic::catch_unwind`) · `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_diff_modes -j 4`
+- **Regression test:** `rskim` · `tests/cli_git_diff_modes.rs::assert_render_fidelity_rejects_a_vacuous_check`
+  (`:414`; a negative test that hands the helper an empty render and expects a panic, via
+  `std::panic::catch_unwind`, routed through the `catch_fidelity_panic` helper at `:391`)
+  · `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_diff_modes -j 4`.
+  **Name corrected against disk at HEAD `44b41ed`:** the field previously named
+  `assert_render_fidelity_rejects_empty_emissions`, which **does not exist** in
+  `crates/rskim/tests/cli_git_diff_modes.rs`. The test landed as
+  `assert_render_fidelity_rejects_a_vacuous_check`
 - **Re-bless:** none
 - **Status:** LANDED
 
@@ -192,9 +238,25 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   are the return-type guard at `:839` (`pos.is_return_type_field`) and the E1 parameter
   guard at `:847-856`; the unexempted path pushes the strip range at `:858-871`. The new
   guard goes beside the E1 guard at `:847`.
-- **Precondition:** stderr **must contain** `[skim] pseudo view:` **and must not contain**
-  `[skim:guardrail]`. This is mandatory and is asserted *before* any assertion about
-  stdout. Under an ADR-001 raw passthrough, stdout **is** the source file, and the source
+- **Precondition:** stderr **must contain the shared marker tail**
+  `SKIM_PASSTHROUGH=1 for full output` **and must not contain** `[skim:guardrail]`. This
+  is mandatory and is asserted *before* any assertion about stdout. **Corrected: the key
+  is the shared tail, not the direct-invocation wording.** The field originally named
+  `[skim] pseudo view:`, which is the **direct** form only; at hook origin the marker
+  reads `[skim] transformed view (cat → skim --mode=pseudo):` (`output/mod.rs:1057`, vs
+  `:1062` for the direct form), so that grep reads **0** on the L2 stderr against a
+  correctly fixed binary. The tail is `ELISION_HINT` (`output/mod.rs:24`) and is
+  byte-identical on both origins — the implementing agent chose it deliberately for
+  exactly this reason, and the field's original script did not capture it.
+  **Second correction, same field: the `[skim:guardrail]` half needs `SKIM_DEBUG=1` on the
+  stderr capture.** That banner is ADR-011 **class 2** and is routed to `io::sink()` unless
+  `SKIM_DEBUG`/`--debug` is set (`output/guardrail.rs:9`), so without the variable the
+  "must not contain" grep reads 0 against a masked binary and a served one alike and
+  **cannot fail**. Here the expected value happens to be the true one, so the check was
+  uninformative rather than inverted — but a precondition that cannot fail is not a
+  precondition, and F1c's copy of the same mistake *was* inverted. The variable is now on
+  both captures in the `Acceptance (argv)` block. This shares F1b's precondition, which
+  inherits the fix. Under an ADR-001 raw passthrough, stdout **is** the source file, and the source
   file already contains `name: string;` — so a naive "stdout contains `name: string`"
   assertion passes green against a completely unfixed binary. The guardrail is
   content-sensitive rather than size-sensitive and **no TypeScript or Python file in this
@@ -215,30 +277,52 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   cd /Users/dean/Sandbox/skim-issues
   B="$PWD/target/skim-baseline-c2b4378"; T="$(/usr/bin/mktemp -d)"
   NPX=/Users/dean/.nvm/versions/node/v22.22.3/bin/npx   # tsc is NOT on $PATH on this host
+  # `-p typescript` (equivalently `--package typescript --`) is REQUIRED. Corrected: the
+  # field originally wrote `npx --yes typescript tsc ...`, where npx runs the typescript
+  # package's default bin and forwards the literal `tsc` as an INPUT FILE -- tsc then
+  # fails TS6231 ("could not resolve the path 'tsc'") before reading any fixture, so both
+  # arms error out for a reason that has nothing to do with the defect under test.
   F=tests/fixtures/typescript/type_level_members.ts
   # fixture identity
   /usr/bin/wc -c "$F"; /sbin/md5 -q "$F"
   # raw control — real tool, absolute path, per-command SKIM_PASSTHROUGH (never exported, PF-026)
   SKIM_DISABLE_ANALYTICS=1 SKIM_PASSTHROUGH=1 /bin/cat "$F" > "$T/raw.ts"
-  # L1 — direct invocation
-  SKIM_DISABLE_ANALYTICS=1 "$B" "$F" --mode=pseudo --no-cache > "$T/l1.ts" 2> "$T/l1.err"
+  # L1 — direct invocation. SKIM_DEBUG=1 IS LOAD-BEARING on the stderr captures: the
+  # `[skim:guardrail]` half of the precondition greps for an ADR-011 CLASS-2 banner routed
+  # to `io::sink()` unless SKIM_DEBUG (or --debug) is set (`output/guardrail.rs:9`).
+  # Without it that grep reads 0 on a MASKED binary and on a SERVED one alike, so the
+  # "must be 0" assertion cannot fail — the same self-satisfying shape F1c's masking check
+  # had. The expected value happens to be the true one here, which makes the check
+  # uninformative rather than inverted; it is fixed anyway, because a precondition that
+  # cannot fail is not a precondition.
+  SKIM_DISABLE_ANALYTICS=1 SKIM_DEBUG=1 "$B" "$F" --mode=pseudo --no-cache > "$T/l1.ts" 2> "$T/l1.err"
   # L2 — hook-origin marker form (the larger marker; L1 clearing does not imply L2 clearing)
-  SKIM_DISABLE_ANALYTICS=1 SKIM_REWRITTEN_FROM=cat "$B" "$F" --mode=pseudo --no-cache \
+  SKIM_DISABLE_ANALYTICS=1 SKIM_DEBUG=1 SKIM_REWRITTEN_FROM=cat "$B" "$F" --mode=pseudo --no-cache \
     > "$T/l2.ts" 2> "$T/l2.err"
-  # PRECONDITION, ASSERTED FIRST, AT BOTH LEVELS
+  # PRECONDITION, ASSERTED FIRST, AT BOTH LEVELS.
+  # THE KEY IS THE SHARED TAIL, not the direct-invocation wording. At hook origin the
+  # marker reads `[skim] transformed view (cat -> skim --mode=pseudo): ...`, so a grep
+  # for `[skim] pseudo view:` reads 0 on l2.err against a CORRECTLY FIXED binary. The
+  # tail `SKIM_PASSTHROUGH=1 for full output` is byte-identical on both origins -- it is
+  # ELISION_HINT (`output/mod.rs:24`), carried by both arms deliberately
+  # (`output/mod.rs:1057` hook-origin, `:1062` direct) -- so it is the only key that
+  # discriminates a served view from a masked one at BOTH levels.
   for e in "$T/l1.err" "$T/l2.err"; do
-    /usr/bin/grep -c '\[skim\] pseudo view:' "$e"   # must be 1
+    /usr/bin/grep -c 'SKIM_PASSTHROUGH=1 for full output' "$e"   # must be 1 at BOTH levels
     /usr/bin/grep -c '\[skim:guardrail\]'    "$e"   # must be 0
     /usr/bin/wc -c "$e"                             # marker size -> headroom arithmetic
   done
+  # origin-specific wording, recorded but NOT the precondition key
+  /usr/bin/grep -c '\[skim\] pseudo view:'      "$T/l1.err"   # 1 -- direct form only
+  /usr/bin/grep -c '\[skim\] transformed view'  "$T/l2.err"   # 1 -- hook-origin form only
   /usr/bin/cmp "$T/l1.ts" "$T/l2.ts"                # stdout byte-identical across L1/L2
   # served-view loss
   /usr/bin/wc -c "$T/raw.ts" "$T/l1.ts"
   /usr/bin/sed -n '10p' "$T/l1.ts" | /sbin/md5 -q   # both union members must NOT collide
   /usr/bin/sed -n '11p' "$T/l1.ts" | /sbin/md5 -q
   # reparse, raw then served (served view written with a .ts suffix so tsc accepts it)
-  "$NPX" --yes typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/raw.ts"; echo "raw rc=$?"
-  "$NPX" --yes typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/l1.ts"; echo "served rc=$?"
+  "$NPX" --yes -p typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/raw.ts"; echo "raw rc=$?"
+  "$NPX" --yes -p typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/l1.ts"; echo "served rc=$?"
   # guard accounting
   SKIM_DISABLE_ANALYTICS=1 "$B" "$F" --mode=pseudo --no-cache --show-stats 2>&1 | /usr/bin/grep -i token
   ```
@@ -259,13 +343,27 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   TS1005 (11:14).
 - **AFTER (required):** a `property_signature` member's `type_annotation` survives
   intact, so the interface body renders as `name: string` / `value: number` and the
-  emitted view parses under `tsc --noEmit`. Scope is `property_signature` **only** —
-  class properties stay stripped. `interface_body` is an alias of `object_type` and
-  `property_signature` occurs only under those two, while class fields are
-  `public_field_definition` under `class_body`; the sets do not intersect, so
-  `test_typescript_pseudo_strips_class_property_annotation` (`pseudo.rs:1268`) needs no
-  amendment. `index_signature` is to be included defensively **only after** a real parse
-  dump confirms the node-kind name. `readonly` is also in the TypeScript `strip_kinds`
+  emitted view parses under `tsc --noEmit`. **Scope is `property_signature` *and*
+  `index_signature` — corrected to the landed behaviour.** The field originally read
+  "`property_signature` **only** — class properties stay stripped", which understates its
+  own commit, and it sat in tension with this section's `Regression test` field, which
+  already records the `index_signature` arm as confirmed and covered. The `index_signature`
+  arm is **deliberate, not defensive**: the TypeScript grammar marks that node's `type`
+  field *required*, so stripping it yields a node the grammar cannot represent and `tsc`
+  rejects it with the dedicated **TS1021** (*an index signature must have a type
+  annotation*) — a harder failure than the implicit-`any` an interface member draws. That
+  arm therefore reaches **inside `class_body` too**, because `index_signature` occurs
+  there as well; the guard is `pos.parent_kind == Some("index_signature")`
+  (`pseudo.rs:950`), with the reasoning at `:903-942` and the module header at `:18-20`.
+  **The class-*field* distinction is intact and must stay stated:** a class field is a
+  `public_field_definition` under `class_body`, its annotation is **still stripped**, and
+  `property_signature` occurs only under `object_type` / `interface_body`
+  (`interface_body` being an alias of `object_type`); the sets do not intersect, so
+  `test_typescript_pseudo_strips_class_property_annotation` (`pseudo.rs:1542` — line
+  corrected against disk from `:1268`) needs no
+  amendment. Do not read "`index_signature`, including under `class_body`" as weakening
+  that: one is a required-field grammar constraint, the other is a class property, and
+  only the first is admitted. `readonly` is also in the TypeScript `strip_kinds`
   table (`:268`) and `property_signature` admits `optional('readonly')`, so the
   interaction needs its own test.
 - **Regression test:** `rskim-core` · `src/transform/pseudo.rs::{test_typescript_pseudo_preserves_interface_member_annotation`
@@ -322,10 +420,17 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   conditions are `is_for_loop_direct_child` (`:896-905`) and the threaded `in_for_header`
   (`:906`); everything else is pushed as a strip range at `:907`. TypeScript sets
   `strip_semicolons: true` at `:269`.
-- **Precondition:** stderr **must contain** `[skim] pseudo view:` **and must not contain**
-  `[skim:guardrail]` — the same vacuity trap as F1, for the same reason: the raw source
+- **Precondition:** stderr **must contain the shared marker tail**
+  `SKIM_PASSTHROUGH=1 for full output` **and must not contain** `[skim:guardrail]` — the
+  same vacuity trap as F1, for the same reason: the raw source
   already contains the `;`, so a raw passthrough satisfies a naive stdout assertion
-  against an unfixed binary. Assert stderr first. Shares F1's fixture, which grew
+  against an unfixed binary. Assert stderr first. **Corrected with F1's: the key is the
+  shared tail, not `[skim] pseudo view:`**, which is the direct-invocation wording only
+  and reads 0 at hook origin against a correctly fixed binary — see F1's `Precondition`
+  for the two marker forms and their source lines. **The `[skim:guardrail]` half likewise
+  requires `SKIM_DEBUG=1` on the stderr capture** (class-2 banner, `io::sink()` unless the
+  variable is set, `output/guardrail.rs:9`); F1b shares F1's run, so it inherits that fix
+  where F1's `Acceptance (argv)` block applies it. Shares F1's fixture, which grew
   1026 B → **1104 B** to keep the post-fix L2 margin at ≥2× (see F1's precondition);
   post-fix L2 measures **2.20× bytes / 2.17× tokens**.
 - **Acceptance (argv):** F1's run, plus the isolation matrix that separates the two
@@ -337,9 +442,9 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   printf 'interface U { id; email }\n'                > "$T/f1-only.ts"
   # F1b alone: annotations intact, terminators gone
   printf 'interface U { id: string email: string }\n' > "$T/f1b-only.ts"
-  "$NPX" --yes typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/f1-only.ts"
+  "$NPX" --yes -p typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/f1-only.ts"
   echo "F1-only rc=$?"
-  "$NPX" --yes typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/f1b-only.ts"
+  "$NPX" --yes -p typescript tsc --noEmit --skipLibCheck --noImplicitAny "$T/f1b-only.ts"
   echo "F1b-only rc=$?"
   # the two `;` losses in the served view of F1's fixture
   /usr/bin/grep -n 'amount\|currency\|^  id\|^  email' "$T/raw.ts" "$T/l1.ts"
@@ -353,6 +458,20 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   F1b is the unparseability, F1 is the information loss and the member collision — a
   single `tsc` exit code cannot attribute the failure, which is why the matrix is part of
   the acceptance command and not a nicety.
+  **TOOLCHAIN DRIFT, NOT A REGRESSION — the F1-only arm no longer reproduces as written.**
+  Re-run at HEAD `44b41ed` with the `-p typescript` invocation corrected (see the
+  `Acceptance (argv)` field), the resolved compiler is **tsc 7.0.2**, under which
+  `interface U { id; email }` emits **TS7008** (*member implicitly has an `any` type*)
+  where the original run recorded **no diagnostics**. Both figures stand, each with the
+  toolchain that produced it: **exit 0 / no diagnostics** under the compiler `npx`
+  resolved at the time of the original `c2b4378` run (whose version was not recorded
+  then — which is itself the lesson), and **exit 1 / TS7008** under **tsc 7.0.2** at
+  `44b41ed`. Nothing in skim moved: `--noImplicitAny` is on in both runs and the fixture
+  text is byte-identical, so this is the compiler's diagnostic set changing, not a defect
+  appearing. **The matrix's conclusion survives intact** — TS7008 is an implicit-`any`
+  complaint about a member that *parsed*, while TS1005 is a parse failure, so the two arms
+  still attribute differently and F1b is still the unparseability. Record the resolved
+  `tsc --version` alongside any future re-run of this arm.
 - **AFTER (required):** a `;` whose parent is `object_type` or `interface_body` is
   preserved; every other `;` keeps today's behaviour. Class-body `;` (under
   `public_field_definition` / `class_body`) is deliberately **not** admitted, matching
@@ -371,7 +490,10 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   diff on that file is the two `;` characters only). Written expectation for Gate 6:
   this change reaches only languages with `strip_semicolons: true`, which in the golden
   matrix is **TypeScript and Rust only** — Python, Go and Markdown are all
-  `strip_semicolons: false` (`pseudo.rs:287`, `:306`, `:408`) and their fixtures contain
+  `strip_semicolons: false` (verified at HEAD `44b41ed`: the `Language::Python` rules block
+  at `pseudo.rs:303`, `Language::Go` at `:326`, and Markdown inside the shared
+  `Language::Markdown | Json | Yaml | Toml` block at `:429`; **lines corrected from the
+  field's original `:287`/`:306`/`:408`**) and their fixtures contain
   no `;` at all. **Not expected to move, with reasons:** `ts_comments_pseudo_max5`
   (window ends above the interface); all four `ts_simple_pseudo_*` cells (their only
   semicolons terminate an `expression_statement` and a `lexical_declaration`, neither
@@ -427,12 +549,21 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   "$RUSTC" --edition 2021 --crate-type lib --emit=metadata -o "$T/raw.meta" \
     tests/fixtures/rust/simple.rs
   echo "raw rc=$?"
-  # unreachability: five escalating fixtures, L1 and L2, must ALL stay masked
+  # unreachability: five escalating fixtures, L1 and L2, must ALL stay masked.
+  # SKIM_DEBUG=1 IS LOAD-BEARING HERE, NOT DECORATION. `[skim:guardrail]` is an ADR-011
+  # CLASS-2 no-loss raw-fallback banner, routed to `io::sink()` unless SKIM_DEBUG (or
+  # --debug) is set -- see `output/guardrail.rs:9`, which states the gating. Without the
+  # variable this grep reads 0 whatever the true masking state is, so a check that
+  # expects a NON-ZERO count is self-satisfying: it reports "not masked" against a binary
+  # that masks every case, i.e. it reads the opposite of the BEFORE field's claim while
+  # appearing to confirm it. Added after the field shipped without it; WITH the variable
+  # set, masking is confirmed at all five sizes on both levels, exactly as the BEFORE
+  # field claims.
   for f in "$T"/esc-716.rs "$T"/esc-2235.rs "$T"/esc-2955.rs "$T"/esc-3495.rs "$T"/esc-4035.rs; do
     /usr/bin/wc -c "$f"
-    SKIM_DISABLE_ANALYTICS=1                         "$B" "$f" --mode=pseudo --no-cache \
+    SKIM_DISABLE_ANALYTICS=1 SKIM_DEBUG=1                         "$B" "$f" --mode=pseudo --no-cache \
       2>&1 >/dev/null | /usr/bin/grep -c '\[skim:guardrail\]'
-    SKIM_DISABLE_ANALYTICS=1 SKIM_REWRITTEN_FROM=cat "$B" "$f" --mode=pseudo --no-cache \
+    SKIM_DISABLE_ANALYTICS=1 SKIM_DEBUG=1 SKIM_REWRITTEN_FROM=cat "$B" "$f" --mode=pseudo --no-cache \
       2>&1 >/dev/null | /usr/bin/grep -c '\[skim:guardrail\]'
   done
   # token neutrality, the reason the guard can never elect Keep
@@ -459,11 +590,15 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   `static_item`. Non-goal, to be stated explicitly in the commit message: Rust pseudo
   output remains non-reparseable via `use` and `let` — that is pre-existing and tracked
   separately, and this commit must not be read as claiming otherwise.
-  `test_rust_pseudo_trait_preserves_return_type` (`pseudo.rs:1858`) asserts only
+  `test_rust_pseudo_trait_preserves_return_type` (`pseudo.rs:2589` — **line corrected
+  against disk from `:1858`**) asserts only
   `-> i32` and `fn compute`, never that the `;` is absent, so it needs no assertion
-  change — **but its doc comment at `:1859-1860` states "the trailing `;` on trait method
+  change — **but its doc comment stated "the trailing `;` on trait method
   signatures is still stripped", which this commit makes false.** Correct that comment in
-  this commit.
+  this commit. **Verified done at HEAD `44b41ed`:** the comment now reads "The trailing
+  `;` is preserved too, by the declaration-terminator guard — this test asserts only the
+  return type, so it holds either way" (`pseudo.rs:2586-2588`; the field's original
+  `:1859-1860` was the pre-fix position).
 - **Regression test:** `rskim-core` · `src/transform/pseudo.rs::{test_rust_pseudo_preserves_trait_method_signature_terminator`
   (`:2027`), `test_rust_pseudo_preserves_struct_item_terminator` (`:2044`),
   `test_rust_pseudo_preserves_associated_type_terminator` (`:2065`)`}` — **three tests,
@@ -623,9 +758,25 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   skips the ADR-001 guard entirely, whereas a false negative corrupts a machine contract,
   which is the entire defect class. Routing through `args_before_separator` can only
   convert a true into a false, i.e. can only manufacture false negatives. Document that
-  asymmetry in the constant's doc comment, and document the known gap rather than fixing
-  it: bundled shorts (`git status -sz`) will not match `-z`. **G is non-droppable** — F6,
+  asymmetry in the constant's doc comment. **G is non-droppable** — F6,
   F9 and F13 drop with it as a unit.
+
+  **The "known gap" this field originally recorded is CLOSED, not open — re-measured at
+  HEAD `44b41ed`.** The field said to "document the known gap rather than fixing it:
+  bundled shorts (`git status -sz`) will not match `-z`". Measured, they **do** match, and
+  `skim git status -sz` stdout is byte-identical to raw `git`. That is not an accident: the
+  gate was made **cluster-aware on purpose**. `args_match_flag_set`
+  (`cmd/git/mod.rs:261`) runs the exact-token `user_has_flag` pass first and then scans
+  single-dash clusters for `CONTRACT_SHORT_OPTS` (`:239`, whose sole member is `z`). The
+  reason, recorded in that constant's own doc comment at `:225-238`, is that
+  `cmd/git/status.rs`'s `CONFLICTING_SHORT_OPTS` scan (`status.rs:15`, members `s` and
+  `z`) was **already** cluster-aware — so an exact-token gate here would have shipped
+  *weaker* than the code it replaced, making it a false negative **manufactured by the
+  fix** rather than a pre-existing gap it declined to close. `-s` (`--short`) is
+  deliberately **not** in the contract set: short format is a human-facing rendering that
+  `status.rs` translates faithfully, and admitting it would turn `skim git status -sb`
+  into raw passthrough. The same cluster-awareness, for the same stated reason, carries
+  into the narrowing predicate's `COMMIT_SHAPE_BREAKING_SHORTS` (`cmd/git/log.rs:371`).
 
   **`--json` regression addendum (found after landing, fixed in the same commit; the
   remedy's scope was narrowed after review, because the first wording of this addendum
@@ -645,16 +796,21 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   what follows; they are both four-ish and they are not the same four.
 
   **The remedy is narrower than the defect class, and the two must not be conflated.**
-  `--json` **disarms the ADR-022 gate** — `caller_requested_json` (`cmd/git/mod.rs:295`),
-  consulted in the dispatch guard at `:94` — which is where the regression was introduced
+  `--json` **disarms the ADR-022 gate** — `caller_requested_json` (`cmd/git/mod.rs:313`),
+  reached through `json_disarms_the_gate` (`:325`) from the dispatch guard at `:97` — which
+  is where the regression was introduced
   and where it is fixed. `--mode` keeps the gate armed but is dropped from the forwarded
-  argv by `strip_git_view_flags` (`:352`). That filter is placed **at the sink**
-  (`run_passthrough`, `:632`, consulting it at `:647`) rather than at the gate, so all
+  argv by `strip_git_view_flags` (`:450`). That filter is placed **at the sink**
+  (`run_passthrough`, `:730`, consulting it at `:745`) rather than at the gate, so all
   **six** `run_passthrough` call sites are covered structurally by one edit rather than
-  six: the ADR-022 gate (`mod.rs:96`) plus the **five per-command gates** that also reach
-  the sink — `show.rs:344` (`PASSTHROUGH_FLAGS`), `show.rs:348` (`ShowMode::MultiRef`),
-  `fetch.rs:29` (`--dry-run`/`-q`/`--quiet`), and the two `--help` gates at
-  `commit.rs:54` and `push.rs:65`.
+  six: the ADR-022 gate (`mod.rs:97`) plus the **five per-command gates** that also reach
+  the sink — `show.rs:343` (`PASSTHROUGH_FLAGS`), `show.rs:348` (`ShowMode::MultiRef`),
+  `fetch.rs:28` (`--dry-run`/`-q`/`--quiet`), and the two `--help` gates at
+  `commit.rs:53` and `push.rs:64`.
+  **Every line number in this paragraph was corrected against disk at HEAD `44b41ed`**;
+  the field's originals (`:295`, `:94`, `:352`, `:632`, `:647`, `:96`, `show.rs:344`,
+  `fetch.rs:29`, `commit.rs:54`, `push.rs:65`) were its pre-`0194bea` positions, which
+  that commit displaced by adding 303 lines to `cmd/git/mod.rs`.
 
   **A side effect of that placement is not a fix for those five.** None of them disarms
   on `--json`. What the sink-level filter changed for them is the *failure mode*: the
@@ -662,8 +818,25 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   That is an improvement, not a fix — those callers asked for JSON and receive git's
   bytes instead. **Explicitly: `--json` on those spellings still does not produce JSON.**
   Extending the disarm into `show.rs` and `fetch.rs` is **out of this batch's scope** and
-  needs a follow-up. `strip_git_view_flags`' own doc comment records this rather than
-  leaving a reader to infer it:
+  needs a follow-up.
+
+  **Also on the known-remaining list — added after the second `--json` fix (`0194bea`)
+  and re-measured at HEAD `44b41ed`.** That commit **narrowed** the disarm: `--json` now
+  disarms the ADR-022 gate only where the handler can actually model the flagged payload
+  (`json_disarms_the_gate`, `cmd/git/mod.rs:325`, consulted by the dispatch guard at
+  `:97`; the blind-payload set is `COMMIT_SHAPE_BREAKING_FLAGS` — `--format`, `--pretty`,
+  `--graph`, `--null` — at `cmd/git/log.rs:361`, plus the cluster short `z` at `:371`).
+  For those four `log` cells, `log --format=%H --json` now serves **git's own bytes,
+  correctly**, which is the right outcome and the point of the narrowing. But the
+  `--json` request itself is **dropped with zero disclosure**: the caller asked for JSON
+  and receives text, with no notice on either stream. That is consistent with the
+  `show`/`fetch` limitation recorded just above — *asked for JSON, receives git's bytes*
+  — and it is **not a new defect**. It is, however, **undisclosed** where those other
+  cases at least fail loudly at exit 1, which is the one respect in which it is worse.
+  Recorded here as a residual gap in the same follow-up's scope, not as a regression.
+
+  `strip_git_view_flags`' own doc comment records the `show`/`fetch` half of this rather
+  than leaving a reader to infer it:
 
   > `--json` reaches here only from the per-command gates this module does not own —
   > `show.rs`'s `PASSTHROUGH_FLAGS` and `ShowMode::MultiRef`, and `fetch.rs`'s
@@ -676,7 +849,8 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   Of the four base-SHA exit-1 spellings, only two are `show`/`fetch` and therefore only
   two land in that raw-serve bucket. The other two had no gate left standing against
   them: `--format`/`--pretty` were **hoisted out of `log.rs`** into
-  `MACHINE_CONTRACT_FLAGS` (`:214-216`) and `cmd/git/diff/` never carried a local gate at
+  `MACHINE_CONTRACT_FLAGS` (the constant is at `:182` at HEAD `44b41ed`; the field's
+  `:214-216` was its pre-`0194bea` position) and `cmd/git/diff/` never carried a local gate at
   all (no `user_has_flag` and no `run_passthrough` call site in that module), so
   `log --format=%H --json` and `diff --stat --json` now route through the ADR-022 gate,
   which disarms. **Source-read, NOT measured:** that says no gate refuses them any more,
@@ -692,12 +866,52 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   The bound flags (`--max-lines` / `--tokens` / `--last-lines`) are deliberately **not**
   stripped: no git handler implements them, so dropping them would turn a hard error into
   a **silently unbounded serve**, which is the exact failure ADR-016 exists to prevent.
-- **Regression test:** `rskim` · `tests/cli_git_contract_flags.rs::porcelain_output_is_byte_identical_to_real_git`
-  (new; a table-driven test over the gated flag set, each case comparing `skim git …`
-  stdout against the real `git …` stdout byte for byte in a hermetic fixture repo) ·
-  `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_contract_flags -j 4`,
-  plus `rskim` · `src/cmd/git/mod.rs::test_contract_flag_gate_*` unit tests for the
-  predicate itself · `cargo nextest run -p rskim --bins -j 4 -E 'test(/contract_flag/)'`
+- **Regression test:** **corrected against disk at HEAD `44b41ed`; both names this field
+  originally carried were plan-shaped and neither exists.**
+  `tests/cli_git_contract_flags.rs::porcelain_output_is_byte_identical_to_real_git`
+  **does not exist**: the table-driven byte-equality helper landed as
+  `assert_byte_identical` (`:236`) with a per-family test above it, and the case the field
+  meant is `status_porcelain_is_byte_identical_to_git` (`:321`). The file's gate coverage
+  is `rskim` · `tests/cli_git_contract_flags.rs::{status_porcelain_is_byte_identical_to_git`
+  (`:321`), `status_porcelain_v2_branch_keeps_every_header_line` (`:352`),
+  `status_porcelain_nul_stream_gains_no_trailing_newline` (`:384`),
+  `status_short_nul_cluster_is_byte_identical_to_git` (`:413`),
+  `status_short_alone_is_not_gated` (`:430`),
+  `log_stat_family_is_byte_identical_and_pairwise_distinct` (`:465`),
+  `log_graph_serves_the_commits_and_not_no_commits` (`:527`),
+  `log_user_format_strings_survive_the_hoist` (`:558`),
+  `log_oneline_still_reaches_the_log_handler` (`:590`),
+  `diff_stat_family_survives_the_hoist` (`:615`),
+  `diff_raw_record_format_is_byte_identical_on_both_streams` (`:667`),
+  `diff_quiet_writes_nothing_and_forwards_its_exit_code` (`:749`),
+  `diff_exit_code_is_byte_identical_and_forwards_status` (`:809`)`}`, plus the nine
+  `--json` cases the second fix added (`:935`–`:1452`) ·
+  `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_contract_flags -j 4`.
+  `src/cmd/git/mod.rs::test_contract_flag_gate_*` **does not exist either — the string
+  `contract_flag_gate` appears nowhere under `crates/`.** The predicate's own unit pins
+  carry no `test_` prefix: `contract_flag_set_is_mirrored_by_the_integration_test`
+  (`:1399`), `every_contract_flag_is_recognised_alone` (`:1421`),
+  `porcelain_matches_its_versioned_forms` (`:1437`),
+  `contract_shorts_are_matched_inside_a_cluster` (`:1455`),
+  `non_contract_flags_are_not_gated` (`:1471`),
+  `gate_is_not_separator_aware_by_design` (`:1505`),
+  `raw_record_format_is_a_contract_on_every_subcommand` (`:1523`),
+  `raw_does_not_match_a_longer_flag_by_prefix` (`:1548`) and
+  `bare_dash_tokens_are_inert` (`:1555`).
+  **The field's own filter expression therefore under-selects, and by more than it looks.**
+  `contract_flag` is a substring of exactly **three** of the nine
+  (`contract_flag_set_is_mirrored_by_the_integration_test`,
+  `every_contract_flag_is_recognised_alone`, `non_contract_flags_are_not_gated`), so
+  `-E 'test(/contract_flag/)'` runs three and silently skips **six** — including
+  `contract_shorts_are_matched_inside_a_cluster`, which is the one pinning the very
+  cluster-awareness this section's closure note turns on. Scope the module instead: the
+  tests live in `mod tests` at `cmd/git/mod.rs:1023`, i.e. under the nextest path
+  `cmd::git::tests::`, so `-E 'test(/cmd::git::tests::/)'` selects all nine ·
+  `cargo nextest run -p rskim --bins -j 4 -E 'test(/cmd::git::tests::/)'`.
+  **Source-derived, not run:** the membership arithmetic above is read off the nine names,
+  and the replacement filter is derived from the module path — neither was executed,
+  because this pass could not invoke `cargo` (see `## Notes`). Confirm the filter selects
+  nine before relying on it.
 - **Re-bless:** none. `cmd/mod\.rs$` in `ci.yml`'s `SEARCH_PATHS` is `$`-anchored, so
   `cmd/git/mod.rs` does not match it and this commit is scoreboard-free.
 - **Status:** LANDED
@@ -759,8 +973,15 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   reaches `run_raw_passthrough` and the diffstat arrives byte-identical to real `git`. No
   change to `log.rs:31`, `injected_log_format` or `is_commit_line`: the gate short-circuits
   above all three.
-- **Regression test:** `rskim` · `tests/cli_git_contract_flags.rs::log_stat_reaches_the_reader`
-  (new; a case in G's table-driven test) · `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_contract_flags -j 4`
+- **Regression test:** `rskim` · `tests/cli_git_contract_flags.rs::log_stat_family_is_byte_identical_and_pairwise_distinct`
+  (`:465`) · `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_contract_flags -j 4`.
+  **Name corrected against disk at HEAD `44b41ed`:** the field named
+  `log_stat_reaches_the_reader`, which **does not exist**. The landed name is the stronger
+  claim and worth keeping visible — it asserts not only that each stat flag reaches the
+  reader byte-identically but that the five renders are **pairwise distinct**, which is the
+  assertion that would have caught this defect's actual signature (all five serving one
+  byte-identical 324 B blob). A test named for "reaches the reader" could have passed on a
+  single flag while the other four stayed swallowed.
 - **Re-bless:** none
 - **Status:** LANDED
 
@@ -836,8 +1057,14 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   output format — the argv never reaches the parser, so there is nothing to repair in it —
   rather than a parse repair on the `# branch.ab` path, which measurement showed was
   never broken.
-- **Regression test:** `rskim` · `tests/cli_git_contract_flags.rs::porcelain_v2_branch_keeps_ahead_behind_header`
-  (new; a case in G's table-driven test) · `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_contract_flags -j 4`
+- **Regression test:** `rskim` · `tests/cli_git_contract_flags.rs::status_porcelain_v2_branch_keeps_every_header_line`
+  (`:352`) · `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_contract_flags -j 4`.
+  **Name corrected against disk at HEAD `44b41ed`:** the field named
+  `porcelain_v2_branch_keeps_ahead_behind_header`, which **does not exist**. The landed
+  name is again the wider claim, and it matches this section's corrected premise: the
+  ahead/behind header was never broken, so a test named for *it* would have pinned the one
+  thing that already worked. `keeps_every_header_line` pins what the defect actually lost —
+  the whole `--porcelain=v2` header stream, `# branch.oid` included.
 - **Re-bless:** none
 - **Status:** LANDED
 
@@ -895,14 +1122,27 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   **RAW control:** rc 0, stdout 0, stderr 157 B, containing
   ` * [new branch]      fb -> dst-bbb`. **The destination is absent from skim's render**,
   and it is the half most likely to be the mistake.
-  **Force path:** `+side2:refs/heads/dst` → ` + side2 [forced]` — same loss, same shape.
+  **Force path — CORRECTED, re-measured at HEAD `44b41ed`; the original figure was
+  inaccurate.** `+side2:refs/heads/dst` renders ` * side2 [new]`, **not**
+  ` + side2 [forced]` as this field originally claimed. The refspec's leading `+` only
+  *requests* permission to force; git's porcelain flag column reports what actually
+  happened, and `refs/heads/dst` did not exist in this fixture, so git emits `*` /
+  `[new branch]`. skim's mapping is one-to-one on that column
+  (`push.rs:285-286`: `"*" => "* {ref_pair} [new]"`, `"+" => "+ {ref_pair} [forced]"`),
+  so **`[new]` fires on a brand-new destination ref and `[forced]` fires only on a
+  genuinely diverged *existing* ref** — one whose current tip is not an ancestor of the
+  source. To exhibit `[forced]` the fixture must push to `dst` once, then diverge the
+  source, then force. Either way the loss and the shape are the same: the destination
+  side is absent from skim's render.
   **Guard:** 149 B served against a **174 B injected-porcelain baseline**
   (`raw_override: None`, PF-024) → `Keep`, **25 B headroom**, corroborated by
   `--show-stats` `74 → 62 tokens (16.2%)`. The fix has room to name both sides.
 - **AFTER (required):** an asymmetric refspec renders both sides. Add a **new**
   `format_ref_pair` and leave `extract_short_ref` alone so its three existing unit tests
-  (`test_extract_short_ref_heads` `:707`, `test_extract_short_ref_tags` `:712`,
-  `test_extract_short_ref_bare` `:717`) stay green without amendment. A symmetric refspec
+  (`test_extract_short_ref_heads` `:836`, `test_extract_short_ref_tags` `:841`,
+  `test_extract_short_ref_bare` `:846` — **lines corrected against disk at HEAD `44b41ed`
+  from `:707`/`:712`/`:717`, which were their pre-fix positions**; all three exist and are
+  unamended, as required) stay green without amendment. A symmetric refspec
   must keep rendering as a single short name — the new renderer must not turn
   `main:main` into `main:main`.
 - **Regression test:** `rskim` · `src/cmd/git/push.rs::test_format_ref_pair_renders_asymmetric_refspec`
@@ -925,34 +1165,79 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   `:287`.
 - **Precondition:** the porcelain fixture line must use git's **real** delete shape, with
   an empty source side (`-\t:refs/heads/old\t[deleted]`). A symmetric refspec makes the
-  check vacuous. `test_deleted_ref_porcelain_happy_path` (`push.rs:781`) feeds
+  check vacuous. `test_deleted_ref_porcelain_happy_path` (`push.rs:1219` — line corrected
+  against disk from `:781`) feeds
   `-\trefs/heads/old:refs/heads/old\t[deleted]`, which is **not** git's delete shape and
   which passes either way. Per Gate 4 this is a *fixture* defect, not a test whose
   polarity should be inverted: **correct the fixture, do not invert the test.**
-- **Acceptance (argv):** reuses **F7**'s fixture (`$T/src`, `$T/sink.git`) and adds a
-  remote literally named `throwaway`, because `--delete <remote> <ref>` needs a named remote.
+
+  **The single-ref plain-text CLI form is masked by construction on this git version — an
+  exact structural tie, not a marginal size effect. Re-measured at HEAD `44b41ed`.** For a
+  single-ref delete the served render and the raw bytes are the *same trimmed length*:
+  `len(raw.trim()) == len(compressed.trim())`. ADR-001's rule is strictly-smaller-to-keep,
+  with **any tie electing `Passthrough`** — the `>=` early-exit inside
+  `decide_with_notice` at `crates/rskim/src/output/fidelity.rs:347`, whose comment names
+  the tie case explicitly ("ties (n == n fails)"); the rule is stated at `:17` and `:240`,
+  and `decide` is the charge-nothing shim at `:272`. So **every** single-ref delete, on
+  **any** fixture, always ties and always serves raw. Verified at two destination-path
+  lengths — roughly 90 characters and 18 characters — and the tie holds at both, which is
+  what rules out a size effect and makes this structural.
+
+  **Same class as F1c's unreachable CLI observable.** There the transform is
+  token-neutral, so ADR-001's `Keep` branch is unreachable at any fixture size; here the
+  render is byte-neutral, so `Keep` is unreachable on any fixture. In both cases the
+  honest acceptance surface is the test layer, not an argv — which is why this section's
+  `Acceptance (argv)` field has been rewritten to be the unit test.
+- **Acceptance (argv):** **REWRITTEN — the original field named the wrong *category* of
+  acceptance, and the argv it named is provably unsatisfiable.** F8 changed **zero
+  production lines**: F7 (C5)'s `format_ref_pair` already fixed the render, and what
+  remained here was a fixture that could not fail. For a test-only commit the acceptance
+  *is* its test, so that is what this field now names. The single-ref plain-text
+  `git push --delete` invocation it previously named always ties on bytes and therefore
+  always serves raw — see the `Precondition` field for the algebra. The two CLI forms that
+  **break** the tie are kept below as corroborating checks, because they are what confirm
+  the render is correct rather than merely unobservable.
 
   ```bash
+  cd /Users/dean/Sandbox/skim-issues
+  # ---- ACCEPTANCE: the unit test. For a commit that changed zero production lines, the
+  #      test IS the acceptance surface. The amended fixture must carry git's REAL delete
+  #      shape (EMPTY source side, `-\t:refs/heads/old\t[deleted]`); the pre-F8 fixture
+  #      fed the symmetric `-\trefs/heads/old:refs/heads/old\t[deleted]`, which passed
+  #      against BOTH the parent renderer and F7's, so no assertion on it could
+  #      discriminate. That vacuity is the defect F8 closes.
+  cargo nextest run -p rskim --bins -j 4 \
+    -E 'test(/deleted_ref_porcelain/) + test(/format_ref_pair/)'
+  # the amended fixture's shape, read off the source rather than inferred
+  /usr/bin/grep -n 'deleted\]' crates/rskim/src/cmd/git/push.rs
+
+  # ---- CORROBORATING CHECK 1: a 2-OR-MORE-REF delete breaks the byte tie, so ADR-001
+  #      elects Keep and the render becomes observable at the CLI. Reuses F7's fixture.
   cd "$T/src"; GIT=/usr/bin/git
   B=/Users/dean/Sandbox/skim-issues/target/skim-baseline-c2b4378
   "$GIT" remote add throwaway "$T/sink.git"
-  for r in bbb ccc ddd; do "$GIT" push -q throwaway "fb:refs/heads/dst-$r"; done
-  # PRECONDITION: git's REAL delete shape has an EMPTY source side. The pre-F8 unit
-  # fixture fed `-\trefs/heads/old:refs/heads/old\t[deleted]`, which is NOT that shape.
-  SKIM_DISABLE_ANALYTICS=1 "$B" git push --delete throwaway dst-bbb > "$T/skim" 2>"$T/skim.err"
-  printf 'rc=%s stdout=%s stderr=%s\n' "$?" "$(/usr/bin/wc -c <"$T/skim")" \
-    "$(/usr/bin/wc -c <"$T/skim.err")"
-  /bin/cat "$T/skim"; /usr/bin/sed -n '2p' "$T/skim" | /usr/bin/xxd   # the blank, in hex
-  # RAW control
-  SKIM_DISABLE_ANALYTICS=1 SKIM_PASSTHROUGH=1 "$GIT" push --delete throwaway dst-ccc 2>&1
-  # GROUND TRUTH — the exact porcelain line skim's parser reads
-  SKIM_DISABLE_ANALYTICS=1 SKIM_PASSTHROUGH=1 "$GIT" push --porcelain --delete throwaway dst-ddd \
-    | /usr/bin/xxd
+  for r in bbb ccc ddd eee fff ggg; do "$GIT" push -q throwaway "fb:refs/heads/dst-$r"; done
+  SKIM_DISABLE_ANALYTICS=1 "$B" git push --delete throwaway dst-bbb dst-ccc \
+    > "$T/multi" 2>"$T/multi.err"
+  printf 'rc=%s stdout=%s stderr=%s\n' "$?" "$(/usr/bin/wc -c <"$T/multi")" \
+    "$(/usr/bin/wc -c <"$T/multi.err")"
+  /bin/cat "$T/multi"        # every ref named; no line carries the double-space blank
+
+  # ---- CORROBORATING CHECK 2: `--json` bypasses the guard, so the render is observable
+  #      at a SINGLE ref too.
+  SKIM_DISABLE_ANALYTICS=1 "$B" git push --delete throwaway dst-ddd --json
+
+  # ---- MASKING DEMONSTRATION: the single-ref plain-text form, shown to be a TIE rather
+  #      than merely untried. Two destination-path lengths (~90 chars and 18) both tie.
+  SKIM_DISABLE_ANALYTICS=1 "$B" git push --delete throwaway dst-eee \
+    > "$T/single" 2>/dev/null
+  SKIM_DISABLE_ANALYTICS=1 SKIM_PASSTHROUGH=1 "$GIT" push --delete throwaway dst-fff \
+    > "$T/single.raw" 2>/dev/null
+  /usr/bin/wc -c "$T/single.raw" "$T/single"   # EXPECT: equal trimmed lengths -> a TIE,
+                                               # which is why ADR-001 elects Passthrough
+  SKIM_DISABLE_ANALYTICS=1 SKIM_PASSTHROUGH=1 "$GIT" push --porcelain --delete throwaway \
+    dst-ggg | /usr/bin/xxd   # GROUND TRUTH: `-<TAB>:refs/heads/dst-ggg<TAB>[deleted]`
   "$GIT" --version
-  # FIXTURE-VACUITY check, measured separately: the pre-F8 unit fixture passes against
-  # BOTH the parent renderer and F7's, so no assertion on it can discriminate.
-  cd /Users/dean/Sandbox/skim-issues
-  cargo nextest run -p rskim --bins -j 4 -E 'test(/deleted_ref_porcelain/)'
   ```
 - **BEFORE (measured at c2b4378):** **DEFECT REPRODUCED.**
   `skim git push --delete throwaway dst-bbb`: rc 0, stdout **152 B**, stderr 0 B, with
@@ -971,11 +1256,21 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   case as a deletion; what remained here was the vacuous fixture. F8 is therefore the
   **test-correctness commit that makes the delete path provable** — before it, the path
   was correct and unprovable, which is the same review risk as incorrect and unnoticed.
-  That also makes F7's ordering dependency load-bearing rather than merely convenient. The informational-line regression at `push.rs:763-772` (AD-GP-2: a `- Some info text`
-  line without a tab must not produce a deleted ref) must stay green.
+  That also makes F7's ordering dependency load-bearing rather than merely convenient. The informational-line regression (AD-GP-2: a `- Some info text`
+  line without a tab must not produce a deleted ref) must stay green. **Located against
+  disk at HEAD `44b41ed`:** it is `test_non_porcelain_dash_skipped`
+  (`push.rs:1187`, AD-GP-2 doc comment at `:1184`, the literal fixture at `:1188`), with
+  two siblings in the same family — `test_non_porcelain_exclamation_skipped` (`:1172`) and
+  `test_tab_prefixed_informational_line_skipped` (`:1259`). The field's original
+  `push.rs:763-772` was the pre-fix span; `:762` now holds
+  `test_summary_does_not_repeat_operation_name`, an unrelated test, so the old span would
+  have sent a reader to the wrong assertion rather than to none.
 - **Regression test:** `rskim` · `src/cmd/git/push.rs::test_deleted_ref_porcelain_happy_path`
-  (**amended fixture**, `:781`) and `src/cmd/git/push.rs::test_format_ref_pair_empty_source_is_a_deletion`
-  (new) · `cargo nextest run -p rskim --bins -j 4 -E 'test(/push/)'`
+  (**amended fixture**, `:1219` — line corrected against disk from `:781`) and
+  `src/cmd/git/push.rs::test_format_ref_pair_empty_source_is_a_deletion` (`:1046`) ·
+  `cargo nextest run -p rskim --bins -j 4 -E 'test(/push/)'`. **These two are F8's
+  *acceptance* surface as well as its regression guard** — see the rewritten
+  `Acceptance (argv)` field for why a test-only commit has no other honest one.
 - **Re-bless:** none
 - **Status:** LANDED
 
@@ -1081,6 +1376,12 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   call sites in total, and `crates/rskim/src/cmd/git/log.rs:192` is a second one inside the
   git subsystem (the large-output degrade path, which appends an elision marker of its
   own); confirm it is not a second leak before asserting that `:532` is the only one.
+  **Two line citations in this field corrected against disk at HEAD `44b41ed`:**
+  `emit_raw_passthrough_split` is at `execution.rs:313`, not the `:257` written above, and
+  the second git-subsystem call site is `crates/rskim/src/cmd/git/log.rs:198`, not `:192`.
+  The three load-bearing calls and the one mirror all resolve as written —
+  `cmd/log.rs:128`, `cmd/test/shared.rs:184`, `cmd/test/shared.rs:231`, and `ensure_newline`
+  at `passthrough_stream.rs:148` inside the `:143-152` mirror.
 - **Regression test:** `rskim` · `tests/cli_curl_fidelity.rs::{unterminated_body_is_byte_identical_to_raw_curl`
   (`:258`), `single_byte_body_is_byte_identical_to_raw_curl` (`:272`),
   `newline_terminated_body_is_byte_identical_to_raw_curl` (`:289`),
@@ -1100,9 +1401,18 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   **Corrected against the working tree:** the plan named
   `tests/cli_git_contract_flags.rs::porcelain_z_output_has_no_extra_trailing_byte` and
   `src/cmd/execution.rs::test_emit_raw_passthrough_exact_appends_nothing` — **neither
-  exists.** The helper itself does land: `exec::emit_raw_passthrough_exact` is
+  exists**, and this field previously stopped there without naming what does. On the
+  contract-flag side the equivalent coverage landed as
+  `tests/cli_git_contract_flags.rs::status_porcelain_nul_stream_gains_no_trailing_newline`
+  (`:384`), with the `-z` cluster form beside it at
+  `status_short_nul_cluster_is_byte_identical_to_git` (`:413`) — both verified at HEAD
+  `44b41ed`. On the unit side the three `execution.rs` pins enumerated above are the
+  replacement, and the third of them is the compile-level one. The helper itself does land:
+  `exec::emit_raw_passthrough_exact` is
   `execution.rs:266`, called at `:1728` (the generic sink, the reachable leak) and at
-  `git/mod.rs:886` (the defense-in-depth git arm).
+  `git/mod.rs:984` (the defense-in-depth git arm — **line corrected against disk from
+  `:886`**, which the second `--json` fix, `0194bea`, displaced by adding 303 lines to
+  that file).
 - **Re-bless:** none
 - **Status:** LANDED
 
@@ -1198,17 +1508,38 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   `Mode::Pseudo` on the blob path is a documented decision (`AD-GIT-SHOW-PSEUDO`, "Fix D")
   pinned by three tests, and the commit message must say so and record that the original
   rationale has partly decayed — it cites stripping "visibility modifiers", which Rust
-  pseudo no longer does (`pseudo.rs:290-297` records `visibility_modifier`'s removal from
+  pseudo no longer does (`pseudo.rs:318` — **line corrected against disk from
+  `:290-297`** — records `visibility_modifier`'s removal from
   `strip_kinds` as API surface).
-- **Regression test:** `rskim` · three **amended** tests in `src/cmd/git/show.rs` —
+- **Regression test:** **corrected against disk at HEAD `44b41ed`; every name this field
+  originally carried was a pre-fix or plan-shaped name, and none of them exists now.**
+  The three `src/cmd/git/show.rs` tests the field called "**amended**" —
   `test_fix_d_file_content_transform_uses_pseudo_mode` (`:1578`),
   `test_fix_d_pseudo_mode_preserves_function_body` (`:1598`),
-  `test_fix_d_pseudo_vs_structure_discriminates_body_tokens` (`:1633`) — plus
-  `rskim` · `tests/cli_git_show_blob.rs::{blob_default_is_byte_faithful, blob_honours_explicit_mode, blob_transform_emits_lossy_view_marker}`
-  (new) · `cargo nextest run -p rskim --bins -j 4 -E 'test(/show/)'` and
+  `test_fix_d_pseudo_vs_structure_discriminates_body_tokens` (`:1633`) — are the names and
+  the positions **as they stood at `c2b4378`** (confirmed by
+  `git show c2b4378:crates/rskim/src/cmd/git/show.rs`, where all three sit at exactly those
+  lines). Commit `9f0864e` did not amend them in place; it **replaced** them, so the
+  `Gate 4` characterisation "amended rather than supplemented" describes the *intent*, not
+  the landing. What pins the three parts of the AFTER field now, all in
+  `src/cmd/git/show.rs`:
+  `test_blob_default_selects_the_verbatim_view_not_a_transform` (`:1895`),
+  `test_blob_default_loses_nothing_and_only_a_named_mode_transforms` (`:1932`),
+  `test_opt_in_modes_really_transform_so_the_flag_is_not_vacuous` (`:1984`),
+  `test_blob_default_serves_bytes_identical_to_git_cat_file_blob` (`:2165`),
+  `test_mode_flag_is_taken_off_the_argv_and_never_reaches_git` (`:2259`),
+  `test_bad_mode_value_is_rejected_rather_than_forwarded_to_git` (`:2317`) and
+  `test_lossy_mode_emits_the_class_one_marker_on_stderr` (`:2358`) ·
+  `cargo nextest run -p rskim --bins -j 4 -E 'test(/show/)'`.
+  At the integration layer the field named
+  `blob_default_is_byte_faithful`, `blob_honours_explicit_mode` and
+  `blob_transform_emits_lossy_view_marker` — **none of the three exists**; they are
+  plan-shaped names. `crates/rskim/tests/cli_git_show_blob.rs` contains exactly three
+  tests, one per AFTER part, and they are the real ones:
+  `test_blob_default_is_byte_identical_to_git_cat_file_blob` (`:374`),
+  `test_blob_mode_full_exits_zero_and_serves_the_bytes` (`:430`),
+  `test_blob_lossy_mode_discloses_itself_unconditionally` (`:479`) ·
   `cargo build -p rskim && cargo nextest run -p rskim --test cli_git_show_blob -j 4`.
-  Per Gate 4 these three are the **only** tests in the campaign that must be amended
-  rather than supplemented.
 - **Re-bless:** none
 - **Status:** LANDED
 
@@ -1277,8 +1608,10 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   summary on both the JSON and the regex tier, and the `problems` detail lines keep their
   existing `{name}@{version}: {msg}` shape. Output grows, so the ADR-001 flip risk is
   real and must be measured, not reasoned about.
-- **Regression test:** `rskim` · `src/cmd/pkg/npm/ls.rs::{test_ls_json_keeps_versions_on_clean_tree, test_ls_regex_keeps_versions}`
-  (new, in this module's own `#[cfg(test)]` block — **not** in
+- **Regression test:** `rskim` · `src/cmd/pkg/npm/ls.rs::{test_ls_json_keeps_versions_on_clean_tree`
+  (`:220`), `test_ls_regex_keeps_versions` (`:256`)`}` — **both verified against disk at
+  HEAD `44b41ed`; lines added, neither name drifted** — (in this module's own
+  `#[cfg(test)]` block — **not** in
   `tests/cli_e2e_pkg_parsers.rs`, which spawns a nested cargo and would make the fast loop
   expensive) · `cargo nextest run -p rskim --bins -j 4 -E 'test(/npm/)'`
 - **Re-bless:** none
@@ -1381,9 +1714,20 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   **cannot label a run ID at all**. There is no divergence to reconcile because there is
   no run-ID label on that path, and changing the anchor to create one would **regress
   `gh pr list`**, whose rows genuinely do start with the number the `#` belongs to.
-- **Regression test:** `rskim` · `src/cmd/infra/gh/list.rs::{test_run_list_label_has_no_hash_prefix, test_issue_list_label_keeps_hash_prefix, test_regex_tier_run_list_label_has_no_hash_prefix}`
-  (new, beside the existing fixtures at `:718`/`:740`/`:790`) ·
-  `cargo nextest run -p rskim --bins -j 4 -E 'test(/gh/)'`
+- **Regression test:** `rskim` · `src/cmd/infra/gh/list.rs::{test_run_list_label_has_no_hash_prefix`
+  (`:842`), `test_issue_list_label_keeps_hash_prefix` (`:870`),
+  `test_regex_tier_declines_real_run_list_text` (`:917`),
+  `test_regex_tier_labels_a_leading_number_column_with_a_hash` (`:937`)`}` ·
+  `cargo nextest run -p rskim --bins -j 4 -E 'test(/gh/)'`.
+  **Names corrected against disk at HEAD `44b41ed`.** The first two exist as the field
+  named them. The third, `test_regex_tier_run_list_label_has_no_hash_prefix`, **does not
+  exist** — and its absence is correct rather than an omission: the AFTER field's ruling
+  is that the regex tier is deliberately *not* changed because it cannot label a run ID at
+  all. The tier is covered instead by the **two** tests that pin exactly that ruling —
+  `test_regex_tier_declines_real_run_list_text` pins the decline on real `run list` text,
+  and `test_regex_tier_labels_a_leading_number_column_with_a_hash` pins that a genuine
+  leading-number column (`gh pr list`) keeps its `#`. The pair matches the landed decision
+  where the single invented name would have contradicted it
 - **Re-bless:** none
 - **Status:** LANDED
 
@@ -1654,10 +1998,23 @@ Rows are in **commit-sequence order**, which is not ID order and not wave order.
   empty zone, so `--passthrough` reaches `grep` untouched. `test_security5_passthrough_as_grep_data_arg_not_consumed`
   (`crates/rskim/tests/cli_passthrough_coverage.rs:1304`) must **not** be reverted,
   weakened or amended.
-- **Regression test:** `rskim` · `src/main.rs::{test_first_positional_*, test_is_subcommand_token_*}`
-  (new) and `rskim` · `tests/cli_passthrough_coverage.rs::passthrough_after_file_positional_is_honoured`
-  (new) · `cargo nextest run -p rskim --bins -j 4 -E 'test(/positional/)'` and
-  `cargo build -p rskim && cargo nextest run -p rskim --test cli_passthrough_coverage -j 4`
+- **Regression test:** `rskim` · `src/main.rs::{test_first_positional_*` (**seven**, at
+  `:1870`, `:1880`, `:1887`, `:1897`, `:1906`, `:1915`, `:1923`)`,
+  test_is_subcommand_token_*}` (**two**: `test_is_subcommand_token_accepts_known_names`
+  `:1929`, `test_is_subcommand_token_rejects_file_like_and_unknown` `:1941`) — **both
+  wildcards verified against disk at HEAD `44b41ed`; both resolve** ·
+  `cargo nextest run -p rskim --bins -j 4 -E 'test(/positional/)'` — and `rskim` ·
+  `tests/cli_passthrough_coverage.rs::{test_f11_passthrough_after_file_positional_serves_raw`
+  (`:1426`), `test_f11_passthrough_after_separate_token_flag_value_serves_raw` (`:1464`),
+  `test_f11_debug_honoured_in_every_flag_zone_position` (`:1495`),
+  `test_f11_end_of_options_separator_still_bounds_the_flag_zone` (`:1531`),
+  `test_f11_zone_stops_at_subcommand_so_grep_argv_is_exact` (`:1557`)`}` ·
+  `cargo build -p rskim && cargo nextest run -p rskim --test cli_passthrough_coverage -j 4`.
+  **Name corrected against disk:** the field named
+  `passthrough_after_file_positional_is_honoured`, which **does not exist**; the landed
+  test is `test_f11_passthrough_after_file_positional_serves_raw`, and it has **four
+  siblings** the field did not mention — including the `--` separator bound and the
+  subcommand-zone stop, which are the two cases most likely to regress.
 - **Re-bless:** none, but note that `crates/rskim/src/main.rs` is one of `ci.yml`'s
   `SEARCH_PATHS`, so this commit arms the `Search Scoreboard` job. The job is a no-op pass
   for this change (nothing in `rskim-search` or the bench path reaches the flag zone), and
@@ -1771,7 +2128,9 @@ variable annotations (`x: int = 5`), because the two produce **identical parent 
 only ancestor scope distinguishes them. Distinguishing them needs a threaded
 `in_class_body` bool, an `@dataclass` decorator check, and a new fixture, and it would
 force amending `test_python_pseudo_strips_variable_annotation`
-(`crates/rskim-core/src/transform/pseudo.rs:1382`). There is **no reported instance** of
+(`crates/rskim-core/src/transform/pseudo.rs:1869` — **line corrected against disk at HEAD
+`44b41ed` from `:1382`**; the test exists and still pins correct behaviour, which is what
+makes this deferral a cost judgement rather than a gap). There is **no reported instance** of
 this defect. That combination — speculative benefit against a real amendment to a test
 that currently pins correct behaviour — is why it is out. It is not a disagreement about
 whether dataclass fields are API surface; they plausibly are. It is a cost judgement,
@@ -1798,13 +2157,81 @@ format switch (`#509` — a deliberate class-2 policy), and the ugrep regex erro
 
 ## Notes
 
-This section records **pre-existing failures found during the campaign that are
-deliberately not fixed here.** Per the plan's failure-and-recovery rule, a failing test
+This section records **campaign-level observations that belong to no single fix**: (1)
+pre-existing failures found during the campaign and deliberately not fixed here, (2)
+verification outcomes across the whole batch, and (3) process findings about how the
+artifact itself was assembled. Only (1) was in its original charter; (2) and (3) were added
+when they arose, because a per-fix section cannot hold a finding whose subject is the set of
+fixes. Per the plan's failure-and-recovery rule, a failing test
 must be classified as a regression or as pre-existing *before* it is debugged — run it at
 `origin/main` in a scratch worktree, not on this branch. A pre-existing failure is
 recorded here, is not fixed in this PR, and does not gate it; absorbing unrelated repairs
 is how a 13-fix batch becomes unreviewable. Also record here any CI red that reproduces at
 `origin/main`, with its issue number in backticks.
+
+**Final end-to-end verification pass, at HEAD `44b41ed`.** Recorded here although it is a
+*verification outcome* rather than a pre-existing failure — wider than this section's
+stated scope, noted so the widening is visible rather than assumed. All **17** acceptance
+commands were re-run against the release binary built at `44b41ed`. Result:
+**16 PASS / 1 FAIL.** The single FAIL is **F8**, and it is a defect in the *acceptance
+command*, not in the code: that field named a single-ref `git push --delete`, which is
+structurally unsatisfiable because the render always ties on bytes and ADR-001 elects
+`Passthrough` on a tie (see F8's `Precondition` for the algebra and
+`output/fidelity.rs:347` for the enforcement). The code is confirmed correct three
+independent ways — a 2-or-more-ref delete, `--json`, and the unit tests. F8's
+`Acceptance (argv)` and `Precondition` fields have been rewritten accordingly; the
+`LANDED` status stands, because the fix landed and only its check was wrong.
+
+**This is the FIFTH time in this campaign that an acceptance command proved wrong while
+the fix proved right.** The four earlier instances are each recorded in place, and the
+pattern is legible in the language those fields carry — *premise corrected*, *reframed
+from the plan*, *structurally unreachable at the CLI*, *corrected against the working
+tree*. A ledger whose acceptance commands are wrong five times while its fixes are wrong
+none is telling you where the review effort belongs, and it is not the code.
+
+**Two — now three — acceptance commands are satisfied by source audit rather than by
+execution, which is strong evidence but not identical evidence.** **C0g**'s and **F5**'s
+own `Acceptance (argv)` fields require `cargo` (`cargo build -p rskim` plus a `nextest`
+run, in both cases), which the verification brief forbade. Both were therefore satisfied
+by reading the source rather than by running the commands the ledger names. For C0g that
+is close to sufficient — its own field already calls a source audit the acceptance surface
+— but it is still not the same as having watched the assertion fire. Re-run both under
+`cargo` before treating either as *executed*. **F8's rewritten acceptance now joins them:**
+making the unit test the acceptance surface makes `cargo` a hard dependency of F8's
+acceptance too, so the cargo-dependent count is **three**, not two. That is a real
+consequence of the rewrite and not a hidden cost — an unsatisfiable argv traded for a
+satisfiable command this particular pass could not run.
+
+**Process finding — why this artifact needed six rounds of correction, and what the next
+campaign should do differently.** Each round of corrections found more than the last. That
+is structural rather than careless, and it is worth writing down because the next batch will
+reproduce it otherwise.
+
+Seventeen sections were authored by **fourteen different agents**. Each named the regression
+test it *intended* to write. The names then drifted as the tests were actually written —
+`log_stat_reaches_the_reader` became
+`log_stat_family_is_byte_identical_and_pairwise_distinct`, `blob_default_is_byte_faithful`
+became `test_blob_default_is_byte_identical_to_git_cat_file_blob`, `test_contract_flag_gate_*`
+became nine differently-prefixed predicates — and **nothing reconciled the two**, because
+the integrity criterion in force was *"did the agent report it?"* rather than *"does it
+exist on disk?"*
+
+**The lesson: an artifact assembled from many agents' self-reports needs a mechanical
+verification pass against the tree, not a review.** A reviewer reads for plausibility, and
+every one of these names was plausible — they were well-formed, idiomatic, and described
+exactly the right behaviour. Plausibility is precisely the property a drifted name retains.
+Only `grep` distinguishes a name that exists from a name that should.
+
+**A near-miss worth recording, because it is the trap a verification pass can still fall
+into.** An earlier pass reported "30 of 30 path claims resolve." That was **true and
+misleading**: it verified the *files*, not the *identifiers inside them*. Every one of the
+fabricated test names above lives in a file that does resolve. A path-level check is not an
+identifier-level check, and reporting the former as coverage of the latter is how a green
+verification pass certifies a broken artifact. **Verify the leaves, not the directories.**
+
+Concretely, for the next campaign: have each agent emit its regression-test names, then run
+one scripted `grep` of every name against the tree before the ledger is committed, and fail
+the commit on any miss. The cost is one script; the alternative is six rounds.
 
 **(a) `cargo nextest run -p rskim-core` reported `833 passed (1 leaky)` on one run and
 `833 passed` on the previous one** — across a **comments-only change that provably
