@@ -107,6 +107,7 @@ pub(super) fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
     Some(RewriteResult {
         tokens,
         category: RewriteCategory::Read,
+        masks_output: false,
     })
 }
 
@@ -213,6 +214,7 @@ fn try_rewrite_head_tail(args: &[&str], line_flag: &str) -> Option<RewriteResult
     Some(RewriteResult {
         tokens,
         category: RewriteCategory::Read,
+        masks_output: false,
     })
 }
 

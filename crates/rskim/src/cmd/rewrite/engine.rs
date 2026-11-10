@@ -22,6 +22,21 @@ fn should_skip_by_flag(middle: &[&str], skip_prefixes: &[&str]) -> bool {
     })
 }
 
+/// Return `true` when a rewrite to `rewrite_to` sends the command through a tool
+/// whose output skim must mask.
+///
+/// `skim env` and `skim printenv` mask variable values: those two names are
+/// exactly [`crate::cmd::redaction_is_mandatory`]. `skim curl` masks the auth
+/// headers it prints, and that masking runs only inside `skim curl`, so curl is
+/// added here and not to `redaction_is_mandatory`, which also gates the raw-serve
+/// paths for `env`.
+fn rewrites_to_masking_tool(rewrite_to: &[&str]) -> bool {
+    matches!(
+        rewrite_to,
+        ["skim", tool] if crate::cmd::redaction_is_mandatory(tool) || *tool == "curl"
+    )
+}
+
 /// Attempt to rewrite a tokenized command. Returns `Some(RewriteResult)` on
 /// match, `None` if no rewrite applies.
 ///
@@ -228,6 +243,7 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
         return Some(RewriteResult {
             tokens: output,
             category: rule.category,
+            masks_output: rewrites_to_masking_tool(rule.rewrite_to),
         });
     }
 

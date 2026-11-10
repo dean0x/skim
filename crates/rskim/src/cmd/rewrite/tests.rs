@@ -1087,6 +1087,11 @@ fn test_require_flags_exact_values_and_arg_matches_flag_cross_source_pin() {
 /// or None.  Mirrors the hook's `run_hook_mode` compound dispatch verbatim so
 /// the drift-guard test drives a code path independent of `classify_command`.
 fn engine_rewrite(shape: &str) -> Option<String> {
+    engine_result(shape).map(|r| r.tokens.join(" "))
+}
+
+/// [`engine_rewrite`], returning the structured result instead of the joined text.
+fn engine_result(shape: &str) -> Option<RewriteResult> {
     use super::compound::{split_compound, try_rewrite_compound};
     use super::engine::try_rewrite;
     use super::types::CompoundSplitResult;
@@ -1095,17 +1100,99 @@ fn engine_rewrite(shape: &str) -> Option<String> {
         shape.contains("&&") || shape.contains("||") || shape.contains(';') || shape.contains('|');
     if !has_operator {
         let tokens: Vec<&str> = shape.split_whitespace().collect();
-        return try_rewrite(&tokens).map(|r| r.tokens.join(" "));
+        return try_rewrite(&tokens);
     }
     match split_compound(shape) {
         CompoundSplitResult::Bail => None,
         CompoundSplitResult::Simple(simple_tokens) => {
             let refs: Vec<&str> = simple_tokens.iter().map(|s| s.as_str()).collect();
-            try_rewrite(&refs).map(|r| r.tokens.join(" "))
+            try_rewrite(&refs)
         }
-        CompoundSplitResult::Compound(segments) => {
-            try_rewrite_compound(&segments).map(|r| r.tokens.join(" "))
-        }
+        CompoundSplitResult::Compound(segments) => try_rewrite_compound(&segments),
+    }
+}
+
+// ========================================================================
+// RewriteResult::masks_output — rewrites that route through a masking tool
+// ========================================================================
+
+/// `env`, `printenv` and `curl` rewrite to the skim tools that mask output.
+#[test]
+fn test_masks_output_true_for_env_printenv_and_curl() {
+    for shape in [
+        "env",
+        "printenv",
+        "printenv HOME",
+        "curl https://example.com",
+        "curl -I https://example.com",
+        "TOKEN=abc curl https://example.com",
+    ] {
+        let result = engine_result(shape).unwrap_or_else(|| panic!("{shape:?} must rewrite"));
+        assert!(result.masks_output, "{shape:?} must report masks_output");
+    }
+}
+
+/// Every other rewrite masks nothing, including the custom `cat`/`head`/`tail` ones.
+#[test]
+fn test_masks_output_false_for_other_rewrites() {
+    for shape in [
+        "cargo test",
+        "git status",
+        "cat src/main.rs",
+        "head -n 5 src/main.rs",
+        "tail -n 5 src/main.rs",
+        "dig example.com",
+    ] {
+        let result = engine_result(shape).unwrap_or_else(|| panic!("{shape:?} must rewrite"));
+        assert!(
+            !result.masks_output,
+            "{shape:?} must not report masks_output"
+        );
+    }
+}
+
+/// A command the rule declines is not rewritten, so there is no result to mask.
+#[test]
+fn test_masks_output_absent_when_the_masking_rule_declines() {
+    for shape in [
+        "env FOO=bar cargo test",
+        "env -i bash",
+        "curl -o out.txt https://example.com",
+        "curl -X POST https://example.com",
+    ] {
+        assert!(engine_result(shape).is_none(), "{shape:?} must not rewrite");
+    }
+}
+
+/// A compound reports `masks_output` when any rewritten segment does.
+#[test]
+fn test_masks_output_compound_true_when_any_rewritten_segment_masks() {
+    for shape in [
+        "env && cargo test",
+        "cargo test && env",
+        "cargo build ; curl https://example.com",
+        "printenv || cargo test",
+    ] {
+        let result = engine_result(shape).unwrap_or_else(|| panic!("{shape:?} must rewrite"));
+        assert!(result.masks_output, "{shape:?} must report masks_output");
+    }
+}
+
+/// A compound with no masking segment reports false, and so does one whose
+/// masking-tool segment is the user's own `skim env` (the engine did not
+/// rewrite it).
+#[test]
+fn test_masks_output_compound_false_without_a_rewritten_masking_segment() {
+    for shape in [
+        "cargo test && cargo build",
+        "echo hi && skim env && cargo test",
+        "env FOO=bar cargo test && cargo build",
+    ] {
+        let result = engine_result(shape).unwrap_or_else(|| panic!("{shape:?} must rewrite"));
+        assert!(
+            !result.masks_output,
+            "{shape:?} must not report masks_output"
+        );
     }
 }
 

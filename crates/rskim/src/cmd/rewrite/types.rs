@@ -68,6 +68,11 @@ pub(super) struct RewriteRule {
 pub(super) struct RewriteResult {
     pub(super) tokens: Vec<String>,
     pub(super) category: RewriteCategory,
+    /// `true` when the rewrite sends a command through a tool whose output skim
+    /// must mask (`skim env`, `skim printenv`, `skim curl`). For a compound
+    /// rewrite, `true` when any rewritten segment does. The hook keeps such a
+    /// rewrite even in auto permission mode.
+    pub(super) masks_output: bool,
 }
 
 // ---- Compound command types (#45) ----
