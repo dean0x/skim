@@ -32,6 +32,10 @@ fn should_skip_by_flag(middle: &[&str], skip_prefixes: &[&str]) -> bool {
 /// continues (not returns) — but if a LATER rule then matches, the skipped
 /// more-specific rule suppresses the rewrite (returns `None`).  This keeps
 /// "specific rule said no" authoritative over broader catch-alls.
+///
+/// A rewrite, from a rule or from a `cat`/`head`/`tail` handler, is returned
+/// only when its program resolves (Step 2b, see
+/// [`target_program_is_unresolvable`]).
 pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
     if tokens.is_empty() {
         return None;
@@ -67,38 +71,6 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
     // nothing.  #317 requires byte-faithful reconstruction or a bail, so bail:
     // the real command runs untouched, at the cost of compression for this shape.
     if has_cargo_toolchain_override(command_tokens) {
-        return None;
-    }
-
-    // Step 2b: Bail when the target program cannot be resolved as a binary.
-    //
-    // Every rewrite in the table replaces the program the shell would have run
-    // with `skim <program> …`, and skim then spawns `<program>` itself through
-    // `std::process::Command`.  When nothing on PATH answers to that name the
-    // rewritten command cannot run at all, so the rewrite does not degrade the
-    // reader's view — it destroys the answer.  Measured on the host that
-    // motivated this bail, where Claude Code supplies `rg` as a shell FUNCTION
-    // with no `rg` binary anywhere: `rg -n 'fn main' crates/` returns 20711
-    // bytes and exit 0, while the rewrite `skim rg -n 'fn main' crates/`
-    // returns 0 bytes and exit 1 — and exit 1 is also ripgrep's own no-matches
-    // code, so "your search tool is missing" is indistinguishable from "your
-    // pattern matched nothing".  #317 requires byte-faithful reconstruction or
-    // a bail, so bail: the real command runs untouched, at the cost of
-    // compression for this shape — which for a byte-faithful RawPassthrough
-    // tool like `rg` is measured at exactly zero (458 B in, 458 B out,
-    // identical sha256; ADR-009).  SEE: PF-038.
-    //
-    // GLOBAL rather than per-rule, for two independent reasons.  The predicate
-    // is program-agnostic: it asks nothing about which rule would fire, only
-    // whether the token the shell would have executed is spawnable.  And
-    // `RewriteRule` structurally cannot express it — every one of its seven
-    // fields is a compile-time constant (`&'static [&'static str]`, `bool`, or
-    // a `Copy` enum), so no rule can carry a runtime probe.
-    //
-    // Placed after Step 1's env strip so the probe sees the COMMAND token
-    // rather than a leading `VAR=value` assignment, which would be
-    // unresolvable for every env-prefixed command.
-    if target_program_is_unresolvable(command_tokens) {
         return None;
     }
 
@@ -216,6 +188,11 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
             return None;
         }
 
+        // Step 2b: the rule fires only for a program skim can spawn.
+        if target_program_is_unresolvable(command_tokens) {
+            return None;
+        }
+
         // Normal match — build rewrite output.
         // For global-flag matches, preserve the original token order so that
         // global flags remain in the output (e.g. `kubectl -n ns get pods`
@@ -255,7 +232,14 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
     }
 
     // No rule matched — fall through to custom handlers for cat/head/tail.
-    try_custom_handlers(env_vars, command_tokens)
+    let rewrite = try_custom_handlers(env_vars, command_tokens)?;
+
+    // Step 2b: a handler rewrite stands only for a program skim can spawn.
+    if target_program_is_unresolvable(command_tokens) {
+        return None;
+    }
+
+    Some(rewrite)
 }
 
 /// Skip global flags in a token slice to find the subcommand index.
@@ -334,7 +318,47 @@ pub(super) fn strip_env_vars(tokens: &[&str]) -> usize {
     count
 }
 
-/// Return `true` when the program `command_tokens` would run cannot be resolved.
+/// Step 2b: return `true` when the program `command_tokens` would run cannot be
+/// resolved, so the rewrite must be dropped.
+///
+/// # Why a rewrite needs a resolvable program
+///
+/// Every rewrite replaces the program the shell would have run with
+/// `skim <program> …`, and skim then spawns `<program>` itself through
+/// `std::process::Command`.  When nothing on PATH answers to that name the
+/// rewritten command cannot run at all, so the rewrite does not degrade the
+/// reader's view — it destroys the answer.  Measured on the host that motivated
+/// this bail, where Claude Code supplies `rg` as a shell FUNCTION with no `rg`
+/// binary anywhere: `rg -n 'fn main' crates/` returns 20711 bytes and exit 0,
+/// while the rewrite `skim rg -n 'fn main' crates/` returns 0 bytes and exit 1 —
+/// and exit 1 is also ripgrep's own no-matches code, so "your search tool is
+/// missing" is indistinguishable from "your pattern matched nothing".  #317
+/// requires byte-faithful reconstruction or a bail, so bail: the real command
+/// runs untouched, at the cost of compression for this shape — which for a
+/// byte-faithful RawPassthrough tool like `rg` is measured at exactly zero
+/// (458 B in, 458 B out, identical sha256; ADR-009).  SEE: PF-038.
+///
+/// # Where it runs
+///
+/// Global in effect, at the two points where `try_rewrite` has produced a
+/// rewrite: after a rule matches, and after a `cat`/`head`/`tail` handler
+/// accepts.  It is program-agnostic — it asks nothing about which rule fired,
+/// only whether the token the shell would have executed is spawnable — and
+/// `RewriteRule` structurally cannot express it: every one of its fields is a
+/// compile-time constant (`&'static [&'static str]`, `bool`, or a `Copy` enum),
+/// so no rule can carry a runtime probe.
+///
+/// It runs ONLY after a match, and never on the raw first token of an arbitrary
+/// command.  Rule matching compares the first token exactly, so the token probed
+/// is always a rule head or a handler name: a bare name searched on `PATH`, or
+/// the cwd-relative `./gradlew` / `./mvnw`.  The probe therefore stats
+/// `<PATH dir>/<known name>` or a wrapper script in the working directory, and
+/// never a path the command text chose; it also leaves the process-wide verdict
+/// cache with a closed key set.  A command no rule or handler rewrites is
+/// returned as `None` without touching the filesystem.  Callers pass the tokens
+/// after the env-var strip, so the probe sees the COMMAND token and not a leading
+/// `VAR=value` assignment, which would be unresolvable for every env-prefixed
+/// command.
 ///
 /// `command_tokens[0]` is both the program the shell would have executed and the
 /// program skim spawns after a rewrite, so it is the only token whose
@@ -1137,5 +1161,135 @@ mod tests {
             !with_resolver(|_| false, || target_program_is_unresolvable(&[])),
             "an empty token slice must not be reported as unresolvable"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Which tokens reach the probe
+    // ------------------------------------------------------------------------
+
+    thread_local! {
+        /// Every program the Step 2b probe was asked about on this thread, in
+        /// call order.  A thread-local for the same reason as
+        /// [`RESOLVER_OVERRIDE`]: the probe is a plain `fn` pointer and cannot
+        /// capture a recorder, and libtest gives each test its own thread.
+        static PROBED: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A resolver that records the program it is asked about and declines it.
+    fn records_and_declines(program: &str) -> bool {
+        PROBED.with_borrow_mut(|probed| probed.push(program.to_string()));
+        false
+    }
+
+    /// Run [`try_rewrite`] under [`records_and_declines`]; return its verdict
+    /// and every program the probe saw.
+    fn rewrite_recording_probes(tokens: &[&str]) -> (Option<RewriteResult>, Vec<String>) {
+        PROBED.with_borrow_mut(Vec::clear);
+        let result = with_resolver(records_and_declines, || try_rewrite(tokens));
+        (result, PROBED.with_borrow_mut(std::mem::take))
+    }
+
+    /// A first token no rule or handler can match must never reach the probe.
+    ///
+    /// The probe stats the token it is given, so a token the command text chose
+    /// — an absolute path, a UNC path, a path spelling of a rewritable name —
+    /// would be stat'd before any permission decision if it were probed.  Rule
+    /// matching compares the first token exactly, so such a token cannot be
+    /// rewritten and has no reason to be resolved.
+    #[test]
+    fn test_unrewritable_first_token_is_never_probed() {
+        for tokens in [
+            vec!["/net/host/x", "-n", "pattern"],
+            vec!["//host/share/x"],
+            vec!["\\\\host\\share\\x"],
+            vec!["../escape/rg", "pattern"],
+            vec!["/usr/bin/rg", "pattern"],
+            vec!["echo", "hello"],
+            vec!["SOME_VAR=1", "/net/host/x"],
+        ] {
+            let (result, probed) = rewrite_recording_probes(&tokens);
+            assert!(result.is_none(), "{tokens:?} matches no rule or handler");
+            assert!(
+                probed.is_empty(),
+                "{tokens:?} must not reach the resolvability probe, but it probed {probed:?}"
+            );
+        }
+    }
+
+    /// A rule or handler that matches the program but then declines the
+    /// command rewrites nothing, so there is nothing to resolve.
+    #[test]
+    fn test_declined_rewrite_never_probes_its_program() {
+        for tokens in [
+            // Skip flag fires on the `rg` rule.
+            vec!["rg", "-h"],
+            // `cat` handler rejects a non-code file.
+            vec!["cat", "notes.txt"],
+            // `head` handler rejects a byte count.
+            vec!["head", "-c", "100", "file.rs"],
+        ] {
+            let (result, probed) = rewrite_recording_probes(&tokens);
+            assert!(result.is_none(), "{tokens:?} must not rewrite");
+            assert!(
+                probed.is_empty(),
+                "{tokens:?} rewrites nothing, so it must not probe; it probed {probed:?}"
+            );
+        }
+    }
+
+    /// A rewritable program that cannot be resolved still declines, and the
+    /// probe is asked about exactly that program, once.
+    ///
+    /// The control (same tokens, resolvable program) keeps the decline from
+    /// passing because the tokens matched nothing.
+    #[test]
+    fn test_rewritable_unresolvable_program_declines_and_is_probed_once() {
+        for (tokens, program) in [
+            (vec!["rg", "-n", "x", "src/"], "rg"),
+            (vec!["git", "status"], "git"),
+            (vec!["RUST_LOG=debug", "cargo", "test"], "cargo"),
+            (vec!["cat", "file.ts"], "cat"),
+            (vec!["tail", "-n", "20", "file.py"], "tail"),
+            (vec!["./gradlew", "build"], "./gradlew"),
+        ] {
+            assert!(
+                with_resolver(|_| true, || try_rewrite(&tokens)).is_some(),
+                "control: {tokens:?} must rewrite while its program resolves"
+            );
+            let (result, probed) = rewrite_recording_probes(&tokens);
+            assert!(
+                result.is_none(),
+                "{tokens:?} must decline when {program} is unresolvable"
+            );
+            assert_eq!(
+                probed,
+                vec![program.to_string()],
+                "{tokens:?} must probe its program once and nothing else"
+            );
+        }
+    }
+
+    /// Every rule head is a bare name or a cwd-relative `./name`.
+    ///
+    /// The probe is reached only with a token equal to a rule head or a handler
+    /// name, so this is what bounds the paths the probe can stat to
+    /// `<PATH dir>/<known name>` and `./<known name>`.  A rule with an empty
+    /// prefix would match every command and hand the probe whatever token the
+    /// command text chose; a head with `..`, `\` or an absolute path would make
+    /// the probe stat somewhere other than a `PATH` entry.
+    #[test]
+    fn test_rule_heads_are_bare_names_or_cwd_relative() {
+        for rule in rules::all_rules() {
+            let head = rule
+                .prefix
+                .first()
+                .unwrap_or_else(|| panic!("a rule with an empty prefix matches every command"));
+            let name = head.strip_prefix("./").unwrap_or(head);
+            assert!(
+                !name.is_empty() && !name.contains(['/', '\\']) && name != "..",
+                "rule head {head:?} must be a bare name or `./name`"
+            );
+        }
     }
 }

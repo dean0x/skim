@@ -498,6 +498,16 @@ static PROGRAM_RESOLVES_CACHE: OnceLock<RwLock<HashMap<String, bool>>> = OnceLoc
 /// unresolvable: reachability cannot be verified, and for a caller deciding
 /// whether to rewrite, declining is the safe direction.
 ///
+/// # Who may call it
+///
+/// Pass only a program name the caller already knows it can act on.  Both the
+/// stat of an explicit path and the `PATH` walk touch the filesystem, and the
+/// verdict cache below keeps one entry per distinct string.  The rewrite engine
+/// calls this only after a rule or handler has matched, so the argument is
+/// always a rule head or handler name; a caller that passed text taken from a
+/// command line would let that text choose which paths are stat'd and how many
+/// entries are cached.
+///
 /// # Caching
 ///
 /// Verdicts are memoised because `cmd::rewrite::compound::try_rewrite_compound`
@@ -505,7 +515,8 @@ static PROGRAM_RESOLVES_CACHE: OnceLock<RwLock<HashMap<String, bool>>> = OnceLoc
 /// re-walk `PATH` several times for a single command.  The cache lives for the
 /// process and is never invalidated: skim does not mutate `PATH` after `main()`'s
 /// first statement, and does not run long enough for a tool to be installed
-/// underneath it.  A **poisoned** lock degrades to "assume it resolves" — the
+/// underneath it.  The cache has no eviction because its key set is closed (see
+/// above).  A **poisoned** lock degrades to "assume it resolves" — the
 /// behaviour before this probe existed — rather than panicking, because this
 /// code runs inside a PreToolUse hook where a panic is a failed hook.
 pub(crate) fn program_resolves(program: &str) -> bool {
