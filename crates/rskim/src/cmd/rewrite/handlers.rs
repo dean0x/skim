@@ -5,6 +5,12 @@
 
 use super::types::{RewriteCategory, RewriteResult};
 
+/// The name [`try_rewrite_cat`] gives itself in `RewriteResult::matched_prefix`.
+///
+/// No rule in the rewrite table has this prefix, so the marker cannot be taken
+/// for a rule match. `head` and `tail` carry no marker.
+pub(super) const CAT_HANDLER_PREFIX: &[&str] = &["cat"];
+
 /// Check if a file path has a known code extension.
 ///
 /// Extracts the extension from the path and checks against `Language::from_extension`.
@@ -108,6 +114,7 @@ pub(super) fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
         tokens,
         category: RewriteCategory::Read,
         masks_output: false,
+        matched_prefix: Some(CAT_HANDLER_PREFIX),
     })
 }
 
@@ -215,6 +222,7 @@ fn try_rewrite_head_tail(args: &[&str], line_flag: &str) -> Option<RewriteResult
         tokens,
         category: RewriteCategory::Read,
         masks_output: false,
+        matched_prefix: None,
     })
 }
 

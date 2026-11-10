@@ -30,7 +30,7 @@ fn should_skip_by_flag(middle: &[&str], skip_prefixes: &[&str]) -> bool {
 /// headers it prints, and that masking runs only inside `skim curl`, so curl is
 /// added here and not to `redaction_is_mandatory`, which also gates the raw-serve
 /// paths for `env`.
-fn rewrites_to_masking_tool(rewrite_to: &[&str]) -> bool {
+pub(super) fn rewrites_to_masking_tool(rewrite_to: &[&str]) -> bool {
     matches!(
         rewrite_to,
         ["skim", tool] if crate::cmd::redaction_is_mandatory(tool) || *tool == "curl"
@@ -244,6 +244,7 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
             tokens: output,
             category: rule.category,
             masks_output: rewrites_to_masking_tool(rule.rewrite_to),
+            matched_prefix: Some(rule.prefix),
         });
     }
 

@@ -1075,6 +1075,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
         tokens: parts,
         category: first_category.unwrap_or(RewriteCategory::Build),
         masks_output: any_masks_output,
+        matched_prefix: None,
     })
 }
 
