@@ -185,24 +185,29 @@ fn skim_flag_zone(pre_sep: &[String]) -> &[String] {
     }
 }
 
-/// The skim-flag zone on the **PATH-wrapper** surface: the leading run of
-/// flags, and nothing past the first non-flag token.
+/// The skim-flag zone on the **PATH-wrapper** surface: always empty.
 ///
-/// This is the pre-F11 rule, kept verbatim and scoped to the one surface where
-/// it is the correct rule.  Under a `~/.skim/bin/<tool>` symlink `argv[0]` is
-/// the tool, so *every* argument is the tool's and there is no positional that
-/// [`is_subcommand_token`] could recognise — [`skim_flag_zone`] would therefore
-/// widen to the whole command line.  Measured consequence of widening here:
-/// `docker run img cmd --passthrough` would flip skim into passthrough mode on
-/// a token that is the containerised command's own argument, and
-/// `strip_skim_flags` would then delete it from docker's argv — security-5's
-/// harm, on the other surface.  `SKIM_PASSTHROUGH=1` is the documented control
-/// for wrapper invocations.
+/// Under a `~/.skim/bin/<tool>` symlink `argv[0]` is the tool, so *every*
+/// argument belongs to the tool and skim reads no flag of its own from the
+/// line.  `SKIM_PASSTHROUGH=1` and `SKIM_DEBUG=1` are the controls on this
+/// surface.
+///
+/// No prefix rule is safe here, because skim cannot tell its own flag from a
+/// token that the tool owns.  Two measured shapes:
+///
+/// - After a positional: [`skim_flag_zone`] would widen to the whole line,
+///   because no positional is a subcommand token.  `docker run img cmd
+///   --passthrough` would then switch skim to passthrough mode on the
+///   containerised command's own argument, and `strip_skim_flags` would delete
+///   the token from docker's argv.
+/// - Inside a leading run of flags: the separate-token value of a tool flag
+///   starts with `-` too.  In `grep -e --passthrough f` the token is the
+///   pattern of `-e`.  A leading-flag rule would delete it, so grep would read
+///   its pattern `f` from stdin and answer wrongly with exit 0.
 ///
 /// PURITY: pure, allocation-free, spawns nothing (see [`first_positional`]).
 fn wrapper_flag_zone(pre_sep: &[String]) -> &[String] {
-    let leading = pre_sep.iter().take_while(|a| a.starts_with('-')).count();
-    &pre_sep[..leading]
+    &pre_sep[..0]
 }
 
 /// Pre-parse `std::env::args()` to decide whether to route to a subcommand
@@ -1030,8 +1035,9 @@ fn main() -> ExitCode {
     //
     // The rule is surface-scoped because the two surfaces ask different
     // questions: on a skim-typed line the args before a wrapped tool's name are
-    // skim's, while under a `~/.skim/bin/<tool>` symlink every arg is the tool's.
-    // See `wrapper_flag_zone` for the measured shape that keeps them apart.
+    // skim's, while under a `~/.skim/bin/<tool>` symlink every arg is the tool's
+    // and the zone is empty.  See `wrapper_flag_zone` for the measured shapes
+    // that keep them apart.
     let argv_for_flags: Vec<String> = std::env::args().skip(1).collect();
     let sep_pos = argv_for_flags
         .iter()
@@ -2025,47 +2031,27 @@ mod tests {
         ));
     }
 
-    /// The wrapper surface keeps the pre-F11 rule: nothing past the first
-    /// non-flag token.  Under a `~/.skim/bin/<tool>` symlink every argument is
-    /// the tool's, so `docker run img cmd --passthrough` must not flip skim's
-    /// mode and must not lose the token from docker's argv.
+    /// The wrapper surface reads no skim flag from the command line.  Under a
+    /// `~/.skim/bin/<tool>` symlink every argument is the tool's, so the zone is
+    /// empty.  `docker run img cmd --passthrough` must not flip skim's mode, and
+    /// `grep -e --passthrough f` must not lose its pattern from grep's argv.
     #[test]
-    fn test_wrapper_zone_stops_at_the_first_non_flag_token() {
-        let f = |args: &[&str], flag: &str| {
-            let argv = owned(args);
-            wrapper_flag_zone(&argv).iter().any(|a| a.as_str() == flag)
-        };
-        assert!(!f(&["run", "img", "cmd", "--passthrough"], "--passthrough"));
-        assert!(!f(&["status", "--passthrough"], "--passthrough"));
-        assert!(!f(&["pattern", "--passthrough"], "--passthrough"));
-        assert!(!f(&["install", "--debug"], "--debug"));
-        // Leading flags stay in the zone, exactly as before F11.
-        assert!(f(&["--passthrough", "foo"], "--passthrough"));
-        assert!(f(&["-e", "--passthrough", "f"], "--passthrough"));
-        assert_eq!(wrapper_flag_zone(&owned(&[])).len(), 0);
-    }
-
-    /// The two surface rules agree except where a skim-typed line has a
-    /// non-subcommand positional — the whole of F11's widening.  Anything the
-    /// wrapper rule admits, the skim rule admits too (it is never narrower),
-    /// so scoping cannot re-break a skim-typed invocation.
-    #[test]
-    fn test_skim_zone_is_never_narrower_than_the_wrapper_zone() {
+    fn test_wrapper_zone_is_empty() {
         let argvs: &[&[&str]] = &[
-            &["--debug", "--passthrough"],
-            &["grep", "-e", "--passthrough", "f.txt"],
-            &["sample.ts", "--passthrough"],
-            &["--mode", "structure", "--passthrough", "sample.ts"],
-            &["-j", "4", "git", "status"],
             &["run", "img", "cmd", "--passthrough"],
+            &["status", "--passthrough"],
+            &["install", "--debug"],
+            &["--passthrough", "foo"],
+            &["--debug", "--passthrough"],
+            &["-e", "--passthrough", "f"],
+            &["-e", "--debug", "f"],
             &[],
         ];
         for argv in argvs {
             let args = owned(argv);
             assert!(
-                skim_flag_zone(&args).len() >= wrapper_flag_zone(&args).len(),
-                "skim-typed zone must never be narrower than the wrapper zone \
-                 for {argv:?}"
+                wrapper_flag_zone(&args).is_empty(),
+                "wrapper zone must be empty for {argv:?}"
             );
         }
     }

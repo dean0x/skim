@@ -119,8 +119,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the zone and the scan stopped there, while `--mode=structure` happened to work. The zone
   now ends at the first positional only when that positional is a known subcommand, so
   `skim grep -e --passthrough f` still hands `--passthrough` to grep as pattern data. The
-  PATH-wrapper surface deliberately keeps the old rule — under a `~/.skim/bin/<tool>`
-  symlink every argument belongs to the wrapped tool; use `SKIM_PASSTHROUGH=1` there.
+  PATH-wrapper surface reads no skim flag from the command line — under a
+  `~/.skim/bin/<tool>` symlink every argument belongs to the wrapped tool, so
+  `~/.skim/bin/grep -e --passthrough f` also hands `--passthrough` to grep, and a leading
+  `--passthrough` or `--debug` is no longer read as a skim flag there. Use
+  `SKIM_PASSTHROUGH=1` or `SKIM_DEBUG=1` on that surface.
 
 - **The rewrite engine declines a command whose target binary cannot be resolved** — `rg …`
   was rewritten to `skim rg …` whether or not anything named `rg` could be found, replacing
