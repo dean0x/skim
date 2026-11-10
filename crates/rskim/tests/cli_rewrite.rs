@@ -1212,3 +1212,104 @@ fn test_rewrite_stub_path_makes_every_rewritable_program_resolvable() {
          new `/`-bearing entry is a hole in this harness, not a passing case."
     );
 }
+
+// ============================================================================
+// Production resolvability probe (#317 Step 2b / PF-038)
+// ============================================================================
+//
+// The unit tests in `cmd/rewrite/engine.rs` replace the probe with a test
+// override, and every other test in this file runs under `rewrite_stub_path()`,
+// where each rewritable program resolves.  So nothing above reaches the probe
+// the shipped binary uses.  These tests do: each runs the real binary with a
+// private `PATH`, and each pair holds the command fixed so that only whether
+// `rg` resolves changes between the two halves.
+
+/// A sandboxed skim whose `PATH` is exactly `path_dir`.
+///
+/// `skim_sandboxed` redirects `HOME` and `SKIM_CACHE_DIR` into `home`, which is
+/// what keeps hook mode's force-raw sidecar and `hook.log` away from the real
+/// cache (PF-017).  `PATH` is then replaced rather than prepended to, so the
+/// host's own `rg` (or any other tool) cannot make the program resolve.
+#[cfg(unix)]
+fn skim_with_private_path(
+    home: &std::path::Path,
+    path_dir: &std::path::Path,
+) -> assert_cmd::Command {
+    let mut cmd = common::skim_sandboxed(home);
+    cmd.env("PATH", path_dir);
+    cmd
+}
+
+/// A Claude Code PreToolUse payload for `command`.
+#[cfg(unix)]
+fn hook_payload(command: &str) -> String {
+    serde_json::json!({ "tool_input": { "command": command } }).to_string()
+}
+
+/// `skim rewrite rg -n x src/` declines when no `rg` is on `PATH`.
+#[cfg(unix)]
+#[test]
+fn test_rewrite_declines_a_program_that_resolves_nowhere() {
+    let home = TempDir::new().unwrap();
+    let empty_path = TempDir::new().unwrap();
+
+    skim_with_private_path(home.path(), empty_path.path())
+        .args(["rewrite", "rg", "-n", "x", "src/"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty());
+}
+
+/// The same tokens rewrite once a `rg` executable is on `PATH`.
+#[cfg(unix)]
+#[test]
+fn test_rewrite_rewrites_the_same_program_once_it_resolves() {
+    let home = TempDir::new().unwrap();
+    let path_dir = TempDir::new().unwrap();
+    common::make_stub(path_dir.path(), "rg", "", "", 0);
+
+    let output = skim_with_private_path(home.path(), path_dir.path())
+        .args(["rewrite", "rg", "-n", "x", "src/"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        String::from_utf8(output).unwrap().trim_end(),
+        "skim rg -n x src/"
+    );
+}
+
+/// Hook mode writes no response for `rg …` when no `rg` is on `PATH`, so the
+/// agent's original command runs untouched.
+#[cfg(unix)]
+#[test]
+fn test_hook_declines_a_program_that_resolves_nowhere() {
+    let home = TempDir::new().unwrap();
+    let empty_path = TempDir::new().unwrap();
+
+    skim_with_private_path(home.path(), empty_path.path())
+        .args(["rewrite", "--hook"])
+        .write_stdin(hook_payload("rg -n x src/"))
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+/// Hook mode answers the same command with a rewrite once `rg` resolves.
+#[cfg(unix)]
+#[test]
+fn test_hook_rewrites_the_same_program_once_it_resolves() {
+    let home = TempDir::new().unwrap();
+    let path_dir = TempDir::new().unwrap();
+    common::make_stub(path_dir.path(), "rg", "", "", 0);
+
+    skim_with_private_path(home.path(), path_dir.path())
+        .args(["rewrite", "--hook"])
+        .write_stdin(hook_payload("rg -n x src/"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim rg -n x src/"));
+}
