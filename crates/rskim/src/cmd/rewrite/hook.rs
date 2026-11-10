@@ -1,16 +1,20 @@
-//! Hook mode (#44) — Claude Code PreToolUse integration.
+//! Hook mode (#44) — agent hook integration.
 //!
 //! Runs as an agent PreToolUse hook via `HookProtocol`. Reads JSON from stdin,
 //! extracts the command field, rewrites if matched, and emits agent-specific
 //! hook-protocol JSON. Each agent's `format_response()` controls the response shape.
+//! A `PostToolUse` event goes to `post_hook::run_post_hook` instead.
 
 use std::io::Read;
 use std::process::ExitCode;
 
 use crate::cmd::session::AgentKind;
 
+use crate::cmd::hooks::claude::POST_TOOL_USE_EVENT;
+
 use super::compound::{command_needs_passthrough, split_compound, try_rewrite_compound};
 use super::engine::try_rewrite;
+use super::post_hook::run_post_hook;
 use super::types::{CompoundSplitResult, RewriteResult};
 
 // ============================================================================
@@ -323,7 +327,7 @@ fn log_declined_multiline(agent_name: &str) {
 /// The watchdog thread may call `process::exit(0)` after the flush completes;
 /// `write_all + flush` before returning ensures the full JSON is on the wire.
 #[allow(clippy::disallowed_methods)] // Hook JSON response to Claude; must hold lock across write+flush to prevent interleaving
-fn write_hook_response(response: &serde_json::Value) -> anyhow::Result<()> {
+pub(super) fn write_hook_response(response: &serde_json::Value) -> anyhow::Result<()> {
     use std::io::Write;
     let json_out = serde_json::to_string(response)?;
     let mut out = std::io::stdout().lock();
@@ -354,9 +358,14 @@ pub(super) fn parse_agent_flag(args: &[String]) -> Option<AgentKind> {
     result
 }
 
-/// Maximum bytes to read from stdin in hook mode (64 KiB).
-/// Hook payloads are small JSON objects; this prevents unbounded allocation.
+/// Maximum bytes the PreToolUse path reads from stdin (64 KiB).
+/// A PreToolUse payload is a small JSON object; this prevents unbounded allocation.
 pub(super) const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
+
+/// Maximum bytes the hook reads from stdin before it knows the event (1 MiB).
+/// A PostToolUse payload also holds the captured output of the tool call, which
+/// the post path accepts up to 29,000 characters. The cap bounds allocation.
+const HOOK_POST_MAX_STDIN_BYTES: u64 = 1024 * 1024;
 
 /// Maximum time (in seconds) a hook invocation is allowed before self-termination.
 ///
@@ -364,6 +373,9 @@ pub(super) const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 /// The hook exits cleanly (exit 0, empty stdout) on timeout — this is a
 /// passthrough, not an error. Logs a warning to hook.log for debugging.
 pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
+
+/// The `permission_mode` value of Claude Code's auto permission mode.
+pub(super) const AUTO_PERMISSION_MODE: &str = "auto";
 
 /// Whether the hook input says the agent runs in auto permission mode.
 ///
@@ -377,7 +389,7 @@ fn is_auto_permission_mode(input: &serde_json::Value) -> bool {
     input
         .get("permission_mode")
         .and_then(serde_json::Value::as_str)
-        == Some("auto")
+        == Some(AUTO_PERMISSION_MODE)
 }
 
 /// Whether the hook sends no response for a rewrite it found.
@@ -392,20 +404,135 @@ fn withholds_rewrite(input: &serde_json::Value, result: &RewriteResult) -> bool 
     is_auto_permission_mode(input) && !result.masks_output
 }
 
-/// Run as an agent PreToolUse hook.
+/// Why [`command_gates`] declined a command.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Decline {
+    AlreadySkim,
+    /// Not rebuildable byte for byte; `multiline` marks an interior newline.
+    Unsafe {
+        multiline: bool,
+    },
+    Empty,
+    /// A dev server or watcher, which never exits.
+    Indefinite,
+}
+
+/// The gates both hook paths apply before they look for a rewrite. Pure: each
+/// path decides what a [`Decline`] costs. Returns the tokens and whether the
+/// command holds a compound operator character.
+pub(super) fn command_gates(command: &str) -> Result<(Vec<&str>, bool), Decline> {
+    if command.starts_with("skim ") {
+        return Err(Decline::AlreadySkim);
+    }
+    // #317: bail before tokenizing on a shape the pipeline cannot rebuild byte
+    // for byte. Trailing whitespace is trimmed first, so only an interior
+    // newline counts as multi-line.
+    if command_needs_passthrough(command) {
+        return Err(Decline::Unsafe {
+            multiline: command.trim_end().contains('\n'),
+        });
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(Decline::Empty);
+    }
+    if super::indefinite::is_indefinite_command(&tokens) {
+        return Err(Decline::Indefinite);
+    }
+    let has_operator_chars = ["&&", "||", ";", "|"].iter().any(|op| command.contains(op));
+    Ok((tokens, has_operator_chars))
+}
+
+/// Where the hook sends the input it read from stdin.
+#[derive(Debug)]
+enum HookRoute {
+    /// A `PostToolUse` event from any agent; `run_post_hook` declines all but Claude Code.
+    Post(serde_json::Value),
+    /// A PreToolUse input, or one with no event name.
+    Pre(serde_json::Value),
+    /// No path handles the input. `audit` is true when the Pre path records an
+    /// empty audit line (JSON that did not parse).
+    Skip { audit: bool },
+}
+
+fn event_name(input: &serde_json::Value) -> Option<&str> {
+    input
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+}
+
+/// Decide the path for the bytes read from stdin.
+///
+/// A `PostToolUse` payload can exceed the Pre cap, so its event comes from the
+/// whole buffer. Every other input keeps the Pre path's view, the first
+/// [`HOOK_MAX_STDIN_BYTES`] bytes. Claude Code registers only Pre and Post, so
+/// another event name from it has no path; other agents name their events
+/// differently and keep the Pre path.
+fn route_stdin(bytes: &[u8], agent: AgentKind) -> HookRoute {
+    let whole = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+    let json = match whole {
+        Some(json) if event_name(&json) == Some(POST_TOOL_USE_EVENT) => {
+            return HookRoute::Post(json);
+        }
+        Some(json) if bytes.len() as u64 <= HOOK_MAX_STDIN_BYTES => json,
+        _ => {
+            let view = &bytes[..bytes.len().min(HOOK_MAX_STDIN_BYTES as usize)];
+            let Ok(text) = std::str::from_utf8(view) else {
+                return HookRoute::Skip { audit: false };
+            };
+            match serde_json::from_str(text) {
+                Ok(json) => json,
+                Err(_) => return HookRoute::Skip { audit: true },
+            }
+        }
+    };
+    match event_name(&json) {
+        None | Some("PreToolUse") => HookRoute::Pre(json),
+        Some(_) if agent == AgentKind::ClaudeCode => HookRoute::Skip { audit: false },
+        Some(_) => HookRoute::Pre(json),
+    }
+}
+
+/// Record integrity and drift findings in hook.log (Claude Code only, the one
+/// agent whose script exports the provenance fields). Rate-limited per kind per
+/// agent per day; no in-band advisory, use `skim doctor`. The post path skips it.
+fn log_provenance_findings(agent_kind: AgentKind) {
+    if agent_kind != AgentKind::ClaudeCode {
+        return;
+    }
+    // #57: log-only (NEVER stderr, GRANITE #361 Bug 3).
+    let integrity_failed = check_hook_integrity(agent_kind);
+    let de = DriftEnv::from_process();
+    // A Tampered script's exports cannot be trusted; an unreadable one still runs drift.
+    let drifts = if integrity_failed {
+        vec![]
+    } else {
+        detect_drift(&de)
+    };
+    if !drifts.is_empty()
+        && let Some(dir) = crate::cmd::resolve_cache_dir()
+    {
+        log_drift_warnings(&drifts, &de, agent_kind.cli_name(), &dir);
+    }
+}
+
+/// Run as an agent hook: PreToolUse for every agent, PostToolUse for Claude Code.
 ///
 /// Protocol:
 /// 1. Read JSON from stdin (bounded)
-/// 2. Extract `tool_input.command`
-/// 3. On parse/extract failure: exit 0, empty stdout (passthrough)
-/// 4. Run command through rewrite logic
-/// 5. In auto permission mode, a rewrite that needs no masking is withheld: exit
+/// 2. A `PostToolUse` event goes to [`run_post_hook`] and ends there
+/// 3. Extract `tool_input.command`
+/// 4. On parse/extract failure: exit 0, empty stdout (passthrough)
+/// 5. Run command through rewrite logic
+/// 6. In auto permission mode, a rewrite that needs no masking is withheld: exit
 ///    0, empty stdout (see [`withholds_rewrite`])
-/// 6. On match: emit hook response JSON, exit 0
-/// 7. On no match: exit 0, empty stdout (passthrough)
+/// 7. On match: emit hook response JSON, exit 0
+/// 8. On no match: exit 0, empty stdout (passthrough)
 ///
-/// Drift is detected and logged to hook.log on every invocation. For diagnosis
-/// run `skim doctor`.
+/// Drift is detected and logged to hook.log on every PreToolUse invocation. For
+/// diagnosis run `skim doctor`.
 ///
 /// When `agent` is None or ClaudeCode, uses existing Claude Code logic.
 /// Other agents passthrough (exit 0) until Phase 2 adds implementations.
@@ -446,56 +573,32 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Drift detection — scoped to ClaudeCode (has the hook script provenance
-    // fields: SKIM_HOOK_BINARY, SKIM_HOOK_VERSION, SKIM_HOOK_COMMIT).
-    // Findings are recorded to hook.log unconditionally (rate-limited per kind
-    // per agent per day). No in-band advisory is emitted; use `skim doctor`
-    // for on-demand diagnosis.
-    if agent_kind == AgentKind::ClaudeCode {
-        // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
-        let integrity_failed = check_hook_integrity(agent_kind);
-
-        let de = DriftEnv::from_process();
-        // Drift detection reads env vars that the hook script itself exports
-        // (SKIM_HOOK_BINARY, SKIM_HOOK_VERSION, SKIM_HOOK_COMMIT).  When the
-        // hook is Tampered those exports come from the tampered script and
-        // cannot be trusted — so drift results would be unreliable.  Skip
-        // drift detection only on Tampered; an unreadable hook (which returns
-        // integrity_failed=false) still allows drift detection to run.
-        let drifts = if !integrity_failed {
-            detect_drift(&de)
-        } else {
-            vec![]
-        };
-
-        // Log channel: rate-limited daily warnings to hook.log.
-        if !drifts.is_empty()
-            && let Some(dir) = crate::cmd::resolve_cache_dir()
-        {
-            log_drift_warnings(&drifts, &de, agent_kind.cli_name(), &dir);
-        }
-    }
-
-    // Read stdin (bounded)
-    let mut stdin_buf = String::new();
+    // Read stdin (bounded), then route on the event. A PostToolUse call ends in
+    // `run_post_hook` before any write below and before the provenance log: it
+    // must leave the sidecar, the force-raw marker, hook.log and the audit log
+    // unchanged. Every other call logs provenance findings, on a read or parse
+    // failure too.
+    let mut stdin_buf = Vec::new();
     let bytes_read = std::io::stdin()
         .lock()
-        .take(HOOK_MAX_STDIN_BYTES)
-        .read_to_string(&mut stdin_buf);
-
-    let stdin_buf = match bytes_read {
-        Ok(_) => stdin_buf,
-        Err(_) => return Ok(ExitCode::SUCCESS), // passthrough on read failure
+        .take(HOOK_POST_MAX_STDIN_BYTES)
+        .read_to_end(&mut stdin_buf);
+    let route = match bytes_read {
+        Ok(_) => route_stdin(&stdin_buf, agent_kind),
+        Err(_) => HookRoute::Skip { audit: false }, // passthrough on read failure
     };
-
-    // Parse as JSON
-    let json: serde_json::Value = match serde_json::from_str(&stdin_buf) {
-        Ok(v) => v,
-        Err(_) => {
-            audit_hook("", false, "");
-            return Ok(ExitCode::SUCCESS); // passthrough on parse failure
+    let json = match route {
+        HookRoute::Post(json) => return Ok(run_post_hook(&json, agent_kind)),
+        HookRoute::Skip { audit } => {
+            log_provenance_findings(agent_kind);
+            if audit {
+                audit_hook("", false, ""); // passthrough on parse failure
+            }
+            return Ok(ExitCode::SUCCESS);
         }
+        HookRoute::Pre(json) => json,
     };
+    log_provenance_findings(agent_kind);
 
     // Extract command (and session_id) using the agent-specific protocol
     let (command, session_id) = match protocol.parse_input(&json) {
@@ -547,67 +650,20 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         );
     }
 
-    // If already starts with "skim " — already rewritten, passthrough
-    if command.starts_with("skim ") {
-        audit_hook(&command, false, "");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Round-trip safety (#317): bail BEFORE tokenization on anything the
-    // pipeline cannot reconstruct byte-faithfully — newlines (the heredoc
-    // `git commit` corruption class: 72 sessions / 180 failures), heredocs,
-    // command substitution, backticks, unmatched quotes, and whitespace that
-    // does not survive split+rejoin. The simple path previously ran
-    // split_whitespace()+join(" ") with NO checks.
-    //
-    // Fix C (fix/rewrite-hook-falseneg): use `command_needs_passthrough`
-    // instead of `rewrite_would_corrupt` directly.  The hook-layer function
-    // trims trailing whitespace first so trailing newlines (commonly added
-    // by agent hooks) are ignored, while interior newlines (multi-line
-    // commands that would corrupt tokenization) still cause a bail-out.
-    if command_needs_passthrough(&command) {
-        audit_hook(&command, false, "");
-        // F12 — the bail used to be completely silent: 0 B stdout, 0 B stderr,
-        // exit 0, nothing in the cache dir, so a declined rewrite was
-        // indistinguishable from "nothing to rewrite". Record it to hook.log.
-        //
-        // `trim_end()` mirrors `command_needs_passthrough` exactly: a command
-        // with only TRAILING newlines is trimmed before the corruption test and
-        // does NOT bail (measured — `"cargo test\n"` still rewrites), so only an
-        // interior newline reaches here. See `log_declined_multiline` for the
-        // ADR-011 classification (class 2, hook.log never stderr) and for why
-        // the other `command_needs_passthrough` triggers stay silent.
-        if command.trim_end().contains('\n') {
-            log_declined_multiline(agent_kind.cli_name());
+    let (tokens, has_operator_chars) = match command_gates(&command) {
+        Ok(passed) => passed,
+        Err(decline) => {
+            audit_hook(&command, false, "");
+            // F12 — a declined multi-line rewrite was indistinguishable from
+            // "nothing to rewrite", so record it to hook.log (ADR-011 class 2,
+            // never stderr). The other bail reasons stay silent; see
+            // `log_declined_multiline`.
+            if decline == (Decline::Unsafe { multiline: true }) {
+                log_declined_multiline(agent_kind.cli_name());
+            }
+            return Ok(ExitCode::SUCCESS);
         }
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Tokenize once (borrowing from `command`) for both the indefinite-command
-    // check and the rewrite engine — a single allocation on this hot path.
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    if tokens.is_empty() {
-        audit_hook(&command, false, "");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Fast-path: indefinite/daemon commands must not be rewritten.
-    // When an agent runs `next dev` or `npm run dev`, passing it through the
-    // rewrite engine would try to capture its output — a dev server never
-    // exits, so the agent would hang. Treat these as no-rewrite passthroughs
-    // the same way already-skim commands are treated (audit + exit 0, empty
-    // stdout → agent runs the raw command unchanged).
-    if super::indefinite::is_indefinite_command(&tokens) {
-        audit_hook(&command, false, "");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Check for compound operator characters on the original string directly
-    // rather than scanning the token slice, since operators may appear mid-token.
-    let has_operator_chars = command.contains("&&")
-        || command.contains("||")
-        || command.contains(';')
-        || command.contains('|');
+    };
 
     // Fast path for non-compound commands. The RewriteResult is kept
     // structured (parts vector) until after session-id injection (#317).
@@ -1007,6 +1063,96 @@ mod tests {
                     "{command:?}: outside auto mode the hook withholds nothing"
                 );
             }
+        }
+    }
+
+    // ========================================================================
+    // command_gates and route_stdin
+    // ========================================================================
+
+    #[test]
+    fn test_command_gates_decline_reason_tokens_and_operator_flag() {
+        for (command, expected) in [
+            ("skim test cargo", Decline::AlreadySkim),
+            ("cargo test\nls", Decline::Unsafe { multiline: true }),
+            ("echo $(date)", Decline::Unsafe { multiline: false }),
+            ("   ", Decline::Empty),
+            ("npm run dev", Decline::Indefinite),
+        ] {
+            assert_eq!(command_gates(command).unwrap_err(), expected, "{command:?}");
+        }
+        // Trailing newlines do not bail.
+        assert_eq!(
+            command_gates("cargo test\n"),
+            Ok((vec!["cargo", "test"], false))
+        );
+        for (command, operators) in [("a && b", true), ("a | b", true), ("a & b", false)] {
+            assert_eq!(
+                command_gates(command).map(|(_, operators)| operators),
+                Ok(operators),
+                "{command:?}"
+            );
+        }
+    }
+
+    fn post_event(stdout_len: usize) -> Vec<u8> {
+        serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_response": { "stdout": "x".repeat(stdout_len) },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn pre_event(event: Option<&str>, padding: usize) -> Vec<u8> {
+        let mut input = serde_json::json!({
+            "tool_input": { "command": format!("cargo test{}", " ".repeat(padding)) },
+        });
+        if let Some(event) = event {
+            input["hook_event_name"] = event.into();
+        }
+        input.to_string().into_bytes()
+    }
+
+    #[test]
+    fn test_route_stdin_by_event_agent_and_size() {
+        use AgentKind::{ClaudeCode as Claude, Cursor, GeminiCli as Gemini};
+        let over_pre_cap = 200 * 1024;
+        let post_cap = HOOK_POST_MAX_STDIN_BYTES as usize;
+        let cut = post_event(2 * post_cap)[..post_cap].to_vec();
+        let cases: Vec<(Vec<u8>, AgentKind, &str)> = vec![
+            (post_event(10), Claude, "post"),
+            (post_event(10), Cursor, "post"),
+            (post_event(over_pre_cap), Claude, "post"),
+            (pre_event(None, 0), Claude, "pre"),
+            (pre_event(Some("PreToolUse"), 0), Claude, "pre"),
+            (
+                pre_event(Some("PostToolUseFailure"), 0),
+                Claude,
+                "silent skip",
+            ),
+            (pre_event(Some("Stop"), 0), Claude, "silent skip"),
+            (pre_event(Some("preToolUse"), 0), Cursor, "pre"),
+            (pre_event(Some("BeforeTool"), 0), Gemini, "pre"),
+            // A Pre input over the Pre cap passes through, audited as before.
+            (
+                pre_event(Some("PreToolUse"), over_pre_cap),
+                Claude,
+                "audited skip",
+            ),
+            (cut, Claude, "audited skip"),
+            (b"\xff\xfe".to_vec(), Claude, "silent skip"),
+            (b"".to_vec(), Claude, "audited skip"),
+            (b"not json".to_vec(), Claude, "audited skip"),
+        ];
+        for (bytes, agent, expected) in cases {
+            let route = match route_stdin(&bytes, agent) {
+                HookRoute::Post(_) => "post",
+                HookRoute::Pre(_) => "pre",
+                HookRoute::Skip { audit: true } => "audited skip",
+                HookRoute::Skip { audit: false } => "silent skip",
+            };
+            assert_eq!(route, expected, "{agent:?}, {} bytes", bytes.len());
         }
     }
 

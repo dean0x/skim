@@ -1,8 +1,16 @@
-//! The allow-list of commands whose captured output the post-run hook may compress.
+//! The post-run hook: Claude Code's `PostToolUse` event for a Bash call.
 //!
-//! This module is the one owner of that list. A command is on it when the
-//! rewrite engine matched one of the rule prefixes in [`POST_COMPRESS_RULES`],
-//! or matched the `cat` handler on exactly one code file.
+//! The command already ran. [`run_post_hook`] reads the captured `tool_response`
+//! and, in auto permission mode, replaces `stdout` with a compressed view and
+//! adds one skim marker line to `stderr`. It only transforms the text it was
+//! given: it starts no process, opens no file, writes no analytics row, and
+//! never returns a permission decision. Every path exits 0 with empty stderr;
+//! a decline sends nothing, so the model gets the raw output.
+//!
+//! This module also owns the allow-list of commands whose output it may
+//! compress. A command is on it when the rewrite engine matched one of the rule
+//! prefixes in [`POST_COMPRESS_RULES`], or matched the `cat` handler on exactly
+//! one code file.
 //!
 //! The list keys on the rule *prefix*, never on the rewrite target: `ruff check`
 //! and bare `ruff` share one target, as do `golangci-lint run` and bare
@@ -12,13 +20,42 @@
 //! (`RewriteResult::masks_output`), and [`post_tool_for`] re-checks that at
 //! lookup time so a future rule cannot add one by accident.
 
+use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use serde_json::{Map, Value};
+
+use super::engine::{strip_env_vars, try_rewrite};
 use super::handlers::CAT_HANDLER_PREFIX;
+use super::hook::{AUTO_PERMISSION_MODE, command_gates, write_hook_response};
 use super::types::RewriteResult;
-use crate::output::REWRITE_ORIGIN_ENV;
+use crate::cmd::hooks::claude::{PostToolUseInput, format_post_response};
+use crate::cmd::lint::{biome, eslint, golangci, mypy, oxlint, rubocop, ruff, swiftlint};
+use crate::cmd::session::AgentKind;
+use crate::cmd::test::{cargo, pytest};
+use crate::output::fidelity::{FidelityDecision, decide_with_notice};
+use crate::output::{
+    POST_VIEW_MARKER_PREFIXES, ParseResult, REWRITE_ORIGIN_ENV, lossy_view_marker,
+    post_parsed_view_marker, strip_ansi_cow,
+};
+use crate::runner::CommandOutput;
+
+/// Most characters of captured stdout the post path accepts. Claude Code keeps
+/// output of about 30,000 characters or more in a file and gives the hook a
+/// prefix, so a text this long is never the whole output.
+const MAX_STDOUT_CHARS: usize = 29_000;
+
+/// `tool_response` keys whose presence means the run is not a plain foreground
+/// run whose `stdout` is the whole output.
+const DECLINING_RESPONSE_KEYS: [&str; 3] = [
+    "persistedOutputPath",
+    "backgroundTaskId",
+    "returnCodeInterpretation",
+];
 
 /// What the post-run hook does with the captured output of an allow-listed command.
-// Used by the post path from Phase 3 on; Phase 3 removes this allow.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PostTool {
     CargoTest,
@@ -42,9 +79,6 @@ pub(super) enum PostTool {
 /// The rule prefixes the post-run hook compresses, each with its tool.
 ///
 /// Every prefix is also a prefix in the rewrite rule table; a unit test pins that.
-// Used by `post_tool_for`, which the post path calls from Phase 3 on; Phase 3
-// removes this allow.
-#[allow(dead_code)]
 pub(super) const POST_COMPRESS_RULES: &[(&[&str], PostTool)] = &[
     (&["cargo", "test"], PostTool::CargoTest),
     (&["pytest"], PostTool::Pytest),
@@ -74,8 +108,6 @@ pub(super) const POST_COMPRESS_RULES: &[(&[&str], PostTool)] = &[
 ///
 /// Fails closed: a result that masks output, has no matched prefix, or is a
 /// `cat` result in a layout this module does not know gets `None`.
-// Called by the post path from Phase 3 on; Phase 3 removes this allow.
-#[allow(dead_code)]
 pub(super) fn post_tool_for(result: &RewriteResult) -> Option<PostTool> {
     if result.masks_output {
         return None;
@@ -107,6 +139,156 @@ fn cat_post_tool(tokens: &[String]) -> Option<PostTool> {
         "--mode=pseudo" => Some(PostTool::Cat { structure: false }),
         _ => None,
     }
+}
+
+// ============================================================================
+// The post path
+// ============================================================================
+
+/// Run the `PostToolUse` hook for `input`, which the router read from stdin.
+/// A decline, a bad input, a closed stdout and a panic all end the same way:
+/// nothing on stdout, nothing on stderr, exit 0.
+pub(super) fn run_post_hook(input: &Value, agent: AgentKind) -> ExitCode {
+    // The default panic hook prints to stderr, which the hook protocol treats as
+    // an error. Log the location only: the message can hold input text.
+    panic::set_hook(Box::new(|info| {
+        let place = info
+            .location()
+            .map(|at| format!(" at {}:{}", at.file(), at.line()))
+            .unwrap_or_default();
+        crate::cmd::hook_log::log_hook_warning(&format!("post hook panicked{place}"));
+    }));
+    if let Some(response) = guarded(|| post_response(input, agent)) {
+        let _ = write_hook_response(&response);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Run `compute`, turning a panic into "no response".
+fn guarded(compute: impl FnOnce() -> Option<Value>) -> Option<Value> {
+    panic::catch_unwind(AssertUnwindSafe(compute))
+        .ok()
+        .flatten()
+}
+
+/// The response for a `PostToolUse` input, or `None` for no output. Each gate
+/// declines, cheapest first: agent, auto mode, input shape, the command gates the
+/// Pre path shares, the captured result, the allow-list, tokenizer health, and
+/// last the net-savings guard.
+fn post_response(input: &Value, agent: AgentKind) -> Option<Value> {
+    if agent != AgentKind::ClaudeCode {
+        return None;
+    }
+    let call = PostToolUseInput::parse(input)?;
+    if call.permission_mode != Some(AUTO_PERMISSION_MODE) {
+        return None;
+    }
+    let (tokens, has_operator_chars) = command_gates(call.command).ok()?;
+    if has_operator_chars || !command_is_plain(call.command, &tokens) {
+        return None;
+    }
+    let raw = captured_stdout(call.tool_response)?;
+    let rewrite = try_rewrite(&tokens)?;
+    let tool = post_tool_for(&rewrite)?;
+    if !crate::tokens::cl100k_is_ready() {
+        return None;
+    }
+    let (served, marker) = match tool {
+        // The cat handler copied its one file argument to the third token.
+        PostTool::Cat { structure } => cat_view(raw, rewrite.tokens.get(2)?, structure)?,
+        // The label is the rule prefix, a fixed string from the rule table.
+        parser => parsed_view(parser, &rewrite.matched_prefix?.join(" "), raw)?,
+    };
+    // The guard charges the marker to the view: a view that saves less than its
+    // own marker costs gives no output.
+    if served.trim().is_empty()
+        || decide_with_notice(raw, &served, Some(&marker)) != FidelityDecision::Keep
+    {
+        return None;
+    }
+    format_post_response(call.tool_response, &served, &marker)
+}
+
+/// Command shapes declined on top of the shared gates. A background `&`, a
+/// redirect or a substitution means the captured text may not be the plain
+/// output of one command; an env prefix or `SKIM_PASSTHROUGH` asks for raw
+/// output. Text checks only: no process runs and no env var is read.
+fn command_is_plain(command: &str, tokens: &[&str]) -> bool {
+    !command.contains(['&', '>', '<'])
+        && !command.contains("$(")
+        && !command.contains("SKIM_PASSTHROUGH")
+        && strip_env_vars(tokens) == 0
+}
+
+/// The captured stdout, when `response` is a finished foreground run whose
+/// stdout is the whole output, is clean text, and holds no skim marker.
+fn captured_stdout(response: &Map<String, Value>) -> Option<&str> {
+    let is_false = |key: &str| response.get(key) == Some(&Value::Bool(false));
+    let finished = is_false("interrupted")
+        && is_false("isImage")
+        && !DECLINING_RESPONSE_KEYS
+            .iter()
+            .any(|key| response.contains_key(*key));
+    let stdout = response.get("stdout")?.as_str()?;
+    let stderr = match response.get("stderr") {
+        None => "",
+        Some(value) => value.as_str()?,
+    };
+    let has_marker = |text: &str| {
+        POST_VIEW_MARKER_PREFIXES
+            .iter()
+            .any(|prefix| text.contains(prefix))
+    };
+    let clean = !stdout.trim().is_empty()
+        && !stdout.contains(['\0', '\u{FFFD}'])
+        && stdout.chars().count() < MAX_STDOUT_CHARS;
+    (finished && clean && !has_marker(stdout) && !has_marker(stderr)).then_some(stdout)
+}
+
+/// The view of a one-file `cat` and its marker. The language comes from the
+/// path the command named. The file is never opened: the text is what `cat`
+/// printed, so a control byte inside a string literal survives.
+fn cat_view(raw: &str, path: &str, structure: bool) -> Option<(String, String)> {
+    let (mode, name) = if structure {
+        (rskim_core::Mode::Structure, "structure")
+    } else {
+        (rskim_core::Mode::Pseudo, "pseudo")
+    };
+    let served = rskim_core::transform_auto(raw, Path::new(path), mode).ok()?;
+    Some((served, lossy_view_marker(Some("cat"), name, 1, 1)?))
+}
+
+/// The parsed summary of a tool's output and its marker. The parser gets the
+/// text without escape sequences, as the spawn path gives it. Only a Full or
+/// Degraded parse is served: a Passthrough parse means the output was not understood.
+fn parsed_view(tool: PostTool, label: &str, raw: &str) -> Option<(String, String)> {
+    let output = CommandOutput {
+        stdout: strip_ansi_cow(raw).into_owned(),
+        stderr: String::new(),
+        exit_code: None,
+        duration: Duration::ZERO,
+    };
+    let served = match tool {
+        PostTool::CargoTest => kept(cargo::parse_impl(&output, false)),
+        PostTool::Pytest => kept(pytest::parse(&output.stdout)),
+        PostTool::Eslint => kept(eslint::parse_impl(&output)),
+        PostTool::RuffCheck => kept(ruff::parse_check_impl(&output)),
+        PostTool::Mypy => kept(mypy::parse_impl(&output)),
+        PostTool::Golangci => kept(golangci::parse_impl(&output)),
+        PostTool::Rubocop => kept(rubocop::parse_impl(&output)),
+        PostTool::Oxlint => kept(oxlint::parse_impl(&output)),
+        PostTool::BiomeCheck => kept(biome::parse_check_impl(&output)),
+        PostTool::Swiftlint => kept(swiftlint::parse_impl(&output)),
+        PostTool::Cat { .. } => None,
+    }?;
+    let marker = post_parsed_view_marker(label, raw.len(), served.len());
+    Some((served, marker))
+}
+
+/// The text of a Full or Degraded parse, and `None` for any other tier.
+fn kept<T: AsRef<str>>(parsed: ParseResult<T>) -> Option<String> {
+    matches!(parsed, ParseResult::Full(_) | ParseResult::Degraded(..))
+        .then(|| parsed.content().to_owned())
 }
 
 #[cfg(test)]
@@ -350,5 +532,246 @@ mod tests {
             let result = result_with(&tokens, false, Some(CAT_HANDLER_PREFIX));
             assert_eq!(post_tool_for(&result), None, "{tokens:?}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The post path
+    // ------------------------------------------------------------------
+
+    /// A passing libtest run, long enough that its summary and the marker
+    /// together are smaller than it.
+    fn cargo_stdout() -> String {
+        let mut text = String::from("running 40 tests\n");
+        for n in 0..40 {
+            text.push_str(&format!("test parser::tests::case_{n} ... ok\n"));
+        }
+        text.push_str(
+            "\ntest result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; \
+             0 filtered out; finished in 0.01s\n",
+        );
+        text
+    }
+
+    /// A Claude Code `PostToolUse` input in auto mode for a finished run.
+    fn call(command: &str, stdout: &str) -> Value {
+        serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "permission_mode": "auto",
+            "tool_input": { "command": command },
+            "tool_response": {
+                "stdout": stdout,
+                "stderr": "   Compiling skim v1.0.0\n",
+                "interrupted": false,
+                "isImage": false,
+                "noOutputExpected": false,
+            },
+        })
+    }
+
+    fn baseline() -> Value {
+        call("cargo test", &cargo_stdout())
+    }
+
+    fn respond(input: &Value) -> Option<Value> {
+        post_response(input, AgentKind::ClaudeCode)
+    }
+
+    fn updated(response: &Value) -> &Value {
+        &response["hookSpecificOutput"]["updatedToolOutput"]
+    }
+
+    /// A module header, then non-doc comments, which pseudo mode removes, and an
+    /// ESC byte in a literal.
+    fn rust_source() -> String {
+        let steps: String = (0..12)
+            .map(|n| {
+                format!(
+                    "// A comment that explains step {n} at some length.\n\
+                     fn step_{n}() -> &'static str {{ \"\u{1b}[31m\" }}\n"
+                )
+            })
+            .collect();
+        format!("//! Module header.\n\n{steps}")
+    }
+
+    #[test]
+    fn a_passing_cargo_test_run_gets_the_summary_and_one_marker_line() {
+        // Escape sequences in the captured text must not reach the parser or the view.
+        let colored = cargo_stdout().replace("ok", "\u{1b}[32mok\u{1b}[0m");
+        let response = respond(&call("cargo test", &colored)).expect("must compress");
+        let keys: Vec<_> = response.as_object().expect("object").keys().collect();
+        assert_eq!(keys, ["hookSpecificOutput"]);
+        assert_eq!(
+            response["hookSpecificOutput"]["hookEventName"],
+            "PostToolUse"
+        );
+        let stdout = updated(&response)["stdout"].as_str().expect("stdout");
+        assert!(
+            stdout.contains("40") && stdout.len() < colored.len(),
+            "{stdout:?}"
+        );
+        assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
+        let stderr = updated(&response)["stderr"].as_str().expect("stderr");
+        assert!(
+            stderr.starts_with("   Compiling skim v1.0.0\n[skim] compressed view of 'cargo test'"),
+            "{stderr:?}"
+        );
+        assert_eq!(stderr.lines().count(), 2, "one marker line: {stderr:?}");
+        assert_eq!(updated(&response)["noOutputExpected"], false);
+    }
+
+    #[test]
+    fn each_gate_declines_when_one_field_of_the_baseline_changes() {
+        use serde_json::json;
+        let marked = |text: &str| format!("{text}{}", cargo_stdout());
+        let cases: Vec<(&str, Option<Value>)> = vec![
+            ("/permission_mode", Some(json!("default"))),
+            ("/permission_mode", None),
+            ("/hook_event_name", Some(json!("PostToolUseFailure"))),
+            ("/tool_name", Some(json!("Read"))),
+            ("/tool_input/command", Some(json!(7))),
+            ("/tool_response", Some(json!("text"))),
+            ("/tool_response/stdout", Some(json!(7))),
+            ("/tool_response/stdout", None),
+            ("/tool_response/stdout", Some(json!(" \n\t"))),
+            ("/tool_response/stdout", Some(json!(marked("\0")))),
+            ("/tool_response/stdout", Some(json!(marked("\u{FFFD}")))),
+            (
+                "/tool_response/stdout",
+                Some(json!("x\n".repeat(MAX_STDOUT_CHARS))),
+            ),
+            (
+                "/tool_response/stdout",
+                Some(json!(marked("[skim] compressed view of 'x'\n"))),
+            ),
+            (
+                "/tool_response/stdout",
+                Some(json!(marked("[skim] transformed view (cat"))),
+            ),
+            (
+                "/tool_response/stderr",
+                Some(json!("[skim] compressed view of 'x'")),
+            ),
+            ("/tool_response/stderr", Some(json!(null))),
+            ("/tool_response/interrupted", Some(json!(true))),
+            ("/tool_response/interrupted", None),
+            ("/tool_response/isImage", Some(json!(true))),
+            ("/tool_response/isImage", None),
+            (
+                "/tool_response/persistedOutputPath",
+                Some(json!("/tmp/out.txt")),
+            ),
+            ("/tool_response/backgroundTaskId", Some(json!("b1"))),
+            (
+                "/tool_response/returnCodeInterpretation",
+                Some(json!("note")),
+            ),
+        ];
+        for (pointer, value) in cases {
+            let mut input = baseline();
+            let (parent, key) = pointer.rsplit_once('/').expect("pointer");
+            let object = input.pointer_mut(parent).and_then(Value::as_object_mut);
+            match (&value, object.expect("parent object")) {
+                (Some(value), object) => object.insert(key.to_string(), value.clone()),
+                (None, object) => object.remove(key),
+            };
+            assert!(respond(&input).is_none(), "{pointer} = {value:?}");
+        }
+    }
+
+    #[test]
+    fn stdout_is_accepted_below_the_char_limit_and_declined_at_it() {
+        let base = cargo_stdout();
+        for (chars, compresses) in [(MAX_STDOUT_CHARS - 1, true), (MAX_STDOUT_CHARS, false)] {
+            let padded = format!("{base}{}", " ".repeat(chars - base.len()));
+            assert_eq!(
+                respond(&call("cargo test", &padded)).is_some(),
+                compresses,
+                "{chars}"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_outside_the_plain_allow_listed_shapes_are_declined() {
+        for command in [
+            "cargo test && cargo build",
+            "cargo test | tee out.txt",
+            "cargo test &",
+            "cargo test > out.txt",
+            "cargo test < in.txt",
+            "cargo test 2>&1",
+            "cargo test $(date)",
+            "cargo test\nls",
+            "FOO=1 cargo test",
+            "SKIM_PASSTHROUGH=1 cargo test",
+            "cargo test SKIM_PASSTHROUGH",
+            "env",
+            "curl https://example.com",
+            "git status",
+            "cat a.rs b.rs",
+            "cat notes.txt",
+        ] {
+            assert!(
+                respond(&call(command, &cargo_stdout())).is_none(),
+                "{command:?}"
+            );
+        }
+        for agent in [AgentKind::CodexCli, AgentKind::GeminiCli, AgentKind::Cursor] {
+            assert!(post_response(&baseline(), agent).is_none(), "{agent:?}");
+        }
+    }
+
+    #[test]
+    fn cat_of_one_code_file_compresses_the_given_text_and_never_opens_the_path() {
+        let source = rust_source();
+        let response = respond(&call("cat no/such/dir/lib.rs", &source)).expect("must compress");
+        let stdout = updated(&response)["stdout"].as_str().expect("stdout");
+        assert!(stdout.len() < source.len());
+        assert!(!stdout.contains("A comment that explains"), "{stdout:?}");
+        assert!(
+            stdout.contains('\u{1b}'),
+            "an ESC byte in a literal survives"
+        );
+        let stderr = updated(&response)["stderr"].as_str().expect("stderr");
+        assert!(
+            stderr.contains("[skim] transformed view (cat \u{2192} skim --mode=pseudo)"),
+            "{stderr:?}"
+        );
+    }
+
+    #[test]
+    fn cat_view_uses_the_mode_the_allow_list_chose() {
+        let source = "export function f(a: number): number {\n  return a + 1;\n}\n";
+        let (served, marker) = cat_view(source, "types/f.d.ts", true).expect("structure view");
+        assert!(!served.contains("return a + 1"), "{served:?}");
+        assert!(marker.contains("--mode=structure"), "{marker:?}");
+        assert!(
+            cat_view(source, "notes.txt", false).is_none(),
+            "unknown language"
+        );
+    }
+
+    /// The guard charges the marker: a view smaller than raw, but not by the
+    /// marker's own cost, gives no output.
+    #[test]
+    fn a_view_that_saves_less_than_its_marker_costs_gives_no_output() {
+        let source = "fn main() {}\n// a short comment below the code\nfn other() {}\n";
+        let (served, marker) = cat_view(source, "main.rs", false).expect("view");
+        assert!(served.len() < source.len(), "the view alone is smaller");
+        assert!(
+            served.len() + marker.len() >= source.len(),
+            "the marker eats the saving"
+        );
+        assert!(respond(&call("cat main.rs", source)).is_none());
+    }
+
+    #[test]
+    fn an_output_no_parser_understands_gives_no_view_and_a_panic_gives_no_response() {
+        assert!(parsed_view(PostTool::CargoTest, "cargo test", "no tests here\n").is_none());
+        assert!(parsed_view(PostTool::Pytest, "pytest", "hello\n").is_none());
+        assert!(guarded(|| panic!("boom")).is_none());
+        assert!(guarded(|| Some(serde_json::json!(1))).is_some());
     }
 }

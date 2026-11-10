@@ -29,7 +29,6 @@ const BASH_TOOL_NAME: &str = "Bash";
 /// struct of known fields, so [`format_post_response`] can copy every key of it,
 /// the keys Claude Code adds later too.
 #[derive(Debug)]
-#[allow(dead_code)] // Read by the post-run hook path once it is wired in.
 pub(crate) struct PostToolUseInput<'a> {
     /// Top-level `permission_mode`; `None` when missing or not a string.
     pub(crate) permission_mode: Option<&'a str>,
@@ -42,7 +41,6 @@ pub(crate) struct PostToolUseInput<'a> {
 impl<'a> PostToolUseInput<'a> {
     /// Parse a hook input. Returns `None` for any other event, any other tool,
     /// and any input without a string command or an object `tool_response`.
-    #[allow(dead_code)] // Called by the post-run hook path once it is wired in.
     pub(crate) fn parse(json: &'a serde_json::Value) -> Option<Self> {
         if json.get("hook_event_name")?.as_str()? != POST_TOOL_USE_EVENT
             || json.get("tool_name")?.as_str()? != BASH_TOOL_NAME
@@ -77,7 +75,6 @@ impl<'a> PostToolUseInput<'a> {
 /// SECURITY: the only keys are `hookSpecificOutput.hookEventName` and
 /// `hookSpecificOutput.updatedToolOutput`. The response never carries a
 /// decision, `continue`, `systemMessage` or `permissionDecision`.
-#[allow(dead_code)] // Called by the post-run hook path once it is wired in.
 pub(crate) fn format_post_response(
     tool_response: &serde_json::Map<String, serde_json::Value>,
     stdout: &str,

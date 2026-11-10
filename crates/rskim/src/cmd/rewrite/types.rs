@@ -80,9 +80,6 @@ pub(super) struct RewriteResult {
     /// `ruff` share one target, as do `golangci-lint run` and bare
     /// `golangci-lint`, and only the prefix tells them apart. `None` for a
     /// compound rewrite and for `head`/`tail`, which have no single owner.
-    // Read only by `post_hook::post_tool_for`, which the post path uses from
-    // Phase 3 on; Phase 3 removes this allow.
-    #[allow(dead_code)]
     pub(super) matched_prefix: Option<&'static [&'static str]>,
 }
 
