@@ -21,12 +21,12 @@ use std::process::ExitCode;
 use rayon::prelude::*;
 
 use crate::cmd::execution as exec;
-use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
+use crate::cmd::{OutputFormat, extract_output_format};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
-use super::{finalize_git_output_owned, map_exit_code, run_passthrough};
+use super::{finalize_git_output_owned, map_exit_code};
 
 /// Maximum file size for AST processing (100 KB). Larger files fall back
 /// to raw diff hunks.
@@ -129,10 +129,25 @@ fn print_diff_help() {
     println!("    --json           Machine-readable JSON output");
     println!("    --show-stats     Show token savings statistics");
     println!();
+    println!("LINE NUMBERS:");
+    println!("    One number column, two coordinate spaces.  The prefix says which:");
+    println!("        -<n>   old-file line n   (removed)");
+    println!("        +<n>   new-file line n   (added)");
+    println!("         <n>   new-file line n   (context)");
+    println!("        ~      no line number    (AST breadcrumb)");
+    println!("    The column therefore repeats, and runs backward across a -/+");
+    println!("    boundary: that is the two axes interleaving, not a misnumbering.");
+    println!("    A second column is not emitted -- it needs 76 B where the measured");
+    println!("    raw-diff margin is 68 B or less (ADR-003) -- and the @@ header is");
+    println!("    withheld on single-hunk files, so there the prefix is the only cue.");
+    println!();
     println!("GIT OPTIONS:");
     println!("    --staged, --cached    Diff staged changes");
-    println!("    --stat, --shortstat   Passthrough to git (no AST processing)");
-    println!("    --name-only           Passthrough to git");
+    println!("    Machine-contract flags serve git's own bytes verbatim, with no AST");
+    println!("    processing, ahead of the net-savings guard (ADR-022):");
+    println!("      --stat --shortstat --numstat --name-only --name-status --raw");
+    println!("      --check --porcelain --null -z --quiet -q --exit-code --graph");
+    println!("      --format --pretty");
     println!();
     println!("EXAMPLES:");
     println!("    skim git diff                    Working tree changes");
@@ -295,8 +310,13 @@ fn render_and_format<'a>(
 
 /// Run `git diff` with AST-aware pipeline (#103).
 ///
-/// Flag-aware passthrough: `--stat`, `--name-only`, `--name-status`, `--check`
-/// pass through to git unmodified.
+/// Flag-aware passthrough lives one level up.  The stat family (`--stat`,
+/// `--shortstat`, `--numstat`, `--name-only`, `--name-status`, `--check`) that
+/// this function used to gate itself now sits in `super::MACHINE_CONTRACT_FLAGS`
+/// alongside `--quiet` and `--exit-code`, so a `git diff` carrying any of them
+/// never reaches here (ADR-022).  `--quiet` is the entry that closes `#576`:
+/// its contract is the exit status, and the `No changes` line this function
+/// writes to stderr on an empty diff is output the caller asked not to receive.
 ///
 /// Supports:
 /// - `--mode structure|full` to control context rendering
@@ -313,20 +333,6 @@ pub(super) fn run_diff(
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_diff_help();
         return Ok(ExitCode::SUCCESS);
-    }
-
-    if user_has_flag(
-        args,
-        &[
-            "--stat",
-            "--shortstat",
-            "--numstat",
-            "--name-only",
-            "--name-status",
-            "--check",
-        ],
-    ) {
-        return run_passthrough(global_flags, "diff", args, show_stats, rec);
     }
 
     // Extract skim-specific flags before passing args to git

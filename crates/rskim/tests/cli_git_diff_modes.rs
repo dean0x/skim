@@ -18,6 +18,10 @@
 //!   number-only checks above)
 //! - **coverage**     — every `+`/`-` line's content reaches the reader (#317)
 //!
+//! Both loops that carry those assertions are preceded by a non-vacuity guard
+//! (PF-025): an empty parsed collection skips every assertion inside its loop
+//! body, so all twelve call sites would go green having checked nothing.
+//!
 //! The assertions hold whether the render is AST-based or the raw-hunk
 //! fallback, so a fix that trades a lying render for a safe one still passes —
 //! but `assert_ast_rendered` pins the shapes where AST rendering must survive.
@@ -222,12 +226,43 @@ fn parse_emissions(rendered: &str, ln_width: usize) -> Vec<(char, usize)> {
     out
 }
 
-/// Assert every render-fidelity invariant for `rendered` against `raw`.
+/// Assert the render-fidelity invariants for `rendered` against `raw`.
 ///
 /// `label` names the configuration so a failure identifies which mode and
 /// context window produced it.
+///
+/// Two of the invariant sets are loop bodies over a parsed collection, and an
+/// empty collection skips every assertion inside it — the function then
+/// returns success having checked nothing.  Each loop is therefore preceded by
+/// a non-vacuity guard (PF-025); the comment at each guard states what it
+/// proves and what it does not.
+///
+/// Not every invariant is checked on every path: the axis invariants
+/// (uniqueness, monotonicity, marker fidelity) are read off skim's
+/// line-number column, which git's own bytes do not have, so they are skipped
+/// when skim served those bytes verbatim — see the early return below.
 fn assert_render_fidelity(label: &str, rendered: &str, raw: &str) {
     let model = parse_raw(raw);
+
+    // Non-vacuity guard for the #317 loop below.  `changed_content` is derived
+    // from `raw` and never from the render, so this holds on every path — every
+    // caller diffs two genuinely different revisions.  An empty vector means
+    // `parse_raw` stopped recognising the diff (hunk-header shape, line
+    // prefixes, `in_hunk` bookkeeping), which would retire #317 coverage at
+    // all twelve call sites at once and in silence.
+    //
+    // It proves the raw model was parsed; it does NOT prove that a content
+    // assertion ran.  A fixture whose only changed line is BLANK contributes
+    // one entry that the loop skips, and those two callers pin the blank
+    // line's emission directly instead — see the `"+3 "` assertions in
+    // `added_blank_line_between_struct_fields_reaches_reader` and
+    // `structure_mode_struct_fields_preserve_line_numbers_and_indentation`.
+    assert!(
+        !model.changed_content.is_empty(),
+        "{label}: fidelity check is VACUOUS — `model.changed_content` is empty, \
+         so `parse_raw` found no `+`/`-` lines and the #317 content-coverage \
+         loop below asserts nothing.  Raw diff was:\n{raw}"
+    );
 
     // #317 coverage: every changed line's content must reach the reader.
     for content in &model.changed_content {
@@ -240,11 +275,48 @@ fn assert_render_fidelity(label: &str, rendered: &str, raw: &str) {
         );
     }
 
+    // Every skim render opens with the file header and writes each patch line
+    // through `emit_patch_line`'s `{prefix}{n:>ln_width$} ` column — that
+    // includes `render_raw_hunks`, the in-file fallback, which inherits the
+    // same header.  No path under `cmd/git/` emits a `diff --git` line, so
+    // this prefix means skim served git's own bytes verbatim (the ADR-001
+    // `Passthrough` verdict).  Those bytes are byte-faithful AND carry no
+    // line-number column, so `parse_emissions` would be reading a grammar
+    // that is not there: the axis checks, and any non-vacuity claim over
+    // them, are both meaningless here.  Return before the guard below.
     if rendered.starts_with("diff --git") {
-        return; // raw-hunk fallback — byte-faithful by construction
+        return;
     }
 
-    let emissions = parse_emissions(rendered, model.ln_width);
+    let ln_width = model.ln_width;
+    let emissions = parse_emissions(rendered, ln_width);
+
+    // Non-vacuity guard for the axis loop below.  Reached only past the
+    // passthrough return above, so `rendered` is one of skim's own renders and
+    // does carry the line-number column; a non-empty diff always puts at
+    // least one numbered line in it.  An empty set therefore means
+    // `parse_emissions` recognised nothing at all in skim's own layout, and
+    // all four axis assertions below (uniqueness, monotonicity,
+    // added-as-context, marker correctness) would be skipped rather than
+    // checked.
+    //
+    // It is a TOTAL-loss detector, and that bound is measured rather than
+    // assumed: changing the marker byte, the width of the number field, or
+    // the separator to a non-space byte empties the set and fires this, as do
+    // a numberless render, a header-only render and empty stdout — but merely
+    // WIDENING the separator, or left-aligning the number inside its field,
+    // still matches most lines and stays silent.  Partial corruption is the
+    // axis assertions' own job, which is exactly why they have to be
+    // reachable.
+    assert!(
+        !emissions.is_empty(),
+        "{label}: fidelity check is VACUOUS — `emissions` is empty, so \
+         `parse_emissions` matched no numbered lines in this render \
+         (ln_width={ln_width}) and the uniqueness, monotonicity and marker \
+         assertions below would all pass without executing.  Render \
+         was:\n{rendered}"
+    );
+
     let mut seen: std::collections::HashSet<(char, usize)> = std::collections::HashSet::new();
     let mut prev_new = 0usize;
 
@@ -282,11 +354,16 @@ fn assert_render_fidelity(label: &str, rendered: &str, raw: &str) {
     }
 }
 
-/// Assert the render came from the AST path, not the raw-hunk fallback.
+/// Assert skim rendered the diff itself rather than serving git's bytes.
 ///
-/// AST output opens with `{path} ({status})`; the fallback opens with
-/// `diff --git a/…`.  Pinning this stops a "fix" that silently disables AST
-/// rendering from passing the fidelity assertions vacuously.
+/// Every skim render opens with `{path} ({status})`; only git's own bytes open
+/// with `diff --git a/…`.  Pinning this stops a "fix" that silently trades a
+/// render for raw bytes from passing the fidelity assertions vacuously
+/// through the early return in `assert_render_fidelity`.
+///
+/// Bound worth knowing before relying on the name: the two shapes it compares
+/// do NOT separate the AST walk from `render_raw_hunks`, which inherits the
+/// same file header, so this does not pin AST rendering specifically.
 fn assert_ast_rendered(label: &str, rendered: &str) {
     assert!(
         !rendered.starts_with("diff --git"),
@@ -295,6 +372,94 @@ fn assert_ast_rendered(label: &str, rendered: &str) {
     assert!(
         rendered.starts_with("src/lib.rs (modified)"),
         "{label}: expected the AST file header, got:\n{rendered}"
+    );
+}
+
+// ============================================================================
+// Non-vacuity guards: run the guards against a known-vacuous input
+// ============================================================================
+
+/// Call `assert_render_fidelity` and return the message it panicked with.
+///
+/// Fails if the call did NOT panic — a guard that does not fire is exactly the
+/// defect these tests exist to detect.
+///
+/// The panic hook is deliberately left alone: suppressing it would be
+/// process-global, so under a thread-per-test harness it would also swallow an
+/// unrelated concurrent test's failure message.  libtest and nextest both
+/// capture this expected panic's output and discard it while the test passes.
+fn catch_fidelity_panic(label: &str, rendered: &str, raw: &str) -> String {
+    // `AssertUnwindSafe` because the payload we are reaching across the unwind
+    // is three `&str`s and the callee is *expected* to panic — there is no
+    // half-mutated state for the boundary to protect.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_render_fidelity(label, rendered, raw);
+    }));
+    let payload = result.expect_err("assert_render_fidelity must panic on a vacuous check");
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else {
+        panic!("panic payload was neither String nor &str");
+    }
+}
+
+/// PF-025 discipline for the two guards in `assert_render_fidelity`: an
+/// invariant proposed to catch a corruption class must be run against a
+/// KNOWN-CORRUPT input and required to FAIL, or it ships green and catches
+/// nothing.  The twelve call sites above only ever exercise the pass
+/// direction; this is the fail direction, for both vacuity surfaces.
+#[test]
+fn assert_render_fidelity_rejects_a_vacuous_check() {
+    let raw = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+ pub fn f() {}
+-// old
++// new
+";
+
+    // Control: a well-formed pair, so a panic below is the guard under test
+    // rather than a fixture that was broken all along.
+    assert_render_fidelity(
+        "control",
+        "src/lib.rs (modified)\n 1 pub fn f() {}\n-2 // old\n+2 // new\n",
+        raw,
+    );
+
+    // Surface 1 — `model.changed_content` empty: a hunk header `parse_raw` no
+    // longer recognises, which is how a real parse regression empties it.
+    let unparseable_raw = raw.replace("@@ -", "@@@ -");
+    let err = catch_fidelity_panic(
+        "vacuous-content",
+        "src/lib.rs (modified)\n+2 // new\n",
+        &unparseable_raw,
+    );
+    assert!(
+        err.contains("VACUOUS") && err.contains("changed_content"),
+        "the empty-`changed_content` guard must fire and name itself; got:\n{err}"
+    );
+
+    // Surface 2 — `emissions` empty: a render that carries the changed content
+    // (so the #317 loop passes) but no line-number column at all, which is how
+    // a render-layout move empties it.
+    let err = catch_fidelity_panic(
+        "vacuous-emissions",
+        "src/lib.rs (modified)\n// old\n// new\n",
+        raw,
+    );
+    assert!(
+        err.contains("VACUOUS") && err.contains("parse_emissions"),
+        "the empty-`emissions` guard must fire and name itself; got:\n{err}"
+    );
+
+    // The two guards must be distinguishable, or a failure cannot be triaged.
+    assert!(
+        !err.contains("changed_content"),
+        "the two vacuity guards must not report each other; got:\n{err}"
     );
 }
 

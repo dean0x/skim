@@ -1,16 +1,28 @@
 //! Pseudo mode transformation — strips syntactic noise while preserving logic flow.
 //!
-//! ARCHITECTURE: Removes type annotations, decorators, semicolons, and other
-//! syntactic noise to produce pseudocode-like output.  The following are
-//! intentionally preserved as API surface (A4 contract):
+//! ARCHITECTURE: Removes decorators, non-doc comments and other syntactic noise to
+//! produce pseudocode-like output.  Type annotations and semicolons are POSITION-
+//! DEPENDENT rather than uniformly noise: which positions survive is per-language and
+//! is settled by guards in `collect_noise_ranges`, not by `strip_kinds` alone.  The
+//! following are intentionally preserved as API surface (A4 contract):
 //! - Visibility modifiers (`pub`/`export`/access modifiers)
 //! - Function return type annotations (Python `-> T`, TypeScript `: T` at return
 //!   position, Rust `-> T` via normal recursion since Rust has no strip_kinds for
 //!   return types)
 //!
 //! For Python, parameter and variable type annotations are still stripped.
-//! TypeScript preserves parameter type annotations (ADR-007); only decorator,
-//! `readonly`, and `abstract` are stripped alongside variable/property `type_annotation`.
+//! TypeScript strips `decorator` and `abstract` unconditionally, and preserves
+//! parameter type annotations (ADR-007 / E1).  `type_annotation` and `readonly` are
+//! position-dependent: both survive on a `property_signature` — an interface or
+//! object-type member, where the annotation IS the declaration — and on an
+//! `index_signature`, including one under `class_body`, deliberately, because the
+//! grammar marks that node's `type` field required.  Both are still stripped on a
+//! `public_field_definition`, i.e. a class field; that kind and `property_signature`
+//! are disjoint and occur in disjoint containers, so the boundary is structural rather
+//! than a lookup.  A `;` whose parent is `object_type` or `interface_body` separates
+//! members instead of terminating a statement, and survives too.  Each type-level
+//! exemption is argued at its own guard site; none of them is ADR-007, which is scoped
+//! to return types and parameters.
 //! Rust strips nothing via `strip_kinds`: lifetimes, type/generic parameters, where
 //! clauses, and attribute items are all preserved as API surface, extending the same
 //! rationale that already kept `visibility_modifier` and `mutable_specifier` out of
@@ -27,10 +39,12 @@
 //!
 //! It is also not a figure one number could carry any more, because the rule sets
 //! diverged. Rust and Go both have an empty `strip_kinds`, empty `strip_keywords` and
-//! `strip_self_param: false`, so Rust pseudo removes only statement semicolons and
-//! non-doc comments, and Go pseudo removes only non-doc comments. Rust is this
-//! repository's own dominant file type, so the mode's headline behaviour here is close
-//! to `minimal`'s.
+//! `strip_self_param: false`, so Rust pseudo removes only semicolons and non-doc
+//! comments, and Go pseudo removes only non-doc comments. Not every semicolon: the
+//! `;` guard preserves Rust declaration terminators (`fn` signatures, unit and tuple
+//! `struct`s, associated `type`s) and array-length separators (`[u8; 32]`), and what
+//! Rust pseudo removes is the rest. Rust is this repository's own dominant file type,
+//! so the mode's headline behaviour here is close to `minimal`'s.
 //!
 //! Do not restate a number here until one exists per language and something that runs
 //! in CI defends it; a target nothing measures reads as a measurement.
@@ -226,8 +240,13 @@ fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
 /// Returns true for node kinds that act as inline modifiers preceding another token.
 ///
 /// When these kinds are stripped, the trailing space between the modifier and the next
-/// token should also be consumed. For example, stripping `readonly` from
-/// `readonly foo: string` should produce `foo: string` (not ` foo: string`).
+/// token should also be consumed, so the removal leaves no gap where the modifier was:
+/// a class field's `private readonly cache: Map<string, number> = new Map()` renders as
+/// `private cache = new Map()`, pinned by
+/// `test_typescript_pseudo_still_strips_class_field_readonly`. A class field's
+/// `public_field_definition` is where `readonly` still reaches the strip; the
+/// `property_signature` and `index_signature` members keep the modifier, so this
+/// predicate is not consulted for it there.
 ///
 /// Type annotations and decorators are NOT inline modifiers — their trailing spaces
 /// may belong to surrounding syntax (e.g., `: number = 42`).
@@ -254,8 +273,13 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
     match language {
         Language::TypeScript => PseudoRules {
             strip_kinds: &[
-                // `type_annotation` is stripped for variable/property positions; parameter
-                // annotations are preserved via a guard in collect_noise_ranges (ADR-007).
+                // `type_annotation` and `readonly` (below) are CANDIDATES here, not
+                // verdicts: collect_noise_ranges exempts the `return_type` field
+                // (ADR-007), parameter positions (E1), and the two type-level member
+                // kinds `property_signature` and `index_signature`, each on its own
+                // grounds stated at its guard — the type-level pair is NOT ADR-007.
+                // What reaches the strip is the rest: variable declarations, and
+                // `public_field_definition` class fields.
                 "type_annotation",
                 // `type_parameters` and `type_arguments` were removed so generic signatures
                 // like `identity<T>` and call-sites like `Migration<'a'>` survive intact
@@ -855,11 +879,84 @@ fn collect_noise_ranges(
             return Ok(());
         }
 
+        // F1: a TypeScript type-level MEMBER keeps its annotation.
+        //
+        // This is deliberately NOT filed under ADR-007. That entry is scoped to
+        // function RETURN types (and E1 above to parameters), where the
+        // annotation decorates a declaration that still reads as itself without
+        // it — `function add(a, b)` is a recognisable function. Here the
+        // annotation IS the declaration: `id: UserId` stripped to `id` leaves a
+        // member with no type at all, the reader cannot tell it was ever typed,
+        // and the compiler does not complain either — `tsc` silently widens the
+        // member to `any` (TS7008, and only under `noImplicitAny`). Two
+        // semantically disjoint union members can collapse onto the same bytes:
+        // `{ amount: number; currency: "USD" }` and its `"EUR"` sibling both
+        // render as `{ amount currency }`, so the discriminant the union exists
+        // for is gone with nothing to signal it.
+        //
+        // `readonly` travels with the annotation. On a `property_signature` it is
+        // part of the member's contract (assigning through it is TS2540), and it
+        // reaches this block via a SECOND `strip_kinds` entry (see `:264`), so
+        // exempting the annotation alone would return the type and still drop the
+        // modifier.
+        //
+        // An `index_signature` keeps both, for its own reasons. Its value type
+        // lives in the `type` field, which the pinned grammar marks
+        // `"required": true` — stripping it yields a node the grammar cannot
+        // represent, and `tsc` has a dedicated hard error for exactly that loss
+        // (TS1021, "An index signature must have a type annotation"). Its
+        // `readonly` carries the same contract a property's does: both
+        // `readonly [k: string]: V` and the mapped-type
+        // `{ readonly [K in keyof T]: T[K] }` stop being read-only without it,
+        // and the grammar admits the modifier in both forms (`SEQ[sign?,
+        // "readonly"]` ahead of the `[`). The KEY type (`[account: string]`) is
+        // a bare `type` node rather than a `type_annotation` and already
+        // survives either way.
+        //
+        // Parent kind alone is a sufficient scope, verified against the pinned
+        // grammar's generated `node-types.json` (tree-sitter-typescript 0.23.2):
+        // `property_signature` occurs ONLY under `object_type` / `interface_body`
+        // (the latter is an alias of the former), while a class field is a
+        // `public_field_definition` occurring ONLY under `class_body`. Those sets
+        // are disjoint, so class property annotations stay stripped — pinned by
+        // `test_typescript_pseudo_strips_class_property_annotation` and
+        // `test_typescript_pseudo_still_strips_class_field_readonly`.
+        //
+        // `index_signature` is DIFFERENT, and the difference is DELIBERATE: it
+        // also occurs under `class_body`, so the second arm reaches
+        // `class C { readonly [k: string]: number }` too. Do NOT narrow it back
+        // to interfaces. The justification for that arm was never LOCATION — it
+        // is the required `type` field, and `class C { [k: string] }` is TS1021
+        // exactly as an interface one is. It cannot reach a
+        // `public_field_definition`, which is what the "class property
+        // annotations stay stripped" argument above is actually about, so the
+        // wider reach leaves that scope argument intact.
+        //
+        // The two arms stay separate because they rest on different grounds, not
+        // by oversight: a property member's annotation is exempt because it IS
+        // the declaration, an index signature's because the grammar requires it.
+        // Collapsing them into one condition would give it two unrelated
+        // rationales and lose the note above.
+        //
+        // No language gate is needed: neither `property_signature` nor
+        // `index_signature` appears in any other vendored grammar. The `;` guard
+        // below is gated, because `interface_body` does collide (with Java).
+        if matches!(kind, "type_annotation" | "readonly")
+            && pos.parent_kind == Some("property_signature")
+        {
+            return Ok(());
+        }
+        if matches!(kind, "type_annotation" | "readonly")
+            && pos.parent_kind == Some("index_signature")
+        {
+            return Ok(());
+        }
+
         let start = node.start_byte();
         let end = node.end_byte();
         let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source_bytes, start);
-        // Consume trailing whitespace only for inline modifiers (lifetime, mut, readonly,
-        // abstract, etc.) where the space separates the modifier from the next token. Do NOT
+        // Consume trailing whitespace only for the inline modifiers `readonly` and
+        // `abstract`, where the space separates the modifier from the next token. Do NOT
         // consume for type annotations — their trailing space may belong to assignment syntax
         // (e.g., `: number = 42` → `= 42` needs the space before `=`).
         let end = if is_inline_modifier_kind(kind) {
@@ -881,18 +978,195 @@ fn collect_noise_ranges(
         }
     }
 
-    // Check for semicolon stripping (statement-terminating only, not for-loop headers).
-    //
-    // Two conditions gate preservation:
-    // 1. Direct child of a for-loop node — the `pos.parent_kind` check catches `;`
+    // Check for semicolon stripping.  Five conditions gate preservation, in the
+    // order the guards below test them:
+    // 1. A TypeScript type-member separator (`object_type` / `interface_body`).
+    // 2. A Rust declaration terminator (`function_signature_item`, `struct_item`,
+    //    `associated_type`).
+    // 3. A Rust array-length separator (`array_type` / `array_expression`).
+    // 4. Direct child of a for-loop node — the `pos.parent_kind` check catches `;`
     //    nodes that are direct children of `for_statement` (e.g., the condition
     //    separator in `for(;;)`).
-    // 2. `in_for_header` — catches `;` nodes nested INSIDE a for-loop's non-body
+    // 5. `in_for_header` — catches `;` nodes nested INSIDE a for-loop's non-body
     //    children (e.g., the `;` inside `lexical_declaration` in `for(let i=0;…)`).
+    //
+    // Conditions 1 and 3 are SEPARATOR cases and 2 is a TERMINATOR case; they are
+    // separate guards because they rest on different grounds, not by oversight.
+    // This list is only the map; each guard carries its own rationale at its site.
     //
     // The parent kind is threaded from the parent's child loop rather than read back
     // via `parent()`, which re-descends from the tree root (PF-020).
     if rules.strip_semicolons && kind == ";" {
+        // F1b: inside a TypeScript `object_type` / `interface_body` the `;` is a
+        // MEMBER SEPARATOR, not a statement terminator.
+        //
+        // The pinned grammar (tree-sitter-typescript 0.23.2) writes that
+        // separator as `CHOICE[",", _semicolon]` inside the member `REPEAT`, and
+        // that choice has NO `BLANK` alternative — two adjacent members with
+        // neither `,` nor `;` is a shape the grammar cannot produce. Multi-line
+        // input survives the loss only because `_semicolon` also admits an
+        // automatic-semicolon newline; on one line there is nothing to fall back
+        // on, so `{ amount: number; currency: "USD" }` reduced to
+        // `{ amount: number currency: "USD" }` is a hard `tsc` TS1005. This is
+        // the half of the type-level defect that actually breaks the parse —
+        // dropping the annotation alone (F1 above) does not.
+        //
+        // `_semicolon` is an INLINE rule, so the `;` token is a direct child of
+        // the object type and `pos.parent_kind` sees it without a `parent()` call
+        // (PF-020).
+        //
+        // LANGUAGE-GATED, and not defensively: `interface_body` is also a node
+        // kind in tree-sitter-java, whose own `interface_body` rule carries a
+        // bare `";"` alternative in its member `REPEAT`, and Java likewise sets
+        // `strip_semicolons: true`. An ungated parent-kind test would therefore
+        // start preserving stray semicolons in Java interface bodies — a silent
+        // behaviour change in a language this fix does not touch. `object_type`
+        // is TypeScript-only, but it is gated with its sibling so the two
+        // spellings cannot drift apart. Pinned by
+        // `test_java_pseudo_interface_body_semicolon_still_stripped`.
+        //
+        // A class body is deliberately excluded: its members are
+        // `public_field_definition`s whose annotations this mode still strips, so
+        // there is no restored declaration for the `;` to terminate.
+        if ctx.language == Language::TypeScript
+            && matches!(pos.parent_kind, Some("object_type" | "interface_body"))
+        {
+            return Ok(());
+        }
+
+        // F1c: a Rust DECLARATION's `;` is what says the declaration is complete,
+        // and without it the declaration reads as a different one.
+        //
+        // The criterion: strip the `;` where its absence is merely untidy, keep it
+        // where its absence changes what the declaration APPEARS TO BE.
+        // `use std::fmt` is still unmistakably a use declaration and `let x = 1`
+        // is still a binding, so both keep being stripped.  But
+        // `fn compute(&self, x: i32) -> i32` is no longer a signature — it is a
+        // function whose body is missing, which is precisely how rustc reads it:
+        // "error: expected ';', found '}'", with "help: add ';' here".  A unit
+        // `struct Marker` stops being a declaration at all, and whatever follows
+        // it reads as its body.  `type Item` reads as a type alias still waiting
+        // for its `= ...`.
+        //
+        // This is deliberately NOT filed under ADR-007.  That entry is scoped to
+        // function RETURN types, and its E1 amendment to parameters; a terminator
+        // is neither, and citing it here would be the PF-014 trap — the anchor
+        // resolves, the row greps, the heading renders, and the citation is still
+        // about something else.  This arm stands on the criterion above.
+        //
+        // Grammar-verified against the LOCKED version (tree-sitter-rust 0.24.0
+        // per `Cargo.lock`; the workspace pin is `"0.24"`).  In all three rules
+        // the `;` is a `STRING` member of the rule's own top-level `SEQ`/`CHOICE`,
+        // so it is a DIRECT child and `pos.parent_kind` sees it without a
+        // `parent()` call (PF-020):
+        //     function_signature_item  ... where_clause? ';'
+        //     struct_item              ... ( where? field_declaration_list
+        //                                  | ordered_field_declaration_list where? ';'
+        //                                  | ';' )
+        //     associated_type          'type' name type_parameters? bounds? where? ';'
+        // `struct_item`'s braced first alternative carries no `;` at all, so this
+        // arm reaches only its tuple and unit forms.
+        //
+        // NO language gate, and that is measured rather than assumed: all 46
+        // `grammar.json` / `node-types.json` artifacts under the vendored
+        // `tree-sitter-*` crates were scanned for these three kinds, and only
+        // tree-sitter-rust carries any of them.  Contrast the guard above, which
+        // IS gated because `interface_body` genuinely collides with
+        // tree-sitter-java.  A gate here could not be made to fail, and an
+        // unfalsifiable guard reads as evidence of a collision that does not
+        // exist (PF-025 rule 1).  The nearest neighbour is pinned independently by
+        // `test_c_pseudo_strips_semicolons`.
+        //
+        // WHAT THIS ARM DOES NOT FIX, recorded so the change is not read as wider
+        // than it is.  Still stripped by the criterion, and asserted so by
+        // `test_rust_pseudo_still_strips_non_declaration_semicolons`:
+        // `use_declaration`, `let_declaration`, `expression_statement`,
+        // `const_item`, `static_item` — so Rust pseudo output still does not
+        // re-parse as a whole, which is pre-existing and tracked separately.
+        //
+        // A further five kinds can carry a `;` and are not weighed by the
+        // criterion at all, so they are also still stripped: `mod_item`
+        // (`mod foo;`), `type_item` (`type T = U;`), `impl_item`,
+        // `foreign_mod_item` and `macro_definition` — plus `empty_statement` and
+        // `extern_crate_declaration`, which the criterion would exclude on its own
+        // terms.  Deliberately deferred to their own decision rather than settled
+        // here; `type_item` against the admitted `associated_type` is a real
+        // asymmetry (same syntactic form, same consequence, different treatment)
+        // and `mod_item` meets the criterion's apparent-kind test on its own
+        // wording.  Widening the criterion from three kinds to ten is not a
+        // decision this commit should make silently.  The array separator below IS
+        // handled, because it is not a terminator question at all.
+        //
+        // And no CLI reader sees any of this today.  Rust's `strip_kinds` and
+        // `strip_keywords` are both empty, so the `;` is pseudo's only lever on
+        // Rust — and it is TOKEN-NEUTRAL: removing 205 semicolons was measured
+        // moving 1,129 tokens to 1,129 tokens (0.0%), because the BPE tokenizer
+        // folds `;` into an adjacent token.  ADR-001's guard keeps the compressed
+        // side only when it is strictly smaller in BOTH bytes and tokens, so its
+        // `Keep` branch is unreachable for any Rust input at any size and the CLI
+        // serves the raw file instead.  What this arm is FOR: `rskim-core` is a
+        // library whose callers invoke the transform directly and never meet that
+        // guard, and `truncation_golden__rust_simple_pseudo_unbounded.snap` had
+        // been blessing invalid Rust as expected output.
+        if matches!(
+            pos.parent_kind,
+            Some("function_signature_item" | "struct_item" | "associated_type")
+        ) {
+            return Ok(());
+        }
+
+        // F1c, second arm: a Rust ARRAY LENGTH separator. This is NOT a
+        // terminator question, which is why it is a separate guard rather than
+        // three more names in the `matches!` above.
+        //
+        // The two above turn on the criterion's judgement — does the declaration
+        // still read as itself without the byte. This one does not need that
+        // judgement, because the `;` here is not punctuation after a declaration:
+        // it is the separator BETWEEN a type and its length, inside the type. Its
+        // loss destroys the type's MEANING rather than its tidiness or its
+        // apparent kind. `[u8; 32]` renders as `[u8 32]`, which is not valid Rust
+        // and does not parse. That is the same defect shape the TypeScript
+        // `object_type` guard above fixes — a member separator whose choice the
+        // grammar offers no blank alternative for — so leaving it stripped in one
+        // language while fixing it in another, in the same guard, one arm away,
+        // would be incoherent.
+        //
+        // Grammar-verified against the locked tree-sitter-rust 0.24.0, where in
+        // both rules the `;` is a direct child of the named node:
+        //     array_type        '[' type (';' expression)? ']'
+        //     array_expression  '[' attribute_item* ( expression ';' expression
+        //                                           | (expression (',' expression)*)? ','? ) ']'
+        // `array_expression`'s comma form carries no `;`, so `[1, 2, 3]` is
+        // untouched; only the repeat form `[value; count]` reaches this arm.
+        //
+        // LANGUAGE-GATED, and for a reason that is NOT the one the guard above
+        // uses — do not collapse the two justifications. `interface_body` collides
+        // with tree-sitter-java BEHAVIOURALLY: Java's rule admits a bare `;`
+        // today, so an ungated test would change live Java output, and a test can
+        // prove it. `array_type` is a weaker but still real collision: re-scanning
+        // all 46 vendored grammar artifacts finds the NAME in five other grammars
+        // — tree-sitter-java, tree-sitter-c-sharp, tree-sitter-typescript (both
+        // the `typescript` and `tsx` dialects), tree-sitter-go and
+        // tree-sitter-swift — and the first three set `strip_semicolons: true`.
+        // (C and C++ do NOT, despite the plausible name: they spell it
+        // `array_declarator`.) In none of the five can `array_type` emit a direct
+        // `;`, so the hazard is absent TODAY and no test can make this gate fail.
+        // It is kept anyway because what protects those three languages is a
+        // second-order property of foreign grammars at their pinned versions, and
+        // a grammar bump is a one-line `Cargo.toml` edit that nothing in CI would
+        // connect to this arm. The gate makes the arm's scope true by construction
+        // instead of true by coincidence. It is therefore NOT an instance of the
+        // decorative guard PF-025 rule 1 warns about: that rule is about an
+        // invariant adopted because it SOUNDS like a check, and this one is
+        // adopted against a measured name collision whose absence of hazard is
+        // contingent. `array_expression` is Rust-only and is gated with its
+        // sibling so the two cannot drift apart.
+        if ctx.language == Language::Rust
+            && matches!(pos.parent_kind, Some("array_type" | "array_expression"))
+        {
+            return Ok(());
+        }
+
         let is_for_loop_direct_child = pos.parent_kind.is_some_and(|parent_kind| {
             matches!(
                 parent_kind,
@@ -1283,6 +1557,219 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------
+    // F1 / F1b — type-level member declarations
+    // ------------------------------------------------------------------------
+    //
+    // These are guard-free by construction: `rskim-core` has no dependency on
+    // `rskim`'s `output/`, so the ADR-001 net-savings guard does not exist here.
+    // They prove the transform is right and say NOTHING about whether a reader
+    // ever sees it — `crates/rskim/tests/cli_pseudo_type_fidelity.rs` is the
+    // other half, and neither layer substitutes for the other.
+    //
+    // F1 (the annotation) and F1b (the `;`) are separate changes, so the tests
+    // below are split along the same seam and no F1 test asserts a `;`: each set
+    // must pass with its own change alone.  `contains("id: UserId")` holds
+    // whether or not the separator is there; `contains("id: UserId;")` does not,
+    // and would make the F1 tests depend on F1b having landed first.
+
+    // --- F1: the annotation (lands with the `strip_kinds` exemption) ---
+
+    #[test]
+    fn test_typescript_pseudo_preserves_interface_member_annotation() {
+        // F1: an interface member's annotation is the ENTIRE content of the
+        // declaration — `id` alone does not record that the member was ever
+        // typed, and nothing downstream complains (`tsc` widens it to `any`,
+        // and only reports that under `noImplicitAny`).
+        let source = "interface User {\n    id: UserId;\n    email: string;\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("id: UserId"),
+            "interface member annotation must be preserved, got: {result}"
+        );
+        assert!(
+            result.contains("email: string"),
+            "every member is exempt, not only the first, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_preserves_interface_member_readonly() {
+        // `readonly` reaches the strip block through a SECOND `strip_kinds`
+        // entry, so exempting `type_annotation` alone yields `createdAt: Date`
+        // and still silently drops a modifier that decides what assigning to
+        // the member means (TS2540).
+        let source = "interface User {\n    readonly createdAt: Date;\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("readonly createdAt: Date"),
+            "`readonly` on a property_signature is part of the member's contract, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_preserves_index_signature_type() {
+        // An `index_signature`'s `type` field is `"required": true` in the
+        // grammar, so stripping it yields a node the grammar cannot represent;
+        // `tsc` rejects it with the dedicated TS1021.  The KEY type survives
+        // either way — it is a bare `type` node, not a `type_annotation`.
+        let source = "interface Ledger {\n    [account: string]: number;\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("[account: string]: number"),
+            "an index signature must keep its value type (TS1021), got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_preserves_index_signature_readonly() {
+        // Same modifier, same contract, same second `strip_kinds` entry as the
+        // property case — and the grammar admits `readonly` on an index
+        // signature in BOTH of its forms, so both are asserted: the plain
+        // `name: type` form and the mapped-type clause.  Leaving either one
+        // stripped would keep a live instance of exactly the defect this change
+        // exists to remove.
+        let plain = "interface Ledger {\n    readonly [account: string]: number;\n}\n";
+        let result = transform(plain, Language::TypeScript);
+        assert!(
+            result.contains("readonly [account: string]: number"),
+            "a readonly index signature must keep its modifier, got: {result}"
+        );
+
+        let mapped = "type Frozen<T> = {\n    readonly [K in keyof T]: T[K];\n};\n";
+        let result = transform(mapped, Language::TypeScript);
+        assert!(
+            result.contains("readonly [K in keyof T]: T[K]"),
+            "a mapped type's `readonly` and value type must both survive, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_union_members_do_not_collapse_to_identical_bytes() {
+        // The sharpest available statement of the defect: pre-fix these two
+        // semantically disjoint members both rendered as the same 22 bytes,
+        // `  | { amount currency }`, so the discriminant the union exists for
+        // was gone and nothing on any stream said so.
+        //
+        // Asserted by comparing the two emitted lines, because `contains` is
+        // structurally unable to state "and these two are not the same text"
+        // (PF-025: assert the specific property, never a proxy that survives
+        // the defect).
+        let source = "type Money =\n  | { amount: number; currency: \"USD\" }\n  | { amount: number; currency: \"EUR\" };\n";
+        let result = transform(source, Language::TypeScript);
+        let members: Vec<&str> = result
+            .lines()
+            .filter(|l| l.trim_start().starts_with("| {"))
+            .collect();
+        assert_eq!(
+            members.len(),
+            2,
+            "both union members must still be emitted, got: {result}"
+        );
+        assert_ne!(
+            members[0], members[1],
+            "two disjoint union members must not render as identical bytes, got: {result}"
+        );
+        assert!(
+            members[0].contains("\"USD\"") && members[1].contains("\"EUR\""),
+            "the discriminant literal is what distinguishes them, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_still_strips_class_field_readonly() {
+        // Control for the `readonly` half of F1, and the reason the exemption is
+        // keyed on `property_signature` rather than on the modifier alone: a
+        // class field is a `public_field_definition` under `class_body`, a
+        // disjoint node kind in a disjoint container.  If either assertion here
+        // fails, F1's scope argument is wrong and
+        // `test_typescript_pseudo_strips_class_property_annotation` was not the
+        // only test needing amendment.
+        let source =
+            "class Store {\n    private readonly cache: Map<string, number> = new Map();\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            !result.contains("readonly"),
+            "a class field's `readonly` is outside F1's scope and must still be \
+             stripped, got: {result}"
+        );
+        assert!(
+            !result.contains(": Map<string, number>"),
+            "a class field's type annotation must still be stripped, got: {result}"
+        );
+        assert!(
+            result.contains("private cache = new Map()"),
+            "visibility (A4), name and initializer survive, got: {result}"
+        );
+    }
+
+    // --- F1b: the member separator (lands with the `;` guard, not with F1) ---
+
+    #[test]
+    fn test_typescript_pseudo_preserves_interface_body_semicolon() {
+        // F1b: the `;` between interface members is the MEMBER SEPARATOR — a
+        // direct child of `interface_body`, and the grammar's member `REPEAT`
+        // offers no `BLANK` alternative in its place.  Asserted per member,
+        // including the trailing one before `}`, because the repeated and
+        // trailing separator positions are two distinct places in the rule and
+        // a one-member body exercises neither.
+        let source = "interface User {\n    id: UserId;\n    email: string;\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("id: UserId;"),
+            "the separator between two members must survive, got: {result}"
+        );
+        assert!(
+            result.contains("email: string;"),
+            "the trailing separator before `}}` must survive too, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_still_strips_statement_terminating_semicolon() {
+        // Control for F1b's scope: only a type-member separator is exempt.  A
+        // `;` that terminates a statement, or a type-alias declaration, keeps
+        // being stripped — otherwise F1b is not a scoped exemption but a repeal
+        // of `strip_semicolons` for TypeScript.
+        let source = "type UserId = string;\nfunction f() {\n    const a = 1;\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            !result.contains("type UserId = string;"),
+            "a type-alias declaration terminator is outside F1b's scope, got: {result}"
+        );
+        assert!(
+            !result.contains("const a = 1;"),
+            "a statement terminator is outside F1b's scope, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_type_level_body_reparses_without_error() {
+        // "It parses" is the contract F1b exists to restore, and no byte
+        // assertion can state it.  This test REQUIRES F1b: with F1 alone the
+        // single-line object type renders as
+        // `{ amount: number currency: string }`, which is the shape the grammar
+        // cannot produce, so tree-sitter yields an error node here exactly as
+        // `tsc` yields TS1005.
+        //
+        // Scoped to what F1/F1b touch: every `;` in this fixture is either a
+        // type-member separator or the terminator of a declaration whose loss is
+        // tolerated by ASI, so the unrelated statement-terminator stripping
+        // cannot be the source of an error observed here (PF-025 — the
+        // assertion is scoped to this change, not a general no-corruption
+        // claim).
+        let source = "type Money = { amount: number; currency: string };\ninterface User {\n    readonly id: number;\n    email: string;\n}\ninterface Ledger {\n    [account: string]: number;\n}\n";
+        let result = transform(source, Language::TypeScript);
+
+        let mut parser = Parser::new(Language::TypeScript).unwrap();
+        let tree = parser.parse(&result).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "pseudo output for type-level declarations must re-parse as valid \
+             TypeScript with no error nodes, got: {result}"
+        );
+    }
+
     // ========================================================================
     // JavaScript pseudo tests
     // ========================================================================
@@ -1507,6 +1994,225 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------
+    // F1c — Rust declaration-terminating `;`
+    // ------------------------------------------------------------------------
+    //
+    // Two arms, on two different grounds.  For a declaration TERMINATOR the
+    // criterion is: strip the `;` where its absence is merely untidy, keep it
+    // where its absence changes what the declaration APPEARS TO BE.  For an array
+    // SEPARATOR no such judgement is needed — the `;` sits inside the type,
+    // between it and its length, so its loss destroys the type's MEANING:
+    // `[u8; 32]` becomes `[u8 32]`, which does not parse.
+    //
+    // Each positive test below names a construct rustc rejects without the byte;
+    // the negative control names one per excluded kind, so the guards stay scoped
+    // exemptions rather than a repeal of `strip_semicolons` for Rust.  An array
+    // type and an array expression are two different grammar rules reaching the
+    // same `;`, so they get a test each — one cannot cover the other, exactly as
+    // for `struct_item`'s unit and tuple forms.
+    //
+    // This layer is the ONLY one that can observe F1c, and that is a measured
+    // constraint rather than a shortcut.  Rust's `strip_kinds` and
+    // `strip_keywords` are both empty, so the `;` is pseudo's only lever on Rust,
+    // and removing 205 of them was measured moving 1,129 tokens to 1,129 tokens
+    // (0.0% — the BPE tokenizer folds `;` into an adjacent token).  ADR-001's
+    // guard keeps the compressed side only when it is strictly smaller in BOTH
+    // bytes and tokens, so its `Keep` branch is unreachable for any Rust input at
+    // any size.  A CLI test would therefore be served the RAW file, which already
+    // contains every `;`, and would pass green against a completely unfixed
+    // binary — PF-025's exact shape, so no such test is written.
+
+    #[test]
+    fn test_rust_pseudo_preserves_trait_method_signature_terminator() {
+        // A `function_signature_item`'s `;` is what states the declaration has no
+        // body.  Without it, rustc reads a function whose block is missing:
+        // "error: expected ';', found '}'" and "help: add ';' here".
+        let source = "pub trait Compute {\n    fn compute(&self, x: i32) -> i32;\n    fn reset(&mut self);\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("-> i32;"),
+            "a trait method signature must keep its terminator, got: {result}"
+        );
+        assert!(
+            result.contains("fn reset(&mut self);"),
+            "every signature in the body is exempt, not only the first, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_preserves_struct_item_terminator() {
+        // The grammar gives `struct_item` three bodies: a braced
+        // `field_declaration_list` with no `;` at all, a tuple
+        // `ordered_field_declaration_list` followed by one, and a bare `;` for a
+        // unit struct.  Both `;`-bearing forms are asserted because they are
+        // different alternatives of the rule and the braced form exercises
+        // neither.  A unit struct without its terminator stops being a
+        // declaration: whatever follows it reads as its body.
+        let source = "pub struct Marker;\npub struct Wrapper(i32);\npub struct Braced {\n    value: i32,\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("pub struct Marker;"),
+            "a unit struct must keep its terminator, got: {result}"
+        );
+        assert!(
+            result.contains("pub struct Wrapper(i32);"),
+            "a tuple struct must keep its terminator, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_preserves_associated_type_terminator() {
+        // `type Item;` without its `;` reads as a type alias still waiting for
+        // its `= ...`.  Asserted with and without bounds: `bounds` is an optional
+        // field, so the two shapes reach the `;` through different paths.
+        let source = "pub trait Source {\n    type Item;\n    type Cursor: Clone;\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("type Item;"),
+            "an associated type must keep its terminator, got: {result}"
+        );
+        assert!(
+            result.contains("type Cursor: Clone;"),
+            "a bounded associated type must keep its terminator, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_preserves_array_type_separator() {
+        // `array_type` is `'[' type (';' expression)? ']'` — the `;` separates the
+        // element type from the length, INSIDE the type.  Without it `[u8; 32]`
+        // reads as `[u8 32]`, which is not a type at all; rustc does not parse it.
+        // Asserted in both positions an array type occurs in API surface: a struct
+        // field and a return type.
+        // The fixture is deliberately free of any array EXPRESSION, so the two
+        // array tests exercise one grammar rule each, and it is valid,
+        // type-correct Rust so it stays usable if a re-parse assertion is ever
+        // added here.
+        let source = "pub struct Digest {\n    bytes: [u8; 32],\n}\n\npub trait Hasher {\n    fn hash(&self) -> [u8; 32];\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("bytes: [u8; 32]"),
+            "an array type in a field must keep its length separator, got: {result}"
+        );
+        assert!(
+            result.contains("-> [u8; 32]"),
+            "an array type in a return position must keep its length separator, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_preserves_array_expression_separator() {
+        // `array_expression`'s repeat form is `'[' expression ';' expression ']'`.
+        // It is a DIFFERENT grammar rule from `array_type` and reaches the same
+        // `;`, so neither test covers the other.
+        //
+        // The `let` here is doing real work rather than decorating the fixture: it
+        // puts an exempt `;` and a stripped `;` on one line, so the two assertions
+        // together state that the guard distinguishes them by parent kind and not
+        // by line or proximity.  The comma form is asserted untouched because it
+        // has no `;` for this arm to reach.
+        let source = "pub fn zeros() -> ([u8; 4], [i32; 3]) {\n    let buf = [0u8; 4];\n    let seq = [1, 2, 3];\n    (buf, seq)\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("[0u8; 4]"),
+            "an array expression must keep its repeat separator, got: {result}"
+        );
+        assert!(
+            !result.contains("[0u8; 4];"),
+            "the enclosing let_declaration terminator is still stripped — the guard \
+             keys on parent kind, not on proximity, got: {result}"
+        );
+        assert!(
+            result.contains("[1, 2, 3]"),
+            "the comma form has no separator for this arm to reach, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_still_strips_non_declaration_semicolons() {
+        // Control for F1c's scope, one construct per excluded node kind.  Each of
+        // these still reads as itself without its `;` — `use std::fmt` is
+        // unmistakably a use declaration — so the criterion calls the loss untidy
+        // rather than misleading, and leaves it.  If any of these starts
+        // surviving, the guard stopped being an exemption and became a repeal of
+        // `strip_semicolons` for Rust.
+        let source = concat!(
+            "use std::fmt;\n",
+            "pub const LIMIT: u32 = 5;\n",
+            "pub static NAME: &str = \"skim\";\n",
+            "pub fn run(acc: &mut u32) {\n",
+            "    let step = 1;\n",
+            "    *acc += step;\n",
+            "}\n",
+        );
+        let result = transform(source, Language::Rust);
+        assert!(
+            !result.contains("use std::fmt;"),
+            "a use_declaration terminator is outside F1c's scope, got: {result}"
+        );
+        assert!(
+            !result.contains("LIMIT: u32 = 5;"),
+            "a const_item terminator is outside F1c's scope, got: {result}"
+        );
+        assert!(
+            !result.contains("NAME: &str = \"skim\";"),
+            "a static_item terminator is outside F1c's scope, got: {result}"
+        );
+        assert!(
+            !result.contains("let step = 1;"),
+            "a let_declaration terminator is outside F1c's scope, got: {result}"
+        );
+        assert!(
+            !result.contains("*acc += step;"),
+            "an expression_statement terminator is outside F1c's scope, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_declaration_terminators_reparse_without_error() {
+        // "It parses" is the contract F1c restores, and no byte assertion can
+        // state it: `contains("-> i32;")` is true of text that is broken
+        // elsewhere.  Pre-fix, the trait shape below is what
+        // `truncation_golden__rust_simple_pseudo_unbounded.snap` blessed, and
+        // rustc answers it with "expected ';', found '}'".
+        //
+        // Scoped to what F1c touches (PF-025): every `;` in this fixture is one
+        // the two guards preserve — a struct terminator, an associated type, a
+        // signature terminator, an array type or an array expression.  A `use`, a
+        // `let` or a statement would contribute an error node for a reason F1c
+        // does not address, and the assertion would then be a general
+        // no-corruption claim this change cannot make.  `zeros`'s body is a bare
+        // tail expression for exactly that reason: giving it a statement would
+        // reintroduce a stripped `;` and break the scoping.
+        let source = concat!(
+            "pub struct Marker;\n",
+            "pub struct Wrapper(i32);\n",
+            "pub struct Digest {\n",
+            "    bytes: [u8; 32],\n",
+            "}\n",
+            "pub trait Source {\n",
+            "    type Item;\n",
+            "    type Cursor: Clone;\n",
+            "    fn next(&mut self) -> Option<i32>;\n",
+            "    fn reset(&mut self);\n",
+            "    fn digest(&self) -> [u8; 32];\n",
+            "}\n",
+            "pub fn zeros() -> [u8; 4] {\n",
+            "    [0u8; 4]\n",
+            "}\n",
+        );
+        let result = transform(source, Language::Rust);
+
+        let mut parser = Parser::new(Language::Rust).unwrap();
+        let tree = parser.parse(&result).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "pseudo output for Rust declaration terminators must re-parse as valid \
+             Rust with no error nodes, got: {result}"
+        );
+    }
+
     // ========================================================================
     // Java pseudo tests
     // ========================================================================
@@ -1524,6 +2230,31 @@ mod tests {
         assert!(
             result.contains("for (int i = 0; i < 10; i++)"),
             "Java for-loop header must be intact (E2.1), got: {result}"
+        );
+    }
+
+    /// F1b language gate: `interface_body` is NOT a TypeScript-only node kind.
+    ///
+    /// tree-sitter-java also names a node `interface_body`, and its rule carries
+    /// a bare `";"` alternative in the member `REPEAT` — so a stray `;` there is
+    /// a DIRECT child of `interface_body`, exactly the shape F1b's parent-kind
+    /// test matches.  Java also sets `strip_semicolons: true`.  Without the
+    /// `Language::TypeScript` gate this test fails, which is the only thing that
+    /// makes the gate falsifiable rather than decorative (PF-025 rule 1: require
+    /// the invariant to fail on a reproduction before trusting it).
+    ///
+    /// `void run();`'s own `;` is a child of `method_declaration`, not of the
+    /// interface body, so it is stripped on either side of the gate — the stray
+    /// `;` is the whole discriminator, and "no `;` survives" is therefore an
+    /// exact statement of the expected Java behaviour rather than a proxy.
+    #[test]
+    fn test_java_pseudo_interface_body_semicolon_still_stripped() {
+        let source = "interface Service {\n    ;\n    void run();\n}\n";
+        let result = transform(source, Language::Java);
+        assert!(
+            !result.contains(';'),
+            "Java is outside F1b's scope: a stray `;` directly under a Java \
+             `interface_body` must still be stripped, got: {result}"
         );
     }
 
@@ -1856,8 +2587,11 @@ mod tests {
 
     #[test]
     fn test_rust_pseudo_trait_preserves_return_type() {
-        // Return type is preserved as API surface (A4 contract); the trailing
-        // `;` on trait method signatures is still stripped.
+        // Return type is preserved as API surface (A4 contract).  The trailing
+        // `;` is preserved too, by the declaration-terminator guard — this test
+        // asserts only the return type, so it holds either way;
+        // `test_rust_pseudo_preserves_trait_method_signature_terminator` is where
+        // the terminator itself is pinned.
         let source = "pub trait Compute {\n    fn compute(&self, value: i32) -> i32;\n    fn reset(&mut self);\n}\n";
         let result = transform(source, Language::Rust);
         assert!(

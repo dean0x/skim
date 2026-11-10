@@ -4,7 +4,7 @@ expression: "snap(RUST_SIMPLE, Language::Rust,\nTransformConfig::with_mode(Mode:
 ---
 // ... (25 lines above)
 pub trait Compute {
-    fn compute(&self, x: i32) -> i32
+    fn compute(&self, x: i32) -> i32;
 }
 
 pub enum Status {

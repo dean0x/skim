@@ -276,23 +276,24 @@ fn try_parse_porcelain(text: &str) -> Option<GitResult> {
         };
 
         found_porcelain = true;
-        // Extract short ref name from `refs/heads/foo:refs/heads/foo` or bare `foo`.
-        let short_ref = extract_short_ref(rest.trim());
+        // Render BOTH sides of the refspec: `feature -> main` when they differ,
+        // a single short name when they do not.  See [`format_ref_pair`].
+        let ref_pair = format_ref_pair(rest.trim());
 
         match flag {
-            "=" => updated.push(format!("= {short_ref} [up to date]")),
-            "*" => pushed.push(format!("* {short_ref} [new]")),
-            "+" => pushed.push(format!("+ {short_ref} [forced]")),
-            "!" => rejected.push(format!("! {short_ref} [rejected]")),
-            "-" => deleted.push(format!("- {short_ref} [deleted]")),
+            "=" => updated.push(format!("= {ref_pair} [up to date]")),
+            "*" => pushed.push(format!("* {ref_pair} [new]")),
+            "+" => pushed.push(format!("+ {ref_pair} [forced]")),
+            "!" => rejected.push(format!("! {ref_pair} [rejected]")),
+            "-" => deleted.push(format!("- {ref_pair} [deleted]")),
             // Space flag: a successfully pushed fast-forward.  Its porcelain
             // summary column is the ref range (`e6bab99..13b30c2`) rather than
             // a bracketed label, and that range is the only per-ref detail the
             // line carries, so it is reported alongside the ref name.
             " " => {
                 let detail = match porcelain_summary_field(rest) {
-                    Some(range) => format!("  {short_ref} [fast-forward] {range}"),
-                    None => format!("  {short_ref} [fast-forward]"),
+                    Some(range) => format!("  {ref_pair} [fast-forward] {range}"),
+                    None => format!("  {ref_pair} [fast-forward]"),
                 };
                 pushed.push(detail);
             }
@@ -426,6 +427,134 @@ fn extract_short_ref(s: &str) -> String {
         .or_else(|| src.strip_prefix("refs/"))
         .unwrap_or(src)
         .to_string()
+}
+
+/// The two sides of a porcelain `<from>:<to>` ref field, shortened — the
+/// classification [`format_ref_pair`] renders.
+///
+/// Every shape git can put in that field is a *variant* here rather than a
+/// special case noticed at a call site.  [`RefPair::Destination`] is the one
+/// that matters most: git's real deleted-ref line has an **empty source side**
+/// (`-\t:refs/heads/old\t[deleted]` — recorded in this module's header and
+/// measured against git 2.50.1), so "no source" is a state the classifier
+/// names, not a blank string a renderer has to guard against.
+#[derive(Debug, PartialEq, Eq)]
+enum RefPair {
+    /// Both sides name the same ref: `refs/heads/main:refs/heads/main`, or a
+    /// bare `main` whose destination is implicitly its source.
+    Same(String),
+    /// The sides differ: `refs/heads/feature:refs/heads/main`.  The only shape
+    /// that earns the arrow form.
+    Distinct { src: String, dst: String },
+    /// No source side — git's deleted-ref shape, `:refs/heads/old`.
+    Destination(String),
+    /// No destination side.  git does not emit this; a hand-written refspec can.
+    Source(String),
+    /// Neither side names a ref (a lone `:`, or an empty field).  Reported
+    /// verbatim so the reader sees the token skim could not interpret rather
+    /// than nothing at all (#317).
+    Unnamed(String),
+}
+
+/// Classify the ref field of a porcelain push status line.
+///
+/// `s` is the content *after* the flag column — the same input
+/// [`extract_short_ref`] takes — so the `<from>:<to>` pair is the first
+/// TAB/space-delimited field and anything after it is the summary column.
+fn classify_ref_pair(s: &str) -> RefPair {
+    // Field 0 of `<from>:<to>\t<summary>`.  A ref name can contain neither a
+    // space, a TAB, nor a colon (`git check-ref-format`), so neither this split
+    // nor the `split_once(':')` below can cut a name in half.
+    let field = s.split(['\t', ' ']).next().unwrap_or(s);
+
+    // A leading `+` is legal refspec syntax for a force push, but git's
+    // porcelain `<from>` field never carries it: measured against git 2.50.1,
+    // `git push --porcelain +side:refs/heads/dst` emits
+    // `+\trefs/heads/side:refs/heads/dst\t<range> (forced update)`, i.e. git's
+    // refspec parser consumes the `+` and force-ness moves to the FLAG column,
+    // which the caller already renders as `[forced]`.  This strip is therefore
+    // defensive — for a caller that hands this renderer a user-typed refspec —
+    // and it discards no information skim does not already show.
+    let field = field.strip_prefix('+').unwrap_or(field);
+
+    let (src, dst) = match field.split_once(':') {
+        Some(pair) => pair,
+        // No colon: a bare refspec pushes a ref to the same name on the remote.
+        None => (field, field),
+    };
+
+    // [`extract_short_ref`] is reused below as the per-side prefix shortener.
+    // On a single isolated side its own `:` and whitespace splits are no-ops,
+    // so it reduces to the `refs/heads/` | `refs/tags/` | `refs/` strip — and
+    // keeping that rule in exactly one place is why this classifier does not
+    // re-implement it.
+    match (src.is_empty(), dst.is_empty()) {
+        (true, true) => RefPair::Unnamed(field.to_string()),
+        (true, false) => RefPair::Destination(extract_short_ref(dst)),
+        (false, true) => RefPair::Source(extract_short_ref(src)),
+        // Equality is decided on the FULL sides, BEFORE shortening, so a pair
+        // that differs only in its namespace is never collapsed into one name.
+        (false, false) if src == dst => RefPair::Same(extract_short_ref(src)),
+        (false, false) => {
+            let short_src = extract_short_ref(src);
+            let short_dst = extract_short_ref(dst);
+            if short_src == short_dst {
+                // Shortening collided two genuinely different refs
+                // (`refs/heads/x:refs/tags/x`).  Show the full names: the arrow
+                // form exists precisely to state that the sides differ, and
+                // `x -> x` would deny it.
+                RefPair::Distinct {
+                    src: src.to_string(),
+                    dst: dst.to_string(),
+                }
+            } else {
+                RefPair::Distinct {
+                    src: short_src,
+                    dst: short_dst,
+                }
+            }
+        }
+    }
+}
+
+/// Render a porcelain ref field for the reader, naming **both** sides of an
+/// asymmetric refspec.
+///
+/// `git push origin feature:main` writes `main` on the remote, and the
+/// destination is the half that says what actually changed there.  Measured at
+/// `c2b4378`, skim rendered `* f2 [new]` for the refspec
+/// `f2:refs/heads/dst-two` while git itself printed
+/// ` * [new branch]      f3 -> dst-three`: the reader could not tell where the
+/// branch had landed, on the one refspec shape that exists *because* the two
+/// sides differ.
+///
+/// The arrow form follows git's own prose spelling (`<src> -> <dst>`) so a
+/// reader can line skim's summary up against git's output.
+///
+/// **Equal sides collapse to a single name.**  `src == dst` is the
+/// overwhelmingly common case (`git push origin main`), `main -> main` states
+/// one fact twice, and this render is graded by the ADR-001 net-savings guard —
+/// inflating every ordinary push would spend bytes to say nothing and push the
+/// guard toward serving raw on exactly the invocations skim compresses today.
+///
+/// Shapes handled, all measured against `git push --porcelain` (git 2.50.1):
+///
+/// | Field | Render |
+/// |---|---|
+/// | `refs/heads/feature:refs/heads/main` | `feature -> main` |
+/// | `refs/heads/main:refs/heads/main` | `main` |
+/// | `main` | `main` |
+/// | `HEAD:refs/heads/feature` | `HEAD -> feature` |
+/// | `:refs/heads/old` (deletion) | `old` |
+/// | `+feature:main` | `feature -> main` |
+fn format_ref_pair(s: &str) -> String {
+    match classify_ref_pair(s) {
+        RefPair::Same(name)
+        | RefPair::Destination(name)
+        | RefPair::Source(name)
+        | RefPair::Unnamed(name) => name,
+        RefPair::Distinct { src, dst } => format!("{src} -> {dst}"),
+    }
 }
 
 // ============================================================================
@@ -718,6 +847,298 @@ mod tests {
         assert_eq!(extract_short_ref("main"), "main");
     }
 
+    // ---- Ref-pair rendering (F7) ----
+    //
+    // Every input below is a shape measured out of real `git push --porcelain`
+    // output (git 2.50.1) against a local bare repo, except where a case is
+    // marked as reachable only through a hand-written refspec.
+    //
+    // These assert the RENDERED string, never `RefPair`, so they cannot be
+    // satisfied by a classifier that is right about the structure and wrong
+    // about the bytes the reader sees.
+
+    /// F7 regression: an asymmetric refspec must name its **destination**.
+    ///
+    /// `git push origin feature:main` writes `main` on the remote, and
+    /// `src:dst` exists precisely because the two sides differ — so the
+    /// destination is the half that says what actually changed there.
+    ///
+    /// RED at the parent commit: `format_ref_pair` did not exist and the call
+    /// site used `extract_short_ref`, which discards everything after the
+    /// colon.  Measured at `c2b4378` against a hermetic bare remote, the
+    /// refspec `fa:refs/heads/dst-aa` rendered as `* fa [new]` — the
+    /// destination absent — while git itself printed
+    /// ` * [new branch]      fa -> dst-aa`.
+    ///
+    /// The negative assertion is what makes this discriminating: a renderer
+    /// that simply echoed the refspec verbatim would satisfy "the destination
+    /// appears somewhere" while still failing to state the relationship.
+    #[test]
+    fn test_format_ref_pair_renders_asymmetric_refspec() {
+        assert_eq!(
+            format_ref_pair("refs/heads/feature:refs/heads/main"),
+            "feature -> main"
+        );
+        assert_eq!(
+            format_ref_pair("refs/heads/feature:refs/heads/main\t[new branch]"),
+            "feature -> main",
+            "the summary column must not leak into the ref pair"
+        );
+    }
+
+    /// End-to-end through the porcelain parser: the rendered detail line, in
+    /// full.  Pinning the whole line rather than a substring is deliberate — a
+    /// `contains` assertion on the destination name is satisfied by the pre-fix
+    /// output whenever the source side happens to contain it.
+    #[test]
+    fn test_parse_porcelain_asymmetric_refspec_names_both_sides() {
+        let input = "*\trefs/heads/feature:refs/heads/main\t[new branch]\nDone\n";
+        let result = parse_push(input);
+        assert_eq!(result.summary, "1 pushed", "summary: {}", result.summary);
+        assert_eq!(
+            result.details,
+            vec!["* feature -> main [new]".to_string()],
+            "the destination ref must be rendered: {:?}",
+            result.details
+        );
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("refs/heads/feature:refs/heads/main"),
+            "the refspec must be rendered, not echoed verbatim: {rendered}"
+        );
+    }
+
+    /// Equal sides collapse to a single name.  `src == dst` is the ordinary
+    /// push, `main -> main` states one fact twice, and this render is graded by
+    /// the ADR-001 net-savings guard — so inflating the common case would spend
+    /// bytes to say nothing.
+    ///
+    /// Not a free green: it is the assertion that stops the fix from rewriting
+    /// every ordinary push line.  A renderer that always emitted the arrow form
+    /// would pass `test_format_ref_pair_renders_asymmetric_refspec` and fail
+    /// here.
+    #[test]
+    fn test_format_ref_pair_equal_sides_collapse_to_one_name() {
+        assert_eq!(
+            format_ref_pair("refs/heads/main:refs/heads/main"),
+            "main",
+            "a symmetric refspec must not render an arrow"
+        );
+        assert_eq!(format_ref_pair("main:main"), "main");
+        assert_eq!(
+            format_ref_pair("refs/tags/v1.0:refs/tags/v1.0"),
+            "v1.0",
+            "tags shorten on both sides"
+        );
+        // Bare refspec: the destination is implicitly the source.  Reachable
+        // through a hand-written refspec only — `extract_flag_and_rest`
+        // requires a `refs/` prefix or a colon before a line reaches here.
+        assert_eq!(format_ref_pair("main"), "main");
+        assert_eq!(format_ref_pair("refs/heads/main"), "main");
+    }
+
+    /// A fully-qualified asymmetric pair across namespaces, plus the tag form.
+    #[test]
+    fn test_format_ref_pair_fully_qualified_refs_shorten_both_sides() {
+        assert_eq!(
+            format_ref_pair("refs/tags/v1.0:refs/tags/v2.0"),
+            "v1.0 -> v2.0"
+        );
+        assert_eq!(
+            format_ref_pair("refs/heads/topic:refs/remotes/upstream/topic"),
+            "topic -> remotes/upstream/topic",
+            "an unrecognised namespace keeps its remaining path (the `refs/` strip)"
+        );
+        // git's own field for `git push <remote> HEAD:refs/heads/x` — measured;
+        // the source side is the literal `HEAD`, not a `refs/` path.
+        assert_eq!(
+            format_ref_pair("HEAD:refs/heads/feature"),
+            "HEAD -> feature"
+        );
+    }
+
+    /// A leading `+` (force) refspec renders as the pair, with the `+`
+    /// consumed.
+    ///
+    /// Measured against git 2.50.1: git's porcelain `<from>` field never
+    /// carries the `+` — `git push --porcelain +side:refs/heads/dst` emits
+    /// `+\trefs/heads/side:refs/heads/dst\t<range> (forced update)`, moving
+    /// force-ness into the FLAG column, which `try_parse_porcelain` already
+    /// renders as `[forced]`.  So this case is defensive against a caller that
+    /// hands the renderer a user-typed refspec, and dropping the `+` loses
+    /// nothing: the flag column still says the push was forced.
+    #[test]
+    fn test_format_ref_pair_force_refspec_drops_the_plus() {
+        assert_eq!(
+            format_ref_pair("+refs/heads/feature:refs/heads/main"),
+            "feature -> main"
+        );
+        assert_eq!(format_ref_pair("+feature:main"), "feature -> main");
+        assert_eq!(
+            format_ref_pair("+refs/heads/main:refs/heads/main"),
+            "main",
+            "a forced symmetric refspec still collapses"
+        );
+        // The genuine `+` FLAG line, end to end: the flag column is what
+        // carries force-ness, and the ref pair rides alongside it.
+        let input = "+\trefs/heads/side:refs/heads/dst\tba90096...4de3509 (forced update)\nDone\n";
+        let result = parse_push(input);
+        assert_eq!(
+            result.details,
+            vec!["+ side -> dst [forced]".to_string()],
+            "details: {:?}",
+            result.details
+        );
+    }
+
+    /// An **empty source side** is git's real deleted-ref shape
+    /// (`-\t:refs/heads/old\t[deleted]`, measured) and must render the
+    /// destination, never a blank.
+    ///
+    /// This pins the renderer half of that contract only, in isolation.  The
+    /// parse-through-render half — that the delete LINE git actually emits
+    /// reaches this renderer and comes out naming the ref — is
+    /// `test_format_ref_pair_empty_source_is_a_deletion` below, and the
+    /// deleted-ref happy path is `test_deleted_ref_porcelain_happy_path`.
+    #[test]
+    fn test_format_ref_pair_empty_source_names_the_destination() {
+        assert_eq!(format_ref_pair(":refs/heads/old"), "old");
+        assert_eq!(
+            format_ref_pair(":refs/heads/old\t[deleted]"),
+            "old",
+            "the summary column must not leak into the ref pair"
+        );
+        assert_eq!(format_ref_pair(":refs/tags/v1.0"), "v1.0");
+        assert_ne!(
+            format_ref_pair(":refs/heads/old"),
+            "",
+            "a deletion must never render a blank ref name"
+        );
+    }
+
+    /// F8 regression: git's real deleted-ref **line**, parsed end to end.
+    ///
+    /// F7 fixed the render — `format_ref_pair` classifies an empty source side
+    /// as `RefPair::Destination` and names it — and
+    /// `test_format_ref_pair_empty_source_names_the_destination` pins that
+    /// renderer in isolation.  What neither closed is the link between them:
+    /// that the line `git push --porcelain --delete` actually emits reaches
+    /// that renderer and comes out naming the ref.  This test is that link, so
+    /// F8 changed **no production line** — it is a test-correctness commit.
+    ///
+    /// The input is measured, not assumed.  Against a local bare remote
+    /// (git 2.50.1, ambient config nulled), `git push --porcelain --delete
+    /// throwaway dst-ddd` emitted `-\t:refs/heads/dst-ddd\t[deleted]` — the
+    /// source side **empty**, exactly the shape this module's header has
+    /// recorded since AD-GP-2 was written.
+    ///
+    /// RED against the parent commit's renderer: `extract_short_ref` took the
+    /// source side, so this same line rendered ` -  [deleted]` — a double
+    /// space where the ref name belongs (measured at `c2b4378`:
+    /// `20 2d 20 20 5b 64 65 6c 65 74 65 64 5d`, stdout 152 B, stderr 0 B,
+    /// exit 0).  The reader was told something was deleted, and not what.
+    ///
+    /// The classifier arm is asserted through the `RefPair` variant on
+    /// purpose: an empty source is a **named state**, not a blank string a
+    /// call site guards with an `is_empty()` check, and pinning the variant is
+    /// what stops the delete path from being re-special-cased later.
+    #[test]
+    fn test_format_ref_pair_empty_source_is_a_deletion() {
+        // The classifier names the state.  A reclassification to `Unnamed("")`
+        // or `Same("")` — either of which renders blank again — fails here
+        // rather than silently, three layers downstream.
+        match classify_ref_pair(":refs/heads/dst-ddd\t[deleted]") {
+            RefPair::Destination(name) => assert_eq!(
+                name, "dst-ddd",
+                "the empty-source state must carry the destination's short name"
+            ),
+            other => panic!(
+                "git's measured delete shape must classify as RefPair::Destination, \
+                 got {other:?} — an empty source is a named state, not a blank \
+                 string a renderer has to guard against"
+            ),
+        }
+
+        // Parse through render, on the measured line, byte for byte.
+        let input = "-\t:refs/heads/dst-ddd\t[deleted]\nDone\n";
+        let result = parse_push(input);
+        assert_eq!(result.summary, "1 deleted", "summary: {}", result.summary);
+        assert_eq!(
+            result.details,
+            vec!["- dst-ddd [deleted]".to_string()],
+            "the deleted ref must be named: {:?}",
+            result.details
+        );
+
+        // The two discriminating negatives.  Each names a renderer that would
+        // satisfy a `contains("deleted")` assertion and still fail the reader.
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("-  [deleted]"),
+            "the blank-name shape measured at `c2b4378` must not return: {rendered}"
+        );
+        assert!(
+            !rendered.contains(":refs/heads/dst-ddd"),
+            "the refspec must be rendered, not echoed verbatim: {rendered}"
+        );
+    }
+
+    /// Equality is decided on the FULL sides, before shortening, so a pair that
+    /// differs only in its namespace is never collapsed.  Shortening would make
+    /// both sides read `x`, which would report a branch-to-tag push as an
+    /// ordinary one — so the full names are shown instead.
+    #[test]
+    fn test_format_ref_pair_namespace_collision_shows_full_refs() {
+        assert_eq!(
+            format_ref_pair("refs/heads/x:refs/tags/x"),
+            "refs/heads/x -> refs/tags/x"
+        );
+    }
+
+    /// A field with no ref on either side is reported verbatim rather than as
+    /// nothing (#317): the reader sees the token skim could not interpret.
+    #[test]
+    fn test_format_ref_pair_unnamed_field_is_reported_verbatim() {
+        assert_eq!(format_ref_pair(":"), ":");
+        assert_eq!(format_ref_pair(""), "");
+    }
+
+    /// The fast-forward (space-flag) line carries the ref pair too, alongside
+    /// the range in its summary column.
+    #[test]
+    fn test_fast_forward_asymmetric_refspec_names_both_sides() {
+        let input = " \trefs/heads/feature:refs/heads/main\te6bab99..13b30c2\nDone\n";
+        let result = parse_push(input);
+        assert_eq!(
+            result.details,
+            vec!["  feature -> main [fast-forward] e6bab99..13b30c2".to_string()],
+            "details: {:?}",
+            result.details
+        );
+    }
+
+    /// The rejected and up-to-date flags render the pair on the same rule.
+    /// `!` is the shape a reader most needs both halves of: a rejection names
+    /// the remote ref that refused the write.
+    #[test]
+    fn test_rejected_and_up_to_date_render_the_ref_pair() {
+        let rejected =
+            parse_push("!\trefs/heads/div2:refs/heads/dst\t[rejected] (non-fast-forward)\nDone\n");
+        assert_eq!(
+            rejected.details,
+            vec!["! div2 -> dst [rejected]".to_string()],
+            "details: {:?}",
+            rejected.details
+        );
+        let up_to_date = parse_push("=\trefs/heads/divergent:refs/heads/dst\t[up to date]\nDone\n");
+        assert_eq!(
+            up_to_date.details,
+            vec!["= divergent -> dst [up to date]".to_string()],
+            "details: {:?}",
+            up_to_date.details
+        );
+    }
+
     // ---- Compression check ----
 
     #[test]
@@ -773,28 +1194,47 @@ mod tests {
         );
     }
 
-    /// Happy-path: a real deleted-ref porcelain line produces a deleted-ref summary.
+    /// Happy-path: a real deleted-ref porcelain line produces a deleted-ref
+    /// summary **that names the ref**.
     ///
-    /// Input uses the standard `git push --porcelain` format for a deleted ref:
-    /// `-\trefs/heads/old:refs/heads/old\t[deleted]`.
+    /// F8 corrected this test's fixture and its assertions; neither was sound.
+    ///
+    /// The fixture fed `-\trefs/heads/old:refs/heads/old\t[deleted]`, a
+    /// **symmetric** refspec git never emits for a delete — contradicting this
+    /// module's own header two hundred lines above, which has recorded the
+    /// real shape since AD-GP-2 was written.  A real delete has an **empty
+    /// source side**: measured against a local bare remote (git 2.50.1),
+    /// `git push --porcelain --delete throwaway dst-ddd` emitted
+    /// `-\t:refs/heads/dst-ddd\t[deleted]`.  The fixture below is that shape.
+    ///
+    /// The assertions were the half that mattered, and both were vacuous:
+    /// `contains("deleted")` holds whatever the renderer does, because the
+    /// literal comes from the summary column, and `contains("old")` was
+    /// satisfied by the *source* side of the symmetric fixture this test
+    /// should never have had.  Together they passed against a renderer that
+    /// printed no ref name at all — measured at `c2b4378` as ` -  [deleted]`.
+    /// A test that cannot fail retires the concern it was written for
+    /// (PF-025), so the assertion now pins the whole rendered detail line.
     #[test]
     fn test_deleted_ref_porcelain_happy_path() {
-        let input = "-\trefs/heads/old:refs/heads/old\t[deleted]\nDone\n";
+        let input = "-\t:refs/heads/old\t[deleted]\nDone\n";
         let result = try_parse_porcelain(input);
         assert!(
             result.is_some(),
             "Deleted-ref porcelain line must be parsed"
         );
         let output = result.unwrap();
+        assert_eq!(output.summary, "1 deleted", "summary: {}", output.summary);
+        assert_eq!(
+            output.details,
+            vec!["- old [deleted]".to_string()],
+            "the deleted ref must be named, not blank: {:?}",
+            output.details
+        );
         let rendered = format!("{output}");
         assert!(
-            rendered.contains("deleted"),
-            "Output must mention the deleted ref: {rendered}"
-        );
-        // Verify the short ref name is extracted correctly.
-        assert!(
-            rendered.contains("old"),
-            "Output must contain the ref name 'old': {rendered}"
+            !rendered.contains("-  [deleted]"),
+            "a blank ref name is the defect this fixture exists to catch: {rendered}"
         );
     }
 

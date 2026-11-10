@@ -36,6 +36,10 @@ fn skim_cmd() -> Command {
     // Remove SKIM_PASSTHROUGH so the daemon guard is active.
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env("SKIM_CACHE_DIR", CACHE_SANDBOX.path());
+    // `try_rewrite`'s Step 2b declines to rewrite a program nothing can spawn
+    // (#317, PF-038), so the hook-mode assertions below need `jest` to resolve.
+    // See `common::rewrite_stub_path`.
+    cmd.env("PATH", common::rewrite_stub_path());
     cmd
 }
 
@@ -95,6 +99,16 @@ fn test_hook_mode_indefinite_command_not_rewritten() {
 }
 
 /// In hook mode, `jest --watch` is indefinite — must not be rewritten.
+///
+/// The empty stdout this asserts has two possible causes, and only one of them
+/// is the daemon guard: `try_rewrite`'s Step 2b also declines when nothing
+/// named `jest` can be spawned (#317, PF-038).  On a host with no `jest` the
+/// two are indistinguishable and this test stops discriminating — it passes
+/// while the guard it is about is never reached (PF-025).  `skim_cmd`'s stub
+/// `PATH` removes the second cause, so the empty stdout is attributable again;
+/// the pairing with `test_hook_mode_jest_ci_is_rewritten` below, which sees
+/// `jest` resolve through the same `PATH` and DOES rewrite, is what makes the
+/// attribution observable.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -119,7 +133,14 @@ fn test_hook_mode_jest_watch_not_rewritten() {
 /// In hook mode, finite `jest --ci` IS rewritten to `skim jest --ci`.
 ///
 /// Hook mode never executes the tool — it only rewrites the command string.
-/// The output is therefore deterministic regardless of whether jest is installed.
+/// The output is nonetheless NOT independent of whether `jest` is installed:
+/// `try_rewrite`'s Step 2b consults `runner::program_resolves` and declines to
+/// rewrite a program nothing can spawn (#317, PF-038), because a rewrite that
+/// cannot run hands the reader a failing command in place of a working one.
+/// Determinism here is earned rather than inherent — `skim_cmd` prepends
+/// `common::rewrite_stub_path`, which guarantees `jest` resolves for the child
+/// on every host.  Measured: under the inherited `PATH` on a machine with no
+/// `jest`, this invocation returns empty stdout and the assertion below fails.
 ///
 /// Expected output: Claude Code hook response JSON containing the rewritten
 /// command `"skim jest --ci"` inside `hookSpecificOutput.updatedInput.command`.
@@ -144,7 +165,8 @@ fn test_hook_mode_jest_ci_is_rewritten() {
         .success()
         // Hook mode emits a JSON response with the rewritten command.
         // `jest` is in the rule table (prefix: ["jest"], rewrite_to: ["skim", "jest"])
-        // with no skip flags, so `jest --ci` always rewrites to `skim jest --ci`.
+        // with no skip flags, so `jest --ci` rewrites to `skim jest --ci`
+        // whenever `jest` resolves — which `skim_cmd`'s stub PATH guarantees.
         // The rewritten command is embedded in the hook response JSON — check both
         // that the output is non-empty and that it contains the rewritten command.
         .stdout(predicate::str::contains("skim jest --ci"));

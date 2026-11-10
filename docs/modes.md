@@ -8,12 +8,12 @@ Skim offers six transformation modes, each with different levels of aggressivene
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
 | Minimal    | 15-30% †        | All code, doc comments, module header comments (every language) | Non-doc comments — module header comments are preserved in **every** language (#476) |
-| Pseudo     | 30-50% †        | Logic flow, names, values, visibility, return types, TypeScript/Rust parameter types, Rust lifetimes/generics/where-clauses/attributes | Parameter type annotations (Python only), generics in Java/Kotlin/Swift/C# (Rust and TypeScript preserve them; Go strips none of these), decorators, semicolons |
+| Pseudo     | 30-50% †        | Logic flow, names, values, visibility, return types, TypeScript/Rust parameter types, TypeScript type-member annotations, Rust lifetimes/generics/where-clauses/attributes | Parameter type annotations (Python only), TypeScript class-field annotations, generics in Java/Kotlin/Swift/C# (Rust and TypeScript preserve them; Go strips none of these), decorators, statement semicolons (type-member, declaration-terminating and array-length `;` are preserved — see Pseudo Mode) |
 | Structure  | 60-80% ‡        | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
 
-† **Unverified targets, not measured figures.** Neither number was derived from a measurement, and no CI gate defends them — ADR-008's archaeology traces pseudo's "30-50%" to the original pseudo-mode commit (04b5f9f, #70), copied into six files and never re-derived, and ADR-007's own text says "no CI gate defends pseudo's 30-50% reduction target". Both modes have since been widened to preserve *more* content — module header comments are now kept in every language (#476), and Rust's pseudo mode strips only statement semicolons and non-doc comments — so treat these two rows as aspirational until they are re-measured. Minimal mode has a known counter-example: a file whose only comments are its module header now reduces by 0%, `tests/fixtures/sql/simple.sql` being exactly that file.
+† **Unverified targets, not measured figures.** Neither number was derived from a measurement, and no CI gate defends them — ADR-008's archaeology traces pseudo's "30-50%" to the original pseudo-mode commit (04b5f9f, #70), copied into six files and never re-derived, and ADR-007's own text says "no CI gate defends pseudo's 30-50% reduction target". Both modes have since been widened to preserve *more* content — module header comments are now kept in every language (#476), and Rust's pseudo mode strips only statement semicolons (declaration terminators and the array-length `;` are preserved) and non-doc comments — so treat these two rows as aspirational until they are re-measured. Minimal mode has a known counter-example: a file whose only comments are its module header now reduces by 0%, `tests/fixtures/sql/simple.sql` being exactly that file.
 
 ‡ **Measured basis: 60.3%.** Structure mode is measured at 60.3% on a production TypeScript codebase (README's reduction tables). The range on the row above is stated wide enough to contain it. No CI gate defends the range either way: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
@@ -261,7 +261,7 @@ skim file.ts --mode full
 
 **Token reduction: unverified.** The "30-50%" this section used to state was never derived from a measurement: ADR-008's archaeology traces it to the original pseudo-mode commit (04b5f9f, #70), where it was copied into six files and never re-derived, and ADR-007's own text says "no CI gate defends pseudo's 30-50% reduction target". See the module header of `crates/rskim-core/src/transform/pseudo.rs` for why no single number can carry this mode across languages any more.
 
-Pseudo mode strips syntactic noise (Python parameter type annotations, decorators, semicolons) while preserving all logic flow and visibility modifiers. TypeScript and Rust parameter types are preserved as API surface (ADR-007). The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
+Pseudo mode strips syntactic noise (Python parameter type annotations, decorators, statement semicolons) while preserving all logic flow and visibility modifiers. TypeScript and Rust parameter types are preserved as API surface (ADR-007); TypeScript's *type-level* member annotations are preserved on separate grounds — there the annotation **is** the declaration. The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
 
 ### What's Preserved
 
@@ -272,14 +272,22 @@ Pseudo mode strips syntactic noise (Python parameter type annotations, decorator
 - Import statements
 - Visibility and export modifiers (`pub`, `export`, `public`, `private`, `protected`, `internal`, `fileprivate`, Swift `open`)
 - **Function return types** (`-> float`, `-> Result<T, E>`, `): Promise<User>`) — preserved as API surface
-- **Rust lifetimes (`<'a>`), type/generic parameters, where clauses, and attribute items (`#[derive(...)]`)** — preserved as API surface. ADR-007 decided that pseudo mode preserves *return types* because API surface is not syntactic noise; these four kinds are the same class, so the same reasoning extends to them and Rust's strip list is now empty apart from statement semicolons
+- **Rust lifetimes (`<'a>`), type/generic parameters, where clauses, and attribute items (`#[derive(...)]`)** — preserved as API surface. ADR-007 decided that pseudo mode preserves *return types* because API surface is not syntactic noise; these four kinds are the same class, so the same reasoning extends to them and Rust's strip list is now empty apart from statement semicolons (declaration-terminating and array-length semicolons are preserved — see the `;` entry below)
+- **TypeScript type-level member annotations** — the type annotation and `readonly` on an interface or type-literal member (`property_signature`), and on an `index_signature` (`[k: string]: V`, in a class body and in a mapped type too). Here the annotation *is* the declaration: `id: UserId` reduced to `id` leaves a member with no type, and two semantically disjoint union members can collapse onto the same bytes. Deliberately **not** filed under ADR-007, whose scope is return types (and E1's parameters), where the declaration still reads as itself without the annotation
 
 ### What's Removed
 
 - Parameter type annotations (`: int`, `: str`) — **Python only**; TypeScript and Rust both preserve parameter types as API surface (ADR-007). Return types are preserved in all languages (see above)
 - Non-visibility keyword modifiers (`static`, `final`, Kotlin `open`)
 - Decorators (`@Override`, `@cache`)
-- Statement-terminating semicolons — preserved inside for-loop headers (`for (let i = 0; i < n; i++)`)
+- TypeScript class **field** type annotations and their `readonly` (`public_field_definition`) — a class field documents an implementation detail and the body still shows its name and initializer, whereas an interface member's annotation is the entire declaration. A class *index signature* is preserved, on grammar grounds rather than location
+- Semicolons, where the `;` is statement punctuation. It is preserved where it is not:
+  - for-loop headers (`for (let i = 0; i < n; i++)`)
+  - TypeScript type-member separators inside an `object_type` / `interface_body` (`interface U { id: string; }`) — language-gated to TypeScript, because Java's `interface_body` admits a bare `;` and also strips semicolons
+  - Rust declaration terminators: a bodyless `fn` signature, a unit or tuple `struct` (`struct Id(u32);`), and a trait associated type (`type Item;`)
+  - the Rust array-length separator (`[u8; 32]`, `[0u8; 32]`)
+
+  Rust `use`, `let`, `const`, `static`, expression statements, `mod foo;` and `type T = U;` still lose theirs, so Rust pseudo output does not re-parse as a whole — pre-existing and tracked separately
 - Non-doc comments at declaration/module scope — same as Minimal mode; module header comments (SPDX, `frozen_string_literal`, provenance lines) are preserved; inline comments inside function bodies are also preserved (they document logic)
 - Python `self`/`cls` first parameter
 
@@ -330,10 +338,10 @@ def calculate(x, y) -> float:
 
 | Language   | What's Stripped                                                                 |
 |------------|--------------------------------------------------------------------------------|
-| TypeScript | Decorators, `readonly`, `abstract`, `;` — parameter and return types preserved (ADR-007) |
+| TypeScript | Decorators, `abstract`, class-field annotations and their `readonly`, statement `;` — parameter and return types preserved (ADR-007); type-member and index-signature annotations, their `readonly`, and the type-member `;` preserved |
 | JavaScript | Decorators, `;`                                                                   |
 | Python     | Parameter type annotations, decorators, `self`/`cls` first param (return types preserved) |
-| Rust       | `;` only — lifetimes, type params, where clauses, attribute items, parameter and return types are all preserved |
+| Rust       | Statement `;` only — declaration-terminating and array-length `;`, lifetimes, type params, where clauses, attribute items, parameter and return types are all preserved |
 | Go         | Conservative (no stripping) — Go types are integral to understanding           |
 | Java       | Annotations, type params, `throws`, `;`                                        |
 | C          | `static`/`extern`/`const`/`volatile`, `;`                                      |

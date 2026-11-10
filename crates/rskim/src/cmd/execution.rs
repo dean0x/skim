@@ -169,8 +169,11 @@ fn classify_write(result: io::Result<()>) -> io::Result<StdoutStatus> {
 /// Write `s` to `out` and flush, optionally appending a trailing newline when
 /// `s` is non-empty and does not already end with one.
 ///
-/// Shared by [`emit_raw_passthrough`] and [`write_to_stdout`] so the
-/// trailing-newline guard cannot drift between the two sinks.
+/// Shared by every stdout/stderr sink in this module — [`emit_raw_passthrough`]
+/// (guard on), [`emit_raw_passthrough_exact`] and [`write_to_stdout`] (guard
+/// off) — so the trailing-newline guard is expressed in exactly one place and
+/// cannot drift between them. The flag, not a second copy of the condition, is
+/// what distinguishes the sinks.
 fn write_and_flush(out: &mut impl Write, s: &str, ensure_trailing_newline: bool) -> io::Result<()> {
     write!(out, "{s}")?;
     if ensure_trailing_newline && !s.is_empty() && !s.ends_with('\n') {
@@ -210,6 +213,59 @@ fn write_line_and_flush(out: &mut impl Write, s: &str) -> io::Result<()> {
 pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, StdoutStatus)> {
     let mut out = io::stdout().lock();
     let status = classify_write(write_and_flush(&mut out, raw, true))?;
+    Ok(("passthrough", status))
+}
+
+/// Emit `raw` to stdout **byte-exactly** — the [`emit_raw_passthrough`] sink
+/// with the trailing-newline guard off. Returns the `"passthrough"` analytics
+/// tier string plus the [`StdoutStatus`], matching its shape so the two are
+/// interchangeable at a call site.
+///
+/// # Why a second sink rather than flipping the shared guard
+///
+/// [`emit_raw_passthrough`]'s `true` is load-bearing at four sites and must
+/// stay: `cmd/log.rs`, both `cmd/test/shared.rs` sinks, and
+/// `cmd/file/passthrough_stream.rs`, whose own `ensure_newline` mirrors the
+/// guard so the streamed and buffered paths agree for one command — parity that
+/// `t7b_missing_trailing_newline_is_added_exactly_once` pins. Flipping the
+/// shared helper would silently change all four.
+///
+/// # What this sink is for
+///
+/// The ADR-001 **`Passthrough`-verdict** arms, and only those. On that verdict
+/// the net-savings guard has already decided compression does not pay, so the
+/// bytes served are the wrapped tool's *own* stdout — and a newline the tool
+/// never emitted is a divergence from raw that no ADR-011 marker discloses.
+/// For a format that exists for deterministic splitting it is worse than
+/// cosmetic: a NUL-delimited body gains one extra empty record.
+///
+/// # Measured reachability (2026-09-29)
+///
+/// The git arm (`cmd/git/mod.rs`) is **unreachable today**: every git format
+/// that is not newline-terminated — `-z` / `--null`, `--pretty=format:` /
+/// `--format=` — is in `MACHINE_CONTRACT_FLAGS`, so the ADR-022 gate routes it
+/// to `run_passthrough` ahead of dispatch and it never reaches a savings
+/// verdict. Measured against the pinned `c2b4378` baseline, which predates that
+/// gate: `git status -z` served 51 B against 50 B of raw git, a trailing `0a`
+/// after the terminating NUL. Every *ungated* git argv measured — `status`,
+/// `status --short`, `status -sb`, `log`, `log --oneline`, `log -n 1`,
+/// `show HEAD`, `diff`, `fetch` — is newline-terminated or empty, so the guard
+/// is inert there. That arm is routed here as defense in depth: if the gate is
+/// ever narrowed, the leak returns.
+///
+/// The generic tool arm (`run_parsed_command_with_fallback`) **is** reachable,
+/// because the ADR-022 gate is git-only. Measured on the same baseline:
+/// `skim curl -s file://<body>` on a 27 B body with no trailing newline served
+/// 28 B, and on a 1 B body served 2 B — trailing-newline-only, exit 0, zero
+/// bytes on stderr.
+///
+/// A [`StdoutStatus::PipeClosed`] result is *not* an error: callers must stop
+/// producing output and return [`pipe_closed_exit`] so the closed pipe never
+/// reports as exit `1`.
+#[allow(clippy::disallowed_methods)] // IS the foundational raw-passthrough sink; cmd/mod.rs policy terminus
+pub(crate) fn emit_raw_passthrough_exact(raw: &str) -> io::Result<(&'static str, StdoutStatus)> {
+    let mut out = io::stdout().lock();
+    let status = classify_write(write_and_flush(&mut out, raw, false))?;
     Ok(("passthrough", status))
 }
 
@@ -1656,7 +1712,20 @@ where
                 if raw_override.is_some() || rerun.is_some() {
                     served_raw = Some(served.clone());
                 }
-                let (tier, status) = emit_raw_passthrough(&served)?;
+                // ADR-001 `Passthrough` verdict: `served` is the wrapped tool's
+                // own stdout, so it is emitted byte-exactly.  The guard-on sink
+                // appended a newline the tool never wrote — measured on the
+                // pinned `c2b4378` baseline, `skim curl -s file://<body>` served
+                // 28 B against a 27 B body with no trailing newline, at exit 0
+                // with zero bytes on stderr.  This arm is NOT gated by ADR-022,
+                // which is git-only, so it is the reachable half of the defect.
+                //
+                // The sibling `RawPassthrough` arm above deliberately keeps
+                // `emit_raw_passthrough`: its producers include the pure
+                // passthrough file family, whose streamed sink appends a newline
+                // by design and whose streamed/buffered parity for one command
+                // is pinned by `t7b_missing_trailing_newline_is_added_exactly_once`.
+                let (tier, status) = emit_raw_passthrough_exact(&served)?;
                 if status == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());
                 }
@@ -3488,5 +3557,86 @@ mod tests {
         let user = owned_argv(&["pr", "create", "--fill"]);
         let injected = owned_argv(&["pr", "create", "--fill", "--json", "number"]);
         assert!(!should_arm_raw_fallback(false, &user, &injected));
+    }
+    // ========================================================================
+    // F13 — the ADR-001 `Passthrough`-verdict sink is byte-exact
+    //
+    // On that verdict the net-savings guard has already decided compression
+    // does not pay, so the bytes served are the wrapped tool's OWN stdout.
+    // `emit_raw_passthrough`'s guard appended a newline the tool never wrote —
+    // not "less than raw", so no ADR-011 marker fires, and for a format that
+    // exists for deterministic splitting it costs a consumer one extra empty
+    // record.
+    //
+    // These tests drive `write_and_flush` rather than the two public sinks:
+    // the sinks lock real stdout, while the guard flag they differ by is the
+    // whole byte contract and is observable here against a `Vec<u8>`.
+    // ========================================================================
+
+    /// A NUL-terminated `git status --porcelain -z` body — the format that
+    /// exists for deterministic splitting, and which never ends in `\n`.
+    ///
+    /// Reached the guard before the ADR-022 gate existed: measured against the
+    /// pinned `c2b4378` baseline, `git status -z` served 51 B against 50 B of
+    /// raw git. It is gated now, which is why the git arm is defense in depth.
+    const F13_NUL_STREAM: &str = " M tracked.txt\0?? untracked.txt\0";
+
+    /// An HTTP response body with no trailing newline — the arm that IS
+    /// reachable, because the ADR-022 gate is git-only.
+    ///
+    /// Measured on the same baseline: `skim curl -s file://<body>` served 28 B
+    /// against this 27 B body, exit 0, zero bytes on stderr.
+    const F13_CURL_BODY: &str = "alpha\nbeta\nomega-no-newline";
+
+    /// The guard-on sink appends exactly one byte — the precondition that makes
+    /// the byte-exactness test below non-vacuous.
+    #[test]
+    fn guard_on_appends_a_byte_the_tool_never_emitted() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_and_flush(&mut buf, F13_NUL_STREAM, true).expect("write to Vec cannot fail");
+        assert_eq!(
+            buf.len(),
+            F13_NUL_STREAM.len() + 1,
+            "precondition: the guard-on sink must append exactly one byte to a \
+             non-newline-terminated body, or this probe is measuring nothing"
+        );
+        assert_eq!(
+            buf.last().copied(),
+            Some(b'\n'),
+            "precondition: the appended byte must be the newline the guard adds"
+        );
+    }
+
+    /// The ADR-001 `Passthrough`-verdict sink emits the tool's bytes unchanged.
+    #[test]
+    fn passthrough_verdict_sink_is_byte_exact() {
+        for (label, body) in [
+            ("porcelain -z", F13_NUL_STREAM),
+            ("curl body", F13_CURL_BODY),
+        ] {
+            let mut buf: Vec<u8> = Vec::new();
+            write_and_flush(&mut buf, body, false).expect("write to Vec cannot fail");
+            assert_eq!(
+                buf.as_slice(),
+                body.as_bytes(),
+                "{label}: the ADR-001 Passthrough-verdict sink serves the tool's own \
+                 bytes, so it must not append a trailing newline"
+            );
+        }
+    }
+
+    /// Both raw sinks stay declared and keep one shape.
+    ///
+    /// A compile-level pin in the D1 style above. The two coercions ARE the
+    /// assertion: this is a type error unless both sinks exist (E0425 if either
+    /// is deleted) and share one signature (E0308 if one drifts), which is what
+    /// lets a `Passthrough`-verdict arm swap one for the other. Neither is
+    /// called — both lock real stdout, and the byte contract they differ by is
+    /// covered against a `Vec<u8>` by the two tests above.
+    #[test]
+    fn the_two_raw_sinks_stay_declared_with_one_shape() {
+        type RawSink = fn(&str) -> io::Result<(&'static str, StdoutStatus)>;
+        let _guarded: RawSink = emit_raw_passthrough;
+        let _exact: RawSink = emit_raw_passthrough_exact;
     }
 }

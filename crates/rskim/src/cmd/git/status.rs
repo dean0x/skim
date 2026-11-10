@@ -27,6 +27,22 @@ const CONFLICTING_SHORT_OPTS: &[char] = &['s', 'z'];
 ///
 /// Callers must exclude pathspecs (tokens after `--`) before invoking this
 /// predicate; see [`strip_conflicting_short_chars`] and [`run_status`].
+///
+/// # Some of these arms are unreachable from `skim git status`, and stay
+///
+/// `--porcelain`, `--porcelain=*`, `--null` and any cluster containing `z` are
+/// machine contracts, so `super::MACHINE_CONTRACT_FLAGS` serves them raw before
+/// [`run_status`] is entered at all (ADR-022) — which is also what keeps
+/// `run_status`'s second `git status` subprocess (the `raw_override` capture)
+/// off the gated path.  The arms are kept anyway, as defense in depth: they are
+/// what stops a *stripped* user format flag from being forwarded alongside the
+/// injected `--porcelain=v2`, where git's last-format-flag-wins rule would
+/// hand the v2 parser a format it cannot read (PF-008).  Deleting them because
+/// the gate currently covers them would make any future narrowing of that set
+/// silently reintroduce PF-008.
+///
+/// `--short`, `--long` and `s`-only clusters (`-s`, `-sb`) are *not* in the
+/// gate's set and do still arrive here.
 fn is_conflicting_status_flag(s: &str) -> bool {
     // Long-form format flags
     if matches!(s, "--short" | "--porcelain" | "--null" | "--long") || s.starts_with("--porcelain=")

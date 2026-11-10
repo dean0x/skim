@@ -61,7 +61,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - File reads (`cat`, `head`, `tail` on code files) are rewritten into direct skim reads (e.g. `cat file.ts` → `skim file.ts --mode=pseudo`); output is a structured view, not raw bytes — skim emits a one-line stderr notice whenever the served view differs from raw file contents. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20` (verbatim lines; when the file is longer, one slot goes to the elision marker, so the bound is N lines *total* — with one documented exception at `N=1`, which emits 1 content line plus the marker), and `tail -5 file.ts` likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
-- Round-trip safe: commands with newlines, heredocs, or command substitution are never rewritten; piped commands are refused too, with one exception — `<cmd> | cat` (bare `cat`, sole consumer, no redirects) rewrites its source, because bare `cat` renders a stream for a reader rather than consuming its bytes
+- Round-trip safe: commands with newlines, heredocs, or command substitution are never rewritten, and neither is a command whose target binary skim cannot resolve on `PATH` (a shell function or alias is invisible to a `PATH` probe by construction, so the real command runs untouched); piped commands are refused too, with one exception — `<cmd> | cat` (bare `cat`, sole consumer, no redirects) rewrites its source, because bare `cat` renders a stream for a reader rather than consuming its bytes
 - Dev installs (`skim init --dev`): while working on skim itself, the hook's commit pin goes stale the moment you rebuild at a new commit, which forces a full reinstall on the next `skim init` and makes `skim doctor` exit 1 for being behind HEAD — neither of which rebuilding can fix, because HEAD keeps moving. `--dev` marks the installed hook as dev-pinned: the real commit is still recorded, and only the commit-staleness check is waived, so repeat installs take the already-up-to-date fast path and doctor stops failing. Version and binary-path checks are unchanged, and the waiver applies only to a hook whose SHA-256 manifest verifies. Dev mode is a property of the command, not stored state — running `skim init` **without** `--dev` reverts the hook to a strict install and reports `dev-pinned -> pinned`, so there is no `--undev`; `skim init --dev --force` re-stamps one in place
 - PATH wrappers (`skim init --wrappers`) now apply a force-raw sidecar marker (set by the PreToolUse hook when it identifies a pipeline shape where compression would cause byte loss) and an `fstat`/`isatty` gate (which serves raw bytes when stdout is a regular file, socket, or non-terminal character device). Together these partially close the compression-into-piped-consumer window (#319). Two holes remain (#514): (1) a same-tool concurrent command can clear a live marker, and (2) when no PreToolUse hook fires at all the wrapper falls back to `fstat`-only behaviour with no pipeline-shape awareness. Use `SKIM_PASSTHROUGH=1` when byte-exact output is required in those cases
 
@@ -88,11 +88,13 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
   - `--mode structure` adds unchanged functions as signatures for context
   - `--mode full` shows entire files with change markers
   - Supports `--staged`, commit ranges (`HEAD~3`, `main..feature`)
-- **`skim git show`** -- compresses `git show` output in two modes:
+  - **Line numbers: one column, two coordinate spaces — the prefix says which.** `-` numbers index the old file; `+` and space numbers index the new one (`~` breadcrumb lines carry no number). So the column repeats, and runs backward across a `-`/`+` boundary: that is the two axes interleaving, not a misnumbering. A second column is not emitted — it needs 76 B against a measured raw-diff margin of 68 B or less — and the `@@` header is withheld on single-hunk files, so there the prefix is the only cue
+- **`skim git show`** -- two modes, only one of which compresses by default:
   - Commit mode (default, e.g. `skim git show HEAD`): strips commit header noise and renders the diff with the AST-aware pipeline
-  - File-content mode (e.g. `skim git show HEAD:src/main.rs`): applies skim's source transform to the file content
-  - Three-tier degradation: AST-aware render → raw hunk render → guardrail passthrough
-- Compresses `git status` and `git log` with flag-aware passthrough
+  - File-content mode (e.g. `skim git show HEAD:src/main.rs`): `<rev>:<path>` is git's blob-extraction syntax, so skim serves the blob's **exact bytes** — no transform. `--mode=<m>` opts into a transformed view and a lossy one announces itself on stderr (ADR-022). Caveat: skim reads the child's stdout as UTF-8 with lossy replacement, so a blob that is not valid UTF-8 arrives with `U+FFFD` substituted
+  - Three-tier degradation (commit mode only): AST-aware render → raw hunk render → guardrail passthrough
+- **Machine-contract flags serve git's own bytes verbatim**, on every git subcommand skim compresses, ahead of and independent of the net-savings guard (ADR-022): `--porcelain`, `--null`/`-z`, `--stat`, `--shortstat`, `--numstat`, `--name-only`, `--name-status`, `--raw`, `--check`, `--quiet`/`-q`, `--exit-code`, `--graph`, `--format`, `--pretty`. So `git log --stat` reaches the reader, `--porcelain` output is byte-exact, and `git push -q` / `git commit --quiet` stay silent
+- Otherwise compresses `git status` and `git log`
 - All subcommands support `--json` for machine-readable output
 
 ### Codebase Heatmap (`skim heatmap`)
@@ -261,12 +263,12 @@ Skim offers six modes with different levels of aggressiveness:
 |------------|-----------|------------------------------------------|----------------------------|
 | Full       | 0%        | Everything (original source)             | Testing/comparison         |
 | Minimal    | 15-30% †  | All code, doc comments                   | Light cleanup              |
-| Pseudo     | 30-50% †  | Logic flow, names, values, return types; parameter types preserved for TypeScript and Rust | LLM context with logic     |
+| Pseudo     | 30-50% †  | Logic flow, names, values, return types; parameter types preserved for TypeScript and Rust, as are its interface / type-literal member annotations | LLM context with logic     |
 | Structure  | 60-80% ‡  | Signatures, types, classes, imports      | Understanding architecture |
 | Signatures | 85-92%    | Only callable signatures                 | API documentation          |
 | Types      | 90-95%    | Only type definitions                    | Type system analysis       |
 
-† **Unverified targets, not measured figures.** These two numbers were never derived from a measurement, and no CI gate defends them. Both modes have since been widened to preserve *more* content — module header comments are now kept in every language (#476), and Rust's pseudo mode strips only statement semicolons and non-doc comments — so treat these two rows as aspirational until they are re-measured.
+† **Unverified targets, not measured figures.** These two numbers were never derived from a measurement, and no CI gate defends them. Both modes have since been widened to preserve *more* content — module header comments are now kept in every language (#476), and Rust's pseudo mode strips only statement semicolons — declaration terminators and the array-length `;` are preserved — plus non-doc comments; TypeScript now keeps its type-level member annotations too — so treat these two rows as aspirational until they are re-measured.
 
 ‡ **Measured basis: 60.3%.** Structure mode's only measured figure is the 60.3% in the reduction table at the top of this README and in the Real-World Token Reduction table under Performance — both on the same production TypeScript codebase. The range on this row is stated wide enough to contain it. No CI gate defends the range either way: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 

@@ -66,11 +66,26 @@ fn cache_dir_for_current_test() -> std::path::PathBuf {
     dir
 }
 
+/// A skim command whose rewrite verdicts are a function of the tokens alone.
+///
+/// The `PATH` is the load-bearing part: `try_rewrite`'s Step 2b declines to
+/// rewrite `<tool> …` when nothing named `<tool>` can be spawned (#317,
+/// PF-038), so an assertion about a tool the host does not have becomes a
+/// function of what happens to be installed.  Measured in this file against a
+/// host missing 30 of the rule table's 64 programs: without
+/// [`common::rewrite_stub_path`], 30 rewrite assertions here change verdict,
+/// and 13 more that assert a rewrite is DECLINED stop discriminating — they go
+/// on passing while the skip-flag or `require_flag` gate each was written to
+/// pin is never reached (PF-025).
+///
+/// Set on the CHILD, never on the test process: writing the environment is
+/// `unsafe` in a multi-threaded test binary.
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_REWRITTEN_FROM");
     cmd.env("SKIM_CACHE_DIR", cache_dir_for_current_test());
+    cmd.env("PATH", common::rewrite_stub_path());
     cmd
 }
 

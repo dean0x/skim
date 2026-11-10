@@ -359,6 +359,275 @@ pub fn stub_path(dir: &std::path::Path) -> String {
 }
 
 // ============================================================================
+// PATH-hermetic rewrite harness (#317 Step 2b / PF-038)
+// ============================================================================
+
+/// Every program name the rewrite RULE TABLE can turn into `skim <program> …`.
+///
+/// One entry per distinct `prefix:` head in `cmd/rewrite/rules.rs`.  The list is
+/// a LITERAL and not derived at run time, because `rskim` is bin-only (no
+/// `src/lib.rs`): an integration test binary cannot `use` anything under
+/// `crates/rskim/src`, so the table is unreachable as data.  A future rule whose
+/// program is missing from here is caught by
+/// `cli_rewrite.rs::test_rewrite_target_program_lists_match_the_engine`, which
+/// re-derives both lists from the engine source and names the difference.
+pub const REWRITE_RULE_TABLE_PROGRAMS: &[&str] = &[
+    "./gradlew",
+    "./mvnw",
+    "aws",
+    "biome",
+    "black",
+    "bundle",
+    "cargo",
+    "curl",
+    "cypress",
+    "df",
+    "dig",
+    "docker",
+    "dotnet",
+    "dprint",
+    "du",
+    "env",
+    "eslint",
+    "find",
+    "gh",
+    "git",
+    "gmake",
+    "go",
+    "gofmt",
+    "golangci-lint",
+    "gradle",
+    "gradlew",
+    "grep",
+    "jest",
+    "kubectl",
+    "ls",
+    "make",
+    "mvn",
+    "mvnw",
+    "mypy",
+    "mysql",
+    "npm",
+    "npx",
+    "nslookup",
+    "oxlint",
+    "pip",
+    "pip3",
+    "playwright",
+    "pnpm",
+    "prettier",
+    "printenv",
+    "ps",
+    "psql",
+    "pytest",
+    "python",
+    "python3",
+    "rg",
+    "rubocop",
+    "ruff",
+    "rustfmt",
+    "sqlite3",
+    "swift",
+    "swiftlint",
+    "terraform",
+    "tree",
+    "tsc",
+    "vitest",
+    "wc",
+    "wget",
+    "yarn",
+];
+
+/// Rewritable programs reached by `try_custom_handlers`, BELOW the rule walk.
+///
+/// These carry no `RewriteRule` and so appear in no `prefix:` field, but Step 2b
+/// is global and gates them exactly like a table rule — `cat file.ts` does not
+/// rewrite when no `cat` can be spawned.  Kept separate from
+/// [`REWRITE_RULE_TABLE_PROGRAMS`] so each list can be checked against the
+/// source construct that actually defines it.
+pub const REWRITE_CUSTOM_HANDLER_PROGRAMS: &[&str] = &["cat", "head", "tail"];
+
+/// A `PATH` under which EVERY rewritable program resolves, for a spawned skim.
+///
+/// # Why this exists
+///
+/// `try_rewrite`'s Step 2b declines to rewrite `<tool> …` when nothing named
+/// `<tool>` can be spawned (`runner::program_resolves`), because a rewrite that
+/// cannot run hands the reader a failing command in place of a working one
+/// (#317, PF-038).  That makes the rewrite verdict a function of the HOST, not
+/// only of the token stream: measured on the machine this harness was written
+/// on, 30 of the 64 programs the rule table names — `aws`, `gradle`, `jest`,
+/// `mysql`, `psql`, `rg`, `tsc`, `vitest`, … — resolve nowhere.  Without this
+/// `PATH`, 43 rewrite assertions across the four rewrite-engine test files pass
+/// only where the tool happens to be installed, and a further 15 that assert a
+/// rewrite is DECLINED stop discriminating altogether: they go on passing while
+/// the gate they were written to pin is never reached (PF-025).
+///
+/// # What it guarantees
+///
+/// Exactly one property: **every rewritable program resolves for the child.**
+/// That is the whole input Step 2b consults, so a rewrite verdict taken under
+/// this `PATH` is identical on every host.  It is NOT a guarantee about which
+/// binary answers to a name — a program already installed keeps resolving to
+/// the real thing.
+///
+/// # Shape
+///
+/// A process-lifetime stub directory PREPENDED to the inherited `PATH`, so
+/// `git`, `sh` and the real toolchain stay reachable.  Initialised once per test
+/// binary: 60-odd stub writes per test would be slow, and concurrent tests
+/// writing the same paths would race.  The directory intentionally outlives the
+/// `TempDir` guard's normal drop — `LazyLock` never runs destructors — matching
+/// the `CACHE_SANDBOX` idiom in `cli_e2e_rewrite.rs`.
+///
+/// Set it on the CHILD (`cmd.env("PATH", common::rewrite_stub_path())`), never
+/// on the test process: writing the environment is `unsafe` in a multi-threaded
+/// test binary.
+#[cfg(unix)]
+pub fn rewrite_stub_path() -> &'static str {
+    &REWRITE_STUB_PATH.1
+}
+
+/// Non-unix form: the inherited `PATH`, UNCHANGED — the guarantee does not hold.
+///
+/// Every piece of the harness is unix-only by construction: the stub is a
+/// `#!/bin/sh` script, and `runner::is_executable` on a non-unix target checks
+/// only `is_file()` with no `PATHEXT` handling, so a file dropped on `PATH`
+/// under that name would not be what `Command::new` searches for.  Returning
+/// the `PATH` unchanged keeps the four rewrite test files COMPILING everywhere
+/// rather than silently making them unix-only, which would surface as a build
+/// break the day the cross-OS matrix (#323) reaches `crates/rskim`.
+///
+/// It does NOT make them pass everywhere: on such a host the Step 2b verdicts
+/// are host-dependent again, exactly as they were before this harness existed.
+/// Closing that needs a `PATHEXT`-aware stub, which is #323's problem and not
+/// this one's — said here so the next reader does not mistake a compiling
+/// no-op for a working guarantee.
+#[cfg(not(unix))]
+pub fn rewrite_stub_path() -> &'static str {
+    static INHERITED_PATH: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| std::env::var("PATH").unwrap_or_default());
+    &INHERITED_PATH
+}
+
+/// Backing state for [`rewrite_stub_path`] — the live `TempDir` and the `PATH`.
+#[cfg(unix)]
+static REWRITE_STUB_PATH: std::sync::LazyLock<(tempfile::TempDir, String)> =
+    std::sync::LazyLock::new(|| {
+        let dir = tempfile::tempdir().expect("rewrite stub TempDir must be creatable");
+        let searched = path_dirs_a_spawned_skim_searches();
+
+        for program in REWRITE_RULE_TABLE_PROGRAMS
+            .iter()
+            .chain(REWRITE_CUSTOM_HANDLER_PROGRAMS)
+        {
+            // A `/`-bearing program is an EXPLICIT PATH: `resolves_in` stats it
+            // against the child's cwd and never searches `PATH`, so no directory
+            // on `PATH` can serve it.  `./gradlew` and `./mvnw` are therefore
+            // out of this harness's reach; a test that rewrites one needs a
+            // stub in a `.current_dir()` of its own.
+            if program.contains('/') {
+                continue;
+            }
+            // Never SHADOW a tool the host really has.  Overwriting `git`,
+            // `cat` or `cargo` with an inert stub would break every test in
+            // these files that runs one — including the `cat`-based scripts
+            // `make_stub` generates.  Skipping costs nothing: the program
+            // already resolves, which is the only thing Step 2b asks.
+            if resolves_for_spawned_skim(program, &searched) {
+                continue;
+            }
+            write_resolvability_only_stub(dir.path(), program);
+        }
+
+        let path = stub_path(dir.path());
+        (dir, path)
+    });
+
+/// The `PATH` directories a skim spawned from this process will search.
+///
+/// Not simply `split_paths(PATH)`: skim's `main()` calls
+/// `strip_skim_wrappers_from_path()` as its very first statement, removing the
+/// wrapper directory (`SKIM_WRAPPERS_DIR`, else `~/.skim/bin`) from its own
+/// `PATH`.  Mirrored here so a tool present ONLY as a `skim init --wrappers`
+/// symlink is still seen as unresolvable and still gets a stub — otherwise this
+/// harness would report "resolves" for a name the child cannot find, which is
+/// precisely the host dependence it exists to remove.
+#[cfg(unix)]
+fn path_dirs_a_spawned_skim_searches() -> Vec<std::path::PathBuf> {
+    // `$HOME` rather than `dirs::home_dir()`: identical on unix, and this module
+    // is compiled into every integration test binary, so it stays free of
+    // dependencies it does not need.
+    let wrappers_dir: Option<std::path::PathBuf> = std::env::var_os("SKIM_WRAPPERS_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| std::path::PathBuf::from(h).join(".skim").join("bin"))
+        })
+        // Syntactic normalization only, matching `filter_wrappers_from_path`.
+        .map(|p| p.components().collect());
+
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return Vec::new();
+    };
+
+    // An empty `PATH` element is left exactly as `split_paths` produced it, so
+    // it keeps meaning the current directory as POSIX requires and `execvp`
+    // implements: `Path::new("").join("git")` is the relative path `git`, which
+    // `fs::metadata` resolves against the cwd.  `resolves_in` relies on the same
+    // identity, so normalizing here would make this walk DIVERGE from the spawn
+    // it is modelling.
+    std::env::split_paths(&path_var)
+        .filter(|d| {
+            let normalized: std::path::PathBuf = d.components().collect();
+            wrappers_dir.as_ref() != Some(&normalized)
+        })
+        .collect()
+}
+
+/// `true` when `program` resolves in `searched` the way `Command::new` would.
+///
+/// Mirrors `runner::resolves_in`'s rule deliberately: an executable REGULAR
+/// FILE, so a non-executable file and a directory bearing the name both read as
+/// unresolvable, exactly as they do for the spawn.
+#[cfg(unix)]
+fn resolves_for_spawned_skim(program: &str, searched: &[std::path::PathBuf]) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    searched.iter().any(|dir| {
+        std::fs::metadata(dir.join(program))
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+            .unwrap_or(false)
+    })
+}
+
+/// Write a stub whose ONLY job is to make `name` resolvable.
+///
+/// Deliberately not a plausible tool: all 11 direct-handler invocations in the
+/// four rewrite test files were measured byte-identical with and without this
+/// `PATH`, because each pipes a fixture and is served by `should_read_stdin`
+/// rather than a spawn — so nothing here is ever executed, and a stub that
+/// pretended to be a real tool would only be able to lie convincingly.  If a
+/// later test does reach one, exit 97 is a code neither skim nor a real tool
+/// produces and the stderr line names the cause, so the failure is loud and
+/// diagnosable rather than a silent empty-output green (PF-025).
+///
+/// `echo` is a `/bin/sh` builtin, so the script resolves no program of its own
+/// and cannot be perturbed by anything else in this directory.
+#[cfg(unix)]
+fn write_resolvability_only_stub(dir: &std::path::Path, name: &str) {
+    let script = format!(
+        "#!/bin/sh\necho \"skim test harness: the resolvability-only PATH stub for \
+         {name} was EXECUTED. It exists to make {name} resolvable for the rewrite \
+         engine and has no tool behaviour. See rewrite_stub_path in \
+         tests/common/mod.rs; a test that spawns {name} needs a real stub from \
+         make_stub.\" >&2\nexit 97\n"
+    );
+    write_stub_script(dir, name, &script);
+}
+
+// ============================================================================
 // Trivial Cargo project fixture
 // ============================================================================
 

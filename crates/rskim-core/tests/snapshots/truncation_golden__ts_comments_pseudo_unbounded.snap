@@ -40,8 +40,8 @@ export class Calculator {
 
 
 export interface Config {
-    name
-    value
+    name: string;
+    value: number;
 }
 
 

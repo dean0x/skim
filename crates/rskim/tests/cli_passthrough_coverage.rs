@@ -86,7 +86,7 @@ export class OrderService {
 /// Body-heavy TypeScript for `--mode=structure`, which replaces each method
 /// body with `{...}`.
 ///
-/// Measured: raw 718 B / 193 t → structure 235 B / 58 t = saving 483 B / 135 t;
+/// Measured: raw 719 B / 193 t → structure 236 B / 58 t = saving 483 B / 135 t;
 /// margin +407 B / +113 t against the 76 B / 22 t direct marker (5.4x / 5.1x).
 const STRUCTURE_FIXTURE: &str = r#"export class InvoiceTotals {
   private readonly rates: Map<string, number> = new Map();
@@ -1343,5 +1343,252 @@ fn test_security5_passthrough_as_grep_data_arg_not_consumed() {
         "grep's `--passthrough` data arg must survive to grep's argv unchanged;\
          pre-fix the unanchored pre-routing scan consumed it and strip_skim_flags\
          dropped it, corrupting the `-e` pattern.\nCaptured grep args: {captured:?}"
+    );
+}
+
+// ============================================================================
+// F11: skim's own flags are honoured wherever the user typed them
+//
+// The pre-routing flag zone used to be `take_while(|a| a.starts_with('-'))`,
+// which is not a positional test.  It stopped at the first token without a
+// leading `-`, so it could not tell
+//   * a subcommand (`grep`) — must stop, security-5 below,
+//   * a file (`lib.ts`)     — must NOT stop, no other program owns the args,
+//   * the separate-token VALUE of a preceding flag (`structure` in
+//     `--mode structure`) — not a positional at all,
+// apart.  Measured against the pinned 2.11.0 baseline on `STRUCTURE_FIXTURE`
+// below (719 B raw): `skim f.ts --passthrough` and
+// `skim --mode structure --passthrough f.ts` both served the 236 B compressed
+// view, exit 0, with nothing on stderr to say the flag had been dropped, while
+// `skim --passthrough f.ts` served all 719 B.  `--debug` behaved the same way:
+// the provenance line appeared only in the leading position.
+//
+// `skim_flag_zone` now keys on `resolve_invocation`'s own classification, so the
+// zone stops exactly where argv is handed to another program and widens only
+// where it is not.
+//
+// VACUITY GUARD: `--passthrough` serves the raw file, and a guardrail that
+// elects raw on its own would produce the same bytes.  Every assertion below is
+// therefore preceded by the precondition that the DEFAULT view differs from raw
+// for this fixture.  Likewise the `--debug` cases assert the control run does
+// NOT carry the provenance line, so the observable cannot come from ambient
+// `SKIM_DEBUG`.
+// ============================================================================
+
+/// The skim binary with analytics off and every `SKIM_*` behaviour control
+/// removed from the environment.
+///
+/// `SKIM_DEBUG` removal is load-bearing: without it an ambient value would make
+/// the `--debug` assertions pass against an unfixed binary (PF-026).  A plain
+/// `std::process::Command` rather than the `skim()` builder above because these
+/// tests compare whole streams rather than chaining predicates.
+fn undebugged_skim() -> std::process::Command {
+    let mut cmd = std::process::Command::new(common::skim_bin());
+    cmd.env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_REWRITTEN_FROM")
+        .env_remove("SKIM_DEBUG");
+    cmd
+}
+
+/// Write `STRUCTURE_FIXTURE` into a temp dir and return `(dir, path)`.
+///
+/// Sized to clear the ADR-001 net-savings guard with a 5.4x margin, so the
+/// default view is genuinely the compressed one.  Measured end to end against
+/// the pinned 2.11.0 baseline: 719 B raw → 236 B served.
+fn f11_fixture() -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("totals.ts");
+    fs::write(&file, STRUCTURE_FIXTURE).unwrap();
+    (dir, file)
+}
+
+/// Run skim with `args` and return `(stdout, stderr)`.
+fn run_f11(args: &[&std::ffi::OsStr]) -> (Vec<u8>, String) {
+    let out = undebugged_skim().args(args).output().unwrap();
+    (
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `&str` → `&OsStr` shorthand, so an argv literal reads like a command line.
+fn o(arg: &str) -> &std::ffi::OsStr {
+    std::ffi::OsStr::new(arg)
+}
+
+/// F11 manifestation 1 — `--passthrough` AFTER the file positional.
+///
+/// `skim totals.ts --passthrough` must serve the raw file, exactly as
+/// `skim --passthrough totals.ts` already did.
+#[test]
+fn test_f11_passthrough_after_file_positional_serves_raw() {
+    let (_dir, file) = f11_fixture();
+    let raw = STRUCTURE_FIXTURE.as_bytes();
+    let path = file.as_os_str();
+    let pt = std::ffi::OsStr::new("--passthrough");
+
+    // PRECONDITION (vacuity guard): the default view is NOT the raw bytes, so
+    // "stdout == raw" can only come from the flag being honoured.
+    let (control, _) = run_f11(&[path]);
+    assert_ne!(
+        control, raw,
+        "precondition: the default view must differ from raw for this fixture, \
+         otherwise a passthrough assertion passes against an unfixed binary"
+    );
+
+    // Control: the already-working position.
+    let (before, _) = run_f11(&[pt, path]);
+    assert_eq!(
+        before, raw,
+        "`skim --passthrough <file>` must serve raw (pre-existing behaviour)"
+    );
+
+    // F11: the flag after the positional.
+    let (after, after_err) = run_f11(&[path, pt]);
+    assert_eq!(
+        after, raw,
+        "`skim <file> --passthrough` must serve raw; the flag zone used to stop \
+         at the first positional and drop it silently.\nstderr: {after_err}"
+    );
+}
+
+/// F11 manifestation 2 — `--passthrough` after a SEPARATE-TOKEN flag value.
+///
+/// `--mode structure --passthrough f.ts` puts the flag BEFORE the positional,
+/// so "after the first positional" never described this case: the old zone
+/// ended at `structure`, which is `--mode`'s value.  The `=` form already
+/// worked and must keep working.
+#[test]
+fn test_f11_passthrough_after_separate_token_flag_value_serves_raw() {
+    let (_dir, file) = f11_fixture();
+    let raw = STRUCTURE_FIXTURE.as_bytes();
+    let path = file.as_os_str();
+
+    let (control, _) = run_f11(&[o("--mode"), o("structure"), path]);
+    assert_ne!(
+        control, raw,
+        "precondition: `--mode structure` alone must not already serve raw"
+    );
+
+    let (space_form, err) = run_f11(&[o("--mode"), o("structure"), o("--passthrough"), path]);
+    assert_eq!(
+        space_form, raw,
+        "`--mode structure --passthrough <file>`: `structure` is --mode's value, \
+         not a positional, so the zone must not end there.\nstderr: {err}"
+    );
+
+    let (equals_form, _) = run_f11(&[o("--mode=structure"), o("--passthrough"), path]);
+    assert_eq!(
+        equals_form, raw,
+        "`--mode=structure --passthrough <file>` worked before F11 and must still work"
+    );
+}
+
+/// F11 — `--debug` is honoured before the positional, after it, and after a
+/// separate-token flag value.
+///
+/// Observable: the B5a startup provenance line (`[skim] <version> exe=… pid=…`),
+/// which `main()` emits on stderr whenever debug is active.
+#[test]
+fn test_f11_debug_honoured_in_every_flag_zone_position() {
+    let (_dir, file) = f11_fixture();
+    let path = file.as_os_str();
+    let dbg = o("--debug");
+
+    // PRECONDITION (vacuity guard): no provenance line without the flag, so the
+    // observable cannot be coming from an ambient SKIM_DEBUG.
+    let (_, control_err) = run_f11(&[path]);
+    assert!(
+        !control_err.contains("exe="),
+        "precondition: the control run must NOT carry the provenance line; \
+         got stderr: {control_err}"
+    );
+
+    for (label, args) in [
+        ("--debug <file>", vec![dbg, path]),
+        ("<file> --debug", vec![path, dbg]),
+        (
+            "--mode structure --debug <file>",
+            vec![o("--mode"), o("structure"), dbg, path],
+        ),
+    ] {
+        let (_, err) = run_f11(&args);
+        assert!(
+            err.contains("exe="),
+            "`skim {label}` must enable debug output; got stderr: {err}"
+        );
+    }
+}
+
+/// F11 must not widen the POSIX `--` cut.
+///
+/// `skim -- --passthrough <file>` asks for a FILE named `--passthrough`.  The
+/// token must stay a filename: skim warns it does not exist and serves the
+/// compressed view of the real file, never raw.
+#[test]
+fn test_f11_end_of_options_separator_still_bounds_the_flag_zone() {
+    let (_dir, file) = f11_fixture();
+    let raw = STRUCTURE_FIXTURE.as_bytes();
+
+    let (stdout, stderr) = run_f11(&[o("--"), o("--passthrough"), file.as_os_str()]);
+    assert_ne!(
+        stdout, raw,
+        "after `--`, `--passthrough` is a filename and must not enable passthrough"
+    );
+    assert!(
+        stderr.contains("File not found: '--passthrough'"),
+        "`--passthrough` after `--` must be reported as a missing file; \
+         got stderr: {stderr}"
+    );
+}
+
+/// security-5, stated as an exact argv rather than a containment check.
+///
+/// `skim grep -e --passthrough <file>` routes to the `grep` subcommand, so the
+/// flag zone ends at index 0 and `--passthrough` is grep's `-e` PATTERN DATA.
+/// `test_security5_passthrough_as_grep_data_arg_not_consumed` above asserts the
+/// token survives; this pins the whole forwarded argv, which is what fails if
+/// F11's widened zone ever reached past a subcommand token — `strip_skim_flags`
+/// would delete the pattern and grep would search stdin for the filename.
+#[cfg(unix)]
+#[test]
+fn test_f11_zone_stops_at_subcommand_so_grep_argv_is_exact() {
+    use common::{stub_path, write_stub_script};
+
+    let dir = TempDir::new().unwrap();
+    let testfile = dir.path().join("testfile.txt");
+    fs::write(&testfile, "some content\n").unwrap();
+    let args_file = dir.path().join("grep_args.txt");
+
+    write_stub_script(
+        dir.path(),
+        "grep",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 1\n",
+            args_file.display()
+        ),
+    );
+
+    let _ = std::process::Command::new(common::skim_bin())
+        .args(["grep", "-e", "--passthrough", testfile.to_str().unwrap()])
+        .env("PATH", stub_path(dir.path()))
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .output()
+        .unwrap();
+
+    let captured = fs::read_to_string(&args_file).unwrap_or_default();
+    let received: Vec<&str> = captured.lines().collect();
+    assert_eq!(
+        received,
+        vec!["-e", "--passthrough", testfile.to_str().unwrap()],
+        "grep must receive its pattern operand intact; a zone that widened past \
+         the `grep` subcommand token would consume `--passthrough` and \
+         strip_skim_flags would forward `[-e, <file>]`, making grep search stdin \
+         for the filename — wrong answer, exit 0, no diagnostic"
     );
 }
