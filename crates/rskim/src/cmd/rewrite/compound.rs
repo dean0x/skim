@@ -1031,6 +1031,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
     // independently. `try_rewrite` declines bare `cat`, so the consumer stage
     // of a `| cat` pipeline is re-emitted verbatim.
     let mut any_rewritten = false;
+    let mut any_masks_output = false;
     let mut first_category: Option<RewriteCategory> = None;
     let mut parts: Vec<String> = Vec::new();
 
@@ -1041,6 +1042,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
         let segment_text = match &rewrite {
             Some(r) => {
                 any_rewritten = true;
+                any_masks_output |= r.masks_output;
                 if first_category.is_none() {
                     first_category = Some(r.category);
                 }
@@ -1072,6 +1074,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
     Some(RewriteResult {
         tokens: parts,
         category: first_category.unwrap_or(RewriteCategory::Build),
+        masks_output: any_masks_output,
     })
 }
 

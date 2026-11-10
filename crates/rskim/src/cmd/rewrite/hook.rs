@@ -11,7 +11,7 @@ use crate::cmd::session::AgentKind;
 
 use super::compound::{command_needs_passthrough, split_compound, try_rewrite_compound};
 use super::engine::try_rewrite;
-use super::types::CompoundSplitResult;
+use super::types::{CompoundSplitResult, RewriteResult};
 
 // ============================================================================
 // B1 — Drift detection types and pure detector
@@ -294,6 +294,33 @@ pub(super) const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 /// passthrough, not an error. Logs a warning to hook.log for debugging.
 pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 
+/// Whether the hook input says the agent runs in auto permission mode.
+///
+/// In auto mode, a hook that changes a tool call voids the auto-mode review of
+/// the other calls in the same response, and each void costs the user one more
+/// model turn. So skim does not rewrite in auto mode, except where the rewrite
+/// must run (see [`withholds_rewrite`]). Only the string `"auto"` in the
+/// top-level `permission_mode` field counts: any other value, a missing field
+/// and a non-string field all keep the normal rewrite behaviour.
+fn is_auto_permission_mode(input: &serde_json::Value) -> bool {
+    input
+        .get("permission_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("auto")
+}
+
+/// Whether the hook sends no response for a rewrite it found.
+///
+/// In auto permission mode the hook withholds every rewrite except one that
+/// sends a command through a tool whose output skim must mask (`env`,
+/// `printenv`, `curl`; see `RewriteResult::masks_output`). The masking runs only
+/// inside that skim tool, so a command left unrewritten would print unmasked.
+/// For a compound command, one such segment keeps the whole rewrite. In every
+/// other mode the hook withholds nothing.
+fn withholds_rewrite(input: &serde_json::Value, result: &RewriteResult) -> bool {
+    is_auto_permission_mode(input) && !result.masks_output
+}
+
 /// Run as an agent PreToolUse hook.
 ///
 /// Protocol:
@@ -301,8 +328,10 @@ pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 /// 2. Extract `tool_input.command`
 /// 3. On parse/extract failure: exit 0, empty stdout (passthrough)
 /// 4. Run command through rewrite logic
-/// 5. On match: emit hook response JSON, exit 0
-/// 6. On no match: exit 0, empty stdout (passthrough)
+/// 5. In auto permission mode, a rewrite that needs no masking is withheld: exit
+///    0, empty stdout (see [`withholds_rewrite`])
+/// 6. On match: emit hook response JSON, exit 0
+/// 7. On no match: exit 0, empty stdout (passthrough)
 ///
 /// Drift is detected and logged to hook.log on every invocation. For diagnosis
 /// run `skim doctor`.
@@ -430,9 +459,10 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     // shares it, so an unscoped marker lets one command's verdict decide an
     // unrelated concurrent or nested one's. See `set_force_raw`.
     //
-    // Placed before every early return below (already-skim, corrupt-bail,
-    // indefinite) so the clear always happens: a marker that outlived its
-    // command would silently disable compression for the next one.
+    // Placed before every return below (already-skim, corrupt-bail, indefinite,
+    // and the auto-mode withhold of a rewrite that needs no masking) so the clear
+    // always happens: a marker that outlived its command would silently disable
+    // compression for the next one.
     //
     // ACCEPTED LIMITATION: this is the only writer, so the marker exists only
     // when the hook actually fires. A wrapper invoked from a shell with no
@@ -514,6 +544,11 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     };
 
     match rewritten {
+        Some(result) if withholds_rewrite(&json, &result) => {
+            // Auto permission mode, and no masking tool on the path: send no
+            // response, so there is no stdout, no stderr and no permission decision.
+            audit_hook(&command, false, "");
+        }
         Some(result) => {
             // Attribution flows out-of-band: session_id was already written to the
             // sidecar file above (write_session_id). The rewritten command does NOT
@@ -756,6 +791,139 @@ mod tests {
     fn test_parse_agent_flag_missing_value() {
         let args = vec!["--hook".to_string(), "--agent".to_string()];
         assert_eq!(parse_agent_flag(&args), None);
+    }
+
+    // ========================================================================
+    // is_auto_permission_mode
+    // ========================================================================
+
+    #[test]
+    fn test_is_auto_permission_mode_auto_is_true() {
+        let input = serde_json::json!({ "permission_mode": "auto" });
+        assert!(is_auto_permission_mode(&input));
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_other_modes_are_false() {
+        for mode in [
+            "default",
+            "plan",
+            "acceptEdits",
+            "dontAsk",
+            "bypassPermissions",
+        ] {
+            let input = serde_json::json!({ "permission_mode": mode });
+            assert!(
+                !is_auto_permission_mode(&input),
+                "permission_mode {mode:?} must keep the normal rewrite behaviour"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_missing_field_is_false() {
+        let input = serde_json::json!({ "tool_input": { "command": "cargo test" } });
+        assert!(!is_auto_permission_mode(&input));
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_non_string_is_false() {
+        for value in [
+            serde_json::json!(1),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(["auto"]),
+            serde_json::json!({ "mode": "auto" }),
+        ] {
+            let input = serde_json::json!({ "permission_mode": value });
+            assert!(
+                !is_auto_permission_mode(&input),
+                "non-string permission_mode {value} must keep the normal rewrite behaviour"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_is_case_exact_and_top_level_only() {
+        assert!(!is_auto_permission_mode(
+            &serde_json::json!({ "permission_mode": "Auto" })
+        ));
+        assert!(!is_auto_permission_mode(
+            &serde_json::json!({ "permission_mode": " auto" })
+        ));
+        assert!(!is_auto_permission_mode(
+            &serde_json::json!({ "tool_input": { "permission_mode": "auto" } })
+        ));
+    }
+
+    // ========================================================================
+    // withholds_rewrite
+    // ========================================================================
+
+    /// The rewrite the hook finds for `command`, by the same engine calls it makes.
+    fn rewrite_of(command: &str) -> RewriteResult {
+        let rewritten = match split_compound(command) {
+            CompoundSplitResult::Simple(tokens) => {
+                let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+                try_rewrite(&refs)
+            }
+            CompoundSplitResult::Compound(segments) => try_rewrite_compound(&segments),
+            CompoundSplitResult::Bail => None,
+        };
+        rewritten.unwrap_or_else(|| panic!("{command:?} must have a rewrite"))
+    }
+
+    fn auto_input() -> serde_json::Value {
+        serde_json::json!({ "permission_mode": "auto" })
+    }
+
+    #[test]
+    fn test_withholds_rewrite_in_auto_mode_for_commands_that_need_no_masking() {
+        for command in ["cargo test", "cat src/main.rs", "cargo test && cargo build"] {
+            assert!(
+                withholds_rewrite(&auto_input(), &rewrite_of(command)),
+                "{command:?}: auto mode must withhold a rewrite that masks nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_withholds_rewrite_never_in_auto_mode_for_masking_tools() {
+        for command in [
+            "env",
+            "printenv",
+            "printenv HOME",
+            "curl https://example.com",
+            "TOKEN=abc curl https://example.com",
+            "env && cargo test",
+            "cargo build && curl https://example.com",
+        ] {
+            assert!(
+                !withholds_rewrite(&auto_input(), &rewrite_of(command)),
+                "{command:?}: auto mode must keep a rewrite that routes through a masking tool"
+            );
+        }
+    }
+
+    #[test]
+    fn test_withholds_rewrite_ignores_a_literal_skim_masking_segment() {
+        // The user typed `skim env`; the hook rewrites only the `cargo test` segment.
+        let result = rewrite_of("echo hi && skim env && cargo test");
+        assert!(withholds_rewrite(&auto_input(), &result));
+    }
+
+    #[test]
+    fn test_withholds_rewrite_never_outside_auto_mode() {
+        let missing = serde_json::json!({ "tool_input": { "command": "cargo test" } });
+        let default = serde_json::json!({ "permission_mode": "default" });
+        for input in [&missing, &default] {
+            for command in ["cargo test", "env", "curl https://example.com"] {
+                assert!(
+                    !withholds_rewrite(input, &rewrite_of(command)),
+                    "{command:?}: outside auto mode the hook withholds nothing"
+                );
+            }
+        }
     }
 
     // ========================================================================
