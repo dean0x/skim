@@ -98,7 +98,16 @@ pub(crate) trait HookProtocol {
 
     fn hook_support(&self) -> HookSupport;
     fn parse_input(&self, json: &serde_json::Value) -> Option<HookInput>;
-    fn format_response(&self, rewritten_command: &str) -> serde_json::Value;
+    /// Build the hook response for a rewrite to `rewritten_command`.
+    ///
+    /// `tool_input` is the agent's original `tool_input` value, when the hook
+    /// input has one. A protocol whose host replaces the whole tool input with
+    /// the response copies its other fields from it.
+    fn format_response(
+        &self,
+        tool_input: Option<&serde_json::Value>,
+        rewritten_command: &str,
+    ) -> serde_json::Value;
 
     /// Render this agent's hook script in the DEFAULT (strict) install mode.
     ///

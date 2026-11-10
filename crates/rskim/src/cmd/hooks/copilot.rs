@@ -75,7 +75,11 @@ impl HookProtocol for CopilotCliHook {
         super::parse_tool_input_command(json)
     }
 
-    fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
+    fn format_response(
+        &self,
+        _tool_input: Option<&serde_json::Value>,
+        rewritten_command: &str,
+    ) -> serde_json::Value {
         // modifiedArgs response: echo the tool-arguments shape with only the command rewritten.
         // No permissionDecision field — skim never self-approves (no-verb column: only emit
         // a permission verb where the host protocol forces a decision field, never voluntarily).
@@ -365,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_copilot_format_response_returns_modified_args() {
-        let response = hook().format_response("skim cargo test --all");
+        let response = hook().format_response(None, "skim cargo test --all");
         // Must return modifiedArgs with the rewritten command
         assert_eq!(
             response["modifiedArgs"]["command"], "skim cargo test --all",
@@ -375,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_copilot_format_response_no_reason_field() {
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         // No reason field — modifiedArgs response is terse
         assert!(
             response.get("reason").is_none(),
@@ -386,7 +390,7 @@ mod tests {
     #[test]
     fn test_copilot_format_response_no_permission_decision() {
         // skim never self-approves — no permissionDecision in the response
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         assert!(
             response.get("permissionDecision").is_none(),
             "Copilot response must NOT include permissionDecision (no-verb column)"
@@ -395,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_copilot_format_response_no_hook_specific_output() {
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         // Copilot uses modifiedArgs, not hookSpecificOutput
         assert!(
             response.get("hookSpecificOutput").is_none(),

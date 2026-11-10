@@ -526,6 +526,32 @@ fn test_rewrite_hook_missing_permission_mode_rewrites_as_before() {
     );
 }
 
+/// #586: Claude Code replaces the whole tool input with `updatedInput`, so the
+/// response must keep every field of the original tool input and change only
+/// `command`. A response with `command` alone drops the description, the
+/// timeout and the background flag of the call.
+#[test]
+fn test_rewrite_hook_keeps_every_tool_input_field() {
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "cargo test",
+            "description": "Run the tests",
+            "timeout": 600000,
+            "run_in_background": true,
+            "dangerouslyDisableSandbox": false
+        }
+    });
+    let output = run_hook_with_input(&input);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let mut expected = input["tool_input"].clone();
+    expected["command"] = serde_json::json!("skim cargo test");
+    assert_eq!(json["hookSpecificOutput"]["updatedInput"], expected);
+}
+
 #[test]
 fn test_rewrite_hook_other_permission_modes_rewrite_as_before() {
     let baseline = run_hook_with_input(&hook_input_with_mode("cargo test", None));

@@ -62,6 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A rewritten Claude Code Bash call keeps its other settings** (#586). Claude Code
+  replaces the whole tool input with the hook's `updatedInput`, and the hook sent only
+  `command`. So a rewritten call lost its `description`, `timeout`,
+  `run_in_background` and sandbox setting. The hook now copies every field of the
+  original tool input and changes only `command`.
+
 - **`--mode=pseudo` no longer destroys TypeScript type-level declarations** — an interface
   or type-literal member was served as a bare name, so
   `interface Config { name: string; value: number }` came out as
