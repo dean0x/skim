@@ -560,7 +560,7 @@ fn test_rewrite_hook_bad_json_with_auto_text_is_unchanged_passthrough() {
 
 #[test]
 fn test_rewrite_hook_auto_permission_mode_keeps_force_raw_marker_lifecycle() {
-    // The marker side effect runs before the auto-mode return: it is still
+    // The marker side effect runs before the auto-mode decision: it is still
     // written for a byte-exact consumer, and a later command in auto mode still
     // clears it, so it never outlives the command that set it.
     let auto = Some(serde_json::json!("auto"));
@@ -581,6 +581,142 @@ fn test_rewrite_hook_auto_permission_mode_keeps_force_raw_marker_lifecycle() {
         "auto mode must still clear the marker for the next command, found: {:?}",
         force_raw_markers()
     );
+}
+
+// In auto mode the hook still rewrites a command that routes through a tool
+// whose output skim must mask (`env`, `printenv`, `curl`): the masking runs only
+// inside that skim tool, so a command left unrewritten would print unmasked.
+
+/// Assert that auto mode gives the same hook response as default mode for
+/// `command`, and that the default-mode response is a real rewrite containing
+/// every text in `expected`.
+fn assert_auto_mode_keeps_rewrite(command: &str, expected: &[&str]) {
+    let baseline = run_hook_with_input(&hook_input_with_mode(command, None));
+    let baseline_stdout = String::from_utf8_lossy(&baseline.stdout).into_owned();
+    assert!(
+        baseline.status.success(),
+        "{command}: default mode must exit 0"
+    );
+    for text in expected {
+        assert!(
+            baseline_stdout.contains(text),
+            "{command}: default mode must rewrite to a command with {text:?}, got: {baseline_stdout}"
+        );
+    }
+
+    let auto = run_hook_with_input(&hook_input_with_mode(
+        command,
+        Some(serde_json::json!("auto")),
+    ));
+    assert!(auto.status.success(), "{command}: auto mode must exit 0");
+    assert_eq!(
+        auto.stdout, baseline.stdout,
+        "{command}: auto mode must give the same response as default mode"
+    );
+    assert!(
+        auto.stderr.is_empty(),
+        "{command}: auto mode must print nothing on stderr, got: {}",
+        String::from_utf8_lossy(&auto.stderr)
+    );
+}
+
+/// Assert that auto mode and default mode both send no response for `command`.
+fn assert_no_rewrite_in_either_mode(command: &str) {
+    let baseline = run_hook_with_input(&hook_input_with_mode(command, None));
+    assert!(
+        baseline.stdout.is_empty(),
+        "{command}: default mode must not rewrite, got: {}",
+        String::from_utf8_lossy(&baseline.stdout)
+    );
+
+    let auto = run_hook_with_input(&hook_input_with_mode(
+        command,
+        Some(serde_json::json!("auto")),
+    ));
+    assert!(auto.status.success(), "{command}: auto mode must exit 0");
+    assert_eq!(
+        auto.stdout, baseline.stdout,
+        "{command}: auto mode must match default mode"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_keeps_env_rewrite() {
+    assert_auto_mode_keeps_rewrite("env", &["skim env"]);
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_keeps_printenv_rewrite() {
+    assert_auto_mode_keeps_rewrite("printenv", &["skim printenv"]);
+    assert_auto_mode_keeps_rewrite("printenv HOME", &["skim printenv HOME"]);
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_keeps_curl_rewrite() {
+    assert_auto_mode_keeps_rewrite(
+        "curl -I https://example.com",
+        &["skim curl -I https://example.com"],
+    );
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_keeps_env_prefixed_curl_rewrite() {
+    assert_auto_mode_keeps_rewrite(
+        "TOKEN=abc curl https://example.com",
+        &["TOKEN=abc skim curl https://example.com"],
+    );
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_keeps_compound_with_env_rewrite() {
+    // One masking segment keeps the whole compound rewrite, other segments too.
+    assert_auto_mode_keeps_rewrite("env && cargo test", &["skim env", "skim cargo test"]);
+    assert_auto_mode_keeps_rewrite(
+        "cargo build && curl https://example.com",
+        &["skim cargo build", "skim curl https://example.com"],
+    );
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_env_with_assignment_is_not_rewritten() {
+    // `env FOO=bar cargo test` passes FOO=bar to the child: no rewrite in any mode.
+    assert_no_rewrite_in_either_mode("env FOO=bar cargo test");
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_curl_with_skip_flag_is_not_rewritten() {
+    // `-o` makes the curl rule decline, so there is no masking tool to route to.
+    assert_no_rewrite_in_either_mode("curl -o out.txt https://example.com");
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_literal_skim_env_does_not_keep_other_rewrites() {
+    // The user typed `skim env` themselves, so the hook sends nothing new through
+    // a masking tool. The `cargo test` rewrite is withheld in auto mode.
+    let command = "echo hi && skim env && cargo test";
+    let baseline = run_hook_with_input(&hook_input_with_mode(command, None));
+    assert!(
+        String::from_utf8_lossy(&baseline.stdout).contains("skim cargo test"),
+        "default mode must rewrite the cargo segment, got: {}",
+        String::from_utf8_lossy(&baseline.stdout)
+    );
+
+    let auto = run_hook_with_input(&hook_input_with_mode(
+        command,
+        Some(serde_json::json!("auto")),
+    ));
+    assert!(auto.status.success());
+    assert!(
+        auto.stdout.is_empty(),
+        "auto mode must print nothing on stdout, got: {}",
+        String::from_utf8_lossy(&auto.stdout)
+    );
+}
+
+#[test]
+fn test_rewrite_hook_auto_permission_mode_capture_shape_is_not_rewritten() {
+    // Command substitution bails before any rewrite in every mode.
+    assert_no_rewrite_in_either_mode("out=$(env) && cargo test");
 }
 
 // ============================================================================
