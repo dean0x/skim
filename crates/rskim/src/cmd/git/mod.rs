@@ -481,15 +481,19 @@ fn strip_git_view_flags(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
                 dropped.push(arg.clone());
                 i += 1;
             }
-            // `--mode <val>`: the value token belongs to the flag, so it goes
+            // `--mode <val>`: a mode-name value belongs to the flag, so it goes
             // too.  Leaving it behind hands git an orphan positional that it
             // reads as a revision — `fatal: ambiguous argument 'full'`, the
-            // same class of failure one token further along.
+            // same class of failure one token further along.  Any other token
+            // is the caller's own revision or pathspec: it stays, because
+            // dropping it makes git answer a different question at exit 0.
             "--mode" => {
                 dropped.push(arg.clone());
                 i += 1;
-                if i < args.len() && !args[i].starts_with('-') {
-                    dropped.push(args[i].clone());
+                if let Some(value) = args.get(i)
+                    && rskim_core::Mode::parse(value).is_some()
+                {
+                    dropped.push(value.clone());
                     i += 1;
                 }
             }
@@ -726,7 +730,25 @@ fn map_exit_code(code: Option<i32>) -> ExitCode {
     }
 }
 
+/// `stream` with URL user-info removed, or `None` when that changes nothing.
+///
+/// Whole-stream, not [`shared::scrub_lines`]: that helper rewrites `\r\n` and
+/// drops the trailing newline, which a byte-faithful serve must not do.  The
+/// `None` arm lets the caller keep the original buffer without a copy.
+fn scrubbed_if_changed(stream: &str) -> Option<String> {
+    match shared::scrub_credential_url(stream) {
+        std::borrow::Cow::Owned(scrubbed) => Some(scrubbed),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
 /// Run a git command with passthrough (no parsing).
+///
+/// On success git's streams are written byte-for-byte.  On a non-zero exit
+/// the URL user-info in both streams is removed first, as `run_parsed_command`
+/// does for a failed run.  Git's own exit code is forwarded (fail-closed), so
+/// `--quiet` / `--exit-code` callers can tell "differences found" (1) from an
+/// error (128).
 pub(super) fn run_passthrough(
     global_flags: &[String],
     subcmd: &str,
@@ -765,30 +787,44 @@ pub(super) fn run_passthrough(
     let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
-    if exec::write_to_stdout(&output.stdout)? == exec::StdoutStatus::PipeClosed {
+    let exit_code = output.exit_code;
+    let failed = exit_code != Some(0);
+    let (scrubbed_stdout, scrubbed_stderr) = if failed {
+        (
+            scrubbed_if_changed(&output.stdout),
+            scrubbed_if_changed(&output.stderr),
+        )
+    } else {
+        (None, None)
+    };
+
+    let stdout_text = scrubbed_stdout.as_deref().unwrap_or(&output.stdout);
+    if exec::write_to_stdout(stdout_text)? == exec::StdoutStatus::PipeClosed {
         return Ok(exec::pipe_closed_exit());
     }
-    if !output.stderr.is_empty()
-        && exec::write_to_stderr(&output.stderr)? == exec::StdoutStatus::PipeClosed
+    let stderr_text = scrubbed_stderr.as_deref().unwrap_or(&output.stderr);
+    if !stderr_text.is_empty()
+        && exec::write_to_stderr(stderr_text)? == exec::StdoutStatus::PipeClosed
     {
         return Ok(exec::pipe_closed_exit());
     }
 
-    let exit_code = output.exit_code;
     // Passthrough: raw == compressed. Move stdout into the passthrough variant
     // so the analytics path clones once and moves once — 1 allocation total
     // instead of 2 (PF-018 resolution).  Label is built lazily via
     // build_analytics_label so the format! is skipped when both show_stats
     // and analytics are disabled (PF-021).
     finalize_git_output_passthrough(
-        output.stdout,
+        scrubbed_stdout.unwrap_or(output.stdout),
         build_analytics_label(subcmd, args, show_stats, rec.enabled),
         show_stats,
         rec.with_tier("passthrough"),
         output.duration,
     );
 
-    Ok(map_exit_code(exit_code))
+    Ok(ExitCode::from(crate::cmd::build::exit_code_from_status(
+        exit_code,
+    )))
 }
 
 /// Options for [`run_parsed_command`] that bundle infrequently-varied flags.
@@ -1861,6 +1897,43 @@ mod tests {
         ] {
             let (forwarded, dropped) = strip_git_view_flags(&argv(&shape))
                 .unwrap_or_else(|| panic!("{shape:?} must drop at least one token"));
+            assert_eq!(
+                forwarded,
+                argv(&expect_forwarded),
+                "forwarded for {shape:?}"
+            );
+            assert_eq!(dropped, argv(&expect_dropped), "dropped for {shape:?}");
+        }
+    }
+
+    /// A bare `--mode` takes the next token only when it is a mode name.
+    ///
+    /// A revision or a pathspec that follows a value-less `--mode` is the
+    /// caller's real argument.  Dropping it makes git answer a different
+    /// question at exit 0 — `git diff --stat` against the index instead of
+    /// against `HEAD~1` — so it stays in the forwarded argv.
+    #[test]
+    fn strip_git_view_flags_keeps_a_token_that_is_not_a_mode_name() {
+        for (shape, expect_forwarded, expect_dropped) in [
+            (
+                vec!["--stat", "--mode", "HEAD~1"],
+                vec!["--stat", "HEAD~1"],
+                vec!["--mode"],
+            ),
+            (
+                vec!["--porcelain", "--mode", "src/"],
+                vec!["--porcelain", "src/"],
+                vec!["--mode"],
+            ),
+            // A real mode name is still consumed, and the revision after it is kept.
+            (
+                vec!["--numstat", "--mode", "structure", "HEAD~1"],
+                vec!["--numstat", "HEAD~1"],
+                vec!["--mode", "structure"],
+            ),
+        ] {
+            let (forwarded, dropped) = strip_git_view_flags(&argv(&shape))
+                .unwrap_or_else(|| panic!("{shape:?} must drop the `--mode` token"));
             assert_eq!(
                 forwarded,
                 argv(&expect_forwarded),

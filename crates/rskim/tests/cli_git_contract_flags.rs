@@ -740,11 +740,10 @@ fn diff_raw_record_format_is_byte_identical_on_both_streams() {
 /// nothing (measured: 0 B on both streams, exit 1); it is asserted here so a
 /// later change cannot break it while fixing the other half.
 ///
-/// The exit status is forwarded by `run_passthrough`'s `map_exit_code`, which
-/// maps `Some(0)` to success and everything else to failure — exactly
-/// `--quiet`'s documented 0/1 contract.  (Codes above 1, e.g. git's 128 for a
-/// bad revision, collapse to 1; that is pre-existing `run_passthrough`
-/// behaviour and outside `--quiet`'s contract.)
+/// The exit status is git's own: `run_passthrough` forwards the child's code
+/// rather than collapsing it, so `--quiet`'s 0/1 contract holds and a code
+/// above 1 stays distinguishable from "differences found" (see
+/// `gated_runs_forward_gits_error_status_and_not_a_one`).
 #[test]
 fn diff_quiet_writes_nothing_and_forwards_its_exit_code() {
     let (_dir, repo) = contract_repo();
@@ -838,6 +837,192 @@ fn diff_exit_code_is_byte_identical_and_forwards_status() {
         show(&clean.stdout),
         show(&clean.stderr)
     );
+}
+
+/// A gated run reports git's own error status, and never a bare `1`.
+///
+/// `--quiet` and `--exit-code` answer with the status, and for them `1` means
+/// "differences found".  Git reports an unusable revision as `128`.  If the
+/// gated path folds every non-zero code to `1`, a caller that branches on
+/// `$? -eq 1` reads "bad revision" as "the tree has changes".
+///
+/// The raw control is asserted to exit 128 first, so the contract is git's and
+/// not this file's invention (PF-026).  The stderr comparison keeps the
+/// error text as git wrote it.
+#[test]
+fn gated_runs_forward_gits_error_status_and_not_a_one() {
+    let (_dir, repo) = contract_repo();
+
+    for args in [
+        vec!["diff", "--exit-code", "no-such-rev"],
+        vec!["diff", "--quiet", "no-such-rev"],
+    ] {
+        let label = args.join(" ");
+        let raw = raw_git(&repo, &args);
+        assert_eq!(
+            raw.status.code(),
+            Some(128),
+            "raw control: `git {label}` must exit 128 for an unusable revision"
+        );
+
+        let skim = served(&repo, &args);
+        assert_eq!(
+            skim.status.code(),
+            Some(128),
+            "`skim git {label}`: git's own status must reach the caller, not a \
+             bare 1 that reads as \"differences found\""
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&skim.stderr),
+            String::from_utf8_lossy(&raw.stderr),
+            "`skim git {label}`: git's error text must reach the caller unchanged"
+        );
+    }
+}
+
+// ============================================================================
+// A failed gated run keeps the URL user-info scrub
+// ============================================================================
+//
+// `run_parsed_command` removes URL user-info from both streams when git fails,
+// and `push -q` / `--quiet` / `--porcelain` used to pass through it.  The gate
+// routes them to `run_passthrough` instead, so that sink carries the same
+// scrub on a non-zero exit.  The success path is left alone: a contract format
+// such as `log --format=%B` must keep its bytes.
+
+/// The user-info text every case below plants in a URL.  It is a placeholder.
+const USERINFO_MARKER: &str = "FAKEPASS";
+
+/// Add `origin` to the fixture repo.
+fn add_origin(repo: &std::path::Path, url: &str) {
+    git_in(repo, &["remote", "add", "origin", url]);
+}
+
+/// A bare local remote whose `pre-receive` hook rejects every push and writes
+/// a URL that carries [`USERINFO_MARKER`] to its stderr.
+///
+/// Git relays that text to the client as a `remote:` line, verbatim — which is
+/// what a server banner or a hook that echoes its own clone URL does.  This is
+/// the case that discriminates: for a plain connection failure git strips the
+/// user-info out of its own message, so a test against a closed port passes
+/// whether or not skim scrubs anything.
+#[cfg(unix)]
+fn add_rejecting_origin(repo: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = repo.parent().expect("fixture repo has a parent dir");
+    let remote = parent.join("remote.git");
+    git_in(
+        parent,
+        &["init", "--bare", "-b", "main", remote.to_str().unwrap()],
+    );
+    let hooks = remote.join("hooks");
+    std::fs::create_dir_all(&hooks).expect("create hooks dir");
+    let hook = hooks.join("pre-receive");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\necho \"denied: see https://user:{USERINFO_MARKER}@127.0.0.1:1/x.git\" >&2\nexit 1\n"
+        ),
+    )
+    .expect("write pre-receive hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+        .expect("make the hook executable");
+    add_origin(repo, remote.to_str().unwrap());
+}
+
+/// A failed gated `push` relays the remote's own text, minus the URL user-info.
+///
+/// The control is asserted to carry the marker first, so its absence on the
+/// subject's side is evidence and not an artefact of an empty message.  The
+/// rest of each stream stays git's own bytes: the comparison is against the
+/// control with exactly the `user:<marker>@` run removed.
+#[cfg(unix)]
+#[test]
+fn failed_gated_push_strips_url_user_info_from_remote_output() {
+    let (_dir, repo) = contract_repo();
+    add_rejecting_origin(&repo);
+
+    for flag in ["-q", "--quiet", "--porcelain"] {
+        let args = ["push", flag, "origin", "main"];
+        let label = args.join(" ");
+
+        let raw = raw_git(&repo, &args);
+        assert_eq!(
+            raw.status.code(),
+            Some(1),
+            "precondition: the remote hook must reject `git {label}`"
+        );
+        let raw_stderr = String::from_utf8_lossy(&raw.stderr).into_owned();
+        assert!(
+            raw_stderr.contains(USERINFO_MARKER),
+            "precondition: raw `git {label}` must carry the marker, or \
+             this case proves nothing.  stderr: {}",
+            show(&raw.stderr)
+        );
+
+        let skim = served(&repo, &args);
+        let stdout = String::from_utf8_lossy(&skim.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&skim.stderr).into_owned();
+
+        assert!(
+            !stdout.contains(USERINFO_MARKER) && !stderr.contains(USERINFO_MARKER),
+            "`skim git {label}`: a failed run must not relay URL user-info.\n  \
+             stdout: {}\n  stderr: {}",
+            show(&skim.stdout),
+            show(&skim.stderr)
+        );
+        assert_eq!(
+            stderr,
+            raw_stderr.replace(&format!("user:{USERINFO_MARKER}@"), ""),
+            "`skim git {label}`: stderr must be git's own bytes with only the \
+             user-info removed"
+        );
+        assert_eq!(
+            skim.stdout, raw.stdout,
+            "`skim git {label}`: stdout carries no user-info here, so it must \
+             stay git's own bytes"
+        );
+        assert_eq!(
+            skim.status.code(),
+            raw.status.code(),
+            "`skim git {label}`: exit status must match the raw tool's"
+        );
+    }
+}
+
+/// A failed gated `push` to a remote URL with user-info never relays it.
+///
+/// Port 1 is closed, so no network host is involved.  Git already removes the
+/// user-info from its own `unable to access` message, so this case holds with
+/// or without skim's scrub; it pins that the marker never appears on either
+/// stream for this common failure.  The rejecting-remote case above is the one
+/// that discriminates.
+#[test]
+fn failed_gated_push_to_a_closed_port_never_relays_user_info() {
+    let (_dir, repo) = contract_repo();
+    add_origin(
+        &repo,
+        &format!("https://user:{USERINFO_MARKER}@127.0.0.1:1/x.git"),
+    );
+
+    for flag in ["-q", "--porcelain"] {
+        let args = ["push", flag, "origin", "main"];
+        let skim = served(&repo, &args);
+
+        assert!(
+            !skim.status.success(),
+            "precondition: `skim git push {flag}` to a closed port must fail"
+        );
+        assert!(
+            !String::from_utf8_lossy(&skim.stdout).contains(USERINFO_MARKER)
+                && !String::from_utf8_lossy(&skim.stderr).contains(USERINFO_MARKER),
+            "`skim git push {flag}`: the URL user-info must not appear on either stream.\n  \
+             stdout: {}\n  stderr: {}",
+            show(&skim.stdout),
+            show(&skim.stderr)
+        );
+    }
 }
 
 // ============================================================================
@@ -1473,8 +1658,22 @@ fn no_contract_flag_with_json_reports_an_empty_payload_for_a_non_empty_one() {
             let skim = served(&repo, &args);
             let text = String::from_utf8_lossy(&skim.stdout).into_owned();
             let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&text) else {
-                // Git's own bytes were served; byte-identity is asserted by
-                // `no_contract_flag_with_json_yields_a_false_log_envelope`.
+                // No envelope was served, so the only admissible answer is
+                // git's own bytes for the same argv without `--json`.  The
+                // log-only `no_contract_flag_with_json_yields_a_false_log_envelope`
+                // does not reach the `diff` and `status` cells.
+                assert_eq!(
+                    skim.stdout,
+                    raw.stdout,
+                    "`skim git {label}`: no envelope was served, so the payload \
+                     must be git's own bytes for `git {}`.\n  raw  ({} B): {}\n  \
+                     skim ({} B): {}",
+                    bare.join(" "),
+                    raw.stdout.len(),
+                    show(&raw.stdout),
+                    skim.stdout.len(),
+                    show(&skim.stdout)
+                );
                 continue;
             };
 
