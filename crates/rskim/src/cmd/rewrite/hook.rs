@@ -294,15 +294,30 @@ pub(super) const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 /// passthrough, not an error. Logs a warning to hook.log for debugging.
 pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 
+/// Whether the hook input says the agent runs in auto permission mode.
+///
+/// In auto mode, a hook that changes a tool call voids the auto-mode review of
+/// the other calls in the same response, and each void costs the user one more
+/// model turn. So skim does not rewrite in auto mode. Only the string `"auto"`
+/// in the top-level `permission_mode` field counts: any other value, a missing
+/// field and a non-string field all keep the normal rewrite behaviour.
+fn is_auto_permission_mode(input: &serde_json::Value) -> bool {
+    input
+        .get("permission_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("auto")
+}
+
 /// Run as an agent PreToolUse hook.
 ///
 /// Protocol:
 /// 1. Read JSON from stdin (bounded)
 /// 2. Extract `tool_input.command`
 /// 3. On parse/extract failure: exit 0, empty stdout (passthrough)
-/// 4. Run command through rewrite logic
-/// 5. On match: emit hook response JSON, exit 0
-/// 6. On no match: exit 0, empty stdout (passthrough)
+/// 4. In auto permission mode: exit 0, empty stdout (no rewrite)
+/// 5. Run command through rewrite logic
+/// 6. On match: emit hook response JSON, exit 0
+/// 7. On no match: exit 0, empty stdout (passthrough)
 ///
 /// Drift is detected and logged to hook.log on every invocation. For diagnosis
 /// run `skim doctor`.
@@ -444,6 +459,15 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             &super::compound::command_heads(&command),
             &dir,
         );
+    }
+
+    // Auto permission mode: do not rewrite (see `is_auto_permission_mode`). Placed
+    // after the sidecar write and the force-raw marker above, so both side effects
+    // run as in every other mode and the marker never outlives its command; placed
+    // before any rewrite work. No stdout, no stderr, and no permission decision.
+    if is_auto_permission_mode(&json) {
+        audit_hook(&command, false, "");
+        return Ok(ExitCode::SUCCESS);
     }
 
     // If already starts with "skim " — already rewritten, passthrough
@@ -756,6 +780,69 @@ mod tests {
     fn test_parse_agent_flag_missing_value() {
         let args = vec!["--hook".to_string(), "--agent".to_string()];
         assert_eq!(parse_agent_flag(&args), None);
+    }
+
+    // ========================================================================
+    // is_auto_permission_mode
+    // ========================================================================
+
+    #[test]
+    fn test_is_auto_permission_mode_auto_is_true() {
+        let input = serde_json::json!({ "permission_mode": "auto" });
+        assert!(is_auto_permission_mode(&input));
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_other_modes_are_false() {
+        for mode in [
+            "default",
+            "plan",
+            "acceptEdits",
+            "dontAsk",
+            "bypassPermissions",
+        ] {
+            let input = serde_json::json!({ "permission_mode": mode });
+            assert!(
+                !is_auto_permission_mode(&input),
+                "permission_mode {mode:?} must keep the normal rewrite behaviour"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_missing_field_is_false() {
+        let input = serde_json::json!({ "tool_input": { "command": "cargo test" } });
+        assert!(!is_auto_permission_mode(&input));
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_non_string_is_false() {
+        for value in [
+            serde_json::json!(1),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(["auto"]),
+            serde_json::json!({ "mode": "auto" }),
+        ] {
+            let input = serde_json::json!({ "permission_mode": value });
+            assert!(
+                !is_auto_permission_mode(&input),
+                "non-string permission_mode {value} must keep the normal rewrite behaviour"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_auto_permission_mode_is_case_exact_and_top_level_only() {
+        assert!(!is_auto_permission_mode(
+            &serde_json::json!({ "permission_mode": "Auto" })
+        ));
+        assert!(!is_auto_permission_mode(
+            &serde_json::json!({ "permission_mode": " auto" })
+        ));
+        assert!(!is_auto_permission_mode(
+            &serde_json::json!({ "tool_input": { "permission_mode": "auto" } })
+        ));
     }
 
     // ========================================================================

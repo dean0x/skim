@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The hook no longer rewrites commands in Claude Code's auto permission mode.** In
+  auto mode, a hook that changes a tool call voids the auto-mode review of the other
+  calls in the same response, and each void costs one more model turn. When the hook
+  input carries `permission_mode: "auto"`, `skim rewrite --hook` now prints nothing and
+  exits 0, so the command runs unchanged. Every other permission mode is unchanged.
+
 - **`cargo +toolchain ...` run through the skim hook could silently run on the
   wrong toolchain and report success.** The rewrite engine reordered a rustup
   `+toolchain` token to after the subcommand, so `cargo +nightly test` became
