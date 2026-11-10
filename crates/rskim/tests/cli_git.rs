@@ -2039,8 +2039,8 @@ fn arch15_git_log_json_stdout_is_valid_json() {
         panic!(
             "arch15: skim git log --json must emit valid JSON on stdout\n\
              parse error: {e}\n\
-             stdout (first 600 bytes):\n{}",
-            &stdout[..stdout.len().min(600)]
+             stdout (first 600 chars):\n{}",
+            first_chars(&stdout, 600)
         )
     });
 
@@ -2053,7 +2053,7 @@ fn arch15_git_log_json_stdout_is_valid_json() {
     assert!(
         !contains_bare_skim_marker,
         "arch15: stdout must not contain a bare [skim] marker outside the JSON document\n\
-         stdout (first 600 bytes):\n{}",
-        &stdout[..stdout.len().min(600)]
+         stdout (first 600 chars):\n{}",
+        first_chars(&stdout, 600)
     );
 }
