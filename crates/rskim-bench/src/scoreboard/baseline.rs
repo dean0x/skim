@@ -3,7 +3,9 @@
 //! The baseline records what `check` compares a run against:
 //! - every HARD outcome (`pass` / `xfail`) by query id and check;
 //! - every RATCHET value, per corpus and aggregated;
-//! - each corpus's commit and golden-file SHA-256, and the golden-set hash;
+//! - each corpus's commit and golden digest (the golden file's SHA-256, with
+//!   the structural-oracle fingerprint folded in when the file has `[[ast]]`
+//!   entries), and the golden-set hash;
 //! - `accepted_regressions[]`: every RATCHET regression and HARD downgrade a
 //!   bless accepted, with its reason.
 //!
@@ -13,9 +15,9 @@
 //! [`bless`] is pure: it decides from a `report.json` (usually the CI
 //! artifact, so blessing needs no local run), the golden files on disk, and
 //! the existing baseline. It refuses a partial (`--only`) run, a report made
-//! from other golden files, any unledgered HARD failure, any XPASS, and any
-//! RATCHET regression or HARD downgrade (see [`hard_downgrades`]) that was
-//! not accepted with a reason.
+//! from other golden files or another structural oracle, any unledgered HARD
+//! failure, any XPASS, and any RATCHET regression or HARD downgrade (see
+//! [`hard_downgrades`]) that was not accepted with a reason.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -163,7 +165,10 @@ pub enum BlessDecision {
 #[derive(Debug, Clone, Copy)]
 pub struct BlessInputs<'a> {
     pub report: &'a Report,
-    /// SHA-256 of each corpus's golden file in the data dir, by corpus.
+    /// Each corpus's golden digest, by corpus: the SHA-256 of its golden
+    /// file in the data dir, with this scoreboard's structural-oracle
+    /// fingerprint folded in when the file has `[[ast]]` entries
+    /// ([`crate::scoreboard::golden::golden_digest`]).
     pub golden_on_disk: &'a BTreeMap<String, String>,
     pub existing: Option<&'a Baseline>,
     /// `--accept-regression "<reason>"`: accepts every HARD downgrade and
@@ -190,7 +195,8 @@ pub fn bless(inputs: &BlessInputs<'_>) -> BlessDecision {
                 c.name
             )),
             Some(sha) if *sha != c.golden_sha256 => reasons.push(format!(
-                "corpus {}: report.json was produced from a different golden file than the data dir holds; rerun the scoreboard",
+                "corpus {}: report.json was produced from a different golden file or structural-oracle \
+                 fingerprint than the data dir and this scoreboard hold; rerun the scoreboard",
                 c.name
             )),
             Some(_) => {}
@@ -417,7 +423,8 @@ mod tests {
     use super::*;
     use crate::scoreboard::report::{
         AggregateReport, CheckRecord, CorpusInfo, CorpusReport, CoverageReport, GateReport,
-        GateStatus, LatencyReport, REPORT_SCHEMA, SkippedByReason, UniverseReport,
+        GateStatus, LatencyReport, REPORT_SCHEMA, SkippedByReason, StructuralReport,
+        UniverseReport,
     };
     use crate::scoreboard::types::CheckId;
 
@@ -452,6 +459,7 @@ mod tests {
             },
             checks,
             ratchet: BTreeMap::from([("ident.mrr".to_string(), mrr)]),
+            structural: StructuralReport::default(),
             info: CorpusInfo {
                 oracle_skipped_by_reason: BTreeMap::new(),
                 unindexed_hits: BTreeMap::new(),
@@ -471,6 +479,7 @@ mod tests {
                 hard: BTreeMap::new(),
                 ratchet: BTreeMap::from([("ident.mrr".to_string(), mrr)]),
             },
+            uncovered_patterns: Vec::new(),
             gate: GateReport {
                 status: GateStatus::Pass,
                 failures: Vec::new(),
@@ -569,7 +578,14 @@ mod tests {
 
         let mut r = report(vec![corpus("skim", Vec::new(), 0.9)], 0.9);
         r.corpora[0].golden_sha256 = "other".to_string();
-        assert!(refused(decide(&r, None, None)).contains("different golden file"));
+        let reasons = refused(decide(&r, None, None));
+        assert!(
+            reasons.contains(
+                "corpus skim: report.json was produced from a different golden file or \
+                 structural-oracle fingerprint than the data dir and this scoreboard hold"
+            ),
+            "{reasons}"
+        );
     }
 
     #[test]

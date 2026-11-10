@@ -2,3 +2,10 @@
 # Integration tests embed fixtures via include_str! / include_bytes!; a CRLF
 # checkout on Windows or misconfigured git would break byte-exact assertions.
 crates/rskim/tests/fixtures/** text eol=lf
+
+# Bytes the search scoreboard hashes or compares must not depend on the
+# checkout's line-ending settings: the structural-oracle queries are
+# include_str!'d into the oracle fingerprint, and the golden files are hashed
+# into golden_sha256 (a CRLF checkout would ask for a bless with no change).
+crates/rskim-oracle/queries/** text eol=lf
+crates/rskim-bench/scoreboard/** text eol=lf

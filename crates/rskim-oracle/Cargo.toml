@@ -1,0 +1,36 @@
+[package]
+name = "rskim-oracle"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "Independent ground-truth oracles for the search scoreboard (tree-sitter structural oracle; compile-time independent of skim's search stack)"
+repository = "https://github.com/dean0x/skim"
+publish = false
+
+# Compile-time independence (#541 AC-3): no rskim-* crate in any dependency
+# table, dev and build included. tests/independence.rs holds the allow-list
+# and fails on anything else.
+
+[lib]
+name = "rskim_oracle"
+path = "src/lib.rs"
+
+[dependencies]
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-go = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"

@@ -39,7 +39,7 @@ Performance targets (sub-50 ms queries, fast incremental updates) matter, but th
 
 - **Local and zero-config.** One binary, no network, no Python, CLI flags only.
 - **Structure and history over embeddings.** Vector similarity scores ~2.6% F1 on structural code search vs ~70% for structural patterns (#173). Revisit only with evidence.
-- **Measured, not asserted.** A green CI is not evidence of retrieval quality (ADR-007). The scoreboard is.
+- **Measured, not asserted.** A green CI is not evidence of retrieval quality (SEARCH-ADR-007). The scoreboard is.
 
 ## The scoreboard
 
@@ -57,12 +57,13 @@ Performance targets (sub-50 ms queries, fast incremental updates) matter, but th
 
 ### How it runs
 
-The scoreboard lives in [`crates/rskim-bench/scoreboard/`](../crates/rskim-bench/scoreboard/README.md) (#203): an end-to-end harness that drives the release `skim` binary against four pinned, full-history corpora (skim, ripgrep, flask, zod) and checks every answer against an independent in-process oracle (`rg -F` semantics over the same file universe, no `rg` dependency).
+The scoreboard lives in [`crates/rskim-bench/scoreboard/`](../crates/rskim-bench/scoreboard/README.md) (#203): an end-to-end harness that drives the release `skim` binary against four pinned, full-history corpora (skim, ripgrep, flask, zod) and checks every answer against independent in-process oracles: `rg -F` semantics over the same file universe for text (no `rg` dependency), and tree-sitter queries for `--ast`.
 
 - **Required gate.** The `Search Scoreboard` CI job runs on every PR that touches search code; a search PR merges only with it green.
 - **HARD checks** must pass per query: recall = precision = 1, zero silent misses, honest pagination, prefix consistency, score order. **RATCHET** metrics (definition top-1, MRR, anchor = definition, P@k vs baselines, output bytes) cannot move in either direction without an explicit re-bless of `baseline.json`. Latency is informational.
+- **Structural oracle (#541).** Each `--ast` named pattern is scored per (pattern, language) against a hand-written tree-sitter query (`crates/rskim-oracle/queries/<pattern>.<lang>.scm`) that encodes the pattern's documented description on the real grammar (TSX for `.tsx`). The oracle is its own crate, `rskim-oracle`, which depends on no `rskim-*` crate (a manifest test enforces it), so nothing from skim's AST index can reach an answer; it knows the patterns by name, and the scoreboard crosses those names with skim's catalog, which it reads once. The scoring layer in `rskim-bench` stays independent by convention, like the lexical oracle. File-level recall is HARD (= 1) for every golden `[[ast]]` entry, precision is HARD for `hard`-class entries, and `structural.coverage` (HARD) requires skim's AST size-cap accounting (`ast_coverage`) to equal the oracle's own count of files over the cap, among the files that accounting counts (tree-sitter languages, Bash included). RATCHETs cover the precision of `ratchet`-class entries, whether skim's `line` lands on a match, intent recall and precision for the nested-loop patterns, and the rows no entry scores, counted for every catalog pattern (neutral: a move either way needs a bless, never a reason). Everything the oracle's answers depend on is hashed into the golden digest: the `.scm` query text, the post-filters, the intent specs, the size cap, the extension table (including the class of an unknown extension) and the attribute kinds the body-element count skips. Editing any of them forces a re-bless.
 - **Known failures are ledgered, never hidden.** Each entry in `known_failures.toml` names its ticket; fixing the bug turns the entry into an XPASS, which fails the gate until the entry is removed.
-- **Manual adversarial dog-food (ADR-007)** remains only for capabilities the scoreboard does not cover yet: structural precision until #541, temporal parity until #542.
+- **Manual adversarial dog-food (SEARCH-ADR-007)** remains only for capabilities the scoreboard does not cover yet: the `--ast` patterns `report.md` lists as uncovered (`deep-nesting`, `java-synchronized`, `ruby-begin-rescue`: no oracle query; `go-channel-send`, `go-defer`, `go-goroutine`, `go-select`: no corpus Go file where the oracle or skim finds a match), `--ast` rows in a language or (pattern, language) no entry scores (counted, not judged), containment and compound `--ast` queries, occurrence- and line-level structural precision (scoring is per file), ratchet-class structural precision (recorded, not required to be 1), temporal parity until #542, and any new query flag or arm.
 
 A change to retrieval or ranking merges only if the scoreboard does not regress.
 

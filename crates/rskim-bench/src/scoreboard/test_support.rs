@@ -4,12 +4,33 @@
 //!
 //! Compiled only under `#[cfg(test)]` or the `test-utils` feature, so unit
 //! tests here and the offline integration tests in `tests/` (#203 AC 3) share
-//! one fixture builder.
+//! one fixture builder, skim's pattern catalog read once ([`catalog`]), and
+//! the structural oracle compiled once ([`oracle`]).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test support: fail loudly
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::LazyLock;
+
+use rskim_oracle::structural::StructuralOracle;
+
+use crate::scoreboard::catalog::{CatalogPattern, skim_catalog};
+
+/// skim's pattern catalog ([`skim_catalog`]), read once per test binary.
+pub fn catalog() -> &'static [CatalogPattern] {
+    static CATALOG: LazyLock<Vec<CatalogPattern>> = LazyLock::new(skim_catalog);
+    &CATALOG
+}
+
+/// The structural oracle, compiled once per test binary and shared by every
+/// test in it (`StructuralOracle` is `Sync`); compiling it at `-O0` is the
+/// slow part of an oracle test.
+pub fn oracle() -> &'static StructuralOracle {
+    static ORACLE: LazyLock<StructuralOracle> =
+        LazyLock::new(|| StructuralOracle::new().expect("every oracle query compiles"));
+    &ORACLE
+}
 
 /// A throwaway git repository plus an isolated `HOME` for every git command
 /// run against it, so the developer's global config (signing, hooks,

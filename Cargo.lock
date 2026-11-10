@@ -2590,6 +2590,7 @@ dependencies = [
  "regex",
  "rskim-bench",
  "rskim-core",
+ "rskim-oracle",
  "rskim-research",
  "rskim-search",
  "serde",
@@ -2668,6 +2669,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "rskim-oracle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml 0.8.23",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
 ]
 
 [[package]]

@@ -402,3 +402,73 @@ limits = [5, 20]
 id = "ripgrep-F004"
 query = "matcher"
 limits = [5, 20]
+
+# --- structural (--ast) entries, #541 (scoreboard golden-gen --corpus ripgrep --ast) ------
+# One entry per (pattern, language) where the structural oracle or skim finds a
+# file in this corpus (golden-gen never proposes a vacuous one). precision is
+# "hard" iff the catalog marks the pattern exact; it is frozen here and never
+# re-read from the catalog. The golden-gen counts are proposal-time evidence
+# (release skim 2f2186c), not checked values.
+
+# golden-gen: oracle files 1; skim files 3
+[[ast]]
+id = "ripgrep-ast-empty-function-rust"
+pattern = "empty-function"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 6; skim files 6
+[[ast]]
+id = "ripgrep-ast-excessive-params-rust"
+pattern = "excessive-params"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 83; skim files 83
+[[ast]]
+id = "ripgrep-ast-function-with-body-rust"
+pattern = "function-with-body"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 10; skim files 10
+[[ast]]
+id = "ripgrep-ast-god-function-rust"
+pattern = "god-function"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 54; skim files 54
+[[ast]]
+id = "ripgrep-ast-impl-method-rust"
+pattern = "impl-method"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 59; skim files 59
+[[ast]]
+id = "ripgrep-ast-match-with-arms-rust"
+pattern = "match-with-arms"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 42; skim files 42
+[[ast]]
+id = "ripgrep-ast-rust-nested-loop-rust"
+pattern = "rust-nested-loop"
+lang = "rust"
+precision = "ratchet"
+
+# golden-gen: oracle files 3; skim files 3
+[[ast]]
+id = "ripgrep-ast-rust-unsafe-block-rust"
+pattern = "rust-unsafe-block"
+lang = "rust"
+precision = "hard"
+
+# golden-gen: oracle files 60; skim files 60
+[[ast]]
+id = "ripgrep-ast-unhandled-result-rust"
+pattern = "unhandled-result"
+lang = "rust"
+precision = "ratchet"

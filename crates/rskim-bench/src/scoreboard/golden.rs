@@ -16,10 +16,12 @@ use std::path::Path;
 
 use anyhow::Context;
 use regex::Regex;
-use serde::Deserialize;
+use rskim_oracle::structural::{self, OracleLang, PatternCoverage};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::scoreboard::MAX_PAGES;
+use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
 use crate::scoreboard::oracle::{LangFilter, LexicalQuery, MatchMode, ground_truth};
 use crate::scoreboard::types::{Arm, CheckId, EntryKind, VerifyMode};
 use crate::scoreboard::universe::Universe;
@@ -205,6 +207,56 @@ pub struct PrefixEntry {
     pub limits: Vec<u32>,
 }
 
+/// The precision class an `[[ast]]` entry declares. It is frozen in the
+/// golden file (`golden-gen` proposes `hard` for a catalog pattern whose
+/// `exact` flag is set, `ratchet` otherwise); the gate never re-reads the
+/// catalog, so reclassifying is a reviewed golden edit plus a bless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrecisionClass {
+    /// `structural.precision` is a HARD check: every returned file matches.
+    Hard,
+    /// Precision is the RATCHET value `structural.precision.<id>`.
+    Ratchet,
+}
+
+impl PrecisionClass {
+    /// The golden / report name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrecisionClass::Hard => "hard",
+            PrecisionClass::Ratchet => "ratchet",
+        }
+    }
+}
+
+/// `[[ast]]`: skim's standalone `--ast <pattern>` answer in one oracle
+/// language, scored against the structural oracle (#541). skim is called
+/// once per pattern and its rows are split by file extension, so each
+/// `(pattern, lang)` pair has at most one entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AstEntry {
+    pub id: String,
+    /// A catalog pattern name (`rskim_search::all_patterns`) the oracle
+    /// has a query for in `lang`.
+    pub pattern: String,
+    /// The oracle language whose files this entry scores.
+    pub lang: OracleLang,
+    pub precision: PrecisionClass,
+    /// A false-positive guard: the oracle is expected to match no file in
+    /// `lang`, so the entry guards precision only (it exists because skim
+    /// returned a file the oracle rejects). Such an entry is scored even when
+    /// skim returns no row either — the state a fix of that false positive
+    /// leaves, where recall and precision both read 1 (an empty denominator)
+    /// and a returning false positive fails `structural.precision` again — so
+    /// it is exempt from the vacuity guard. An oracle match on a flagged entry
+    /// is a golden error (the flag is stale and would hide recall). Absent =
+    /// `false`; `golden-gen --ast` sets it on an entry whose oracle is empty.
+    #[serde(default)]
+    pub expect_oracle_empty: bool,
+}
+
 /// One corpus's golden file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,11 +274,13 @@ pub struct GoldenFile {
     pub paginations: Vec<PaginationEntry>,
     #[serde(default, rename = "prefix")]
     pub prefixes: Vec<PrefixEntry>,
+    #[serde(default, rename = "ast")]
+    pub asts: Vec<AstEntry>,
 }
 
 impl GoldenFile {
     /// Every `(id, kind)`, in file order within each kind (ident, concept,
-    /// lexical, pagination, prefix).
+    /// lexical, pagination, prefix, ast).
     pub fn ids(&self) -> impl Iterator<Item = (&str, EntryKind)> {
         let idents = self
             .idents
@@ -248,11 +302,13 @@ impl GoldenFile {
             .prefixes
             .iter()
             .map(|e| (e.id.as_str(), EntryKind::Prefix));
+        let asts = self.asts.iter().map(|e| (e.id.as_str(), EntryKind::Ast));
         idents
             .chain(concepts)
             .chain(lexicals)
             .chain(paginations)
             .chain(prefixes)
+            .chain(asts)
     }
 
     /// The kind of the entry with `id`.
@@ -261,12 +317,15 @@ impl GoldenFile {
     }
 }
 
-/// A golden file plus the SHA-256 of its raw bytes.
+/// A golden file plus its digest ([`golden_digest`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedGolden {
     pub file: GoldenFile,
     /// Lowercase hex SHA-256 of the file bytes as read (any byte edit,
-    /// comments included, changes it).
+    /// comments included, changes it); a file with `[[ast]]` entries also
+    /// folds in [`structural_oracle_sha256`], so editing any oracle query
+    /// changes it too. This is the per-corpus `golden_sha256` the gate and
+    /// `bless` compare.
     pub sha256: String,
 }
 
@@ -289,15 +348,44 @@ pub fn load_golden(path: &Path) -> anyhow::Result<LoadedGolden> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading golden file {}", path.display()))?;
     let file = parse_golden(&raw).with_context(|| format!("in {}", path.display()))?;
-    Ok(LoadedGolden {
-        file,
-        sha256: hex_sha256(raw.as_bytes()),
-    })
+    // The oracle fingerprint is rendered and hashed only for a file that
+    // folds it in.
+    let oracle = (!file.asts.is_empty()).then(structural_oracle_sha256);
+    let sha256 = golden_digest(raw.as_bytes(), oracle.as_deref());
+    Ok(LoadedGolden { file, sha256 })
+}
+
+/// Lowercase hex SHA-256 of [`structural::fingerprint`]: every table the
+/// oracle's answers depend on — the size cap, the extension table, the
+/// body-element attribute kinds, every registered query (file name,
+/// post-filter, text) and every intent spec.
+pub fn structural_oracle_sha256() -> String {
+    hex_sha256(structural::fingerprint().as_bytes())
+}
+
+/// A golden file's digest: the SHA-256 of its `raw` bytes, or — for a file
+/// with `[[ast]]` entries, which passes `oracle_sha256`
+/// ([`structural_oracle_sha256`]) — the SHA-256 of the bytes, a separator
+/// and that digest. The oracle queries are compiled into the scoreboard, so
+/// this is how an edit to one reaches the per-corpus `golden_sha256`: the
+/// gate then asks for a bless, and `bless` refuses a report made with other
+/// queries.
+pub fn golden_digest(raw: &[u8], oracle_sha256: Option<&str>) -> String {
+    let Some(oracle_sha256) = oracle_sha256 else {
+        return hex_sha256(raw);
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(raw);
+    hasher.update(b"\0structural-oracle\0");
+    hasher.update(oracle_sha256.as_bytes());
+    hex(&hasher.finalize())
 }
 
 /// One hash over a whole golden set (report / baseline `golden_sha256`):
 /// SHA-256 over `"<corpus>\0<file sha256>\n"` lines sorted by corpus, so it
-/// does not depend on load order.
+/// does not depend on load order. Each file's digest already carries the
+/// structural oracle digest when it has `[[ast]]` entries
+/// ([`golden_digest`]), so a query edit changes this hash too.
 pub fn golden_set_sha256<'a>(files: impl IntoIterator<Item = &'a LoadedGolden>) -> String {
     let lines: BTreeSet<String> = files
         .into_iter()
@@ -585,6 +673,10 @@ pub struct IntegrityContext<'a> {
     pub universe: Option<&'a Universe>,
     /// Ledger entries for this corpus.
     pub ledger: &'a [LedgerRef<'a>],
+    /// skim's pattern catalog
+    /// ([`crate::scoreboard::catalog::skim_catalog`]): every `[[ast]]`
+    /// pattern must be one of its names.
+    pub catalog: &'a [CatalogPattern],
 }
 
 /// One integrity violation.
@@ -633,12 +725,20 @@ impl Violations {
 /// concept regexes compile; lexical `mode` / `near` / `lang` / `category`
 /// agree and the oracle accepts the query; pagination and prefix `limits`
 /// are non-empty and positive and their `flags` parse; a prefix without a
-/// query selects a standalone arm; every ledger entry names an existing id
-/// whose kind its check applies to.
+/// query selects a standalone arm; every `[[ast]]` pattern is in skim's
+/// catalog and has an oracle query in the entry's language, and no
+/// `(pattern, lang)` pair has two entries; every ledger entry names an
+/// existing id whose kind its check applies to.
 ///
 /// With a universe: every `def.path` is indexed and its `def.line` contains
 /// the query; every lexically-computable pagination entry's ground truth fits
 /// [`pagination_bound`]; every `zero-hit` entry's ground truth is empty.
+///
+/// Two `[[ast]]` golden errors need the structural oracle's answers, so the
+/// pipeline checks them: an entry flagged `expect_oracle_empty` whose oracle
+/// matches a file (`pipeline::require_expected_empty_oracles`, before skim
+/// runs), and an unflagged entry where the oracle and skim both find nothing
+/// (`pipeline::require_non_vacuous_structural`, after the run).
 pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<IntegrityViolation> {
     let mut v = Violations(Vec::new());
 
@@ -670,6 +770,13 @@ pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<I
     }
     for e in &golden.prefixes {
         v.entry_err(&e.id, check_prefix(e));
+    }
+    if !golden.asts.is_empty() {
+        let catalog = catalog_coverage(ctx.catalog);
+        for e in &golden.asts {
+            v.entry_err(&e.id, check_ast(e, &catalog));
+        }
+        check_ast_pairs(golden, &mut v);
     }
     check_ledger(golden, ctx.ledger, &mut v);
 
@@ -779,6 +886,53 @@ fn check_prefix(e: &PrefixEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An `[[ast]]` pattern must be a catalog pattern the oracle has a query for
+/// in the entry's language.
+fn check_ast(e: &AstEntry, catalog: &BTreeMap<&str, PatternCoverage>) -> anyhow::Result<()> {
+    match catalog.get(e.pattern.as_str()) {
+        None => anyhow::bail!(
+            "pattern {:?} is not in skim's pattern catalog (rskim_search::all_patterns)",
+            e.pattern
+        ),
+        Some(PatternCoverage::Uncovered { reason }) => {
+            anyhow::bail!(
+                "pattern {:?} has no structural oracle query: {reason}",
+                e.pattern
+            )
+        }
+        Some(PatternCoverage::Covered { langs }) if !langs.contains(&e.lang) => {
+            let covered: Vec<&str> = langs.iter().map(|l| l.as_str()).collect();
+            anyhow::bail!(
+                "the structural oracle has no {} query for pattern {:?} (it has: {})",
+                e.lang,
+                e.pattern,
+                covered.join(", ")
+            )
+        }
+        Some(PatternCoverage::Covered { .. }) => Ok(()),
+    }
+}
+
+/// skim is called once per pattern and its rows are split by language, so
+/// two entries for one `(pattern, lang)` would score the same rows twice.
+fn check_ast_pairs(golden: &GoldenFile, v: &mut Violations) {
+    let mut first: BTreeMap<(&str, OracleLang), &str> = BTreeMap::new();
+    for e in &golden.asts {
+        match first.get(&(e.pattern.as_str(), e.lang)) {
+            Some(earlier) => v.entry(
+                &e.id,
+                format!(
+                    "({}, {}) is already scored by {earlier}; one [[ast]] entry per pattern and language",
+                    e.pattern, e.lang
+                ),
+            ),
+            None => {
+                first.insert((e.pattern.as_str(), e.lang), e.id.as_str());
+            }
+        }
+    }
+}
+
 fn check_ledger(golden: &GoldenFile, ledger: &[LedgerRef<'_>], v: &mut Violations) {
     for entry in ledger {
         match golden.entry_kind(entry.id) {
@@ -805,7 +959,7 @@ fn check_ledger(golden: &GoldenFile, ledger: &[LedgerRef<'_>], v: &mut Violation
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
-    use crate::scoreboard::test_support::FixtureRepo;
+    use crate::scoreboard::test_support::{FixtureRepo, catalog};
     use crate::scoreboard::universe::{GitIsolation, Universe};
 
     const SHA: &str = "b8a0a79463382347820f1c2572bde37b68e87c76";
@@ -861,6 +1015,7 @@ limits = [5, 20]
             commit: SHA,
             universe: None,
             ledger,
+            catalog: catalog(),
         }
     }
 
@@ -945,6 +1100,174 @@ limits = [5, 20]
         assert_eq!(g.entry_kind("skim-F001"), Some(EntryKind::Prefix));
         assert_eq!(g.entry_kind("nope"), None);
         assert_eq!(g.ids().count(), 5);
+    }
+
+    // --- [[ast]] ---------------------------------------------------------------
+
+    fn ast(id: &str, pattern: &str, lang: &str, precision: &str) -> String {
+        format!(
+            "[[ast]]\nid = \"{id}\"\npattern = \"{pattern}\"\nlang = \"{lang}\"\nprecision = \"{precision}\"\n"
+        )
+    }
+
+    #[test]
+    fn ast_entries_parse_with_their_language_and_precision_class() {
+        let g = golden(&format!(
+            "{}{}{}",
+            header(),
+            ast(
+                "skim-ast-try-catch-finally-javascript",
+                "try-catch-finally",
+                "javascript",
+                "hard"
+            ),
+            ast(
+                "skim-ast-rust-nested-loop-rust",
+                "rust-nested-loop",
+                "rust",
+                "ratchet"
+            ),
+        ));
+        assert_eq!(
+            g.asts[0],
+            AstEntry {
+                id: "skim-ast-try-catch-finally-javascript".to_string(),
+                pattern: "try-catch-finally".to_string(),
+                lang: OracleLang::JavaScript,
+                precision: PrecisionClass::Hard,
+                expect_oracle_empty: false,
+            }
+        );
+        assert_eq!(g.asts[1].precision, PrecisionClass::Ratchet);
+        assert_eq!(
+            g.entry_kind("skim-ast-rust-nested-loop-rust"),
+            Some(EntryKind::Ast)
+        );
+        assert_eq!(g.ids().count(), 2);
+        assert!(check_integrity(&g, &ctx(&[])).is_empty());
+    }
+
+    #[test]
+    fn expect_oracle_empty_is_an_optional_bool_that_defaults_to_false() {
+        let entry = ast("skim-A1", "try-catch-finally", "javascript", "hard");
+        let flagged = golden(&format!("{}{entry}expect_oracle_empty = true\n", header()));
+        assert!(flagged.asts[0].expect_oracle_empty);
+        let explicit = golden(&format!("{}{entry}expect_oracle_empty = false\n", header()));
+        assert!(!explicit.asts[0].expect_oracle_empty);
+        assert!(!golden(&format!("{}{entry}", header())).asts[0].expect_oracle_empty);
+        // The flag needs the oracle's answers, so schema integrity accepts it.
+        assert!(check_integrity(&flagged, &ctx(&[])).is_empty());
+        assert!(
+            parse_golden(&format!(
+                "{}{entry}expect_oracle_empty = \"yes\"\n",
+                header()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ast_entries_with_a_bad_class_language_or_field_do_not_load() {
+        for body in [
+            ast("skim-A1", "try-catch", "typescript", "strict"),
+            ast("skim-A1", "try-catch", "haskell", "hard"),
+            ast("skim-A1", "try-catch", "TypeScript", "hard"),
+            "[[ast]]\nid = \"skim-A1\"\npattern = \"try-catch\"\nlang = \"typescript\"\n"
+                .to_string(),
+            format!(
+                "{}flags = []\n",
+                ast("skim-A1", "try-catch", "typescript", "hard")
+            ),
+        ] {
+            assert!(
+                parse_golden(&format!("{}{body}", header())).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn ast_patterns_must_be_catalog_patterns_the_oracle_covers_in_that_language() {
+        let v = violations_for(&format!(
+            "{}{}{}{}{}",
+            header(),
+            ast("skim-A1", "no-such-pattern", "rust", "hard"),
+            ast("skim-A2", "deep-nesting", "rust", "ratchet"),
+            ast("skim-A3", "god-function", "typescript", "ratchet"),
+            ast("skim-A4", "god-function", "rust", "ratchet"),
+        ));
+        let message = |id: &str| {
+            v.iter()
+                .find(|x| x.id.as_deref() == Some(id))
+                .map(|x| x.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            message("skim-A1").contains("not in skim's pattern catalog"),
+            "{v:?}"
+        );
+        assert!(
+            message("skim-A2").contains("no structural oracle query"),
+            "{v:?}"
+        );
+        assert!(
+            message("skim-A3").contains("no typescript query")
+                && message("skim-A3").contains("rust"),
+            "{v:?}"
+        );
+        assert!(!flagged(&v, "skim-A4"), "{v:?}");
+    }
+
+    #[test]
+    fn one_ast_entry_per_pattern_and_language_with_ids_unique_across_kinds() {
+        let v = violations_for(&format!(
+            "{}{}{}{}[[concept]]\nid = \"skim-A9\"\nquery = \"a\"\nrelevant = \"a\"\n{}",
+            header(),
+            ast("skim-A1", "try-catch", "typescript", "hard"),
+            ast("skim-A2", "try-catch", "typescript", "ratchet"),
+            ast("skim-A3", "try-catch", "tsx", "hard"),
+            ast("skim-A9", "try-catch", "javascript", "hard"),
+        ));
+        assert!(!flagged(&v, "skim-A1"), "the first entry stands: {v:?}");
+        assert!(flagged(&v, "skim-A2"), "{v:?}");
+        assert!(!flagged(&v, "skim-A3"), ".tsx is its own language: {v:?}");
+        assert!(flagged(&v, "skim-A9"), "id shared with a concept: {v:?}");
+    }
+
+    #[test]
+    fn ledger_entries_pair_structural_checks_with_ast_entries_only() {
+        let g = golden(&format!(
+            "{}{}[[lexical]]\nid = \"skim-X01\"\nquery = \"q\"\ncategory = \"substr\"\n",
+            header(),
+            ast(
+                "skim-ast-try-catch-finally-javascript",
+                "try-catch-finally",
+                "javascript",
+                "hard"
+            ),
+        ));
+        let ok = [LedgerRef {
+            check: CheckId::StructuralPrecision,
+            id: "skim-ast-try-catch-finally-javascript",
+        }];
+        assert!(check_integrity(&g, &ctx(&ok)).is_empty());
+        for (check, id) in [
+            (CheckId::StructuralRecall, "skim-X01"),
+            (
+                CheckId::LexicalRecall,
+                "skim-ast-try-catch-finally-javascript",
+            ),
+            (
+                CheckId::OrderScoreMonotone,
+                "skim-ast-try-catch-finally-javascript",
+            ),
+        ] {
+            let refs = [LedgerRef { check, id }];
+            assert!(
+                flagged(&check_integrity(&g, &ctx(&refs)), id),
+                "{check} on {id}"
+            );
+        }
     }
 
     // --- flags -----------------------------------------------------------------
@@ -1204,6 +1527,7 @@ limits = [5, 20]
             commit: sha,
             universe: Some(universe),
             ledger: &[],
+            catalog: catalog(),
         };
         check_integrity(&golden(&src), &ctx)
     }
@@ -1315,6 +1639,63 @@ limits = [5, 20]
         std::fs::write(&path, "corpus = ").unwrap();
         let err = load_golden(&path).unwrap_err();
         assert!(format!("{err:#}").contains("broken.toml"), "{err:#}");
+    }
+
+    #[test]
+    fn a_golden_file_with_ast_entries_folds_the_oracle_digest_into_its_own() {
+        let raw = b"corpus = \"skim\"\n";
+        // No [[ast]] entry, so no oracle digest: the raw bytes' SHA-256.
+        assert_eq!(golden_digest(raw, None), hex_sha256(raw));
+        // With [[ast]] entries: any change to the oracle changes the digest.
+        let with = golden_digest(raw, Some("q1"));
+        assert_ne!(with, hex_sha256(raw));
+        assert_ne!(with, golden_digest(raw, Some("q2")));
+        assert_eq!(with, golden_digest(raw, Some("q1")));
+        assert_eq!(with.len(), 64);
+    }
+
+    #[test]
+    fn the_oracle_digest_covers_every_query_text_filter_and_intent() {
+        let fingerprint = structural::fingerprint();
+        for q in structural::query_sources() {
+            assert!(
+                fingerprint.contains(&q.file_name()) && fingerprint.contains(q.source),
+                "{} is not in the golden digest",
+                q.file_name()
+            );
+        }
+        assert!(
+            fingerprint.contains("at-least 20 @body"),
+            "god-function threshold"
+        );
+        assert!(
+            fingerprint.contains("intent rust-nested-loop"),
+            "intent specs"
+        );
+        assert_eq!(structural_oracle_sha256(), structural_oracle_sha256());
+        assert_eq!(structural_oracle_sha256().len(), 64);
+    }
+
+    #[test]
+    fn load_golden_folds_the_oracle_digest_only_into_files_with_ast_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.toml");
+        std::fs::write(&plain, DESIGN_EXAMPLE).unwrap();
+        assert_eq!(
+            load_golden(&plain).unwrap().sha256,
+            hex_sha256(DESIGN_EXAMPLE.as_bytes())
+        );
+
+        let with_ast = format!(
+            "{DESIGN_EXAMPLE}{}",
+            ast("skim-A1", "try-catch", "typescript", "hard")
+        );
+        let structural_file = dir.path().join("ast.toml");
+        std::fs::write(&structural_file, &with_ast).unwrap();
+        assert_eq!(
+            load_golden(&structural_file).unwrap().sha256,
+            golden_digest(with_ast.as_bytes(), Some(&structural_oracle_sha256()))
+        );
     }
 
     #[test]

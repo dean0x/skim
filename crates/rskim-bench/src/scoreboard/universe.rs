@@ -9,7 +9,7 @@
 //!
 //! # Rules
 //!
-//! - **Candidates** — `git ls-files -z` (tracked, ADR-008's union) ∪
+//! - **Candidates** — `git ls-files -z` (tracked, SEARCH-ADR-008's union) ∪
 //!   untracked-not-ignored files (`git ls-files -z --others
 //!   --exclude-standard`) with no hidden (`.`-prefixed) path component, the
 //!   walker's `.hidden(true)` (`walk.rs:1157`). On a verified-clean clone the
@@ -17,7 +17,7 @@
 //! - **Regular files only** — `symlink_metadata`; symlinks, gitlinks and
 //!   other non-files are dropped (`walk.rs:418-432`).
 //! - **Extension allow-list** — the oracle's own copy of
-//!   `Language::from_extension` (`crates/rskim-core/src/types.rs:55-80`),
+//!   `Language::from_extension` (`crates/rskim-core/src/types.rs`),
 //!   shared with its `--lang` map
 //!   ([`crate::scoreboard::oracle::is_indexable_extension`]),
 //!   case-sensitive, extension only.
@@ -500,7 +500,7 @@ fn has_nul_probe(bytes: &[u8]) -> bool {
 
 /// A non-empty relative path made only of normal components — the oracle's
 /// own containment rule, standing in for skim's `is_repo_relative_safe` and
-/// `Language::from_path`'s `..` rejection (`types.rs:155-169`).
+/// `Language::from_path`'s `..` rejection (`crates/rskim-core/src/types.rs`).
 fn is_safe_relative(path: &str) -> bool {
     !path.is_empty()
         && Path::new(path)
@@ -752,7 +752,7 @@ mod tests {
         let u = universe(&repo);
         assert!(
             u.contains("generated/tracked.rs"),
-            "ADR-008 union keeps tracked files"
+            "SEARCH-ADR-008 union keeps tracked files"
         );
         assert!(!u.contains("generated/untracked.rs"));
     }

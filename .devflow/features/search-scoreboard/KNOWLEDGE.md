@@ -1,64 +1,62 @@
 ---
 feature: search-scoreboard
-name: Search scoreboard (end-to-end retrieval quality gate)
-description: "Use when a search PR's Search Scoreboard CI job fails, when changing skim search retrieval/ranking/pagination/walker universe/text output, when running the scoreboard locally, when ledgering or promoting a known HARD failure, when blessing baseline.json (incl. --accept-regression), when adding golden queries or bumping a corpus pin, or when editing the scoreboard harness (oracle, universe, runner, gate, bless), the CI search-path filter, or rskim-research pinned-clone / subprocess-timeout code. Keywords: scoreboard, Search Scoreboard, run, check, bless, golden-gen, baseline.json, known_failures.toml, ledger, XFAIL, XPASS, promote, HARD, RATCHET, INFO, bless required, --accept-regression, accepted_regressions, golden, corpora.toml, oracle, universe.delta, skipped_by_reason_mismatch, coverage.tracked_text, oracle_less.full_rows, results.unique_paths, silent_fn, degraded, temporal_state, harness error, exit 2, SEARCH_PATHS, --no-renames, skim-release, scoreboard-report, ensure_pinned_history_clone, verify_pinned_clone, OWNERSHIP_MARKER, zeroPaddedFilemode, process_group, git_output_with_timeout, KILL_GRACE, caffeinate, .bench-corpus/scoreboard, #544, #545, #547, #541, #542, ADR-007."
+name: Search scoreboard (quality gate) incl. the structural oracle
+description: "Use when a search PR's Search Scoreboard CI job fails, when changing skim search retrieval/ranking/pagination/walker universe/text output or the --ast pattern catalog / AST indexing / AST size cap, when running the scoreboard locally, when ledgering or promoting a known HARD failure, when blessing baseline.json (incl. --accept-regression), when adding golden queries or [[ast]] entries, bumping a corpus pin or a tree-sitter grammar, when adding a structural-oracle query or oracle language in crates/rskim-oracle, or when editing the scoreboard harness (lexical oracle, structural oracle, catalog read, universe, runner, gate, bless), the CI search-path filter, or rskim-research pinned-clone / subprocess-timeout code. Keywords: scoreboard, Search Scoreboard, run, check, bless, golden-gen, golden-gen --ast, [[ast]], structural oracle, rskim-oracle, AC-3, tests/independence.rs, ALLOWED, include!, #[path], build.rs, queries/*.scm, ; Grammar: header, Cargo.lock, OracleInputs, fingerprint, structural_oracle_sha256, golden_digest, MATCH_CAPTURE, ORACLE_MATCH_LIMIT, OracleScratch, map_init, intent oracle, nested_loop_lines, PostFilter, EXT_CLASSES, AST_SIZE_CAP_BYTES, UNCOVERED, UNCLASSIFIED_REASON, catalog.rs, skim_catalog, catalog_coverage, all_patterns, LANGS, structural.recall, structural.precision, structural.coverage, structural.unscored_rows, neutral, line_on_match, intent_recall, expect_oracle_empty, false-positive guard, vacuous, uncovered_patterns, structural_oracle_wall_ms, pattern_calls_wall_ms, profile.dev.package.tree-sitter, eol=lf, baseline.json, known_failures.toml, ledger, XFAIL, XPASS, promote, HARD, RATCHET, INFO, bless required, --accept-regression, accepted_regressions, corpora.toml, universe.delta, skipped_by_reason_mismatch, coverage.tracked_text, oracle_less.full_rows, results.unique_paths, silent_fn, degraded, temporal_state, harness error, exit 2, SEARCH_PATHS, --no-renames, skim-release, scoreboard-report, ensure_pinned_history_clone, OWNERSHIP_MARKER, zeroPaddedFilemode, process_group, git_output_with_timeout, KILL_GRACE, caffeinate, .bench-corpus/scoreboard, #541, #542, #544, #545, #546, #547, #571, #572, SEARCH-ADR-007."
 category: domain-knowledge
-directories: [crates/rskim-bench/src/scoreboard/, crates/rskim-bench/src/bin/scoreboard.rs, crates/rskim-bench/scoreboard/, crates/rskim-bench/tests/scoreboard.rs, crates/rskim-research/src/clone.rs, .github/workflows/ci.yml]
+directories: [crates/rskim-bench/src/scoreboard/, crates/rskim-bench/src/bin/scoreboard.rs, crates/rskim-bench/scoreboard/, crates/rskim-bench/tests/scoreboard.rs, crates/rskim-oracle/, crates/rskim-research/src/clone.rs, .github/workflows/ci.yml]
 referencedFiles:
-  - crates/rskim-bench/src/scoreboard/mod.rs
   - crates/rskim-bench/src/scoreboard/pipeline.rs
   - crates/rskim-bench/src/scoreboard/runner.rs
   - crates/rskim-bench/src/scoreboard/metrics.rs
   - crates/rskim-bench/src/scoreboard/gate.rs
   - crates/rskim-bench/src/scoreboard/baseline.rs
   - crates/rskim-bench/src/scoreboard/golden.rs
-  - crates/rskim-bench/src/scoreboard/oracle.rs
-  - crates/rskim-bench/src/scoreboard/universe.rs
-  - crates/rskim-bench/src/scoreboard/report.rs
-  - crates/rskim-bench/src/scoreboard/types.rs
-  - crates/rskim-bench/src/scoreboard/corpus.rs
-  - crates/rskim-bench/src/bin/scoreboard.rs
-  - crates/rskim-bench/scoreboard/README.md
+  - crates/rskim-bench/src/scoreboard/golden_gen.rs
+  - crates/rskim-bench/src/scoreboard/catalog.rs
+  - crates/rskim-bench/src/scoreboard/structural_metrics.rs
+  - crates/rskim-oracle/src/structural.rs
+  - crates/rskim-oracle/tests/independence.rs
   - crates/rskim-bench/scoreboard/known_failures.toml
-  - crates/rskim-bench/scoreboard/corpora.toml
-  - crates/rskim-bench/tests/scoreboard.rs
   - crates/rskim-research/src/clone.rs
   - .github/workflows/ci.yml
 created: 2026-09-25
-updated: 2026-09-25
+updated: 2026-09-28
 ---
 
-# Search scoreboard (end-to-end retrieval quality gate)
+# Search scoreboard (quality gate) incl. the structural oracle
 
 ## Overview
 
-The scoreboard (#203, PR #560) is the **required merge gate for search PRs**. It is the `Search Scoreboard` job in
-`.github/workflows/ci.yml`. It runs the **release `skim` binary as a subprocess**, the same way an agent does,
-against four pinned full-history corpora (skim `b8a0a79`, ripgrep, flask, zod). It checks every answer against
-oracles that share no code with skim's search stack, and it compares ranking with naive baselines. It replaced the
-manual ADR-007 dog-food campaign as the standing gate. Manual dog-food is still required only where the scoreboard
-cannot see: AST structural precision/recall (#541), the temporal arms against `git log` (#542), and any new
-query flag or arm that has no golden entries yet.
+The scoreboard (#203, PR #560; structural oracle #541, PR #574) is the **required merge gate for search PRs**, the
+`Search Scoreboard` job in `.github/workflows/ci.yml`. It runs the **release `skim` binary as a subprocess** against
+four pinned full-history corpora (skim `b8a0a79`, never the live tree; ripgrep, flask, zod), checks every answer
+against oracles that share no code with skim's search stack, and compares ranking with naive baselines. It replaced
+the manual SEARCH-ADR-007 dog-food campaign as the standing gate; manual dog-food remains only where it is blind:
 
-The user-facing runbook is `crates/rskim-bench/scoreboard/README.md`. This file covers what the README does not
-spell out: how the pieces couple, which invariants are enforced where, and the traps. Most of them were found the
-hard way during #203.
+- `--ast` patterns with no structural score (`uncovered_patterns`, full run): `deep-nesting`, `java-synchronized`,
+  `ruby-begin-rescue` have no query; the four `go-*` patterns have one but no corpus Go file where the oracle or
+  skim finds a match, so no entry;
+- `--ast` rows no entry scores (a language with no oracle grammar, or an oracle language with no entry for that
+  pattern): counted in `structural.unscored_rows.<pattern>`, never judged;
+- containment (`a > b`) and compound `--ast` queries: only `[[prefix]]` / `[[pagination]]` self-consistency checks;
+- occurrence- and line-level structural precision (scoring is per file), and ratchet-class structural precision;
+- the temporal arms against `git log` (#542), and any new query flag or arm without golden entries.
+
+The runbook is `crates/rskim-bench/scoreboard/README.md`; this file covers what it does not spell out: how the pieces
+couple across the two crates, which invariant is enforced where, and the traps found in #203 and the #574 review.
 
 ## Business Context
 
-- **Why it exists.** Dog-food rounds produce only negative evidence and never a "done" signal. The old reader-API
-  `rskim-bench` harness scored a different file universe and bypassed the verify gate, anchors and pagination. The
-  scoreboard measures what the shipped CLI actually returns (ADR-007 amendment, 2026-09-25).
-- **What "passing" means.** `scoreboard check` passes when every HARD outcome is PASS or ledgered XFAIL, and
-  nothing differs from the blessed `baseline.json`. That covers RATCHET values, HARD states, corpus pins, golden
-  hashes and the corpus set. It does **not** mean skim beats the baselines. The "beats baseline" column is INFO.
-  The committed baseline has skim *losing* some comparisons, for example aggregate `bytes.text_median` 2177 vs
-  simulated rg 1573, and `concept.p5` 0.8538 vs occurrence-count 0.9.
-- **Ratchets, not targets.** RATCHET values are compared with blessed *measured* values. The "bar" column is not
-  compared (applies ADR-003: grounded regression guards instead of aspirational targets). Golden data is declared
-  before anyone looks at skim's output, and it is never regenerated in CI.
-- **A green scoreboard is not merge authorization.** Report the verdict and stop. The user asks for the merge
-  (ADR-005).
+- **Why it exists.** Dog-food rounds give only negative evidence, never "done". The old reader-API harness scored a
+  different universe and bypassed the verify gate, anchors and pagination; this measures what the shipped CLI returns.
+- **What "passing" means.** Every HARD outcome is PASS or ledgered XFAIL and nothing differs from the blessed
+  `baseline.json` (RATCHET values, HARD states, pins, golden digests, corpus set). It does **not** mean skim beats the
+  baselines ("beats baseline" is INFO; the baseline has skim *losing* aggregate `bytes.text_median` 2177 vs simulated
+  rg 1573 and `concept.p5` 0.8538 vs occurrence-count 0.9).
+- **Ratchets, not targets** (applies SEARCH-ADR-003): RATCHET values compare with blessed *measured* values, never
+  the "bar" column. Golden data is declared before anyone looks at skim's output and never regenerated in CI.
+- **Green is not merge authorization** (SEARCH-ADR-005), except its 2026-09-26 amendment: #540 phase PRs merge once
+  reviewed, comments resolved and CI (Search Scoreboard included) green, and only within that scope.
 
 ## Core Business Rules
 
@@ -66,83 +64,80 @@ hard way during #203.
 
 | Class | Scope | Tolerance | Where defined |
 |---|---|---|---|
-| HARD | per golden entry × check (`CheckId::ALL`, 11 checks) | 0; only a ledger entry excuses a failure | `types.rs` `CheckId`, `metrics.rs` `PlannedQuery::runs` |
-| RATCHET | per corpus + aggregate | exact after `round4`; `bytes.text_*` / `bytes.*first_correct_median` / `bytes.rg_*` are ±3% **relative to the baseline value** | `metrics.rs` `RATCHET_METRICS`, `compare_ratchet` |
+| HARD | golden entry × check (`CheckId::ALL`, 14 checks) | 0; only a ledger entry excuses a failure | `types.rs` `CheckId`, `metrics.rs` `PlannedQuery::runs` |
+| RATCHET | per corpus + aggregate | exact after `round4`; `bytes.text_*` / `bytes.*first_correct_median` / `bytes.rg_*` ±3% **relative to the baseline value** | `metrics.rs` `RATCHET_METRICS`, `ORACLE_LESS_ROWS_DEF`, `STRUCTURAL_FAMILIES`, `compare_ratchet` |
 | INFO | latency, `unindexed_hits`, per-reason skip breakdown, beats-baseline | never gated | `report.rs` |
 
 Which HARD checks run on an entry is decided in one place, `PlannedQuery::runs`:
 
-- recall / precision / `silent_fn` need an oracle. There is none for `--ast`, `--blast-radius`, or a standalone
-  temporal run.
-- `verify_mode` needs a text query.
-- `pagination.*` runs only on `[[pagination]]` entries, and `order.prefix_consistent` only on `[[prefix]]` entries.
-- `order.score_monotone` is skipped when a temporal sort or `--blast-radius` overrides the rank.
-- `results.unique_paths` runs on every entry, within each single list. The same path on two different pages is
-  `pagination.disjoint`.
+- `lexical.*` recall / precision / `silent_fn` need the lexical oracle (none for `--ast`, `--blast-radius` or a
+  standalone temporal run); `lexical.verify_mode` needs a text query.
+- `structural.recall` / `.coverage` run on every `[[ast]]` entry, `structural.precision` only on `precision = "hard"`
+  ones (a `ratchet` entry records `structural.precision.<id>` instead).
+- `pagination.*` only on `[[pagination]]`, `order.prefix_consistent` only on `[[prefix]]` entries.
+- `order.score_monotone` is skipped on `[[ast]]` entries (standalone `--ast` is path-ordered, #547) and when a
+  temporal sort or `--blast-radius` overrides the rank. `results.unique_paths` runs on every entry, within each list.
 
-Pagination and prefix checks compare skim with **its own full list** (`--limit 1_000_000`), not with the oracle.
-That is why oracle-less entries can still be pagination entries.
-
-`lexical.silent_fn` fails only when a ground-truth file is missing **and** `degraded[]` is empty. A miss that skim
-discloses counts against recall, not against `silent_fn`.
+Pagination and prefix checks compare skim with **its own full list** (`--limit 1_000_000`), so oracle-less entries
+can be pagination entries. `lexical.silent_fn` fails only when a ground-truth file is missing **and** `degraded[]`
+is empty; a disclosed miss counts against recall only.
 
 ### Ledger (`known_failures.toml`)
 
-- Each `[[xfail]]` entry names `issue = "#<digits>"`, which must be a filed ticket (`is_issue_ref` rejects
-  placeholders and leading zeros), plus one dotted `check` and the exact failing `ids` copied from `report.json`.
-  A `(check, id)` pair may appear only once.
-- Ids map to a corpus by the **longest** `<corpus>-` prefix (`gate::corpus_of`). An id that belongs to no corpus
-  is a harness error when `Inputs::load` runs. So is an id missing from the golden set, or a check that never runs
-  on that entry (for example `order.score_monotone` on a `--hot` entry): see `golden::check_ledger` and
-  `gate::unplanned_ledger_refs`. A stale entry therefore cannot silently XFAIL nothing.
-- The current ledger is seeded from the first real run and covers #544 (multi-word pagination pool cut before
-  verification), #545 (text / `--ast` `--hot` re-sorts only a 100-row `resort_window`) and #547 (standalone
-  `--ast` in path order, not score order).
+- Each `[[xfail]]` names `issue = "#<digits>"` (a filed ticket; `is_issue_ref` rejects placeholders and leading
+  zeros), one dotted `check` and the exact failing `ids` from `report.json`. A `(check, id)` pair appears once.
+- Ids map to a corpus by the **longest** `<corpus>-` prefix (`gate::corpus_of`). An id in no corpus, an id missing
+  from golden, or a check that never runs on that entry (`order.score_monotone` on `--hot`, `structural.precision` on
+  a `ratchet` entry) is exit 2 (`golden::check_ledger` via `CheckId::applies_to`, `gate::unplanned_ledger_refs`).
+
+| Ticket | Ledgered check: ids | skim root cause | What fixing it requires |
+|---|---|---|---|
+| #544 | `pagination.complete` / `.ordered` / `.has_more_honest` on multi-word G-ids | candidate pool cut before verification (`cmd/search/query.rs`) | offset/limit applied to verified rows only; promote |
+| #545 | pagination checks on `skim-G007`, `zod-G006`; `order.prefix_consistent` F-ids | `--hot` re-sorts only a 100-row `resort_window` (`temporal.rs`) | full-list temporal re-sort; promote |
+| #547 | `order.score_monotone` on the four `<corpus>-F003` | `search_ast` returns FileId (path) order (`ast.rs`) | sort standalone `--ast` by score; promote |
+| #546 | `structural.precision` on `skim-ast-try-catch-finally-javascript` (a false-positive guard) | two independent edges declared, the verify gate accepts either (`patterns.rs`, `compound/reparse.rs`) | one `try_statement` must carry both clauses; XPASS: remove the ledger entry, **keep** the golden guard, bless (no reason) |
+| #571 | `structural.recall` on `zod-ast-try-catch-tsx`, `zod-ast-unhandled-result-tsx` | `.tsx` → `Language::TypeScript` → `LANGUAGE_TYPESCRIPT` (`rskim-core/src/types.rs`); JSX makes `_og.tsx` an ERROR root | skim parses `.tsx` with `LANGUAGE_TSX`; both XPASS; other `*-tsx` ratchets may move (a drop needs a reason) |
+| #572 | `structural.precision` on `ripgrep-ast-empty-function-rust` | `is_counted_child` drops `self` (in `PUNCTUATION_KIND_IDS`), so `{ self }` counts as empty (`ast_index/structural.rs`) | count the tail expression as a body element, as the oracle does; promote |
+
+"Promote" is lifecycle 1 below: remove the ids, then bless `xfail -> pass` (no reason needed).
 
 ### Bless rules (`baseline.rs::bless`, pure)
 
-`bless` refuses (exit 1) in these cases:
-
-- a partial `--only` report (`complete: false`);
-- a report whose per-corpus golden SHA-256 differs from the golden file on disk;
-- any FAIL or XPASS record;
-- any RATCHET regression or HARD downgrade without a non-blank `--accept-regression "<reason>"`.
-
-HARD downgrades are `pass -> xfail`, `<blessed> -> not run` (a removed entry or check), and a blessed corpus that
-is no longer run. The reason, with every accepted line, is appended to `accepted_regressions[]`. Existing entries
-are carried forward and never dropped. `--accept-regression` with nothing to accept is ignored, with a note.
+`bless` refuses (exit 1) a partial `--only` report; a report whose per-corpus golden digest differs from what this
+scoreboard computes for the files on disk (`golden_hashes_on_disk`, oracle fingerprint folded in); any FAIL or XPASS;
+and any RATCHET regression or HARD downgrade (`pass -> xfail`, `<blessed> -> not run`, a blessed corpus no longer
+run) without a non-blank `--accept-regression "<reason>"`. Reasons and accepted lines append to
+`accepted_regressions[]` (carried forward, never dropped); a needless `--accept-regression` is ignored with a note.
 
 | RATCHET movement (`compare_ratchet`) | `check` | `bless` |
 |---|---|---|
 | within tolerance | ok | n/a |
 | Improved | FAIL "bless required" | no reason needed |
 | Regressed (bad direction) | FAIL | needs `--accept-regression` |
-| Changed (a Neutral reference column, or a ZeroBest value that flips sign at equal magnitude) | FAIL | no reason needed |
-| new metric / no longer measured | FAIL | no reason needed (`regressions()` compares only metrics present on both sides) |
+| Changed: a Neutral value (reference columns, `structural.unscored_rows.<pattern>`), or a ZeroBest sign flip | FAIL | no reason needed |
+| new metric / no longer measured | FAIL | no reason needed (`regressions()` compares only shared metrics) |
 
-`universe.delta` and `universe.skipped_by_reason_mismatch` are **RATCHETs** (ZeroBest, exact, bar "= 0"), not
-HARD checks. Moving away from 0 is a regression, so it can only be blessed with a reason. In practice, fix the
-mismatch instead (ADR-008: skim indexes walked ∪ tracked, and the oracle must reproduce that universe
-independently).
+`universe.delta` and `universe.skipped_by_reason_mismatch` are RATCHETs (ZeroBest, exact, bar "= 0"), so leaving 0
+needs a reason. Fix the mismatch instead (SEARCH-ADR-008: the oracle reproduces walked ∪ tracked independently).
 
 ### Oracle independence
 
-Nothing on the scoring path may import skim's search code (`rskim_search::query_substring_present`, an
-`rskim-search` tokenizer, `rskim_core::Language`). Where the oracle must agree with skim, it keeps **its own
-copy** with a citation, so that a policy change on skim's side shows up as a scoreboard diff instead of flowing
-through silently:
+Nothing on the scoring path may import skim's search code (`rskim_search::query_substring_present`, a tokenizer,
+`rskim_core::Language`, the AST search stack). Where an oracle must agree with skim it keeps **its own cited copy**,
+so a policy change on skim's side shows up as a scoreboard diff instead of flowing through silently:
 
-- `oracle.rs` `LANGS`: the extension allow-list and `--lang` names, a copy of `Language::from_extension` and
-  `parse_lang_value`;
-- `oracle.rs`: its own `is_word_byte`;
+- `oracle.rs`: `LANGS` (a copy of `Language::from_extension` / `parse_lang_value`) and its own `is_word_byte`;
 - `universe.rs`: `MAX_FILE_BYTES` (5 MiB), the `MINIFY_*` gate, `SERDE_EXTENSIONS`, the hidden-component rule,
-  `MAX_INDEXED_FILES` (50 000), and the producer-phase skip labels that must equal skim's
-  `PersistedSkipReason::label()`.
+  `MAX_INDEXED_FILES` (50 000), skip labels equal to `PersistedSkipReason::label()`;
+- `rskim-oracle` `structural.rs`: `EXT_CLASSES` (skim's extension table × the languages skim AST-indexes × the
+  grammar table), `UNKNOWN_EXTENSION`, and `AST_SIZE_CAP_BYTES` (1 MiB, **inclusive**: skim excludes only `len > cap`).
+  `oracle::tests::langs_agree_with_the_structural_oracles_extension_table` keeps `EXT_CLASSES` and `LANGS` naming the
+  same extensions the same way, except `.tsx` (`tsx` structurally, `typescript` in `LANGS`).
 
-This is **convention only**. `rskim-bench` depends on `rskim-search` and `rskim-core` (for the BM25F bench and
-`golden_gen`), so a forbidden import would compile. `golden_gen.rs` is the one sanctioned user: it passes
-`rskim_core::Language` / `SearchField` only as the symbol extractor's dispatch key, and it only *proposes* entries
-for human review.
+Independence holds at two strengths: **compile time** for `rskim-oracle` (below), **convention** for everything in
+`rskim-bench` (`oracle.rs`, `universe.rs`, `metrics.rs`, `structural_metrics.rs`), whose crate depends on
+`rskim-search` / `rskim-core`, so a forbidden import would compile. Two bench modules read skim on purpose and score
+nothing: `catalog.rs` (the one catalog read) and `golden_gen.rs` (`rskim_core::Language` only as a dispatch key).
 
 ## State Transitions
 
@@ -155,111 +150,224 @@ HARD outcome classification (`gate::classify`) happens before the baseline compa
 | fail | no | FAIL (Unledgered) | fails | no |
 | pass | yes | XPASS | fails: "promote" | no |
 
-The baseline stores only `pass` / `xfail` per `(id, check)`. Any change, including `new -> pass`, fails the gate
-with "bless required" (`hard_state_changes`).
+The baseline stores only `pass` / `xfail` per `(id, check)`; any change, `new -> pass` included, is "bless required".
 
-**Lifecycles you will actually hit:**
-
-1. **You fixed a ledgered bug.** CI shows XPASS. Remove the ids (or the whole entry) from `known_failures.toml`
-   and push. CI then shows `xfail -> pass; bless required`. Bless from that run's `scoreboard-report` artifact,
-   commit `baseline.json`, and push again. That is two CI rounds. You can also do it locally in one push:
-   `scoreboard run --out <dir>` and then `bless --from <dir>/report.json`.
-2. **You found a real bug you will not fix in this PR.** File the ticket first. Add an `[[xfail]]` entry with that
-   number and the exact ids. Re-bless with `--accept-regression "<reason>"`, because `pass -> xfail` is a
-   downgrade.
-3. **You added a HARD check or golden entries.** Every entry reports `new -> pass`, and the golden hash changes.
-   Bless, with no reason needed. Example: adding `results.unique_paths` blessed 260 new records (71/64/63/62) in
-   960b763.
-4. **You removed a golden entry.** Its checks go `-> not run`, a HARD downgrade that needs `--accept-regression`.
-   Its `oracle_less.full_rows.<id>` value (if any) goes "no longer measured".
-5. **You bumped a corpus pin.** Update `corpora.toml` and the golden `commit` together, and re-verify every
-   `def.line` (drift is exit 2). The CI corpus cache key is `hashFiles(corpora.toml)`, so CI does a fresh clone.
-   Refresh the ledger ids from the new `report.json`, then bless.
+1. **You fixed a ledgered bug.** XPASS. Remove the ids (or entry) and push; CI shows `xfail -> pass; bless
+   required`; bless from that run's `scoreboard-report` artifact and push `baseline.json` (or locally in one push:
+   `scoreboard run --out <dir>`, then `bless --from <dir>/report.json`).
+2. **A real bug you will not fix here.** File the ticket, add an `[[xfail]]` with the exact ids, re-bless with
+   `--accept-regression "<reason>"` (`pass -> xfail` is a downgrade).
+3. **You added a HARD check or golden entries.** `new -> pass` / `new -> xfail` plus a digest change: bless, no
+   reason. New `[[ast]]` entries also shrink the `structural.unscored_rows.<pattern>` they now score (neutral).
+4. **You removed a golden entry** (e.g. an `[[ast]]` entry a pin bump made vacuous). Its checks go `-> not run`, a
+   downgrade: remove its ledger ids too, bless with `--accept-regression`.
+5. **You bumped a corpus pin.** Update `corpora.toml` and the golden `commit` together, re-verify every `def.line`
+   (drift is exit 2); CI re-clones (cache key `hashFiles(corpora.toml)`). Refresh ledger ids from the new
+   `report.json`, confirm each `expect_oracle_empty` guard's oracle is still empty, bless.
 
 ## Technical Implementation Patterns
 
 ### Per-corpus pipeline (`pipeline::run_corpus`, in order)
 
-1. `materialize_verified`: clone or reuse at the pin, then require `PinnedCloneState::Reusable`.
-2. `Universe::compute` (the oracle's universe, with git isolated under the sandbox HOME), then `check_file_cap`.
-3. `checked_plan`: golden integrity plus ledger refs, then `metrics::plan`. Any problem is exit 2.
-4. `runner.build` (`skim search --build`, must exit 0), then `runner.stats`, then `require_temporal_data`.
-5. `runner.observe` for each entry, then `require_oracle_less_rows`.
-6. `verify_untouched`: the clone must still be `Reusable`. `git status --porcelain --untracked-files=all
-   --ignored` catches anything skim wrote into the corpus root, even gitignored files.
-7. `metrics::evaluate`, then `gate::apply_ledger`, then the report. The aggregate RATCHET values and
-   `gate::evaluate` run after all corpora.
+`pipeline::run` compiles one `StructuralOracle` per run, only if some golden file has `[[ast]]` entries. Per corpus:
+
+1. `materialize_verified` (clone or reuse at the pin, require `Reusable`); `Universe::compute` + `check_file_cap`.
+2. `checked_plan`: golden integrity (catalog-aware for `[[ast]]`) plus ledger refs, then `metrics::plan`.
+3. `structural_answers` (only with `[[ast]]` entries): the timed oracle pass, then `require_expected_empty_oracles`,
+   **before skim runs** (it needs only the oracle).
+4. `runner.build` (`--build` must exit 0), `runner.stats`, `require_temporal_data`.
+5. `observe_plan`: one `--ast <pattern>` full-list call per catalog pattern (`call_patterns`), then every other
+   entry's calls; an `[[ast]]` entry makes no call of its own (it is its pattern call's rows in its language). Then
+   `require_oracle_less_rows` and `require_non_vacuous_structural`.
+6. `verify_untouched`: `git status --porcelain --untracked-files=all --ignored` must be clean (skim wrote nothing).
+7. `metrics::evaluate`, `gate::apply_ledger`, the report; aggregate RATCHET values and `gate::evaluate` run last.
 
 ### Runner contract (`runner.rs`)
 
-- **Argument shape.** `search --root <clone> --json --limit N [--offset K] <flags> [-- <query>]`. Every flag goes
-  before `--` and the query always after it, so queries like `-D warnings` and `->` parse as text. `--offset` is
-  emitted only when K > 0.
-- **Sandbox.** There is one fresh temp `HOME` per run (`SkimSandbox`). It redirects `SKIM_CACHE_DIR`, every
-  agent config dir and `SKIM_WRAPPERS_DIR`. It sets `SKIM_DISABLE_ANALYTICS=1` and `NO_COLOR=1`, and it strips
-  `SKIM_PASSTHROUGH` / `SKIM_DEBUG` / hook and session variables. The oracle's `git ls-files` shares the same
-  `GitIsolation` (the same `HOME`, `GIT_CONFIG_NOSYSTEM=1`), so global excludes cannot differ between the two
-  sides.
-- **Exit handling.** A non-zero exit whose stdout parses as the arm's envelope is accepted (so a future no-match
-  exit code does not read as a crash). A signal, non-JSON stdout or a malformed envelope is a harness error.
-- **Byte metrics** come from a separate **text-mode** run at the default limit (what an agent reads), counting
-  **stdout + stderr**, with every `in <N>ms` normalized to `in 0ms`.
+- `search --root <clone> --json --limit N [--offset K] <flags> [-- <query>]`: flags before `--`, the query after, so
+  `-D warnings` and `->` parse as text. One temp `HOME` per run (`SkimSandbox`) redirects `SKIM_CACHE_DIR`, agent
+  config dirs and `SKIM_WRAPPERS_DIR`, sets `SKIM_DISABLE_ANALYTICS=1` / `NO_COLOR=1`, strips `SKIM_PASSTHROUGH` /
+  `SKIM_DEBUG` / hook and session vars; the oracle's `git ls-files` shares its `GitIsolation`.
+- A non-zero exit whose stdout parses as the arm's envelope is accepted; a signal, non-JSON or malformed envelope is a
+  harness error, and so is an `ast_list` full list reporting `has_more`.
+- Byte metrics come from a separate **text-mode** run at the default limit, counting **stdout + stderr**, with every
+  `in <N>ms` normalized to `in 0ms`.
 
 ### Subprocess timeouts kill the whole process group (`clone.rs`)
 
-Every subprocess the scoreboard starts goes through `rskim_research::clone::git_output_with_timeout`: skim calls
-(120 s, `SKIM_TIMEOUT_SECS`), network git (300 s), local git (120 s) and `ls-files` (120 s). Before 6129a36, only
-the direct child was killed. A grandchild that inherited the pipes kept `wait_with_output` blocked: a 120 s timeout
-returned after 179 s. The fix, as it exists now:
+Every subprocess goes through `rskim_research::clone::git_output_with_timeout` (skim calls 120 s /
+`SKIM_TIMEOUT_SECS`, network git 300 s, local git and `ls-files` 120 s). Killing only the direct child is not enough:
+a grandchild holding the pipes keeps `wait_with_output` blocked (a 120 s timeout once returned after 179 s, 6129a36).
+`spawn_in_own_group` sets `process_group(0)`; on the deadline `kill_process_tree` sends SIGKILL to `-pid` then
+`pid` (`taskkill /T` off-unix), and the wait thread is joined only if it finishes within `KILL_GRACE` (2 s),
+otherwise detached, so nothing blocks past timeout + 2 s. Reuse `git_output_with_timeout` / `git_run_with_timeout`
+for any new subprocess; the error reports the elapsed time actually taken.
+
+### The `rskim-oracle` crate (#541 AC-3)
+
+The structural oracle is its own crate so that its independence is a **compile-time** fact: `rskim-bench` must
+depend on `rskim-search` (catalog read, `golden_gen`, BM25F bench), so no compiler can enforce an import rule there. `crates/rskim-oracle/tests/independence.rs` checks:
+
+- every entry of every dependency table (`[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, and their
+  `[target.<cfg>.*]` forms; `workspace = true` resolved through `[workspace.dependencies]`) is a registry crate on
+  `ALLOWED`: `tree-sitter`, the five grammars (rust, python, typescript, javascript, go), `anyhow`, `rayon`,
+  `serde`, `sha2`, `toml`;
+- a `rskim-*` crate fails with its own message however named (a `package =` rename included), as does any `path` /
+  `git` source (a local crate could be skim's code under another name);
+- no `build.rs` / `package.build`, and no file under `src/`, `tests/`, `benches/`, `examples/` contains `include!(`
+  or a `#[path = "…"]` leaving its directory (`..` or absolute). It is a text scan: a comment spelling either fails
+  too. `include_str!` of the `.scm` data is allowed.
+
+The crate never sees skim's catalog: it knows its registry by pattern **name** (`QUERIES`, `UNCOVERED`, `INTENTS`,
+`coverage_of`), and `rskim-bench` crosses the two.
+
+### Queries, grammars and the answer model (`structural.rs`)
+
+- One hand-written query per (pattern, language), `queries/<pattern>.<lang>.scm` (53 files, 26 patterns),
+  `include_str!`ed by `oracle_query!` into `QUERIES`, sorted by pattern then language. Each encodes the catalog
+  **description**, not skim's n-grams, and captures one `@match` whose first line (1-based) is the match line.
+  `StructuralOracle::new` fails on a query that does not compile, lacks `@match` or its filter capture, or repeats a pair.
+- **Line 2 names the grammar**: `; Grammar: <crate> <version>.`, with ` (LANGUAGE_TYPESCRIPT)` / ` (LANGUAGE_TSX)`
+  before the full stop for `tree-sitter-typescript`, and no other `; Grammar:` line.
+  `every_query_names_the_grammar_version_cargo_lock_resolves` compares it with this crate's `Cargo.lock` entry: a
+  grammar bump fails until the headers are edited, and that edit moves the digest (bless).
+- Six `OracleLang`s; `Tsx` is separate because the oracle parses `.tsx` with `LANGUAGE_TSX` (SEARCH-ADR-007: an
+  independent oracle uses the real grammar), which is exactly what #571 ledgers.
+- `PostFilter` on six queries: `Empty` (`empty-catch` ×3, `empty-function`), `AtLeast` 20 (`god-function`) and 5
+  (`excessive-params`). It counts **body elements**: named, non-extra (comments are extras), non-`ATTRIBUTE_KINDS`
+  children, so a Rust tail expression counts (the #572 difference).
+- **Intent oracles** (`INTENTS`: TS/TSX/JS `nested-loop`, `rust-nested-loop`): a loop with a loop ancestor inside the
+  same function; functions, arrows and closures are boundaries. `nested_loop_lines` is **one pre-order `TreeCursor`
+  pass** carrying "inside a loop of this function" on a stack, bounded by `descendant_count`. A `Node::parent`
+  ancestor walk re-descends from the root, quadratic in depth (a 3,000-arm `else if` chain: >120 s vs about 1 s); it
+  survives only as the reference of the differential test `the_intent_answer_agrees_with_the_ancestor_walk`.
+- Files with syntax errors are queried, not skipped (skim's walk visits error nodes too); only "no tree" is an error.
+  `file_matches` returns `NotScored(LangClass)`, `OverSizeCap(lang)` or `Scored(FileReport)` (every pattern's and
+  intent's lines for that language, from **one parse**).
+
+### `OracleScratch` and `ORACLE_MATCH_LIMIT`
+
+`OracleAnswers::compute` is rayon-parallel with `map_init(OracleScratch::new, …)`: one parser and one `QueryCursor`
+per worker, reused file to file (the compiled oracle is shared; `Query` is `Send + Sync`). The cursor holds at most
+`ORACLE_MATCH_LIMIT` = 4096 in-progress matches (tree-sitter's contract is `1..=65536`; unlimited, its `u16`
+capture-list ids wrap past 65,535); the corpora never need more than 3 over 1,181 scored files. Past the limit
+tree-sitter **drops** matches, so `did_exceed_match_limit()` is a harness error naming the `.scm`. The limit is **set
+once, when the scratch is made**: tree-sitter caps how many capture lists the pool allocates and reuses freed ones
+first, so lowering it on a used cursor would not bind (`with_match_limit` is `#[cfg(test)]`, forcing the error path
+with 1). With several failing files, `first_failure_by_path` reports the first by path, independent of scheduling.
+
+### The fingerprint and the golden digest
+
+`structural::fingerprint()` is the `Display` of `OracleInputs`: the size cap, every `EXT_CLASSES` row and
+`UNKNOWN_EXTENSION`, `ATTRIBUTE_KINDS`, every query (file name, post-filter, byte length, full text; sorted, so
+registry order is not an input) and every `IntentSpec`, written explicitly (never `Debug`, so toolchain-stable) and
+naming files, not directories. `rskim-bench` folds its hash into each golden file's digest:
 
 ```rust
-// clone.rs — every timed child leads its own process group (unix)
-fn spawn_in_own_group(cmd: &mut Command, label: &str) -> anyhow::Result<Child> {
-    #[cfg(unix)]
-    { use std::os::unix::process::CommandExt; cmd.process_group(0); } // pgid = child pid
-    cmd.spawn().with_context(|| format!("spawning {label}"))
-}
-
-// run_with_timeout, on the deadline:
-kill_process_tree(child_id);            // libc::kill(-pid, SIGKILL) then kill(pid, SIGKILL); taskkill /T off-unix
-if rx.recv_timeout(KILL_GRACE).is_ok() { // KILL_GRACE = 2 s
-    let _ = handle.join();              // join only a finished wait thread...
-}                                       // ...otherwise detach it: never block past timeout + 2 s
+// golden.rs load_golden — only a golden file with [[ast]] entries folds the oracle in
+let oracle = (!file.asts.is_empty()).then(structural_oracle_sha256); // hex sha256 of fingerprint()
+let sha256 = golden_digest(raw.as_bytes(), oracle.as_deref());
+// golden_digest(raw, Some(o)) = sha256(raw ‖ "\0structural-oracle\0" ‖ o);  None → sha256(raw)
 ```
 
-- Reuse `git_output_with_timeout` / `git_run_with_timeout` for any new subprocess. Never call `Child::kill` on
-  the direct child and then `join` unconditionally.
-- The error text reports the elapsed time it actually took, not only the configured bound.
+All four golden files carry `[[ast]]` entries, so **any** oracle-input edit moves all four `golden_sha256` values:
+`check` prints `corpus <c>: golden file or structural-oracle fingerprint changed; bless required`, and `bless`
+refuses a report made with other oracle inputs. Deliberately **excluded**: `MATCH_CAPTURE` (a query without `@match`
+fails to compile into the oracle), `ORACLE_MATCH_LIMIT` (it can turn an answer into an error, never change one) and
+grammar versions (carried by the headers). The `any_*_edit_changes_the_fingerprint` tests prove each input moves it
+alone, via a helper that destructures `OracleInputs` without `..`: a new input fails to compile until tested.
+
+### Catalog injection (`catalog.rs`)
+
+`catalog::skim_catalog()` is the **only** reader of `rskim_search::all_patterns()`. It projects each pattern to
+`CatalogPattern { name, exact, example }`, dropping the n-gram tables that encode how skim matches (AC-3), and is
+called once by `Inputs::load` and once by `golden-gen --ast`, which pass the slice to integrity, the call set and
+`uncovered_patterns`; `catalog_coverage` crosses names with `coverage_of`. `exact` only seeds the class `golden-gen`
+proposes. `example` only feeds `catalog_tests.rs` (in `rskim-bench`, because only it may see the catalog): every
+registered query must match its catalog example (or a hand-written positive) on the expected lines and reject a
+near-miss, and every catalog pattern must be covered or listed in `UNCOVERED` with a reason. A pattern newer than the
+oracle reads `UNCLASSIFIED_REASON` and fails; `uncovered_patterns_are_the_three_that_cannot_be_encoded` pins the list.
+
+### Golden `[[ast]]` entries and scoring (`structural_metrics.rs`)
+
+- 53 entries (skim 23, zod 18, ripgrep 9, flask 3), id `<corpus>-ast-<pattern>-<lang>`, at most one per
+  (pattern, language). `precision` (`hard` | `ratchet`) is frozen in golden; the gate never re-reads `exact`.
+- A corpus with any `[[ast]]` entry calls skim for **every** catalog pattern (29 × 4 = 116 calls). Rows split by
+  `structural::classify` (`.tsx` is its own language); every row no entry scores lands in
+  `structural.unscored_rows.<pattern>`, emitted for every called pattern, 0 included. Calling only entry patterns
+  would silently drop rows (e.g. skim's god-function / excessive-params rows on flask and zod).
+- **HARD**: `structural.recall` (every oracle file returned); `structural.precision` (`hard`: every returned file
+  matches); `structural.coverage` (`ast_coverage.size_excluded_files` equals the oracle's `over_cap_count` over
+  size-capped classes, Bash included, JSON/YAML/TOML/unknown not, and `undetermined_files` is 0); plus
+  `results.unique_paths`. Coverage is corpus-wide but recorded **per `[[ast]]` id** (every HARD record, ledger ref and
+  baseline state is keyed by a golden id): ledgering it needs every `[[ast]]` id of the corpus, and a new entry fails
+  until ledgered too.
+- **RATCHET** (`STRUCTURAL_FAMILIES`, all exact): `structural.precision.<id>` (`ratchet` class),
+  `.line_on_match.<id>`, `.intent_recall.<id>` / `.intent_precision.<id>` (nested-loop entries) are HigherBetter;
+  `structural.unscored_rows.<pattern>` is **Neutral** (summed over corpora in the aggregate): any move fails `check`,
+  `bless` needs no reason, since no oracle judges those rows.
+- `line_on_match` reads low by design: skim anchors on the child completing an edge (`catch_clause`, `class_body`),
+  the oracle on the construct; try-*, class-method and impl-method read 0.
+- **Vacuity** (`is_vacuous`, exit 2 in `require_non_vacuous_structural`): oracle and skim both empty in the entry's
+  language. A **false-positive guard** (`expect_oracle_empty = true`) is exempt, since skim returning nothing is the
+  fixed state it guards (recall and precision read 1 over an empty denominator; a returning row fails precision), but
+  is vacuous itself when `scored_files(lang) == 0`. A guard whose oracle matches is exit 2 before skim runs
+  (`require_expected_empty_oracles`), so the flag never hides recall. All share `golden integrity failed (N
+  problem(s)):` + one `<id>: <reason>` line each; the report marks guards (`<class>, FP guard` in `report.md`).
+- `OracleAnswers` pre-seeds **only registered** `(pattern, lang)` keys: absent means "no query" (an error in
+  `definition()`), empty means "no match" (avoids PF-016). Never seed other keys.
+
+### `golden-gen --ast`
+
+It runs the same oracle, builds skim in a sandbox HOME, and calls every catalog pattern through the gate's own loop
+(`pipeline::call_patterns`). `generate_ast` applies the gate's `is_vacuous` **twice** per covered pair (as an ordinary
+entry, then as proposed, `expect_oracle_empty` iff `oracle files 0`), so it never proposes an entry the gate refuses.
+Above the entries it prints `unscored_after` with every path through `comment_safe` (control characters, Unicode bidi
+controls U+202A–202E / U+2066–2069 and `\` become Rust escapes), so skim's output can neither end the TOML comment
+and forge an entry a reviewer pastes, nor reach the terminal as an escape sequence.
+
+### Cost, latency and the dev-profile optimisation
+
+CI builds the scoreboard in the **dev profile** (`target/debug/scoreboard`), so the root `Cargo.toml` sets
+`[profile.dev.package.tree-sitter] opt-level = 3` (`cc` follows it, so the C core is optimised too): the oracle pass
+takes 0.99 s over the four corpora (skim 635 ms, zod 203, ripgrep 130, flask 22), vs 5.12 s unoptimised, for ~4 s of compile.
+Grammar crates stay default (their lexers are ~7% of the pass). `report.json` `latency` (INFO, outside baseline and
+determinism) carries `structural_oracle_wall_ms` (absent without `[[ast]]`) and `pattern_calls_wall_ms` per pattern;
+`calls`, percentiles and `entries_wall_ms` cover the entries' own calls only, so runs stay comparable.
+
+### Adding a pattern query or an oracle language
+
+- **Query**: write `queries/<pattern>.<lang>.scm` (title, `; Grammar:` on line 2, the quoted description, one
+  `@match`); register it in sorted `QUERIES` (a disk ↔ registry test catches omissions); add a `PostFilter` only if
+  the description states a count; drop it from `UNCOVERED` (and the pinned-list test) if listed; add a positive +
+  near-miss fixture in `catalog_tests.rs`; `golden-gen --ast`; `check`; bless.
+- **Language**: grammar crate in root `[workspace.dependencies]`, `crates/rskim-oracle/Cargo.toml` **and** `ALLOWED`;
+  an `OracleLang` variant (`ALL`, `as_str`, `grammar`); its `EXT_CLASSES` row from `Unscored` to `Oracle` (`LANGS`
+  must still agree); a `grammar_crate` arm in `structural_tests.rs`; queries, entries, bless.
 
 ### Pinned full-history clones (`ensure_pinned_history_clone`)
 
-- The clone is full history (`--no-checkout`, no `--depth` / `--filter`) with a detached checkout. The temporal
-  layer needs real history, and `Shallow` is never reusable. If the pin is not reachable from the cloned refs,
-  the code runs `fetch origin <sha>` once. It re-clones **once**, and a second failure is an error (exit 2).
-- The deletion guard: a non-reusable destination is deleted only if it is empty or holds
-  `.git/skim-scoreboard-pinned-clone` (`OWNERSHIP_MARKER`). If `--corpus-dir` points at your own checkout, you
-  get an error, never a deletion.
-- Security arguments: `credential.helper=` and `transfer.fsckObjects=true`, with exactly one downgrade,
-  `fetch.fsck.zeroPaddedFilemode=ignore`. pallets/flask's history has `040000` tree modes (object `0b404df8…`),
-  and strict fsck rejects them. `hasDotgit` and every other check stay fatal.
-- Every pinned-clone git call scrubs `GIT_DIR` / `GIT_WORK_TREE` / … and sets `GIT_CEILING_DIRECTORIES` to the
-  destination's parent, so an empty directory never borrows an enclosing repo's HEAD.
+- Full history (`--no-checkout`, no `--depth` / `--filter`); `Shallow` is never reusable. An unreachable pin gets one
+  `fetch origin <sha>`; it re-clones **once**, then errors. A non-reusable destination is deleted only if empty or
+  holding `.git/skim-scoreboard-pinned-clone` (`OWNERSHIP_MARKER`), so a mis-set `--corpus-dir` errors, never deletes.
+- `credential.helper=`, `transfer.fsckObjects=true`, one downgrade `fetch.fsck.zeroPaddedFilemode=ignore` (flask's
+  `040000` tree modes, object `0b404df8…`); every call scrubs `GIT_DIR` / `GIT_WORK_TREE` / … and sets
+  `GIT_CEILING_DIRECTORIES` to the destination's parent.
 
 ### Determinism
 
-`report.json` is byte-identical across runs of the same binary except its last section, `latency`. The
-workspace `serde_json` has `preserve_order`, so every map in the report or baseline **must be a `BTreeMap`** (or a
-struct). Lists are sorted before they are stored, floats go through `round4`, and nothing records a timestamp,
-binary version or machine path. The committed baseline was blessed from a local macOS release run (960b763), and
-the #203 session observed it gating byte-identically on ubuntu CI. The README still says to bless from the CI
-artifact, because ubuntu is the platform that gates.
+`report.json` is byte-identical across runs of one binary except `latency`. The workspace `serde_json` has
+`preserve_order`, so every report / baseline map **must be a `BTreeMap`** (or a struct); lists are sorted, floats go
+through `round4`, nothing records a timestamp, version or machine path. The oracle is order-independent too
+(`BTreeMap` answers, sorted/deduped lines, path-ordered first failure). The baseline was blessed on macOS and gates
+byte-identically on ubuntu CI; still bless from the CI artifact, because ubuntu is the platform that gates.
 
 ### CI wiring: fail closed, never a green skip
 
-`changes` (**Detect Search Changes**) classifies the event. `workflow_dispatch` and pushes to `main` always run the
-gate. Pushes to `feature/*` and `wave/**` never run it (their PR run gates). An unknown event runs it (fail
-closed). On a PR, `git diff --name-only --no-renames -z HEAD^1 HEAD` on the merge commit (`fetch-depth: 2`) is
-matched against `SEARCH_PATHS`. `--no-renames` makes a file moved *out of* a search path still count (80ac691).
+`changes` (**Detect Search Changes**) always gates `workflow_dispatch` and pushes to `main`, never pushes to
+`feature/*` / `wave/**`, and fails closed on unknown events. On a PR, `git diff --name-only --no-renames -z HEAD^1
+HEAD` is matched against `SEARCH_PATHS` (which includes `crates/rskim-oracle/`); `--no-renames` counts a file moved
+*out of* a search path.
 
 ```yaml
 scoreboard:
@@ -273,140 +381,119 @@ scoreboard:
       run: exit 1                    # ...and its first step turns that into a red job instead of a skip
 ```
 
-- A job skipped by `if:` reports **success**, which is fine only for a PR that touches no search path. A broken
-  build must not turn a search PR green.
-- Build Check uploads `target/release/skim` as `skim-release` (1 day). The scoreboard downloads it to
-  `$RUNNER_TEMP` (never under `target/`, which is cached) and restores the exec bit. The scoreboard itself is
-  built **debug** (`target/debug/scoreboard`) under its own cache prefix, `cargo-build-scoreboard-`.
-- The corpora cache (`.bench-corpus/scoreboard`, about 115 MB) is saved only by a successful job, so a clone cut
-  off halfway is never cached. `report.md` goes to the step summary, and `report.json` + `report.md` go to the
-  `scoreboard-report` artifact (30 days). That artifact is what you bless from. The job timeout is 25 minutes.
+A job skipped by `if:` reports **success**, fine only outside the search paths. Build Check uploads its release
+`skim` as `skim-release` (downloaded to `$RUNNER_TEMP`, never the cached `target/`); the scoreboard build cache prefix
+is `cargo-build-scoreboard-`; the corpora cache is saved only by a successful job; `report.json` + `report.md` go to
+the `scoreboard-report` artifact (30 days), which is what you bless from. Timeout 25 minutes.
 
 ## Operating the Gate
-
-Run everything from the workspace root, because every default path is relative to it:
 
 ```bash
 cargo build --release -p rskim                   # ALWAYS first: the scoreboard tests whatever binary is at --skim-bin (PF-019)
 caffeinate -i -s cargo run -p rskim-bench --bin scoreboard -- check --skim-bin target/release/skim
-# reports: target/scoreboard/report.{json,md}   (--out to change)
+# reports: target/scoreboard/report.{json,md}   (--out to change); run from the workspace root
 cargo run -p rskim-bench --bin scoreboard -- bless --from target/scoreboard/report.json [--accept-regression "<why>"]
 ```
 
-- The first run clones the corpora into the gitignored `.bench-corpus/scoreboard/` (about 113 MB on disk, about
-  30 s on a fast link). A warm `check` takes about 3 minutes on Apple Silicon.
-- `run` never gates: it exits 0 unless a harness error occurs. `check` = `run` + gate. `golden-gen --corpus <name>`
-  prints up to 20 `[[ident]]` candidates for review. Each candidate has a unique definition, a name of at least
-  6 bytes and 2–60 ground-truth files, ordered by `sha256("<corpus>:<name>")`. Never run it in CI.
-- **Exit codes:** `0` pass. `1` gate failure, or bless refused. `2` harness error: never a regression, and no
-  report is written.
-- Each gate failure prints one stderr line, `FAIL <check> [<ids>]: <message>`. The failures are also listed in
-  `report.md` under "Gate failures". Failure kinds: `Unledgered`, `Xpass`, `Ratchet`, `Baseline`.
-- Harness-only tests: `tests/scoreboard.rs` drives the real `scoreboard` binary against a tempdir git fixture and
-  a **stub `skim` shell script** (offline, never `target/*/skim`). Change harness behaviour there, not by running
-  real corpora.
+- **Run time:** the first run clones ~113 MB into gitignored `.bench-corpus/scoreboard/` (~30 s). A warm `check`
+  takes **about 3.6 minutes** locally on Apple Silicon (212–221 s); the CI job **about 7 minutes**.
+- `run` never gates; `check` = `run` + gate. `golden-gen --corpus <name>` proposes up to 20 `[[ident]]` entries (unique
+  definition, name ≥ 6 bytes, 2–60 ground-truth files); with `--ast --skim-bin …`, `[[ast]]` entries. Never in CI.
+- **Exit codes:** `0` pass; `1` gate failure or bless refused; `2` harness error (never a regression; no report).
+  Each gate failure prints `FAIL <check> [<ids>]: <message>` (kinds `Unledgered`, `Xpass`, `Ratchet`, `Baseline`).
+- `tests/scoreboard.rs` drives the real binary against a tempdir git fixture and a **stub `skim` script** (offline),
+  including an `[[ast]]` entry whose stub serves an `--ast` list for every catalog pattern. Test harness changes there.
 
 ## Error Handling and Recovery
 
-Every `Err` in `pipeline.rs` is exit 2. Each class exists because scoring through it would give a false signal:
+Every `Err` in `pipeline.rs` is exit 2, because scoring through it would give a false signal:
 
 | Harness error | Why it is not a gate result |
 |---|---|
-| Golden integrity: pin mismatch, a `def.line` that no longer contains the query, a bad regex, a duplicate or unprefixed id, a `zero-hit` entry with ground truth, a pagination entry over `min(limits) × 63`, a stale ledger ref | The golden data itself is wrong |
-| `temporal_state` ≠ `"ready"` after `--build` while any entry uses `--hot` / `--cold` / `--risky` / `--blast-radius` (`require_temporal_data`) | skim serves a fallback order; a ledgered `--hot` check would **XPASS** and ask for a promotion that bakes the breakage into ledger and baseline (939d1e9) |
-| `degraded[]` on **any** page of a temporal-ranked entry (`ensure_ranking_applied`) | Same reason. On other entries, `degraded[]` just feeds `silent_fn` |
-| An empty full list on an oracle-less entry (`require_oracle_less_rows`) | An empty list passes every check vacuously; the #547 XFAILs would XPASS (a4c7b3a). A list that shrinks without emptying moves `oracle_less.full_rows.<id>` instead (HigherBetter, exact) |
-| An oracle-less pagination full list over the bound | Integrity cannot bound `--ast` / `--blast-radius` in advance |
-| Non-JSON / malformed envelope, a signal, a timeout, `--build` exit ≠ 0, a `--stats` `{"error":…}` | skim is broken, not worse |
-| Corpus not `Reusable` after the run; over 50 000 walk-accepted files; unknown `--only`; an invalid data file or schema | The environment or input is wrong |
+| Golden integrity: pin mismatch, drifted `def.line`, bad regex, duplicate / unprefixed id, `zero-hit` with ground truth, pagination over `min(limits) × 63`, an `[[ast]]` pattern not in the catalog / uncovered / without a query in `lang`, two entries per pair, a stale ledger ref | The golden data itself is wrong |
+| `temporal_state` ≠ `"ready"` while an entry ranks by temporal data (`require_temporal_data`); `degraded[]` on any page of a temporal-ranked entry (`ensure_ranking_applied`) | skim serves a fallback order; a ledgered check would **XPASS** and bake the breakage into ledger and baseline (939d1e9) |
+| An empty full list on an oracle-less entry (`require_oracle_less_rows`) | It passes vacuously (the #547 XFAILs would XPASS, a4c7b3a); a shrink moves `oracle_less.full_rows.<id>` instead |
+| A vacuous `[[ast]]` entry or guard; a guard whose oracle matches | It would measure nothing, or the flag would hide a recall loss |
+| Oracle failure (no tree; over `ORACLE_MATCH_LIMIT`); an `--ast` full list with `has_more` | A partial answer scores as a miss or a false positive |
+| Malformed envelope, signal, timeout, `--build` exit ≠ 0, `--stats` `{"error":…}` | skim is broken, not worse |
+| Corpus not `Reusable` after the run; > 50 000 walk-accepted files; unknown `--only`; invalid data file | The environment or input is wrong |
 
-`run` / `check` delete any previous `report.json` / `report.md` in `--out` **before** doing any work (2245a7b).
-A failed run therefore can never leave an older passing report for `bless --from` to pick up.
+`run` / `check` delete any previous `report.json` / `report.md` in `--out` **before** any work (2245a7b), so a failed
+run never leaves an older passing report for `bless --from`.
 
 ## Anti-Patterns
 
-- **Blessing to turn the gate green without reading the failure.** "Bless required" means *look*.
-  `--accept-regression` with a vague reason leaves a permanent, unhelpful `accepted_regressions[]` record.
-- **Following an XPASS "promote" when the temporal or AST layer might be broken.** The harness errors above exist
-  to stop exactly this. Never weaken `require_temporal_data`, `ensure_ranking_applied` or
-  `require_oracle_less_rows` to get past an exit 2.
-- **Ledgering without a filed ticket, or with guessed ids.** The parser rejects placeholders. Copy the exact ids
-  from `report.json`.
-- **Deriving golden data from skim's output**, or regenerating it in CI. Concept relevance regexes and
-  `def` sites come from the corpus source, not from what skim ranks.
-- **Importing skim code into `oracle.rs` / `universe.rs` / `metrics.rs`** to "stay in sync". Mirror it with a
-  citation instead, or the scoreboard stops being able to catch the change.
-- **Using `HashMap`** in any report or baseline type. It breaks byte-determinism.
-- **Adding a subprocess that bypasses `git_output_with_timeout`**, or that times out with a direct-child kill.
-- **Editing `SEARCH_PATHS` in only one place.** It is mirrored in `ci.yml`, the README "CI" section and the
-  CLAUDE.md "Search quality gate" paragraph.
+- **Blessing without reading the failure.** "Bless required" means *look*; a vague `--accept-regression` leaves a
+  permanent, unhelpful `accepted_regressions[]` record.
+- **Following an XPASS "promote" when the temporal or AST layer might be broken**, or weakening any exit-2 guard
+  (`require_temporal_data`, `ensure_ranking_applied`, `require_oracle_less_rows`, `require_non_vacuous_structural`,
+  `require_expected_empty_oracles`) to get past it.
+- **Ledgering without a filed ticket, or with guessed ids.** Copy the exact ids from `report.json`.
+- **Deriving golden data or an oracle query from skim's output**, or regenerating golden in CI.
+- **Importing skim code into the scoring modules**; giving `rskim-oracle` an `rskim-*` / `path` / `git` dependency,
+  a `build.rs`, an `include!` or an escaping `#[path]`; reading `all_patterns()` outside `catalog.rs`. Mirror the
+  policy with a citation instead, or the scoreboard stops catching the change.
+- **Seeding `OracleAnswers` with unregistered keys**, or lowering the match limit on a used cursor (it would not bind).
+- **Calling `--ast` only for patterns with entries**: skim's other rows would vanish from `unscored_rows`.
+- **`HashMap` in any report, baseline or oracle-answer type** (breaks byte-determinism).
+- **A subprocess that bypasses `git_output_with_timeout`**, or times out with a direct-child kill.
+- **Editing `SEARCH_PATHS` in one place.** It is mirrored in `ci.yml`, the README "CI" section and CLAUDE.md.
 
 ## Gotchas
 
-- **Stale binary.** The scoreboard only canonicalizes `--skim-bin`. Neither the report nor the baseline records
-  skim's version, so an old `target/release/skim` is silently what gets scored. Always build first (PF-019), and
-  never run two release builds at once (CLAUDE.md resource rules).
-- **macOS sleep.** An unattended Mac can sleep mid-run: one run stretched from about 3 minutes to about 27. The
-  per-call timers stop during sleep, so the timings still look normal. Wrap long runs in `caffeinate -i -s`.
-- **First exec on macOS** of the freshly linked `scoreboard`, `skim` or `rskim-bench` test binaries can stall at
-  `_dyld_start` (XProtect scan). Warm each one with a throwaway exec (`--version` / `--help`) before you assume a
-  hang (PF-013).
-- **Every run is a cold build.** Each run gets a fresh temp HOME, so skim runs `--build` from scratch, including
-  the full-history temporal walk. The incremental / staleness / auto-refresh paths are **not** exercised.
-- **Any byte edit to a golden file**, even a comment, changes its `golden_sha256`, and that requires a bless. If
-  you edit a golden file after the run, `bless` refuses the report.
-- **`--only`** reports are partial. The gate still compares the covered corpus but skips the aggregate and
-  missing-corpus checks, and `bless` refuses the report.
-- **Mirrored skim policy.** Adding a language or extension to skim, or changing walker limits, the minified gate,
-  the hidden-path rule or the file cap, requires the matching edit in `oracle.rs` `LANGS` / `universe.rs`.
-  Otherwise `universe.delta` goes non-zero, and precision fails on files the oracle does not index. Adding a
-  language also moves `coverage.tracked_text` (bless).
-- **The text-mode output format is load-bearing.** `metrics::is_block_header` recognizes `<path>:<digit>…` or
-  `<path>  [` as a result header. A renderer change can turn every `first_correct` into a miss
-  (`bytes.first_correct_misses` is exact, LowerBetter). **stderr counts toward `bytes.text_*`**, so a new
-  search-path stderr notice can move the byte ratchets. Small moves stay inside ±3%.
-- **Reference columns** (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) depend only on corpus, golden and
-  oracle. If one moves on a PR that touches only skim, the harness changed.
-- **The ±3% byte tolerance is relative to the baseline**, so a baseline of 0 tolerates no change.
-- **`rskim-bench` denies `unwrap_used` / `expect_used` / `panic`**, so test modules carry `#[allow(...)]`. Lint
-  with `cargo clean -p rskim-bench && cargo clippy -p rskim-bench --all-targets -- -D warnings` (PF-009:
-  `gate_tests.rs` / `metrics_tests.rs` are `#[cfg(test)] #[path]` modules).
-- **The skim corpus is `dean0x/skim` pinned at `b8a0a79`.** It never tracks the live tree, and it is bumped only
-  by hand together with a bless.
+- **Stale binary.** Only `--skim-bin` is canonicalized; nothing records skim's version, so an old
+  `target/release/skim` is silently what gets scored. Build first (PF-019); never run two release builds at once.
+- **macOS.** Sleep once stretched a run to ~27 minutes while per-call timers looked normal (`caffeinate -i -s`). A
+  freshly linked binary's first exec can stall at `_dyld_start` (XProtect): warm it with `--version` (PF-013).
+- **Every run is a cold build** (fresh HOME): incremental / staleness / auto-refresh paths are **not** exercised.
+- **Digest-changing edits force a re-bless.** Any golden byte (a comment included) and any oracle input (a `.scm`, a
+  post-filter, an intent spec, the cap, the extension table, the attribute kinds) moves `golden_sha256`, and `bless`
+  refuses a report made before the edit. `.gitattributes` pins `text eol=lf` on `crates/rskim-oracle/queries/**` and
+  `crates/rskim-bench/scoreboard/**` so a CRLF checkout cannot ask for a bless.
+- **Golden header bytes are hashed.** The four `golden/*.toml` headers still cite bare `(ADR-003)`, not
+  `SEARCH-ADR-003` (#561 namespace rule); fixing that comment is a digest move needing a bless, so it is parked as a
+  Polish item under #540. Do not "just fix the comment" in an unrelated PR.
+- **Skim-side changes surface here, on purpose.** A new catalog pattern fails `catalog_tests` until it has a query or
+  an `UNCOVERED` reason, and adds a `structural.unscored_rows.<pattern>` metric (bless). A skim AST size-cap or
+  AST-indexed-language change shows as a `structural.coverage` or recall/precision diff until `AST_SIZE_CAP_BYTES` /
+  `EXT_CLASSES` follow (fingerprint → bless). A new language / extension, or a change to walker limits, the minified
+  gate, the hidden-path rule or the file cap, needs `LANGS` / `universe.rs` edits or `universe.delta` leaves 0.
+- **`--only`** reports are partial: no aggregate or missing-corpus checks, `bless` refuses them, and
+  `uncovered_patterns` then lists patterns whose entries are in other corpora.
+- **Text-mode output is load-bearing.** `metrics::is_block_header` recognizes `<path>:<digit>…` or `<path>  [`; a
+  renderer change can turn every `first_correct` into a miss. **stderr counts toward `bytes.text_*`**, so a new
+  search-path notice moves byte ratchets (±3% is relative: a baseline of 0 tolerates nothing).
+- **Reference columns** (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) moving on a skim-only PR means the harness changed.
+- **Lints.** `rskim-bench` and `rskim-oracle` deny `unwrap_used` / `expect_used` / `panic` (test modules carry
+  `#[allow(...)]`); lint with `cargo clean -p <crate> && cargo clippy -p <crate> --all-targets -- -D warnings`
+  (PF-009: `*_tests.rs` are `#[cfg(test)] #[path]` modules).
 
 ## Key Files
 
-- `crates/rskim-bench/scoreboard/README.md`: the runbook (commands, ledger, blessing, adding golden entries, pin bumps, CI).
-- `crates/rskim-bench/src/bin/scoreboard.rs`: the CLI (`run|check|bless|golden-gen`), exit codes, sandbox HOME per run, `clear_outputs`.
-- `crates/rskim-bench/src/scoreboard/pipeline.rs`: per-corpus orchestration and the harness-error guards (`require_temporal_data`, `require_oracle_less_rows`).
-- `crates/rskim-bench/src/scoreboard/runner.rs`: skim subprocess contract, `SkimSandbox`, sweeps, `ensure_ranking_applied`.
-- `crates/rskim-bench/src/scoreboard/metrics.rs`: `plan` / `runs` (which checks run), pure HARD checks, `RATCHET_METRICS`, `compare_ratchet`, byte parsing.
-- `crates/rskim-bench/src/scoreboard/gate.rs`: ledger parsing and validation, `classify`, `evaluate` (the gate verdict).
-- `crates/rskim-bench/src/scoreboard/baseline.rs`: `baseline.json` schema, `bless`, `hard_downgrades`, `regressions`.
-- `crates/rskim-bench/src/scoreboard/golden.rs`: golden schema, `QueryFlags` (`uses_temporal_data`, `has_rank_override`, `arm`), integrity.
-- `crates/rskim-bench/src/scoreboard/oracle.rs`: independent predicates (and / phrase / near / pnear / lang), baselines, simulated `rg -n -F`.
-- `crates/rskim-bench/src/scoreboard/universe.rs`: the oracle's file universe mirroring the CLI walker, `GitIsolation`, coverage.
-- `crates/rskim-bench/src/scoreboard/types.rs`: `CheckId`, `Arm` envelopes, `ResultPage`, `StatsSnapshot`.
-- `crates/rskim-bench/scoreboard/{corpora.toml,golden/*.toml,known_failures.toml,baseline.json}`: the data. `baseline.json` is written only by `bless`.
-- `crates/rskim-bench/tests/scoreboard.rs`: offline end-to-end tests with a stub skim.
-- `crates/rskim-research/src/clone.rs`: `ensure_pinned_history_clone`, `verify_pinned_clone`, the process-group timeout (`git_output_with_timeout`).
-- `.github/workflows/ci.yml`: the `changes` and `scoreboard` jobs, plus the `skim-release` upload in Build Check.
+- `crates/rskim-bench/src/bin/scoreboard.rs`: CLI (`run|check|bless|golden-gen [--ast]`), exit codes, sandbox HOME.
+- `crates/rskim-bench/src/scoreboard/pipeline.rs`: per-corpus orchestration, timed oracle pass, `call_patterns`, exit-2 guards.
+- `crates/rskim-bench/src/scoreboard/runner.rs`: skim subprocess contract, `SkimSandbox`, `ast_list`, `ensure_ranking_applied`.
+- `crates/rskim-bench/src/scoreboard/metrics.rs`: `plan` / `runs`, HARD checks, `RATCHET_METRICS`, `STRUCTURAL_FAMILIES`, `compare_ratchet`.
+- `crates/rskim-bench/src/scoreboard/gate.rs` / `baseline.rs`: ledger, `classify`, `evaluate`; `baseline.json` and `bless`.
+- `crates/rskim-bench/src/scoreboard/golden.rs` / `golden_gen.rs`: schema (`AstEntry`), integrity, `golden_digest`; proposals, `comment_safe`.
+- `crates/rskim-bench/src/scoreboard/oracle.rs` / `universe.rs`: lexical oracle and `LANGS`; the oracle universe.
+- `crates/rskim-bench/src/scoreboard/catalog.rs` (+ `catalog_tests.rs`): the one catalog read; per-query fixtures.
+- `crates/rskim-bench/src/scoreboard/structural_metrics.rs`: `OracleAnswers`, row splitting, structural checks, vacuity.
+- `crates/rskim-oracle/src/structural.rs` (+ `structural_tests.rs`): registry, `EXT_CLASSES`, cap, scratch, intent walk, fingerprint.
+- `crates/rskim-oracle/tests/independence.rs` and `queries/*.scm`: the AC-3 guard; one query per (pattern, language).
+- `crates/rskim-bench/scoreboard/{corpora.toml,golden/*.toml,known_failures.toml,baseline.json}`: the data (`baseline.json` only via `bless`).
+- `crates/rskim-bench/tests/scoreboard.rs`: offline stub-skim tests; `crates/rskim-research/src/clone.rs`: pinned clones, process-group timeout.
+- `.github/workflows/ci.yml`, root `Cargo.toml` (`[profile.dev.package.tree-sitter]`), `.gitattributes` (LF for hashed files).
 
 ## Related
 
-- **ADR-007** (amended 2026-09-25): this scoreboard is the required search gate. Manual adversarial dog-food only
-  covers what it cannot see: structural until #541, temporal until #542, and new flags or arms.
-- **ADR-008**: skim indexes walked ∪ tracked. `universe.rs` reproduces that union independently, and
-  `universe.delta` must stay 0.
-- **ADR-003**: ratchets against blessed measured values rather than invented targets. Golden data is declared up
-  front.
-- **ADR-005**: a green `Search Scoreboard` is not permission to merge.
-- **PF-019**: build the binary the run spawns first. **PF-013**: warm fresh binaries on macOS. **PF-009**:
-  `clippy --all-targets` after `cargo clean -p`.
-- Feature knowledge `cmd-search`: the CLI code the scoreboard judges. The ledgered bugs live in
-  `cmd/search/query.rs` (#544), `temporal.rs` `resort_window` (#545) and `ast.rs` (#547).
-- Feature knowledge `search-temporal` / `temporal-scoring`: `--hot` / `--cold` / `--risky` / `--blast-radius`
-  and `temporal_state`, which `require_temporal_data` reads.
-- Feature knowledge `ast-index`: the standalone `--ast` arm (#547 order, #541 coverage gap).
-- Feature knowledge `research-ast` / `cochange`: share `clone.rs`, including the process-group timeout that now
-  bounds their git calls too.
+- **SEARCH-ADR-007** (amended 2026-09-25): this is the required search gate; dog-food covers only its blind spots.
+  **SEARCH-ADR-008**: walked ∪ tracked, `universe.delta` = 0. **SEARCH-ADR-003**: ratchets on measured values.
+  **SEARCH-ADR-005**: green is not merge permission, outside the 2026-09-26 standing authorization for #540 PRs.
+- **PF-019** build first; **PF-013** warm fresh macOS binaries; **PF-009** `clippy --all-targets` after `cargo clean
+  -p`; **PF-016** keep key absence load-bearing (`OracleAnswers` seeds registered keys only).
+- Feature knowledge `cmd-search`: the CLI judged here; #544 in `cmd/search/query.rs`, #545 in `temporal.rs`
+  `resort_window`, #547 in `ast.rs`.
+- Feature knowledge `ast-index`: the pattern catalog (`patterns.rs`), `is_counted_child` (#572), the verify gate
+  behind #546, and the 1 MiB inclusive `ast_size_limit` the oracle mirrors.
+- Feature knowledge `search-temporal` / `temporal-scoring` (temporal arms, `temporal_state`); `research-ast` / `cochange` (share `clone.rs`).

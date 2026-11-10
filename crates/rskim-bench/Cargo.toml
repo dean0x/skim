@@ -28,6 +28,7 @@ path = "src/lib.rs"
 rskim-search = { path = "../rskim-search" }
 rskim-core = { path = "../rskim-core" }
 rskim-research = { path = "../rskim-research" }
+rskim-oracle = { path = "../rskim-oracle" }
 tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-python = { workspace = true }

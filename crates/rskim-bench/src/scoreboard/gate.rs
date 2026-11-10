@@ -20,8 +20,9 @@
 //! # Gate
 //!
 //! [`evaluate`] fails on: unledgered HARD failures; XPASSes; a missing
-//! baseline; a corpus, commit, golden file or HARD state that differs from
-//! the baseline; and any RATCHET value outside tolerance in either
+//! baseline; a corpus, commit, golden digest (a golden file or the
+//! structural-oracle fingerprint) or HARD state that differs from the
+//! baseline; and any RATCHET value outside tolerance in either
 //! direction ("bless required"). Every failure names its check (or metric)
 //! and query ids.
 
@@ -365,7 +366,10 @@ fn baseline_failures(inputs: &GateInputs<'_>, baseline: &Baseline) -> Vec<GateFa
             out.push(bless_failure(
                 None,
                 Vec::new(),
-                format!("corpus {}: golden file changed; bless required", c.name),
+                format!(
+                    "corpus {}: golden file or structural-oracle fingerprint changed; bless required",
+                    c.name
+                ),
             ));
         }
         out.extend(hard_state_changes(c, b));

@@ -13,10 +13,12 @@
 //! - [`RATCHET_METRICS`] defines each RATCHET metric's good direction and
 //!   tolerance; [`compare_ratchet`] applies them for the gate and `bless`.
 //!   Each entry with no oracle also ratchets its full-list row count
-//!   ([`ORACLE_LESS_ROWS`]).
+//!   ([`ORACLE_LESS_ROWS`]); `[[ast]]` entries ratchet their structural
+//!   measurements ([`STRUCTURAL_FAMILIES`]).
 //!
 //! No function here imports skim's own search code: every expectation comes
-//! from the oracle (`oracle.rs`) over the oracle's universe.
+//! from the oracles (`oracle.rs`, and `structural.rs` through
+//! `structural_metrics.rs`) over the oracle's universe.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,20 +27,20 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::MAX_PAGES;
-use crate::scoreboard::golden::{DefSite, GoldenFile, QueryFlags};
+use crate::scoreboard::fmt::{round4, sample};
+use crate::scoreboard::golden::{DefSite, GoldenFile, PrecisionClass, QueryFlags};
 use crate::scoreboard::oracle::{
     LexicalQuery, MatchMode, baseline_alphabetical, baseline_occurrence_count, ground_truth,
     simulate_rg_fixed,
 };
-use crate::scoreboard::report::round4;
 use crate::scoreboard::runner::{EntryObservation, Sweep};
+use crate::scoreboard::structural_metrics::{
+    EntryScore, StructuralEvidence, StructuralSample, StructuralTarget, score_entry, unscored_rows,
+};
 use crate::scoreboard::types::{
     Arm, CheckId, CheckOutcome, EntryKind, ResultPage, ResultRow, StatsSnapshot, VerifyMode,
 };
 use crate::scoreboard::universe::Universe;
-
-/// Paths quoted in a failure detail before "+N more".
-const SAMPLE_PATHS: usize = 5;
 
 // ============================================================================
 // Plan
@@ -55,26 +57,64 @@ pub enum Target {
     None,
 }
 
+/// What judges an entry's full list.
+#[derive(Debug, Clone)]
+pub enum Oracle {
+    /// A lexical predicate over the oracle universe (`oracle.rs`).
+    Lexical(LexicalQuery),
+    /// The structural oracle for one pattern in one language (`[[ast]]`,
+    /// `structural.rs`).
+    Structural(StructuralTarget),
+}
+
 /// One golden entry, resolved into what the runner calls and what the
 /// metrics check.
 #[derive(Debug, Clone)]
 pub struct PlannedQuery {
     pub id: String,
     pub kind: EntryKind,
-    /// The text query (`None` for a standalone `--ast` / temporal prefix).
+    /// The text query (`None` for a standalone `--ast` / temporal prefix,
+    /// and for `[[ast]]`).
     pub query: Option<String>,
     pub flags: QueryFlags,
     /// The JSON envelope the flags produce.
     pub arm: Arm,
-    /// The oracle's query for the full result set; `None` when that set is
-    /// not a lexical predicate (`--ast`, `--blast-radius`, no text query).
-    pub oracle: Option<LexicalQuery>,
+    /// What judges the full result set; `None` when nothing does (a text +
+    /// `--ast` or `--blast-radius` list, a standalone `--ast` / temporal
+    /// `[[prefix]]`): those lists are only compared with themselves.
+    pub oracle: Option<Oracle>,
     /// `[[pagination]]` sweep limits / `[[prefix]]` limits.
     pub limits: Vec<u32>,
     pub target: Target,
 }
 
 impl PlannedQuery {
+    /// The lexical oracle query, if the entry has one.
+    pub fn lexical_oracle(&self) -> Option<&LexicalQuery> {
+        match &self.oracle {
+            Some(Oracle::Lexical(query)) => Some(query),
+            Some(Oracle::Structural(_)) | None => None,
+        }
+    }
+
+    /// The structural target of an `[[ast]]` entry.
+    pub fn structural_target(&self) -> Option<&StructuralTarget> {
+        match &self.oracle {
+            Some(Oracle::Structural(target)) => Some(target),
+            Some(Oracle::Lexical(_)) | None => None,
+        }
+    }
+
+    /// Whether this is an `[[ast]]` entry: judged by the structural oracle,
+    /// with its pattern call's rows in its language as its full list, never
+    /// observed on its own. [`plan`] gives exactly the `[[ast]]` entries a
+    /// structural target; a `[[prefix]]` or `[[pagination]]` entry with
+    /// `--ast` in its flags calls skim with `--ast` too, but is not scored by
+    /// the structural oracle.
+    pub fn is_structural(&self) -> bool {
+        self.structural_target().is_some()
+    }
+
     /// The HARD checks that run on this entry, in [`CheckId::ALL`] order.
     pub fn checks(&self) -> Vec<CheckId> {
         CheckId::ALL
@@ -85,18 +125,23 @@ impl PlannedQuery {
     }
 
     /// Whether `check` runs on this entry:
-    /// - `lexical.recall` / `precision` / `silent_fn`: the full list has an
-    ///   oracle ground truth;
+    /// - `lexical.recall` / `precision` / `silent_fn`: the full list has a
+    ///   lexical oracle ground truth;
     /// - `lexical.verify_mode`: there is a text query (the lexical envelope);
     /// - `pagination.*`: `[[pagination]]` entries;
     /// - `order.prefix_consistent`: `[[prefix]]` entries;
     /// - `order.score_monotone`: the list is ranked by `score` (no temporal
-    ///   sort, no `--blast-radius`);
-    /// - `results.unique_paths`: every entry (every list it fetches).
+    ///   sort, no `--blast-radius`) and is not an `[[ast]]` entry's slice of
+    ///   a standalone `--ast` list (path-ordered, #547; `[[prefix]]` entries
+    ///   judge that arm's order);
+    /// - `results.unique_paths`: every entry (every list it fetches);
+    /// - `structural.recall` / `coverage`: `[[ast]]` entries;
+    /// - `structural.precision`: `[[ast]]` entries of class `hard` (a
+    ///   `ratchet` entry records `structural.precision.<id>` instead).
     pub fn runs(&self, check: CheckId) -> bool {
         match check {
             CheckId::LexicalRecall | CheckId::LexicalPrecision | CheckId::LexicalSilentFn => {
-                self.oracle.is_some()
+                self.lexical_oracle().is_some()
             }
             CheckId::LexicalVerifyMode => self.arm == Arm::Lexical,
             CheckId::PaginationComplete
@@ -104,8 +149,12 @@ impl PlannedQuery {
             | CheckId::PaginationOrdered
             | CheckId::PaginationHasMoreHonest => self.kind == EntryKind::Pagination,
             CheckId::OrderPrefixConsistent => self.kind == EntryKind::Prefix,
-            CheckId::OrderScoreMonotone => !self.flags.has_rank_override(),
+            CheckId::OrderScoreMonotone => !self.is_structural() && !self.flags.has_rank_override(),
             CheckId::ResultsUniquePaths => true,
+            CheckId::StructuralRecall | CheckId::StructuralCoverage => self.is_structural(),
+            CheckId::StructuralPrecision => self
+                .structural_target()
+                .is_some_and(|t| t.precision == PrecisionClass::Hard),
         }
     }
 
@@ -131,9 +180,9 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
             query: Some(e.query.clone()),
             flags: QueryFlags::default(),
             arm: Arm::Lexical,
-            oracle: Some(
+            oracle: Some(Oracle::Lexical(
                 LexicalQuery::new(&e.query, MatchMode::And, None).with_context(|| e.id.clone())?,
-            ),
+            )),
             limits: Vec::new(),
             target: Target::Definition(e.def.clone()),
         });
@@ -145,9 +194,9 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
             query: Some(e.query.clone()),
             flags: QueryFlags::default(),
             arm: Arm::Lexical,
-            oracle: Some(
+            oracle: Some(Oracle::Lexical(
                 LexicalQuery::new(&e.query, MatchMode::And, None).with_context(|| e.id.clone())?,
-            ),
+            )),
             limits: Vec::new(),
             target: Target::Relevance(e.relevance()?),
         });
@@ -159,7 +208,9 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
             query: Some(e.query.clone()),
             flags: e.flags().with_context(|| e.id.clone())?,
             arm: Arm::Lexical,
-            oracle: Some(e.oracle_query().with_context(|| e.id.clone())?),
+            oracle: Some(Oracle::Lexical(
+                e.oracle_query().with_context(|| e.id.clone())?,
+            )),
             limits: Vec::new(),
             target: Target::None,
         });
@@ -171,7 +222,10 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
             kind: EntryKind::Pagination,
             query: Some(e.query.clone()),
             arm: flags.arm(true)?,
-            oracle: flags.oracle_query(&e.query).with_context(|| e.id.clone())?,
+            oracle: flags
+                .oracle_query(&e.query)
+                .with_context(|| e.id.clone())?
+                .map(Oracle::Lexical),
             flags,
             limits: e.limits.clone(),
             target: Target::None,
@@ -180,7 +234,10 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
     for e in &golden.prefixes {
         let flags = QueryFlags::parse(&e.flags).with_context(|| e.id.clone())?;
         let oracle = match &e.query {
-            Some(q) => flags.oracle_query(q).with_context(|| e.id.clone())?,
+            Some(q) => flags
+                .oracle_query(q)
+                .with_context(|| e.id.clone())?
+                .map(Oracle::Lexical),
             None => None,
         };
         out.push(PlannedQuery {
@@ -194,6 +251,26 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
             target: Target::None,
         });
     }
+    for e in &golden.asts {
+        out.push(PlannedQuery {
+            id: e.id.clone(),
+            kind: EntryKind::Ast,
+            query: None,
+            flags: QueryFlags {
+                ast: Some(e.pattern.clone()),
+                ..QueryFlags::default()
+            },
+            arm: Arm::Ast,
+            oracle: Some(Oracle::Structural(StructuralTarget {
+                pattern: e.pattern.clone(),
+                lang: e.lang,
+                precision: e.precision,
+                expect_oracle_empty: e.expect_oracle_empty,
+            })),
+            limits: Vec::new(),
+            target: Target::None,
+        });
+    }
     Ok(out)
 }
 
@@ -203,21 +280,6 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
 
 fn paths(rows: &[ResultRow]) -> Vec<&str> {
     rows.iter().map(|r| r.path.as_str()).collect()
-}
-
-/// Up to [`SAMPLE_PATHS`] paths, then `(+N more)`.
-fn sample<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
-    let items: Vec<&str> = items.into_iter().collect();
-    let shown = items
-        .iter()
-        .take(SAMPLE_PATHS)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    match items.len().saturating_sub(SAMPLE_PATHS) {
-        0 => shown,
-        more => format!("{shown} (+{more} more)"),
-    }
 }
 
 /// Ground-truth files absent from `rows`, in ground-truth order.
@@ -702,6 +764,11 @@ pub struct CorpusSamples {
     /// Full-list row count of each entry with no oracle
     /// ([`PlannedQuery::oracle`] is `None`), by id.
     pub oracle_less_rows: BTreeMap<String, u64>,
+    /// Per-`[[ast]]`-entry measurements, in plan order.
+    pub structural: Vec<StructuralSample>,
+    /// skim `--ast` rows no `[[ast]]` entry scores, per pattern skim was
+    /// called for.
+    pub unscored_rows: BTreeMap<String, u64>,
 }
 
 // ============================================================================
@@ -783,7 +850,8 @@ const fn reference(name: &'static str, tolerance: Tolerance) -> MetricDef {
 
 /// Every fixed RATCHET metric (tolerance 0 except bytes at ±3%). The
 /// per-entry family [`ORACLE_LESS_ROWS`] is defined by
-/// [`ORACLE_LESS_ROWS_DEF`].
+/// [`ORACLE_LESS_ROWS_DEF`], the structural families by
+/// [`STRUCTURAL_FAMILIES`].
 pub const RATCHET_METRICS: &[MetricDef] = &[
     def(
         "universe.delta",
@@ -900,14 +968,102 @@ pub static ORACLE_LESS_ROWS_DEF: MetricDef = def(
     "ratchet (no oracle)",
 );
 
-/// The definition of the RATCHET metric `name` (a fixed metric, or an
-/// `oracle_less.full_rows.<id>` value).
+/// Name prefix of `structural.precision.<id>`: the file-level precision of
+/// an `[[ast]]` entry of class `ratchet` (a `hard` entry's precision is the
+/// HARD check `structural.precision` instead).
+pub const STRUCTURAL_PRECISION: &str = "structural.precision.";
+
+/// Name prefix of `structural.line_on_match.<id>`: how many of an `[[ast]]`
+/// entry's rows anchor on the first line of an oracle match.
+pub const STRUCTURAL_LINE_ON_MATCH: &str = "structural.line_on_match.";
+
+/// Name prefix of `structural.intent_recall.<id>` (nested-loop entries).
+pub const STRUCTURAL_INTENT_RECALL: &str = "structural.intent_recall.";
+
+/// Name prefix of `structural.intent_precision.<id>` (nested-loop entries).
+pub const STRUCTURAL_INTENT_PRECISION: &str = "structural.intent_precision.";
+
+/// Name prefix of `structural.unscored_rows.<pattern>`: skim `--ast` rows no
+/// `[[ast]]` entry of this corpus scores, for every catalog pattern of a
+/// corpus with an `[[ast]]` entry (0 included). Neutral: any move needs a
+/// bless, never a reason (see [`STRUCTURAL_FAMILIES`]).
+pub const STRUCTURAL_UNSCORED_ROWS: &str = "structural.unscored_rows.";
+
+/// The structural RATCHET families (#541), each `(name prefix, definition)`;
+/// the name suffix is an `[[ast]]` id, or a pattern for
+/// [`STRUCTURAL_UNSCORED_ROWS`]. Every value is exact. The precision and
+/// intent fractions and the anchor count are higher-is-better: a drop is a
+/// regression, and blessing it needs `--accept-regression`. Unscored rows
+/// are neutral: no oracle judges them, and a move either way has an
+/// ordinary cause (a shrink: a new entry now scores those rows, or skim
+/// stopped returning rows no entry judges; a growth: skim returns rows in a
+/// language no entry scores). So a move reads `changed`: the gate asks for a
+/// bless, and bless needs no reason.
+pub static STRUCTURAL_FAMILIES: [(&str, MetricDef); 5] = [
+    (
+        STRUCTURAL_PRECISION,
+        def(
+            "structural.precision.<id>",
+            Direction::HigherBetter,
+            Tolerance::Exact,
+            "ratchet (class \"ratchet\"; 1 = oracle-exact)",
+        ),
+    ),
+    (
+        STRUCTURAL_LINE_ON_MATCH,
+        def(
+            "structural.line_on_match.<id>",
+            Direction::HigherBetter,
+            Tolerance::Exact,
+            "ratchet (rows on an oracle match line)",
+        ),
+    ),
+    (
+        STRUCTURAL_INTENT_RECALL,
+        def(
+            "structural.intent_recall.<id>",
+            Direction::HigherBetter,
+            Tolerance::Exact,
+            "ratchet (intent oracle)",
+        ),
+    ),
+    (
+        STRUCTURAL_INTENT_PRECISION,
+        def(
+            "structural.intent_precision.<id>",
+            Direction::HigherBetter,
+            Tolerance::Exact,
+            "ratchet (intent oracle)",
+        ),
+    ),
+    (
+        STRUCTURAL_UNSCORED_ROWS,
+        def(
+            "structural.unscored_rows.<pattern>",
+            Direction::Neutral,
+            Tolerance::Exact,
+            "ratchet (no oracle)",
+        ),
+    ),
+];
+
+/// The definition of the RATCHET metric `name` (a fixed metric, an
+/// `oracle_less.full_rows.<id>` value, or a structural family member).
 pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
-    RATCHET_METRICS.iter().find(|d| d.name == name).or_else(|| {
-        name.strip_prefix(ORACLE_LESS_ROWS)
-            .is_some_and(|id| !id.is_empty())
-            .then_some(&ORACLE_LESS_ROWS_DEF)
-    })
+    let names_one = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty())
+    };
+    RATCHET_METRICS
+        .iter()
+        .find(|d| d.name == name)
+        .or_else(|| names_one(ORACLE_LESS_ROWS).then_some(&ORACLE_LESS_ROWS_DEF))
+        .or_else(|| {
+            STRUCTURAL_FAMILIES
+                .iter()
+                .find(|(prefix, _)| names_one(prefix))
+                .map(|(_, d)| d)
+        })
 }
 
 /// How a RATCHET value moved against its baseline.
@@ -1048,7 +1204,50 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
             Some(rows as f64),
         );
     }
+    put_structural_values(&mut out, samples);
     out
+}
+
+/// The structural families ([`STRUCTURAL_FAMILIES`]): one value per
+/// `[[ast]]` entry (ids are corpus-prefixed, so the aggregate keeps
+/// corpora apart), and `structural.unscored_rows.<pattern>` summed over the
+/// pooled corpora.
+fn put_structural_values(out: &mut BTreeMap<String, f64>, samples: &[&CorpusSamples]) {
+    for s in samples.iter().flat_map(|s| s.structural.iter()) {
+        if s.precision_class == PrecisionClass::Ratchet {
+            put(
+                out,
+                &format!("{STRUCTURAL_PRECISION}{}", s.id),
+                Some(s.precision),
+            );
+        }
+        put(
+            out,
+            &format!("{STRUCTURAL_LINE_ON_MATCH}{}", s.id),
+            Some(s.line_on_match as f64),
+        );
+        put(
+            out,
+            &format!("{STRUCTURAL_INTENT_RECALL}{}", s.id),
+            s.intent_recall,
+        );
+        put(
+            out,
+            &format!("{STRUCTURAL_INTENT_PRECISION}{}", s.id),
+            s.intent_precision,
+        );
+    }
+    let mut unscored: BTreeMap<&str, u64> = BTreeMap::new();
+    for (pattern, &rows) in samples.iter().flat_map(|s| s.unscored_rows.iter()) {
+        *unscored.entry(pattern.as_str()).or_insert(0) += rows;
+    }
+    for (pattern, rows) in unscored {
+        put(
+            out,
+            &format!("{STRUCTURAL_UNSCORED_ROWS}{pattern}"),
+            Some(rows as f64),
+        );
+    }
 }
 
 /// Record `value`, rounded to 4 decimal places, under `name` (nothing for
@@ -1184,67 +1383,100 @@ pub struct CorpusEvaluation {
     pub unindexed_hits: BTreeMap<String, u64>,
 }
 
-/// Score one corpus.
+/// `plan` and `observations` paired entry by entry: observations follow the
+/// plan, one per entry, in order. Everything that walks both checks this
+/// first, so an entry never goes unjudged or is judged by another entry's
+/// rows.
 ///
 /// # Errors
 ///
-/// `observations` does not follow `plan` one-for-one (same length, same
-/// ids), or an entry lacks an observation its checks need.
-pub fn evaluate(
-    universe: &Universe,
-    stats: &StatsSnapshot,
-    plan: &[PlannedQuery],
-    observations: &[EntryObservation],
-) -> anyhow::Result<CorpusEvaluation> {
+/// The two differ in length, or an observation's id is not its planned
+/// entry's.
+pub fn paired<'a>(
+    plan: &'a [PlannedQuery],
+    observations: &'a [EntryObservation],
+) -> anyhow::Result<impl Iterator<Item = (&'a PlannedQuery, &'a EntryObservation)>> {
     anyhow::ensure!(
         plan.len() == observations.len(),
         "{} planned entries but {} observations",
         plan.len(),
         observations.len()
     );
+    if let Some((q, obs)) = plan
+        .iter()
+        .zip(observations)
+        .find(|(q, obs)| q.id != obs.id)
+    {
+        anyhow::bail!(
+            "observation {} does not match planned entry {}",
+            obs.id,
+            q.id
+        );
+    }
+    Ok(plan.iter().zip(observations))
+}
 
+/// Score one corpus. `structural` holds the structural oracle's answers and
+/// skim's `--ast` calls for the `[[ast]]` entries (empty when there are
+/// none); an `[[ast]]` entry's observation holds skim's rows in its language.
+///
+/// # Errors
+///
+/// `observations` does not follow `plan` one-for-one (same length, same
+/// ids), or an entry lacks an observation (or structural evidence) its
+/// checks need.
+pub fn evaluate(
+    universe: &Universe,
+    stats: &StatsSnapshot,
+    plan: &[PlannedQuery],
+    observations: &[EntryObservation],
+    structural: &StructuralEvidence,
+) -> anyhow::Result<CorpusEvaluation> {
     let mut outcomes = Vec::new();
     let mut idents = Vec::new();
     let mut concepts = Vec::new();
     let mut unindexed_hits = BTreeMap::new();
     let mut oracle_less_rows = BTreeMap::new();
+    let mut structural_samples = Vec::new();
 
-    for (q, obs) in plan.iter().zip(observations) {
-        anyhow::ensure!(
-            q.id == obs.id,
-            "observation {} does not match planned entry {}",
-            obs.id,
-            q.id
-        );
-        let gt = q.oracle.as_ref().map(|o| ground_truth(universe.files(), o));
-        match &q.oracle {
-            Some(o) => {
-                let hits = ground_truth(universe.unindexed_text_files(), o).len();
-                if hits > 0 {
-                    unindexed_hits.insert(q.id.clone(), hits as u64);
-                }
-            }
-            None => {
-                oracle_less_rows.insert(q.id.clone(), u64::try_from(obs.full.rows.len())?);
-            }
-        }
-
+    for (q, obs) in paired(plan, observations)? {
+        let oracle = eval_oracle(q, obs, universe, structural)?;
         let pagination = (q.kind == EntryKind::Pagination)
             .then(|| check_pagination(&obs.full.rows, &obs.sweeps));
+        let inputs = CheckInputs {
+            oracle: &oracle,
+            pagination: pagination.as_ref(),
+        };
         for check in q.checks() {
-            let outcome = run_check(check, q, obs, gt.as_deref(), pagination.as_ref())
-                .with_context(|| format!("{}: {check}", q.id))?;
+            let outcome =
+                run_check(check, q, obs, &inputs).with_context(|| format!("{}: {check}", q.id))?;
             outcomes.push((q.id.clone(), check, outcome));
         }
 
+        let gt = oracle.ground_truth();
         match &q.target {
             Target::Definition(def) => {
-                idents.push(measure_ident(q, def, obs, universe, gt.as_deref())?);
+                idents.push(measure_ident(q, def, obs, universe, gt)?);
             }
             Target::Relevance(re) => {
-                concepts.push(measure_concept(q, re, obs, universe, gt.as_deref())?);
+                concepts.push(measure_concept(q, re, obs, universe, gt)?);
             }
             Target::None => {}
+        }
+
+        match oracle {
+            OracleEval::Lexical {
+                unindexed_hits: hits,
+                ..
+            } => {
+                if hits > 0 {
+                    unindexed_hits.insert(q.id.clone(), hits);
+                }
+            }
+            OracleEval::Structural(score) => structural_samples.push(score.sample),
+            OracleEval::None { full_rows } => {
+                oracle_less_rows.insert(q.id.clone(), full_rows);
+            }
         }
     }
     outcomes.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
@@ -1263,20 +1495,115 @@ pub fn evaluate(
             idents,
             concepts,
             oracle_less_rows,
+            structural: structural_samples,
+            unscored_rows: unscored_rows(
+                plan.iter().filter_map(PlannedQuery::structural_target),
+                &structural.patterns,
+            ),
         },
         unindexed_hits,
     })
+}
+
+/// What an entry's oracle says about its full list, resolved once per entry
+/// by [`eval_oracle`]: the per-oracle-family seam of [`evaluate`]. The checks
+/// ([`run_check`]), the ranking measurements and the per-family tallies all
+/// read it, so a new oracle family (#542's temporal oracle) is one more
+/// variant here and one more arm of [`eval_oracle`]'s match.
+#[derive(Debug)]
+enum OracleEval {
+    /// A lexical oracle (`oracle.rs`).
+    Lexical {
+        /// Its ground truth over the universe.
+        gt: Vec<String>,
+        /// Its ground-truth hits among tracked text files outside the
+        /// indexed universe (INFO `unindexed_hits`).
+        unindexed_hits: u64,
+    },
+    /// The structural oracle (`[[ast]]`): the entry's structural HARD
+    /// outcomes and measurements.
+    Structural(EntryScore),
+    /// No oracle: the full list's row count, which ratchets instead
+    /// ([`ORACLE_LESS_ROWS`]).
+    None {
+        /// Rows in the entry's full list.
+        full_rows: u64,
+    },
+}
+
+impl OracleEval {
+    /// The lexical ground truth, if the entry has a lexical oracle.
+    fn ground_truth(&self) -> Option<&[String]> {
+        match self {
+            OracleEval::Lexical { gt, .. } => Some(gt),
+            OracleEval::Structural(_) | OracleEval::None { .. } => None,
+        }
+    }
+
+    /// The structural score, if the entry is an `[[ast]]` entry.
+    fn structural(&self) -> Option<&EntryScore> {
+        match self {
+            OracleEval::Structural(score) => Some(score),
+            OracleEval::Lexical { .. } | OracleEval::None { .. } => None,
+        }
+    }
+}
+
+/// Resolve `q`'s oracle for [`evaluate`], with one match on
+/// [`PlannedQuery::oracle`]: a lexical oracle's ground truth over `universe`
+/// (and its hits outside it), the structural score of an `[[ast]]` entry's
+/// rows against `structural`, or the full-list row count of an entry with no
+/// oracle.
+///
+/// # Errors
+///
+/// An `[[ast]]` entry the structural oracle has no query for, or whose
+/// pattern skim was not called with (named by the entry id); a count that
+/// does not fit a `u64`.
+fn eval_oracle(
+    q: &PlannedQuery,
+    obs: &EntryObservation,
+    universe: &Universe,
+    structural: &StructuralEvidence,
+) -> anyhow::Result<OracleEval> {
+    Ok(match &q.oracle {
+        Some(Oracle::Lexical(query)) => OracleEval::Lexical {
+            gt: ground_truth(universe.files(), query),
+            unindexed_hits: u64::try_from(
+                ground_truth(universe.unindexed_text_files(), query).len(),
+            )?,
+        },
+        Some(Oracle::Structural(target)) => OracleEval::Structural(
+            score_entry(&q.id, target, &obs.full.rows, structural).with_context(|| q.id.clone())?,
+        ),
+        None => OracleEval::None {
+            full_rows: u64::try_from(obs.full.rows.len())?,
+        },
+    })
+}
+
+/// What an entry's checks read besides its observation.
+struct CheckInputs<'a> {
+    /// The entry's oracle, resolved once ([`eval_oracle`]).
+    oracle: &'a OracleEval,
+    /// The pagination outcomes of a `[[pagination]]` entry.
+    pagination: Option<&'a PaginationOutcomes>,
 }
 
 fn run_check(
     check: CheckId,
     q: &PlannedQuery,
     obs: &EntryObservation,
-    gt: Option<&[String]>,
-    pagination: Option<&PaginationOutcomes>,
+    inputs: &CheckInputs<'_>,
 ) -> anyhow::Result<CheckOutcome> {
-    let gt = || gt.context("no oracle ground truth");
-    let pagination = || pagination.context("no pagination sweep");
+    let gt = || {
+        inputs
+            .oracle
+            .ground_truth()
+            .context("no oracle ground truth")
+    };
+    let pagination = || inputs.pagination.context("no pagination sweep");
+    let structural = || inputs.oracle.structural().context("no structural score");
     Ok(match check {
         CheckId::LexicalRecall => check_recall(&obs.full.rows, gt()?),
         CheckId::LexicalPrecision => check_precision(&obs.full.rows, gt()?),
@@ -1291,6 +1618,9 @@ fn run_check(
         CheckId::ResultsUniquePaths => {
             check_unique_paths(&obs.full.rows, &obs.sweeps, &obs.limited)
         }
+        CheckId::StructuralRecall => structural()?.recall.clone(),
+        CheckId::StructuralPrecision => structural()?.precision.clone(),
+        CheckId::StructuralCoverage => structural()?.coverage.clone(),
     })
 }
 

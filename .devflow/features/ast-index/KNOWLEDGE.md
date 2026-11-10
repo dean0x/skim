@@ -200,7 +200,7 @@ detection. `AstWalkConfig` exposes `DEFAULT_MAX_DEPTH = 500` and
 `kind_id` indexes into `NODE_KIND_VOCABULARY`; sentinel `0` maps to `""` for
 grammar kinds absent from the vocabulary. `depth` is 0-indexed from the root.
 
-`linearize_source` guards: files > 100 KiB (1 MiB for SQL) → empty result; language
+`linearize_source` guards: no grammar (`ast_size_limit` → `None`) or files > 1 MiB → empty result; language
 not in `LANG_MAPS` → empty result; grammar load failure → `Err(SearchError::Ast)`.
 Parse errors → empty result (tree-sitter is error-tolerant).
 
@@ -626,7 +626,7 @@ over different file sets is a logic error with no runtime trap.
 ```
 linearize_source(&str, Language)
     │
-    ├── Guard: source.len() > size_limit (100 KiB; 1 MiB for SQL)  → Ok(default)
+    ├── Guard: ast_size_limit None, or source.len() > 1 MiB cap    → Ok(default)
     ├── Guard: language not in LANG_MAPS                            → Ok(default)
     ├── Parser::new(language)   → Err                              → SearchError::Ast
     ├── parser.parse(source)    → Err                              → Ok(default)
@@ -673,8 +673,7 @@ AstQueryEngine::search_ast(q: &AstQuery)
 
 | Constant | Value | Source |
 |---|---|---|
-| `MAX_FILE_SIZE` | 100 KiB | `linearize.rs` |
-| `MAX_FILE_SIZE_LARGE` (SQL) | 1 MiB | `linearize.rs` |
+| `AST_SIZE_LIMIT_DEFAULT` via `ast_size_limit(lang)` | 1 MiB for every tree-sitter language, inclusive (`len > cap` is excluded); `None` for JSON/YAML/TOML | `rskim-core/src/ast_walk.rs` |
 | `DEFAULT_MAX_DEPTH` | 500 | `AstWalkConfig` |
 | `DEFAULT_MAX_NODES` | 100,000 | `AstWalkConfig` |
 | `MAX_AST_QUERY_BYTES` | 4096 (alias of `lexical::MAX_QUERY_BYTES`) | `query/parse.rs` |
@@ -801,9 +800,9 @@ AstQueryEngine::search_ast(q: &AstQuery)
   only within one grammar. Do not compare `kind_id` values across languages. The `LANG_MAPS`
   indirection exists to map from grammar-local IDs to the shared vocabulary.
 
-- **SQL file size limit is 1 MiB, not 100 KiB**: a `match` on `Language::Sql` at the top of
-  `linearize_source` is easy to miss when debugging why a large SQL file produces results
-  while a large Rust file returns empty.
+- **One AST size cap for every tree-sitter language (1 MiB, inclusive)**: `ast_size_limit` in
+  `rskim-core/src/ast_walk.rs` is its only definition (#405); `linearize_source` skips only `source.len() > cap`.
+  The search scoreboard's structural oracle keeps a cited copy (`AST_SIZE_CAP_BYTES`, feature `search-scoreboard`).
 
 - **`post_mmap` is `None` for an empty corpus**: `AstIndexReader::open` does not mmap a
   zero-length `.skpost`. `lookup_bigram`/`lookup_trigram` return `Ok(vec![])` — callers
@@ -897,7 +896,7 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - `crates/rskim-search/src/ast_index/ast_cache_tests.rs` — co-located tests (included
   via `#[path]` in `ast_cache.rs`)
 - `crates/rskim-core/src/ast_walk.rs` — `AstWalkIter`, `AstWalkConfig` (canonical limit source), `AstWalkNode`
-- `crates/rskim-search/src/ast_index/linearize.rs` — `LANG_MAPS`, `linearize_source`, `linearize_tree`; SQL size override; delegates DFS to `AstWalkIter`
+- `crates/rskim-search/src/ast_index/linearize.rs` — `LANG_MAPS`, `linearize_source`, `linearize_tree`; size guard via `ast_size_limit`; delegates DFS to `AstWalkIter`
 - `crates/rskim-search/src/ast_index/ngram.rs` — `AstBigram`, `AstTrigram`, vocabulary helpers, IDF weight lookups
 - `crates/rskim-search/src/ast_index/extract.rs` — `extract_ast_ngrams_with_metrics` (single-pass, Wave 3e), `extract_ast_ngrams_with_weights` (DI core), `AstNgramSet`, `AstBigramEntry`, `AstTrigramEntry`
 - `crates/rskim-search/src/ast_index/structural.rs` — synthetic IDs, bucket edge tables, `StructuralMetrics`, `is_counted_child`, `COMMENT_KIND_IDS`, `PUNCTUATION_KIND_IDS` (Wave 3e); `pub(crate)` visibility
