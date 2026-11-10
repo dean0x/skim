@@ -159,7 +159,7 @@ pub(crate) fn run(
 ///
 /// Receives the `CommandOutput` and a pre-computed `is_nextest` flag (captured
 /// from the original user args in `run()` to avoid re-detecting from modified args).
-fn parse_impl(output: &CommandOutput, is_nextest: bool) -> ParseResult<TestResult> {
+pub(crate) fn parse_impl(output: &CommandOutput, is_nextest: bool) -> ParseResult<TestResult> {
     if is_nextest {
         // Tier 1: nextest text state machine
         if let Some(result) = try_parse_nextest(&output.stdout) {
