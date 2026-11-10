@@ -213,7 +213,9 @@ fn run_uninstall_for_agent(
         let real_path = resolve_real_settings_path(&settings_path)?;
         let mut settings = load_or_create_settings(&real_path)?;
 
-        remove_skim_from_settings(&mut settings, protocol.hook_event_key());
+        for event_key in protocol.hook_event_keys() {
+            remove_skim_from_settings(&mut settings, event_key);
+        }
 
         atomic_write_settings(&settings, &real_path)?;
 

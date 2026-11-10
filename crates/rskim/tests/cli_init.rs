@@ -647,6 +647,54 @@ fn test_init_uninstall_preserves_other_hooks() {
     );
 }
 
+/// Claude Code gets the hook under both events, and uninstall removes the skim
+/// entry from both while it keeps a foreign hook on the post-run event.
+#[test]
+fn test_init_uninstall_removes_the_post_tool_use_entry_and_keeps_foreign_ones() {
+    let sandbox = Sandbox::new();
+    let settings_path = sandbox.claude_config().join("settings.json");
+
+    sandbox.init().args(["--yes"]).assert().success();
+
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    for event in ["PreToolUse", "PostToolUse"] {
+        assert_eq!(
+            json["hooks"][event].as_array().map(Vec::len),
+            Some(1),
+            "init should register one skim entry under {event}"
+        );
+    }
+    json["hooks"]["PostToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/usr/bin/other-hook", "timeout": 10}]
+        }));
+    fs::write(&settings_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    let contents = fs::read_to_string(&settings_path).unwrap();
+    assert!(
+        !contents.contains("skim-rewrite"),
+        "no skim entry may stay under either event"
+    );
+    let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+    assert!(json["hooks"].get("PreToolUse").is_none());
+    assert_eq!(
+        json["hooks"]["PostToolUse"].as_array().map(Vec::len),
+        Some(1),
+        "the foreign PostToolUse hook must stay"
+    );
+    assert!(contents.contains("other-hook"));
+}
+
 #[test]
 fn test_init_uninstall_when_not_installed() {
     // This is a GLOBAL uninstall with no `--agent`: before sandboxing it reached
