@@ -23,13 +23,25 @@ impl HookProtocol for ClaudeCodeHook {
         super::parse_tool_input_command(json)
     }
 
-    fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
+    fn format_response(
+        &self,
+        tool_input: Option<&serde_json::Value>,
+        rewritten_command: &str,
+    ) -> serde_json::Value {
+        // Claude Code replaces the whole tool input with `updatedInput`, so keep
+        // every field of the original input and change only `command` (#586).
+        let updated_input = match tool_input {
+            Some(serde_json::Value::Object(fields)) => {
+                let mut fields = fields.clone();
+                fields.insert("command".to_string(), rewritten_command.into());
+                serde_json::Value::Object(fields)
+            }
+            _ => serde_json::json!({ "command": rewritten_command }),
+        };
         serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "updatedInput": {
-                    "command": rewritten_command
-                }
+                "updatedInput": updated_input
             }
         })
     }
@@ -92,17 +104,60 @@ mod tests {
 
     #[test]
     fn test_claude_format_response() {
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         let output = response.get("hookSpecificOutput").unwrap();
         assert_eq!(output["hookEventName"], "PreToolUse");
         assert_eq!(output["updatedInput"]["command"], "skim cargo test");
     }
 
     #[test]
+    fn test_claude_format_response_keeps_every_tool_input_field() {
+        let tool_input = serde_json::json!({
+            "command": "cargo test",
+            "description": "Run the tests",
+            "timeout": 600000,
+            "run_in_background": true,
+            "dangerouslyDisableSandbox": false
+        });
+        let response = hook().format_response(Some(&tool_input), "skim cargo test");
+
+        let mut expected = tool_input.clone();
+        expected["command"] = serde_json::json!("skim cargo test");
+        assert_eq!(response["hookSpecificOutput"]["updatedInput"], expected);
+    }
+
+    #[test]
+    fn test_claude_format_response_without_an_input_object_sends_the_command_only() {
+        for tool_input in [None, Some(serde_json::json!("cargo test"))] {
+            let response = hook().format_response(tool_input.as_ref(), "skim cargo test");
+            assert_eq!(
+                response["hookSpecificOutput"]["updatedInput"],
+                serde_json::json!({ "command": "skim cargo test" })
+            );
+        }
+    }
+
+    #[test]
     fn test_claude_format_response_no_permission_decision() {
-        let response = hook().format_response("skim cargo test");
-        // SECURITY: Must never set permissionDecision
-        assert!(response.get("permissionDecision").is_none());
+        let tool_input = serde_json::json!({
+            "command": "cargo test",
+            "description": "Run the tests",
+            "dangerouslyDisableSandbox": true
+        });
+        for input in [None, Some(&tool_input)] {
+            let response = hook().format_response(input, "skim cargo test");
+            // SECURITY: Must never set permissionDecision, at the top level or
+            // under hookSpecificOutput, also when the input fields are copied.
+            assert!(response.get("permissionDecision").is_none());
+            let mut keys: Vec<&str> = response["hookSpecificOutput"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["hookEventName", "updatedInput"]);
+        }
     }
 
     #[test]

@@ -27,7 +27,11 @@ impl HookProtocol for CrushHook {
         super::parse_tool_input_command(json)
     }
 
-    fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
+    fn format_response(
+        &self,
+        _tool_input: Option<&serde_json::Value>,
+        rewritten_command: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "decision": "allow",
             "updated_input": { "command": rewritten_command }
@@ -101,14 +105,14 @@ mod tests {
 
     #[test]
     fn test_crush_format_response() {
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         assert_eq!(response["decision"], "allow");
         assert_eq!(response["updated_input"]["command"], "skim cargo test");
     }
 
     #[test]
     fn test_crush_format_response_has_required_decision_field() {
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         assert_eq!(
             response.get("decision").and_then(|v| v.as_str()),
             Some("allow"),
@@ -119,7 +123,7 @@ mod tests {
     #[test]
     fn test_crush_format_response_no_permission_decision() {
         // Crush must not emit Claude Code's permissionDecision field
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         assert!(response.get("permissionDecision").is_none());
     }
 

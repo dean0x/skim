@@ -22,7 +22,11 @@ impl HookProtocol for CodexCliHook {
         None
     }
 
-    fn format_response(&self, _rewritten_command: &str) -> serde_json::Value {
+    fn format_response(
+        &self,
+        _tool_input: Option<&serde_json::Value>,
+        _rewritten_command: &str,
+    ) -> serde_json::Value {
         serde_json::Value::Null
     }
 
@@ -61,7 +65,7 @@ mod tests {
 
     #[test]
     fn test_codex_format_response_returns_null() {
-        let response = hook().format_response("skim cargo test");
+        let response = hook().format_response(None, "skim cargo test");
         assert!(response.is_null());
     }
 

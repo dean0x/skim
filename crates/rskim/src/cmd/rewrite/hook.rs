@@ -641,7 +641,7 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // ancestry walk (read_session_id) or SKIM_SESSION_ID env var.
             let final_cmd = result.tokens.join(" ");
             audit_hook(&command, true, &final_cmd);
-            let response = protocol.format_response(&final_cmd);
+            let response = protocol.format_response(json.get("tool_input"), &final_cmd);
             write_hook_response(&response)?;
         }
         None => {
@@ -1417,7 +1417,7 @@ mod tests {
         );
 
         // The hook response JSON must contain no systemMessage or additionalContext.
-        let response = ClaudeCodeHook.format_response("skim git status");
+        let response = ClaudeCodeHook.format_response(None, "skim git status");
         let json_str = response.to_string();
         assert!(
             !json_str.contains("systemMessage"),
