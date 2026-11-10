@@ -1,14 +1,22 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
-description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, working on skim init --permissions / the PermissionsProtocol subsystem, modifying the proxy feature gate / cfg-gated registry entries, touching the lossy-view transparency marker, working on doctor integrity checks / ScriptIntegrity / hook_status_line, adding test harness sandboxing, modifying the rewrite engine dispatch (try_rewrite / command_needs_exact_bytes / is_bare_cat_pipeline / dispatch_for_wrapper / dispatch_inner / dispatch_explicit), working on the force-raw sidecar / stdout destination gate / Surface enum, or working on rate-limited hook.log signals (warn_once_daily, should_warn_today, DriftKind, log_declined_multiline). Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, resolve_skim_binary, generate_hook_script, uses_pinned_binary, pin_is_current, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, seed tier, sidecar manifest, proxy feature gate, KNOWN_SUBCOMMANDS, META_SUBCOMMANDS, WRAPPER_TARGETS, wrapper_targets, dispatch_for_wrapper, dispatch_inner, dispatch_explicit, passthrough_strips_json, Surface, command_needs_exact_bytes, is_bare_cat_pipeline, BYTE_EXACT_PIPE_CONSUMERS, force_raw_requested, set_force_raw, session_sidecar, isatty, ScriptIntegrity, classify_script_integrity, hook_status_line, HookFacts, NoManifest, Tampered, Verified, Unreadable, binary pin mismatch, skim_sandboxed, skim_sandboxed_with_bin, hermetic_path, SKIM_CACHE_DIR, require_flags_for_tool, interactive_tool_for, skip_flags_for_tool, byte loss 304 6803, #514, ADR-004, ADR-005, ADR-006, ADR-008, PF-010, PF-015, PF-017, warn_once_daily, should_warn_today, DriftKind, log_declined_multiline, DECLINED_MULTILINE_KIND."
+description: "Use when changing hook install, binary pinning, wrapper symlinks or the wrapper flag zone, rewrite engine dispatch, the force-raw sidecar, doctor integrity or permissions seeding. Keywords: hook, wrapper_flag_zone."
 category: domain-knowledge
-directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions]
+directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions, crates/rskim/src/main.rs, crates/rskim/src/runner.rs]
 created: 2026-07-04
-updated: 2026-09-29
+updated: 2026-11-10
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
+
+## Rules
+
+- **KB-INV-1** `wrapper_flag_zone` in `main.rs` is empty: on the PATH-wrapper surface every argument belongs to the wrapped tool, and `SKIM_PASSTHROUGH=1` / `SKIM_DEBUG=1` are the only wrapper-surface controls. Pinned by `test_wrapper_zone_is_empty` and `cli_wrapper_flag_zone.rs`.
+- **KB-AP-1** Do not give `wrapper_flag_zone` a prefix rule (leading flags, or up to the first positional): a separate-token value of a tool flag also starts with `-` (`grep -e --passthrough f`), so deleting it makes the tool read its pattern from stdin and answer wrongly at exit 0.
+- **KB-INV-2** The rewrite engine's PATH-resolvability check (`target_program_is_unresolvable`) runs only after a rule or a `cat`/`head`/`tail` handler has produced a rewrite; a command nothing rewrites returns `None` without touching the filesystem.
+- **KB-AP-2** Do not call `runner::program_resolves` with text taken from a command line: it stats paths and its verdict cache has one entry per distinct string, so only rule heads and handler names are safe arguments.
+- **KB-AP-3** Do not test the wrapper surface through a skim link outside the directory `SKIM_WRAPPERS_DIR` names, or without a private `PATH` and a bounded run: the link is not stripped from `PATH`, so the real-tool spawn re-executes it without bound.
 
 ## Overview
 
@@ -48,6 +56,14 @@ static WRAPPER_TARGETS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 - **D4** (via `arg_matches_flag` + `skip_flags_for_tool`): Tool-owned skip flags — e.g., `rg --json` enables rg's own JSON output. `redaction_is_mandatory(subcommand)` blocks this gate for `env`/`printenv` so credential redaction always runs.
 - **D5** (interactive-tool gate, via `interactive_tool_for` + `require_flags_for_tool`): If `interactive_tool_for(subcommand)` returns true and no required flags are present, exec via `run_inherited_passthrough` with inherited stdio so TTY line-editing works. `interactive_tool_for` asks "would this tool open a readline session?"; `require_flags_for_tool` asks "does the rewrite rule need this flag?". D4 and D5 use `arg_matches_flag` so `psql --command=…` is accepted on both surfaces. `require_flags_for_tool` reads the same `rules::all_rules()` table as `skip_flags_for_tool` — adding a required flag in rules.rs propagates to both D4 and D5 automatically.
 
+### `wrapper_flag_zone` — Empty by Design
+
+`main()` reads skim's own `--debug` and `--passthrough` flags only from a **zone** of the argv. Two zone functions exist, one per surface. `skim_flag_zone` (skim-typed lines) is the args before the first positional when that positional is a subcommand token, and the whole pre-`--` argv otherwise. `wrapper_flag_zone` (PATH-wrapper surface) returns the empty slice: under a `<wrappers-dir>/<tool>` link `argv[0]` is the tool, so skim reads no flag of its own from the line.
+
+No prefix rule is safe, because skim cannot tell its own flag from a token the tool owns. After a positional the zone would widen to the whole line (`docker run img cmd --passthrough` would flip skim to passthrough and `strip_skim_flags` would delete the token from docker's argv). Inside a leading run of flags, `grep -e --passthrough f` would lose the pattern of `-e`. The effect of the empty zone: `--passthrough` / `--debug` typed as a wrapped-tool argument are no longer skim controls; use the env vars.
+
+`crates/rskim/tests/cli_wrapper_flag_zone.rs` proves `main()` takes the wrapper branch by running the built binary through a real link named for the tool, with a recording stub of the same name and a private `PATH` (wrappers dir, then stub dir). It asserts the stub sees the argv unchanged and skim prints no startup line. Every run is bounded (20 s) and kills the child's whole process group on expiry; every link sits inside the one directory `SKIM_WRAPPERS_DIR` names (see `KB-AP-3`).
+
 ### `dispatch_explicit()` — Canonical Explicit-Surface Entry Point
 
 `dispatch_explicit(subcommand, args, analytics)` is the public entry point for `main.rs`'s `Invocation::Subcommand` arm (the `skim <tool>` path). It tags the call as `Surface::Explicit` and delegates to `dispatch_inner`. No D3/D4/D5 gates are applied on the explicit surface — those are wrapper-surface concerns.
@@ -75,7 +91,7 @@ Every category-3 entry has a measured defect behind it (producer `git log -n 40`
 
 **STRUCTURAL LIMIT, now documented on the constant's own rustdoc:** membership is keyed on the consumer's command head name alone (`segment_head`), so a flag-discriminated consumer is unrepresentable. `head -c 100` measures exact bytes and `cat -n` renders them, but neither can be listed without also denying bare `| head` and `| cat` — the two pipelines skim exists to compress. Those shapes stay compressed knowingly; closing them needs a per-flag key, not a new name in this list.
 
-**Surface reach — the denylist arms only the PATH-wrapper surface, and this is the most consequential fact about it.** `force_raw_requested` is consulted **only** inside the `detect_argv0_dispatch()` branch in `main.rs` (~line 1049), whose own comment states the `Subcommand` and `FileOperation` branches are intentionally NOT guarded. So `BYTE_EXACT_PIPE_CONSUMERS` — and every predicate in `command_needs_exact_bytes` — has no effect on the hook surface (which already refuses every pipeline via `is_bare_cat_pipeline`'s literal 2-segment destructuring) and no effect on the explicit surface (`skim git log -n 40 | wc -l` still returns `40` by design — typing `skim` yourself is the opt-in to the compressed view). The category-3 defects above are latent on a machine without `~/.skim/bin` and go live on `skim init --wrappers`; `wc` and `diff` are both in `wrapper_targets()`.
+**Surface reach — the denylist arms only the PATH-wrapper surface, and this is the most consequential fact about it.** `force_raw_requested` is consulted **only** inside the `detect_argv0_dispatch()` branch in `main.rs`, whose own comment states the `Subcommand` and `FileOperation` branches are intentionally NOT guarded. So `BYTE_EXACT_PIPE_CONSUMERS` — and every predicate in `command_needs_exact_bytes` — has no effect on the hook surface (which already refuses every pipeline via `is_bare_cat_pipeline`'s literal 2-segment destructuring) and no effect on the explicit surface (`skim git log -n 40 | wc -l` still returns `40` by design — typing `skim` yourself is the opt-in to the compressed view). The category-3 defects above are latent on a machine without `~/.skim/bin` and go live on `skim init --wrappers`; `wc` and `diff` are both in `wrapper_targets()`.
 
 ### The `| cat` Pipeline Exception
 
@@ -278,7 +294,7 @@ detect_state()
 - `crates/rskim/src/cmd/rewrite/mod.rs` — `skip_flags_for_tool()` (D4 source); `require_flags_for_tool()` (D5 required-flags check); `interactive_tool_for()` (D5 outer gate: "would this tool open a readline session?"); `arg_matches_flag()`; `args_before_separator()`; `classify_command()`
 - `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`; five early returns before `set_force_raw`; `check_hook_integrity()` (ClaudeCode-only); `warn_once_daily`/`should_warn_today` (shared rate-limiter, `.hook-{kind}-warned-{agent}` stamp, UTC calendar day); `DriftKind` (`version`/`binary`/`commit`/`unpinned`); `log_declined_multiline`/`DECLINED_MULTILINE_KIND` (F12 — interior-newline rewrite bail signal, ADR-011 class 2)
 - `crates/rskim/src/cmd/session_sidecar.rs` — `set_force_raw`/`read_force_raw`; `{ppid}.{tool}.raw` key; wildcard `{ppid}.raw`; `FORCE_RAW_MAX_AGE` (300 s)
-- `crates/rskim/src/main.rs` — `dispatch_for_wrapper` call site; `dispatch_explicit` call site; `stdout_should_serve_raw()` (`isatty(1)`, not `is_char_device()`); `force_raw_requested()`
+- `crates/rskim/src/main.rs` — `wrapper_flag_zone` (empty) and `skim_flag_zone`; `dispatch_for_wrapper` call site; `dispatch_explicit` call site; `stdout_should_serve_raw()` (`isatty(1)`, not `is_char_device()`); `force_raw_requested()`
 - `crates/rskim/src/cmd/integrity.rs` — `ScriptIntegrity` enum; `classify_script_integrity()`; `verify_script_integrity`; `compute_file_hash()`; `write_hash_manifest()`
 - `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch; `script_has_pinned_marker()`; `HookFacts`; `hook_facts()`
 - `crates/rskim/src/cmd/init/helpers.rs` — `resolve_skim_binary()` (single canonical path source); `confirm_grant()` (TTY-gated consent gate)
@@ -289,6 +305,9 @@ detect_state()
 - `crates/rskim/tests/common/mod.rs` — `skim_sandboxed_with_bin(home, bin)` (authoritative sandbox); `skim_sandboxed(home)` (delegates to above)
 - `crates/rskim/tests/cli_cross_surface_conformance.rs` — (tool × arg set) matrix across both surfaces; SKIM_CACHE_DIR per-test temp dir; pinned divergences
 - `crates/rskim/tests/cli_stdout_destination.rs` — 18/18 pinned stdout-destination matrix; socket cell is the one remaining structural divergence
+- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite`; Step 2b `target_program_is_unresolvable` (after a rule match and after a `cat`/`head`/`tail` handler rewrite only); probe-reach tests (`test_unrewritable_first_token_is_never_probed`, `test_rule_heads_are_bare_names_or_cwd_relative`)
+- `crates/rskim/src/runner.rs` — `program_resolves` (PATH walk plus process-wide verdict cache; pass only a rule head or handler name)
+- `crates/rskim/tests/cli_wrapper_flag_zone.rs` — end-to-end wrapper-surface argv fidelity through a real link, private `PATH`, recording stub, process-group kill, 20 s bound
 - `crates/rskim/tests/cli_wrapper_argv0.rs` — D5 tests with fake psql/mysql on PATH; env controls
 - `crates/rskim/tests/cli_doctor.rs` — `hermetic_path()`; `test_doctor_exits_0_on_binary_pin_mismatch` (copy-binary technique; exit 0 because pin mismatch is advisory, not drift)
 
@@ -307,6 +326,6 @@ detect_state()
 - ADR-005: Guidance framed as calibrated trust; prohibits `SKIM_PASSTHROUGH` in guidance template
 - ADR-008: Default builds never link async/TLS/HTTP; `proxy` cfg-pair is the runtime enforcement
 - Feature: `file-wrapper-fidelity` — the B1 convergence gate for `SKIM_PASSTHROUGH`, D3/D4/D5 wrapper gates inside `dispatch_inner`, and the force-raw sidecar architecture are shared between the two feature areas; `Surface` enum and `dispatch_inner`/`dispatch_explicit` split also documented there
-- Feature: `build-parsers` — Fix C (`command_needs_passthrough`, interior-newline detection) and the F12 `log_declined_multiline` signal documented here are the same mechanism from the rewrite-engine side; PF-038's global PATH-resolvability bail (`try_rewrite` Step 2b) is also rewrite-engine-only, alongside Fix A/C/E
+- Feature: `build-parsers` — Fix C (`command_needs_passthrough`, interior-newline detection) and the F12 `log_declined_multiline` signal documented here are the same mechanism from the rewrite-engine side; the rewrite engine's PATH-resolvability check (`try_rewrite` Step 2b) is also rewrite-engine-only, alongside Fix A/C/E; it runs only after a rule or a `cat`/`head`/`tail` handler has produced a rewrite, never on the raw first token
 - Source: `crates/rskim/src/cmd/hook_log.rs` — `log_hook_warning()` (only permitted diagnostic channel in hook mode)
 - Tests: `crates/rskim/tests/cli_integrity.rs` — E2E tests for `classify_script_integrity` and `hook_status_line`
