@@ -4,9 +4,10 @@
 //! The command already ran, so the hook must start no process. Every run here
 //! has a private `PATH` of sentinel stubs (a stub writes a file when it runs,
 //! and each rewrite rule needs its tool to resolve), a private cache dir, and
-//! `SKIM_HOOK_AUDIT=1`. [`hook`] fails the test when a stub ran, when the hook
-//! wrote anything to the cache dir (marker, sidecar, audit log, hook.log), or
-//! when it exited non-zero or printed to stderr.
+//! `SKIM_HOOK_AUDIT=1`. Analytics stays on, so the default `analytics.db` would
+//! land in that cache dir. [`hook`] fails the test when a stub ran, when the hook
+//! wrote anything to the cache dir (marker, sidecar, audit log, hook.log,
+//! analytics.db), or when it exited non-zero or printed to stderr.
 
 #![cfg(unix)]
 
@@ -77,7 +78,6 @@ fn spawn_with(agent: &str, cache: &Path, envs: &[(&str, &str)]) -> Child {
         .env("HOME", cache)
         .env("SKIM_CACHE_DIR", cache)
         .env("SKIM_HOOK_AUDIT", "1")
-        .env("SKIM_DISABLE_ANALYTICS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -306,7 +306,7 @@ compresses! {
 }
 
 #[test]
-fn response_holds_no_permission_decision_at_any_level() {
+fn response_adds_no_permission_decision_key() {
     let text = post(&baseline()).expect("compresses").to_string();
     for key in FORBIDDEN_KEYS.split_whitespace() {
         assert!(!text.contains(&format!("\"{key}\"")), "{key}: {text}");
@@ -365,6 +365,14 @@ fn each_skip_gate_gives_no_output() {
     let padded = |len: usize| json!(format!("{raw}{}", " ".repeat(len - raw.len())));
     let input = changed(&baseline(), STDOUT, Some(padded(28_999)));
     assert!(post(&input).is_some(), "28,999 characters compress");
+    // The limit counts characters: this text has 28,999 of them in more than 29,000 bytes.
+    let accented = format!("{raw}{}", "é".repeat(28_999 - raw.chars().count()));
+    assert!(accented.len() > 29_000, "{} bytes", accented.len());
+    let input = changed(&baseline(), STDOUT, Some(json!(accented)));
+    assert!(
+        post(&input).is_some(),
+        "28,999 characters in over 29,000 bytes compress"
+    );
     #[rustfmt::skip]
     let set = [
         (STDOUT, padded(29_000)), (STDOUT, json!(7)),

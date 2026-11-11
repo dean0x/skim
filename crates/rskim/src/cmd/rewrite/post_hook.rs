@@ -662,6 +662,7 @@ mod tests {
     #[test]
     fn each_gate_declines_when_one_field_of_the_baseline_changes() {
         use serde_json::json;
+        assert!(respond(&baseline()).is_some(), "the baseline compresses");
         let marked = |text: &str| format!("{text}{}", cargo_stdout());
         let cases: Vec<(&str, Option<Value>)> = vec![
             ("/permission_mode", Some(json!("default"))),
@@ -731,8 +732,23 @@ mod tests {
         }
     }
 
+    /// The limit counts characters, not bytes: 28,999 two-byte characters are
+    /// more than 29,000 bytes and still compress.
+    #[test]
+    fn the_char_limit_counts_characters_not_bytes() {
+        let base = cargo_stdout();
+        let padded = format!("{base}{}", "é".repeat(MAX_STDOUT_CHARS - 1 - base.len()));
+        assert_eq!(padded.chars().count(), MAX_STDOUT_CHARS - 1);
+        assert!(padded.len() > MAX_STDOUT_CHARS, "{} bytes", padded.len());
+        assert!(
+            respond(&call("cargo test", &padded)).is_some(),
+            "28,999 characters compress"
+        );
+    }
+
     #[test]
     fn commands_outside_the_plain_allow_listed_shapes_are_declined() {
+        assert!(respond(&baseline()).is_some(), "the baseline compresses");
         for command in [
             "cargo test && cargo build",
             "cargo test | tee out.txt",
