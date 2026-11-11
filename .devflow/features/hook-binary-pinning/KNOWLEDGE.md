@@ -1,9 +1,9 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
-description: "Use when changing hook install, binary pinning, wrapper symlinks or the wrapper flag zone, rewrite engine dispatch, the force-raw sidecar, doctor integrity or permissions seeding. Keywords: hook, wrapper_flag_zone."
+description: "Use when changing hook install, binary pinning, wrapper flag zone, rewrite dispatch, force-raw sidecar, doctor integrity, permissions seeding or the after-run hook. Keywords: hook, PostToolUse, wrapper_flag_zone."
 category: domain-knowledge
-directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions, crates/rskim/src/main.rs, crates/rskim/src/runner.rs]
+directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/doctor, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions, crates/rskim/src/main.rs, crates/rskim/src/runner.rs]
 created: 2026-07-04
 updated: 2026-11-11
 ---
@@ -17,6 +17,9 @@ updated: 2026-11-11
 - **KB-INV-2** The rewrite engine's PATH-resolvability check (`target_program_is_unresolvable`) runs only after a rule or a `cat`/`head`/`tail` handler has produced a rewrite; a command nothing rewrites returns `None` without touching the filesystem.
 - **KB-AP-2** Do not call `runner::program_resolves` with text taken from a command line: it stats paths and its verdict cache has one entry per distinct string, so only rule heads and handler names are safe arguments.
 - **KB-AP-3** Do not test the wrapper surface through a skim link outside the directory `SKIM_WRAPPERS_DIR` names, or without a private `PATH` and a bounded run: the link is not stripped from `PATH`, so the real-tool spawn re-executes it without bound.
+- **KB-INV-3** `scan_foreign_post_hooks` never counts skim's own entry (skipped under every event key), scans a directory named twice once, and reports a settings file it cannot read in `unreadable`; doctor prints the findings as notes only, never a drift or exit-code change, and only when the skim hook is installed.
+- **KB-AP-4** Do not print another tool's hook command raw: init and doctor go through `ForeignPostHook::describe` (`sanitize_for_display`: 64-character cut, non-ASCII to `?`), or a settings file can write control bytes to the terminal.
+- **KB-AP-5** Do not measure the after-run size gate in bytes (`len()`): `MAX_STDOUT_CHARS` is a character limit (`chars().count()`), pinned by `the_char_limit_counts_characters_not_bytes`; and do not turn analytics off in the post-hook E2E harness, or its empty-cache-dir check cannot see `analytics.db`.
 
 ## Overview
 
@@ -26,9 +29,17 @@ The solution is a pinned-binary hook script format (F6 / PR #421) embedding the 
 
 **Post-run surface (Claude Code only).** The same script and `skim rewrite --hook` argv also serve the `PostToolUse` event. `hook.rs` `route_stdin` routes on `hook_event_name`: a `PostToolUse` input goes to `post_hook.rs` `run_post_hook`, every other input keeps the Pre path unchanged. The post path is pure: it spawns no process, reads no file, writes no analytics row, no force-raw marker and no sidecar, and skips the drift/integrity block. It replaces `tool_response.stdout` for an allow-listed, successful, auto-mode Bash call and returns no permission decision. `skim init` installs both event keys (`hook_event_keys()`); `missing_hook_events` in the detected state makes a Pre-only install fall off the fast path, and `skim doctor` notes the gap without drift.
 
+**After-run size gate.** `post_hook.rs` compresses a call only when `stdout.chars().count() < MAX_STDOUT_CHARS`: the limit counts characters, not bytes, so text of multi-byte characters under the limit still compresses even when its byte length is over it. `the_char_limit_counts_characters_not_bytes` (28,999 two-byte characters) and the boundary test beside it pin this.
+
+**Other tools' PostToolUse hooks.** Claude Code gives the model one `PostToolUse` result per Bash call, so another hook that can select Bash may cancel skim's view. `scan_foreign_post_hooks` in `init/state.rs` finds such hooks and returns `ForeignPostHooks { found, unreadable }`; `detect_state` stores it as `existing_post_hooks`, and `HookFacts.foreign_post_hooks` carries it to doctor. The scan reads, for the install scope and then the other scope, the agent's settings file and `settings.local.json`. A directory that both scopes resolve to is scanned once (the scan keys on the canonical file path). Skim's own entry is skipped under every event key by `protocol.is_skim_entry`. A file that exists but cannot be read as JSON goes to `unreadable`, so an empty `found` never reads as "checked and clean". Plugin hooks come from a plugin's own hooks file and are NOT scanned. An agent without a `PostToolUse` event key gets an empty result. Matcher test: an absent, empty or `*` matcher selects Bash; any other matcher is an unanchored regex, and an invalid regex counts as a match.
+
+**Where the findings print.** `skim init` prints one warning with each hook's command and file when `found` is not empty (it does not print `unreadable`). `skim doctor` prints `foreign_post_hook_notes` as indented `note:` lines under the agent's hook line, and only when the skim hook is installed. These notes never set the drift verdict or the exit code, as with the missing-entry note and the binary-pin mismatch. Both commands print another tool's command text through `ForeignPostHook::describe`, which calls `sanitize_for_display` (cut at 64 characters; each non-printable or non-ASCII character becomes `?`), so control bytes in a settings file cannot reach the terminal.
+
 ## Business Context
 
 **The wrong-clone hazard in practice**: parallel skim clones at the same version. Without the binary pin + SHA check, the hook would exec the wrong binary silently. `skim doctor` uses the manifest sidecar — not the hook text — to derive tamper verdicts.
+
+**Standing decisions that shape this area, in words.** The hook install pins the installing binary's absolute path and build commit. The binary-path pin is advisory: doctor reports a mismatch, and it never blocks install or sets exit 1. Provenance drift is logged and diagnosed on demand, never injected into the agent's hook response. Hook responses never self-approve a rewritten call. In Claude auto permission mode the Pre hook rewrites only commands whose output skim must mask; compression for other commands happens after the run through the PostToolUse hook, never by rewriting the command. A rewrite is not the same command to a host permission matcher (it forms a parallel command namespace), so the force-raw signal uses a sidecar file and not an env-var prefix. An integrity check must not return an empty finding set when it fails to run. Guidance text never promises output correctness and never advises `SKIM_PASSTHROUGH`. The `proxy` subcommand is compiled out of default builds, which never link async, TLS or HTTP code. Tests that shell out to init, uninstall, doctor or the hook must sandbox `$HOME` and every agent config-dir override.
 
 **Constraints**: Hard zero-stderr invariant in hook mode (#361 Bug 3). Hooks must never fail. Script must be shell-safe for paths with spaces and single quotes. Reinstall idempotence. Permissions seeding is TTY-gated with no bypass flag.
 
@@ -113,7 +124,7 @@ Two independent surfaces detect that skim's output will reach a file and must se
 
 **Wrapper surface (runtime):** `stdout_should_serve_raw()` in `main.rs` uses a real `isatty(1)` test (not `is_char_device()` — using the file-type bit as an isatty proxy misclassifies `/dev/null`, `/dev/zero`, and `/dev/random` as terminals). `force_raw_requested(tool)` additionally reads the sidecar written by the rewrite surface.
 
-**Key: partial knowledge → wildcard.** When the rewrite engine cannot identify the pipe-source tool (exec-prefix launchers like `timeout 60 git log`, unrepresentable shapes, head-count overflow), it writes the wildcard marker `{ppid}.raw` which matches every tool. A sidecar was chosen over an env-var prefix because an env prefix shifts the command into a namespace host permission matchers no longer match (PF-010), and it is not semantics-preserving for compound shapes (PF-004).
+**Key: partial knowledge → wildcard.** When the rewrite engine cannot identify the pipe-source tool (exec-prefix launchers like `timeout 60 git log`, unrepresentable shapes, head-count overflow), it writes the wildcard marker `{ppid}.raw` which matches every tool. A sidecar was chosen over an env-var prefix because an env prefix shifts the command into a namespace host permission matchers no longer match, and it is not semantics-preserving for compound shapes.
 
 **Sidecar key is `{ppid}.{tool}.raw`.** PPID alone is not a command identity: every command an agent runs shares that PID, so a PPID-only key made one command's verdict decide unrelated concurrent, background, and nested-sub-agent wrapper invocations. The tool component comes from `command_heads`; a shape that defeats head extraction falls back to the wildcard `{ppid}.raw`.
 
@@ -134,7 +145,7 @@ A marker left by a previously processed command (that the hook fired for) lives 
 
 This caused four argv0-surface tests to fail while their hook-surface twins passed. The failure was not reproducible under `cargo test` (which forks per-test) but always reproducible under nextest. `cli_cross_surface_conformance.rs` sets `SKIM_CACHE_DIR` to a per-test temp dir.
 
-Relates to PF-017: any test shelling out to `skim init`/`--uninstall`/`doctor`/`rewrite --hook` must use `skim_sandboxed_with_bin` or set `SKIM_CACHE_DIR` explicitly.
+Any test shelling out to `skim init`/`--uninstall`/`doctor`/`rewrite --hook` must use `skim_sandboxed_with_bin` or set `SKIM_CACHE_DIR` explicitly.
 
 ### `resolve_skim_binary()` — Single Source of Truth for Binary Path
 
@@ -149,7 +160,7 @@ On macOS, `/tmp → /private/tmp`. On Homebrew installs, the binary sits behind 
 
 **`hook_is_current()`**: version matches && pinned format && commit matches. Does NOT check path — that is `pin_is_current()`'s job.
 
-**`pin_is_current()`**: compares `hook_binary_pin` against `resolve_skim_binary()`. Used only by `hook_status_line` in `skim doctor` — it is **not a fast-path gate** (ADR-014: provenance machinery is advisory, not enforcing).
+**`pin_is_current()`**: compares `hook_binary_pin` against `resolve_skim_binary()`. Used only by `hook_status_line` in `skim doctor` — it is **not a fast-path gate** (the pin is advisory: doctor reports a mismatch, and it never gates install or sets exit 1).
 
 **Fast-path** (6 conditions):
 ```
@@ -183,11 +194,11 @@ The older `cli_both_surfaces_paired.rs` compared stdout only and its "hook surfa
 
 ### Proxy Feature Gate
 
-The `proxy` subcommand is compiled out of default builds (ADR-008). Enforced at three coordinated places: registry pair-gate (both `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the same `#[cfg(feature = "proxy")]`), the routing guard in `main.rs`, and optional Cargo deps. `test_proxy_registry_entries_gated_as_a_pair` asserts the cfg-pair.
+The `proxy` subcommand is compiled out of default builds (default builds never link async, TLS or HTTP code). Enforced at three coordinated places: registry pair-gate (both `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the same `#[cfg(feature = "proxy")]`), the routing guard in `main.rs`, and optional Cargo deps. `test_proxy_registry_entries_gated_as_a_pair` asserts the cfg-pair.
 
 ### Transparency Marker
 
-`lossy_view_marker` fires when the served view differs from baseline. `rewrite_origin()` reads `SKIM_REWRITTEN_FROM` with a closed vocabulary. Marker is rewrite-engine-only — PATH-wrapper-mediated reads are intentionally unmarked (PF-004). See file-wrapper-fidelity KB for full treatment.
+`lossy_view_marker` fires when the served view differs from baseline. `rewrite_origin()` reads `SKIM_REWRITTEN_FROM` with a closed vocabulary. Marker is rewrite-engine-only — PATH-wrapper-mediated reads are intentionally unmarked. See file-wrapper-fidelity KB for full treatment.
 
 ### `warn_once_daily` — Rate-Limited `hook.log` Signals
 
@@ -197,7 +208,7 @@ The `proxy` subcommand is compiled out of default builds (ADR-008). Enforced at 
 - `"version"`, `"binary"`, `"commit"`, `"unpinned"` — the four `DriftKind` variants (`log_drift_warnings`), one stamp per kind per agent
 - `"declined-multiline"` (`DECLINED_MULTILINE_KIND`, added by F12, commit `9a73593`) — see below
 
-**F12 — the interior-newline rewrite bail now signals through this mechanism.** Before F12, `run_hook_mode`'s `command_needs_passthrough(&command)` bail (Fix C, shared with the `build-parsers` feature knowledge) emitted nothing at all: 0 B stdout, 0 B stderr, exit 0, empty cache dir — a declined rewrite was indistinguishable from "nothing to rewrite." `log_declined_multiline(agent_name)` now calls `warn_once_daily(cache_dir, DECLINED_MULTILINE_KIND, agent_name, msg)` whenever the bail specifically fires because `command.trim_end().contains('\n')` (an interior newline, not merely a trailing one — `trim_end()` mirrors `command_needs_passthrough`'s own trim exactly, so `"cargo test\n"` alone does not trigger it). ADR-011 classifies this as **class 2** (no loss: the original command still runs unmodified, byte-faithfully, so nothing is lost) — the write is unconditional (not gated behind `SKIM_DEBUG`) because ADR-011's stderr taxonomy does not apply here at all: hook mode forbids stderr at any gating, so `hook.log` is the only permitted sink regardless of class.
+**F12 — the interior-newline rewrite bail now signals through this mechanism.** Before F12, `run_hook_mode`'s `command_needs_passthrough(&command)` bail (Fix C, shared with the `build-parsers` feature knowledge) emitted nothing at all: 0 B stdout, 0 B stderr, exit 0, empty cache dir — a declined rewrite was indistinguishable from "nothing to rewrite." `log_declined_multiline(agent_name)` now calls `warn_once_daily(cache_dir, DECLINED_MULTILINE_KIND, agent_name, msg)` whenever the bail specifically fires because `command.trim_end().contains('\n')` (an interior newline, not merely a trailing one — `trim_end()` mirrors `command_needs_passthrough`'s own trim exactly, so `"cargo test\n"` alone does not trigger it). The stderr-notice rule classifies this as **class 2** (no loss: the original command still runs unmodified, byte-faithfully, so nothing is lost) — the write is unconditional (not gated behind `SKIM_DEBUG`) because that stderr taxonomy does not apply here at all: hook mode forbids stderr at any gating, so `hook.log` is the only permitted sink regardless of class.
 
 **The message deliberately omits the declined command text.** `command_needs_passthrough` folds 8+ distinct triggers (heredocs, `$(…)`, backticks, unmatched quotes, whitespace that doesn't survive split+rejoin, …) into one `bool`, so the caller re-tests exactly the one condition this signal was measured against (the interior newline) rather than trying to name the reason generically. The command text itself is never written to `hook.log`: it is unbounded and routinely carries credentials. `SKIM_HOOK_AUDIT=1` remains the existing opt-in channel that records each declined command in full, to `hook-audit.log`.
 
@@ -226,6 +237,10 @@ detect_state()
 
 ## Anti-Patterns
 
+**KB-AP-4 — printing another tool's hook command raw.** The command text comes from a settings file skim does not own. `sanitize_for_display` keeps printable ASCII, cuts at 64 characters and turns anything else into `?`; `ForeignPostHook::describe` applies it, and the collision warning for Pre hooks in `install.rs` applies it too. Tests `test_doctor_filters_a_foreign_hooks_command_text_before_printing_it` and `test_foreign_post_hook_describe_filters_control_bytes_and_newlines` pin it.
+
+**KB-AP-5 — a byte count or an analytics-off harness in the after-run checks.** A byte count rejects multi-byte output that is under the limit in characters, and so declines a call that should compress. The post-hook E2E harness (`cli_e2e_post_hook.rs`) clears the environment and keeps analytics on on purpose: the default `analytics.db` would land in the private cache dir, so the helper's "cache dir is empty" check covers it. Its pre-run test shows the same check can fail when something writes. Setting `SKIM_DISABLE_ANALYTICS` there would hide an analytics write from that check.
+
 **Calling `dispatch_inner()` directly on the wrapper surface.** It silently bypasses the D3 help/version passthrough, D4 tool skip flags, and D5 require-flag passthrough that `dispatch_for_wrapper()` applies. The wrapper entry point in `main.rs` is `dispatch_for_wrapper`.
 
 **Calling `dispatch_for_wrapper()` on the explicit surface.** The explicit surface (`skim <tool>`) must call `dispatch_explicit`, not `dispatch_for_wrapper`. The D3/D4/D5 gates belong on the wrapper surface only.
@@ -248,13 +263,15 @@ detect_state()
 
 **Using `let _ = write_hash_manifest(...)`.** The manifest write must use `?`.
 
-**Running init/doctor/rewrite-hook tests without `skim_sandboxed_with_bin`.** Tests without sandboxing will mutate the developer's real `~/.claude`, `~/.gemini`, `~/.skim/bin`, etc. (PF-017).
+**Running init/doctor/rewrite-hook tests without `skim_sandboxed_with_bin`.** Tests without sandboxing will mutate the developer's real `~/.claude`, `~/.gemini`, `~/.skim/bin`, etc.
 
 **Trying to reach pin-mismatch in doctor by editing the hook script.** Any edit trips `Tampered`, which early-returns before the pin block. Install from a binary at one path and run doctor from another — the copy-binary technique.
 
 **Mis-gating the proxy registry entries.** `"proxy"` must appear in both `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the **same** `#[cfg(feature = "proxy")]`.
 
 ## Gotchas
+
+**KB-INV-3 — what the foreign PostToolUse scan does not see.** Plugin hooks are not scanned, so "no note" means no competing hook in the settings files, not none at all. `init` shows only `found`; a file in `unreadable` is shown by doctor alone ("could not read ...; its PostToolUse hooks are not checked"). Skim's own entry can sit under any event key, so the skip is by `is_skim_entry`, not by event name. The Bash matcher test errs toward a warning: an invalid regex counts as a match, since a wrong answer costs one extra line. Doctor tests in `cli_doctor.rs` cover the local-settings file, the other scope, skim's own entry (no note), a matcher that cannot select Bash (no note) and text filtering.
 
 **`WRAPPER_TARGETS` is derived, not maintained.** Adding a tool to `KNOWN_SUBCOMMANDS` automatically adds it to wrapper_targets (if it is not in `META_SUBCOMMANDS`). The only routing key for the golangci linter is `golangci-lint`; the bare `golangci` alias is absent from `dispatch_inner`.
 
@@ -294,15 +311,15 @@ detect_state()
 - `crates/rskim/src/cmd/dispatch.rs` — `dispatch_for_wrapper()` (thin tag → `Surface::Wrapper`); `dispatch_explicit()` (explicit surface entry → `Surface::Explicit`); private `dispatch_inner(surface, …)` (shared core; D3/D4/D5 wrapper gates live here behind `if surface == Surface::Wrapper`); `redaction_is_mandatory()`; `Surface` enum; `passthrough_strips_json()`; B1 `SKIM_PASSTHROUGH` convergence gate; `MULTI_LEVEL_DISPATCHERS`, `HANDLER_CONSUMED_TOKENS`
 - `crates/rskim/src/cmd/rewrite/compound.rs` — `command_needs_exact_bytes()` (single extension point; predicates: `is_capture_shape`, `stdout_redirected_to_file`, `pipe_consumer_needs_exact_bytes`); `is_bare_cat_pipeline()` (`| cat` exception); `BYTE_EXACT_PIPE_CONSUMERS` (denylist); `try_rewrite_compound()` (pipe guard: `has_pipe_operator && !is_bare_cat_pipeline`); `rejoin_segments()`; `set_force_raw()`, `read_force_raw()`
 - `crates/rskim/src/cmd/rewrite/mod.rs` — `skip_flags_for_tool()` (D4 source); `require_flags_for_tool()` (D5 required-flags check); `interactive_tool_for()` (D5 outer gate: "would this tool open a readline session?"); `arg_matches_flag()`; `args_before_separator()`; `classify_command()`
-- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`; five early returns before `set_force_raw`; `check_hook_integrity()` (ClaudeCode-only); `warn_once_daily`/`should_warn_today` (shared rate-limiter, `.hook-{kind}-warned-{agent}` stamp, UTC calendar day); `DriftKind` (`version`/`binary`/`commit`/`unpinned`); `log_declined_multiline`/`DECLINED_MULTILINE_KIND` (F12 — interior-newline rewrite bail signal, ADR-011 class 2)
+- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`; five early returns before `set_force_raw`; `check_hook_integrity()` (ClaudeCode-only); `warn_once_daily`/`should_warn_today` (shared rate-limiter, `.hook-{kind}-warned-{agent}` stamp, UTC calendar day); `DriftKind` (`version`/`binary`/`commit`/`unpinned`); `log_declined_multiline`/`DECLINED_MULTILINE_KIND` (F12 — interior-newline rewrite bail signal, stderr-notice class 2)
 - `crates/rskim/src/cmd/session_sidecar.rs` — `set_force_raw`/`read_force_raw`; `{ppid}.{tool}.raw` key; wildcard `{ppid}.raw`; `FORCE_RAW_MAX_AGE` (300 s)
 - `crates/rskim/src/main.rs` — `wrapper_flag_zone` (empty) and `skim_flag_zone`; `dispatch_for_wrapper` call site; `dispatch_explicit` call site; `stdout_should_serve_raw()` (`isatty(1)`, not `is_char_device()`); `force_raw_requested()`
 - `crates/rskim/src/cmd/integrity.rs` — `ScriptIntegrity` enum; `classify_script_integrity()`; `verify_script_integrity`; `compute_file_hash()`; `write_hash_manifest()`
 - `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch; `script_has_pinned_marker()`; `HookFacts`; `hook_facts()`
 - `crates/rskim/src/cmd/init/helpers.rs` — `resolve_skim_binary()` (single canonical path source); `confirm_grant()` (TTY-gated consent gate)
 - `crates/rskim/src/cmd/init/install.rs` — `run_install_single()` (fast path: 6 gates; wrappers inside fast path); `create_hook_script()`; `atomic_write_executable()`; `maybe_install_wrappers()`
-- `crates/rskim/src/cmd/init/state.rs` — `detect_state()`; `hook_is_current()`; `pin_is_current()`; `parse_version_from_script`
-- `crates/rskim/src/cmd/doctor/mod.rs` — `hook_status_line()` (manifest-first; "binary pin mismatch" terminal; uses `version_ok` to distinguish version vs. commit mismatch; commit check derived from `hook_is_current`); `print_hook_section()`
+- `crates/rskim/src/cmd/init/state.rs` — `detect_state()`; `hook_is_current()`; `pin_is_current()`; `parse_version_from_script`; `scan_foreign_post_hooks()`, `ForeignPostHooks`, `ForeignPostHook::describe()` (both scopes plus `settings.local.json`; plugin hooks not scanned)
+- `crates/rskim/src/cmd/doctor/mod.rs` — `hook_status_line()` (manifest-first; "binary pin mismatch" terminal; uses `version_ok` to distinguish version vs. commit mismatch; commit check derived from `hook_is_current`); `print_hook_section()`; `foreign_post_hook_notes()` (advisory notes, no exit-code change, installed hook only)
 - `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait
 - `crates/rskim/tests/common/mod.rs` — `skim_sandboxed_with_bin(home, bin)` (authoritative sandbox); `skim_sandboxed(home)` (delegates to above)
 - `crates/rskim/tests/cli_cross_surface_conformance.rs` — (tool × arg set) matrix across both surfaces; SKIM_CACHE_DIR per-test temp dir; pinned divergences
@@ -315,18 +332,6 @@ detect_state()
 
 ## Related
 
-- ADR-006: Hook responses never self-approve; permissions seeding is consent-gated; `confirm_grant` enforces pre-checks
-- ADR-011: Stderr notice taxonomy; no-loss raw-fallback banners are debug-gated; loss-bearing elision markers are unconditional
-- ADR-015: stdout fidelity gate answers role (wrapper vs. filter) and fd-1 taxonomy; `stdout_should_serve_raw()` compresses IFF fd 1 is a TTY or FIFO; `isatty(1)` is the terminal test; `is_char_device()` is not — it misclassifies `/dev/null`, `/dev/zero`, `/dev/random`; pipe ambiguity resolved by the force-raw sidecar
-- PF-004: Two interception surfaces (rewrite engine vs PATH wrappers) — `dispatch_explicit` is the rewrite entry; `dispatch_for_wrapper` is the wrapper entry; they share `dispatch_inner` but have different front-ends
-- PF-010: Rewrite creates a parallel command namespace — host permission matchers stop matching; env-var prefixing (rejected alternative to sidecar) has the same problem
-- PF-015: Provenance mechanism fails in ways its own tests cannot see; copy-binary E2E technique for pin-mismatch coverage
-- PF-017: Installer tests must sandbox `$HOME` + all five agent config-dir overrides; `SKIM_CACHE_DIR` additionally required for rewrite-hook tests
-- PF-025: D4 and D5 read the same `rules::all_rules()` table via `skip_flags_for_tool` and `require_flags_for_tool`; adding a tool-specific flag in rules.rs propagates to both surfaces automatically — but PF-025 rule 8 says a fix's own tests are NECESSARY BUT NEVER A SUFFICIENT oracle, so test both surfaces independently
-- PF-026: Verification methodology for self-interposing tools — "the raw control is not raw unless you prove it"; relevant when writing tests that verify skim compresses vs. passes through its own output
-- ADR-004: Hook install pins absolute binary path + commit SHA; `resolve_skim_binary()` is the canonicalization implementation
-- ADR-005: Guidance framed as calibrated trust; prohibits `SKIM_PASSTHROUGH` in guidance template
-- ADR-008: Default builds never link async/TLS/HTTP; `proxy` cfg-pair is the runtime enforcement
 - Feature: `file-wrapper-fidelity` — the B1 convergence gate for `SKIM_PASSTHROUGH`, D3/D4/D5 wrapper gates inside `dispatch_inner`, and the force-raw sidecar architecture are shared between the two feature areas; `Surface` enum and `dispatch_inner`/`dispatch_explicit` split also documented there
 - Feature: `build-parsers` — Fix C (`command_needs_passthrough`, interior-newline detection) and the F12 `log_declined_multiline` signal documented here are the same mechanism from the rewrite-engine side; the rewrite engine's PATH-resolvability check (`try_rewrite` Step 2b) is also rewrite-engine-only, alongside Fix A/C/E; it runs only after a rule or a `cat`/`head`/`tail` handler has produced a rewrite, never on the raw first token
 - Source: `crates/rskim/src/cmd/hook_log.rs` — `log_hook_warning()` (only permitted diagnostic channel in hook mode)
