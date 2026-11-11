@@ -122,16 +122,17 @@ pub(super) fn post_tool_for(result: &RewriteResult) -> Option<PostTool> {
         .map(|(_, tool)| *tool)
 }
 
-/// The tool for a `cat` rewrite of exactly one code file.
+/// The tool for a `cat` rewrite of exactly one tree-sitter code file.
 ///
 /// The cat handler builds `[<origin tag>, skim, <file>, <mode>]` for one file.
 /// More files add `--no-header`, and caller env vars add leading tokens, so
-/// both give a different token count and are refused.
+/// both give a different token count and are refused. The cat rewrite also
+/// accepts Markdown and the serde data formats; this path does not.
 fn cat_post_tool(tokens: &[String]) -> Option<PostTool> {
-    let [origin, skim, _file, mode] = tokens else {
+    let [origin, skim, file, mode] = tokens else {
         return None;
     };
-    if !origin.starts_with(REWRITE_ORIGIN_ENV) || skim != "skim" {
+    if !origin.starts_with(REWRITE_ORIGIN_ENV) || skim != "skim" || !is_code_language(file) {
         return None;
     }
     match mode.as_str() {
@@ -139,6 +140,13 @@ fn cat_post_tool(tokens: &[String]) -> Option<PostTool> {
         "--mode=pseudo" => Some(PostTool::Cat { structure: false }),
         _ => None,
     }
+}
+
+/// Whether the extension of `path` names a tree-sitter code language: not
+/// Markdown, and not JSON, YAML or TOML.
+fn is_code_language(path: &str) -> bool {
+    rskim_core::Language::from_path(Path::new(path))
+        .is_some_and(|lang| lang != rskim_core::Language::Markdown && !lang.is_serde_based())
 }
 
 // ============================================================================
@@ -505,6 +513,22 @@ mod tests {
     #[test]
     fn lookup_gives_none_for_cat_of_several_files() {
         for command in ["cat a.rs b.rs", "cat a.d.ts b.d.ts"] {
+            assert!(rewrite_of(command).is_some(), "{command:?} must rewrite");
+            assert_eq!(post_tool_of(command), None, "{command:?}");
+        }
+    }
+
+    /// Prose and data formats are not code: the cat rewrite accepts them, the
+    /// post path does not.
+    #[test]
+    fn lookup_gives_none_for_cat_of_prose_and_data_files() {
+        for command in [
+            "cat README.md",
+            "cat package.json",
+            "cat ci.yaml",
+            "cat ci.yml",
+            "cat Cargo.toml",
+        ] {
             assert!(rewrite_of(command).is_some(), "{command:?} must rewrite");
             assert_eq!(post_tool_of(command), None, "{command:?}");
         }
