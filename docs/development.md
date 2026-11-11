@@ -684,20 +684,19 @@ git push origin main --tags
 GitHub Actions automatically:
 - Builds for all platforms (Linux, macOS, Windows)
 - Creates GitHub release with binaries
-- Publishes to crates.io
+- Publishes `rskim-core` to crates.io (`rskim` is not published there; see #453)
 - Publishes to npm
 
 ### 5. Verify Release
 
 ```bash
-# Check crates.io
-cargo search rskim
+# Check crates.io (rskim-core only)
+cargo search rskim-core
 
 # Check npm
 npm info rskim
 
 # Test installation
-cargo install rskim
 npm install -g rskim
 ```
 

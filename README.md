@@ -167,9 +167,11 @@ brew install dean0x/tap/skim
 # Via npm
 npm install -g rskim
 
-# Via Cargo
-cargo install rskim
+# Via Cargo (from the Git repository)
+cargo install --git https://github.com/dean0x/skim rskim
 ```
+
+> **Note**: crates.io stays at rskim 2.10.0 for now. For the current version, use npm, Homebrew or `cargo install --git`.
 
 > **Note**: Use `npx` for trying it out. For regular use, install globally to avoid npx overhead (~100-500ms per invocation).
 
@@ -654,7 +656,7 @@ cargo bench
 - `skim learn` — CLI error pattern detection and correction rules
 
 ✅ **Distribution:**
-- cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
+- npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`), cargo from Git (`cargo install --git https://github.com/dean0x/skim rskim`); crates.io stays at 2.10.0 for now
 - 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
