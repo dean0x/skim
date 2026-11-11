@@ -24,6 +24,7 @@
 use std::sync::LazyLock;
 
 use super::types::{RewriteCategory, RewriteRule};
+use crate::runner::NpxTool;
 
 // ============================================================================
 // TEST rules (18)
@@ -1884,9 +1885,187 @@ pub(super) fn all_rules() -> impl Iterator<Item = &'static RewriteRule> {
     ALL_RULES_VEC.iter().copied()
 }
 
+// ============================================================================
+// npx rules that start the project-local bin (skim#587)
+// ============================================================================
+
+/// The `npx <tool>` rules whose rewrite starts the project's own copy of the
+/// tool through `npx --no-install <tool>`.
+///
+/// One closed list, shared by the rewrite engine (which asks the hook to probe
+/// the project first), by dispatch (which accepts `--via-npx` only after these
+/// rules' tool words) and by the table test below. A rule is named by its
+/// `prefix`. Each entry's `rewrite_to` is `["skim", <tool>, <flag tail>…]`.
+pub(crate) const NPX_LOCAL_BIN_RULES: &[&[&str]] = &[
+    &["npx", "tsc"],
+    &["npx", "eslint"],
+    &["npx", "prettier", "--write"],
+    &["npx", "prettier", "-w"],
+    &["npx", "prettier", "--check"],
+    &["npx", "biome", "check"],
+    &["npx", "biome", "format"],
+    &["npx", "biome", "lint"],
+    &["npx", "biome"],
+    &["npx", "oxlint"],
+];
+
+/// The other `npx <tool>` rules, each with the reason it is not in
+/// [`NPX_LOCAL_BIN_RULES`]. The table test requires every `npx` rule to be in
+/// exactly one of the two lists, so a new `npx` rule cannot be added without a
+/// decision.
+#[cfg(test)]
+const NPX_RULES_NOT_LOCAL_BIN: &[(&[&str], &str)] = &[
+    (&["npx", "vitest"], TEST_FAMILY_REASON),
+    (&["npx", "jest"], TEST_FAMILY_REASON),
+    (&["npx", "playwright", "test"], TEST_FAMILY_REASON),
+    (&["npx", "cypress", "run"], TEST_FAMILY_REASON),
+];
+
+#[cfg(test)]
+const TEST_FAMILY_REASON: &str = "spawned via run_with_node_fallback";
+
+/// The tool a rule starts through npx, or `None` when `prefix` is not one of
+/// [`NPX_LOCAL_BIN_RULES`].
+pub(crate) fn npx_local_tool(prefix: &[&str]) -> Option<NpxTool> {
+    if !NPX_LOCAL_BIN_RULES.contains(&prefix) {
+        return None;
+    }
+    prefix.get(1).and_then(|bin| NpxTool::from_bin(bin))
+}
+
+/// Every form `--via-npx` can follow for `tool`: the `rewrite_to` words after
+/// `["skim", <tool>]` of each of the tool's [`NPX_LOCAL_BIN_RULES`], longest
+/// first. `prettier` gives `["--write"]`, `["-w"]` and `[]`; `biome` gives
+/// `["check"]`, `["format"]`, `["lint"]` and `[]`.
+///
+/// Derived from the rules, so the engine's insertion point and dispatch's
+/// accepted position cannot drift apart.
+pub(crate) fn npx_flag_tails(tool: NpxTool) -> Vec<&'static [&'static str]> {
+    let mut tails: Vec<&'static [&'static str]> = all_rules()
+        .filter(|rule| npx_local_tool(rule.prefix) == Some(tool))
+        .map(|rule| rule.rewrite_to.get(2..).unwrap_or_default())
+        .collect();
+    tails.sort_by_key(|tail| std::cmp::Reverse(tail.len()));
+    tails.dedup();
+    tails
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // npx local-bin table (skim#587)
+    // ========================================================================
+
+    fn npx_rules() -> impl Iterator<Item = &'static RewriteRule> {
+        all_rules().filter(|rule| rule.prefix.first() == Some(&"npx"))
+    }
+
+    fn is_local_bin(prefix: &[&str]) -> bool {
+        NPX_LOCAL_BIN_RULES.contains(&prefix)
+    }
+
+    fn is_excluded(prefix: &[&str]) -> bool {
+        NPX_RULES_NOT_LOCAL_BIN.iter().any(|(p, _)| *p == prefix)
+    }
+
+    /// Every `npx` rule is a decision: in the local-bin list, or in the
+    /// exclusion list with a reason, never both and never neither.
+    #[test]
+    fn test_every_npx_rule_is_in_exactly_one_list() {
+        let mut seen = 0;
+        for rule in npx_rules() {
+            seen += 1;
+            let (local, excluded) = (is_local_bin(rule.prefix), is_excluded(rule.prefix));
+            assert!(
+                local != excluded,
+                "npx rule {:?} must be in exactly one of NPX_LOCAL_BIN_RULES and \
+                 NPX_RULES_NOT_LOCAL_BIN (local={local}, excluded={excluded})",
+                rule.prefix
+            );
+        }
+        assert_eq!(
+            seen,
+            NPX_LOCAL_BIN_RULES.len() + NPX_RULES_NOT_LOCAL_BIN.len(),
+            "a list names an npx rule that does not exist"
+        );
+        assert_eq!(NPX_LOCAL_BIN_RULES.len(), 10);
+        assert_eq!(NPX_RULES_NOT_LOCAL_BIN.len(), 4);
+    }
+
+    #[test]
+    fn test_every_exclusion_has_a_reason() {
+        for (prefix, reason) in NPX_RULES_NOT_LOCAL_BIN {
+            assert!(!reason.trim().is_empty(), "no reason for {prefix:?}");
+        }
+    }
+
+    /// `rewrite_to` is `skim <tool> …` with the tool the prefix names, and the
+    /// tool is one the launcher knows.
+    #[test]
+    fn test_local_bin_rules_rewrite_to_the_tool_their_prefix_names() {
+        let mut tools_seen = Vec::new();
+        for rule in npx_rules().filter(|rule| is_local_bin(rule.prefix)) {
+            assert_eq!(rule.rewrite_to.first(), Some(&"skim"), "{:?}", rule.prefix);
+            assert_eq!(
+                rule.rewrite_to.get(1),
+                rule.prefix.get(1),
+                "rewrite_to must name the tool the prefix names: {:?}",
+                rule.prefix
+            );
+            let tool = NpxTool::from_bin(rule.prefix[1])
+                .unwrap_or_else(|| panic!("no NpxTool for {:?}", rule.prefix));
+            assert_eq!(npx_local_tool(rule.prefix), Some(tool));
+            tools_seen.push(tool);
+        }
+        for tool in NpxTool::ALL {
+            assert!(
+                tools_seen.contains(&tool),
+                "{tool:?} has no rule in NPX_LOCAL_BIN_RULES"
+            );
+        }
+    }
+
+    #[test]
+    fn test_npx_local_tool_is_none_outside_the_list() {
+        assert_eq!(
+            npx_local_tool(&["tsc"]),
+            None,
+            "bare rules are not npx rules"
+        );
+        assert_eq!(npx_local_tool(&["npx", "vitest"]), None);
+        assert_eq!(npx_local_tool(&["npx", "playwright", "test"]), None);
+        assert_eq!(npx_local_tool(&["npx"]), None);
+        assert_eq!(npx_local_tool(&[]), None);
+        assert_eq!(
+            npx_local_tool(&["npx", "tsc", "--noEmit"]),
+            None,
+            "the whole prefix must match, not its head"
+        );
+        assert_eq!(npx_local_tool(&["npx", "tsc"]), Some(NpxTool::Tsc));
+        assert_eq!(
+            npx_local_tool(&["npx", "biome", "format"]),
+            Some(NpxTool::Biome)
+        );
+    }
+
+    /// The flag tails come from the rules' `rewrite_to`, longest first.
+    #[test]
+    fn test_npx_flag_tails_follow_the_rules_rewrite_to() {
+        let empty: &[&str] = &[];
+        assert_eq!(npx_flag_tails(NpxTool::Tsc), vec![empty]);
+        assert_eq!(npx_flag_tails(NpxTool::Eslint), vec![empty]);
+        assert_eq!(npx_flag_tails(NpxTool::Oxlint), vec![empty]);
+        assert_eq!(
+            npx_flag_tails(NpxTool::Prettier),
+            vec![&["--write"][..], &["-w"][..], empty]
+        );
+        assert_eq!(
+            npx_flag_tails(NpxTool::Biome),
+            vec![&["check"][..], &["format"][..], &["lint"][..], empty]
+        );
+    }
 
     /// Expected rule count — update this constant together with the category arrays.
     /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(26) + INFRA(28) + FILE_OPS(15) + DB(3)

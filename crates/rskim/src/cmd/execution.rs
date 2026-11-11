@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::process::ExitCode;
 
 use crate::cmd::stream_pump::{
@@ -13,7 +14,7 @@ use crate::cmd::stream_pump::{
 };
 use crate::output::ParseResult;
 use crate::output::fidelity::{Completeness, RemedyCtx, remedy_for};
-use crate::runner::{CommandOutput, CommandRunner};
+use crate::runner::{CommandOutput, CommandRunner, Launch};
 
 // ============================================================================
 // Net-savings guard (#317 / Cluster C)
@@ -931,19 +932,27 @@ pub(crate) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
 /// falls through silently to the spawn path so the real command runs with
 /// its actual exit code instead of producing empty output.
 ///
-/// Returns `None` when the program is not found (install hint already
-/// printed to stderr). The caller should return `ExitCode::FAILURE`.
+/// Returns [`ControlFlow::Break`] with the exit code to return when the run is
+/// already over, and [`ControlFlow::Continue`] with the output to parse
+/// otherwise. Three runs end here:
+/// - the program is not found (the error line and the install hint are already
+///   on stderr; exit failure);
+/// - the run asked for npx and the project-local bin is gone (exit 127, nothing
+///   started — see [`Launch::resolve`]);
+/// - the run asked for npx and npx itself failed with nothing on stdout. The
+///   text is npm's, so it goes out raw with npm's exit code and no parser sees
+///   it (see [`Launch::npx_failed`]).
 fn obtain_output(
     program: &str,
     args: &[String],
     env_overrides: &[(&str, &str)],
     install_hint: &str,
     use_stdin: bool,
-) -> anyhow::Result<Option<CommandOutput>> {
+) -> anyhow::Result<ControlFlow<ExitCode, CommandOutput>> {
     if use_stdin {
         let stdin_buf = read_stdin_bounded()?;
         if stdin_buf.bytes().any(|b| !b.is_ascii_whitespace()) {
-            return Ok(Some(CommandOutput {
+            return Ok(ControlFlow::Continue(CommandOutput {
                 stdout: stdin_buf,
                 stderr: String::new(),
                 exit_code: Some(0),
@@ -952,15 +961,21 @@ fn obtain_output(
         }
     }
 
+    let launch = match Launch::resolve(program, args) {
+        Ok(launch) => launch,
+        Err(gone) => return Ok(ControlFlow::Break(gone.report())),
+    };
     let runner = CommandRunner::new();
-    let args_str: Vec<&str> = args.iter().map(String::as_str).collect();
-    match runner.run_with_env(program, &args_str, env_overrides) {
-        Ok(out) => Ok(Some(out)),
+    match runner.run_with_env(&launch.spawn, &launch.argv_refs(), env_overrides) {
+        Ok(out) if launch.npx_failed(&out) => passthrough_raw(&out).map(ControlFlow::Break),
+        Ok(out) => Ok(ControlFlow::Continue(out)),
         Err(e) => {
             if crate::runner::is_spawn_error(&e) {
-                eprintln!("error: '{program}' not found");
-                eprintln!("hint: {install_hint}");
-                return Ok(None);
+                eprintln!("{}", launch.spawn_error_line());
+                if let Some(hint) = launch.install_hint(install_hint) {
+                    eprintln!("hint: {hint}");
+                }
+                return Ok(ControlFlow::Break(ExitCode::FAILURE));
             }
             Err(e)
         }
@@ -1107,11 +1122,15 @@ pub(crate) fn stream_passthrough_raw(
     env_overrides: &[(&str, &str)],
     install_hint: &str,
 ) -> anyhow::Result<ExitCode> {
+    let launch = match Launch::resolve(program, args) {
+        Ok(launch) => launch,
+        Err(gone) => return Ok(gone.report()),
+    };
     let mut sink = io::BufWriter::with_capacity(PUMP_BUF_BYTES, io::stdout().lock());
     let outcome = stream_child(
         &StreamSpec {
-            program,
-            args,
+            program: &launch.spawn,
+            args: &launch.argv,
             env_overrides,
         },
         &mut sink,
@@ -1120,8 +1139,10 @@ pub(crate) fn stream_passthrough_raw(
     let done = match outcome {
         // Same message and hint as `obtain_output`'s `is_spawn_error` branch.
         StreamOutcome::SpawnFailed(_) => {
-            eprintln!("error: '{program}' not found");
-            eprintln!("hint: {install_hint}");
+            eprintln!("{}", launch.spawn_error_line());
+            if let Some(hint) = launch.install_hint(install_hint) {
+                eprintln!("hint: {hint}");
+            }
             return Ok(ExitCode::FAILURE);
         }
         StreamOutcome::PipeClosed => {
@@ -1401,8 +1422,9 @@ where
         return stream_passthrough_raw(program, args, env_overrides, install_hint);
     }
 
-    let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
-        return Ok(ExitCode::FAILURE);
+    let output = match obtain_output(program, args, env_overrides, install_hint, use_stdin)? {
+        ControlFlow::Continue(output) => output,
+        ControlFlow::Break(code) => return Ok(code),
     };
 
     // Stdin-fed passthrough: `obtain_output` may have taken its bytes from stdin

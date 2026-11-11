@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use crate::output::ParseResult;
 use crate::output::canonical::BuildResult;
-use crate::runner::{CommandOutput, CommandRunner};
+use crate::runner::{CommandOutput, CommandRunner, Launch};
 
 // ============================================================================
 // Public dispatch
@@ -292,6 +292,13 @@ fn resolve_exit_code(child: Option<i32>, result: &ParseResult<BuildResult>) -> u
 /// fallback. The two patterns are not consolidatable without changing that
 /// behaviour.
 ///
+/// # npx start (`skim tsc --via-npx`)
+///
+/// The start goes through [`Launch::resolve`], which turns `tsc <args>` into
+/// `npx --no-install tsc <args>` when the run asked for it. A refused start
+/// (project-local bin gone) returns exit 127 before anything runs. A failed npx
+/// (non-zero exit, empty stdout) is forwarded raw before any parser runs.
+///
 /// # Arguments
 ///
 /// * `program` - The executable name (e.g., "cargo", "tsc")
@@ -308,22 +315,38 @@ pub(super) fn run_parsed_command(
     rec: crate::analytics::RecordingContext<'_>,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
 ) -> anyhow::Result<ExitCode> {
+    let launch = match Launch::resolve(program, args) {
+        Ok(launch) => launch,
+        Err(gone) => return Ok(gone.report()),
+    };
     let runner = CommandRunner::new();
 
-    let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-
-    let output = match runner.run_with_env(program, &str_args, env_vars) {
+    let output = match runner.run_with_env(&launch.spawn, &launch.argv_refs(), env_vars) {
         Ok(output) => output,
         Err(e) => {
             if crate::runner::is_spawn_error(&e) {
-                anyhow::bail!(
-                    "{program}: command not found\n\
-                     Hint: {install_hint}"
-                );
+                match launch.install_hint(install_hint) {
+                    Some(hint) => anyhow::bail!(
+                        "{program}: command not found\n\
+                         Hint: {hint}"
+                    ),
+                    None => anyhow::bail!("{}", launch.spawn_error_line()),
+                }
             }
             return Err(e);
         }
     };
+
+    // A failed npx start is npm's text, not the tool's: nothing for a parser to
+    // summarise. Forward both streams as they came and pass the exit code on.
+    if launch.npx_failed(&output) {
+        let (_, status) =
+            crate::cmd::execution::emit_raw_passthrough_split(&output.stdout, &output.stderr)?;
+        if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+            return Ok(crate::cmd::execution::pipe_closed_exit());
+        }
+        return Ok(ExitCode::from(exit_code_from_status(output.exit_code)));
+    }
 
     // Strip ANSI escape codes before parsing. Some build tools emit color codes
     // even with NO_COLOR=1, matching the shared run_parsed_command_with_mode pattern.
