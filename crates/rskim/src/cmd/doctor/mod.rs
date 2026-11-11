@@ -641,9 +641,54 @@ fn print_hook_section(
                 agent.cli_name()
             );
         }
+        for note in foreign_post_hook_notes(&facts) {
+            println!("{note}");
+        }
     }
 
     Ok(verdict)
+}
+
+/// Advisory lines about `PostToolUse` hooks of other tools, for one agent.
+///
+/// Claude Code gives the model one `PostToolUse` result per Bash call, so another
+/// hook that selects Bash can cancel skim's compressed view or lose its own
+/// output. These lines are notes only: nothing here sets the drift verdict or the
+/// exit code, the same treatment as the missing-entry note and the binary-pin
+/// mismatch (ADR-014).
+///
+/// A settings file that could not be read gets its own line, so an unchecked file
+/// never reads as a clean result. Hooks that the scan does not cover (plugin
+/// hooks) are not reported.
+fn foreign_post_hook_notes(facts: &crate::cmd::init::HookFacts) -> Vec<String> {
+    // With no skim entry installed, another hook has nothing to compete with.
+    if !facts.hook_installed {
+        return Vec::new();
+    }
+    let scan = &facts.foreign_post_hooks;
+    let mut notes: Vec<String> = scan
+        .found
+        .iter()
+        .map(|hook| {
+            format!(
+                "       note: other PostToolUse hook can select Bash: {}",
+                hook.describe()
+            )
+        })
+        .collect();
+    if !notes.is_empty() {
+        notes.push(
+            "       note: Claude Code uses one PostToolUse result per call; skim's may be dropped"
+                .to_string(),
+        );
+    }
+    notes.extend(scan.unreadable.iter().map(|path| {
+        format!(
+            "       note: could not read {}; its PostToolUse hooks are not checked",
+            path.display()
+        )
+    }));
+    notes
 }
 
 // ============================================================================
@@ -1247,6 +1292,7 @@ mod tests {
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: integrity,
             missing_hook_events: Vec::new(),
+            foreign_post_hooks: Default::default(),
         }
     }
 
@@ -1575,6 +1621,7 @@ mod tests {
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: crate::cmd::integrity::ScriptIntegrity::NoManifest,
             missing_hook_events: Vec::new(),
+            foreign_post_hooks: Default::default(),
         };
         let (drift, line) = hook_status_line(&facts, "gemini", "2.11.0", "abc1234");
 
@@ -1583,6 +1630,80 @@ mod tests {
             line.contains("not installed"),
             "not-installed must say so: {line}"
         );
+    }
+
+    // ---- foreign_post_hook_notes ----
+
+    fn facts_with_foreign_post_hooks(
+        found: Vec<(&str, &str)>,
+        unreadable: Vec<&str>,
+    ) -> crate::cmd::init::HookFacts {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.foreign_post_hooks = crate::cmd::init::ForeignPostHooks {
+            found: found
+                .into_iter()
+                .map(|(file, command)| crate::cmd::init::ForeignPostHook {
+                    file: std::path::PathBuf::from(file),
+                    command: command.to_string(),
+                })
+                .collect(),
+            unreadable: unreadable
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        };
+        facts
+    }
+
+    #[test]
+    fn test_foreign_post_hook_notes_empty_without_foreign_hooks() {
+        let facts = facts_with_foreign_post_hooks(vec![], vec![]);
+        assert!(foreign_post_hook_notes(&facts).is_empty());
+    }
+
+    #[test]
+    fn test_foreign_post_hook_notes_name_each_hook_with_its_file() {
+        let facts = facts_with_foreign_post_hooks(
+            vec![
+                ("/h/.claude/settings.local.json", "/usr/bin/one"),
+                ("/p/.claude/settings.json", "/usr/bin/two"),
+            ],
+            vec![],
+        );
+        let notes = foreign_post_hook_notes(&facts);
+        let hook_notes: Vec<&String> = notes
+            .iter()
+            .filter(|n| n.contains("other PostToolUse hook can select Bash"))
+            .collect();
+        assert_eq!(hook_notes.len(), 2, "{notes:?}");
+        assert!(hook_notes[0].contains("/usr/bin/one"));
+        assert!(hook_notes[0].contains("/h/.claude/settings.local.json"));
+        assert!(hook_notes[1].contains("/usr/bin/two"));
+        assert!(hook_notes[1].contains("/p/.claude/settings.json"));
+    }
+
+    #[test]
+    fn test_foreign_post_hook_notes_filter_control_bytes_in_the_command() {
+        let facts =
+            facts_with_foreign_post_hooks(vec![("/f.json", "/bin/x\u{1b}[31m\nEXTRA")], vec![]);
+        let notes = foreign_post_hook_notes(&facts).join("\n");
+        assert!(!notes.contains('\u{1b}'), "{notes:?}");
+        assert!(!notes.lines().any(|l| l.starts_with("EXTRA")), "{notes:?}");
+    }
+
+    #[test]
+    fn test_foreign_post_hook_notes_name_an_unreadable_file() {
+        let facts = facts_with_foreign_post_hooks(vec![], vec!["/h/.claude/settings.local.json"]);
+        let notes = foreign_post_hook_notes(&facts);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("could not read /h/.claude/settings.local.json"));
+    }
+
+    #[test]
+    fn test_foreign_post_hook_notes_empty_when_skim_is_not_installed() {
+        let mut facts = facts_with_foreign_post_hooks(vec![("/f.json", "/usr/bin/one")], vec![]);
+        facts.hook_installed = false;
+        assert!(foreign_post_hook_notes(&facts).is_empty());
     }
 
     // ---- query_binary_info acquisition-path test ----

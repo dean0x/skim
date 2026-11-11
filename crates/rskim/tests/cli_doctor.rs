@@ -232,6 +232,164 @@ fn test_doctor_notes_a_missing_post_tool_use_entry_without_exit_1() {
     assert!(out.contains(note), "stdout:\n{out}");
 }
 
+/// The note doctor prints for a PostToolUse hook that is not skim's.
+const FOREIGN_POST_NOTE: &str = "other PostToolUse hook can select Bash: ";
+
+/// A `PostToolUse` entry that selects Bash and runs `command`.
+fn foreign_post_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]})
+}
+
+/// Add `entry` under `hooks.PostToolUse` of the settings file at `path`.
+///
+/// Keeps whatever the file holds, so skim's own entries stay in place; a file
+/// that does not exist yet starts empty.
+fn add_post_tool_use_entry(path: &std::path::Path, entry: serde_json::Value) {
+    let mut json: serde_json::Value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let entries = &mut json["hooks"]["PostToolUse"];
+    match entries.as_array_mut() {
+        Some(list) => list.push(entry),
+        None => *entries = serde_json::json!([entry]),
+    }
+    std::fs::write(path, json.to_string()).unwrap();
+}
+
+/// Run `skim doctor` from `cwd`, require exit 0, and return stdout.
+fn doctor_stdout_exit_0(home: &std::path::Path, cwd: &std::path::Path) -> String {
+    let mut cmd = common::skim_sandboxed(home);
+    cmd.arg("doctor").current_dir(cwd);
+    let assert = cmd.env("PATH", common::hermetic_path()).assert().success();
+    String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+}
+
+/// The doctor note lines for foreign PostToolUse hooks.
+fn foreign_post_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|l| l.contains(FOREIGN_POST_NOTE))
+        .collect()
+}
+
+/// Skim's own PostToolUse entry is never reported as another tool's hook.
+#[test]
+fn test_doctor_gives_no_foreign_post_hook_note_for_skims_own_entries() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+
+    let out = doctor_stdout_exit_0(home, home);
+    assert!(foreign_post_lines(&out).is_empty(), "stdout:\n{out}");
+}
+
+/// Claude Code also reads `settings.local.json`. A foreign PostToolUse hook there
+/// gets one advisory note that names the file and the command; the exit code stays 0.
+#[test]
+fn test_doctor_notes_a_foreign_post_tool_use_hook_in_settings_local_json() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+    let local = home.join(".claude/settings.local.json");
+    add_post_tool_use_entry(&local, foreign_post_entry("/usr/bin/local-post-hook"));
+
+    // cwd = home makes both scopes resolve to the same directory: the note must
+    // still appear once, not once per scope.
+    let out = doctor_stdout_exit_0(home, home);
+    let lines = foreign_post_lines(&out);
+    assert_eq!(lines.len(), 1, "stdout:\n{out}");
+    assert!(
+        lines[0].contains("/usr/bin/local-post-hook"),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].contains("settings.local.json"), "{}", lines[0]);
+}
+
+/// A foreign PostToolUse hook in the project scope (`<cwd>/.claude`) is reported
+/// when the global scope holds skim's install. The exit code stays 0.
+#[test]
+fn test_doctor_notes_a_foreign_post_tool_use_hook_in_the_other_scope() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+    let project = home.join("proj");
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    let settings = project.join(".claude/settings.json");
+    add_post_tool_use_entry(&settings, foreign_post_entry("/usr/bin/project-post-hook"));
+
+    let out = doctor_stdout_exit_0(home, &project);
+    let lines = foreign_post_lines(&out);
+    assert_eq!(lines.len(), 1, "stdout:\n{out}");
+    assert!(
+        lines[0].contains("/usr/bin/project-post-hook"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("proj/.claude/settings.json"),
+        "the note must name the project file: {}",
+        lines[0]
+    );
+}
+
+/// A foreign hook whose matcher cannot select Bash gives no note.
+#[test]
+fn test_doctor_gives_no_note_for_a_foreign_post_hook_that_cannot_select_bash() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+    let entry = serde_json::json!({"matcher": "Edit|Write", "hooks": [
+        {"type": "command", "command": "/usr/bin/edit-post-hook"}
+    ]});
+    add_post_tool_use_entry(&home.join(".claude/settings.local.json"), entry);
+
+    let out = doctor_stdout_exit_0(home, home);
+    assert!(foreign_post_lines(&out).is_empty(), "stdout:\n{out}");
+}
+
+/// Another hook's command text is filtered before doctor prints it.
+#[test]
+fn test_doctor_filters_a_foreign_hooks_command_text_before_printing_it() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+    let nasty = foreign_post_entry("/usr/bin/x\u{1b}[31m\nEXTRA");
+    add_post_tool_use_entry(&home.join(".claude/settings.local.json"), nasty);
+
+    let out = doctor_stdout_exit_0(home, home);
+    assert!(out.contains("/usr/bin/x"), "the hook is still named");
+    assert!(!out.contains('\u{1b}'), "control byte reached stdout");
+    assert!(
+        !out.lines().any(|l| l.starts_with("EXTRA")),
+        "a newline in a command started a new line:\n{out}"
+    );
+}
+
+/// A settings file doctor cannot read is not a clean result: doctor says the file
+/// was not checked, and the exit code stays 0.
+#[test]
+fn test_doctor_says_when_a_settings_file_could_not_be_checked_for_post_hooks() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+    std::fs::write(home.join(".claude/settings.local.json"), "{ not json").unwrap();
+
+    let out = doctor_stdout_exit_0(home, home);
+    let line = out
+        .lines()
+        .find(|l| l.contains("could not read") && l.contains("settings.local.json"))
+        .unwrap_or_else(|| panic!("no unreadable-file note in:\n{out}"));
+    assert!(line.contains("PostToolUse"), "{line}");
+}
+
 /// After tampering with the hook script (appending one byte), `skim doctor`
 /// must exit 1 AND name the tamper in stdout.
 ///

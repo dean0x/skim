@@ -39,8 +39,12 @@ pub(crate) use helpers::atomic_write_settings;
 pub(crate) use helpers::backup_settings_file;
 pub(crate) use helpers::load_or_create_settings;
 pub(crate) use helpers::resolve_skim_binary;
+pub(crate) use state::ForeignPostHooks;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 pub(crate) use state::has_skim_hook_entry;
+// Only doctor's unit tests build a hook by hand; production code reads them off `HookFacts`.
+#[cfg(test)]
+pub(crate) use state::ForeignPostHook;
 
 // ============================================================================
 // B4: HookFacts DTO seam — cross-module hook state projection for `skim doctor`
@@ -87,6 +91,9 @@ pub(crate) struct HookFacts {
     pub(crate) script_integrity: crate::cmd::integrity::ScriptIntegrity,
     /// Event keys without a skim entry while the primary one exists (a note, not drift).
     pub(crate) missing_hook_events: Vec<&'static str>,
+    /// `PostToolUse` hooks of other tools that can select Bash, found in both
+    /// scopes and in `settings.local.json` (an advisory note, not drift).
+    pub(crate) foreign_post_hooks: ForeignPostHooks,
 }
 
 /// Gather hook installation facts for a given agent — used by `skim doctor`.
@@ -141,6 +148,7 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         hook_script_path,
         script_integrity: detected.script_integrity,
         missing_hook_events: detected.missing_hook_events,
+        foreign_post_hooks: detected.existing_post_hooks,
     })
 }
 

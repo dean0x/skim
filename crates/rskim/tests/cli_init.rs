@@ -716,7 +716,9 @@ fn test_init_adds_the_post_tool_use_entry_to_a_pre_only_install() {
     init()
         .stdout(predicate::str::contains("PostToolUse"))
         .stdout(predicate::str::contains("Already up to date").not());
-    init().stdout(predicate::str::contains("Already up to date"));
+    init()
+        .stdout(predicate::str::contains("Already up to date"))
+        .stdout(predicate::str::contains("Other PostToolUse hooks").not());
 }
 
 /// Claude Code uses one PostToolUse result per Bash call, so a foreign hook that
@@ -740,6 +742,52 @@ fn test_init_warns_about_a_foreign_post_tool_use_hook_that_selects_bash() {
             "matcher {matcher:?}"
         );
     }
+}
+
+/// Claude Code merges `settings.local.json` into the settings it reads, so a
+/// foreign PostToolUse hook there gets the same warning, and the line names the file.
+#[test]
+fn test_init_warns_about_a_foreign_post_tool_use_hook_in_settings_local_json() {
+    let sandbox = Sandbox::new();
+    let hook = serde_json::json!({"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "/usr/bin/local-post-hook"}
+    ]});
+    let settings = serde_json::json!({"hooks": {"PostToolUse": [hook]}});
+    let path = sandbox.claude_config().join("settings.local.json");
+    fs::write(path, settings.to_string()).unwrap();
+
+    let assert = sandbox.init().args(["--yes"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("Other PostToolUse hooks"))
+        .unwrap_or_else(|| panic!("no warning line in:\n{stdout}"));
+    assert!(line.contains("local-post-hook"), "{line}");
+    assert!(line.contains("settings.local.json"), "{line}");
+}
+
+/// Other hooks' command text is filtered before it is printed: a control byte
+/// or a newline in a PreToolUse or PostToolUse command must not reach the terminal.
+#[test]
+fn test_init_filters_other_hooks_command_text_before_printing_it() {
+    let sandbox = Sandbox::new();
+    let nasty = "/usr/bin/x\u{1b}[31m\nEXTRA";
+    let entry = |command: &str| serde_json::json!({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]});
+    let settings = serde_json::json!({"hooks": {
+        "PreToolUse": [entry(nasty)],
+        "PostToolUse": [entry(nasty)],
+    }});
+    let path = sandbox.claude_config().join("settings.json");
+    fs::write(path, settings.to_string()).unwrap();
+
+    let assert = sandbox.init().args(["--yes"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("/usr/bin/x"), "the hook is still named");
+    assert!(!stdout.contains('\u{1b}'), "control byte reached stdout");
+    assert!(
+        !stdout.lines().any(|l| l.starts_with("EXTRA")),
+        "a newline in a command started a new line:\n{stdout}"
+    );
 }
 
 /// A settings file with only the PostToolUse entry (and no script) is still an

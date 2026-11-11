@@ -10,9 +10,12 @@ use super::helpers::{
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
     confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
-use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
+use super::state::{
+    DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
+};
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
+use crate::cmd::sanitize_for_display;
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
 // ============================================================================
@@ -131,7 +134,7 @@ fn print_install_header(agent_name: &str) {
 fn print_collision_warning(hooks: &[String]) {
     println!("  WARNING: Other hooks detected for the same tool matcher:");
     for hook_cmd in hooks {
-        println!("    - {hook_cmd}");
+        println!("    - {}", sanitize_for_display(hook_cmd));
     }
     println!("  Both hooks will fire on Bash commands. This is usually harmless");
     println!("  but may cause unexpected behavior if the other hook also modifies commands.");
@@ -506,9 +509,17 @@ fn run_install_single(
     if !state.existing_hooks.is_empty() {
         print_collision_warning(&state.existing_hooks);
     }
-    if !state.existing_post_hooks.is_empty() {
-        let hooks = state.existing_post_hooks.join(", ");
-        println!("  WARNING: Other PostToolUse hooks can select Bash: {hooks}");
+    if !state.existing_post_hooks.found.is_empty() {
+        let hooks: Vec<String> = state
+            .existing_post_hooks
+            .found
+            .iter()
+            .map(ForeignPostHook::describe)
+            .collect();
+        println!(
+            "  WARNING: Other PostToolUse hooks can select Bash: {}",
+            hooks.join(", ")
+        );
         println!("  Claude Code uses one PostToolUse result per call; skim's may be dropped.");
         println!();
     }
@@ -1972,7 +1983,7 @@ mod tests {
             dual_scope_warning: None,
             existing_hooks: vec![],
             missing_hook_events: vec![],
-            existing_post_hooks: vec![],
+            existing_post_hooks: Default::default(),
             agent_cli_name,
         }
     }

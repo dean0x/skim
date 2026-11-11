@@ -643,7 +643,7 @@ cargo bench
 
 ✅ **Agent Integration:**
 - `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush; optional consent-gated permission seeding (`--permissions`); dev-pinned installs for skim development (`--dev`)
-- `skim doctor` — install health check: which `skim` on `$PATH` wins, per-agent hook state (version, commit, binary pin, tamper verdict), wrapper targets, and staleness vs. repo HEAD. Exit 0 healthy / 1 on drift, so it works as a CI pre-flight. A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)` — never `✓` — printing both the commit the install froze and the commit the running binary was built from, so `skim doctor | grep dev-pinned` is a one-line guard against shipping a dev install.
+- `skim doctor` — install health check: which `skim` on `$PATH` wins, per-agent hook state (version, commit, binary pin, tamper verdict), wrapper targets, and staleness vs. repo HEAD. Exit 0 healthy / 1 on drift, so it works as a CI pre-flight. A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)` — never `✓` — printing both the commit the install froze and the commit the running binary was built from, so `skim doctor | grep dev-pinned` is a one-line guard against shipping a dev install. It also prints an advisory note (no change to the exit code) for each PostToolUse hook of another tool that can select Bash, found in either scope or in `settings.local.json`; Claude Code gives the model one PostToolUse result per call, so such a hook can cancel skim's output. Plugin hooks are not checked.
 - `skim rewrite` — command rewriting engine with `--hook` mode
 - MCP server mode for agent-native workflows
 
