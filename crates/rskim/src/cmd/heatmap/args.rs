@@ -136,6 +136,11 @@ fn apply_value_flag(
             }
         }
         ValueFlagAction::Diff => {
+            // Heatmap flag values reach git as values only: a value that
+            // starts with `-` is not a branch or commit name.
+            if val.starts_with('-') {
+                anyhow::bail!("--diff value must not start with '-': {val}");
+            }
             args.diff_base = Some(val);
         }
     }
@@ -488,6 +493,26 @@ mod tests {
     fn test_parse_args_diff_equals() {
         let args = parse_args(&["--diff=develop".to_string()]).unwrap();
         assert_eq!(args.diff_base, Some("develop".to_string()));
+    }
+
+    #[test]
+    fn test_parse_args_diff_dash_value_space_form_errors() {
+        let result = parse_args(&["--diff".to_string(), "--stat".to_string()]);
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--diff value must not start with '-'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_diff_dash_value_equals_form_errors() {
+        let result = parse_args(&["--diff=-x".to_string()]);
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--diff value must not start with '-'"),
+            "got: {msg}"
+        );
     }
 
     #[test]

@@ -725,6 +725,58 @@ fn test_heatmap_diff_bad_ref() {
         ));
 }
 
+/// Sorted names of the top-level entries in `dir`.
+fn dir_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Heatmap flag values reach git as values only: a `--diff` value that
+/// starts with `-` exits 1 with a message, and no file appears in the repo.
+fn assert_diff_dash_value_refused(diff_args: &[&str]) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+    let before = dir_entries(dir.path());
+
+    let output = common::skim()
+        .arg("heatmap")
+        .args(diff_args)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        dir_entries(dir.path()),
+        before,
+        "no file may appear in the repo for args {diff_args:?}"
+    );
+    assert_eq!(output.status.code(), Some(1), "args {diff_args:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--diff value must not start with '-'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_heatmap_diff_dash_value_space_form_refused() {
+    assert_diff_dash_value_refused(&["--diff", "--output=heatmap-out.txt"]);
+}
+
+#[test]
+fn test_heatmap_diff_dash_value_equals_form_refused() {
+    assert_diff_dash_value_refused(&["--diff=--output=heatmap-out.txt"]);
+}
+
 #[test]
 fn test_heatmap_file_not_in_history() {
     let dir = tempfile::tempdir().expect("tempdir");
