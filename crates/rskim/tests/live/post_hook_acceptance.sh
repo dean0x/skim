@@ -110,7 +110,8 @@ view_of() {  # dir command: fill dir/exp.{out,err,txt}; fail when the hook gives
   [ -s "$d/resp.json" ] || return 1
   jq -j '.hookSpecificOutput.updatedToolOutput.stdout' "$d/resp.json" > "$d/exp.out"
   jq -j '.hookSpecificOutput.updatedToolOutput.stderr' "$d/resp.json" > "$d/exp.err"
-  { cat "$d/exp.out"; printf '\n'; cat "$d/exp.err"; } > "$d/exp.txt"
+  # The host trims the end newlines of stdout before it joins stdout, "\n" and stderr (measured).
+  { jq -j '.hookSpecificOutput.updatedToolOutput.stdout | sub("\n+$"; "")' "$d/resp.json"; printf '\n'; cat "$d/exp.err"; } > "$d/exp.txt"
 }
 check_view() {  # label dir command
   local key canary; key=$(key_of "$3"); canary=$(cat "$S/canary/$key")
@@ -186,8 +187,12 @@ check_call() {  # run id command
     check "$run:$key:no-marker" "skim line on a failed run" lacks "$MARKER" "$d/got.txt"
     check "$run:$key:canary-seen" "the raw canary is missing" grep -qF "$(cat "$S/canary/mypy")" "$d/got.txt"
   elif check_view "$run:$key" "$d" "$3"; then
-    check "$run:$key:shape" "tool_use_result is not an object" jq -e '.tur | type == "object"' "$d/res.json"
-    same "$run:$key:tur.stdout" "$d/exp.out" "$d/got.out"; same "$run:$key:tur.stderr" "$d/exp.err" "$d/got.err"
+    if [ "$run" = subagent ]; then  # the host stores no tool_use_result in a sidechain (measured)
+      check "$run:$key:shape" "a sidechain tool_use_result must be null" jq -e '.tur == null' "$d/res.json"
+    else
+      check "$run:$key:shape" "tool_use_result is not an object" jq -e '.tur | type == "object"' "$d/res.json"
+      same "$run:$key:tur.stdout" "$d/exp.out" "$d/got.out"; same "$run:$key:tur.stderr" "$d/exp.err" "$d/got.err"
+    fi
     same "$run:$key:tool_result" "$d/exp.txt" "$d/got.txt"
   fi
 }
