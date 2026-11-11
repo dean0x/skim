@@ -634,6 +634,13 @@ fn print_hook_section(
         if facts.hook_installed {
             println!("       script: {}", facts.hook_script_path.display());
         }
+        if !facts.missing_hook_events.is_empty() {
+            println!(
+                "       note: no {} entry; run `skim init --agent {}` to add it",
+                facts.missing_hook_events.join(", "),
+                agent.cli_name()
+            );
+        }
     }
 
     Ok(verdict)
@@ -1239,6 +1246,7 @@ mod tests {
             pin_is_current: true,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: integrity,
+            missing_hook_events: Vec::new(),
         }
     }
 
@@ -1566,6 +1574,7 @@ mod tests {
             pin_is_current: false,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: crate::cmd::integrity::ScriptIntegrity::NoManifest,
+            missing_hook_events: Vec::new(),
         };
         let (drift, line) = hook_status_line(&facts, "gemini", "2.11.0", "abc1234");
 

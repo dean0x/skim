@@ -83,6 +83,8 @@ pub(crate) struct HookFacts {
     /// Derived from the manifest (an independent artefact), NOT from the hook
     /// script bytes — which is exactly what a tamper modifies (PF-016).
     pub(crate) script_integrity: crate::cmd::integrity::ScriptIntegrity,
+    /// Event keys without a skim entry while the primary one exists (a note, not drift).
+    pub(crate) missing_hook_events: Vec<&'static str>,
 }
 
 /// Gather hook installation facts for a given agent — used by `skim doctor`.
@@ -136,6 +138,7 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         pin_is_current: pin_current,
         hook_script_path,
         script_integrity: detected.script_integrity,
+        missing_hook_events: detected.missing_hook_events,
     })
 }
 

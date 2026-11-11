@@ -7,7 +7,7 @@ use super::helpers::{
     HOOK_SCRIPT_NAME, atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
     resolve_real_settings_path,
 };
-use super::state::{has_skim_hook_entry, read_settings_json};
+use super::state::{has_skim_hook_entry, read_settings_json, skim_event_keys};
 use crate::cmd::hooks::protocol_for_agent;
 use crate::cmd::session::InstructionEnv;
 
@@ -127,14 +127,9 @@ fn run_uninstall_for_agent(
         (reg, false)
     } else {
         // settings.json-based agents.
-        let has = read_settings_json(&settings_path)
-            .and_then(|json| {
-                json.get("hooks")?
-                    .get(protocol.hook_event_key())?
-                    .as_array()
-                    .map(|arr| arr.iter().any(has_skim_hook_entry))
-            })
-            .unwrap_or(false);
+        let has = read_settings_json(&settings_path).is_some_and(|json| {
+            !skim_event_keys(&json, protocol.as_ref(), has_skim_hook_entry).is_empty()
+        });
         (has, has)
     };
 

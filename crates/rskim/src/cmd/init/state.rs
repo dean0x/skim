@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::flags::DetectionEnv;
 use super::helpers::HOOK_SCRIPT_NAME;
+use crate::cmd::hooks::claude::POST_TOOL_USE_EVENT;
 use crate::cmd::hooks::{
     HookMode, HookProtocol, honour_dev_declaration, parse_mode_from_script, protocol_for_agent,
 };
@@ -51,6 +52,10 @@ pub(super) struct DetectedState {
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim hooks for the agent's tool matcher (plugin collision detection)
     pub(super) existing_hooks: Vec<String>,
+    /// Event keys without a skim entry, set only when the primary entry exists.
+    pub(super) missing_hook_events: Vec<&'static str>,
+    /// Non-skim `PostToolUse` hooks that can select Bash (plugin collision detection)
+    pub(super) existing_post_hooks: Vec<String>,
     /// CLI name of the target agent (e.g., "claude-code", "cursor") for integrity hashing
     pub(super) agent_cli_name: &'static str,
 }
@@ -230,6 +235,12 @@ pub(super) fn detect_state(
     let mut hook_installed = false;
     let mut hook_version = None;
 
+    let parsed_settings = if protocol.uses_dedicated_hook_file() {
+        None
+    } else {
+        read_settings_json(&settings_path)
+    };
+
     let existing_hooks = if protocol.uses_dedicated_hook_file() {
         // Copilot-style: detect from hooks/skim.json, not settings.json.
         hook_installed = protocol.detect_hook_registration(&hook_config_dir);
@@ -242,7 +253,6 @@ pub(super) fn detect_state(
         protocol.scan_foreign_hooks(&hook_config_dir)
     } else {
         // settings.json-style: existing detection code (behaviorally unchanged).
-        let parsed_settings = read_settings_json(&settings_path);
         if let Some(ref json) = parsed_settings
             && let Some(arr) = json
                 .get("hooks")
@@ -279,6 +289,26 @@ pub(super) fn detect_state(
             protocol.tool_matcher(),
             protocol.as_ref(),
         )
+    };
+
+    let missing_hook_events = match parsed_settings.as_ref() {
+        Some(json) if hook_installed => {
+            let present = skim_event_keys(json, protocol.as_ref(), |e| protocol.is_skim_entry(e));
+            let mut keys = protocol.hook_event_keys();
+            keys.retain(|key| !present.contains(key));
+            keys
+        }
+        _ => Vec::new(),
+    };
+    let existing_post_hooks = if protocol.hook_event_keys().contains(&POST_TOOL_USE_EVENT) {
+        scan_hooks_matching(
+            parsed_settings.as_ref(),
+            POST_TOOL_USE_EVENT,
+            protocol.as_ref(),
+            post_matcher_selects_bash,
+        )
+    } else {
+        Vec::new()
     };
 
     // Dual-scope check (B5)
@@ -334,6 +364,8 @@ pub(super) fn detect_state(
         script_integrity,
         dual_scope_warning,
         existing_hooks,
+        missing_hook_events,
+        existing_post_hooks,
         agent_cli_name: agent.cli_name(),
     })
 }
@@ -375,6 +407,48 @@ fn scan_existing_hooks(
     tool_matcher: &str,
     protocol: &dyn HookProtocol,
 ) -> Vec<String> {
+    scan_hooks_matching(parsed, event_key, protocol, |m| m == Some(tool_matcher))
+}
+
+/// Whether a `PostToolUse` entry's `matcher` can select the Bash tool.
+///
+/// An absent, empty or `*` matcher selects every tool; any other matcher is
+/// read as an unanchored regex, which also covers a plain name list. An
+/// invalid regex counts as a match: a wrong answer costs one extra warning.
+fn post_matcher_selects_bash(matcher: Option<&str>) -> bool {
+    match matcher {
+        None | Some("" | "*") => true,
+        Some(m) => regex::Regex::new(m)
+            .ok()
+            .is_none_or(|re| re.is_match("Bash")),
+    }
+}
+
+/// The event keys of `protocol` under which `config` holds an entry `is_skim` accepts.
+pub(super) fn skim_event_keys(
+    config: &serde_json::Value,
+    protocol: &dyn HookProtocol,
+    is_skim: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<&'static str> {
+    let mut keys = protocol.hook_event_keys();
+    keys.retain(|key| {
+        config
+            .get("hooks")
+            .and_then(|h| h.get(key))
+            .and_then(|v| v.as_array())
+            .is_some_and(|entries| entries.iter().any(&is_skim))
+    });
+    keys
+}
+
+/// [`scan_existing_hooks`] with the matcher test left to the caller: `selects`
+/// gets each entry's `matcher` string, or `None` when it has none.
+fn scan_hooks_matching(
+    parsed: Option<&serde_json::Value>,
+    event_key: &str,
+    protocol: &dyn HookProtocol,
+    selects: impl Fn(Option<&str>) -> bool,
+) -> Vec<String> {
     let Some(json) = parsed else {
         return Vec::new();
     };
@@ -390,11 +464,7 @@ fn scan_existing_hooks(
     let mut other_hooks = Vec::new();
     for entry in entries {
         // Only care about entries matching the agent's tool matcher
-        let is_matching_tool = entry
-            .get("matcher")
-            .and_then(|m| m.as_str())
-            .is_some_and(|m| m == tool_matcher);
-        if !is_matching_tool {
+        if !selects(entry.get("matcher").and_then(|m| m.as_str())) {
             continue;
         }
         // Skip skim entries using the agent-format-aware check.
@@ -452,14 +522,9 @@ pub(super) fn check_dual_scope(
 
     let protocol = protocol_for_agent(agent);
     let other_settings = other_dir.join(protocol.config_filename());
-    let has_hook = read_settings_json(&other_settings)
-        .and_then(|json| {
-            json.get("hooks")?
-                .get(protocol.hook_event_key())?
-                .as_array()
-                .map(|arr| arr.iter().any(|e| protocol.is_skim_entry(e)))
-        })
-        .unwrap_or(false);
+    let has_hook = read_settings_json(&other_settings).is_some_and(|json| {
+        !skim_event_keys(&json, protocol.as_ref(), |e| protocol.is_skim_entry(e)).is_empty()
+    });
 
     if !has_hook {
         return Ok(None);
@@ -758,6 +823,36 @@ mod tests {
     }
 
     #[test]
+    fn test_post_matcher_selects_bash() {
+        assert!(post_matcher_selects_bash(None));
+        for m in ["", "*", "Edit|Bash", "^B", "("] {
+            assert!(post_matcher_selects_bash(Some(m)), "{m:?} must select Bash");
+        }
+        for m in ["Edit", "Edit|Write", "bash", "^Notebook"] {
+            assert!(!post_matcher_selects_bash(Some(m)), "{m:?} must not");
+        }
+    }
+
+    #[test]
+    fn test_skim_event_keys_lists_each_event_that_holds_a_skim_entry() {
+        let entry = |cmd: &str| serde_json::json!({"hooks": [{"command": cmd}]});
+        let (skim, other) = (entry("/h/skim-rewrite.sh"), entry("/usr/bin/other"));
+        let keys = |hooks: serde_json::Value| {
+            let config = serde_json::json!({ "hooks": hooks });
+            skim_event_keys(&config, &ClaudeCodeHook, |e| {
+                ClaudeCodeHook.is_skim_entry(e)
+            })
+        };
+        let both = keys(serde_json::json!({"PreToolUse": [skim], "PostToolUse": [other, skim]}));
+        assert_eq!(both, ["PreToolUse", "PostToolUse"]);
+        assert_eq!(
+            keys(serde_json::json!({"PostToolUse": [skim]})),
+            ["PostToolUse"]
+        );
+        assert!(keys(serde_json::json!({"PreToolUse": [other]})).is_empty());
+    }
+
+    #[test]
     fn test_scan_existing_hooks_cursor_format() {
         // Cursor flat format: non-skim entry uses top-level "command" field
         let settings = serde_json::json!({
@@ -929,6 +1024,8 @@ mod tests {
             script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: vec![],
             agent_cli_name: "claude-code",
         };
 
@@ -966,6 +1063,8 @@ mod tests {
             script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: vec![],
             agent_cli_name: "claude-code",
         };
 
@@ -1110,6 +1209,8 @@ mod tests {
             script_integrity: integrity,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: vec![],
             agent_cli_name: "claude-code",
         }
     }
@@ -1509,6 +1610,8 @@ mod tests {
             script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: vec![],
             agent_cli_name: "claude-code",
         }
     }

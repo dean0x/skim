@@ -155,9 +155,12 @@ fn print_dual_scope_warning(warning: &str) {
 /// (or the reverse).
 fn print_install_summary(state: &DetectedState, agent: AgentKind, dev_requested: bool) {
     println!("  Summary:");
-    if !state.hook_installed || !state.matches_request(dev_requested) {
-        let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-        println!("    * Create hook script: {}", hook_script_path.display());
+    let script_stale = !state.hook_installed || !state.matches_request(dev_requested);
+    if script_stale || !state.missing_hook_events.is_empty() {
+        if script_stale {
+            let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+            println!("    * Create hook script: {}", hook_script_path.display());
+        }
         let protocol = protocol_for_agent(agent);
         if protocol.uses_dedicated_hook_file() {
             // Copilot CLI: registration via hooks/skim.json, not settings.json.
@@ -172,7 +175,7 @@ fn print_install_summary(state: &DetectedState, agent: AgentKind, dev_requested:
             println!(
                 "    * Patch settings: {} (add {} hook)",
                 state.settings_path.display(),
-                protocol.hook_event_key(),
+                protocol.hook_event_keys().join(", "),
             );
         }
     }
@@ -503,6 +506,12 @@ fn run_install_single(
     if !state.existing_hooks.is_empty() {
         print_collision_warning(&state.existing_hooks);
     }
+    if !state.existing_post_hooks.is_empty() {
+        let hooks = state.existing_post_hooks.join(", ");
+        println!("  WARNING: Other PostToolUse hooks can select Bash: {hooks}");
+        println!("  Claude Code uses one PostToolUse result per call; skim's may be dropped.");
+        println!();
+    }
 
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
@@ -548,6 +557,7 @@ fn run_install_single(
     );
     if state.hook_installed
         && state.matches_request(dev_requested)
+        && state.missing_hook_events.is_empty()
         && guidance_current
         && !permissions_blocked
         && !flags.force
@@ -1470,7 +1480,7 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
         "  {} Patched: {} ({} hook added)",
         check_mark(true),
         state.settings_path.display(),
-        protocol.hook_event_key(),
+        protocol.hook_event_keys().join(", "),
     );
 
     Ok(())
@@ -1616,7 +1626,7 @@ pub(super) fn print_dry_run_actions(
         println!(
             "  [dry-run] Would patch: {} (add {} hook)",
             state.settings_path.display(),
-            protocol.hook_event_key(),
+            protocol.hook_event_keys().join(", "),
         );
     }
     if !no_guidance && let Some(path) = agent.instruction_file(global, env) {
@@ -1961,6 +1971,8 @@ mod tests {
             script_integrity: crate::cmd::integrity::ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: vec![],
             agent_cli_name,
         }
     }
