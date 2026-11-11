@@ -34,7 +34,12 @@ SKIM_ENV=(SKIM_CACHE_DIR="$S/cache" SKIM_ANALYTICS_DB="$S/cache/analytics.db" SK
   SKIM_WRAPPERS_DIR="$S/wrappers" PATH="$S/bin:$PATH")
 AGENT_ENV=(HOME="$S/home" CLAUDE_CONFIG_DIR="$S/global" CURSOR_CONFIG_DIR="$S/cursor"
   GEMINI_CONFIG_DIR="$S/gemini" COPILOT_CONFIG_DIR="$S/copilot" CODEX_CONFIG_DIR="$S/codex"
-  CODEX_HOME="$S/codex" CRUSH_CONFIG_DIR="$S/crush")
+  CODEX_HOME="$S/codex" CRUSH_CONFIG_DIR="$S/crush" TMPDIR="$S/tmp")
+# The real paths init writes when a redirect fails. Checked by mtime only; never read or listed.
+RH=$HOME RC=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+WATCH=("$RC/settings.json" "$RC/settings.local.json" "$RC/hooks" "$RC/CLAUDE.md" "$RH/.skim" "$RH/.skim/bin")
+newer_than() {  # stamp path...: print each path that exists and changed after the stamp
+  local st=$1 p; shift; for p in "$@"; do [ -e "$p" ] && [ "$p" -nt "$st" ] && printf '%s ' "$p"; done; return 0; }
 skim_env() { env -u SKIM_PASSTHROUGH -u SKIM_REWRITTEN_FROM -u SKIM_SESSION_ID "${SKIM_ENV[@]}" "$@"; }
 
 record() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$RES"; }
@@ -116,15 +121,19 @@ check_view() {  # label dir command
 
 # ---- Install into the scratch project ----
 install_hooks() {
-  touch "$S/stamp"
+  mkdir -p "$S/tmp" "$S/watch"; echo a > "$S/watch/old"; touch "$S/watch/stamp"; sleep 1
+  echo b > "$S/watch/old"; echo b > "$S/watch/new"
+  check init:watch-selftest "a planted write must be found" \
+    test "$(newer_than "$S/watch/stamp" "$S/watch/old" "$S/watch/new" "$S/watch/absent")" = "$S/watch/old $S/watch/new "
+  touch "$S/stamp"; sleep 1
   ( cd "$S/proj" && skim_env env "${AGENT_ENV[@]}" "$SKIM_BIN" init --project --agent claude-code --no-wrappers --no-guidance ) \
     > "$S/init.out" 2>&1 || die "skim init failed: $(tail -n 3 "$S/init.out")"
   local pid i outside stray; pid=$(sed -n 's/.*build started (PID \([0-9]*\)).*/\1/p' "$S/init.out")
   for i in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
   outside=$(grep -oE '/[^ ()"]+' "$S/init.out" | grep -vF -e "$S/" -e "$SKIM_BIN" | tr '\n' ' ' || true)
   check init:inside-scratch "init output names paths outside the scratch dir: $outside" test -z "$outside"
-  stray=$(find "$(dirname "$S")" -mindepth 1 -maxdepth 2 -newer "$S/stamp" -not -path "$S" -not -path "$S/*" 2>/dev/null | tr '\n' ' ' || true)
-  check init:no-write-outside-scratch "init wrote outside the scratch dir: $stray" test -z "$stray"
+  stray=$(newer_than "$S/stamp" "${WATCH[@]}")
+  check init:no-write-outside-scratch "init wrote a real config path: $stray" test -z "$stray"
   check init:settings "Pre and Post entries expected, no PostToolUseFailure" \
     jq -e '.hooks | has("PreToolUse") and has("PostToolUse") and (has("PostToolUseFailure") | not)' "$S/proj/.claude/settings.json"
   check init:pin "hook script does not pin $SKIM_BIN" grep -qF "$SKIM_BIN" "$S/proj/.claude/hooks/skim-rewrite.sh"
