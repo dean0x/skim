@@ -32,8 +32,9 @@ use rskim_core::{Language, Mode};
 // ============================================================================
 
 /// Set to `true` immediately before the first thread is spawned (just before
-/// `cmd::dispatch()`).  `strip_skim_wrappers_from_path()` asserts this is
-/// still `false` so that a future reordering of `main()` is caught at
+/// `cmd::dispatch()`).  `strip_skim_wrappers_from_path()` and
+/// `set_env_before_threads()` (every `set_var` of the start-up path) assert this
+/// is still `false` so that a future reordering of `main()` is caught at
 /// runtime rather than silently producing a data race on `set_var`.
 static THREADS_SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -835,44 +836,280 @@ fn filter_wrappers_from_path(
     std::env::join_paths(&filtered).ok()
 }
 
-/// Remove `~/.skim/bin` from `PATH` to prevent infinite recursion when the
-/// skim binary is invoked as a symlink (e.g. `~/.skim/bin/git`).
+// ============================================================================
+// PATH preparation and restart-loop guard
+// ============================================================================
+
+/// Exit status for a start that skim refuses because it would start itself
+/// again.  It is the shell's "found, cannot run" status.  Exit 1 cannot carry
+/// this: for grep, rg, diff and cmp it is a real answer.
+const RESTART_REFUSED_EXIT: u8 = 126;
+
+/// Env var that counts the skim processes in one chain of starts.  A literal
+/// `const` so the sandbox guard in `tests/cli_init.rs` can resolve the name.
+const SKIM_DEPTH_ENV: &str = "SKIM_DEPTH";
+
+/// Env var that names the wrapper process that started a child, as
+/// `<tool>:<pid>`.
+const SKIM_WRAPPER_PARENT_ENV: &str = "SKIM_WRAPPER_PARENT";
+
+/// Most skim processes allowed in one chain of starts.  Real chains are two to
+/// five deep.
+const SKIM_DEPTH_LIMIT: u32 = 32;
+
+/// What `stat` reports to identify a file: `(device, inode)`.
+type FileId = (u64, u64);
+
+/// Why skim refuses to start.
+#[derive(Debug, PartialEq, Eq)]
+enum LoopRefusal {
+    /// After the PATH change, the first `<tool>` on `PATH` is this binary.
+    SelfFirstOnPath,
+    /// The direct parent is a skim wrapper for the same tool.
+    SameToolParent,
+    /// The chain of skim processes is longer than [`SKIM_DEPTH_LIMIT`].
+    TooDeep,
+}
+
+impl LoopRefusal {
+    /// The one stderr line for this refusal.  It names the tool, and says how
+    /// to cure the cause.
+    fn line(&self, tool: &str) -> String {
+        let cause = match self {
+            Self::SelfFirstOnPath => format!("the first {tool} on PATH is skim itself"),
+            Self::SameToolParent => format!("a skim named {tool} started it"),
+            Self::TooDeep => format!(
+                "skim started itself {SKIM_DEPTH_LIMIT} times in a row (limit {SKIM_DEPTH_LIMIT})"
+            ),
+        };
+        format!(
+            "error: {tool}: {cause}; a link or copy of skim named {tool} is on PATH outside \
+             the skim wrappers folder — remove it or run the real {tool} by its full path"
+        )
+    }
+}
+
+/// `(device, inode)` of what `path` names, following links.  `None` when `stat`
+/// fails, and on a platform without inodes.
+#[cfg(unix)]
+fn file_id_at(path: &std::path::Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id_at(_path: &std::path::Path) -> Option<FileId> {
+    None
+}
+
+/// Identity of the running binary, or `None` when it cannot be read.
+fn running_binary_id() -> Option<FileId> {
+    file_id_at(&std::env::current_exe().ok()?)
+}
+
+/// Parse a decimal count.  Only ASCII digits are valid: no sign, no space, no
+/// prefix.
+fn parse_decimal_u32(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// The depth of this process: the inherited count plus one, saturating.  A
+/// missing, malformed or out-of-range inherited value counts as zero.
+fn next_depth(current: Option<&std::ffi::OsStr>) -> u32 {
+    current
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(parse_decimal_u32)
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+/// The [`SKIM_WRAPPER_PARENT_ENV`] value that process `pid` exports for `tool`.
+fn parent_marker(tool: &str, pid: u32) -> String {
+    format!("{tool}:{pid}")
+}
+
+/// Whether `marker` says that process `parent_pid` is a skim wrapper for `tool`.
+///
+/// The parse is closed: `<tool>:<decimal pid>` and nothing else.
+fn parent_marker_matches(marker: Option<&std::ffi::OsStr>, tool: &str, parent_pid: u32) -> bool {
+    marker
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|text| text.rsplit_once(':'))
+        .is_some_and(|(marked_tool, marked_pid)| {
+            marked_tool == tool && parse_decimal_u32(marked_pid) == Some(parent_pid)
+        })
+}
+
+/// Pure verdict for one new skim process: the depth it gets, or why it stops.
+///
+/// `tool` is `Some` only on the wrapper surface, and only there are `parent_env`
+/// and `parent_pid` used.
+fn next_level(
+    depth_env: Option<&std::ffi::OsStr>,
+    parent_env: Option<&std::ffi::OsStr>,
+    tool: Option<&str>,
+    parent_pid: Option<u32>,
+) -> Result<u32, LoopRefusal> {
+    let depth = next_depth(depth_env);
+    if depth > SKIM_DEPTH_LIMIT {
+        return Err(LoopRefusal::TooDeep);
+    }
+    if let (Some(tool), Some(parent_pid)) = (tool, parent_pid)
+        && parent_marker_matches(parent_env, tool, parent_pid)
+    {
+        return Err(LoopRefusal::SameToolParent);
+    }
+    Ok(depth)
+}
+
+/// Move to the end of `path` every folder whose `<tool>` is the running binary.
+///
+/// `Some(new_path)` only when the order changes.  A folder counts when
+/// `<folder>/<tool>` has the same device and inode as the running binary, which
+/// holds for a link, a hard link, a `..` spelling and a symlinked parent alike.
+/// Order is kept in both groups.  A folder that cannot be examined stays where
+/// it is.  Nothing is removed, so a second program in the same folder still
+/// resolves.
+///
+/// `tool` is `None` for a `skim`-typed start: then no lookup runs at all.
+/// `self_id` is a closure for the same reason; it runs at most once.
+fn demote_self_dirs(
+    path: &std::ffi::OsStr,
+    tool: Option<&str>,
+    self_id: impl FnOnce() -> Option<FileId>,
+) -> Option<std::ffi::OsString> {
+    let tool = tool?;
+    let self_id = self_id()?;
+    let entries: Vec<std::path::PathBuf> = std::env::split_paths(path).collect();
+    // One stat per entry.
+    let (others, selves): (Vec<_>, Vec<_>) = entries
+        .iter()
+        .cloned()
+        .partition(|dir| file_id_at(&dir.join(tool)) != Some(self_id));
+    let reordered: Vec<std::path::PathBuf> = others.into_iter().chain(selves).collect();
+    if reordered == entries {
+        return None;
+    }
+    std::env::join_paths(&reordered).ok()
+}
+
+/// Whether the first executable `<tool>` on `path` is the file `self_id` names.
+///
+/// This is the file a spawn of `<tool>` would start.
+fn first_tool_is_self(path: &std::ffi::OsStr, tool: &str, self_id: FileId) -> bool {
+    std::env::split_paths(path)
+        .map(|dir| dir.join(tool))
+        .find(|candidate| runner::is_executable(candidate))
+        .and_then(|candidate| file_id_at(&candidate))
+        == Some(self_id)
+}
+
+/// The `PATH` a skim process must run with, as `Ok(Some(path))` when it
+/// differs from `path`.
+///
+/// 1. Remove the wrappers folder, so a wrapper link there is not found again.
+/// 2. On the wrapper surface only, demote every other folder whose `<tool>` is
+///    the running binary (see [`demote_self_dirs`]).
+/// 3. Refuse when the first `<tool>` on the result is still the running binary:
+///    a spawn of the real tool would only start skim again.
+///
+/// A `skim`-typed start (`tool` is `None`) gets step 1 only, and `self_id` does
+/// not run.
+fn plan_wrapper_path(
+    path: &std::ffi::OsStr,
+    wrappers_dir: Option<&std::path::Path>,
+    tool: Option<&str>,
+    self_id: impl Fn() -> Option<FileId>,
+) -> Result<Option<std::ffi::OsString>, LoopRefusal> {
+    let stripped = filter_wrappers_from_path(path, wrappers_dir);
+    let Some(tool) = tool else {
+        return Ok(stripped);
+    };
+    let base = stripped.as_deref().unwrap_or(path);
+    let demoted = demote_self_dirs(base, Some(tool), &self_id);
+    let result = demoted.as_deref().unwrap_or(base);
+    if self_id().is_some_and(|id| first_tool_is_self(result, tool, id)) {
+        return Err(LoopRefusal::SelfFirstOnPath);
+    }
+    Ok(demoted.or(stripped))
+}
+
+/// `set_var` for the single-threaded start of `main()`.
+fn set_env_before_threads(key: &str, value: &std::ffi::OsStr) {
+    // Machine-checked single-thread invariant: if a future refactor moves a
+    // call below the thread boundary, this panics loudly rather than racing
+    // on the environment.
+    assert!(
+        !THREADS_SPAWNED.load(std::sync::atomic::Ordering::SeqCst),
+        "set_env_before_threads({key}) called after threads were spawned"
+    );
+    // SAFETY: THREADS_SPAWNED is false (asserted above), so no other thread can
+    // be reading the environment concurrently.
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+/// Prepare `PATH` so that a spawn of the wrapped tool finds the real tool, and
+/// stop at once when it would only find skim again.
 ///
 /// This MUST be the first thing called in `main()`, before any thread is
-/// spawned, because `set_var` is not thread-safe.
+/// spawned, because `set_var` is not thread-safe.  It writes `PATH` at most
+/// once.
 ///
 /// # Why this is needed
 ///
-/// When a symlink in `~/.skim/bin/git` invokes this binary, `~/.skim/bin`
-/// is at the front of PATH. If we let that PATH entry persist, then when a
-/// subcommand handler calls `CommandRunner::run("git", …)`, the shell will
-/// find `~/.skim/bin/git` again — triggering infinite recursion.
+/// When a link such as `~/.skim/bin/git` starts this binary, that folder is
+/// early on `PATH`.  If it stayed there, a handler that spawns `git` would find
+/// the link again and start skim again without end.  [`plan_wrapper_path`]
+/// removes the wrappers folder, and on the wrapper surface also moves to the end
+/// of `PATH` every other folder that holds a link to this binary under the
+/// tool's name.
 ///
-/// # Safety
-///
-/// `set_var` is unsafe in multi-threaded programs. This function must be
-/// called before any thread is spawned (before analytics background threads,
-/// rayon pools, etc.).
-fn strip_skim_wrappers_from_path() {
-    // Machine-checked single-thread invariant: assert that no thread has been
-    // spawned yet.  If a future refactor reorders main() and calls this
-    // function after spawning threads, this panics loudly rather than
-    // producing a silent data race on set_var.
+/// Reading the environment and the file system only: `PATH` is left as it is
+/// when the running binary or a folder cannot be examined.
+fn strip_skim_wrappers_from_path() -> Result<(), LoopRefusal> {
     assert!(
         !THREADS_SPAWNED.load(std::sync::atomic::Ordering::SeqCst),
         "strip_skim_wrappers_from_path() called after threads were spawned"
     );
-    let path = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return,
+    let Some(path) = std::env::var_os("PATH") else {
+        return Ok(());
     };
-    if let Some(new_path) = filter_wrappers_from_path(&path, cmd::skim_wrappers_dir()) {
-        // SAFETY: THREADS_SPAWNED is false (asserted above), so no other
-        // thread can be reading the environment concurrently.
-        unsafe {
-            std::env::set_var("PATH", &new_path);
-        }
+    let self_id = std::cell::OnceCell::new();
+    let lookup = || *self_id.get_or_init(running_binary_id);
+    let tool = wrapper_tool_from_argv0();
+    if let Some(new_path) =
+        plan_wrapper_path(&path, cmd::skim_wrappers_dir(), tool.as_deref(), lookup)?
+    {
+        set_env_before_threads("PATH", &new_path);
     }
+    Ok(())
+}
+
+/// Count this process in the chain of skim starts, and mark a wrapper process
+/// for its children.  Refuses when the chain is too long or a wrapper for the
+/// same tool started this one.  Runs once in `main()`, before any thread.
+fn enter_skim_level() -> Result<(), LoopRefusal> {
+    let tool = wrapper_tool_from_argv0();
+    let tool = tool.as_deref();
+    let depth = next_level(
+        std::env::var_os(SKIM_DEPTH_ENV).as_deref(),
+        std::env::var_os(SKIM_WRAPPER_PARENT_ENV).as_deref(),
+        tool,
+        tool.and_then(|_| cmd::session_sidecar::get_ppid()),
+    )?;
+    set_env_before_threads(SKIM_DEPTH_ENV, std::ffi::OsStr::new(&depth.to_string()));
+    if let Some(tool) = tool {
+        set_env_before_threads(
+            SKIM_WRAPPER_PARENT_ENV,
+            std::ffi::OsStr::new(&parent_marker(tool, std::process::id())),
+        );
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1004,9 +1241,17 @@ fn force_raw_requested(tool: &str) -> bool {
 }
 
 fn main() -> ExitCode {
-    // Strip ~/.skim/bin from PATH FIRST — before any thread is spawned.
-    // This prevents infinite recursion when invoked as a symlink (PF-003).
-    strip_skim_wrappers_from_path();
+    // Prepare PATH FIRST — before any thread is spawned.  This prevents
+    // infinite recursion when invoked as a link or copy named for a wrapped
+    // tool.  A start that would only start itself again stops here with exit
+    // 126, before it starts any other process.
+    if let Err(refusal) = strip_skim_wrappers_from_path().and_then(|()| enter_skim_level()) {
+        let named = wrapper_tool_from_argv0()
+            .or_else(|| extract_argv0_stem(&std::env::args().next()?))
+            .unwrap_or_else(|| "skim".to_string());
+        eprintln!("{}", refusal.line(&named));
+        return ExitCode::from(RESTART_REFUSED_EXIT);
+    }
 
     // Initialise debug flag from SKIM_DEBUG env var once, before any threads
     // are spawned. After this call, is_debug_enabled() is a pure atomic load.
@@ -2665,44 +2910,449 @@ mod tests {
         );
     }
 
-    /// KNOWN LIMITATION: filter_wrappers_from_path uses syntactic normalization
-    /// only (component-level path collapsing), not filesystem canonicalization.
-    ///
-    /// If `~/.skim` is itself a symlink (e.g. `~/.skim -> /opt/skim-wrappers`),
-    /// the syntactic comparison `normalized != wrappers_dir_canonical` will fail
-    /// because the PATH entry carries the real path `/opt/skim-wrappers/bin` while
-    /// `wrappers_dir_canonical` holds `~/.skim/bin` (syntactically normalised only).
-    ///
-    /// This means the recursion-prevention guard does NOT fire and `~/.skim/bin`
-    /// effectively stays on PATH under the symlink alias — a skim wrapper invocation
-    /// would recurse infinitely.
-    ///
-    /// Resolution requires `std::fs::canonicalize` on both sides of the comparison,
-    /// which is an I/O call and cannot be pure/no-alloc. Tracked as a known limitation
-    /// per PF-003. The test below documents the gap so the constraint is explicit.
+    // ========================================================================
+    // Restart-loop guard: depth counter, parent marker, PATH demotion
+    // ========================================================================
+
+    fn os(s: &str) -> &std::ffi::OsStr {
+        std::ffi::OsStr::new(s)
+    }
+
     #[test]
-    fn test_filter_wrappers_symlink_bypass_is_known_limitation() {
-        // We cannot create real filesystem symlinks in a unit test reliably across
-        // all platforms and CI environments.  Instead, this test documents the
-        // known limitation by asserting the SYNTACTIC behaviour: a path entry that
-        // resolves to the same filesystem location as `~/.skim/bin` but is spelled
-        // differently (e.g. via a parent-directory symlink) will NOT be removed.
-        //
-        // Concretely: if $HOME/.skim is a symlink to /tmp/skim-wrappers, then
-        // a PATH entry of `/tmp/skim-wrappers/bin` is NOT filtered out because
-        // `skim_wrappers_dir()` returns `$HOME/.skim/bin`, and the syntactic
-        // normalisation step cannot resolve that symlink.
-        //
-        // The safe escape hatch is SKIM_PASSTHROUGH=1, which bypasses all
-        // handler logic and is documented in CLAUDE.md.
-        //
-        // If you are here to fix this: replace the syntactic `components().collect()`
-        // canonicalization with `std::fs::canonicalize` on both sides and add
-        // filesystem-level symlink tests using tempdir + std::os::unix::fs::symlink.
-        //
-        // This test intentionally has no assertions — its purpose is to be a
-        // discoverable marker in the test suite for this limitation.
-        let _note = "syntactic-only PATH filter: symlink bypass is a known limitation (PF-003)";
+    fn next_depth_starts_at_one_when_unset() {
+        assert_eq!(next_depth(None), 1);
+    }
+
+    #[test]
+    fn next_depth_adds_one_to_a_valid_count() {
+        assert_eq!(next_depth(Some(os("0"))), 1);
+        assert_eq!(next_depth(Some(os("7"))), 8);
+        assert_eq!(next_depth(Some(os("32"))), 33);
+    }
+
+    #[test]
+    fn next_depth_counts_a_bad_value_as_zero() {
+        for bad in [
+            "",
+            "abc",
+            "-1",
+            "+5",
+            " 5",
+            "5 ",
+            "1.5",
+            "0x10",
+            "4294967296",
+            "99999999999999999999",
+        ] {
+            assert_eq!(next_depth(Some(os(bad))), 1, "{bad:?} must count as 0");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn next_depth_counts_a_non_utf8_value_as_zero() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            next_depth(Some(std::ffi::OsStr::from_bytes(b"\xff\xfe"))),
+            1
+        );
+    }
+
+    #[test]
+    fn next_depth_saturates_at_the_top_of_the_range() {
+        assert_eq!(next_depth(Some(os("4294967295"))), u32::MAX);
+    }
+
+    #[test]
+    fn parent_marker_matches_the_same_tool_and_pid() {
+        let marker = parent_marker("git", 4242);
+        assert_eq!(marker, "git:4242");
+        assert!(parent_marker_matches(Some(os(&marker)), "git", 4242));
+    }
+
+    #[test]
+    fn parent_marker_ignores_another_tool_or_pid_or_no_marker() {
+        assert!(!parent_marker_matches(Some(os("git:4242")), "grep", 4242));
+        assert!(!parent_marker_matches(Some(os("git:4242")), "git", 4243));
+        assert!(!parent_marker_matches(None, "git", 4242));
+    }
+
+    #[test]
+    fn parent_marker_parse_is_closed() {
+        for bad in [
+            "git",
+            "git:",
+            ":4242",
+            "git:+4242",
+            "git: 4242",
+            "git:4242:",
+            "git:4242:4242",
+            "git:0x10",
+            "git:-1",
+            "git:99999999999",
+        ] {
+            assert!(
+                !parent_marker_matches(Some(os(bad)), "git", 4242),
+                "{bad:?} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn next_level_allows_the_limit_and_refuses_one_past_it() {
+        assert_eq!(next_level(Some(os("31")), None, None, None), Ok(32));
+        assert_eq!(
+            next_level(Some(os("32")), None, None, None),
+            Err(LoopRefusal::TooDeep)
+        );
+    }
+
+    #[test]
+    fn next_level_refuses_a_wrapper_started_by_a_wrapper_of_the_same_tool() {
+        assert_eq!(
+            next_level(None, Some(os("git:100")), Some("git"), Some(100)),
+            Err(LoopRefusal::SameToolParent)
+        );
+    }
+
+    #[test]
+    fn next_level_allows_a_marker_of_another_tool_or_pid() {
+        assert_eq!(
+            next_level(None, Some(os("git:100")), Some("grep"), Some(100)),
+            Ok(1)
+        );
+        assert_eq!(
+            next_level(None, Some(os("git:100")), Some("git"), Some(101)),
+            Ok(1)
+        );
+        assert_eq!(
+            next_level(None, Some(os("git:100")), Some("git"), None),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn next_level_ignores_the_marker_for_a_plain_skim_start() {
+        assert_eq!(
+            next_level(None, Some(os("git:100")), None, Some(100)),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn every_refusal_line_names_the_tool_and_the_cure() {
+        for refusal in [
+            LoopRefusal::SelfFirstOnPath,
+            LoopRefusal::SameToolParent,
+            LoopRefusal::TooDeep,
+        ] {
+            let line = refusal.line("git");
+            assert!(!line.contains('\n'), "one line: {line:?}");
+            assert!(line.starts_with("error: git: "), "{line:?}");
+            assert!(
+                line.ends_with("remove it or run the real git by its full path"),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            LoopRefusal::TooDeep.line("git"),
+            "error: git: skim started itself 32 times in a row (limit 32); a link or copy \
+             of skim named git is on PATH outside the skim wrappers folder — remove it or \
+             run the real git by its full path"
+        );
+    }
+
+    /// Temp tree for PATH tests: a stand-in for the running binary, plus the
+    /// folders and files a test puts on a `PATH`.  Nothing here starts a process.
+    #[cfg(unix)]
+    struct PathTree {
+        root: tempfile::TempDir,
+        skim: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn write_exec(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn join_dirs(dirs: &[&std::path::Path]) -> std::ffi::OsString {
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    #[cfg(unix)]
+    impl PathTree {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let skim = root.path().join("skim-bin");
+            write_exec(&skim, "#!/bin/sh\n# stands in for the running skim\n");
+            Self { root, skim }
+        }
+
+        fn dir(&self, name: &str) -> std::path::PathBuf {
+            let dir = self.root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn self_id(&self) -> Option<FileId> {
+            file_id_at(&self.skim)
+        }
+
+        fn link(&self, dir: &std::path::Path, tool: &str) {
+            std::os::unix::fs::symlink(&self.skim, dir.join(tool)).unwrap();
+        }
+
+        fn hard_link(&self, dir: &std::path::Path, tool: &str) {
+            std::fs::hard_link(&self.skim, dir.join(tool)).unwrap();
+        }
+
+        /// A copy has the same bytes and another inode.
+        fn copy(&self, dir: &std::path::Path, tool: &str) {
+            std::fs::copy(&self.skim, dir.join(tool)).unwrap();
+        }
+
+        fn real(&self, dir: &std::path::Path, tool: &str) {
+            write_exec(&dir.join(tool), "#!/bin/sh\nexit 0\n");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_moves_a_folder_with_a_symlink_to_the_end() {
+        let t = PathTree::new();
+        let (a, b, c) = (t.dir("a"), t.dir("b"), t.dir("c"));
+        t.link(&a, "git");
+        t.real(&c, "git");
+        let got = demote_self_dirs(&join_dirs(&[&a, &b, &c]), Some("git"), || t.self_id());
+        assert_eq!(got, Some(join_dirs(&[&b, &c, &a])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_moves_a_folder_with_a_hard_link_to_the_end() {
+        let t = PathTree::new();
+        let (a, c) = (t.dir("a"), t.dir("c"));
+        t.hard_link(&a, "git");
+        t.real(&c, "git");
+        let got = demote_self_dirs(&join_dirs(&[&a, &c]), Some("git"), || t.self_id());
+        assert_eq!(got, Some(join_dirs(&[&c, &a])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_matches_a_folder_spelled_with_dot_dot() {
+        let t = PathTree::new();
+        let (a, c) = (t.dir("a"), t.dir("c"));
+        t.link(&a, "git");
+        t.real(&c, "git");
+        let spelled = c.join("..").join("a");
+        let got = demote_self_dirs(&join_dirs(&[&spelled, &c]), Some("git"), || t.self_id());
+        assert_eq!(
+            got,
+            Some(join_dirs(&[&c, &spelled])),
+            "the entry keeps its spelling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_matches_a_folder_reached_through_a_symlinked_parent() {
+        let t = PathTree::new();
+        let (a, c) = (t.dir("a"), t.dir("c"));
+        t.link(&a, "git");
+        t.real(&c, "git");
+        let alias = t.root.path().join("alias");
+        std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let got = demote_self_dirs(&join_dirs(&[&alias, &c]), Some("git"), || t.self_id());
+        assert_eq!(got, Some(join_dirs(&[&c, &alias])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_keeps_the_order_of_both_groups() {
+        let t = PathTree::new();
+        let (s1, x, s2, y) = (t.dir("s1"), t.dir("x"), t.dir("s2"), t.dir("y"));
+        t.link(&s1, "git");
+        t.link(&s2, "git");
+        t.real(&x, "git");
+        t.real(&y, "git");
+        let got = demote_self_dirs(&join_dirs(&[&s1, &x, &s2, &y]), Some("git"), || t.self_id());
+        assert_eq!(got, Some(join_dirs(&[&x, &y, &s1, &s2])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_leaves_a_copy_in_place() {
+        let t = PathTree::new();
+        let a = t.dir("a");
+        let c = t.dir("c");
+        t.copy(&a, "git");
+        t.real(&c, "git");
+        let got = demote_self_dirs(&join_dirs(&[&a, &c]), Some("git"), || t.self_id());
+        assert_eq!(
+            got, None,
+            "a copy is another file; the parent marker covers it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_keeps_an_entry_it_cannot_stat_in_place() {
+        let t = PathTree::new();
+        let (a, c) = (t.dir("a"), t.dir("c"));
+        t.link(&a, "git");
+        t.real(&c, "git");
+        let missing = t.root.path().join("missing");
+        let got = demote_self_dirs(&join_dirs(&[&missing, &a, &c]), Some("git"), || t.self_id());
+        assert_eq!(got, Some(join_dirs(&[&missing, &c, &a])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_returns_none_when_nothing_would_move() {
+        let t = PathTree::new();
+        let (a, c) = (t.dir("a"), t.dir("c"));
+        t.link(&a, "git");
+        t.real(&c, "git");
+        assert_eq!(
+            demote_self_dirs(&join_dirs(&[&c, &a]), Some("git"), || t.self_id()),
+            None,
+            "the self folder is already last"
+        );
+        assert_eq!(
+            demote_self_dirs(&join_dirs(&[&c]), Some("git"), || t.self_id()),
+            None,
+            "no self folder"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_returns_none_when_the_running_binary_is_unknown() {
+        let t = PathTree::new();
+        let a = t.dir("a");
+        t.link(&a, "git");
+        assert_eq!(
+            demote_self_dirs(&join_dirs(&[&a]), Some("git"), || None),
+            None
+        );
+    }
+
+    /// A plain `skim` start does no PATH work: the closure that would read the
+    /// running binary must not run.
+    #[test]
+    fn demote_never_reads_the_running_binary_for_a_plain_skim_start() {
+        let got = demote_self_dirs(os("/a:/b"), None, || {
+            panic!("self-id lookup ran for a plain skim start")
+        });
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn plan_does_no_self_lookup_for_a_plain_skim_start() {
+        let wrappers = std::path::Path::new("/w/bin");
+        let got = plan_wrapper_path(os("/w/bin:/usr/bin"), Some(wrappers), None, || {
+            panic!("self-id lookup ran for a plain skim start")
+        });
+        assert_eq!(
+            got,
+            Ok(Some(std::ffi::OsString::from("/usr/bin"))),
+            "the wrappers folder is still removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_demotes_a_link_folder_and_reaches_the_real_tool() {
+        let t = PathTree::new();
+        let (l, r) = (t.dir("links"), t.dir("real"));
+        t.link(&l, "git");
+        t.real(&r, "git");
+        let got = plan_wrapper_path(&join_dirs(&[&l, &r]), None, Some("git"), || t.self_id());
+        assert_eq!(got, Ok(Some(join_dirs(&[&r, &l]))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_removes_the_wrappers_folder_and_demotes_in_one_result() {
+        let t = PathTree::new();
+        let (w, l, r) = (t.dir("wrappers"), t.dir("links"), t.dir("real"));
+        t.link(&w, "git");
+        t.link(&l, "git");
+        t.real(&r, "git");
+        let got = plan_wrapper_path(&join_dirs(&[&w, &l, &r]), Some(&w), Some("git"), || {
+            t.self_id()
+        });
+        assert_eq!(got, Ok(Some(join_dirs(&[&r, &l]))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_refuses_when_only_this_binary_is_named_for_the_tool() {
+        let t = PathTree::new();
+        let (l, other) = (t.dir("links"), t.dir("other"));
+        t.link(&l, "git");
+        t.real(&other, "zzother");
+        for path in [join_dirs(&[&l]), join_dirs(&[&l, &other])] {
+            assert_eq!(
+                plan_wrapper_path(&path, None, Some("git"), || t.self_id()),
+                Err(LoopRefusal::SelfFirstOnPath)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_refuses_when_a_hard_link_is_the_only_match() {
+        let t = PathTree::new();
+        let l = t.dir("links");
+        t.hard_link(&l, "git");
+        assert_eq!(
+            plan_wrapper_path(&join_dirs(&[&l]), None, Some("git"), || t.self_id()),
+            Err(LoopRefusal::SelfFirstOnPath)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_skips_a_file_without_the_exec_bit_like_the_spawn_does() {
+        let t = PathTree::new();
+        let (l, nx) = (t.dir("links"), t.dir("noexec"));
+        t.link(&l, "git");
+        std::fs::write(nx.join("git"), "not executable").unwrap();
+        assert_eq!(
+            plan_wrapper_path(&join_dirs(&[&l, &nx]), None, Some("git"), || t.self_id()),
+            Err(LoopRefusal::SelfFirstOnPath),
+            "the non-executable git is skipped, so the link is still the first match"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_allows_a_copy_in_front_because_it_is_another_file() {
+        let t = PathTree::new();
+        let (c, r) = (t.dir("copies"), t.dir("real"));
+        t.copy(&c, "git");
+        t.real(&r, "git");
+        assert_eq!(
+            plan_wrapper_path(&join_dirs(&[&c, &r]), None, Some("git"), || t.self_id()),
+            Ok(None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_keeps_the_path_when_the_running_binary_is_unknown() {
+        let t = PathTree::new();
+        let l = t.dir("links");
+        t.link(&l, "git");
+        assert_eq!(
+            plan_wrapper_path(&join_dirs(&[&l]), None, Some("git"), || None),
+            Ok(None)
+        );
     }
 
     // ========================================================================

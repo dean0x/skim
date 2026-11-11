@@ -161,6 +161,8 @@ pub const SANDBOX_REMOVED_VARS: &[&str] = &[
     "SKIM_HOOK_AUDIT",          // would append JSON lines to a hook-audit log
     "SKIM_SESSION_ID",          // analytics session attribution + sidecar keying
     "SKIM_DEBUG",               // adds raw-fallback banners that break stderr assertions
+    "SKIM_DEPTH",               // restart-chain counter; a host value moves the refusal point
+    "SKIM_WRAPPER_PARENT",      // `<tool>:<pid>` marker; a host value could refuse a start
     "SKIM_INPUT_COST_PER_MTOK", // cost estimates must use the documented default
     "SKIM_PROJECTS_DIR",        // session-provider transcript dir (Claude)
     "SKIM_CODEX_SESSIONS_DIR",  // session-provider transcript dir (Codex)
