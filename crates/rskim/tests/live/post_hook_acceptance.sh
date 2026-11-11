@@ -2,6 +2,10 @@
 # Live acceptance for the PostToolUse compression hook. Manual: it needs Claude auth,
 # starts real `claude -p` sessions in auto mode and spends tokens. CI does not run it.
 # Env: SKIM_BIN (default target/debug/skim) CLAUDE_BIN MAX_TURNS=10 MAX_BUDGET_USD=1.00
+#      SESSION_SECS=600 (wall-clock limit of each claude session: a session that runs longer
+#      is killed and the script reports a FAIL for it)
+#      ALLOW_UNCAPPED=1 (run when `claude --help` names no --max-turns or no --max-budget-usd;
+#      without it the script stops with an error before the first session)
 #      LATENCY_N=50 KEEP=1 (keep the scratch dir) OFFLINE=1 (skip every claude run)
 set -euo pipefail
 
@@ -10,6 +14,8 @@ SKIM_BIN=${SKIM_BIN:-$REPO/target/debug/skim}
 CLAUDE_BIN=${CLAUDE_BIN:-claude}
 MAX_TURNS=${MAX_TURNS:-10}
 MAX_BUDGET_USD=${MAX_BUDGET_USD:-1.00}
+SESSION_SECS=${SESSION_SECS:-600}
+ALLOW_UNCAPPED=${ALLOW_UNCAPPED:-0}
 LATENCY_N=${LATENCY_N:-50}
 KEEP=${KEEP:-0}
 OFFLINE=${OFFLINE:-0}
@@ -19,9 +25,18 @@ die() { echo "error: $*" >&2; exit 2; }
 for t in jq perl git cmp awk od; do command -v "$t" >/dev/null || die "missing tool: $t"; done
 [ -x "$SKIM_BIN" ] || die "no skim binary at $SKIM_BIN (run: cargo build -p rskim)"
 SKIM_BIN=$(cd "$(dirname "$SKIM_BIN")" && pwd -P)/$(basename "$SKIM_BIN")
+HAS_TURNS=0; HAS_BUDGET=0
 if [ "$OFFLINE" != 1 ]; then
   command -v "$CLAUDE_BIN" >/dev/null || die "missing tool: $CLAUDE_BIN"
   [ -z "${ANTHROPIC_BASE_URL:-}" ] || die "ANTHROPIC_BASE_URL is set: run without a proxy"
+  # perl reads a zero or a non-number as "no alarm", so a bad value would remove the limit.
+  [[ $SESSION_SECS =~ ^[1-9][0-9]*$ ]] || die "SESSION_SECS must be a whole number of seconds above zero: '$SESSION_SECS'"
+  claude_help=$("$CLAUDE_BIN" --help 2>&1 || true)
+  if [[ $claude_help == *--max-turns* ]]; then HAS_TURNS=1; fi
+  if [[ $claude_help == *--max-budget-usd* ]]; then HAS_BUDGET=1; fi
+  if [ "$HAS_TURNS$HAS_BUDGET" != 11 ] && [ "$ALLOW_UNCAPPED" != 1 ]; then
+    die "'$CLAUDE_BIN --help' does not name both --max-turns (found: $HAS_TURNS) and --max-budget-usd (found: $HAS_BUDGET). Every paid session would run with no cap. Use a claude CLI that has both flags, or set ALLOW_UNCAPPED=1 to run without them."
+  fi
 fi
 
 S=$(cd "$(mktemp -d)" && pwd -P)
@@ -223,13 +238,18 @@ verify_run() {  # run ncalls
 }
 
 # ---- Sessions ----
-HAS_TURNS=0; HAS_BUDGET=0
 claude_run() {  # name dir settings prompt
-  local a=(-p --permission-mode auto --setting-sources project --settings "$3" --output-format stream-json --verbose)
+  local a=(-p --permission-mode auto --setting-sources project --settings "$3" --output-format stream-json --verbose) rc=0
   if [ "$HAS_BUDGET" = 1 ]; then a+=(--max-budget-usd "$MAX_BUDGET_USD"); fi
   if [ "$HAS_TURNS" = 1 ]; then a+=(--max-turns "$MAX_TURNS"); fi
-  ( cd "$2" && printf '%s' "$4" | skim_env "$CLAUDE_BIN" "${a[@]}" ) > "$S/out/$1.jsonl" 2> "$S/out/$1.err" \
-    || record INFO "$1:exit" "claude exited non-zero; see $S/out/$1.err"
+  # perl sets a wall-clock alarm, then becomes claude: macOS has no timeout(1). The alarm survives exec.
+  ( cd "$2" && printf '%s' "$4" | skim_env perl -e 'alarm shift; exec @ARGV; die "exec failed: $!\n"' "$SESSION_SECS" "$CLAUDE_BIN" "${a[@]}" ) \
+    > "$S/out/$1.jsonl" 2> "$S/out/$1.err" || rc=$?
+  if [ "$rc" = 142 ]; then   # 128 + SIGALRM: the session ran past SESSION_SECS and was killed
+    record FAIL "$1:timeout" "killed after ${SESSION_SECS}s (SESSION_SECS); see $S/out/$1.err"
+  elif [ "$rc" != 0 ]; then
+    record INFO "$1:exit" "claude exited non-zero ($rc); see $S/out/$1.err"
+  fi
 }
 ASK='This is a tool-output test. Run the Bash commands below exactly as written. Do not run any other command.'
 P_SINGLE="$ASK
@@ -251,10 +271,7 @@ P_FAIL="$ASK
 
 Reply with the exact full output text you received, and say if the call failed."
 live_runs() {
-  local help; help=$("$CLAUDE_BIN" --help 2>&1 || true)
-  if [[ $help == *--max-turns* ]]; then HAS_TURNS=1; fi
-  if [[ $help == *--max-budget-usd* ]]; then HAS_BUDGET=1; fi
-  record INFO claude "$("$CLAUDE_BIN" --version 2>&1 | sed -n 1p); --max-turns supported=$HAS_TURNS; --max-budget-usd supported=$HAS_BUDGET"
+  record INFO claude "$("$CLAUDE_BIN" --version 2>&1 | sed -n 1p); --max-turns supported=$HAS_TURNS; --max-budget-usd supported=$HAS_BUDGET; ALLOW_UNCAPPED=$ALLOW_UNCAPPED; SESSION_SECS=$SESSION_SECS"
   claude_run single "$S/proj" "$S/settings.json" "$P_SINGLE"; verify_run single 1
   check_reply single compressed "$(cat "$S/canary/pytest")"
   claude_run batch "$S/proj" "$S/settings.json" "$P_BATCH"; verify_run batch 3
