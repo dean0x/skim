@@ -1,11 +1,13 @@
 //! Interactive hook installation for Claude Code (#44)
 //!
-//! `skim init` installs skim as a Claude Code PreToolUse hook, enabling
-//! automatic command rewriting. Supports global (`~/.claude/`) and project-level
-//! (`.claude/`) installation with idempotent, atomic writes.
+//! `skim init` installs skim as a Claude Code PreToolUse and PostToolUse hook,
+//! enabling automatic command rewriting and after-run output compression.
+//! Supports global (`~/.claude/`) and project-level (`.claude/`) installation
+//! with idempotent, atomic writes.
 //!
 //! The hook script calls `skim rewrite --hook` which reads Claude Code's
-//! PreToolUse JSON, rewrites matched commands, and emits `updatedInput`.
+//! PreToolUse JSON, rewrites matched commands, and emits `updatedInput`. For a
+//! PostToolUse event it compresses the captured output instead.
 //!
 //! SECURITY INVARIANT (Claude Code): The Claude Code hook NEVER sets
 //! `permissionDecision`. It only emits `updatedInput` inside

@@ -5,7 +5,7 @@ description: "Use when changing hook install, binary pinning, wrapper symlinks o
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions, crates/rskim/src/main.rs, crates/rskim/src/runner.rs]
 created: 2026-07-04
-updated: 2026-11-10
+updated: 2026-11-11
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
@@ -23,6 +23,8 @@ updated: 2026-11-10
 This feature area covers how skim installs itself as a PreToolUse hook into AI agent runtimes (Claude Code, Cursor, Gemini CLI, Copilot CLI, Crush) and as awareness-only files into Codex CLI. The central problem it solves is the **wrong-clone hazard**: multiple skim clones on different branches can report identical semver strings. Without binary pinning, the installed hook might silently exec the wrong clone.
 
 The solution is a pinned-binary hook script format (F6 / PR #421) embedding the canonicalized absolute path plus a git short SHA. A SHA-256 manifest sidecar enables tamper detection independent of the script's own content.
+
+**Post-run surface (Claude Code only).** The same script and `skim rewrite --hook` argv also serve the `PostToolUse` event. `hook.rs` `route_stdin` routes on `hook_event_name`: a `PostToolUse` input goes to `post_hook.rs` `run_post_hook`, every other input keeps the Pre path unchanged. The post path is pure: it spawns no process, reads no file, writes no analytics row, no force-raw marker and no sidecar, and skips the drift/integrity block. It replaces `tool_response.stdout` for an allow-listed, successful, auto-mode Bash call and returns no permission decision. `skim init` installs both event keys (`hook_event_keys()`); `missing_hook_events` in the detected state makes a Pre-only install fall off the fast path, and `skim doctor` notes the gap without drift.
 
 ## Business Context
 

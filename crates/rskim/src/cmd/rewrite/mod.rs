@@ -15,6 +15,7 @@
 //! Reads JSON from stdin, extracts the command field (agent-specific), rewrites if
 //! matched, and emits agent-specific hook-protocol JSON. Each agent's
 //! `format_response()` controls the response shape — see `hooks/` module.
+//! Claude Code's PostToolUse event goes to `post_hook` instead.
 //!
 //! **Tri-state classification** (`classify_command`, AD-RW-2): Exposes a richer
 //! API used by `discover` to distinguish between commands that are genuinely
