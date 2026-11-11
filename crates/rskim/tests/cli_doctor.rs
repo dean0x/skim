@@ -202,6 +202,36 @@ fn test_doctor_exits_0_after_clean_init() {
         .success();
 }
 
+/// An install without its PostToolUse entry is not drift: doctor still exits 0
+/// and prints one note that names the entry and the command that adds it.
+#[test]
+fn test_doctor_notes_a_missing_post_tool_use_entry_without_exit_1() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+    let doctor = || {
+        let mut cmd = common::skim_sandboxed(home);
+        cmd.arg("doctor").current_dir(home);
+        let assert = cmd.env("PATH", common::hermetic_path()).assert().success();
+        String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+    };
+    assert!(
+        !doctor().contains("PostToolUse"),
+        "a full install has no note"
+    );
+
+    let path = home.join(".claude/settings.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    json["hooks"].as_object_mut().unwrap().remove("PostToolUse");
+    std::fs::write(&path, json.to_string()).unwrap();
+
+    let out = doctor();
+    let note = "note: no PostToolUse entry; run `skim init --agent claude-code` to add it";
+    assert!(out.contains(note), "stdout:\n{out}");
+}
+
 /// After tampering with the hook script (appending one byte), `skim doctor`
 /// must exit 1 AND name the tamper in stdout.
 ///
