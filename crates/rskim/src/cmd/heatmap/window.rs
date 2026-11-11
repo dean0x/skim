@@ -221,7 +221,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::super::types::CommitInfo;
+    use super::super::git_source::ParsedLog;
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -427,8 +427,14 @@ mod tests {
                 Ok(self.commit_count_since)
             }
         }
-        fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>> {
-            Ok(vec![])
+        fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<ParsedLog> {
+            Ok(ParsedLog::default())
+        }
+        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
+            Ok(None)
+        }
+        fn show_prefix(&self) -> anyhow::Result<String> {
+            Ok(String::new())
         }
     }
 

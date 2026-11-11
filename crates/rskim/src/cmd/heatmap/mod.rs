@@ -213,8 +213,8 @@ fn prepare_commits(
     }
 
     // Step 3: Fetch commits
-    let raw_commits = match source.fetch_commits(&config) {
-        Ok(c) => c,
+    let parsed = match source.fetch_commits(&config) {
+        Ok(p) => p,
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("not installed") || msg.contains("not in PATH") {
@@ -225,6 +225,19 @@ fn prepare_commits(
             return Ok(None);
         }
     };
+
+    if parsed.malformed > 0 {
+        let noun = if parsed.malformed == 1 {
+            "record"
+        } else {
+            "records"
+        };
+        warnings.push(format!(
+            "Skipped {} malformed git log {noun} (bad hash or timestamp); their file changes are not counted.",
+            parsed.malformed
+        ));
+    }
+    let raw_commits = parsed.commits;
 
     if debug {
         eprintln!("[skim:heatmap] raw commits fetched: {}", raw_commits.len());
@@ -728,6 +741,85 @@ mod tests {
             !module_paths.contains(&"tests"),
             "expected 'tests' module to be dropped, got: {module_paths:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // prepare_commits — malformed git log records
+    // -----------------------------------------------------------------------
+
+    /// Stub `GitDataSource` whose `fetch_commits` returns one commit with one
+    /// file and the configured count of malformed records.
+    struct StubSource {
+        malformed: usize,
+    }
+
+    impl GitDataSource for StubSource {
+        fn is_git_repo(&self) -> bool {
+            true
+        }
+        fn get_repo_root(&self) -> anyhow::Result<String> {
+            Ok("/stub/repo".to_string())
+        }
+        fn detect_shallow_clone(&self) -> bool {
+            false
+        }
+        fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
+            Ok(None)
+        }
+        fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<git_source::ParsedLog> {
+            Ok(git_source::ParsedLog {
+                commits: vec![CommitInfo {
+                    hash: "a".repeat(40),
+                    author: "Alice".to_string(),
+                    timestamp: 1_700_000_000,
+                    message: "feat: one".to_string(),
+                    changed_files: vec![types::FileChangeInfo {
+                        path: std::path::PathBuf::from("src/main.rs"),
+                        additions: 1,
+                        deletions: 0,
+                    }],
+                }],
+                malformed: self.malformed,
+            })
+        }
+        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
+            Ok(None)
+        }
+        fn show_prefix(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn malformed_warnings(prepared: &PreparedCommits) -> Vec<&String> {
+        prepared
+            .warnings
+            .iter()
+            .filter(|w| w.contains("malformed git log"))
+            .collect()
+    }
+
+    #[test]
+    fn test_prepare_commits_adds_one_warning_with_malformed_count() {
+        let source = StubSource { malformed: 3 };
+        let prepared = prepare_commits(&source, HeatmapArgs::default())
+            .unwrap()
+            .expect("one good commit remains");
+        assert_eq!(
+            malformed_warnings(&prepared),
+            vec![
+                "Skipped 3 malformed git log records (bad hash or timestamp); their file changes are not counted."
+            ]
+        );
+        assert_eq!(prepared.commits.len(), 1);
+    }
+
+    #[test]
+    fn test_prepare_commits_no_malformed_warning_when_count_is_zero() {
+        let source = StubSource { malformed: 0 };
+        let prepared = prepare_commits(&source, HeatmapArgs::default())
+            .unwrap()
+            .expect("one good commit remains");
+        assert!(malformed_warnings(&prepared).is_empty());
     }
 
     // -----------------------------------------------------------------------
