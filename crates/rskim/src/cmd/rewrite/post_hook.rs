@@ -126,13 +126,19 @@ pub(super) fn post_tool_for(result: &RewriteResult) -> Option<PostTool> {
 ///
 /// The cat handler builds `[<origin tag>, skim, <file>, <mode>]` for one file.
 /// More files add `--no-header`, and caller env vars add leading tokens, so
-/// both give a different token count and are refused. The cat rewrite also
-/// accepts Markdown and the serde data formats; this path does not.
+/// both give a different token count and are refused. A glob, brace or `$`
+/// in the one argument can expand to several files in the shell, so it is
+/// refused too. The cat rewrite also accepts Markdown and the serde data
+/// formats; this path does not.
 fn cat_post_tool(tokens: &[String]) -> Option<PostTool> {
     let [origin, skim, file, mode] = tokens else {
         return None;
     };
-    if !origin.starts_with(REWRITE_ORIGIN_ENV) || skim != "skim" || !is_code_language(file) {
+    if !origin.starts_with(REWRITE_ORIGIN_ENV)
+        || skim != "skim"
+        || file.contains(['*', '?', '[', '{', '$'])
+        || !is_code_language(file)
+    {
         return None;
     }
     match mode.as_str() {
@@ -512,7 +518,15 @@ mod tests {
 
     #[test]
     fn lookup_gives_none_for_cat_of_several_files() {
-        for command in ["cat a.rs b.rs", "cat a.d.ts b.d.ts"] {
+        for command in [
+            "cat a.rs b.rs",
+            "cat a.d.ts b.d.ts",
+            "cat src/*.rs",
+            "cat src/{a,b}.rs",
+            "cat src/?.rs",
+            "cat src/[ab].rs",
+            "cat $F.rs",
+        ] {
             assert!(rewrite_of(command).is_some(), "{command:?} must rewrite");
             assert_eq!(post_tool_of(command), None, "{command:?}");
         }
