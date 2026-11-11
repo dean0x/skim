@@ -187,6 +187,10 @@ Do not change permission or allowlist settings yourself to avoid a
 prompt. If a wrapped command is denied when you did not expect it,
 surface the denial to the user rather than working around it.
 
+In Claude Code auto mode, skim can also compress the output of some Bash
+commands after they run. A `[skim]` line on stderr names such a view. Run the
+command again with `SKIM_PASSTHROUGH=1` in front to get the raw output.
+
 ### When to use skim
 
 **General principle:** Use skim when structure is sufficient for your task.
@@ -511,9 +515,13 @@ mod tests {
         assert!(content.contains("--mode=types"));
         // No prescriptive decision table
         assert!(!content.contains("Choose ONE tool per file"));
-        // SKIM_PASSTHROUGH is NOT documented in guidance — agents learn about it
-        // from stderr hints emitted on compressed non-zero exits (shared.rs, mod.rs).
-        assert!(!content.contains("SKIM_PASSTHROUGH"));
+        // The after-run view of auto mode is the one place the guidance names
+        // the escape hatch: the agent sees that view without a rewrite to read.
+        assert!(
+            content.contains("In Claude Code auto mode")
+                && content.contains("`SKIM_PASSTHROUGH=1` in front"),
+            "Guidance must say that auto mode can compress output after the run"
+        );
         // Command wrapping section explains that the rewrite hook may wrap
         // supported tools and that agents should flag garbled output to the user.
         assert!(
