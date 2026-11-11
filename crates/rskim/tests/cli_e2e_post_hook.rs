@@ -63,10 +63,16 @@ static STUBS: LazyLock<Stubs> = LazyLock::new(|| {
 /// Start `skim rewrite --hook --agent <agent>` with piped stdio, a private
 /// `PATH`, and `cache` as both home and cache dir.
 fn spawn(agent: &str, cache: &Path) -> Child {
+    spawn_with(agent, cache, &[])
+}
+
+/// [`spawn`] with extra environment variables.
+fn spawn_with(agent: &str, cache: &Path, envs: &[(&str, &str)]) -> Child {
     let mut command = Command::new(common::skim_bin());
     command
         .args(["rewrite", "--hook", "--agent", agent])
         .env_clear()
+        .envs(envs.iter().copied())
         .env("PATH", &STUBS.path)
         .env("HOME", cache)
         .env("SKIM_CACHE_DIR", cache)
@@ -516,4 +522,37 @@ fn a_pre_run_input_over_64_kib_still_passes_through() {
     let pre = |pad: usize| json!({ "tool_input": { "command": "cargo test", "description": "x".repeat(pad) } });
     assert!(!run_quiet(pre(0).to_string()).stdout.is_empty());
     assert!(run_quiet(pre(70_000).to_string()).stdout.is_empty());
+}
+
+// ---- A drift finding reaches hook.log on a pre-run or bad input, never on a post-run input ----
+
+/// Run the hook as a drifted install (a hook version that is not the binary's)
+/// and return the hook.log it wrote, or `None` when it wrote none.
+fn drift_log(stdin: &str) -> Option<String> {
+    let cache = tempfile::tempdir().expect("cache dir");
+    let mut child = spawn_with(
+        "claude-code",
+        cache.path(),
+        &[("SKIM_HOOK_VERSION", "0.0.0-fake")],
+    );
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write");
+    assert_quiet(&child.wait_with_output().expect("wait for skim"));
+    fs::read_to_string(cache.path().join("hook.log")).ok()
+}
+
+#[test]
+fn a_drift_finding_is_logged_for_pre_and_bad_inputs_but_not_for_a_post_input() {
+    assert_eq!(drift_log(&baseline().to_string()), None, "post input");
+    for (name, stdin) in [
+        ("pre input", r#"{"tool_input":{"command":"cargo test"}}"#),
+        ("bad JSON", "{"),
+    ] {
+        let log = drift_log(stdin).unwrap_or_else(|| panic!("{name}: no hook.log"));
+        assert!(log.contains("0.0.0-fake"), "{name}: {log}");
+    }
 }

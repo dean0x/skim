@@ -116,12 +116,15 @@ check_view() {  # label dir command
 
 # ---- Install into the scratch project ----
 install_hooks() {
+  touch "$S/stamp"
   ( cd "$S/proj" && skim_env env "${AGENT_ENV[@]}" "$SKIM_BIN" init --project --agent claude-code --no-wrappers --no-guidance ) \
     > "$S/init.out" 2>&1 || die "skim init failed: $(tail -n 3 "$S/init.out")"
-  local pid i outside; pid=$(sed -n 's/.*build started (PID \([0-9]*\)).*/\1/p' "$S/init.out")
+  local pid i outside stray; pid=$(sed -n 's/.*build started (PID \([0-9]*\)).*/\1/p' "$S/init.out")
   for i in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
   outside=$(grep -oE '/[^ ()"]+' "$S/init.out" | grep -vF -e "$S/" -e "$SKIM_BIN" | tr '\n' ' ' || true)
   check init:inside-scratch "init output names paths outside the scratch dir: $outside" test -z "$outside"
+  stray=$(find "$(dirname "$S")" -mindepth 1 -maxdepth 2 -newer "$S/stamp" -not -path "$S" -not -path "$S/*" 2>/dev/null | tr '\n' ' ' || true)
+  check init:no-write-outside-scratch "init wrote outside the scratch dir: $stray" test -z "$stray"
   check init:settings "Pre and Post entries expected, no PostToolUseFailure" \
     jq -e '.hooks | has("PreToolUse") and has("PostToolUse") and (has("PostToolUseFailure") | not)' "$S/proj/.claude/settings.json"
   check init:pin "hook script does not pin $SKIM_BIN" grep -qF "$SKIM_BIN" "$S/proj/.claude/hooks/skim-rewrite.sh"
