@@ -245,6 +245,7 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
             category: rule.category,
             masks_output: rewrites_to_masking_tool(rule.rewrite_to),
             matched_prefix: Some(rule.prefix),
+            npx_tool: rules::npx_local_tool(rule.prefix),
         });
     }
 
@@ -498,6 +499,7 @@ pub(super) fn try_custom_handlers(
 mod tests {
     use super::super::types::RewriteCategory;
     use super::*;
+    use crate::runner::NpxTool;
 
     // ========================================================================
     // Prefix rule matches
@@ -1285,6 +1287,97 @@ mod tests {
                 "{tokens:?} must probe its program once and nothing else"
             );
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // The npx local-bin requirement (skim#587)
+    // ------------------------------------------------------------------------
+
+    /// Each `npx <tool>` rule that starts the project's own bin names its tool
+    /// in the result, and the engine text for it does not change.
+    #[test]
+    fn test_npx_local_bin_rules_name_their_tool() {
+        for (tokens, tool, text) in [
+            (
+                vec!["npx", "tsc", "--noEmit"],
+                NpxTool::Tsc,
+                "skim tsc --noEmit",
+            ),
+            (
+                vec!["npx", "eslint", "src/"],
+                NpxTool::Eslint,
+                "skim eslint src/",
+            ),
+            (
+                vec!["npx", "prettier", "--write", "src/"],
+                NpxTool::Prettier,
+                "skim prettier --write src/",
+            ),
+            (
+                vec!["npx", "prettier", "-w", "src/"],
+                NpxTool::Prettier,
+                "skim prettier -w src/",
+            ),
+            (
+                vec!["npx", "prettier", "--check", "src/"],
+                NpxTool::Prettier,
+                "skim prettier src/",
+            ),
+            (
+                vec!["npx", "biome", "check", "."],
+                NpxTool::Biome,
+                "skim biome check .",
+            ),
+            (
+                vec!["npx", "biome", "format", "."],
+                NpxTool::Biome,
+                "skim biome format .",
+            ),
+            (
+                vec!["npx", "biome", "lint", "."],
+                NpxTool::Biome,
+                "skim biome lint .",
+            ),
+            (vec!["npx", "biome", "ci"], NpxTool::Biome, "skim biome ci"),
+            (
+                vec!["npx", "oxlint", "src/"],
+                NpxTool::Oxlint,
+                "skim oxlint src/",
+            ),
+        ] {
+            let result = try_rewrite(&tokens)
+                .unwrap_or_else(|| panic!("{tokens:?} must rewrite while its program resolves"));
+            assert_eq!(result.npx_tool, Some(tool), "{tokens:?}");
+            assert_eq!(result.tokens.join(" "), text, "{tokens:?}");
+        }
+    }
+
+    /// A rewrite that does not start a project-local bin through npx carries no
+    /// requirement: bare tool names, the test-family `npx` rules (they have
+    /// their own npx fallback) and the file handlers.
+    #[test]
+    fn test_other_rewrites_carry_no_npx_tool() {
+        for tokens in [
+            vec!["tsc", "--noEmit"],
+            vec!["eslint", "src/"],
+            vec!["prettier", "--write", "src/"],
+            vec!["npx", "vitest", "run"],
+            vec!["npx", "jest", "src/"],
+            vec!["cargo", "test"],
+            vec!["cat", "file.ts"],
+            vec!["head", "-n", "5", "file.ts"],
+        ] {
+            let result = try_rewrite(&tokens).unwrap_or_else(|| panic!("{tokens:?} must rewrite"));
+            assert_eq!(result.npx_tool, None, "{tokens:?}");
+        }
+    }
+
+    /// The requirement survives an env-var prefix, because the rule match runs
+    /// after the env strip.
+    #[test]
+    fn test_npx_tool_survives_an_env_prefix() {
+        let result = try_rewrite(&["CI=1", "npx", "eslint", "."]).expect("must rewrite");
+        assert_eq!(result.npx_tool, Some(NpxTool::Eslint));
     }
 
     /// Every rule head is a bare name or a cwd-relative `./name`.

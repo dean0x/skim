@@ -17,6 +17,7 @@ use super::engine::try_rewrite;
 use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
+use crate::runner::NpxTool;
 
 // ---- Round-trip safety (#317) ----
 
@@ -1033,11 +1034,16 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
     let mut any_rewritten = false;
     let mut any_masks_output = false;
     let mut first_category: Option<RewriteCategory> = None;
+    let mut first_segment_npx_tool: Option<NpxTool> = None;
     let mut parts: Vec<String> = Vec::new();
 
-    for seg in segments {
+    for (index, seg) in segments.iter().enumerate() {
         let token_refs: Vec<&str> = seg.tokens.iter().map(|s| s.as_str()).collect();
-        let rewrite = try_rewrite(&token_refs);
+        // A rewrite that starts a project-local bin through npx is right only
+        // for a command that runs in the folder the hook checked. Only the
+        // first segment does: an earlier `cd` can move a later one. A later
+        // `npx` segment stays as typed.
+        let rewrite = try_rewrite(&token_refs).filter(|r| index == 0 || r.npx_tool.is_none());
 
         let segment_text = match &rewrite {
             Some(r) => {
@@ -1045,6 +1051,9 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
                 any_masks_output |= r.masks_output;
                 if first_category.is_none() {
                     first_category = Some(r.category);
+                }
+                if index == 0 {
+                    first_segment_npx_tool = r.npx_tool;
                 }
                 // Splice redirects back at their original positions.
                 let mut rewritten_tokens = r.tokens.clone();
@@ -1076,6 +1085,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
         category: first_category.unwrap_or(RewriteCategory::Build),
         masks_output: any_masks_output,
         matched_prefix: None,
+        npx_tool: first_segment_npx_tool,
     })
 }
 
@@ -1949,6 +1959,87 @@ mod tests {
     #[test]
     fn test_compound_empty_returns_none() {
         assert!(try_rewrite_compound(&[]).is_none());
+    }
+
+    // ========================================================================
+    // npx local-bin requirement in a compound (skim#587)
+    // ========================================================================
+
+    /// The compound rewrite of `command`, which must split as a compound.
+    fn compound_rewrite_of(command: &str) -> Option<RewriteResult> {
+        match split_compound(command) {
+            CompoundSplitResult::Compound(segments) => try_rewrite_compound(&segments),
+            other => panic!("expected Compound for `{command}`, got {other:?}"),
+        }
+    }
+
+    /// Only the first segment of a compound runs in the folder the hook knows,
+    /// so a later `npx` segment stays as typed. With nothing else to rewrite,
+    /// the whole compound is left alone.
+    #[test]
+    fn test_compound_later_npx_segment_is_left_as_typed() {
+        for command in [
+            "cd x && npx tsc",
+            "echo hi && npx eslint .",
+            "cd x ; npx prettier --write src",
+            "false || npx oxlint src",
+            "cd x && npx biome check .",
+        ] {
+            assert!(
+                compound_rewrite_of(command).is_none(),
+                "`{command}` has an npx segment past the first and nothing else to rewrite"
+            );
+        }
+    }
+
+    /// A first-segment npx rewrite stays, a later one does not, and the result
+    /// takes its requirement from the first segment.
+    #[test]
+    fn test_compound_rewrites_only_the_first_npx_segment() {
+        let result = compound_rewrite_of("npx tsc && npx eslint .")
+            .expect("the first segment is an npx rule and must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim tsc && npx eslint .");
+        assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
+    }
+
+    /// A later non-npx segment is still rewritten beside a first npx segment,
+    /// and an operator other than `&&` makes no difference.
+    #[test]
+    fn test_compound_first_npx_segment_keeps_later_non_npx_rewrites() {
+        let result = compound_rewrite_of("npx eslint . ; cargo test")
+            .expect("both segments rewrite: the npx one is first");
+        assert_eq!(result.tokens.join(" "), "skim eslint . ; skim cargo test");
+        assert_eq!(result.npx_tool, Some(NpxTool::Eslint));
+    }
+
+    /// A later npx segment does not stop other segments from being rewritten,
+    /// and it adds no requirement: the first segment has none.
+    #[test]
+    fn test_compound_later_npx_segment_does_not_set_the_requirement() {
+        let result = compound_rewrite_of("cargo test && npx tsc")
+            .expect("the first segment is a plain rule and must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim cargo test && npx tsc");
+        assert_eq!(result.npx_tool, None);
+    }
+
+    /// A later segment of the test family has its own npx fallback and carries
+    /// no requirement, so it is rewritten as before.
+    #[test]
+    fn test_compound_later_test_family_npx_segment_still_rewrites() {
+        let result = compound_rewrite_of("cd x && npx vitest run")
+            .expect("npx vitest is not a local-bin rule and must rewrite");
+        assert_eq!(result.tokens.join(" "), "cd x && skim vitest run");
+        assert_eq!(result.npx_tool, None);
+    }
+
+    /// The bare-`| cat` shape rewrites its source, and the source is the first
+    /// segment, so an npx source keeps its requirement.
+    #[test]
+    fn test_compound_npx_source_of_a_cat_pipe_keeps_the_requirement() {
+        let result = compound_rewrite_of("npx tsc --noEmit | cat")
+            .expect("the source of a bare `| cat` pipeline must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim tsc --noEmit | cat");
+        assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
     }
 
     /// `ls | head` must NOT be rewritten — `ls` is a catch-all rule and must not
