@@ -71,7 +71,7 @@ In auto permission mode, Claude Code runs a command without the PreToolUse rewri
 - **Marker:** skim adds one `[skim]` line to stderr, for example `[skim] compressed view of 'pytest': parsed summary, 494 B → 30 B — SKIM_PASSTHROUGH=1 for full output`. A `cat` view shows `[skim] transformed view (cat → skim --mode=pseudo): …` instead.
 - **Raw output:** run the command again with `SKIM_PASSTHROUGH=1` in front.
 - **Scope:** the hook never runs a command, never reads a file and never returns a permission decision. It changes only the output text it receives.
-- **Limits:** a failed run stays raw, because Claude Code does not let a hook replace its output. Lint tools exit non-zero when they find problems, so only clean or warning-only lint runs can compress. Output of about 30,000 characters or more, compound commands, pipes, redirects (including `2>&1`) and env-prefixed commands stay raw. `ruff check` in its default full format stays raw.
+- **Limits:** a failed run stays raw, because Claude Code does not let a hook replace its output. Lint tools exit non-zero when they find problems, so only clean or warning-only lint runs can compress. Output of 29,000 characters or more, compound commands, pipes, redirects (including `2>&1`) and env-prefixed commands stay raw. `ruff check` in its default full format stays raw.
 - **Existing installs:** run `skim init` again to add the hook entry. `skim doctor` notes a missing entry.
 
 ### Test Output Compression

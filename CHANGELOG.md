@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[skim] compressed view of 'pytest': parsed summary, 494 B → 30 B — SKIM_PASSTHROUGH=1 for
   full output`. A `cat` view carries `[skim] transformed view (cat → skim --mode=pseudo): …`.
   The hook runs no command, reads no file, writes no analytics row and returns no permission
-  decision. Failed runs, output of about 30,000 characters or more, compound commands, pipes,
+  decision. Failed runs, output of 29,000 characters or more, compound commands, pipes,
   redirects and env-prefixed commands stay raw. Run the command with `SKIM_PASSTHROUGH=1` in
   front to get raw output. Existing installs get the new entry on the next `skim init`;
   `skim doctor` notes a missing entry. Manual acceptance script:
