@@ -186,7 +186,7 @@ fn run_pytest(args: &[&str]) -> anyhow::Result<CommandOutput> {
 /// Parse pytest output using three-tier degradation.
 ///
 /// Returns `Full` if tier 1 succeeds, or `Passthrough` if no summary line is found.
-fn parse(output: &str) -> ParseResult<TestResult> {
+pub(crate) fn parse(output: &str) -> ParseResult<TestResult> {
     // Tier 1: full text state machine
     if let Some(result) = tier1_parse(output) {
         return ParseResult::Full(result);

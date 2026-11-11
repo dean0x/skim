@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::flags::DetectionEnv;
 use super::helpers::HOOK_SCRIPT_NAME;
+use crate::cmd::hooks::claude::POST_TOOL_USE_EVENT;
 use crate::cmd::hooks::{
     HookMode, HookProtocol, honour_dev_declaration, parse_mode_from_script, protocol_for_agent,
 };
@@ -51,6 +52,11 @@ pub(super) struct DetectedState {
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim hooks for the agent's tool matcher (plugin collision detection)
     pub(super) existing_hooks: Vec<String>,
+    /// Event keys without a skim entry, set only when the primary entry exists.
+    pub(super) missing_hook_events: Vec<&'static str>,
+    /// Non-skim `PostToolUse` hooks that can select Bash, from both scopes and
+    /// from `settings.local.json` (see [`scan_foreign_post_hooks`]).
+    pub(super) existing_post_hooks: ForeignPostHooks,
     /// CLI name of the target agent (e.g., "claude-code", "cursor") for integrity hashing
     pub(super) agent_cli_name: &'static str,
 }
@@ -230,6 +236,12 @@ pub(super) fn detect_state(
     let mut hook_installed = false;
     let mut hook_version = None;
 
+    let parsed_settings = if protocol.uses_dedicated_hook_file() {
+        None
+    } else {
+        read_settings_json(&settings_path)
+    };
+
     let existing_hooks = if protocol.uses_dedicated_hook_file() {
         // Copilot-style: detect from hooks/skim.json, not settings.json.
         hook_installed = protocol.detect_hook_registration(&hook_config_dir);
@@ -242,7 +254,6 @@ pub(super) fn detect_state(
         protocol.scan_foreign_hooks(&hook_config_dir)
     } else {
         // settings.json-style: existing detection code (behaviorally unchanged).
-        let parsed_settings = read_settings_json(&settings_path);
         if let Some(ref json) = parsed_settings
             && let Some(arr) = json
                 .get("hooks")
@@ -281,8 +292,23 @@ pub(super) fn detect_state(
         )
     };
 
-    // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(agent, project, env)?;
+    let missing_hook_events = match parsed_settings.as_ref() {
+        Some(json) if hook_installed => {
+            let present = skim_event_keys(json, protocol.as_ref(), |e| protocol.is_skim_entry(e));
+            let mut keys = protocol.hook_event_keys();
+            keys.retain(|key| !present.contains(key));
+            keys
+        }
+        _ => Vec::new(),
+    };
+    // Dual-scope check (B5). The other scope's directory is resolved once and
+    // feeds both the dual-scope warning and the foreign PostToolUse scan.
+    let other_dir = other_scope_config_dir(agent, project, env)?;
+    let dual_scope_warning = check_dual_scope(agent, project, other_dir.as_deref());
+    let scanned_dirs: Vec<&Path> = std::iter::once(config_dir.as_path())
+        .chain(other_dir.as_deref())
+        .collect();
+    let existing_post_hooks = scan_foreign_post_hooks(protocol.as_ref(), &scanned_dirs);
 
     // Reuse the already-read hook script contents for pinned-binary detection.
     let hook_uses_pinned_binary = hook_script_contents
@@ -334,6 +360,8 @@ pub(super) fn detect_state(
         script_integrity,
         dual_scope_warning,
         existing_hooks,
+        missing_hook_events,
+        existing_post_hooks,
         agent_cli_name: agent.cli_name(),
     })
 }
@@ -375,6 +403,147 @@ fn scan_existing_hooks(
     tool_matcher: &str,
     protocol: &dyn HookProtocol,
 ) -> Vec<String> {
+    scan_hooks_matching(parsed, event_key, protocol, |m| m == Some(tool_matcher))
+}
+
+/// Whether a `PostToolUse` entry's `matcher` can select the Bash tool.
+///
+/// An absent, empty or `*` matcher selects every tool; any other matcher is
+/// read as an unanchored regex, which also covers a plain name list. An
+/// invalid regex counts as a match: a wrong answer costs one extra warning.
+fn post_matcher_selects_bash(matcher: Option<&str>) -> bool {
+    match matcher {
+        None | Some("" | "*") => true,
+        Some(m) => regex::Regex::new(m)
+            .ok()
+            .is_none_or(|re| re.is_match("Bash")),
+    }
+}
+
+/// The per-machine settings file Claude Code merges over `settings.json`.
+const SETTINGS_LOCAL_FILENAME: &str = "settings.local.json";
+
+/// A non-skim `PostToolUse` hook that can select Bash, and the file that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForeignPostHook {
+    pub(crate) file: PathBuf,
+    /// The command exactly as the settings file stores it. Filter it with
+    /// [`Self::describe`] before it is printed.
+    pub(crate) command: String,
+}
+
+impl ForeignPostHook {
+    /// The hook as one line of display text: its command, then its file.
+    ///
+    /// Filters other hooks' command text before it is printed; the stored
+    /// `command` is unchanged.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{} ({})",
+            crate::cmd::sanitize_for_display(&self.command),
+            self.file.display()
+        )
+    }
+}
+
+/// What [`scan_foreign_post_hooks`] found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ForeignPostHooks {
+    /// Foreign hooks in scan order: the install scope first, and in each scope
+    /// the settings file before `settings.local.json`.
+    pub(crate) found: Vec<ForeignPostHook>,
+    /// Settings files that exist but could not be read as JSON. Their hooks were
+    /// not checked, so an empty `found` does not mean they hold none.
+    pub(crate) unreadable: Vec<PathBuf>,
+}
+
+/// Scan the settings of every directory in `config_dirs` for `PostToolUse` hooks
+/// that are not skim's and can select Bash.
+///
+/// Claude Code merges the settings files of both scopes and `settings.local.json`
+/// beside each, so a foreign hook in any of them competes with skim's: Claude
+/// Code gives the model one `PostToolUse` result per call. Callers pass the
+/// install scope and the other scope (see [`other_scope_config_dir`]); a
+/// directory named twice (both scopes can resolve to one directory) is scanned once.
+///
+/// Plugin hooks are NOT scanned: they come from a plugin's own hooks file, which
+/// this scan does not read.
+///
+/// Skim's own entry is never foreign: `protocol.is_skim_entry` skips it under
+/// every event key. A file that exists but cannot be read is reported in
+/// `unreadable`, never counted as holding no hooks.
+pub(super) fn scan_foreign_post_hooks(
+    protocol: &dyn HookProtocol,
+    config_dirs: &[&Path],
+) -> ForeignPostHooks {
+    let mut scan = ForeignPostHooks::default();
+    if !protocol.hook_event_keys().contains(&POST_TOOL_USE_EVENT) {
+        return scan;
+    }
+
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for dir in config_dirs {
+        for name in [protocol.config_filename(), SETTINGS_LOCAL_FILENAME] {
+            let path = dir.join(name);
+            let identity = match std::fs::canonicalize(&path) {
+                Ok(canonical) => canonical,
+                // No such file: nothing to check.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    scan.unreadable.push(path);
+                    continue;
+                }
+            };
+            if seen.contains(&identity) {
+                continue;
+            }
+            seen.push(identity);
+
+            let Some(json) = read_settings_json(&path) else {
+                scan.unreadable.push(path);
+                continue;
+            };
+            let commands = scan_hooks_matching(
+                Some(&json),
+                POST_TOOL_USE_EVENT,
+                protocol,
+                post_matcher_selects_bash,
+            );
+            scan.found
+                .extend(commands.into_iter().map(|command| ForeignPostHook {
+                    file: path.clone(),
+                    command,
+                }));
+        }
+    }
+    scan
+}
+
+/// The event keys of `protocol` under which `config` holds an entry `is_skim` accepts.
+pub(super) fn skim_event_keys(
+    config: &serde_json::Value,
+    protocol: &dyn HookProtocol,
+    is_skim: impl Fn(&serde_json::Value) -> bool,
+) -> Vec<&'static str> {
+    let mut keys = protocol.hook_event_keys();
+    keys.retain(|key| {
+        config
+            .get("hooks")
+            .and_then(|h| h.get(key))
+            .and_then(|v| v.as_array())
+            .is_some_and(|entries| entries.iter().any(&is_skim))
+    });
+    keys
+}
+
+/// [`scan_existing_hooks`] with the matcher test left to the caller: `selects`
+/// gets each entry's `matcher` string, or `None` when it has none.
+fn scan_hooks_matching(
+    parsed: Option<&serde_json::Value>,
+    event_key: &str,
+    protocol: &dyn HookProtocol,
+    selects: impl Fn(Option<&str>) -> bool,
+) -> Vec<String> {
     let Some(json) = parsed else {
         return Vec::new();
     };
@@ -390,11 +559,7 @@ fn scan_existing_hooks(
     let mut other_hooks = Vec::new();
     for entry in entries {
         // Only care about entries matching the agent's tool matcher
-        let is_matching_tool = entry
-            .get("matcher")
-            .and_then(|m| m.as_str())
-            .is_some_and(|m| m == tool_matcher);
-        if !is_matching_tool {
+        if !selects(entry.get("matcher").and_then(|m| m.as_str())) {
             continue;
         }
         // Skip skim entries using the agent-format-aware check.
@@ -437,42 +602,46 @@ fn scan_existing_hooks(
 pub(super) fn check_dual_scope(
     agent: crate::cmd::session::AgentKind,
     project: bool,
-    env: &DetectionEnv,
-) -> anyhow::Result<Option<String>> {
-    let other_dir = if project {
-        // Installing project-level, check global
-        env.resolve(agent, false)?
-    } else {
-        // Installing global, check project
-        match env.resolve(agent, true) {
-            Ok(dir) => dir,
-            Err(_) => return Ok(None),
-        }
-    };
-
+    other_dir: Option<&Path>,
+) -> Option<String> {
+    let other_dir = other_dir?;
     let protocol = protocol_for_agent(agent);
     let other_settings = other_dir.join(protocol.config_filename());
-    let has_hook = read_settings_json(&other_settings)
-        .and_then(|json| {
-            json.get("hooks")?
-                .get(protocol.hook_event_key())?
-                .as_array()
-                .map(|arr| arr.iter().any(|e| protocol.is_skim_entry(e)))
-        })
-        .unwrap_or(false);
+    let has_hook = read_settings_json(&other_settings).is_some_and(|json| {
+        !skim_event_keys(&json, protocol.as_ref(), |e| protocol.is_skim_entry(e)).is_empty()
+    });
 
     if !has_hook {
-        return Ok(None);
+        return None;
     }
 
     let scope = if project { "globally" } else { "in project" };
     let uninstall_scope = if project { "--global" } else { "--project" };
     let path = other_settings.display();
-    Ok(Some(format!(
+    Some(format!(
         "skim hook is also installed {scope} ({path})\n  \
          Both hooks will fire, but this is harmless -- the second is a no-op.\n  \
          To remove: skim init {uninstall_scope} --uninstall"
-    )))
+    ))
+}
+
+/// The config directory of the scope that `project` does not name: the global
+/// one for a project install, the project one for a global install.
+///
+/// The one resolution of the "other" scope, shared by [`check_dual_scope`] and
+/// [`scan_foreign_post_hooks`]. A global install whose working directory cannot
+/// be read has no project scope (`None`); a project install whose global
+/// directory cannot be resolved is an error.
+pub(super) fn other_scope_config_dir(
+    agent: crate::cmd::session::AgentKind,
+    project: bool,
+    env: &DetectionEnv,
+) -> anyhow::Result<Option<PathBuf>> {
+    if project {
+        env.resolve(agent, false).map(Some)
+    } else {
+        Ok(env.resolve(agent, true).ok())
+    }
 }
 
 /// Read and parse a settings.json file, returning `None` on any failure.
@@ -758,6 +927,160 @@ mod tests {
     }
 
     #[test]
+    fn test_post_matcher_selects_bash() {
+        assert!(post_matcher_selects_bash(None));
+        for m in ["", "*", "Edit|Bash", "^B", "("] {
+            assert!(post_matcher_selects_bash(Some(m)), "{m:?} must select Bash");
+        }
+        for m in ["Edit", "Edit|Write", "bash", "^Notebook"] {
+            assert!(!post_matcher_selects_bash(Some(m)), "{m:?} must not");
+        }
+    }
+
+    /// Write `hooks.PostToolUse = [entries...]` (and any other event) into `dir/name`.
+    fn write_settings(dir: &Path, name: &str, hooks: serde_json::Value) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(name),
+            serde_json::json!({ "hooks": hooks }).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn bash_entry(command: &str) -> serde_json::Value {
+        serde_json::json!({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]})
+    }
+
+    fn found_commands(scan: &ForeignPostHooks) -> Vec<&str> {
+        scan.found.iter().map(|h| h.command.as_str()).collect()
+    }
+
+    #[test]
+    fn test_scan_foreign_post_hooks_reads_local_settings_and_the_other_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (primary, other) = (tmp.path().join("global"), tmp.path().join("project"));
+        write_settings(
+            &primary,
+            "settings.json",
+            serde_json::json!({"PostToolUse": [bash_entry("/bin/in-settings")]}),
+        );
+        write_settings(
+            &primary,
+            "settings.local.json",
+            serde_json::json!({"PostToolUse": [bash_entry("/bin/in-local")]}),
+        );
+        write_settings(
+            &other,
+            "settings.local.json",
+            serde_json::json!({"PostToolUse": [bash_entry("/bin/in-other-local")]}),
+        );
+
+        let scan = scan_foreign_post_hooks(&ClaudeCodeHook, &[&primary, &other]);
+
+        assert_eq!(
+            found_commands(&scan),
+            ["/bin/in-settings", "/bin/in-local", "/bin/in-other-local"]
+        );
+        assert_eq!(scan.found[1].file, primary.join("settings.local.json"));
+        assert_eq!(scan.found[2].file, other.join("settings.local.json"));
+        assert!(scan.unreadable.is_empty());
+    }
+
+    #[test]
+    fn test_scan_foreign_post_hooks_never_counts_skims_own_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skim = bash_entry("/home/u/.claude/hooks/skim-rewrite.sh");
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            serde_json::json!({"PreToolUse": [skim.clone()], "PostToolUse": [skim]}),
+        );
+
+        let scan = scan_foreign_post_hooks(&ClaudeCodeHook, &[tmp.path()]);
+
+        assert_eq!(scan, ForeignPostHooks::default());
+    }
+
+    #[test]
+    fn test_scan_foreign_post_hooks_scans_a_directory_named_twice_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            serde_json::json!({"PostToolUse": [bash_entry("/bin/once")]}),
+        );
+
+        let scan = scan_foreign_post_hooks(&ClaudeCodeHook, &[tmp.path(), tmp.path()]);
+
+        assert_eq!(found_commands(&scan), ["/bin/once"]);
+    }
+
+    #[test]
+    fn test_scan_foreign_post_hooks_reports_a_file_it_could_not_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("settings.local.json"), "{ not json").unwrap();
+
+        let scan = scan_foreign_post_hooks(&ClaudeCodeHook, &[tmp.path()]);
+
+        assert!(scan.found.is_empty());
+        assert_eq!(scan.unreadable, [tmp.path().join("settings.local.json")]);
+    }
+
+    #[test]
+    fn test_scan_foreign_post_hooks_is_empty_for_an_agent_without_a_post_event() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_settings(
+            tmp.path(),
+            "hooks.json",
+            serde_json::json!({"PostToolUse": [bash_entry("/bin/other")]}),
+        );
+
+        let scan = scan_foreign_post_hooks(&CursorHook, &[tmp.path()]);
+
+        assert_eq!(scan, ForeignPostHooks::default());
+    }
+
+    #[test]
+    fn test_foreign_post_hook_describe_filters_control_bytes_and_newlines() {
+        let hook = ForeignPostHook {
+            file: PathBuf::from("/h/.claude/settings.local.json"),
+            command: "/bin/x\u{1b}[31m\nEXTRA\rEND".to_string(),
+        };
+
+        let shown = hook.describe();
+
+        assert!(
+            shown.chars().all(|c| !c.is_control()),
+            "control character in {shown:?}"
+        );
+        assert!(shown.starts_with("/bin/x?[31m?EXTRA?END"), "{shown:?}");
+        assert!(shown.contains("settings.local.json"));
+        assert_eq!(
+            hook.command, "/bin/x\u{1b}[31m\nEXTRA\rEND",
+            "stored value is unchanged"
+        );
+    }
+
+    #[test]
+    fn test_skim_event_keys_lists_each_event_that_holds_a_skim_entry() {
+        let entry = |cmd: &str| serde_json::json!({"hooks": [{"command": cmd}]});
+        let (skim, other) = (entry("/h/skim-rewrite.sh"), entry("/usr/bin/other"));
+        let keys = |hooks: serde_json::Value| {
+            let config = serde_json::json!({ "hooks": hooks });
+            skim_event_keys(&config, &ClaudeCodeHook, |e| {
+                ClaudeCodeHook.is_skim_entry(e)
+            })
+        };
+        let both = keys(serde_json::json!({"PreToolUse": [skim], "PostToolUse": [other, skim]}));
+        assert_eq!(both, ["PreToolUse", "PostToolUse"]);
+        assert_eq!(
+            keys(serde_json::json!({"PostToolUse": [skim]})),
+            ["PostToolUse"]
+        );
+        assert!(keys(serde_json::json!({"PreToolUse": [other]})).is_empty());
+    }
+
+    #[test]
     fn test_scan_existing_hooks_cursor_format() {
         // Cursor flat format: non-skim entry uses top-level "command" field
         let settings = serde_json::json!({
@@ -929,6 +1252,8 @@ mod tests {
             script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: ForeignPostHooks::default(),
             agent_cli_name: "claude-code",
         };
 
@@ -966,6 +1291,8 @@ mod tests {
             script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: ForeignPostHooks::default(),
             agent_cli_name: "claude-code",
         };
 
@@ -1110,6 +1437,8 @@ mod tests {
             script_integrity: integrity,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: ForeignPostHooks::default(),
             agent_cli_name: "claude-code",
         }
     }
@@ -1509,6 +1838,8 @@ mod tests {
             script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
+            missing_hook_events: vec![],
+            existing_post_hooks: ForeignPostHooks::default(),
             agent_cli_name: "claude-code",
         }
     }

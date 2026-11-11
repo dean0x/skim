@@ -1,0 +1,14 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/session-logs/work-project/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/work/project",
+  "prompt_id": "00000000-0000-4000-8000-000000000002",
+  "permission_mode": "auto",
+  "effort": {"level":"high"},
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {"command":"cargo test","description":"Run the unit tests","run_in_background":true},
+  "tool_response": {"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"b0000000a"},
+  "tool_use_id": "toolu_00000000000000000000000a",
+  "duration_ms": 800
+}

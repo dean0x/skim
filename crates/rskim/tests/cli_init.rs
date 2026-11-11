@@ -647,6 +647,170 @@ fn test_init_uninstall_preserves_other_hooks() {
     );
 }
 
+/// Claude Code gets the hook under both events, and uninstall removes the skim
+/// entry from both while it keeps a foreign hook on the post-run event.
+#[test]
+fn test_init_uninstall_removes_the_post_tool_use_entry_and_keeps_foreign_ones() {
+    let sandbox = Sandbox::new();
+    let settings_path = sandbox.claude_config().join("settings.json");
+
+    sandbox.init().args(["--yes"]).assert().success();
+
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    for event in ["PreToolUse", "PostToolUse"] {
+        assert_eq!(
+            json["hooks"][event].as_array().map(Vec::len),
+            Some(1),
+            "init should register one skim entry under {event}"
+        );
+    }
+    json["hooks"]["PostToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/usr/bin/other-hook", "timeout": 10}]
+        }));
+    fs::write(&settings_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    let contents = fs::read_to_string(&settings_path).unwrap();
+    assert!(
+        !contents.contains("skim-rewrite"),
+        "no skim entry may stay under either event"
+    );
+    let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+    assert!(json["hooks"].get("PreToolUse").is_none());
+    assert_eq!(
+        json["hooks"]["PostToolUse"].as_array().map(Vec::len),
+        Some(1),
+        "the foreign PostToolUse hook must stay"
+    );
+    assert!(contents.contains("other-hook"));
+}
+
+/// Remove the `hooks.<event>` array from the `settings.json` at `path`.
+fn remove_hook_event(path: &std::path::Path, event: &str) {
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    json["hooks"].as_object_mut().unwrap().remove(event);
+    fs::write(path, json.to_string()).unwrap();
+}
+
+/// An install made before the post-run hook existed has only the PreToolUse
+/// entry. The next `skim init` must add the other one, not stop at "up to date".
+#[test]
+fn test_init_adds_the_post_tool_use_entry_to_a_pre_only_install() {
+    let sandbox = Sandbox::new();
+    sandbox.init().args(["--yes"]).assert().success();
+    let settings_path = sandbox.claude_config().join("settings.json");
+    remove_hook_event(&settings_path, "PostToolUse");
+
+    let init = || sandbox.init().args(["--yes"]).assert().success();
+    init()
+        .stdout(predicate::str::contains("PostToolUse"))
+        .stdout(predicate::str::contains("Already up to date").not());
+    init()
+        .stdout(predicate::str::contains("Already up to date"))
+        .stdout(predicate::str::contains("Other PostToolUse hooks").not());
+}
+
+/// Claude Code uses one PostToolUse result per Bash call, so a foreign hook that
+/// can select Bash gets a warning. One that selects another tool does not.
+#[test]
+fn test_init_warns_about_a_foreign_post_tool_use_hook_that_selects_bash() {
+    for (matcher, warns) in [("Bash", true), ("*", true), ("Edit|Write", false)] {
+        let sandbox = Sandbox::new();
+        let hook = serde_json::json!({"matcher": matcher, "hooks": [
+            {"type": "command", "command": "/usr/bin/other-post-hook"}
+        ]});
+        let settings = serde_json::json!({"hooks": {"PostToolUse": [hook]}});
+        let path = sandbox.claude_config().join("settings.json");
+        fs::write(path, settings.to_string()).unwrap();
+
+        let assert = sandbox.init().args(["--yes"]).assert().success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+        assert_eq!(
+            stdout.contains("other-post-hook"),
+            warns,
+            "matcher {matcher:?}"
+        );
+    }
+}
+
+/// Claude Code merges `settings.local.json` into the settings it reads, so a
+/// foreign PostToolUse hook there gets the same warning, and the line names the file.
+#[test]
+fn test_init_warns_about_a_foreign_post_tool_use_hook_in_settings_local_json() {
+    let sandbox = Sandbox::new();
+    let hook = serde_json::json!({"matcher": "Bash", "hooks": [
+        {"type": "command", "command": "/usr/bin/local-post-hook"}
+    ]});
+    let settings = serde_json::json!({"hooks": {"PostToolUse": [hook]}});
+    let path = sandbox.claude_config().join("settings.local.json");
+    fs::write(path, settings.to_string()).unwrap();
+
+    let assert = sandbox.init().args(["--yes"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("Other PostToolUse hooks"))
+        .unwrap_or_else(|| panic!("no warning line in:\n{stdout}"));
+    assert!(line.contains("local-post-hook"), "{line}");
+    assert!(line.contains("settings.local.json"), "{line}");
+}
+
+/// Other hooks' command text is filtered before it is printed: a control byte
+/// or a newline in a PreToolUse or PostToolUse command must not reach the terminal.
+#[test]
+fn test_init_filters_other_hooks_command_text_before_printing_it() {
+    let sandbox = Sandbox::new();
+    let nasty = "/usr/bin/x\u{1b}[31m\nEXTRA";
+    let entry = |command: &str| serde_json::json!({"matcher": "Bash", "hooks": [{"type": "command", "command": command}]});
+    let settings = serde_json::json!({"hooks": {
+        "PreToolUse": [entry(nasty)],
+        "PostToolUse": [entry(nasty)],
+    }});
+    let path = sandbox.claude_config().join("settings.json");
+    fs::write(path, settings.to_string()).unwrap();
+
+    let assert = sandbox.init().args(["--yes"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(stdout.contains("/usr/bin/x"), "the hook is still named");
+    assert!(!stdout.contains('\u{1b}'), "control byte reached stdout");
+    assert!(
+        !stdout.lines().any(|l| l.starts_with("EXTRA")),
+        "a newline in a command started a new line:\n{stdout}"
+    );
+}
+
+/// A settings file with only the PostToolUse entry (and no script) is still an
+/// install: uninstall must remove the entry, not report nothing to do.
+#[test]
+fn test_init_uninstall_removes_an_install_that_has_only_the_post_tool_use_entry() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.claude_config();
+    sandbox.init().args(["--yes"]).assert().success();
+    remove_hook_event(&config.join("settings.json"), "PreToolUse");
+    fs::remove_file(config.join("hooks/skim-rewrite.sh")).unwrap();
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing to uninstall").not());
+
+    let contents = fs::read_to_string(config.join("settings.json")).unwrap();
+    assert!(!contents.contains("skim-rewrite"), "{contents}");
+}
+
 #[test]
 fn test_init_uninstall_when_not_installed() {
     // This is a GLOBAL uninstall with no `--agent`: before sandboxing it reached

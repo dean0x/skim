@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **After-run output compression in Claude Code auto mode.** `skim init` now also installs a
+  `PostToolUse` hook entry (matcher `Bash`). In auto permission mode the hook replaces the
+  output of a successful `cat` of one code file, `cargo test`, `pytest`, `eslint`,
+  `ruff check`, `mypy`, `golangci-lint run`, `rubocop`, `oxlint`, `biome check`/`biome lint` or
+  `swiftlint` run with a compressed view, and adds one `[skim]` line to stderr, for example
+  `[skim] compressed view of 'pytest': parsed summary, 494 B → 30 B — SKIM_PASSTHROUGH=1 for
+  full output`. A `cat` view carries `[skim] transformed view (cat → skim --mode=pseudo): …`.
+  The hook runs no command, reads no file, writes no analytics row and returns no permission
+  decision. Failed runs, output of 29,000 characters or more, compound commands, pipes,
+  redirects and env-prefixed commands stay raw. Run the command with `SKIM_PASSTHROUGH=1` in
+  front to get raw output. Existing installs get the new entry on the next `skim init`;
+  `skim doctor` notes a missing entry. Manual acceptance script:
+  `crates/rskim/tests/live/post_hook_acceptance.sh`.
+
+  **Downgrade:** `skim init --uninstall` from an older binary leaves the `PostToolUse` entry
+  in `settings.json`. An older binary that runs the hook script for a `PostToolUse` input
+  answers with a `PreToolUse`-shaped response. How Claude Code reacts to that response is not
+  yet measured live.
+
 ### Changed
 
 - **Machine-contract flags on `skim git` now serve git's own bytes verbatim** (#576,

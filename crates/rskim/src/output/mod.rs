@@ -1107,6 +1107,32 @@ pub(crate) fn lossy_view_marker(
     Some(marker)
 }
 
+/// Opening of [`post_parsed_view_marker`].
+const POST_PARSED_VIEW_PREFIX: &str = "[skim] compressed view";
+
+/// The openings of the two markers the post-run hook writes: its own parsed
+/// summary marker, and [`lossy_view_marker`] for a hook-rewritten `cat`. A tool
+/// output that already holds either one is not compressed again.
+pub(crate) const POST_VIEW_MARKER_PREFIXES: [&str; 2] =
+    [POST_PARSED_VIEW_PREFIX, "[skim] transformed view ("];
+
+/// Marker for a parsed summary that the post-run hook serves in place of a
+/// tool's captured output (ADR-011 class 1: unconditional).
+///
+/// It holds the tool label, two byte counts and the remedy, and no text taken
+/// from the tool output. `SKIM_PASSTHROUGH=1` on the command makes the hook
+/// decline, so the remedy is literally reachable.
+pub(crate) fn post_parsed_view_marker(tool: &str, raw_bytes: usize, served_bytes: usize) -> String {
+    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
+        tool,
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: true,
+    });
+    format!(
+        "{POST_PARSED_VIEW_PREFIX} of '{tool}': parsed summary, {raw_bytes} B \u{2192} {served_bytes} B \u{2014} {remedy}"
+    )
+}
+
 // ============================================================================
 // Delivered cost — what the reader actually received
 // ============================================================================
@@ -1546,6 +1572,28 @@ mod lossy_view_marker_tests {
     #[test]
     fn test_rewrite_origin_env_constant() {
         assert_eq!(REWRITE_ORIGIN_ENV, "SKIM_REWRITTEN_FROM");
+    }
+
+    /// The post-run hook declines tool output that already holds one of its own
+    /// markers, by `POST_VIEW_MARKER_PREFIXES`, so each marker it writes must
+    /// start with a listed prefix, on one line.
+    #[test]
+    fn test_post_view_markers_name_the_tool_sizes_remedy_and_a_listed_prefix() {
+        let parsed = post_parsed_view_marker("cargo test", 4821, 112);
+        assert_eq!(
+            parsed,
+            "[skim] compressed view of 'cargo test': parsed summary, 4821 B \u{2192} 112 B \
+             \u{2014} SKIM_PASSTHROUGH=1 for full output"
+        );
+        let cat = lossy_view_marker(Some("cat"), "pseudo", 1, 1).expect("marker");
+        for marker in [parsed, cat] {
+            let starts_listed = |p: &&str| marker.starts_with(*p);
+            assert!(
+                POST_VIEW_MARKER_PREFIXES.iter().any(starts_listed),
+                "{marker:?}"
+            );
+            assert!(!marker.contains('\n'), "{marker:?}");
+        }
     }
 
     /// The class clause must name what is GONE — the property ADR-011 asks for.

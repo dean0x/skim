@@ -6,17 +6,21 @@
 //! ## Config lifecycle methods
 //!
 //! The trait includes config-lifecycle methods with sane defaults covering the
-//! Claude Code `settings.json` / `hooks.PreToolUse` format. Agents that use a
+//! Claude Code `settings.json` / `hooks.<event>` format. Agents that use a
 //! different on-disk format override the relevant methods:
 //!
-//! | Agent       | Config file          | Event key    | Matcher           | Hook artifacts dir | Response strategy     |
-//! |-------------|----------------------|--------------|-------------------|--------------------|-----------------------|
-//! | Claude Code | settings.json        | PreToolUse   | Bash              | ~/.claude          | hookSpecificOutput    |
-//! | Cursor      | hooks.json           | preToolUse   | Shell             | ~/.config/Cursor   | permission: allow     |
-//! | Gemini CLI  | settings.json        | BeforeTool   | run_shell_command | ~/.gemini          | decision: allow       |
-//! | Copilot CLI | hooks/skim.json      | preToolUse   | bash (detect only)| ~/.copilot         | modifiedArgs (no verb)|
-//! | Crush       | crush.json           | PreToolUse   | Bash              | ~/.crush           | permission: allow     |
-//! | Codex CLI   | (none)               | (none)       | (none)            | (none)             | AwarenessOnly         |
+//! | Agent       | Config file          | Event keys               | Matcher           | Hook artifacts dir | Response strategy     |
+//! |-------------|----------------------|--------------------------|-------------------|--------------------|-----------------------|
+//! | Claude Code | settings.json        | PreToolUse, PostToolUse  | Bash              | ~/.claude          | hookSpecificOutput    |
+//! | Cursor      | hooks.json           | preToolUse               | Shell             | ~/.config/Cursor   | permission: allow     |
+//! | Gemini CLI  | settings.json        | BeforeTool               | run_shell_command | ~/.gemini          | decision: allow       |
+//! | Copilot CLI | hooks/skim.json      | preToolUse               | bash (detect only)| ~/.copilot         | modifiedArgs (no verb)|
+//! | Crush       | crush.json           | PreToolUse               | Bash              | ~/.crush           | permission: allow     |
+//! | Codex CLI   | (none)               | (none)                   | (none)            | (none)             | AwarenessOnly         |
+//!
+//! Only Claude Code registers a second event: `PostToolUse`, where the hook can
+//! replace the captured output of a Bash call that already ran (see
+//! `claude::format_post_response`). Every other agent has the one event key.
 //!
 //! **Copilot CLI** is special: hook artifacts (script, sidecar, `skim.json`) live
 //! under `~/.copilot/hooks/` while the agent's settings/rules remain at `~/.github/`.
@@ -209,7 +213,7 @@ pub(crate) trait HookProtocol {
     // Config lifecycle methods
     //
     // Default implementations match the Claude Code `settings.json` /
-    // `hooks.PreToolUse` format. Agents with different config formats override
+    // `hooks.<event>` format. Agents with different config formats override
     // the relevant methods.
     // -------------------------------------------------------------------------
 
@@ -221,12 +225,21 @@ pub(crate) trait HookProtocol {
         "settings.json"
     }
 
-    /// The top-level event key under `hooks` where hook entries live.
+    /// The primary event key under `hooks`: the one that carries the rewrite
+    /// hook, and the one detection and diagnostics read.
     ///
     /// Default: `"PreToolUse"` (Claude Code, Crush).
     /// Override: Gemini CLI → `"BeforeTool"`, Cursor → `"preToolUse"`, Copilot CLI → `"preToolUse"`.
     fn hook_event_key(&self) -> &'static str {
         "PreToolUse"
+    }
+
+    /// Every event key under `hooks` that skim registers its entry in.
+    ///
+    /// Default: the primary key alone. Claude Code overrides it to add
+    /// `"PostToolUse"`. `upsert_hook` writes one entry per key.
+    fn hook_event_keys(&self) -> Vec<&'static str> {
+        vec![self.hook_event_key()]
     }
 
     /// The tool matcher value used when inserting a hook entry.
@@ -284,8 +297,9 @@ pub(crate) trait HookProtocol {
 
     /// Upsert the skim hook entry into a parsed config JSON value in place.
     ///
-    /// Removes any existing skim entry under `hooks.<event_key>`, then appends
-    /// the new entry. Creates the `hooks` and event-key arrays if absent.
+    /// Removes any existing skim entry under each `hooks.<event_key>` of
+    /// [`hook_event_keys`](Self::hook_event_keys), then appends the new entry
+    /// there. Creates the `hooks` and event-key arrays if absent.
     ///
     /// Default implementation handles the Claude Code / Gemini / Copilot /
     /// Crush array-of-objects format. Cursor overrides this.
@@ -304,19 +318,19 @@ pub(crate) trait HookProtocol {
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("config 'hooks' is not an object"))?;
 
-        let event_arr = hooks
-            .entry(self.hook_event_key())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-            .as_array_mut()
-            .ok_or_else(|| {
-                anyhow::anyhow!("config 'hooks.{}' is not an array", self.hook_event_key())
-            })?;
+        for event_key in self.hook_event_keys() {
+            let event_arr = hooks
+                .entry(event_key)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("config 'hooks.{event_key}' is not an array"))?;
 
-        // Remove existing skim entries (idempotent upsert)
-        event_arr.retain(|e| !self.is_skim_entry(e));
+            // Remove existing skim entries (idempotent upsert)
+            event_arr.retain(|e| !self.is_skim_entry(e));
 
-        // Append new entry
-        event_arr.push(self.build_config_entry(hook_script_path));
+            // Append new entry
+            event_arr.push(self.build_config_entry(hook_script_path));
+        }
 
         Ok(())
     }
@@ -1271,6 +1285,43 @@ mod tests {
     fn test_default_hook_event_key() {
         let hook = claude::ClaudeCodeHook;
         assert_eq!(hook.hook_event_key(), "PreToolUse");
+    }
+
+    #[test]
+    fn test_hook_event_keys_default_to_the_single_primary_key() {
+        for (kind, key) in [
+            (AgentKind::Cursor, "preToolUse"),
+            (AgentKind::GeminiCli, "BeforeTool"),
+            (AgentKind::CopilotCli, "preToolUse"),
+            (AgentKind::CodexCli, "PreToolUse"),
+            (AgentKind::Crush, "PreToolUse"),
+        ] {
+            let protocol = protocol_for_agent(kind);
+            assert_eq!(protocol.hook_event_keys(), [key], "{kind:?}");
+            assert_eq!(protocol.hook_event_key(), key, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_default_upsert_hook_writes_only_the_primary_event_key() {
+        for (kind, key) in [
+            (AgentKind::GeminiCli, "BeforeTool"),
+            (AgentKind::Crush, "PreToolUse"),
+        ] {
+            let protocol = protocol_for_agent(kind);
+            let mut config = serde_json::json!({});
+            protocol
+                .upsert_hook(&mut config, "/path/to/skim-rewrite.sh")
+                .unwrap();
+
+            let events: Vec<&str> = config["hooks"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(events, [key], "{kind:?} must not gain a PostToolUse entry");
+        }
     }
 
     #[test]

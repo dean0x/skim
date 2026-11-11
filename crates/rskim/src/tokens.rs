@@ -28,26 +28,39 @@ fn get_counter() -> &'static Counter {
         // Counter::new for cl100k is practically infallible (embedded vocab in tiktoken-rs).
         // On the dead Err path (embedded vocab corrupt), fall back to the byte-length
         // heuristic so the process continues rather than crashing (constraint 4).
-        build_counter_with_fallback()
+        build_counter_with_fallback(true)
     })
+}
+
+/// Whether the real cl100k tokenizer loaded, not the byte-length fallback.
+/// The post-run hook asks before it compresses, and it starts the counter
+/// without the stderr warning, because that hook must keep stderr empty.
+pub(crate) fn cl100k_is_ready() -> bool {
+    COUNTER
+        .get_or_init(|| build_counter_with_fallback(false))
+        .encoding()
+        == Encoding::Cl100k
 }
 
 /// Build the cl100k counter, falling back to the heuristic on (practically dead) init failure.
 ///
 /// Separated from the OnceLock closure so the error-handling logic is readable.
+/// `warn` says whether the fallback prints its stderr warning.
 ///
 /// Uses `Counter::heuristic()` (infallible by construction) as the fallback so
 /// no panic macro is required on the dead error path (AC10 no-panic invariant).
-fn build_counter_with_fallback() -> Counter {
+fn build_counter_with_fallback(warn: bool) -> Counter {
     match Counter::new(Encoding::Cl100k) {
         Ok(counter) => counter,
         Err(e) => {
             // Practically dead: tiktoken embeds its vocab at compile time.
             // Counter::heuristic() is unconditionally infallible — no panic macro needed.
-            eprintln!(
-                "[skim] warning: cl100k tokenizer init failed ({e}); \
-                 falling back to byte-length heuristic"
-            );
+            if warn {
+                eprintln!(
+                    "[skim] warning: cl100k tokenizer init failed ({e}); \
+                     falling back to byte-length heuristic"
+                );
+            }
             Counter::heuristic()
         }
     }

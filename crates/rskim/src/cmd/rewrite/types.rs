@@ -73,6 +73,14 @@ pub(super) struct RewriteResult {
     /// rewrite, `true` when any rewritten segment does. The hook keeps such a
     /// rewrite even in auto permission mode.
     pub(super) masks_output: bool,
+    /// The rule prefix that produced this rewrite, or the name a custom handler
+    /// gives itself (see `handlers::CAT_HANDLER_PREFIX`).
+    ///
+    /// The key is the prefix, not the rewrite target: `ruff check` and bare
+    /// `ruff` share one target, as do `golangci-lint run` and bare
+    /// `golangci-lint`, and only the prefix tells them apart. `None` for a
+    /// compound rewrite and for `head`/`tail`, which have no single owner.
+    pub(super) matched_prefix: Option<&'static [&'static str]>,
 }
 
 // ---- Compound command types (#45) ----

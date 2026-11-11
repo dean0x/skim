@@ -9,7 +9,7 @@ pub(crate) mod cypress;
 pub(crate) mod dotnet;
 pub(crate) mod go;
 pub(crate) mod playwright;
-mod pytest;
+pub(crate) mod pytest;
 mod shared;
 pub(crate) mod swift;
 pub(crate) mod vitest;

@@ -1,0 +1,14 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "transcript_path": "/home/user/session-logs/work-project/00000000-0000-4000-8000-000000000001.jsonl",
+  "cwd": "/work/project",
+  "prompt_id": "00000000-0000-4000-8000-000000000002",
+  "permission_mode": "auto",
+  "effort": {"level":"high"},
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {"command":"cargo test","description":"Run the unit tests"},
+  "tool_response": {"stdout":"\nrunning 40 tests\ntest parser::tests::case_0 ... ok\ntest parser::tests::case_1 ... ok\ntest parser::tests::case_2 ... ok\ntest parser::tests::case_3 ... ok\ntest parser::tests::case_4 ... ok\ntest parser::tests::case_5 ... ok\ntest parser::tests::case_6 ... ok\ntest parser::tests::case_7 ... ok\ntest parser::tests::case_8 ... ok\ntest parser::tests::case_9 ... ok\ntest parser::tests::case_10 ... ok\ntest parser::tests::case_11 ... ok\ntest parser::tests::case_12 ... ok\ntest parser::tests::case_13 ... ok\ntest parser::tests::case_14 ... ok\ntest parser::tests::case_15 ... ok\ntest parser::tests::case_16 ... ok\ntest parser::tests::case_17 ... ok\ntest parser::tests::case_18 ... ok\ntest parser::tests::case_19 ... ok\ntest parser::tests::case_20 ... ok\ntest parser::tests::case_21 ... ok\ntest parser::tests::case_22 ... ok\ntest parser::tests::case_23 ... ok\ntest parser::tests::case_24 ... ok\ntest parser::tests::case_25 ... ok\ntest parser::tests::case_26 ... ok\ntest parser::tests::case_27 ... ok\ntest parser::tests::case_28 ... ok\ntest parser::tests::case_29 ... ok\ntest parser::tests::case_30 ... ok\ntest parser::tests::case_31 ... ok\ntest parser::tests::case_32 ... ok\ntest parser::tests::case_33 ... ok\ntest parser::tests::case_34 ... ok\ntest parser::tests::case_35 ... ok\ntest parser::tests::case_36 ... ok\ntest parser::tests::case_37 ... ok\ntest parser::tests::case_38 ... ok\ntest parser::tests::case_39 ... ok\n\ntest result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s","stderr":"   Compiling skim-fixture v0.1.0 (/work/project)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.20s\n     Running unittests src/lib.rs (target/debug/deps/skim_fixture-0000000000000000)","interrupted":false,"isImage":false,"noOutputExpected":false,"persistedOutputPath":"/tmp/skim-fixture/tool-results/0000.txt","persistedOutputSize":70000},
+  "tool_use_id": "toolu_00000000000000000000000a",
+  "duration_ms": 800
+}
