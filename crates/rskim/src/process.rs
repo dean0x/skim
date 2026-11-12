@@ -8,12 +8,13 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
 use rskim_core::{
-    ElidedSide, Language, Mode, TransformConfig, detect_language_from_path, elision_marker_line,
-    simple_last_line_truncate_with_start, simple_line_truncate, transform_auto_with_config,
-    transform_with_config, transform_with_line_map,
+    ElidedSide, Language, Mode, Parser, TransformConfig, declarations, detect_language_from_path,
+    elision_marker_line, simple_last_line_truncate_with_start, simple_line_truncate,
+    transform_auto_with_config, transform_with_config, transform_with_line_map,
 };
 
 use crate::output::ELISION_HINT;
+use crate::symbol::{self, SymbolRead};
 use crate::{cache, cascade, cascade::TruncationOptions, tokens};
 
 /// Maximum input size to prevent memory exhaustion (50MB)
@@ -387,6 +388,7 @@ fn try_cached_result(
         trunc: options.trunc,
         line_numbers: options.line_numbers,
         notice_bytes,
+        symbol: None,
     }) else {
         return Ok(None);
     };
@@ -1301,6 +1303,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
                 // the disclosure's size, which is not otherwise in the key.
                 // Same `notice_bytes` the read key above used.
                 notice_bytes,
+                symbol: None,
             },
             content: &final_output,
             original_tokens: orig_tokens,
@@ -1310,6 +1313,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             // consistency-2: store the authoritative view_differs so the
             // cache-hit path does not have to re-derive it from the mode.
             view_differs,
+            notice: None,
         });
     }
 
@@ -1326,6 +1330,168 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         stdin_raw: None,
         view_differs,
     })
+}
+
+/// Read one named declaration of `path` (`skim FILE --symbol NAME`).
+///
+/// The result is the raw source lines of every declaration `name` selects
+/// (see [`symbol::select`]), bounded by `--max-lines` / `--last-lines` and
+/// numbered by `--line-numbers` after the selection, so line numbers start at
+/// the declaration's first line. No mode transform and no ADR-001 guard run:
+/// the selection is the view the reader asked for.
+///
+/// The caller has rejected the option mixes that cannot mean a symbol read
+/// (stdin, several files, a mode, a token budget). A [`symbol::SymbolError`]
+/// in the error chain carries the exit code of the other refusals.
+///
+/// A cache entry is keyed by the symbol name and carries the stderr notice, so
+/// a warm read prints what the cold read printed. Only a read that succeeded
+/// writes an entry. The result is not a [`ProcessResult`] because the caller
+/// records no analytics row for it.
+pub(crate) fn process_symbol_file(
+    path: &Path,
+    name: &str,
+    options: ProcessOptions,
+) -> anyhow::Result<SymbolRead> {
+    // A language known from the flag or the extension is judged before the
+    // cache is read, so a refused file never meets a stored entry.
+    let known_language = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path));
+    if let Some(language) = known_language {
+        symbol::require_supported(language, path)?;
+    }
+
+    let key = cache::CacheKeyParams {
+        path,
+        mode: Mode::Full,
+        trunc: options.trunc,
+        line_numbers: options.line_numbers,
+        notice_bytes: 0,
+        symbol: Some(name),
+    };
+
+    // An entry without its notice is not served: the notice is unconditional.
+    if options.use_cache
+        && let Some(hit) = cache::read_cache(&key)
+        && let Some(notice) = hit.notice
+    {
+        let (original_tokens, transformed_tokens) =
+            match (hit.original_tokens, hit.transformed_tokens) {
+                (Some(original), Some(transformed)) => (Some(original), Some(transformed)),
+                _ if options.show_stats => {
+                    tokens::count_token_pair(&read_and_validate(path)?, &hit.content)
+                }
+                _ => (None, None),
+            };
+        return Ok(SymbolRead {
+            output: hit.content,
+            notice,
+            original_tokens,
+            transformed_tokens,
+        });
+    }
+
+    let contents = read_and_validate(path)?;
+    let language = known_language
+        .or_else(|| detect_language_from_shebang(&contents))
+        .ok_or_else(|| symbol::unknown_language(path))?;
+    symbol::require_supported(language, path)?;
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    let tree = Parser::new_for_extension(language, extension)?.parse(&contents)?;
+    let scan = declarations(&tree, &contents, language);
+    let matches = symbol::select(&scan.decls, name);
+    if matches.is_empty() {
+        return Err(symbol::not_found(path, name, &scan).into());
+    }
+
+    let selected = symbol::render(path, &contents, &matches, name);
+    let (output, bounded_map) =
+        if options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some() {
+            enforce_line_bounds(
+                &selected.text,
+                Some(language),
+                &options.trunc,
+                &selected.text,
+            )
+        } else {
+            (selected.text, None)
+        };
+    let output = if options.line_numbers {
+        let map = compose_line_maps(&selected.line_map, bounded_map);
+        crate::format::format_with_line_numbers(&output, &map)
+    } else {
+        output
+    };
+
+    let (original_tokens, transformed_tokens) = if options.show_stats {
+        tokens::count_token_pair(&contents, &output)
+    } else {
+        (None, None)
+    };
+
+    // Cache write failures are non-fatal; the read itself succeeded.
+    if options.use_cache {
+        let _ = cache::write_cache(&cache::CacheWriteParams {
+            key,
+            content: &output,
+            original_tokens,
+            transformed_tokens,
+            effective_mode: None,
+            parse_tier: None,
+            view_differs: true,
+            notice: Some(&selected.notice),
+        });
+    }
+
+    Ok(SymbolRead {
+        output,
+        notice: selected.notice,
+        original_tokens,
+        transformed_tokens,
+    })
+}
+
+/// Source line numbers for text that a line bound cut after a selection.
+///
+/// `selected[i]` is the source line of line `i + 1` of the selected text, or
+/// `0` for a header line. `bounded` is the map [`enforce_line_bounds`] built
+/// over that text: entries are 1-based positions in the selected text, and `0`
+/// marks the elision marker. `None` means no bound cut anything.
+fn compose_line_maps(selected: &[usize], bounded: Option<Vec<usize>>) -> Vec<usize> {
+    match bounded {
+        None => selected.to_vec(),
+        Some(map) => map
+            .into_iter()
+            .map(|position| match position {
+                0 => 0,
+                n => selected.get(n - 1).copied().unwrap_or(0),
+            })
+            .collect(),
+    }
+}
+
+/// Write a `--symbol` result: the lines to stdout, the notice to stderr.
+///
+/// The notice is unconditional (ADR-011 class 1): the reader sees part of the
+/// file. Write failures use bare `?` so a closed pipe stays recognisable at
+/// the top-level boundary.
+#[allow(clippy::disallowed_methods)] // Result emitter; BufWriter wraps the single stdout lock for coherent output
+pub(crate) fn write_symbol_result(result: &SymbolRead, show_stats: bool) -> anyhow::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    write!(writer, "{}", result.output)?;
+    writer.flush()?;
+
+    eprintln!("{}", result.notice);
+    if show_stats {
+        report_token_stats(result.original_tokens, result.transformed_tokens, "");
+    }
+    Ok(())
 }
 
 /// Read a file and validate it doesn't exceed the maximum input size.
@@ -1823,5 +1989,258 @@ mod tests {
             prospective(&over_bound, three).is_none(),
             "lines > n: raw is cut and discloses too"
         );
+    }
+
+    // ========================================================================
+    // process_symbol_file — `skim FILE --symbol NAME`
+    // ========================================================================
+
+    const SYMBOL_RUST: &str = "\
+fn first() {}
+
+fn long_one() {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+}
+
+fn last() {}
+";
+
+    fn symbol_opts(trunc: TruncationOptions, line_numbers: bool) -> ProcessOptions {
+        ProcessOptions {
+            mode: Mode::Full,
+            explicit_lang: None,
+            use_cache: false,
+            show_stats: false,
+            trunc,
+            line_numbers,
+            batch: false,
+        }
+    }
+
+    fn write_source(dir: &tempfile::TempDir, name: &str, source: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn exit_code_of(error: &anyhow::Error) -> Option<u8> {
+        error
+            .downcast_ref::<crate::symbol::SymbolError>()
+            .map(crate::symbol::SymbolError::exit_code)
+    }
+
+    #[test]
+    fn symbol_read_prints_the_declaration_lines_and_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_source(&dir, "a.rs", SYMBOL_RUST);
+
+        let read = process_symbol_file(
+            &path,
+            "long_one",
+            symbol_opts(TruncationOptions::default(), false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read.output,
+            "fn long_one() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n}\n"
+        );
+        assert_eq!(
+            read.notice,
+            "[skim] --symbol \"long_one\": lines 3-8 of 10 shown (2 above, 2 below not shown) — omit --symbol for the whole file"
+        );
+    }
+
+    #[test]
+    fn symbol_read_max_lines_bounds_the_slice_with_its_marker_included() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_source(&dir, "a.rs", SYMBOL_RUST);
+        let trunc = TruncationOptions {
+            max_lines: Some(3),
+            ..Default::default()
+        };
+
+        let read = process_symbol_file(&path, "long_one", symbol_opts(trunc, false)).unwrap();
+
+        let lines: Vec<&str> = read.output.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "N-1 content lines plus the marker: {lines:?}"
+        );
+        assert_eq!(&lines[..2], ["fn long_one() {", "    let a = 1;"]);
+        assert!(
+            lines[2].contains("4 lines truncated"),
+            "the marker counts slice lines: {}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn symbol_read_last_lines_keeps_the_tail_of_the_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_source(&dir, "a.rs", SYMBOL_RUST);
+        let trunc = TruncationOptions {
+            last_lines: Some(3),
+            ..Default::default()
+        };
+
+        let read = process_symbol_file(&path, "long_one", symbol_opts(trunc, false)).unwrap();
+
+        let lines: Vec<&str> = read.output.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "the marker plus N-1 content lines: {lines:?}"
+        );
+        assert!(lines[0].contains("4 lines above"), "{}", lines[0]);
+        assert_eq!(&lines[1..], ["    let d = 4;", "}"]);
+    }
+
+    #[test]
+    fn symbol_read_line_numbers_start_at_the_declaration_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_source(&dir, "a.rs", SYMBOL_RUST);
+
+        let plain = process_symbol_file(
+            &path,
+            "long_one",
+            symbol_opts(TruncationOptions::default(), true),
+        )
+        .unwrap();
+        assert_eq!(
+            plain.output,
+            "3\tfn long_one() {\n4\t    let a = 1;\n5\t    let b = 2;\n6\t    let c = 3;\n7\t    let d = 4;\n8\t}\n"
+        );
+
+        let head = TruncationOptions {
+            max_lines: Some(3),
+            ..Default::default()
+        };
+        let head = process_symbol_file(&path, "long_one", symbol_opts(head, true)).unwrap();
+        let head_lines: Vec<&str> = head.output.lines().collect();
+        assert_eq!(
+            &head_lines[..2],
+            ["3\tfn long_one() {", "4\t    let a = 1;"]
+        );
+        assert!(
+            !head_lines[2].starts_with(|c: char| c.is_ascii_digit()),
+            "the elision marker carries no number: {}",
+            head_lines[2]
+        );
+
+        let tail = TruncationOptions {
+            last_lines: Some(3),
+            ..Default::default()
+        };
+        let tail = process_symbol_file(&path, "long_one", symbol_opts(tail, true)).unwrap();
+        let tail_lines: Vec<&str> = tail.output.lines().collect();
+        assert_eq!(&tail_lines[1..], ["7\t    let d = 4;", "8\t}"]);
+    }
+
+    #[test]
+    fn symbol_read_of_an_unknown_name_is_exit_1_and_lists_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_source(&dir, "a.rs", SYMBOL_RUST);
+
+        let error = process_symbol_file(
+            &path,
+            "nope",
+            symbol_opts(TruncationOptions::default(), false),
+        )
+        .unwrap_err();
+
+        assert_eq!(exit_code_of(&error), Some(1));
+        let text = error.to_string();
+        assert!(
+            text.starts_with("no declaration named \"nope\" in "),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("declarations: \"first\", \"long_one\", \"last\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn symbol_read_of_markdown_or_an_undetected_language_is_exit_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let markdown = write_source(&dir, "notes.md", "# Title\n\nbody\n");
+        let unknown = write_source(&dir, "LICENSE", "MIT License\n");
+        let opts = symbol_opts(TruncationOptions::default(), false);
+
+        let markdown_error = process_symbol_file(&markdown, "Title", opts).unwrap_err();
+        assert_eq!(exit_code_of(&markdown_error), Some(3));
+        assert!(markdown_error.to_string().contains("Markdown"));
+
+        let unknown_error = process_symbol_file(&unknown, "x", opts).unwrap_err();
+        assert_eq!(exit_code_of(&unknown_error), Some(3));
+    }
+
+    #[test]
+    fn symbol_read_of_a_tsx_file_finds_a_declaration_after_jsx() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "\
+function App() {
+  return <div className=\"a\">{[1, 2].map((n) => <b key={n}>{n}</b>)}</div>;
+}
+
+function Footer() {
+  return <footer />;
+}
+";
+        let path = write_source(&dir, "app.tsx", source);
+
+        let read = process_symbol_file(
+            &path,
+            "Footer",
+            symbol_opts(TruncationOptions::default(), false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read.output,
+            "function Footer() {\n  return <footer />;\n}\n"
+        );
+    }
+
+    /// A warm read prints the same stdout AND the same notice as the cold read
+    /// that wrote it; another name never reads that entry; and a read that
+    /// failed leaves nothing in the cache.
+    #[test]
+    #[serial_test::serial]
+    fn symbol_read_warm_hit_repeats_stdout_and_notice_and_failures_write_nothing() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let path = write_source(&src_dir, "a.rs", SYMBOL_RUST);
+        let markdown = write_source(&src_dir, "notes.md", "# T\n");
+        let opts = ProcessOptions {
+            use_cache: true,
+            ..symbol_opts(TruncationOptions::default(), false)
+        };
+        let cache_files = || fs::read_dir(cache_dir.path()).unwrap().count();
+
+        // SAFETY: test-only, serial-gated.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_dir.path()) };
+        let missing = process_symbol_file(&path, "nope", opts);
+        let refused = process_symbol_file(&markdown, "T", opts);
+        let after_failures = cache_files();
+        let cold = process_symbol_file(&path, "long_one", opts);
+        let after_cold = cache_files();
+        let warm = process_symbol_file(&path, "long_one", opts);
+        let other = process_symbol_file(&path, "last", opts);
+        unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
+
+        assert!(missing.is_err() && refused.is_err());
+        assert_eq!(after_failures, 0, "a failed read must not write an entry");
+        let (cold, warm, other) = (cold.unwrap(), warm.unwrap(), other.unwrap());
+        assert_eq!(after_cold, 1, "the cold read writes one entry");
+        assert_eq!(warm.output, cold.output);
+        assert_eq!(warm.notice, cold.notice);
+        assert_eq!(other.output, "fn last() {}\n");
+        assert_ne!(other.output, warm.output);
     }
 }
