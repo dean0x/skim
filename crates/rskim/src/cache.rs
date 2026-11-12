@@ -25,7 +25,9 @@
 //! The key's fan-out has grown, so orphans accrue faster than they used to:
 //! `line_numbers` and then `notice_bytes` joined the key, and `notice_bytes`
 //! alone takes three distinct values for one file (hook origin, direct, batch)
-//! — up to three orphans per edit rather than one. The
+//! — up to three orphans per edit rather than one. The `--symbol` name joined
+//! the key as well, so every distinct symbol name read from a file adds one
+//! more orphan per edit, on top of those combinations. The
 //! `CACHE_SCHEMA_VERSION` 2 → 3 bump orphaned every warm entry once.
 //!
 //! Adding a bound is a new cache-lifecycle policy (eviction order, budget,
@@ -133,6 +135,13 @@ struct CacheEntry {
     /// mode-inference in that case (`mode != Mode::Full`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     view_differs: Option<bool>,
+    /// The stderr notice the read printed beside this stdout.
+    ///
+    /// A `--symbol` read prints one on every run, warm or cold, so the entry
+    /// keeps it. `None` for whole-file reads and for entries written before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notice: Option<String>,
 }
 
 /// Data returned on a successful cache lookup.
@@ -149,6 +158,8 @@ pub(crate) struct CacheHit {
     /// `None` for cache entries written before this field was added — callers
     /// fall back to mode-inference (`mode != Mode::Full`) in that case.
     pub(crate) view_differs: Option<bool>,
+    /// The stderr notice stored with the entry (see [`CacheWriteParams::notice`]).
+    pub(crate) notice: Option<String>,
 }
 
 /// Everything that identifies a cache entry.
@@ -188,6 +199,11 @@ pub(crate) struct CacheKeyParams<'a> {
     /// `process::view_notice_cache_bytes`, which is the sole producer of this
     /// value on the live path.
     pub(crate) notice_bytes: usize,
+    /// The `--symbol` name this read selects, or `None` for a whole-file read.
+    ///
+    /// The selected lines are a different stdout from the whole file and from
+    /// every other name, so the name is part of the entry's identity.
+    pub(crate) symbol: Option<&'a str>,
 }
 
 /// Parameters for writing a cache entry.
@@ -211,6 +227,11 @@ pub(crate) struct CacheWriteParams<'a> {
     /// here so the cache-hit path in `try_cached_result` can reproduce the correct
     /// answer without re-reading the file (consistency-2).
     pub(crate) view_differs: bool,
+    /// The stderr notice this read prints beside the cached stdout, if any.
+    ///
+    /// A cache hit skips the work that built the notice, so a read whose notice
+    /// is unconditional must store it or lose it on the second run.
+    pub(crate) notice: Option<&'a str>,
 }
 
 /// Returns the skim cache directory, creating it with owner-only permissions if it does not
@@ -280,6 +301,10 @@ const CACHE_SCHEMA_VERSION: u32 = 3;
 /// collapses origin, batch-ness and mode into one field, and it makes a future
 /// marker-wording edit self-invalidating.
 ///
+/// `symbol` is included because a `--symbol` read prints other lines than the
+/// whole file and than every other name. It is length-prefixed and placed
+/// before the path, so no name can be read as part of another input.
+///
 /// `CACHE_SCHEMA_VERSION` is included so that any change to the output format
 /// (a later phase of the fidelity overhaul) automatically invalidates all warm
 /// entries without needing to clear the cache manually.
@@ -289,13 +314,29 @@ fn cache_key(p: &CacheKeyParams<'_>, mtime: SystemTime) -> Result<String> {
 
     let opt_str = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
 
+    // A symbol read puts `symbol:<byte length>:<name>|` between the schema
+    // version and the path; a whole-file read puts nothing there, so its hash
+    // input is byte-identical to the one it had before this field existed and
+    // warm entries stay valid.
+    //
+    // The name is free text, so WHERE it sits decides whether the input is
+    // unambiguous. Placed last, a file whose own name spells the trailing
+    // numeric fields could make another file's whole-file input read exactly
+    // like a symbol input (the collision test pins this). Placed first, the
+    // two input families cannot meet: a whole-file input has a canonical
+    // absolute path after the version, which never begins with `symbol:`, and
+    // inside the symbol family the length prefix fixes where the name ends.
+    let symbol_part = p.symbol.map_or_else(String::new, |name| {
+        format!("symbol:{}:{}|", name.len(), name)
+    });
+
     // Bound out because inline format args take an identifier, not a field
-    // access. The hash input is byte-identical to the positional form this
-    // replaced, so warm v3 entries are not orphaned by the refactor.
+    // access.
     let mode = p.mode;
     let hash_input = format!(
-        "cache_schema_v{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
+        "cache_schema_v{}|{}{}|{}|{:?}|{}|{}|{}|{}|{}",
         CACHE_SCHEMA_VERSION,
+        symbol_part,
         canonical_path.display(),
         mtime_secs,
         mode,
@@ -337,6 +378,7 @@ pub(crate) fn read_cache(p: &CacheKeyParams<'_>) -> Option<CacheHit> {
             original_tokens: entry.original_tokens,
             transformed_tokens: entry.transformed_tokens,
             view_differs: entry.view_differs,
+            notice: entry.notice,
         })
     } else {
         // Stale entry: best-effort cleanup.
@@ -367,6 +409,7 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
         effective_mode: params.effective_mode.map(|m| format!("{m:?}")),
         parse_tier: params.parse_tier.clone(),
         view_differs: Some(params.view_differs),
+        notice: params.notice.map(str::to_string),
     };
 
     let json = serde_json::to_string(&entry)?;
@@ -420,6 +463,7 @@ mod tests {
             trunc,
             line_numbers: false,
             notice_bytes: 0,
+            symbol: None,
         }
     }
 
@@ -618,6 +662,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             view_differs: false,
+            notice: None,
         })
         .unwrap();
 
@@ -675,6 +720,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             view_differs: false,
+            notice: None,
         })
         .unwrap();
 
@@ -719,6 +765,7 @@ mod tests {
             effective_mode: Some(Mode::Signatures),
             parse_tier: None,
             view_differs: true,
+            notice: None,
         })
         .unwrap();
 
@@ -767,6 +814,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             view_differs: false,
+            notice: None,
         })
         .unwrap();
         let hit = read_cache(&key_params(&path, Mode::Structure, default_trunc)).unwrap();
@@ -912,6 +960,202 @@ mod tests {
         assert_ne!(
             key_batch, key_origin,
             "a batch read pays no marginal disclosure and must key separately"
+        );
+    }
+
+    /// A warm `--symbol` read must print the same stderr notice as the cold read
+    /// that wrote it, and a notice never crosses to another name or to a
+    /// whole-file read. Entries written without a notice read back as `None`.
+    #[test]
+    #[serial_test::serial]
+    fn test_symbol_notice_round_trips_and_stays_with_its_symbol() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "fn a() {{}}\nfn b() {{}}\n").unwrap();
+        let path = temp_file.path();
+        let trunc = TruncationOptions::default();
+        let for_symbol = |symbol| CacheKeyParams {
+            symbol,
+            ..key_params(path, Mode::Full, trunc)
+        };
+
+        // SAFETY: test-only, serial-gated.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_dir.path()) };
+        let written = write_cache(&CacheWriteParams {
+            key: for_symbol(Some("a")),
+            content: "fn a() {}\n",
+            original_tokens: None,
+            transformed_tokens: None,
+            effective_mode: None,
+            parse_tier: None,
+            view_differs: true,
+            notice: Some("[skim] --symbol \"a\": lines 1-1 of 2 shown"),
+        });
+        let plain_written = write_cache(&CacheWriteParams {
+            key: for_symbol(None),
+            content: "fn a() {}\nfn b() {}\n",
+            original_tokens: None,
+            transformed_tokens: None,
+            effective_mode: None,
+            parse_tier: None,
+            view_differs: false,
+            notice: None,
+        });
+        let hit_a = read_cache(&for_symbol(Some("a")));
+        let hit_b = read_cache(&for_symbol(Some("b")));
+        let hit_plain = read_cache(&for_symbol(None));
+        unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
+
+        written.unwrap();
+        plain_written.unwrap();
+        let hit_a = hit_a.expect("the symbol the entry was written for must hit");
+        assert_eq!(hit_a.content, "fn a() {}\n");
+        assert_eq!(
+            hit_a.notice.as_deref(),
+            Some("[skim] --symbol \"a\": lines 1-1 of 2 shown")
+        );
+        assert!(hit_b.is_none(), "another symbol must miss");
+        let hit_plain = hit_plain.expect("the whole-file entry must hit");
+        assert_eq!(hit_plain.content, "fn a() {}\nfn b() {}\n");
+        assert_eq!(hit_plain.notice, None);
+    }
+
+    /// A whole-file read and `--symbol` reads of one file print different
+    /// stdout, so none of them may share an entry. The names `a`, `a::b` and
+    /// `ab` are the shapes a naive `format!("{a}{b}")` join would run together.
+    #[test]
+    fn test_cache_key_separates_symbol_reads() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "fn a() {{}}\nfn b() {{}}\n").unwrap();
+        let path = temp_file.path();
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        let key_of = |symbol: Option<&str>| {
+            cache_key(
+                &CacheKeyParams {
+                    symbol,
+                    ..key_params(path, Mode::Full, TruncationOptions::default())
+                },
+                mtime,
+            )
+            .unwrap()
+        };
+
+        let keys = [
+            key_of(None),
+            key_of(Some("a")),
+            key_of(Some("b")),
+            key_of(Some("a::b")),
+            key_of(Some("ab")),
+            key_of(Some("")),
+        ];
+        for (i, left) in keys.iter().enumerate() {
+            for (j, right) in keys.iter().enumerate().skip(i + 1) {
+                assert_ne!(left, right, "keys {i} and {j} must differ");
+            }
+        }
+        assert_eq!(
+            key_of(Some("a")),
+            key_of(Some("a")),
+            "the same symbol must hit the same entry"
+        );
+    }
+
+    /// A read without `--symbol` keeps the exact hash input it had before the
+    /// symbol field existed. A different input would orphan every warm entry
+    /// without a schema bump, and a schema bump is not wanted for an additive flag.
+    #[test]
+    fn test_cache_key_without_symbol_is_unchanged() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "export const x = 1;").unwrap();
+        let path = temp_file.path();
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        let mtime_secs = mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let canonical = path.canonicalize().unwrap();
+        let sha = |input: &str| {
+            let mut hasher = Sha256::new();
+            hasher.update(input.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        let plain = cache_key(
+            &key_params(path, Mode::Structure, TruncationOptions::default()),
+            mtime,
+        )
+        .unwrap();
+        assert_eq!(
+            plain,
+            sha(&format!(
+                "cache_schema_v3|{}|{mtime_secs}|Structure|none|none|none|0|0",
+                canonical.display()
+            ))
+        );
+
+        let busy = cache_key(
+            &CacheKeyParams {
+                line_numbers: true,
+                notice_bytes: 162,
+                ..key_params(
+                    path,
+                    Mode::Pseudo,
+                    TruncationOptions {
+                        max_lines: Some(50),
+                        last_lines: None,
+                        token_budget: Some(500),
+                    },
+                )
+            },
+            mtime,
+        )
+        .unwrap();
+        assert_eq!(
+            busy,
+            sha(&format!(
+                "cache_schema_v3|{}|{mtime_secs}|Pseudo|50|none|500|1|162",
+                canonical.display()
+            ))
+        );
+    }
+
+    /// A `--symbol` read must not share a key with a whole-file read of a
+    /// different file whose NAME spells the end of the symbol read's hash input.
+    ///
+    /// The name is free text, so appended to the end of the input it can be
+    /// made to read as the trailing numeric fields of another path's input.
+    /// Both inputs below are the same string when the symbol is appended.
+    #[test]
+    fn test_cache_key_symbol_cannot_collide_with_a_file_name_that_spells_it() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("f.rs");
+        fs::write(&plain, "fn foo() {}\n").unwrap();
+
+        let (symbol_mtime, path_mtime) = (1_700_000_000_u64, 1_700_000_500_u64);
+        let symbol = format!("foo|{path_mtime}|Full|none|none|none|0|0");
+        let spelled = dir.path().join(format!(
+            "f.rs|{symbol_mtime}|Full|none|none|none|0|0|symbol:{}:foo",
+            symbol.len()
+        ));
+        fs::write(&spelled, "fn bar() {}\n").unwrap();
+
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let trunc = TruncationOptions::default();
+        let symbol_key = cache_key(
+            &CacheKeyParams {
+                symbol: Some(&symbol),
+                ..key_params(&plain, Mode::Full, trunc)
+            },
+            at(symbol_mtime),
+        )
+        .unwrap();
+        let path_key = cache_key(&key_params(&spelled, Mode::Full, trunc), at(path_mtime)).unwrap();
+
+        assert_ne!(
+            symbol_key, path_key,
+            "a symbol read and a whole-file read of a look-alike file name must not share an entry"
         );
     }
 }

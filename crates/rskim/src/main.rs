@@ -19,6 +19,7 @@ mod multi;
 mod output;
 mod process;
 mod runner;
+mod symbol;
 mod tokens;
 
 use clap::Parser;
@@ -68,6 +69,7 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "-j"
             | "--max-lines"
             | "--last-lines"
+            | "--symbol"
             | "--tokens"
             | "--since"
             | "--session"
@@ -423,6 +425,29 @@ struct Args {
     )]
     last_lines: Option<usize>,
 
+    /// Print only the source lines of the declaration named NAME
+    ///
+    /// Prints the raw source lines of one function, type, class or other
+    /// declaration of a single file. `Type::name` or `Type.name` selects a
+    /// member of `Type`. When several declarations share the name, all are
+    /// printed, each under a `==> path:A-B name (k of n) <==` header.
+    ///
+    /// Stderr carries a notice that gives the lines shown and the lines above
+    /// and below that are not. `--max-lines`, `--last-lines` and
+    /// `--line-numbers` apply to the selected lines; line numbers start at
+    /// the declaration's first line. Needs exactly one file path; does not
+    /// combine with `--tokens` or a `--mode` other than `full`. Not available
+    /// for Markdown, JSON, YAML or TOML.
+    ///
+    /// Exit codes: 1 no declaration with that name, 2 the options cannot
+    /// mean a symbol read, 3 the file's language has no declarations.
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Print only the source lines of the declaration named NAME (Type::name selects a member)"
+    )]
+    symbol: Option<String>,
+
     /// Token budget - cascade through modes until output fits within N tokens
     ///
     /// Progressively applies more aggressive modes (full -> minimal -> structure
@@ -668,6 +693,35 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Reject the option mixes that cannot mean `--symbol NAME`.
+///
+/// Every refusal is a [`symbol::SymbolError::Usage`] (exit 2). `mode_given` is
+/// true only when `--mode` was typed: the default is `structure`, which would
+/// otherwise look like a conflicting choice on every symbol read.
+fn validate_symbol_args(args: &Args, mode_given: bool) -> anyhow::Result<()> {
+    let Some(name) = args.symbol.as_deref() else {
+        return Ok(());
+    };
+    let usage = |message: String| anyhow::Error::from(symbol::SymbolError::Usage(message));
+
+    if name.is_empty() {
+        return Err(usage("--symbol needs a non-empty name".to_string()));
+    }
+    if args.files.len() != 1 || args.files[0] == "-" {
+        return Err(usage("--symbol needs exactly one file path".to_string()));
+    }
+    if mode_given && !matches!(args.mode, ModeArg::Full) {
+        return Err(usage(format!(
+            "--symbol prints source lines and needs --mode full, not --mode {:?}",
+            Mode::from(args.mode).name()
+        )));
+    }
+    if args.tokens.is_some() {
+        return Err(usage("--symbol does not combine with --tokens".to_string()));
+    }
     Ok(())
 }
 
@@ -1564,6 +1618,15 @@ fn main() -> ExitCode {
             );
             cmd::execution::pipe_closed_exit()
         }
+        // A refused `--symbol` read carries its own exit code and prints as
+        // `skim: <message>`, without the `Error:` prefix.
+        (Err(e), None) if e.is::<symbol::SymbolError>() => {
+            eprintln!("skim: {e}");
+            ExitCode::from(
+                e.downcast_ref::<symbol::SymbolError>()
+                    .map_or(1, symbol::SymbolError::exit_code),
+            )
+        }
         (Err(e), None) => {
             eprintln!("Error: {e:#}");
             // Map known SkimError variants to documented exit codes:
@@ -1597,7 +1660,15 @@ fn main() -> ExitCode {
 /// - 1 arg  → `process_single_arg` (stdin, directory, glob, or single file)
 /// - N args → explicit multi-file list (no stdin mixing allowed)
 fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<()> {
-    let args = Args::parse();
+    // The same parse `Args::parse()` does, but the matches stay in hand: only
+    // they tell a typed `--mode` from the default.
+    let mut command = <Args as clap::CommandFactory>::command();
+    let matches = command.get_matches_mut();
+    let args = match <Args as clap::FromArgMatches>::from_arg_matches(&matches) {
+        Ok(args) => args,
+        Err(error) => error.format(&mut command).exit(),
+    };
+    let mode_given = matches.value_source("mode") == Some(clap::parser::ValueSource::CommandLine);
     validate_args(&args)?;
 
     if args.clear_cache {
@@ -1613,6 +1684,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
              Use 'skim --help' for more information."
         );
     }
+    validate_symbol_args(&args, mode_given)?;
 
     let process_options = process::ProcessOptions {
         mode: Mode::from(args.mode),
@@ -1743,6 +1815,10 @@ fn process_single_arg(
         return Ok(());
     }
 
+    if let Some(name) = args.symbol.as_deref() {
+        return run_symbol_read(file, name, process_options, args.show_stats);
+    }
+
     // Capture cwd on the main thread before any background threads are spawned.
     // (std::env::current_dir is not safe to call from background threads in general.)
     let cwd = std::env::current_dir()
@@ -1794,6 +1870,39 @@ fn process_single_arg(
         Some(path), // file: re-read from disk in background
     );
     Ok(())
+}
+
+/// `skim FILE --symbol NAME`: print one declaration of one file.
+///
+/// A directory or a glob cannot be the one file a symbol read needs, so both
+/// are usage errors (exit 2). A path that names an existing file is that file
+/// even when its name holds a glob character, as `pages/[id].tsx` does. Stdin
+/// and several files are refused earlier, in [`validate_symbol_args`]. The
+/// read records no analytics row: the row would count the selection as a
+/// token saving.
+fn run_symbol_read(
+    file: &str,
+    name: &str,
+    options: process::ProcessOptions,
+    show_stats: bool,
+) -> anyhow::Result<()> {
+    let path = PathBuf::from(file);
+    let not_a_file = if path.is_dir() {
+        Some("a directory")
+    } else if !path.is_file() && multi::has_glob_pattern(file) {
+        Some("a glob")
+    } else {
+        None
+    };
+    if let Some(kind) = not_a_file {
+        return Err(symbol::SymbolError::Usage(format!(
+            "--symbol needs exactly one file path, not {kind}: {file:?}"
+        ))
+        .into());
+    }
+
+    let read = process::process_symbol_file(&path, name, options)?;
+    process::write_symbol_result(&read, show_stats)
 }
 
 /// Record token analytics for file operations (single file or stdin).
@@ -2101,6 +2210,7 @@ mod tests {
         "-j",
         "--max-lines",
         "--last-lines",
+        "--symbol",
         "--tokens",
         "--since",
         "--session",
@@ -2122,6 +2232,52 @@ mod tests {
                 is_flag_with_value(flag),
                 "Value-consuming flag {flag} is NOT registered in is_flag_with_value(). \
                  Add it to prevent subcommand mis-routing."
+            );
+        }
+    }
+
+    // ========================================================================
+    // validate_symbol_args — option mixes that cannot mean `--symbol NAME`
+    // ========================================================================
+
+    fn symbol_args(argv: &[&str]) -> Args {
+        Args::try_parse_from(std::iter::once("skim").chain(argv.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn validate_symbol_args_refuses_each_unusable_mix_with_exit_2() {
+        let refused: &[(&[&str], bool)] = &[
+            (&["a.rs", "--symbol", ""], false),
+            (&["-", "--symbol", "x"], false),
+            (&["a.rs", "b.rs", "--symbol", "x"], false),
+            (&["a.rs", "--symbol", "x", "--tokens", "10"], false),
+            (&["a.rs", "--symbol", "x", "--mode", "structure"], true),
+            (&["a.rs", "--symbol", "x", "--mode", "pseudo"], true),
+        ];
+        for (argv, mode_given) in refused {
+            let error = validate_symbol_args(&symbol_args(argv), *mode_given)
+                .expect_err(&format!("{argv:?} must be refused"));
+            let exit = error
+                .downcast_ref::<symbol::SymbolError>()
+                .map(symbol::SymbolError::exit_code);
+            assert_eq!(exit, Some(2), "{argv:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn validate_symbol_args_lets_a_plain_symbol_read_through() {
+        // The default mode is `structure`; only a typed --mode can conflict.
+        let accepted: &[(&[&str], bool)] = &[
+            (&["a.rs", "--symbol", "x"], false),
+            (&["a.rs", "--symbol", "x", "--mode", "full"], true),
+            (&["a.rs", "--symbol", "x", "--max-lines", "5", "-n"], false),
+            (&["a.rs", "b.rs"], false),
+            (&["a.rs", "--tokens", "10"], false),
+        ];
+        for (argv, mode_given) in accepted {
+            assert!(
+                validate_symbol_args(&symbol_args(argv), *mode_given).is_ok(),
+                "{argv:?}"
             );
         }
     }

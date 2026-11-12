@@ -539,3 +539,233 @@ fn test_cache_stats_computed_on_hit_when_missing() {
         .success()
         .stderr(predicate::str::contains("[skim]"));
 }
+
+// ============================================================================
+// `--symbol` cache identity (issue 540, PR 2)
+// ============================================================================
+//
+// A symbol read caches the selected lines, so its cache key must name the
+// symbol: a key that did not would serve the output of `--symbol a` to a read
+// of `--symbol b`, or the whole file to either. The key itself is pinned byte
+// for byte in `cache.rs`; these tests pin what a reader of the CLI sees.
+
+/// Two functions that a symbol read can tell apart, and a whole-file read too.
+const TWO_FUNCTIONS: &str = "fn a() -> u32 {\n    1\n}\n\nfn b() -> u32 {\n    2\n}\n";
+
+/// Output of one run: the bytes the reader sees on each stream.
+#[derive(Debug, PartialEq, Eq)]
+struct Streams {
+    stdout: String,
+    stderr: String,
+}
+
+/// A sandboxed home that holds `name` with `source`. Its parser cache is
+/// `<home>/.cache/skim`, which no other test shares.
+fn symbol_home(name: &str, source: &str) -> TempDir {
+    let home = TempDir::new().unwrap();
+    fs::write(home.path().join(name), source).unwrap();
+    home
+}
+
+/// Run `skim <args>` in the sandbox of `home`; the run must succeed.
+fn read_ok(home: &TempDir, args: &[&str]) -> Streams {
+    let output = common::skim_sandboxed(home.path())
+        .args(args)
+        .output()
+        .expect("skim must start");
+    assert!(
+        output.status.success(),
+        "skim {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Streams {
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+    }
+}
+
+/// The parser-cache entries (`<key>.json`) of the sandbox of `home`.
+fn cache_entries(home: &TempDir) -> Vec<std::path::PathBuf> {
+    let cache_dir = common::sandbox_var_path(home.path(), ".cache/skim");
+    let Ok(listing) = fs::read_dir(cache_dir) else {
+        return Vec::new();
+    };
+    listing
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect()
+}
+
+/// Change the stored entry whose `content` is the stdout of `cold`.
+///
+/// A warm read that equals its cold read proves nothing: a cache miss prints
+/// the same bytes. After `edit` changes the stored entry, a warm read shows
+/// whether it was served from that entry or ran cold again.
+fn edit_entry_of(home: &TempDir, cold: &Streams, edit: impl FnOnce(&mut serde_json::Value)) {
+    let load = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let entry_path = cache_entries(home)
+        .into_iter()
+        .find(|path| load(path)["content"] == cold.stdout.as_str())
+        .expect("the cold read wrote an entry that holds its stdout");
+    let mut entry = load(&entry_path);
+    edit(&mut entry);
+    fs::write(&entry_path, entry.to_string()).unwrap();
+}
+
+/// Replace the stored lines of the entry that holds the stdout of `cold`.
+fn replace_stored_lines(home: &TempDir, cold: &Streams, stored: &str) {
+    edit_entry_of(home, cold, |entry| {
+        entry["content"] = serde_json::Value::from(stored);
+    });
+}
+
+#[test]
+fn a_full_read_and_two_symbol_reads_of_one_file_keep_three_different_cached_outputs() {
+    // TP-41
+    let home = symbol_home("two.rs", TWO_FUNCTIONS);
+    let full = ["two.rs", "--mode", "full"];
+    let only_a = ["two.rs", "--symbol", "a"];
+    let only_b = ["two.rs", "--symbol", "b"];
+
+    // Cold: nothing is cached yet.
+    let cold_full = read_ok(&home, &full);
+    let cold_a = read_ok(&home, &only_a);
+    let cold_b = read_ok(&home, &only_b);
+
+    assert_eq!(cold_full.stdout, TWO_FUNCTIONS);
+    assert_eq!(cold_a.stdout, "fn a() -> u32 {\n    1\n}\n");
+    assert_eq!(cold_b.stdout, "fn b() -> u32 {\n    2\n}\n");
+    assert_eq!(
+        cache_entries(&home).len(),
+        3,
+        "a full read, --symbol a and --symbol b each own one entry"
+    );
+
+    // Give each entry its own stored text. A warm read prints the text of the
+    // entry of its own key, and the notice that the entry kept: a read that
+    // ran cold would print the source lines instead.
+    replace_stored_lines(&home, &cold_full, "stored: whole file\n");
+    replace_stored_lines(&home, &cold_a, "stored: a\n");
+    replace_stored_lines(&home, &cold_b, "stored: b\n");
+
+    // Warm, in the opposite order of the cold reads.
+    let warm_b = read_ok(&home, &only_b);
+    let warm_a = read_ok(&home, &only_a);
+    let warm_full = read_ok(&home, &full);
+
+    assert_eq!(warm_b.stdout, "stored: b\n");
+    assert_eq!(warm_b.stderr, cold_b.stderr);
+    assert_eq!(warm_a.stdout, "stored: a\n");
+    assert_eq!(warm_a.stderr, cold_a.stderr);
+    assert_eq!(warm_full.stdout, "stored: whole file\n");
+    assert_eq!(warm_full.stderr, cold_full.stderr);
+    assert_eq!(cache_entries(&home).len(), 3, "a warm read adds no entry");
+}
+
+#[test]
+fn a_warm_symbol_read_is_served_from_the_entry_of_its_own_name() {
+    // TP-41
+    let home = symbol_home("two.rs", TWO_FUNCTIONS);
+    let cold_a = read_ok(&home, &["two.rs", "--symbol", "a"]);
+    let cold_b = read_ok(&home, &["two.rs", "--symbol", "b"]);
+
+    // Replace the stored lines of the entry of `a` with a marker text. A warm
+    // read of `a` must print it, and a warm read of `b` must not.
+    replace_stored_lines(&home, &cold_a, "stored lines of a\n");
+
+    let warm_a = read_ok(&home, &["two.rs", "--symbol", "a"]);
+    let warm_b = read_ok(&home, &["two.rs", "--symbol", "b"]);
+
+    assert_eq!(warm_a.stdout, "stored lines of a\n");
+    assert_eq!(
+        warm_a.stderr, cold_a.stderr,
+        "the stderr notice is stored with the entry and printed again"
+    );
+    assert_eq!(warm_b, cold_b);
+}
+
+#[test]
+fn a_stored_symbol_entry_without_a_notice_is_not_served() {
+    // TP-41 (the notice is unconditional, so an entry that lost it is a miss)
+    let home = symbol_home("two.rs", TWO_FUNCTIONS);
+    let cold = read_ok(&home, &["two.rs", "--symbol", "a"]);
+    assert!(
+        !cold.stderr.is_empty(),
+        "a symbol read prints a notice, or this test proves nothing"
+    );
+
+    // Drop the notice from the entry and change its lines, so a read that
+    // served the entry anyway would show it on stdout and print no notice.
+    edit_entry_of(&home, &cold, |entry| {
+        entry
+            .as_object_mut()
+            .expect("an entry is a JSON object")
+            .remove("notice")
+            .expect("the cold read stored its notice");
+        entry["content"] = serde_json::Value::from("stored lines of a\n");
+    });
+
+    let warm = read_ok(&home, &["two.rs", "--symbol", "a"]);
+
+    assert_eq!(
+        warm, cold,
+        "the read runs cold: the source lines and the notice are printed again"
+    );
+}
+
+#[test]
+fn a_warm_read_of_several_declarations_prints_the_same_headers_and_notice() {
+    // TP-41 (the notice of a multi-match read is cached with its entry)
+    let source = "fn dup() -> u32 {\n    1\n}\n\nfn dup(x: u32) -> u32 {\n    x\n}\n";
+    let home = symbol_home("dup.rs", source);
+
+    let cold = read_ok(&home, &["dup.rs", "--symbol", "dup"]);
+
+    assert!(
+        cold.stdout.starts_with("==> dup.rs:1-3 dup (1 of 2) <==\n"),
+        "stdout: {}",
+        cold.stdout
+    );
+    assert_eq!(
+        cold.stderr,
+        "[skim] --symbol \"dup\": 2 declarations, 6 of 7 lines shown (1 not shown) \
+         — omit --symbol for the whole file\n"
+    );
+
+    // Change one stored body line. Only a read served from the entry prints it,
+    // and it keeps the stored headers and the stored notice.
+    let stored = cold.stdout.replacen("    1\n", "    stored\n", 1);
+    assert_ne!(stored, cold.stdout, "the edit must change the stored lines");
+    replace_stored_lines(&home, &cold, &stored);
+
+    let warm = read_ok(&home, &["dup.rs", "--symbol", "dup"]);
+
+    assert_eq!(warm.stdout, stored);
+    assert_eq!(warm.stderr, cold.stderr);
+}
+
+#[test]
+fn a_symbol_read_that_fails_leaves_no_cache_entry() {
+    // TP-41 (a refusal must not be replayed as if it were a result)
+    let home = symbol_home("two.rs", TWO_FUNCTIONS);
+    fs::write(home.path().join("notes.md"), "# Notes\n").unwrap();
+
+    for args in [
+        ["two.rs", "--symbol", "missing"],
+        ["notes.md", "--symbol", "a"],
+    ] {
+        let output = common::skim_sandboxed(home.path())
+            .args(args)
+            .output()
+            .expect("skim must start");
+        assert!(!output.status.success(), "skim {args:?} must fail");
+    }
+
+    assert!(
+        cache_entries(&home).is_empty(),
+        "a failed symbol read stores nothing: {:?}",
+        cache_entries(&home)
+    );
+}
