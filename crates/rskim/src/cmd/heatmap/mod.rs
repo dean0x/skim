@@ -32,7 +32,7 @@ use git_source::{CliGitSource, GitDataSource};
 use insights::{build_insights_result, compute_insights};
 use metrics::{
     CouplingResult, ModuleRoots, compute_authors, compute_churn, compute_coupling,
-    compute_encapsulation, compute_fix_after_touch, compute_stability, module_of,
+    compute_encapsulation, compute_fix_after_touch, compute_stability, module_of, without_quotes,
 };
 use noise::{COUPLING_MAX_FILES, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS};
 use output::{
@@ -103,31 +103,13 @@ fn resolve_diff_files(
             Ok(Some(ExitCode::FAILURE))
         }
         Ok(files) => {
-            // Detect deleted files for annotation. git diff output is repo-root-relative,
-            // so resolve paths against the repo root to avoid cwd-dependent failures.
+            // git diff output is repo-root-relative, so resolve paths against
+            // the repo root to avoid cwd-dependent failures. The warning gates
+            // nothing: `args.diff_files` still receives the full diff list, and
+            // apply_file_scope filters the output by set intersection.
             let root = git_source.get_repo_root().unwrap_or_default();
-            for f in &files {
-                // Containment guard — skip any git-diff path that is
-                // absolute or escapes root via `..` or a drive-relative prefix.
-                // Delegates to the canonical shared guard (`super::is_repo_relative_safe`)
-                // so this site stays consistent with `walk::list_tracked_files` and
-                // `temporal_build::rel_is_regular_file`.
-                if !super::is_repo_relative_safe(std::path::Path::new(f.as_str())) {
-                    continue;
-                }
-                let abs = std::path::Path::new(&root).join(f);
-                // AD-408-2 (OD2, 2026-07-17): use is_file() not exists() so that a
-                // path now occupied by a directory or dangling symlink triggers the
-                // warning below, just as a genuinely deleted path does.
-                // NOTE: this gates only the warning; `args.diff_files` still receives
-                // the full diff list.  Actual output filtering happens downstream in
-                // apply_file_scope via set intersection.
-                if !abs.is_file() {
-                    eprintln!(
-                        "skim heatmap: warning: '{}' is not a regular file on current branch",
-                        f
-                    );
-                }
+            if let Some(warning) = diff_not_file_warning(std::path::Path::new(&root), &files) {
+                eprintln!("skim heatmap: warning: {warning}");
             }
             args.diff_files = files;
             Ok(None)
@@ -137,6 +119,97 @@ fn resolve_diff_files(
             Ok(Some(ExitCode::FAILURE))
         }
     }
+}
+
+/// One warning for the `--diff` paths that are not regular files under
+/// `root`, or `None` when each one is. It names the first
+/// [`WARNING_NAMES`] in diff order, as git wrote them, and counts the
+/// others. A large diff thus adds one line, not one per path.
+///
+/// It tests `is_file()`, not `exists()`, so a path that is now a folder or a
+/// dangling link gets the warning, as a deleted path does. A path that is
+/// absolute or goes out of `root` (`..`, a drive prefix) is not tested: the
+/// shared containment rule of `super::is_repo_relative_safe` applies, as for
+/// `walk::list_tracked_files` and `temporal_build::rel_is_regular_file`.
+fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<String> {
+    let not_files: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|f| {
+            disk_path(f)
+                .is_some_and(|rel| super::is_repo_relative_safe(&rel) && !root.join(&rel).is_file())
+        })
+        .collect();
+    match not_files.as_slice() {
+        [] => None,
+        [only] => Some(format!("'{only}' is not a regular file on current branch")),
+        _ => Some(format!(
+            "{} changed paths are not regular files on current branch: {}",
+            not_files.len(),
+            named_paths(&not_files)
+        )),
+    }
+}
+
+/// A path from git output as the relative path to test on disk, or `None`
+/// when its quoted form does not decode. git writes a name with unusual
+/// bytes in double quotes, with C escapes and 3-digit octal escapes (the
+/// form of `card::git_quoted`); a test on the quoted text would name no file.
+fn disk_path(path: &str) -> Option<std::path::PathBuf> {
+    let (inner, quoted) = without_quotes(path);
+    if !quoted {
+        return Some(std::path::PathBuf::from(path));
+    }
+    path_from_bytes(c_unescaped(inner)?)
+}
+
+/// The bytes of the text inside git's quotes, or `None` for an escape that
+/// git does not write. Each pass reads at least one byte, so the loop ends
+/// after at most `inner.len()` passes.
+fn c_unescaped(inner: &str) -> Option<Vec<u8>> {
+    let mut rest = inner.bytes();
+    let mut out = Vec::with_capacity(inner.len());
+    while let Some(b) = rest.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        let byte = match rest.next()? {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'"' => b'"',
+            b'\\' => b'\\',
+            // Three octal digits, the first 0-3, so the value fits in a byte.
+            first @ b'0'..=b'3' => {
+                let mut value = first - b'0';
+                for _ in 0..2 {
+                    let digit = rest.next().filter(|d| (b'0'..=b'7').contains(d))?;
+                    value = value * 8 + (digit - b'0');
+                }
+                value
+            }
+            _ => return None,
+        };
+        out.push(byte);
+    }
+    Some(out)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(std::ffi::OsString::from_vec(bytes).into())
+}
+
+/// Off Unix a path is text: bytes that are not UTF-8 name no file.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
+    String::from_utf8(bytes).ok().map(Into::into)
 }
 
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
@@ -493,13 +566,30 @@ fn record_heatmap_analytics(
 // File-scope display filter (Step 5-alt)
 // ============================================================================
 
-/// Names in the warning about `--diff` files that are not in the window's
-/// history. The warning counts the files that it does not name.
-const MISSING_TARGET_NAMES: usize = 3;
+/// Names in a counted warning about `--diff` paths. The warning counts the
+/// paths that it does not name.
+const WARNING_NAMES: usize = 3;
+
+/// The first [`WARNING_NAMES`] of `names` in single quotes, then
+/// `" and N more"` for the others.
+fn named_paths(names: &[&str]) -> String {
+    let shown: Vec<String> = names
+        .iter()
+        .take(WARNING_NAMES)
+        .map(|name| format!("'{name}'"))
+        .collect();
+    let unnamed = names.len().saturating_sub(WARNING_NAMES);
+    let rest = if unnamed > 0 {
+        format!(" and {unnamed} more")
+    } else {
+        String::new()
+    };
+    format!("{}{rest}", shown.join(", "))
+}
 
 /// Add one warning for the `--diff` files that are not in the window's
 /// history. It counts each missing file once and names the first
-/// [`MISSING_TARGET_NAMES`] in argument order (a set order would change
+/// [`WARNING_NAMES`] in argument order (a set order would change
 /// between runs). A large diff thus adds one warning, not one per file.
 fn warn_missing_targets(result: &mut HeatmapResult, files: &[String]) {
     use std::collections::HashSet;
@@ -514,24 +604,11 @@ fn warn_missing_targets(result: &mut HeatmapResult, files: &[String]) {
     let warning = match missing.as_slice() {
         [] => return,
         [only] => format!("targeted file '{only}' not found in git history"),
-        _ => {
-            let names: Vec<String> = missing
-                .iter()
-                .take(MISSING_TARGET_NAMES)
-                .map(|name| format!("'{name}'"))
-                .collect();
-            let unnamed = missing.len().saturating_sub(MISSING_TARGET_NAMES);
-            let rest = if unnamed > 0 {
-                format!(" and {unnamed} more")
-            } else {
-                String::new()
-            };
-            format!(
-                "{} targeted files not found in git history: {}{rest}",
-                missing.len(),
-                names.join(", ")
-            )
-        }
+        _ => format!(
+            "{} targeted files not found in git history: {}",
+            missing.len(),
+            named_paths(&missing)
+        ),
     };
     result.warnings.push(warning);
 }
@@ -856,11 +933,11 @@ mod tests {
     #[test]
     fn test_warn_missing_targets_names_the_missing_diff_file() {
         let mut result = make_test_result();
+        result.warnings.clear();
         warn_missing_targets(&mut result, &["nonexistent.rs".to_string()]);
-        assert!(
-            result.warnings.iter().any(|w| {
-                w.contains("nonexistent.rs") && w.contains("not found in git history")
-            })
+        assert_eq!(
+            result.warnings,
+            ["targeted file 'nonexistent.rs' not found in git history"]
         );
     }
 
@@ -896,6 +973,117 @@ mod tests {
         let present: Vec<String> = result.files.iter().map(|f| f.path.clone()).collect();
         warn_missing_targets(&mut result, &present);
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    // -----------------------------------------------------------------------
+    // --diff paths that are not regular files
+    // -----------------------------------------------------------------------
+
+    /// A root with the regular files `kept.rs` and `docs/café.md`.
+    fn diff_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("kept.rs"), "").expect("write kept.rs");
+        std::fs::create_dir(dir.path().join("docs")).expect("create docs");
+        std::fs::write(dir.path().join("docs/caf\u{e9}.md"), "").expect("write docs file");
+        dir
+    }
+
+    fn strings(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn test_diff_not_file_warning_counts_the_paths_in_one_line() {
+        let root = diff_root();
+        let files = strings(&["kept.rs", "a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]);
+        assert_eq!(
+            diff_not_file_warning(root.path(), &files).as_deref(),
+            Some(
+                "5 changed paths are not regular files on current branch: 'a.rs', 'b.rs', 'c.rs' and 2 more"
+            )
+        );
+    }
+
+    #[test]
+    fn test_diff_not_file_warning_names_all_of_a_few_paths() {
+        let root = diff_root();
+        let files = strings(&["a.rs", "kept.rs", "docs"]);
+        assert_eq!(
+            diff_not_file_warning(root.path(), &files).as_deref(),
+            Some("2 changed paths are not regular files on current branch: 'a.rs', 'docs'")
+        );
+    }
+
+    #[test]
+    fn test_diff_not_file_warning_names_one_path_alone() {
+        let root = diff_root();
+        let files = strings(&["kept.rs", "gone.rs"]);
+        assert_eq!(
+            diff_not_file_warning(root.path(), &files).as_deref(),
+            Some("'gone.rs' is not a regular file on current branch")
+        );
+    }
+
+    #[test]
+    fn test_diff_not_file_warning_finds_a_quoted_path_on_disk() {
+        let root = diff_root();
+        let quoted = card::git_quoted("docs/caf\u{e9}.md", true);
+        assert_eq!(quoted, r#""docs/caf\303\251.md""#);
+        assert_eq!(
+            diff_not_file_warning(root.path(), &[quoted, "kept.rs".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_diff_not_file_warning_names_a_quoted_path_as_git_wrote_it() {
+        let root = diff_root();
+        let files = strings(&[r#""docs/gon\303\251.md""#]);
+        assert_eq!(
+            diff_not_file_warning(root.path(), &files).as_deref(),
+            Some(r#"'"docs/gon\303\251.md"' is not a regular file on current branch"#)
+        );
+    }
+
+    #[test]
+    fn test_diff_not_file_warning_skips_a_path_outside_the_root() {
+        let root = diff_root();
+        let files = strings(&["../outside.rs", r#""../caf\303\251.rs""#, "/etc/none.rs"]);
+        assert_eq!(diff_not_file_warning(root.path(), &files), None);
+    }
+
+    #[test]
+    fn test_disk_path_decodes_each_escape_that_git_writes() {
+        let paths = [
+            "plain.rs",
+            "a\tb\nc\rd.rs",
+            "bell\u{7}back\u{8}vt\u{b}ff\u{c}.rs",
+            r#"say "hi".rs"#,
+            r"back\slash.rs",
+            "caf\u{e9}/\u{65e5}.rs",
+            "del\u{7f}\u{1}.rs",
+        ];
+        for path in paths {
+            let quoted = card::git_quoted(path, true);
+            assert_eq!(
+                disk_path(&quoted),
+                Some(std::path::PathBuf::from(path)),
+                "{quoted}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_disk_path_refuses_an_escape_that_git_does_not_write() {
+        for quoted in [
+            r#""a\qb""#,
+            r#""a\""#,
+            r#""a\3""#,
+            r#""a\400""#,
+            r#""a\08x""#,
+        ] {
+            assert_eq!(disk_path(quoted), None, "{quoted}");
+        }
     }
 
     #[test]
@@ -1059,7 +1247,7 @@ mod tests {
             match &self.tracked {
                 TrackedStub::Listed(paths) => Ok(Some(paths.clone())),
                 TrackedStub::Unavailable => Ok(None),
-                TrackedStub::Fails => Err(anyhow::anyhow!("simulated ls-files failure")),
+                TrackedStub::Fails => Err(anyhow::anyhow!("simulated ls-tree failure")),
             }
         }
         fn show_prefix(&self) -> anyhow::Result<String> {
@@ -1088,6 +1276,20 @@ mod tests {
             ]
         );
         assert_eq!(prepared.commits.len(), 1);
+    }
+
+    #[test]
+    fn test_prepare_commits_uses_the_singular_noun_for_one_malformed_record() {
+        let source = StubSource::with_malformed(1);
+        let prepared = prepare_commits(&source, HeatmapArgs::default())
+            .unwrap()
+            .expect("one good commit remains");
+        assert_eq!(
+            malformed_warnings(&prepared),
+            vec![
+                "Skipped 1 malformed git log record (bad hash or timestamp); their file changes are not counted."
+            ]
+        );
     }
 
     #[test]
@@ -1270,6 +1472,24 @@ mod tests {
         ]);
         assert_eq!(result.window_authors, 1);
         assert_eq!(result.fix_commits_total, 0);
+    }
+
+    #[test]
+    fn test_compute_heatmap_large_commit_warning_uses_the_plural_for_two() {
+        let names: Vec<String> = (0..=COUPLING_MAX_FILES)
+            .map(|i| format!("src/f{i}.rs"))
+            .collect();
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let result = result_of(vec![stub_commit(0, &files), stub_commit(1, &files)]);
+        let coupling: Vec<&String> = result
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("coupling:"))
+            .collect();
+        assert_eq!(
+            coupling,
+            ["coupling: 2 commits with more than 50 files not paired"]
+        );
     }
 
     #[test]
