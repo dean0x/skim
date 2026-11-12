@@ -525,3 +525,117 @@ id = "zod-ast-unhandled-result-typescript"
 pattern = "unhandled-result"
 lang = "typescript"
 precision = "ratchet"
+
+# --- frozen answers (#540): refs, clash, plain-word first files, stakes -----------
+#
+# Every site below comes from `git grep -nw <name>` at bbc68f99 and a hand read of
+# each hit line, with no skim output. The roles are def, call, ref, import,
+# comment, string and text. A [[refs]] entry lists every whole-word line of its
+# name, so its sites add up to the grep count.
+#
+# [[clash]] names have 2 or more definitions. Calls are not split by definition
+# (split = "none"), so every call is "unassigned".
+
+[[refs]]
+id = "zod-R01"
+query = "mergeDefs"
+def = { path = "packages/zod/src/v4/core/util.ts", line = 301 }
+sites = [
+    { path = "packages/zod/src/v4/classic/schemas.ts", line = 258, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 301, role = "def" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 313, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 610, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 639, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 677, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 691, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 705, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 732, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 777, role = "call" },
+]
+origin = "curated"
+
+[[refs]]
+id = "zod-R02"
+query = "shallowClone"
+def = { path = "packages/zod/src/v4/core/util.ts", line = 406 }
+sites = [
+    { path = "packages/zod/src/v4/classic/schemas.ts", line = 2228, role = "call" },
+    { path = "packages/zod/src/v4/classic/schemas.ts", line = 2258, role = "call" },
+    { path = "packages/zod/src/v4/classic/tests/index.test.ts", line = 862, role = "string" },
+    { path = "packages/zod/src/v4/classic/tests/index.test.ts", line = 864, role = "call" },
+    { path = "packages/zod/src/v4/classic/tests/index.test.ts", line = 880, role = "call" },
+    { path = "packages/zod/src/v4/core/api.ts", line = 1478, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 406, role = "def" },
+    { path = "packages/zod/src/v4/mini/schemas.ts", line = 1483, role = "call" },
+    { path = "packages/zod/src/v4/mini/schemas.ts", line = 1509, role = "call" },
+]
+origin = "curated"
+
+[[refs]]
+id = "zod-R03"
+query = "escapeRegex"
+def = { path = "packages/zod/src/v4/core/util.ts", line = 488 }
+sites = [
+    { path = "packages/zod/src/v4/core/checks.ts", line = 969, role = "call" },
+    { path = "packages/zod/src/v4/core/checks.ts", line = 1014, role = "call" },
+    { path = "packages/zod/src/v4/core/checks.ts", line = 1058, role = "call" },
+    { path = "packages/zod/src/v4/core/regexes.ts", line = 70, role = "call" },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 3230, role = "call" },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 3287, role = "call" },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 3337, role = "comment" },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 4309, role = "call" },
+    { path = "packages/zod/src/v4/core/util.ts", line = 488, role = "def" },
+]
+origin = "curated"
+
+[[clash]]
+id = "zod-D01"
+query = "mergeValues"
+defs = [
+    { path = "packages/zod/src/v3/types.ts", line = 3241 },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 2495 },
+]
+calls = [
+    { path = "packages/zod/src/v3/types.ts", line = 3253, def = "unassigned" },
+    { path = "packages/zod/src/v3/types.ts", line = 3270, def = "unassigned" },
+    { path = "packages/zod/src/v3/types.ts", line = 3302, def = "unassigned" },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 2514, def = "unassigned" },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 2535, def = "unassigned" },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 2589, def = "unassigned" },
+]
+split = "none"
+origin = "curated"
+
+# Plain-word queries with the files that hold the answer. The relevance regex was
+# written from the source before any skim run.
+[[concept]]
+id = "zod-C07"
+query = "json schema"
+relevant = '(?i)json[_\s-]*schema'
+first = [
+    "packages/zod/src/v4/core/json-schema-processors.ts",
+    "packages/zod/src/v4/core/to-json-schema.ts",
+]
+
+[[concept]]
+id = "zod-C08"
+query = "flatten error"
+relevant = '(?i)flatten[_\s-]*error'
+first = ["packages/zod/src/v4/core/errors.ts"]
+
+# --- stakes: exit codes of a plain-text search (no flag) ----------------------------
+# A literal that no tracked file holds exits 1; a literal that a tracked file holds
+# exits 0 (the exit codes of rg).
+[[stakes]]
+id = "zod-Q01"
+query = "qzvx_absent_7713"
+flags = []
+expect = "exit"
+exit = 1
+
+[[stakes]]
+id = "zod-Q02"
+query = "exactOptional"
+flags = []
+expect = "exit"
+exit = 0

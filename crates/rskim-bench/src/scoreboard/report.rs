@@ -23,7 +23,9 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::baseline::Baseline;
-use crate::scoreboard::metrics::{self, Beat, ConceptSample, IdentSample, RatchetChange};
+use crate::scoreboard::metrics::{
+    self, Beat, ConceptSample, IdentSample, RatchetChange, RefsSample,
+};
 use crate::scoreboard::structural_metrics::{
     CoverageComparison, StructuralSample, UncoveredCause, UncoveredPattern,
 };
@@ -169,7 +171,7 @@ pub struct CheckRecord {
 }
 
 /// INFO about one corpus (deterministic, never gated).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorpusInfo {
     /// The oracle's per-reason skip breakdown, walk-phase reasons included.
@@ -182,6 +184,15 @@ pub struct CorpusInfo {
     pub idents: Vec<IdentSample>,
     /// Per-query measurements behind the `concept.*` / `bytes.*` ratchets.
     pub concepts: Vec<ConceptSample>,
+    /// Per-query measurements of the `[[refs]]` entries behind the
+    /// `refs.call_precision` ratchet, in golden order (#540).
+    #[serde(default)]
+    pub refs: Vec<RefsSample>,
+    /// The reference rows (#540): the byte columns of the `rg -nw`
+    /// simulation, by name ([`metrics::reference_values`]). They are INFO:
+    /// no baseline holds them and no gate reads them.
+    #[serde(default)]
+    pub reference: BTreeMap<String, f64>,
 }
 
 /// Cross-corpus aggregates.
@@ -486,6 +497,7 @@ pub fn render_markdown(report: &Report, baseline: Option<&Baseline>) -> String {
                 .and_then(|b| b.corpora.get(&c.name))
                 .map(|b| &b.ratchet),
         );
+        reference_table(&mut md, &c.info.reference);
         structural_table(&mut md, &c.structural);
     }
     uncovered_section(&mut md, &report.uncovered_patterns);
@@ -552,6 +564,22 @@ fn ratchet_table(
             base.map_or_else(|| "—".to_string(), fmt_value),
             metrics::beats_baseline(name, current).map_or("—", Beat::as_str)
         );
+    }
+    md.push('\n');
+}
+
+/// One corpus's reference rows (INFO): the `rg -nw` byte columns. They have
+/// no bar, no baseline and no status, because nothing gates on them. Nothing
+/// is written for a corpus with no reference row.
+fn reference_table(md: &mut String, reference: &BTreeMap<String, f64>) {
+    if reference.is_empty() {
+        return;
+    }
+    let _ = writeln!(md, "### Reference (INFO, never gated)\n");
+    let _ = writeln!(md, "| row | value |");
+    let _ = writeln!(md, "|---|---|");
+    for (name, value) in reference {
+        let _ = writeln!(md, "| `{name}` | {} |", fmt_value(*value));
     }
     md.push('\n');
 }
@@ -726,12 +754,7 @@ mod tests {
                 ("ident.mrr.baseline_alpha".to_string(), 0.5),
             ]),
             structural: StructuralReport::default(),
-            info: CorpusInfo {
-                oracle_skipped_by_reason: BTreeMap::new(),
-                unindexed_hits: BTreeMap::new(),
-                idents: Vec::new(),
-                concepts: Vec::new(),
-            },
+            info: CorpusInfo::default(),
         };
         Report {
             schema: REPORT_SCHEMA,
@@ -919,6 +942,68 @@ mod tests {
             .remove("structural");
         let parsed = Report::parse(&json.to_string()).unwrap();
         assert_eq!(parsed, minimal_report());
+    }
+
+    /// `minimal_report` with the #540 INFO records filled.
+    fn report_with_info_records() -> Report {
+        let mut r = minimal_report();
+        r.corpora[0].info.refs = vec![
+            RefsSample {
+                id: "skim-R01".to_string(),
+                call_precision: Some(0.75),
+            },
+            RefsSample {
+                id: "skim-R02".to_string(),
+                call_precision: None,
+            },
+        ];
+        r.corpora[0].info.reference = BTreeMap::from([
+            ("bytes.rgw_first_correct_median".to_string(), 120.0),
+            ("bytes.rgw_text_median".to_string(), 3400.0),
+        ]);
+        r
+    }
+
+    #[test]
+    fn the_info_section_carries_the_rg_word_reference_rows_and_the_refs_samples() {
+        let json = report_with_info_records().to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let info = &v["corpora"][0]["info"];
+        assert_eq!(info["reference"]["bytes.rgw_text_median"], 3400.0);
+        assert_eq!(info["reference"]["bytes.rgw_first_correct_median"], 120.0);
+        assert_eq!(info["refs"][0]["id"], "skim-R01");
+        assert_eq!(info["refs"][0]["call_precision"], 0.75);
+        assert!(info["refs"][1]["call_precision"].is_null());
+        // INFO rows are not RATCHET values.
+        let ratchet = v["corpora"][0]["ratchet"].as_object().unwrap();
+        assert!(ratchet.keys().all(|k| !k.contains("rgw")), "{ratchet:?}");
+        // The same bytes every run, and a lossless round trip.
+        assert_eq!(report_with_info_records().to_json().unwrap(), json);
+        assert_eq!(Report::parse(&json).unwrap(), report_with_info_records());
+    }
+
+    #[test]
+    fn a_report_from_before_the_info_records_still_parses() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&minimal_report().to_json().unwrap()).unwrap();
+        let info = json["corpora"][0]["info"].as_object_mut().unwrap();
+        info.remove("refs");
+        info.remove("reference");
+        assert_eq!(Report::parse(&json.to_string()).unwrap(), minimal_report());
+    }
+
+    #[test]
+    fn markdown_lists_the_reference_rows_as_info_that_never_gates() {
+        let md = render_markdown(&report_with_info_records(), None);
+        assert!(md.contains("Reference (INFO, never gated)"), "{md}");
+        let row = md
+            .lines()
+            .find(|l| l.starts_with("| `bytes.rgw_text_median` "))
+            .expect("the row is in the reference table");
+        assert!(row.contains("3400"), "{row}");
+        assert!(!row.contains("bless"), "{row}");
+        // A corpus with no reference row has no such table.
+        assert!(!render_markdown(&minimal_report(), None).contains("Reference (INFO"));
     }
 
     #[test]

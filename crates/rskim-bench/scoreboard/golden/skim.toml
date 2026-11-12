@@ -618,3 +618,182 @@ id = "skim-ast-unhandled-result-typescript"
 pattern = "unhandled-result"
 lang = "typescript"
 precision = "ratchet"
+
+# --- frozen answers (#540): refs, clash, plain-word first files, stakes -----------
+#
+# Every site below comes from `git grep -nw <name>` at b8a0a79 and a hand read of
+# each hit line, with no skim output. The roles are def, call, ref, import,
+# comment, string and text (a markdown file is text). A [[refs]] entry lists every
+# whole-word line of its name, so its sites add up to the grep count. A call
+# inside a macro argument list (the assert_eq! lines of skim-R02) is a call.
+# skim-R01 and skim-R02 re-pin the callers-1 and callers-2 queries of the earlier
+# hand-made skim query set to this commit.
+#
+# [[clash]] names have 2 or more definitions. Calls are not split by definition
+# (split = "none"), so every call is "unassigned".
+
+[[refs]]
+id = "skim-R01"
+query = "is_passthrough_mode"
+def = { path = "crates/rskim/src/cmd/mod.rs", line = 286 }
+sites = [
+    { path = ".devflow/features/build-parsers/KNOWLEDGE.md", line = 161, role = "text" },
+    { path = ".devflow/features/build-parsers/KNOWLEDGE.md", line = 542, role = "text" },
+    { path = ".devflow/features/file-wrapper-fidelity/KNOWLEDGE.md", line = 172, role = "text" },
+    { path = "CHANGELOG.md", line = 1347, role = "text" },
+    { path = "CHANGELOG.md", line = 1434, role = "text" },
+    { path = "crates/rskim/src/cmd/dispatch.rs", line = 1194, role = "call" },
+    { path = "crates/rskim/src/cmd/dispatch.rs", line = 1237, role = "call" },
+    { path = "crates/rskim/src/cmd/execution.rs", line = 381, role = "import" },
+    { path = "crates/rskim/src/cmd/execution.rs", line = 1032, role = "call" },
+    { path = "crates/rskim/src/cmd/file/mod.rs", line = 232, role = "call" },
+    { path = "crates/rskim/src/cmd/log.rs", line = 83, role = "call" },
+    { path = "crates/rskim/src/cmd/mod.rs", line = 286, role = "def" },
+    { path = "crates/rskim/src/cmd/mod.rs", line = 333, role = "comment" },
+    { path = "crates/rskim/src/cmd/proxy.rs", line = 215, role = "call" },
+    { path = "crates/rskim/src/cmd/rewrite/hook.rs", line = 321, role = "call" },
+    { path = "crates/rskim/src/cmd/test/go.rs", line = 36, role = "call" },
+    { path = "crates/rskim/src/cmd/test/pytest.rs", line = 51, role = "call" },
+    { path = "crates/rskim/src/cmd/test/shared.rs", line = 134, role = "call" },
+    { path = "crates/rskim/src/main.rs", line = 600, role = "comment" },
+    { path = "crates/rskim/src/main.rs", line = 1241, role = "call" },
+    { path = "crates/rskim/tests/cli_passthrough_coverage.rs", line = 195, role = "comment" },
+    { path = "crates/rskim/tests/cli_passthrough_coverage.rs", line = 303, role = "comment" },
+    { path = "crates/rskim/tests/cli_passthrough_coverage.rs", line = 356, role = "comment" },
+]
+origin = "curated"
+
+[[refs]]
+id = "skim-R02"
+query = "strip_ansi"
+def = { path = "crates/rskim/src/output/mod.rs", line = 250 }
+sites = [
+    { path = ".devflow/docs/reviews/fix-agent-reported-batch-2/2026-07-25_1722/resolution-summary.md", line = 111, role = "text" },
+    { path = "CHANGELOG.md", line = 796, role = "text" },
+    { path = "CHANGELOG.md", line = 797, role = "text" },
+    { path = "CHANGELOG.md", line = 803, role = "text" },
+    { path = "CHANGELOG.md", line = 807, role = "text" },
+    { path = "crates/rskim/src/cmd/build/mod.rs", line = 179, role = "call" },
+    { path = "crates/rskim/src/cmd/build/mod.rs", line = 180, role = "call" },
+    { path = "crates/rskim/src/cmd/git/commit.rs", line = 32, role = "import" },
+    { path = "crates/rskim/src/cmd/git/commit.rs", line = 93, role = "call" },
+    { path = "crates/rskim/src/cmd/git/push.rs", line = 38, role = "import" },
+    { path = "crates/rskim/src/cmd/git/push.rs", line = 110, role = "call" },
+    { path = "crates/rskim/src/cmd/git/status.rs", line = 158, role = "call" },
+    { path = "crates/rskim/src/cmd/infra/gh/pr_checks.rs", line = 41, role = "import" },
+    { path = "crates/rskim/src/cmd/infra/gh/pr_checks.rs", line = 190, role = "comment" },
+    { path = "crates/rskim/src/cmd/infra/gh/pr_checks.rs", line = 193, role = "call" },
+    { path = "crates/rskim/src/cmd/infra/gh/pr_checks.rs", line = 211, role = "comment" },
+    { path = "crates/rskim/src/cmd/infra/gh/pr_checks.rs", line = 213, role = "call" },
+    { path = "crates/rskim/src/cmd/infra/gh/pr_checks.rs", line = 462, role = "comment" },
+    { path = "crates/rskim/src/cmd/infra/gh/pr_checks.rs", line = 485, role = "comment" },
+    { path = "crates/rskim/src/cmd/infra/gh/run_watch.rs", line = 30, role = "comment" },
+    { path = "crates/rskim/src/cmd/infra/gh/run_watch.rs", line = 31, role = "comment" },
+    { path = "crates/rskim/src/cmd/infra/gh/streaming.rs", line = 88, role = "import" },
+    { path = "crates/rskim/src/cmd/infra/gh/streaming.rs", line = 363, role = "call" },
+    { path = "crates/rskim/src/cmd/infra/gh/streaming.rs", line = 493, role = "call" },
+    { path = "crates/rskim/src/cmd/infra/gh/streaming.rs", line = 526, role = "call" },
+    { path = "crates/rskim/src/cmd/test/pytest.rs", line = 29, role = "import" },
+    { path = "crates/rskim/src/cmd/test/pytest.rs", line = 80, role = "call" },
+    { path = "crates/rskim/src/cmd/test/shared.rs", line = 329, role = "call" },
+    { path = "crates/rskim/src/cmd/test/vitest.rs", line = 293, role = "call" },
+    { path = "crates/rskim/src/output/mod.rs", line = 250, role = "def" },
+    { path = "crates/rskim/src/output/mod.rs", line = 1471, role = "comment" },
+    { path = "crates/rskim/src/output/mod.rs", line = 1479, role = "call" },
+    { path = "crates/rskim/src/output/mod.rs", line = 1491, role = "call" },
+    { path = "crates/rskim/src/output/mod.rs", line = 1498, role = "call" },
+    { path = "crates/rskim/src/output/mod.rs", line = 1506, role = "call" },
+    { path = "crates/rskim/src/output/mod.rs", line = 1713, role = "call" },
+    { path = "crates/rskim/src/output/mod.rs", line = 1720, role = "call" },
+    { path = "crates/rskim/tests/cli_stdout_destination.rs", line = 103, role = "def" },
+    { path = "crates/rskim/tests/cli_stdout_destination.rs", line = 129, role = "call" },
+    { path = "crates/rskim/tests/cli_subcommand.rs", line = 16, role = "comment" },
+    { path = "crates/rskim/tests/cli_subcommand.rs", line = 19, role = "comment" },
+]
+origin = "curated"
+
+[[refs]]
+id = "skim-R03"
+query = "cache_root_from"
+def = { path = "crates/rskim/src/cache.rs", line = 39 }
+sites = [
+    { path = ".devflow/features/analytics/KNOWLEDGE.md", line = 75, role = "text" },
+    { path = ".devflow/features/analytics/KNOWLEDGE.md", line = 81, role = "text" },
+    { path = ".devflow/features/analytics/KNOWLEDGE.md", line = 146, role = "text" },
+    { path = ".devflow/features/analytics/KNOWLEDGE.md", line = 147, role = "text" },
+    { path = ".devflow/features/analytics/KNOWLEDGE.md", line = 157, role = "text" },
+    { path = "CHANGELOG.md", line = 1054, role = "text" },
+    { path = "CHANGELOG.md", line = 1055, role = "text" },
+    { path = "CHANGELOG.md", line = 1057, role = "text" },
+    { path = "crates/rskim/src/analytics/mod.rs", line = 412, role = "comment" },
+    { path = "crates/rskim/src/cache.rs", line = 12, role = "comment" },
+    { path = "crates/rskim/src/cache.rs", line = 39, role = "def" },
+    { path = "crates/rskim/src/cache.rs", line = 67, role = "comment" },
+    { path = "crates/rskim/src/cache.rs", line = 70, role = "comment" },
+    { path = "crates/rskim/src/cache.rs", line = 73, role = "call" },
+    { path = "crates/rskim/src/cmd/hook_log.rs", line = 44, role = "comment" },
+    { path = "crates/rskim/src/cmd/hook_log.rs", line = 48, role = "call" },
+]
+origin = "curated"
+
+[[clash]]
+id = "skim-D01"
+query = "run_parsed_command"
+defs = [
+    { path = "crates/rskim/src/cmd/build/mod.rs", line = 150 },
+    { path = "crates/rskim/src/cmd/git/mod.rs", line = 414 },
+]
+calls = [
+    { path = "crates/rskim/src/cmd/build/cargo.rs", line = 101, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/build/cargo.rs", line = 141, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/build/gradle.rs", line = 36, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/build/make.rs", line = 45, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/build/maven.rs", line = 35, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/build/tsc.rs", line = 36, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/git/commit.rs", line = 65, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/git/fetch.rs", line = 40, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/git/push.rs", line = 83, def = "unassigned" },
+    { path = "crates/rskim/src/cmd/git/status.rs", line = 163, def = "unassigned" },
+]
+split = "none"
+origin = "curated"
+
+# Plain-word queries with the files that hold the answer (meaning-1 and meaning-2
+# of the same query set, each file checked at b8a0a79). The relevance regex was
+# written from the source before any skim run.
+[[concept]]
+id = "skim-C08"
+query = "compressed output raw fallback"
+relevant = '(?i)guardrail|FidelityDecision|SavingsDecision|net[_\s-]*savings'
+first = [
+    "crates/rskim/src/output/guardrail.rs",
+    "crates/rskim/src/output/fidelity.rs",
+    "crates/rskim/src/cmd/execution.rs",
+    "crates/rskim/src/process.rs",
+]
+
+[[concept]]
+id = "skim-C09"
+query = "analytics schema migration"
+relevant = '(?i)analytics[^\n]{0,80}(migrat|user_version)|(migrat|user_version)[^\n]{0,80}analytics'
+first = [
+    "crates/rskim/src/analytics/schema.rs",
+    "crates/rskim/src/analytics/mod.rs",
+]
+
+# --- stakes: exit codes of a plain-text search (no flag) ----------------------------
+# A literal that no tracked file holds exits 1; a literal that a tracked file holds
+# exits 0 (the exit codes of rg).
+[[stakes]]
+id = "skim-Q01"
+query = "qzvx_absent_7713"
+flags = []
+expect = "exit"
+exit = 1
+
+[[stakes]]
+id = "skim-Q02"
+query = "force_raw_requested"
+flags = []
+expect = "exit"
+exit = 0

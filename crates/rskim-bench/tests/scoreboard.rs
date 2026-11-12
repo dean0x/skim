@@ -22,15 +22,19 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use rskim_bench::scoreboard::MAX_PAGES;
-use rskim_bench::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
+use rskim_bench::scoreboard::corpus::load_corpora;
+use rskim_bench::scoreboard::golden::{
+    ClashSplit, IntegrityContext, Origin, check_integrity, parse_golden,
+};
 use rskim_bench::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use rskim_bench::scoreboard::structural_metrics::called_patterns;
 use rskim_bench::scoreboard::test_support::{FixtureRepo, catalog};
-use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
+use rskim_bench::scoreboard::universe::{GitIsolation, TextUniverse, Universe, text_universe};
+use rskim_research::clone::verify_pinned_clone;
 use serde_json::{Value, json};
 
 // ============================================================================
@@ -171,6 +175,7 @@ else
 fi
 if [ -f "$f" ]; then
   cat "$f"
+  if [ -f "$dir/exit_code" ]; then exit "$(cat "$dir/exit_code")"; fi
   exit 0
 fi
 printf 'stub skim: no canned response for query=%s flags=%s limit=%s offset=%s json=%s\n' "$query" "$flags" "$limit" "$offset" "$json" >&2
@@ -194,11 +199,32 @@ struct Row {
     content: String,
 }
 
+impl Row {
+    /// The `field` the binary prints for this line (`SearchField::name`): a
+    /// type or function declaration is a definition field, a comment is
+    /// `comment`, and any other line is `function_body`.
+    fn field(&self) -> &'static str {
+        let line = self.content.trim_start();
+        if ["struct ", "pub struct ", "enum ", "pub enum "]
+            .iter()
+            .any(|p| line.starts_with(p))
+        {
+            "type_definition"
+        } else if ["fn ", "pub fn "].iter().any(|p| line.starts_with(p)) {
+            "function_signature"
+        } else if line.starts_with("//") {
+            "comment"
+        } else {
+            "function_body"
+        }
+    }
+}
+
 fn row_json(row: &Row, score: f64) -> Value {
     json!({
         "path": row.path,
         "score": score,
-        "field": "text",
+        "field": row.field(),
         "line_number": row.line,
         "snippet": {"lines": [{"line_number": row.line, "content": row.content, "is_match": true}]},
         "stale": false,
@@ -276,11 +302,13 @@ struct Harness {
     out_dir: tempfile::TempDir,
     commit: String,
     universe: Universe,
+    text: TextUniverse,
 }
 
 impl Harness {
     /// A fixture corpus, its golden set, and a stub that answers every
-    /// golden query correctly. No ledger and no baseline.
+    /// golden query correctly. The ledger is empty, and there is no
+    /// baseline.
     fn new() -> Self {
         let source = FixtureRepo::new();
         for (path, contents) in FILES {
@@ -297,6 +325,7 @@ impl Harness {
             root.to_str().unwrap(),
         ]);
         let universe = Universe::compute(&root, &GitIsolation::new(source.home())).unwrap();
+        let text = text_universe(&root, &GitIsolation::new(source.home())).unwrap();
 
         let h = Harness {
             _source: source,
@@ -306,6 +335,7 @@ impl Harness {
             out_dir: tempfile::tempdir().unwrap(),
             commit,
             universe,
+            text,
         };
         fs::write(
             h.data_dir.path().join("corpora.toml"),
@@ -316,6 +346,7 @@ impl Harness {
         )
         .unwrap();
         h.write_golden(DEF_LINE);
+        h.write_ledger("");
         h.install_stub();
         h.write_empty_pattern_calls();
         h.write_correct_responses();
@@ -388,6 +419,7 @@ impl Harness {
         );
     }
 
+    /// The ledger: `body`.
     fn write_ledger(&self, body: &str) {
         fs::write(self.data_dir.path().join("known_failures.toml"), body).unwrap();
     }
@@ -472,6 +504,12 @@ impl Harness {
 
     fn write_response(&self, query: &str, flags: &[&str], file: &str, body: &str) {
         fs::write(self.response_dir(query, flags).join(file), body).unwrap();
+    }
+
+    /// Make the stub exit with `code` after it prints the canned answer of
+    /// `query` (the current binary exits 0 on a query with no hit).
+    fn write_exit_code(&self, query: &str, flags: &[&str], code: i32) {
+        self.write_response(query, flags, "exit_code", &code.to_string());
     }
 
     fn write_full(&self, query: &str, flags: &[&str], rows: &[Row]) {
@@ -757,6 +795,16 @@ fn a_correct_skim_passes_run_bless_and_check() {
             "{check}"
         );
     }
+    // The tracked-text recall agrees with the indexed one on this fixture.
+    assert_eq!(
+        outcome(&report, "fixture-X01", "lexical.recall_tracked").as_deref(),
+        Some("pass")
+    );
+    // The first definition site is the frozen definition line.
+    assert_eq!(
+        outcome(&report, "fixture-L01", "ident.def_first").as_deref(),
+        Some("pass")
+    );
     assert_eq!(
         outcome(&report, "fixture-G001", "pagination.complete").as_deref(),
         Some("pass")
@@ -791,6 +839,45 @@ fn a_correct_skim_passes_run_bless_and_check() {
     assert_exit(&bless, 0);
     let check = h.check();
     assert_exit(&check, 0);
+    assert_eq!(h.report()["gate"]["status"], "pass");
+}
+
+#[test]
+fn the_rg_word_rows_are_info_and_rows_the_output_cannot_state_are_absent() {
+    let h = Harness::new();
+    assert_exit(&h.run(), 0);
+    let report = h.report();
+    let corpus = &report["corpora"][0];
+
+    // The `rg -nw` byte columns are in the INFO section of the report.
+    let reference = corpus["info"]["reference"].as_object().unwrap();
+    for name in ["bytes.rgw_text_median", "bytes.rgw_first_correct_median"] {
+        assert!(
+            reference[name].as_f64().is_some_and(|v| v > 0.0),
+            "{name}: {reference:?}"
+        );
+    }
+
+    // The stub, like the current binary, states no cost, labels no call and
+    // names no role the role oracle could judge: those rows have no value,
+    // and the `rg -nw` rows are not RATCHET values.
+    for ratchet in [&corpus["ratchet"], &report["aggregate"]["ratchet"]] {
+        let names: Vec<&String> = ratchet.as_object().unwrap().keys().collect();
+        for prefix in ["cost.", "roles.", "refs.", "bytes.rgw"] {
+            assert!(
+                names.iter().all(|n| !n.starts_with(prefix)),
+                "{prefix}: {names:?}"
+            );
+        }
+    }
+
+    // None of it reaches the baseline, and the gate stays green.
+    assert_exit(&h.bless(None), 0);
+    let baseline = fs::read_to_string(h.baseline_path()).unwrap();
+    for name in ["rgw", "cost.", "roles.", "refs."] {
+        assert!(!baseline.contains(name), "{name} is in the baseline");
+    }
+    assert_exit(&h.check(), 0);
     assert_eq!(h.report()["gate"]["status"], "pass");
 }
 
@@ -994,6 +1081,11 @@ ids = ["fixture-X01"]
 issue = "#9004"
 check = "lexical.silent_fn"
 ids = ["fixture-X01"]
+
+[[xfail]]
+issue = "#9004"
+check = "lexical.recall_tracked"
+ids = ["fixture-X01"]
 "##,
     );
     assert_exit(&h.check(), 1);
@@ -1007,6 +1099,10 @@ ids = ["fixture-X01"]
     );
     assert!(
         err.contains("fixture/fixture-X01 lexical.silent_fn: pass -> xfail"),
+        "{err}"
+    );
+    assert!(
+        err.contains("fixture/fixture-X01 lexical.recall_tracked: pass -> xfail"),
         "{err}"
     );
     assert!(err.contains("--accept-regression"), "{err}");
@@ -1038,9 +1134,15 @@ fn bless_refuses_a_report_with_unledgered_hard_failures() {
 fn removing_a_ledger_entry_for_a_failing_check_fails_naming_check_and_ids() {
     let h = Harness::new();
     h.drop_lexical_ground_truth_file();
+    // Dropping a ground-truth file fails both recall checks; `recall` ledgers them.
     let recall = r##"[[xfail]]
 issue = "#9001"
 check = "lexical.recall"
+ids = ["fixture-X01"]
+
+[[xfail]]
+issue = "#9001"
+check = "lexical.recall_tracked"
 ids = ["fixture-X01"]
 "##;
     let silent = r##"
@@ -1386,6 +1488,7 @@ fn golden_gen_prints_integrity_clean_ident_candidates() {
             corpus: "fixture",
             commit: &h.commit,
             universe: Some(&h.universe),
+            text: Some(&h.text),
             ledger: &[],
             catalog: catalog(),
         },
@@ -1491,6 +1594,7 @@ fn golden_gen_ast_calls_every_catalog_pattern_once_and_prints_parsable_entries()
             corpus: "fixture",
             commit: &h.commit,
             universe: Some(&h.universe),
+            text: Some(&h.text),
             ledger: &[],
             catalog: catalog(),
         },
@@ -2095,4 +2199,548 @@ fn an_ast_entry_naming_a_pattern_the_oracle_cannot_score_is_a_harness_error() {
     let err = stderr(&run);
     assert!(err.contains("golden integrity failed"), "{err}");
     assert!(err.contains("no structural oracle query"), "{err}");
+}
+
+// ============================================================================
+// #540: the frozen-answer tables, end to end
+// ============================================================================
+
+/// A query that no file of the fixture holds.
+const ABSENT: &str = "qzvx_absent_7713";
+
+/// A `[[refs]]` entry for `check_staleness`; `sites` are `(path, line, role)`.
+/// The name is a whole word on two lines of the fixture: the definition
+/// (`src/staleness.rs:2`) and the call (`src/other.rs:2`).
+fn refs_entry(sites: &[(&str, u32, &str)]) -> String {
+    let sites: String = sites
+        .iter()
+        .map(|(path, line, role)| {
+            format!("  {{ path = \"{path}\", line = {line}, role = \"{role}\" }},\n")
+        })
+        .collect();
+    format!(
+        "\n[[refs]]\nid = \"fixture-R01\"\nquery = \"check_staleness\"\n\
+         def = {{ path = \"{DEF_PATH}\", line = {DEF_LINE} }}\norigin = \"curated\"\n\
+         sites = [\n{sites}]\n"
+    )
+}
+
+/// The refs entry that holds exactly the whole-word lines of the fixture.
+fn exact_refs_entry() -> String {
+    refs_entry(&[("src/staleness.rs", 2, "def"), ("src/other.rs", 2, "call")])
+}
+
+/// A `[[clash]]` entry for `check_staleness`; `defs` and `calls` are
+/// `(path, line)`. The fixture defines the name once and holds it as a whole
+/// word on two lines only, so a test that needs two definitions treats the call
+/// line as the second one, and freezes that same line as the call: the entry
+/// only has to hold whole-word lines. Its calls are not split by definition.
+fn clash_entry(defs: &[(&str, u32)], calls: &[(&str, u32)], split: &str) -> String {
+    let defs: Vec<String> = defs
+        .iter()
+        .map(|(path, line)| format!("{{ path = \"{path}\", line = {line} }}"))
+        .collect();
+    let calls: String = calls
+        .iter()
+        .map(|(path, line)| {
+            format!("  {{ path = \"{path}\", line = {line}, def = \"unassigned\" }},\n")
+        })
+        .collect();
+    format!(
+        "\n[[clash]]\nid = \"fixture-D01\"\nquery = \"check_staleness\"\nsplit = \"{split}\"\n\
+         origin = \"curated\"\ndefs = [ {} ]\ncalls = [\n{calls}]\n",
+        defs.join(", ")
+    )
+}
+
+const TWO_DEFS: &[(&str, u32)] = &[("src/staleness.rs", 2), ("src/other.rs", 2)];
+
+/// The call line of the fixture, which `TWO_DEFS` also lists as its second
+/// definition.
+const CLASH_CALLS: &[(&str, u32)] = &[("src/other.rs", 2)];
+
+/// A `[[concept]]` entry on the fixture's `build lock` query, which freezes
+/// `first`. The query is the one of `fixture-C01`, so the stub already
+/// answers it.
+fn concept_with_first(id: &str, first: &str) -> String {
+    format!(
+        "\n[[concept]]\nid = \"{id}\"\nquery = \"build lock\"\nrelevant = '(?i)build[_\\s-]*lock'\n\
+         first = [\"{first}\"]\n"
+    )
+}
+
+/// A zero-hit `[[stakes]]` entry that expects `exit = 1`, and a match entry on
+/// the fixture's `marker` query that expects `exit = 0`.
+fn stakes_entries() -> String {
+    format!(
+        "\n[[stakes]]\nid = \"fixture-S01\"\nquery = \"{ABSENT}\"\nflags = []\nexpect = \"exit\"\nexit = 1\n\
+         \n[[stakes]]\nid = \"fixture-S02\"\nquery = \"marker\"\nflags = []\nexpect = \"exit\"\nexit = 0\n"
+    )
+}
+
+/// Every new table at once, each with the answer the fixture really has.
+fn frozen_answer_entries() -> String {
+    [
+        exact_refs_entry(),
+        clash_entry(TWO_DEFS, CLASH_CALLS, "none"),
+        concept_with_first("fixture-C02", "src/lock.rs"),
+        concept_with_first("fixture-C03", "src/marker.rs"),
+        stakes_entries(),
+    ]
+    .concat()
+}
+
+/// A harness that serves the new entries: zero hits for the absent query, as
+/// the current binary answers it (`total` 0, exit 0).
+fn frozen_answer_harness() -> Harness {
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, &frozen_answer_entries());
+    h.write_full(ABSENT, &[], &[]);
+    h
+}
+
+/// The failure detail the report holds for `(id, check)`.
+fn detail_of(report: &Value, id: &str, check: &str) -> String {
+    report["corpora"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["checks"].as_array().unwrap().iter())
+        .find(|c| c["id"] == id && c["check"] == check)
+        .and_then(|c| c["detail"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `check` over a golden file with `extra` appended: it must stop at
+/// integrity with exit 2 and leave no report. Gives stderr.
+fn integrity_failure_of(extra: &str) -> String {
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, extra);
+    let check = h.check();
+    assert_exit(&check, 2);
+    let err = stderr(&check);
+    assert!(err.contains("golden integrity failed"), "{err}");
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
+    err
+}
+
+#[test]
+fn a_refs_entry_whose_sites_differ_from_the_whole_word_lines_exits_2_at_integrity() {
+    // One whole-word line is not listed.
+    let err = integrity_failure_of(&refs_entry(&[("src/staleness.rs", 2, "def")]));
+    assert!(
+        err.contains("fixture-R01") && err.contains("missing") && err.contains("src/other.rs:2"),
+        "{err}"
+    );
+
+    // One listed line does not hold the word as a whole word.
+    let err = integrity_failure_of(&refs_entry(&[
+        ("src/staleness.rs", 2, "def"),
+        ("src/other.rs", 2, "call"),
+        ("src/other.rs", 1, "call"),
+    ]));
+    assert!(
+        err.contains("fixture-R01")
+            && err.contains("not a whole-word line")
+            && err.contains("src/other.rs:1"),
+        "{err}"
+    );
+
+    // The same entry with the exact set passes integrity.
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, &exact_refs_entry());
+    assert_exit(&h.run(), 0);
+}
+
+#[test]
+fn a_clash_with_one_definition_or_a_split_exits_2_at_integrity() {
+    let err = integrity_failure_of(&clash_entry(&TWO_DEFS[..1], CLASH_CALLS, "none"));
+    assert!(
+        err.contains("fixture-D01") && err.contains("2 or more"),
+        "{err}"
+    );
+
+    let err = integrity_failure_of(&clash_entry(TWO_DEFS, CLASH_CALLS, "exact"));
+    assert!(
+        err.contains("fixture-D01") && err.contains("split"),
+        "{err}"
+    );
+
+    // The two-definition entry with no split passes integrity.
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, &clash_entry(TWO_DEFS, CLASH_CALLS, "none"));
+    assert_exit(&h.run(), 0);
+}
+
+#[test]
+fn the_frozen_answer_entries_are_judged_against_the_output_the_current_binary_prints() {
+    let h = frozen_answer_harness();
+
+    assert_exit(&h.run(), 0);
+    let report = h.report();
+    let result = |id: &str, check: &str| outcome(&report, id, check);
+
+    // The two frozen sites are in the output, so recall holds; the call line
+    // carries no role in the current output, so the call recall fails.
+    assert_eq!(
+        result("fixture-R01", "refs.recall").as_deref(),
+        Some("pass")
+    );
+    assert_eq!(
+        result("fixture-R01", "refs.calls_recall").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-R01", "refs.calls_recall");
+    assert!(d.contains("src/other.rs:2 (role none)"), "{d}");
+    // The fixture's indexed files are its text files: the accounting agrees.
+    assert_eq!(
+        result("fixture-R01", "universe.accounted").as_deref(),
+        Some("pass")
+    );
+
+    // The output lists the definition site it knows, with no count.
+    assert_eq!(
+        result("fixture-D01", "clash.defs_complete").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-D01", "clash.defs_complete");
+    assert!(
+        d.contains("missing 1 of 2") && d.contains("src/other.rs:2"),
+        "{d}"
+    );
+    assert_eq!(
+        result("fixture-D01", "clash.def_count").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-D01", "clash.def_count");
+    assert!(d.contains("no definitions.count"), "{d}");
+    // The frozen call line is in the output with no role, so the call recall
+    // fails on it.
+    assert_eq!(
+        result("fixture-D01", "clash.calls_recall").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-D01", "clash.calls_recall");
+    assert!(d.contains("src/other.rs:2 (role none)"), "{d}");
+
+    // `build lock` lists src/lock.rs, not src/marker.rs.
+    assert_eq!(
+        result("fixture-C02", "concept.first_right_top5").as_deref(),
+        Some("pass")
+    );
+    assert_eq!(
+        result("fixture-C03", "concept.first_right_top5").as_deref(),
+        Some("fail")
+    );
+    // The first-file check is for the concepts that freeze one.
+    assert_eq!(result("fixture-C01", "concept.first_right_top5"), None);
+
+    // The absent query exits 0, the match query exits 0.
+    assert_eq!(
+        result("fixture-S01", "stakes.exit").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-S01", "stakes.exit");
+    assert!(d.contains("exit code is 0, expected 1"), "{d}");
+    assert_eq!(
+        result("fixture-S02", "stakes.exit").as_deref(),
+        Some("pass")
+    );
+}
+
+#[test]
+fn a_zero_hit_stakes_entry_passes_once_the_run_exits_1() {
+    let h = frozen_answer_harness();
+    h.write_exit_code(ABSENT, &[], 1);
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-S01", "stakes.exit").as_deref(),
+        Some("pass")
+    );
+}
+
+#[test]
+fn a_search_that_counts_a_different_number_of_files_fails_the_universe_accounting() {
+    let h = frozen_answer_harness();
+    let files = h.text.len();
+    // One file more than the text universe holds, with no reason for it.
+    fs::write(
+        h.stub_dir.path().join("stats.json"),
+        json!({"file_count": files + 1, "skipped_by_reason": {}, "temporal_state": "ready"})
+            .to_string(),
+    )
+    .unwrap();
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-R01", "universe.accounted").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-R01", "universe.accounted");
+    assert!(
+        d.contains(&format!("searched_files is {}", files + 1))
+            && d.contains(&format!("has {files}")),
+        "{d}"
+    );
+}
+
+/// The ledger of the failures `frozen_answer_entries` has against the
+/// fixture's current-shaped output.
+const FROZEN_ANSWER_LEDGER: &str = r##"[[xfail]]
+issue = "#553"
+check = "refs.calls_recall"
+ids = ["fixture-R01"]
+
+[[xfail]]
+issue = "#555"
+check = "clash.defs_complete"
+ids = ["fixture-D01"]
+
+[[xfail]]
+issue = "#555"
+check = "clash.def_count"
+ids = ["fixture-D01"]
+
+[[xfail]]
+issue = "#553"
+check = "clash.calls_recall"
+ids = ["fixture-D01"]
+
+[[xfail]]
+issue = "#556"
+check = "concept.first_right_top5"
+ids = ["fixture-C03"]
+
+[[xfail]]
+issue = "#552"
+check = "stakes.exit"
+ids = ["fixture-S01"]
+"##;
+
+#[test]
+fn the_new_hard_failures_are_ledgered_by_id_and_a_first_bless_needs_no_reason() {
+    let h = frozen_answer_harness();
+
+    // Without a ledger the gate names the new failures.
+    let unledgered = h.check();
+    assert_exit(&unledgered, 1);
+    let err = stderr(&unledgered);
+    for check in [
+        "refs.calls_recall",
+        "clash.defs_complete",
+        "clash.def_count",
+        "clash.calls_recall",
+        "concept.first_right_top5",
+        "stakes.exit",
+    ] {
+        assert!(err.contains(check), "{check}: {err}");
+    }
+
+    // Ledgered, they are `xfail`; a first bless takes them with no reason.
+    h.write_ledger(FROZEN_ANSWER_LEDGER);
+    assert_exit(&h.run(), 0);
+    assert_eq!(
+        outcome(&h.report(), "fixture-S01", "stakes.exit").as_deref(),
+        Some("xfail")
+    );
+    assert_exit(&h.bless(None), 0);
+    assert_exit(&h.check(), 0);
+    assert_eq!(h.report()["gate"]["status"], "pass");
+
+    // When the engine fixes one, the ledger entry is an XPASS until removed.
+    h.write_exit_code(ABSENT, &[], 1);
+    let fixed = h.check();
+    assert_exit(&fixed, 1);
+    let err = stderr(&fixed);
+    assert!(
+        err.contains("XPASS") && err.contains("stakes.exit"),
+        "{err}"
+    );
+}
+
+#[test]
+fn ident_def_first_fails_when_the_first_definition_is_another_line_of_the_right_file() {
+    let h = Harness::new();
+    assert_exit(&h.run(), 0);
+    assert_eq!(
+        outcome(&h.report(), "fixture-L01", "ident.def_first").as_deref(),
+        Some("pass"),
+        "the definition line is the first definition site"
+    );
+
+    // The right file ranks first, but its definition site is line 4.
+    let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
+    rows[0].line = 4;
+    rows[0].content = "pub fn check_staleness() {}".to_string();
+    h.write_ident(&rows);
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-L01", "ident.def_first").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-L01", "ident.def_first");
+    assert!(
+        d.contains("src/staleness.rs:4") && d.contains("expected src/staleness.rs:2"),
+        "{d}"
+    );
+}
+
+// ============================================================================
+// Frozen golden data of the four corpora (#540)
+// ============================================================================
+
+/// The four corpora of `corpora.toml`.
+const CORPORA: [&str; 4] = ["skim", "ripgrep", "flask", "zod"];
+
+/// The scoreboard data dir of this crate (`corpora.toml`, `golden/`).
+fn data_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("scoreboard")
+}
+
+/// The raw text of the checked-in golden file of `corpus`.
+fn real_golden_text(corpus: &str) -> String {
+    let path = data_dir().join("golden").join(format!("{corpus}.toml"));
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[test]
+fn each_golden_file_loads_and_holds_at_least_three_refs_entries() {
+    for corpus in CORPORA {
+        let golden =
+            parse_golden(&real_golden_text(corpus)).unwrap_or_else(|e| panic!("{corpus}: {e:#}"));
+        assert_eq!(golden.corpus, corpus);
+        assert!(
+            golden.refs.len() >= 3,
+            "{corpus} holds {} [[refs]] entries, expected 3 or more",
+            golden.refs.len()
+        );
+    }
+}
+
+#[test]
+fn the_skim_golden_file_freezes_both_definitions_of_run_parsed_command() {
+    let golden = parse_golden(&real_golden_text("skim")).unwrap();
+    let clash = golden
+        .clashes
+        .iter()
+        .find(|c| c.query == "run_parsed_command")
+        .expect("no [[clash]] entry for run_parsed_command");
+
+    let mut defs: Vec<(&str, u32)> = clash
+        .defs
+        .iter()
+        .map(|d| (d.path.as_str(), d.line))
+        .collect();
+    defs.sort_unstable();
+    assert_eq!(
+        defs,
+        vec![
+            ("crates/rskim/src/cmd/build/mod.rs", 150),
+            ("crates/rskim/src/cmd/git/mod.rs", 414),
+        ]
+    );
+    assert_eq!(clash.split, ClashSplit::None);
+    assert!(!clash.calls.is_empty(), "the clash freezes no call site");
+}
+
+#[test]
+fn each_golden_file_holds_a_clash_entry() {
+    for corpus in CORPORA {
+        let golden =
+            parse_golden(&real_golden_text(corpus)).unwrap_or_else(|e| panic!("{corpus}: {e:#}"));
+        assert!(
+            !golden.clashes.is_empty(),
+            "{corpus} holds no [[clash]] entry, expected 1 or more"
+        );
+    }
+}
+
+#[test]
+fn each_golden_file_holds_two_concept_entries_with_first_files() {
+    for corpus in CORPORA {
+        let golden = parse_golden(&real_golden_text(corpus)).unwrap();
+        let with_first = golden
+            .concepts
+            .iter()
+            .filter(|c| c.first.as_ref().is_some_and(|first| !first.is_empty()))
+            .count();
+        assert!(
+            with_first >= 2,
+            "{corpus} holds {with_first} concept entries with `first`, expected 2 or more"
+        );
+    }
+}
+
+#[test]
+fn each_golden_file_holds_a_zero_hit_and_a_match_stakes_entry() {
+    for corpus in CORPORA {
+        let golden = parse_golden(&real_golden_text(corpus)).unwrap();
+        for (exit, what) in [(1, "zero-hit"), (0, "match")] {
+            assert!(
+                golden.stakes.iter().any(|s| s.exit == Some(exit)),
+                "{corpus} holds no {what} [[stakes]] entry (exit = {exit})"
+            );
+        }
+    }
+}
+
+/// Golden integrity of the checked-in files against the pinned clones. It
+/// runs no skim: it loads each golden file and each clone, and applies the
+/// same `check_integrity` the scoreboard applies before its first query.
+///
+/// Run it after a golden edit, with the clones in `.bench-corpus/scoreboard`:
+/// `cargo nextest run -p rskim-bench --run-ignored only the_golden_files_pass_integrity`.
+#[test]
+#[ignore = "needs the pinned corpus clones under .bench-corpus/scoreboard"]
+fn the_golden_files_pass_integrity_against_the_pinned_clones() {
+    let specs = load_corpora(&data_dir().join("corpora.toml")).unwrap();
+    let clones = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.bench-corpus/scoreboard");
+    let home = tempfile::tempdir().unwrap();
+    let git = GitIsolation::new(home.path());
+
+    for spec in &specs {
+        let root = clones.join(&spec.name);
+        let state = verify_pinned_clone(&root, &spec.commit).unwrap();
+        assert!(
+            state.is_reusable(),
+            "{}: the clone is not the pinned one: {state}",
+            spec.name
+        );
+        let golden = parse_golden(&real_golden_text(&spec.name)).unwrap();
+        let universe = Universe::compute(&root, &git).unwrap();
+        let text = text_universe(&root, &git).unwrap();
+        let violations = check_integrity(
+            &golden,
+            &IntegrityContext {
+                corpus: &spec.name,
+                commit: &spec.commit,
+                universe: Some(&universe),
+                text: Some(&text),
+                ledger: &[],
+                catalog: catalog(),
+            },
+        );
+        assert!(
+            violations.is_empty(),
+            "{}: {} integrity violation(s):\n{}",
+            spec.name,
+            violations.len(),
+            violations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }

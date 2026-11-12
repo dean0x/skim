@@ -57,8 +57,9 @@ impl Arm {
 
 /// skim's `verify_mode` (absent = substring), or the mode a golden entry
 /// declares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum VerifyMode {
+    #[default]
     Substring,
     Phrase,
     Near,
@@ -125,11 +126,112 @@ pub struct Degraded {
     pub applied: Option<String>,
 }
 
+/// What a matched line is. The names follow the role rules of the search
+/// engine: `def`, `call`, `ref`, `import`, `comment`, `string` and `text`
+/// are the roles a frozen site can have; `partial` (the hit is inside a longer
+/// identifier) and `unlabelled` (the engine did not parse the file) only
+/// occur in the engine's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    Def,
+    Call,
+    Ref,
+    Import,
+    Comment,
+    String,
+    Text,
+    Partial,
+    Unlabelled,
+}
+
+impl Role {
+    /// The lowercase name used in JSON and in failure details.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Def => "def",
+            Role::Call => "call",
+            Role::Ref => "ref",
+            Role::Import => "import",
+            Role::Comment => "comment",
+            Role::String => "string",
+            Role::Text => "text",
+            Role::Partial => "partial",
+            Role::Unlabelled => "unlabelled",
+        }
+    }
+
+    /// The role named `name`, or `None` for a name this scoreboard does not
+    /// know.
+    pub fn from_name(name: &str) -> Option<Role> {
+        const ALL: [Role; 9] = [
+            Role::Def,
+            Role::Call,
+            Role::Ref,
+            Role::Import,
+            Role::Comment,
+            Role::String,
+            Role::Text,
+            Role::Partial,
+            Role::Unlabelled,
+        ];
+        ALL.into_iter().find(|r| r.as_str() == name)
+    }
+}
+
+/// One matching line of a result page: `path:line`, with its role when the
+/// engine labels it (`None` = the engine gives no role).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    pub path: String,
+    /// 1-based line number.
+    pub line: u32,
+    pub role: Option<Role>,
+}
+
+/// One definition site of the queried name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionSite {
+    pub path: String,
+    /// 1-based line that holds the name.
+    pub line: u32,
+}
+
+/// The definitions of the queried name that a page reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Definitions {
+    /// How many definitions the engine counted. `None` = the output states
+    /// no count.
+    pub count: Option<u64>,
+    /// The count is a lower bound: the parse budget ran out, so some matched
+    /// files have no labels.
+    pub at_least: bool,
+    /// The definition sites, in the engine's order: the first is the one the
+    /// result anchors on.
+    pub sites: Vec<DefinitionSite>,
+}
+
+/// The work counters of one call (`cost` in the engine's envelope).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cost {
+    pub files_read: u64,
+    pub bytes_read: u64,
+    pub files_parsed: u64,
+    pub bytes_parsed: u64,
+}
+
 /// One page of results from one skim invocation.
 ///
 /// A result's rank is its index in `rows` plus the invocation's `--offset`.
 /// skim's `total` is deliberately not kept: it is the page size, not a count.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// [`ResultPage::parse`] fills the first four fields, and for the lexical
+/// envelope `occurrences` and `definitions` too (the adapter for the current
+/// output). The other fields are the accounting answers the #540 checks
+/// read: the current output states none of them, so they stay at their
+/// default (nothing observed) until [`ResultPage::with_accounting`] or the
+/// runner fills them, and every check that reads one fails closed on an
+/// absent value.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResultPage {
     pub rows: Vec<ResultRow>,
     /// `has_more` (absent = `false`).
@@ -140,6 +242,26 @@ pub struct ResultPage {
     /// `degraded[]` (absent = empty). Standalone `--ast` never carries it
     /// (#483).
     pub degraded: Vec<Degraded>,
+    /// The matching lines, one per `path:line`, with their roles.
+    pub occurrences: Vec<Occurrence>,
+    /// The definitions of the queried name; `None` = the output has none.
+    pub definitions: Option<Definitions>,
+    /// Matched files that have no labels (`parse.unlabelled_files`); `0` when
+    /// absent.
+    pub unlabelled_files: u64,
+    /// Files the search read (`searched_files`); `None` = not stated.
+    pub searched_files: Option<u64>,
+    /// Files left out of the search, by reason (`left_out`); `None` = not
+    /// stated.
+    pub left_out: Option<BTreeMap<String, u64>>,
+    /// Matching lines per file (`files[].line_count`); empty when the output
+    /// has no counts.
+    pub line_counts: BTreeMap<String, u64>,
+    /// The work counters of the call; `None` = not stated.
+    pub cost: Option<Cost>,
+    /// The process exit code. A page parsed from JSON has `0`; the runner
+    /// overwrites it with the real status.
+    pub exit_code: i32,
 }
 
 impl ResultPage {
@@ -179,13 +301,120 @@ impl ResultPage {
             Some(entries) => parse_each(entries, "degraded", parse_degraded)?,
         };
 
+        let (occurrences, definitions) = match arm {
+            Arm::Lexical => {
+                let roles = parse_each(results, "results", field_role)?;
+                let (occurrences, definitions) = line_answers(&rows, &roles);
+                (occurrences, Some(definitions))
+            }
+            Arm::Ast | Arm::HotCold | Arm::Risky | Arm::BlastRadius => (Vec::new(), None),
+        };
+
         Ok(ResultPage {
             rows,
             has_more,
             verify_mode,
             degraded,
+            occurrences,
+            definitions,
+            ..ResultPage::default()
         })
     }
+
+    /// This page with the corpus accounting of `stats`: `searched_files` is
+    /// the index's file count and `left_out` its persisted skips by reason.
+    /// The current output states neither, so the run takes them from
+    /// `skim search --stats --json`.
+    #[must_use]
+    pub fn with_accounting(self, stats: &StatsSnapshot) -> Self {
+        ResultPage {
+            searched_files: Some(stats.file_count),
+            left_out: Some(stats.skipped_by_reason.clone()),
+            ..self
+        }
+    }
+}
+
+/// The `field` values that name a definition (`SearchField::TypeDefinition`
+/// and `FunctionSignature`).
+const DEFINITION_FIELDS: [&str; 2] = ["type_definition", "function_signature"];
+
+/// The `field` values that name no role this scoreboard uses: the other six
+/// `SearchField` names, and the co-change-only result of `--blast-radius`.
+const OTHER_FIELDS: [&str; 7] = [
+    "symbol_name",
+    "import_export",
+    "function_body",
+    "comment",
+    "string_literal",
+    "other",
+    "co_change_partner",
+];
+
+/// The role a lexical result's `field` gives its matching line: `def` for
+/// a definition field, `None` for any other known field. The binary prints
+/// the name `SearchField::name` returns
+/// (`crates/rskim-search/src/types.rs:154-165`) in
+/// `ResolvedResult::field` (`crates/rskim/src/cmd/search/types.rs:338`), and
+/// `"co_change_partner"` for a co-change-only result
+/// (`crates/rskim/src/cmd/search/query.rs:1234`).
+///
+/// # Errors
+///
+/// The row has no string `field`, or its value is none of those names: a
+/// value this scoreboard does not know is a harness error, never a missing
+/// role.
+fn field_role(row: &Value) -> anyhow::Result<Option<Role>> {
+    let obj = as_object(row, "row")?;
+    let field = opt_str(obj, "field")?.context("row has no `field`")?;
+    if DEFINITION_FIELDS.contains(&field) {
+        Ok(Some(Role::Def))
+    } else if OTHER_FIELDS.contains(&field) {
+        Ok(None)
+    } else {
+        anyhow::bail!(
+            "unknown `field` value {field:?} (known: {})",
+            DEFINITION_FIELDS
+                .iter()
+                .chain(OTHER_FIELDS.iter())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// The line-level answers of a lexical page: one occurrence for each
+/// `is_match` snippet line of a result, with the result's role, and the
+/// definitions, which are the results whose role is `def` and that state a
+/// line. The output states no definition count.
+fn line_answers(rows: &[ResultRow], roles: &[Option<Role>]) -> (Vec<Occurrence>, Definitions) {
+    let mut occurrences = Vec::new();
+    let mut sites = Vec::new();
+    for (row, &role) in rows.iter().zip(roles) {
+        occurrences.extend(
+            row.snippet
+                .iter()
+                .filter(|l| l.is_match)
+                .map(|l| Occurrence {
+                    path: row.path.clone(),
+                    line: l.line_number,
+                    role,
+                }),
+        );
+        if let (Some(Role::Def), Some(line)) = (role, row.line) {
+            sites.push(DefinitionSite {
+                path: row.path.clone(),
+                line,
+            });
+        }
+    }
+    let definitions = Definitions {
+        count: None,
+        at_least: false,
+        sites,
+    };
+    (occurrences, definitions)
 }
 
 fn parse_row(arm: Arm, value: &Value) -> anyhow::Result<ResultRow> {
@@ -476,6 +705,14 @@ pub enum EntryKind {
     /// `[[ast]]`: one catalog pattern in one oracle language, scored against
     /// the structural oracle (#541).
     Ast,
+    /// `[[refs]]`: every site of one name, frozen with its role (#540).
+    Refs,
+    /// `[[clash]]`: a name with two or more definitions, frozen with its
+    /// definitions and calls (#540).
+    Clash,
+    /// `[[stakes]]`: a plain-text query whose lines, files, counts or exit
+    /// code are compared with the regex oracle (#540).
+    Stakes,
 }
 
 /// A HARD check (tolerance 0; the ledger in `known_failures.toml` names
@@ -516,6 +753,42 @@ pub enum CheckId {
     /// `[[ast]]`: the call's `ast_coverage.size_excluded_files` equals the
     /// oracle's own over-cap count, and nothing is undetermined.
     StructuralCoverage,
+    /// `[[refs]]`: every frozen site is among the page's occurrences.
+    RefsRecall,
+    /// `[[refs]]`: every frozen call site is an occurrence with the role
+    /// `call`.
+    RefsCallsRecall,
+    /// `[[clash]]`: every frozen definition is among the definition sites.
+    ClashDefsComplete,
+    /// `[[clash]]`: the stated definition count equals the frozen number of
+    /// definitions (or is a valid lower bound).
+    ClashDefCount,
+    /// `[[clash]]`: every frozen call site of either definition is an
+    /// occurrence with the role `call`.
+    ClashCallsRecall,
+    /// `[[lexical]]`: every file of the text universe (no language
+    /// allow-list) that holds the query is returned.
+    LexicalRecallTracked,
+    /// `[[refs]]`: the searched files plus each left-out reason count equal
+    /// the oracle text universe's counts.
+    UniverseAccounted,
+    /// `[[ident]]`: the first definition site is the frozen definition line.
+    IdentDefFirst,
+    /// `[[concept]]` with `first`: a frozen first file is among the first
+    /// five files.
+    ConceptFirstRightTop5,
+    /// `[[stakes]]` with `expect = "lines"`: the matching lines equal the
+    /// regex oracle's.
+    StakesLines,
+    /// `[[stakes]]` with `expect = "files"`: the matching files equal the
+    /// regex oracle's.
+    StakesFiles,
+    /// `[[stakes]]` with `expect = "counts"`: the matching lines per file
+    /// equal the regex oracle's.
+    StakesCounts,
+    /// `[[stakes]]` with `expect = "exit"`: the exit code equals the frozen
+    /// one.
+    StakesExit,
 }
 
 impl CheckId {
@@ -535,6 +808,19 @@ impl CheckId {
         CheckId::StructuralRecall,
         CheckId::StructuralPrecision,
         CheckId::StructuralCoverage,
+        CheckId::RefsRecall,
+        CheckId::RefsCallsRecall,
+        CheckId::ClashDefsComplete,
+        CheckId::ClashDefCount,
+        CheckId::ClashCallsRecall,
+        CheckId::LexicalRecallTracked,
+        CheckId::UniverseAccounted,
+        CheckId::IdentDefFirst,
+        CheckId::ConceptFirstRightTop5,
+        CheckId::StakesLines,
+        CheckId::StakesFiles,
+        CheckId::StakesCounts,
+        CheckId::StakesExit,
     ];
 
     /// The dotted name used in reports and the ledger.
@@ -554,6 +840,19 @@ impl CheckId {
             CheckId::StructuralRecall => "structural.recall",
             CheckId::StructuralPrecision => "structural.precision",
             CheckId::StructuralCoverage => "structural.coverage",
+            CheckId::RefsRecall => "refs.recall",
+            CheckId::RefsCallsRecall => "refs.calls_recall",
+            CheckId::ClashDefsComplete => "clash.defs_complete",
+            CheckId::ClashDefCount => "clash.def_count",
+            CheckId::ClashCallsRecall => "clash.calls_recall",
+            CheckId::LexicalRecallTracked => "lexical.recall_tracked",
+            CheckId::UniverseAccounted => "universe.accounted",
+            CheckId::IdentDefFirst => "ident.def_first",
+            CheckId::ConceptFirstRightTop5 => "concept.first_right_top5",
+            CheckId::StakesLines => "stakes.lines",
+            CheckId::StakesFiles => "stakes.files",
+            CheckId::StakesCounts => "stakes.counts",
+            CheckId::StakesExit => "stakes.exit",
         }
     }
 
@@ -569,15 +868,40 @@ impl CheckId {
             CheckId::OrderPrefixConsistent => kind == EntryKind::Prefix,
             // An `[[ast]]` entry is judged by the structural oracle; the
             // standalone `--ast` arm's ordering is `[[prefix]]` territory.
+            // `[[refs]]`, `[[clash]]` and `[[stakes]]` have their own
+            // oracles and checks, so no lexical or ordering check runs on
+            // them.
             CheckId::LexicalRecall
             | CheckId::LexicalPrecision
             | CheckId::LexicalSilentFn
             | CheckId::LexicalVerifyMode
-            | CheckId::OrderScoreMonotone => kind != EntryKind::Ast,
+            | CheckId::OrderScoreMonotone => matches!(
+                kind,
+                EntryKind::Ident
+                    | EntryKind::Concept
+                    | EntryKind::Lexical
+                    | EntryKind::Pagination
+                    | EntryKind::Prefix
+            ),
+            // Every entry kind fetches a full list of file rows, one row per
+            // path, so the check applies to the new kinds too.
             CheckId::ResultsUniquePaths => true,
             CheckId::StructuralRecall
             | CheckId::StructuralPrecision
             | CheckId::StructuralCoverage => kind == EntryKind::Ast,
+            CheckId::RefsRecall | CheckId::RefsCallsRecall | CheckId::UniverseAccounted => {
+                kind == EntryKind::Refs
+            }
+            CheckId::ClashDefsComplete | CheckId::ClashDefCount | CheckId::ClashCallsRecall => {
+                kind == EntryKind::Clash
+            }
+            CheckId::LexicalRecallTracked => kind == EntryKind::Lexical,
+            CheckId::IdentDefFirst => kind == EntryKind::Ident,
+            CheckId::ConceptFirstRightTop5 => kind == EntryKind::Concept,
+            CheckId::StakesLines
+            | CheckId::StakesFiles
+            | CheckId::StakesCounts
+            | CheckId::StakesExit => kind == EntryKind::Stakes,
         }
     }
 }
@@ -710,7 +1034,7 @@ mod tests {
     fn short_query_rows_carry_a_null_line() {
         let p = page(
             Arm::Lexical,
-            r#"{"results":[{"path":"a.rs","score":0.0,"line_number":null,"snippet":null}]}"#,
+            r#"{"results":[{"path":"a.rs","score":0.0,"field":"other","line_number":null,"snippet":null}]}"#,
         )
         .unwrap();
         assert_eq!(p.rows[0].line, None);
@@ -805,17 +1129,23 @@ mod tests {
             (Arm::Lexical, "skim search: no index found"),
             (Arm::Lexical, r#"{"total":0}"#),
             (Arm::Lexical, r#"{"results":{}}"#),
-            (Arm::Lexical, r#"{"results":[{"score":1.0}]}"#),
             (
                 Arm::Lexical,
-                r#"{"results":[{"path":"a.rs","score":"high"}]}"#,
+                r#"{"results":[{"score":1.0,"field":"other"}]}"#,
             ),
-            (Arm::Lexical, r#"{"results":[{"path":"a.rs"}]}"#),
+            (
+                Arm::Lexical,
+                r#"{"results":[{"path":"a.rs","score":"high","field":"other"}]}"#,
+            ),
+            (
+                Arm::Lexical,
+                r#"{"results":[{"path":"a.rs","field":"other"}]}"#,
+            ),
             (Arm::Lexical, r#"{"has_more":"yes","results":[]}"#),
             (Arm::Lexical, r#"{"verify_mode":3,"results":[]}"#),
             (
                 Arm::Lexical,
-                r#"{"results":[{"path":"a.rs","score":1.0,"line_number":-1}]}"#,
+                r#"{"results":[{"path":"a.rs","score":1.0,"field":"other","line_number":-1}]}"#,
             ),
             (Arm::HotCold, r#"{"results":[{"path":"a.rs","score":1.0}]}"#),
         ] {
@@ -874,7 +1204,7 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", check.as_str()));
             assert_eq!(serde_json::from_str::<CheckId>(&json).unwrap(), *check);
         }
-        assert_eq!(CheckId::ALL.len(), 14);
+        assert_eq!(CheckId::ALL.len(), 27);
         for (check, name) in [
             (CheckId::StructuralRecall, "structural.recall"),
             (CheckId::StructuralPrecision, "structural.precision"),
@@ -900,8 +1230,41 @@ mod tests {
             EntryKind::Pagination,
             EntryKind::Prefix,
             EntryKind::Ast,
+            EntryKind::Refs,
+            EntryKind::Clash,
+            EntryKind::Stakes,
         ] {
             assert!(CheckId::ResultsUniquePaths.applies_to(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn lexical_and_ordering_checks_never_apply_to_refs_clash_or_stakes_entries() {
+        // A ledger entry that pairs one of these checks with such an entry
+        // would XFAIL nothing, so `applies_to` must refuse it.
+        for check in [
+            CheckId::LexicalRecall,
+            CheckId::LexicalPrecision,
+            CheckId::LexicalSilentFn,
+            CheckId::LexicalVerifyMode,
+            CheckId::OrderScoreMonotone,
+            CheckId::OrderPrefixConsistent,
+            CheckId::PaginationComplete,
+            CheckId::StructuralRecall,
+        ] {
+            for kind in [EntryKind::Refs, EntryKind::Clash, EntryKind::Stakes] {
+                assert!(!check.applies_to(kind), "{check} on {kind:?}");
+            }
+        }
+        // The five older kinds keep their lexical checks.
+        for kind in [
+            EntryKind::Ident,
+            EntryKind::Concept,
+            EntryKind::Lexical,
+            EntryKind::Pagination,
+            EntryKind::Prefix,
+        ] {
+            assert!(CheckId::LexicalRecall.applies_to(kind), "{kind:?}");
         }
     }
 
@@ -920,6 +1283,9 @@ mod tests {
                 EntryKind::Lexical,
                 EntryKind::Pagination,
                 EntryKind::Prefix,
+                EntryKind::Refs,
+                EntryKind::Clash,
+                EntryKind::Stakes,
             ] {
                 assert!(!check.applies_to(kind), "{check} on {kind:?}");
             }
@@ -937,6 +1303,289 @@ mod tests {
         ] {
             assert!(!check.applies_to(EntryKind::Ast), "{check}");
         }
+    }
+
+    #[test]
+    fn the_new_checks_have_the_dotted_names_of_the_plan_and_run_on_their_own_kind_only() {
+        let table: [(CheckId, &str, EntryKind); 13] = [
+            (CheckId::RefsRecall, "refs.recall", EntryKind::Refs),
+            (
+                CheckId::RefsCallsRecall,
+                "refs.calls_recall",
+                EntryKind::Refs,
+            ),
+            (
+                CheckId::ClashDefsComplete,
+                "clash.defs_complete",
+                EntryKind::Clash,
+            ),
+            (CheckId::ClashDefCount, "clash.def_count", EntryKind::Clash),
+            (
+                CheckId::ClashCallsRecall,
+                "clash.calls_recall",
+                EntryKind::Clash,
+            ),
+            (
+                CheckId::LexicalRecallTracked,
+                "lexical.recall_tracked",
+                EntryKind::Lexical,
+            ),
+            (
+                CheckId::UniverseAccounted,
+                "universe.accounted",
+                EntryKind::Refs,
+            ),
+            (CheckId::IdentDefFirst, "ident.def_first", EntryKind::Ident),
+            (
+                CheckId::ConceptFirstRightTop5,
+                "concept.first_right_top5",
+                EntryKind::Concept,
+            ),
+            (CheckId::StakesLines, "stakes.lines", EntryKind::Stakes),
+            (CheckId::StakesFiles, "stakes.files", EntryKind::Stakes),
+            (CheckId::StakesCounts, "stakes.counts", EntryKind::Stakes),
+            (CheckId::StakesExit, "stakes.exit", EntryKind::Stakes),
+        ];
+        let kinds = [
+            EntryKind::Ident,
+            EntryKind::Concept,
+            EntryKind::Lexical,
+            EntryKind::Pagination,
+            EntryKind::Prefix,
+            EntryKind::Ast,
+            EntryKind::Refs,
+            EntryKind::Clash,
+            EntryKind::Stakes,
+        ];
+        for (check, name, own) in table {
+            assert_eq!(check.as_str(), name);
+            assert_eq!(name.parse::<CheckId>().unwrap(), check);
+            for kind in kinds {
+                assert_eq!(check.applies_to(kind), kind == own, "{check} on {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn role_names_round_trip_and_an_unknown_name_is_none() {
+        for name in [
+            "def",
+            "call",
+            "ref",
+            "import",
+            "comment",
+            "string",
+            "text",
+            "partial",
+            "unlabelled",
+        ] {
+            assert_eq!(Role::from_name(name).unwrap().as_str(), name);
+        }
+        assert_eq!(Role::from_name("Call"), None);
+        assert_eq!(Role::from_name(""), None);
+    }
+
+    // --- the adapter for the current search output (#540) ---------------------
+
+    /// A `skim search --json` envelope as the current binary prints it (skim
+    /// 2.11.0, `--limit 10 -- check_staleness` over a three-file repository),
+    /// less the `index_stats` object. The first file defines the name, the
+    /// second calls it, and the match line is the `is_match` snippet line.
+    const CURRENT_ENVELOPE: &str = r#"{"query":"check_staleness","total":2,"results":[
+        {"path":"staleness.rs","score":3.636363557547579,"field":"function_signature",
+         "line_number":2,"line_range":{"start":2,"end":3},
+         "snippet":{"lines":[
+            {"line_number":1,"content":"// staleness checks","is_match":false},
+            {"line_number":2,"content":"pub fn check_staleness() -> bool {","is_match":true},
+            {"line_number":3,"content":"    true","is_match":false},
+            {"line_number":4,"content":"}","is_match":false}]},
+         "stale":false},
+        {"path":"other.rs","score":0.6818181670401711,"field":"function_body",
+         "line_number":2,"line_range":{"start":2,"end":3},
+         "snippet":{"lines":[
+            {"line_number":1,"content":"fn refresh() {","is_match":false},
+            {"line_number":2,"content":"    if check_staleness() {}","is_match":true},
+            {"line_number":3,"content":"}","is_match":false},
+            {"line_number":4,"content":"// check_staleness is here","is_match":false}]},
+         "stale":false}],
+        "duration_ms":2}"#;
+
+    fn occurrence(path: &str, line: u32, role: Option<Role>) -> Occurrence {
+        Occurrence {
+            path: path.to_string(),
+            line,
+            role,
+        }
+    }
+
+    #[test]
+    fn the_adapter_reads_occurrences_and_definition_sites_from_a_recorded_current_envelope() {
+        let page = page(Arm::Lexical, CURRENT_ENVELOPE).unwrap();
+        // One occurrence per result: its `is_match` line, never a context line.
+        assert_eq!(
+            page.occurrences,
+            vec![
+                occurrence("staleness.rs", 2, Some(Role::Def)),
+                occurrence("other.rs", 2, None),
+            ]
+        );
+        // The definition sites are the results whose field names a definition.
+        assert_eq!(
+            page.definitions,
+            Some(Definitions {
+                count: None,
+                at_least: false,
+                sites: vec![DefinitionSite {
+                    path: "staleness.rs".to_string(),
+                    line: 2,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn the_current_output_states_nothing_beyond_occurrences_and_definition_sites() {
+        let page = page(Arm::Lexical, CURRENT_ENVELOPE).unwrap();
+        assert_eq!(page.unlabelled_files, 0);
+        assert_eq!(page.searched_files, None);
+        assert_eq!(page.left_out, None);
+        assert!(page.line_counts.is_empty());
+        assert_eq!(page.cost, None);
+        assert_eq!(page.exit_code, 0);
+    }
+
+    #[test]
+    fn every_field_value_the_current_binary_prints_maps_to_a_role() {
+        // `SearchField::name` (eight values) and the co-change stub.
+        for (field, role) in [
+            ("type_definition", Some(Role::Def)),
+            ("function_signature", Some(Role::Def)),
+            ("symbol_name", None),
+            ("import_export", None),
+            ("function_body", None),
+            ("comment", None),
+            ("string_literal", None),
+            ("other", None),
+            ("co_change_partner", None),
+        ] {
+            let json = format!(
+                r#"{{"results":[{{"path":"a.rs","score":1.0,"field":"{field}","line_number":3,
+                    "snippet":{{"lines":[{{"line_number":3,"content":"x","is_match":true}}]}}}}]}}"#
+            );
+            let p = page(Arm::Lexical, &json).unwrap();
+            assert_eq!(p.occurrences, vec![occurrence("a.rs", 3, role)], "{field}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_value_is_a_harness_error_naming_the_value() {
+        for field in ["text", "Function_Signature", "", "functionSignature"] {
+            let json = format!(
+                r#"{{"results":[{{"path":"a.rs","score":1.0,"field":"{field}","line_number":3}}]}}"#
+            );
+            let err = page(Arm::Lexical, &json).expect_err("an unknown field value");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("field"), "{field:?}: {msg}");
+            assert!(msg.contains(&format!("{field:?}")), "{field:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_lexical_row_without_a_string_field_is_a_harness_error() {
+        for row in [
+            r#"{"path":"a.rs","score":1.0,"line_number":3}"#,
+            r#"{"path":"a.rs","score":1.0,"field":null,"line_number":3}"#,
+            r#"{"path":"a.rs","score":1.0,"field":7,"line_number":3}"#,
+        ] {
+            let json = format!(r#"{{"results":[{row}]}}"#);
+            assert!(page(Arm::Lexical, &json).is_err(), "{row}");
+        }
+    }
+
+    #[test]
+    fn a_result_with_no_snippet_or_line_gives_no_occurrence_and_no_definition_site() {
+        // A query under three bytes: `line_number` and `snippet` are null.
+        let p = page(
+            Arm::Lexical,
+            r#"{"results":[{"path":"a.rs","score":0.0,"field":"function_signature",
+                            "line_number":null,"snippet":null}]}"#,
+        )
+        .unwrap();
+        assert!(p.occurrences.is_empty());
+        assert_eq!(p.definitions.unwrap().sites, vec![]);
+    }
+
+    #[test]
+    fn an_empty_lexical_page_reports_no_definition_sites() {
+        let p = page(Arm::Lexical, r#"{"results": []}"#).unwrap();
+        assert!(p.occurrences.is_empty());
+        let definitions = p.definitions.expect("a lexical page states definitions");
+        assert_eq!(definitions.count, None);
+        assert!(definitions.sites.is_empty());
+    }
+
+    #[test]
+    fn definition_sites_keep_the_rank_order_of_the_results() {
+        let row = |path: &str, field: &str, line: u32| {
+            format!(
+                r#"{{"path":"{path}","score":1.0,"field":"{field}","line_number":{line},
+                    "snippet":{{"lines":[{{"line_number":{line},"content":"x","is_match":true}}]}}}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"results":[{},{},{}]}}"#,
+            row("b.rs", "type_definition", 9),
+            row("c.rs", "function_body", 4),
+            row("a.rs", "function_signature", 1)
+        );
+        let sites = page(Arm::Lexical, &json)
+            .unwrap()
+            .definitions
+            .unwrap()
+            .sites;
+        let at: Vec<(&str, u32)> = sites.iter().map(|s| (s.path.as_str(), s.line)).collect();
+        assert_eq!(at, [("b.rs", 9), ("a.rs", 1)]);
+    }
+
+    #[test]
+    fn the_other_arms_state_no_line_level_answers() {
+        // Their rows carry no `field`, and they name no definition.
+        let p = page(
+            Arm::HotCold,
+            r#"{"results":[{"path":"a.rs","hotspot_score":0.9}]}"#,
+        )
+        .unwrap();
+        assert!(p.occurrences.is_empty());
+        assert_eq!(p.definitions, None);
+        let p = page(
+            Arm::Ast,
+            r#"{"results":[{"path":"a.rs","score":1.5,"line":7,"snippet":"fn big() {"}]}"#,
+        )
+        .unwrap();
+        assert!(p.occurrences.is_empty());
+        assert_eq!(p.definitions, None);
+    }
+
+    #[test]
+    fn the_corpus_accounting_comes_from_the_stats_snapshot() {
+        let stats = StatsSnapshot::parse(
+            br#"{"file_count":828,"skipped_by_reason":{"minified":1,"binary":2}}"#,
+        )
+        .unwrap();
+        let p = page(Arm::Lexical, CURRENT_ENVELOPE)
+            .unwrap()
+            .with_accounting(&stats);
+        assert_eq!(p.searched_files, Some(828));
+        assert_eq!(
+            p.left_out,
+            Some(BTreeMap::from([
+                ("binary".to_string(), 2),
+                ("minified".to_string(), 1)
+            ]))
+        );
+        // Nothing else changes.
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(p.occurrences.len(), 2);
     }
 
     // --- standalone --ast coverage ------------------------------------------------

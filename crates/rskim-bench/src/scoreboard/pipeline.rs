@@ -54,7 +54,7 @@ use crate::scoreboard::structural_metrics::{
     uncovered_patterns, unexpected_oracle_matches,
 };
 use crate::scoreboard::types::{AstPage, StatsSnapshot};
-use crate::scoreboard::universe::Universe;
+use crate::scoreboard::universe::{TextUniverse, Universe, text_universe};
 
 // ============================================================================
 // Data dir
@@ -263,7 +263,8 @@ fn run_corpus(
     progress(name, "computing the oracle universe");
     let universe = Universe::compute(&root, &runner.sandbox().git())?;
     universe.check_file_cap()?;
-    let plan = checked_plan(spec, golden, inputs, &universe)?;
+    let text = text_universe(&root, &runner.sandbox().git())?;
+    let plan = checked_plan(spec, golden, inputs, &universe, &text)?;
     let (answers, oracle_wall_ms) = structural_answers(name, &plan, &universe, oracle)?;
     require_expected_empty_oracles(&plan, &answers)?;
 
@@ -273,7 +274,7 @@ fn run_corpus(
     require_temporal_data(&plan, &stats)?;
 
     progress(name, &format!("running {} golden entries", plan.len()));
-    let observed = observe_plan(runner, &root, &plan, &inputs.catalog)?;
+    let observed = observe_plan(runner, &root, &plan, &inputs.catalog, &stats)?;
     require_oracle_less_rows(&plan, &observed.observations)?;
     let evidence = StructuralEvidence {
         answers,
@@ -287,7 +288,14 @@ fn run_corpus(
         "the corpus changed during the run (skim must not write into the corpus root): {after}"
     );
 
-    let eval = metrics::evaluate(&universe, &stats, &plan, &observed.observations, &evidence)?;
+    let eval = metrics::evaluate(
+        &universe,
+        &text,
+        &stats,
+        &plan,
+        &observed.observations,
+        &evidence,
+    )?;
     let report = corpus_report(
         spec,
         golden,
@@ -397,7 +405,10 @@ pub fn call_patterns(
 /// Run every call the plan needs. Each pattern of [`ast_calls`] is called
 /// once (`--ast <pattern>`, full list), in pattern order
 /// ([`call_patterns`]); an `[[ast]]` entry's observation is its pattern
-/// call's rows in its language ([`EntryObservation::for_ast`]).
+/// call's rows in its language ([`EntryObservation::for_ast`]). The full
+/// list of every other entry states the corpus accounting of `stats`
+/// ([`EntryObservation::with_accounting`]): the current output states
+/// `searched_files` and `left_out` nowhere else.
 ///
 /// # Errors
 ///
@@ -407,6 +418,7 @@ fn observe_plan(
     root: &Path,
     plan: &[PlannedQuery],
     catalog: &[CatalogPattern],
+    stats: &StatsSnapshot,
 ) -> anyhow::Result<PlanObservations> {
     let calls = call_patterns(runner, root, ast_calls(plan, catalog))?;
     let mut pattern_timings = BTreeMap::new();
@@ -429,7 +441,7 @@ fn observe_plan(
         let observed = runner
             .observe(root, q)
             .with_context(|| format!("entry {}", q.id))?;
-        observations.push(observed.observation);
+        observations.push(observed.observation.with_accounting(stats));
         timings.push((q.id.clone(), observed.timings));
     }
     Ok(PlanObservations {
@@ -648,6 +660,7 @@ fn checked_plan(
     golden: &LoadedGolden,
     inputs: &Inputs,
     universe: &Universe,
+    text: &TextUniverse,
 ) -> anyhow::Result<Vec<PlannedQuery>> {
     let names: Vec<&str> = inputs.all_names.iter().map(String::as_str).collect();
     let refs = inputs.ledger.refs_for_corpus(&spec.name, &names);
@@ -657,6 +670,7 @@ fn checked_plan(
             corpus: &spec.name,
             commit: &spec.commit,
             universe: Some(universe),
+            text: Some(text),
             ledger: &refs,
             catalog: &inputs.catalog,
         },
@@ -730,6 +744,8 @@ fn corpus_report(
             unindexed_hits: eval.unindexed_hits.clone(),
             idents: eval.samples.idents.clone(),
             concepts: eval.samples.concepts.clone(),
+            refs: eval.samples.refs.clone(),
+            reference: metrics::reference_values(&[&eval.samples]),
         },
     })
 }
@@ -887,9 +903,42 @@ mod tests {
         require_temporal_data(&lexical_only, &stats_with(None)).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn every_full_list_states_the_accounting_of_the_stats_snapshot() {
+        use crate::scoreboard::test_support::script_runner;
+
+        let plan = plan_of(
+            "[[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n\
+             [[stakes]]\nid = \"skim-S01\"\nquery = \"qzvx_absent_7713\"\nexpect = \"exit\"\nexit = 1\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let runner = script_runner(dir.path(), "printf '{\"results\":[]}'\nexit 1");
+        let stats = StatsSnapshot {
+            file_count: 12,
+            skipped_by_reason: BTreeMap::from([("binary".to_string(), 3)]),
+            temporal_state: None,
+        };
+
+        let observed = observe_plan(&runner, Path::new("/c"), &plan, catalog(), &stats).unwrap();
+
+        assert_eq!(observed.observations.len(), 2);
+        for obs in &observed.observations {
+            assert_eq!(obs.full.searched_files, Some(12), "{}", obs.id);
+            assert_eq!(
+                obs.full.left_out,
+                Some(BTreeMap::from([("binary".to_string(), 3)])),
+                "{}",
+                obs.id
+            );
+            // The exit code is the process's, not the default.
+            assert_eq!(obs.full.exit_code, 1, "{}", obs.id);
+        }
+    }
+
     /// An observation whose full list has `rows` rows.
     fn observed(id: &str, rows: usize) -> EntryObservation {
-        use crate::scoreboard::types::{ResultPage, ResultRow, VerifyMode};
+        use crate::scoreboard::types::{ResultPage, ResultRow};
         EntryObservation {
             id: id.to_string(),
             full: ResultPage {
@@ -901,9 +950,7 @@ mod tests {
                         snippet: Vec::new(),
                     })
                     .collect(),
-                has_more: false,
-                verify_mode: VerifyMode::Substring,
-                degraded: Vec::new(),
+                ..ResultPage::default()
             },
             sweeps: Vec::new(),
             limited: Vec::new(),

@@ -13,11 +13,13 @@
 //!   `rskim_research::clone::git_output_with_timeout`; a sweep is bounded by
 //!   [`MAX_PAGES`].
 //! - **Exit status**: stdout must parse as the arm's JSON envelope. A
-//!   non-zero exit with a parsable envelope is accepted (a future no-match
-//!   exit code must not read as a crash); a signal, a timeout, non-JSON
-//!   stdout, a malformed envelope, or a `degraded[]` page for an entry that
-//!   ranks by temporal data is an error, which the scoreboard reports as a
-//!   harness error (exit 2), never as a regression.
+//!   non-zero exit with a parsable envelope is accepted (a no-match exit
+//!   code must not read as a crash), and the page keeps the real exit code
+//!   (`ResultPage::exit_code`), which `stakes.exit` judges. A signal, a
+//!   timeout, non-JSON stdout, a malformed envelope (an unknown `field`
+//!   value included), or a `degraded[]` page for an entry that ranks by
+//!   temporal data is an error, which the scoreboard reports as a harness
+//!   error (exit 2), never as a regression.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -214,6 +216,17 @@ pub struct EntryObservation {
 }
 
 impl EntryObservation {
+    /// This observation with the corpus accounting of `stats` on its full
+    /// list (`universe.accounted` reads it there). The other lists are
+    /// pages of the same call and state none.
+    #[must_use]
+    pub fn with_accounting(self, stats: &StatsSnapshot) -> Self {
+        EntryObservation {
+            full: self.full.with_accounting(stats),
+            ..self
+        }
+    }
+
     /// An `[[ast]]` entry's observation: the rows of its pattern's
     /// `--ast <pattern>` answer `call` in `lang` ([`rows_in`]) as its full
     /// list, and nothing else (the entry is never observed on its own).
@@ -242,6 +255,20 @@ struct JsonCall {
     label: String,
     status: ExitStatus,
     timing: Timing,
+}
+
+impl JsonCall {
+    /// The process exit code, which `stakes.exit` judges.
+    ///
+    /// # Errors
+    ///
+    /// The process has no exit code (a signal ended it): [`SkimRunner::json`]
+    /// refuses that first, and this refuses it too rather than invent a code.
+    fn exit_code(&self) -> anyhow::Result<i32> {
+        self.status
+            .code()
+            .with_context(|| format!("{}: no exit code ({})", self.label, self.status))
+    }
 }
 
 // ============================================================================
@@ -323,7 +350,8 @@ impl SkimRunner {
             .with_context(|| format!("{label} ({}); stderr: {}", out.status, excerpt(&out.stderr)))
     }
 
-    /// One JSON query page.
+    /// One JSON query page, with the process's exit code (any exit code is
+    /// accepted when stdout is a parsable envelope).
     ///
     /// # Errors
     ///
@@ -345,6 +373,10 @@ impl SkimRunner {
                 call.label, call.status
             )
         })?;
+        let page = ResultPage {
+            exit_code: call.exit_code()?,
+            ..page
+        };
         Ok((page, call.timing))
     }
 
@@ -366,12 +398,19 @@ impl SkimRunner {
             ..QueryFlags::default()
         };
         let call = self.json(root, None, &flags, FULL_LIST_LIMIT, 0)?;
-        let page = AstPage::from_json(&call.value).with_context(|| {
+        let AstPage { page, coverage } = AstPage::from_json(&call.value).with_context(|| {
             format!(
                 "{}: unexpected standalone --ast JSON envelope ({})",
                 call.label, call.status
             )
         })?;
+        let page = AstPage {
+            page: ResultPage {
+                exit_code: call.exit_code()?,
+                ..page
+            },
+            coverage,
+        };
         anyhow::ensure!(
             !page.page.has_more,
             "{}: the full list reports has_more = true at --limit {FULL_LIST_LIMIT}, so it is not \
@@ -474,7 +513,9 @@ impl SkimRunner {
     /// # Errors
     ///
     /// An `[[ast]]` entry (its rows come from its pattern's single
-    /// [`SkimRunner::ast_list`] call); any call error; an oracle-less
+    /// [`SkimRunner::ast_list`] call); a `[[stakes]]` entry with `flags` (the
+    /// runner passes none of them to skim, so skim would answer another
+    /// query than the one the regex oracle judges); any call error; an oracle-less
     /// (`--ast` / `--blast-radius`) pagination entry whose full list exceeds
     /// `min(limits) × (MAX_PAGES − 1)` — golden integrity cannot bound those
     /// in advance; or an entry that ranks by temporal data whose pages
@@ -486,6 +527,15 @@ impl SkimRunner {
              (SkimRunner::ast_list), not per entry",
             q.id
         );
+        if let Some(stakes) = q.stakes_oracle() {
+            anyhow::ensure!(
+                stakes.entry.flags.is_empty(),
+                "{}: the runner does not pass the [[stakes]] flags {:?} to skim, so skim would \
+                 answer another query than the one the regex oracle judges; use flags = []",
+                q.id,
+                stakes.entry.flags
+            );
+        }
         let mut timings = Vec::new();
         let query = q.query.as_deref();
         let (full, t) = self.page(root, q.arm, query, &q.flags, FULL_LIST_LIMIT, 0)?;
@@ -623,6 +673,8 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::scoreboard::test_support::script_runner;
 
     fn strings(args: &[OsString]) -> Vec<String> {
         args.iter()
@@ -732,7 +784,7 @@ mod tests {
 
     #[test]
     fn a_ranked_entry_whose_ranking_skim_did_not_apply_is_an_error() {
-        use crate::scoreboard::types::{Degraded, VerifyMode};
+        use crate::scoreboard::types::Degraded;
 
         let golden = crate::scoreboard::golden::parse_golden(
             "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
@@ -751,10 +803,8 @@ mod tests {
             applied: Some("lexical".to_string()),
         };
         let page = |degraded: Vec<Degraded>| ResultPage {
-            rows: Vec::new(),
-            has_more: false,
-            verify_mode: VerifyMode::Substring,
             degraded,
+            ..ResultPage::default()
         };
         let observation = |q: &PlannedQuery, full, sweeps, limited| EntryObservation {
             id: q.id.clone(),
@@ -825,6 +875,116 @@ mod tests {
             .observe(Path::new("/c"), &plan[0])
             .expect_err("an [[ast]] entry's rows come from its pattern's call");
         assert!(format!("{err:#}").contains("ast_list"), "{err:#}");
+    }
+
+    #[test]
+    fn a_stakes_entry_with_flags_is_refused_because_the_runner_cannot_pass_them() {
+        let golden = crate::scoreboard::golden::parse_golden(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
+             [[stakes]]\nid = \"skim-Q09\"\nquery = \"Launch\"\nflags = [\"-i\"]\nexpect = \"lines\"\n",
+        )
+        .unwrap();
+        let plan = crate::scoreboard::metrics::plan(&golden).unwrap();
+        // The binary does not exist: the refusal comes before any call.
+        let runner = SkimRunner::new("/nonexistent/skim", SkimSandbox::new("/sb"));
+        let err = runner
+            .observe(Path::new("/c"), &plan[0])
+            .expect_err("skim would run without the -i the oracle reads");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("skim-Q09"), "{msg}");
+        assert!(msg.contains("\"-i\""), "{msg}");
+    }
+
+    // --- the exit status of the process -----------------------------------------
+
+    #[cfg(unix)]
+    fn lexical_page(runner: &SkimRunner) -> anyhow::Result<(ResultPage, Timing)> {
+        runner.page(
+            Path::new("/c"),
+            Arm::Lexical,
+            Some("qzvx_absent_7713"),
+            &QueryFlags::default(),
+            10,
+            0,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_page_carries_the_exit_code_of_the_process() {
+        for code in [0, 1, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = script_runner(
+                dir.path(),
+                &format!("printf '{{\"results\":[]}}'\nexit {code}"),
+            );
+            let (page, _) = lexical_page(&runner).unwrap();
+            assert_eq!(page.exit_code, code);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ast_list_carries_the_exit_code_of_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = script_runner(dir.path(), "printf '{\"results\":[]}'\nexit 1");
+        let (ast, _) = runner.ast_list(Path::new("/c"), "try-catch").unwrap();
+        assert_eq!(ast.page.exit_code, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_envelope_that_does_not_parse_is_a_harness_error_whatever_the_exit_code() {
+        for code in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = script_runner(
+                dir.path(),
+                &format!("printf 'skim search: no index found'\nexit {code}"),
+            );
+            let err = lexical_page(&runner).expect_err("stdout is not JSON");
+            assert!(format!("{err:#}").contains("not valid JSON"), "{err:#}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lexical_envelope_with_an_unknown_field_is_a_harness_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = script_runner(
+            dir.path(),
+            "printf '{\"results\":[{\"path\":\"a.rs\",\"score\":1.0,\"field\":\"text\"}]}'",
+        );
+        let err = lexical_page(&runner).expect_err("an unknown field value");
+        assert!(format!("{err:#}").contains("\"text\""), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_killed_by_a_signal_is_a_harness_error_not_an_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = script_runner(dir.path(), "printf '{\"results\":[]}'\nkill -9 $$");
+        let err = lexical_page(&runner).expect_err("a killed process");
+        assert!(format!("{err:#}").contains("signal"), "{err:#}");
+    }
+
+    #[test]
+    fn the_accounting_of_the_stats_lands_on_the_full_list_only() {
+        let stats =
+            StatsSnapshot::parse(br#"{"file_count":7,"skipped_by_reason":{"binary":2}}"#).unwrap();
+        let observation = EntryObservation {
+            id: "x".to_string(),
+            full: ResultPage::default(),
+            sweeps: Vec::new(),
+            limited: vec![(5, ResultPage::default())],
+            text: None,
+        }
+        .with_accounting(&stats);
+        assert_eq!(observation.full.searched_files, Some(7));
+        assert_eq!(
+            observation.full.left_out,
+            Some(BTreeMap::from([("binary".to_string(), 2)]))
+        );
+        assert_eq!(observation.limited[0].1.searched_files, None);
     }
 
     #[test]

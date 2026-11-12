@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "golden_sha256": "2b38acc90815ab908ab1eb1a535b9fd0f7cf5c85180c26d72ca57a60d5f8f080",
+  "golden_sha256": "56ce43189a5f17cfdff0465cf4cc425b3cd5b8a3316a493fa2f9732af9d4469a",
   "corpora": {
     "flask": {
       "commit": "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392",
-      "golden_sha256": "a28867f51bf371383dc166c1f3dcd873c424487a692f0dbd13bfd562b0b4135f",
+      "golden_sha256": "63e589aaf2a17adb033fc9d26d3b3b012c5c5dc6d46518b0379216185a0ae842",
       "hard": {
         "flask-C01": {
           "lexical.precision": "pass",
@@ -52,6 +52,30 @@
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "flask-C07": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "flask-C08": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "flask-D01": {
+          "clash.calls_recall": "xfail",
+          "clash.def_count": "xfail",
+          "clash.defs_complete": "xfail",
           "results.unique_paths": "pass"
         },
         "flask-F001": {
@@ -166,12 +190,14 @@
         "flask-G01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "flask-I01": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -180,6 +206,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I02": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -188,6 +215,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I03": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -196,6 +224,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I04": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -204,6 +233,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I05": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -212,6 +242,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I06": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -220,6 +251,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I07": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -228,6 +260,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I08": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -236,6 +269,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I09": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -244,6 +278,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I10": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -252,6 +287,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I11": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -260,6 +296,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I12": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -268,6 +305,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I13": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -276,6 +314,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I14": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -284,6 +323,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I15": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -292,6 +332,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I16": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -300,6 +341,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I17": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -308,6 +350,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I18": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -316,6 +359,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I19": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -324,6 +368,7 @@
           "results.unique_paths": "pass"
         },
         "flask-I20": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -334,6 +379,7 @@
         "flask-K01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -342,12 +388,14 @@
         "flask-K02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "flask-L01": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -356,6 +404,7 @@
           "results.unique_paths": "pass"
         },
         "flask-L02": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -364,6 +413,7 @@
           "results.unique_paths": "pass"
         },
         "flask-L03": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -372,6 +422,7 @@
           "results.unique_paths": "pass"
         },
         "flask-L04": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -380,6 +431,7 @@
           "results.unique_paths": "pass"
         },
         "flask-L05": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -388,6 +440,7 @@
           "results.unique_paths": "pass"
         },
         "flask-L06": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -398,6 +451,7 @@
         "flask-P01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -406,6 +460,7 @@
         "flask-P02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -414,6 +469,7 @@
         "flask-P03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -422,6 +478,7 @@
         "flask-P04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -430,14 +487,42 @@
         "flask-P05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
+        "flask-Q01": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "xfail"
+        },
+        "flask-Q02": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "pass"
+        },
+        "flask-R01": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "flask-R02": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "flask-R03": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
         "flask-S01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -446,6 +531,7 @@
         "flask-S02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -454,6 +540,7 @@
         "flask-S03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -462,6 +549,7 @@
         "flask-X01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -470,6 +558,7 @@
         "flask-X02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -478,6 +567,7 @@
         "flask-X03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -486,6 +576,7 @@
         "flask-X04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -494,6 +585,7 @@
         "flask-X05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -502,6 +594,7 @@
         "flask-X06": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -510,6 +603,7 @@
         "flask-X07": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -518,6 +612,7 @@
         "flask-Z01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -526,6 +621,7 @@
         "flask-Z02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -553,16 +649,16 @@
         "bytes.first_correct_median": 376.0,
         "bytes.first_correct_misses": 0.0,
         "bytes.rg_first_correct_median": 183.0,
-        "bytes.rg_text_median": 655.0,
+        "bytes.rg_text_median": 608.0,
         "bytes.rg_text_p90": 5513.0,
-        "bytes.text_median": 1416.0,
+        "bytes.text_median": 1480.0,
         "bytes.text_p90": 7728.0,
-        "concept.p10": 0.75,
-        "concept.p10.baseline_alpha": 0.6833,
-        "concept.p10.baseline_count": 0.7667,
-        "concept.p5": 0.7667,
-        "concept.p5.baseline_alpha": 0.6333,
-        "concept.p5.baseline_count": 0.8667,
+        "concept.p10": 0.7181,
+        "concept.p10.baseline_alpha": 0.6181,
+        "concept.p10.baseline_count": 0.7056,
+        "concept.p5": 0.775,
+        "concept.p5.baseline_alpha": 0.575,
+        "concept.p5.baseline_count": 0.825,
         "coverage.tracked_text": 0.4632,
         "ident.anchor_eq_def": 0.5769,
         "ident.def_line_in_snippet": 0.6154,
@@ -613,7 +709,7 @@
     },
     "ripgrep": {
       "commit": "4519153e5e461527f4bca45b042fff45c4ec6fb9",
-      "golden_sha256": "18eeda17cfde1267059fe5672564b83c513dfe266c76f14b24f4fd2c1e26f70b",
+      "golden_sha256": "0ae46046850984952d0b0777f08df7e9aea2579d511558fef20631e5e45ce745",
       "hard": {
         "ripgrep-C01": {
           "lexical.precision": "pass",
@@ -669,6 +765,30 @@
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "ripgrep-C08": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "ripgrep-C09": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "ripgrep-D01": {
+          "clash.calls_recall": "xfail",
+          "clash.def_count": "xfail",
+          "clash.defs_complete": "xfail",
           "results.unique_paths": "pass"
         },
         "ripgrep-F001": {
@@ -783,12 +903,14 @@
         "ripgrep-G01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "ripgrep-I01": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -797,6 +919,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I02": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -805,6 +928,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I03": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -813,6 +937,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I04": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -821,6 +946,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I05": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -829,6 +955,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I06": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -837,6 +964,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I07": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -845,6 +973,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I08": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -853,6 +982,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I09": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -861,6 +991,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I10": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -869,6 +1000,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I11": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -877,6 +1009,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I12": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -885,6 +1018,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I13": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -893,6 +1027,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I14": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -901,6 +1036,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I15": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -909,6 +1045,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I16": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -917,6 +1054,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I17": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -925,6 +1063,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I18": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -933,6 +1072,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I19": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -941,6 +1081,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-I20": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -951,6 +1092,7 @@
         "ripgrep-K01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -959,12 +1101,14 @@
         "ripgrep-K02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "ripgrep-L01": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -973,6 +1117,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-L02": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -981,6 +1126,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-L03": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -989,6 +1135,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-L04": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -997,6 +1144,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-L05": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1005,6 +1153,7 @@
           "results.unique_paths": "pass"
         },
         "ripgrep-L06": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1015,6 +1164,7 @@
         "ripgrep-P01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1023,6 +1173,7 @@
         "ripgrep-P02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1031,6 +1182,7 @@
         "ripgrep-P03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1039,6 +1191,7 @@
         "ripgrep-P04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1047,14 +1200,42 @@
         "ripgrep-P05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
+        "ripgrep-Q01": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "xfail"
+        },
+        "ripgrep-Q02": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "pass"
+        },
+        "ripgrep-R01": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "ripgrep-R02": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "ripgrep-R03": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
         "ripgrep-S01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1063,6 +1244,7 @@
         "ripgrep-S02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1071,6 +1253,7 @@
         "ripgrep-S03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1079,6 +1262,7 @@
         "ripgrep-X01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1087,6 +1271,7 @@
         "ripgrep-X02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1095,6 +1280,7 @@
         "ripgrep-X03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1103,6 +1289,7 @@
         "ripgrep-X04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1111,6 +1298,7 @@
         "ripgrep-X05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1119,6 +1307,7 @@
         "ripgrep-X06": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1127,6 +1316,7 @@
         "ripgrep-X07": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1135,6 +1325,7 @@
         "ripgrep-Z01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1143,6 +1334,7 @@
         "ripgrep-Z02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1207,14 +1399,14 @@
         "bytes.rg_first_correct_median": 433.0,
         "bytes.rg_text_median": 1765.0,
         "bytes.rg_text_p90": 16252.0,
-        "bytes.text_median": 2222.0,
+        "bytes.text_median": 2348.0,
         "bytes.text_p90": 9643.0,
         "concept.p10": 0.9,
-        "concept.p10.baseline_alpha": 0.7714,
-        "concept.p10.baseline_count": 0.9571,
-        "concept.p5": 0.9143,
-        "concept.p5.baseline_alpha": 0.7429,
-        "concept.p5.baseline_count": 0.9714,
+        "concept.p10.baseline_alpha": 0.8,
+        "concept.p10.baseline_count": 0.9444,
+        "concept.p5": 0.9111,
+        "concept.p5.baseline_alpha": 0.7778,
+        "concept.p5.baseline_count": 0.9556,
         "coverage.tracked_text": 0.6651,
         "ident.anchor_eq_def": 0.5769,
         "ident.def_line_in_snippet": 0.5769,
@@ -1274,7 +1466,7 @@
     },
     "skim": {
       "commit": "b8a0a79463382347820f1c2572bde37b68e87c76",
-      "golden_sha256": "c9b29dadd79bb17cd8c540eb78197300d98f90cecbb27e431f587e5e779b1c30",
+      "golden_sha256": "52c21b25448cbcc7311f00467ed54d3f42e958f7da5934c13241a6d3a1e9d097",
       "hard": {
         "skim-C01": {
           "lexical.precision": "pass",
@@ -1330,6 +1522,30 @@
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "skim-C08": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "skim-C09": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "skim-D01": {
+          "clash.calls_recall": "xfail",
+          "clash.def_count": "xfail",
+          "clash.defs_complete": "xfail",
           "results.unique_paths": "pass"
         },
         "skim-F001": {
@@ -1456,6 +1672,7 @@
         "skim-G01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1464,12 +1681,14 @@
         "skim-G02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "skim-I01": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1478,6 +1697,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I02": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1486,6 +1706,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I03": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1494,6 +1715,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I04": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1502,6 +1724,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I05": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1510,6 +1733,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I06": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1518,6 +1742,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I07": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1526,6 +1751,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I08": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1534,6 +1760,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I09": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1542,6 +1769,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I10": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1550,6 +1778,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I11": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1558,6 +1787,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I12": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1566,6 +1796,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I13": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1574,6 +1805,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I14": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1582,6 +1814,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I15": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1590,6 +1823,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I16": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1598,6 +1832,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I17": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1606,6 +1841,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I18": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1614,6 +1850,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I19": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1622,6 +1859,7 @@
           "results.unique_paths": "pass"
         },
         "skim-I20": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1632,6 +1870,7 @@
         "skim-K01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1640,12 +1879,14 @@
         "skim-K02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "skim-L01": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1654,6 +1895,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L02": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1662,6 +1904,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L03": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1670,6 +1913,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L04": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1678,6 +1922,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L05": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1686,6 +1931,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L06": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1694,6 +1940,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L07": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1702,6 +1949,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L08": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1710,6 +1958,7 @@
           "results.unique_paths": "pass"
         },
         "skim-L09": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1720,6 +1969,7 @@
         "skim-P01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1728,6 +1978,7 @@
         "skim-P02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1736,6 +1987,7 @@
         "skim-P03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1744,6 +1996,7 @@
         "skim-P04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1752,12 +2005,40 @@
         "skim-P05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
+        "skim-Q01": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "xfail"
+        },
+        "skim-Q02": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "pass"
+        },
+        "skim-R01": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "skim-R02": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "skim-R03": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
         "skim-S01": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -1768,6 +2049,7 @@
         "skim-S02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1776,6 +2058,7 @@
         "skim-S03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1784,6 +2067,7 @@
         "skim-S04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1792,6 +2076,7 @@
         "skim-X01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1800,6 +2085,7 @@
         "skim-X02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1808,6 +2094,7 @@
         "skim-X03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1816,6 +2103,7 @@
         "skim-X04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1824,6 +2112,7 @@
         "skim-X05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1832,6 +2121,7 @@
         "skim-X06": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1840,6 +2130,7 @@
         "skim-X07": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1848,6 +2139,7 @@
         "skim-X08": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1856,6 +2148,7 @@
         "skim-Z01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -1864,6 +2157,7 @@
         "skim-Z02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2005,16 +2299,16 @@
         "bytes.first_correct_median": 480.0,
         "bytes.first_correct_misses": 0.0,
         "bytes.rg_first_correct_median": 674.0,
-        "bytes.rg_text_median": 2432.0,
+        "bytes.rg_text_median": 2179.0,
         "bytes.rg_text_p90": 21854.0,
-        "bytes.text_median": 4994.0,
+        "bytes.text_median": 6119.0,
         "bytes.text_p90": 21578.0,
-        "concept.p10": 0.7714,
-        "concept.p10.baseline_alpha": 0.7143,
-        "concept.p10.baseline_count": 0.8143,
-        "concept.p5": 0.8,
-        "concept.p5.baseline_alpha": 0.6571,
-        "concept.p5.baseline_count": 0.8286,
+        "concept.p10": 0.716,
+        "concept.p10.baseline_alpha": 0.6827,
+        "concept.p10.baseline_count": 0.7827,
+        "concept.p5": 0.7556,
+        "concept.p5.baseline_alpha": 0.6444,
+        "concept.p5.baseline_count": 0.8222,
         "coverage.tracked_text": 0.7377,
         "ident.anchor_eq_def": 0.4667,
         "ident.def_line_in_snippet": 0.5,
@@ -2093,7 +2387,7 @@
     },
     "zod": {
       "commit": "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5",
-      "golden_sha256": "cf4a2ff08645d8683a280440dfdac7c90996203a90ae1593d2c01a57e47df5c3",
+      "golden_sha256": "2f05b767f1e533a095bed4c3319dc627c965afb18480a1c985c65aa6745004d7",
       "hard": {
         "zod-C01": {
           "lexical.precision": "pass",
@@ -2141,6 +2435,30 @@
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "zod-C07": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "zod-C08": {
+          "concept.first_right_top5": "pass",
+          "lexical.precision": "pass",
+          "lexical.recall": "pass",
+          "lexical.silent_fn": "pass",
+          "lexical.verify_mode": "pass",
+          "order.score_monotone": "pass",
+          "results.unique_paths": "pass"
+        },
+        "zod-D01": {
+          "clash.calls_recall": "xfail",
+          "clash.def_count": "xfail",
+          "clash.defs_complete": "xfail",
           "results.unique_paths": "pass"
         },
         "zod-F001": {
@@ -2255,12 +2573,14 @@
         "zod-G01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "zod-I01": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2269,6 +2589,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I02": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2277,6 +2598,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I03": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2285,6 +2607,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I04": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2293,6 +2616,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I05": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2301,6 +2625,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I06": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2309,6 +2634,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I07": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2317,6 +2643,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I08": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2325,6 +2652,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I09": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2333,6 +2661,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I10": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2341,6 +2670,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I11": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2349,6 +2679,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I12": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2357,6 +2688,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I13": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2365,6 +2697,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I14": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2373,6 +2706,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I15": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2381,6 +2715,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I16": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2389,6 +2724,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I17": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2397,6 +2733,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I18": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2405,6 +2742,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I19": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2413,6 +2751,7 @@
           "results.unique_paths": "pass"
         },
         "zod-I20": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2423,6 +2762,7 @@
         "zod-K01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2431,12 +2771,14 @@
         "zod-K02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
         "zod-L01": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2445,6 +2787,7 @@
           "results.unique_paths": "pass"
         },
         "zod-L02": {
+          "ident.def_first": "pass",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2453,6 +2796,7 @@
           "results.unique_paths": "pass"
         },
         "zod-L03": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2461,6 +2805,7 @@
           "results.unique_paths": "pass"
         },
         "zod-L04": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2469,6 +2814,7 @@
           "results.unique_paths": "pass"
         },
         "zod-L05": {
+          "ident.def_first": "xfail",
           "lexical.precision": "pass",
           "lexical.recall": "pass",
           "lexical.silent_fn": "pass",
@@ -2479,6 +2825,7 @@
         "zod-P01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2487,6 +2834,7 @@
         "zod-P02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2495,6 +2843,7 @@
         "zod-P03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2503,6 +2852,7 @@
         "zod-P04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2511,14 +2861,42 @@
         "zod-P05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
         },
+        "zod-Q01": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "xfail"
+        },
+        "zod-Q02": {
+          "results.unique_paths": "pass",
+          "stakes.exit": "pass"
+        },
+        "zod-R01": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "zod-R02": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
+        "zod-R03": {
+          "refs.calls_recall": "xfail",
+          "refs.recall": "xfail",
+          "results.unique_paths": "pass",
+          "universe.accounted": "xfail"
+        },
         "zod-S01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2527,6 +2905,7 @@
         "zod-S02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2535,6 +2914,7 @@
         "zod-S03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2543,6 +2923,7 @@
         "zod-X01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2551,6 +2932,7 @@
         "zod-X02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2559,6 +2941,7 @@
         "zod-X03": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2567,6 +2950,7 @@
         "zod-X04": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2575,6 +2959,7 @@
         "zod-X05": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "xfail",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2583,6 +2968,7 @@
         "zod-X06": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2591,6 +2977,7 @@
         "zod-X07": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2599,6 +2986,7 @@
         "zod-Z01": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2607,6 +2995,7 @@
         "zod-Z02": {
           "lexical.precision": "pass",
           "lexical.recall": "pass",
+          "lexical.recall_tracked": "pass",
           "lexical.silent_fn": "pass",
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
@@ -2716,16 +3105,16 @@
         "bytes.first_correct_median": 425.0,
         "bytes.first_correct_misses": 0.0,
         "bytes.rg_first_correct_median": 939.0,
-        "bytes.rg_text_median": 1833.0,
+        "bytes.rg_text_median": 1593.0,
         "bytes.rg_text_p90": 14024.0,
-        "bytes.text_median": 2194.0,
-        "bytes.text_p90": 9278.0,
-        "concept.p10": 0.9167,
-        "concept.p10.baseline_alpha": 0.6667,
-        "concept.p10.baseline_count": 0.85,
-        "concept.p5": 0.9333,
-        "concept.p5.baseline_alpha": 0.6,
-        "concept.p5.baseline_count": 0.9333,
+        "bytes.text_median": 2514.0,
+        "bytes.text_p90": 9343.0,
+        "concept.p10": 0.8625,
+        "concept.p10.baseline_alpha": 0.6125,
+        "concept.p10.baseline_count": 0.8,
+        "concept.p5": 0.875,
+        "concept.p5.baseline_alpha": 0.525,
+        "concept.p5.baseline_count": 0.875,
         "coverage.tracked_text": 0.8858,
         "ident.anchor_eq_def": 0.48,
         "ident.def_line_in_snippet": 0.52,
@@ -2804,16 +3193,16 @@
     "bytes.first_correct_median": 404.0,
     "bytes.first_correct_misses": 0.0,
     "bytes.rg_first_correct_median": 433.0,
-    "bytes.rg_text_median": 1573.0,
-    "bytes.rg_text_p90": 16252.0,
-    "bytes.text_median": 2177.0,
+    "bytes.rg_text_median": 1439.0,
+    "bytes.rg_text_p90": 15766.0,
+    "bytes.text_median": 2348.0,
     "bytes.text_p90": 10932.0,
-    "concept.p10": 0.8346,
-    "concept.p10.baseline_alpha": 0.7115,
-    "concept.p10.baseline_count": 0.85,
-    "concept.p5": 0.8538,
-    "concept.p5.baseline_alpha": 0.6615,
-    "concept.p5.baseline_count": 0.9,
+    "concept.p10": 0.7997,
+    "concept.p10.baseline_alpha": 0.682,
+    "concept.p10.baseline_count": 0.8114,
+    "concept.p5": 0.8294,
+    "concept.p5.baseline_alpha": 0.6353,
+    "concept.p5.baseline_count": 0.8706,
     "coverage.tracked_text": 0.7378,
     "ident.anchor_eq_def": 0.5234,
     "ident.def_line_in_snippet": 0.5514,
@@ -2941,5 +3330,21 @@
     "universe.delta": 0.0,
     "universe.skipped_by_reason_mismatch": 0.0
   },
-  "accepted_regressions": []
+  "accepted_regressions": [
+    {
+      "reason": "new frozen concept entries (#540 PR 1) change the pooled means; skim binary unchanged",
+      "regressions": [
+        "skim/bytes.text_median: 4994 -> 6119",
+        "skim/concept.p10: 0.7714 -> 0.716",
+        "skim/concept.p5: 0.8 -> 0.7556",
+        "ripgrep/bytes.text_median: 2222 -> 2348",
+        "ripgrep/concept.p5: 0.9143 -> 0.9111",
+        "flask/bytes.text_median: 1416 -> 1480",
+        "flask/concept.p10: 0.75 -> 0.7181",
+        "zod/bytes.text_median: 2194 -> 2514",
+        "zod/concept.p10: 0.9167 -> 0.8625",
+        "zod/concept.p5: 0.9333 -> 0.875"
+      ]
+    }
+  ]
 }

@@ -864,7 +864,7 @@ pub struct StructuralOracle {
 pub struct OracleScratch {
     parser: Parser,
     /// Its match limit is fixed at creation ([`ORACLE_MATCH_LIMIT`]).
-    cursor: QueryCursor,
+    pub(crate) cursor: QueryCursor,
 }
 
 impl OracleScratch {
@@ -907,7 +907,7 @@ impl OracleScratch {
     /// The grammar cannot be loaded, or the parser returns no tree
     /// (tree-sitter does so only on cancellation or timeout, neither of
     /// which is set here).
-    fn parse(&mut self, lang: OracleLang, source: &str) -> anyhow::Result<Tree> {
+    pub(crate) fn parse(&mut self, lang: OracleLang, source: &str) -> anyhow::Result<Tree> {
         self.parser
             .set_language(&lang.grammar())
             .with_context(|| format!("loading the {lang} grammar"))?;
@@ -1281,7 +1281,7 @@ fn nested_loop_lines(spec: &IntentSpec, tree: &Tree) -> anyhow::Result<Vec<u32>>
 }
 
 /// The 1-based first line of `node`.
-fn first_line(node: Node<'_>) -> anyhow::Result<u32> {
+pub(crate) fn first_line(node: Node<'_>) -> anyhow::Result<u32> {
     let row = node.start_position().row;
     row.checked_add(1)
         .and_then(|line| u32::try_from(line).ok())
@@ -1291,4 +1291,4 @@ fn first_line(node: Node<'_>) -> anyhow::Result<u32> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code — unwrap/expect/panic acceptable for test assertions
 #[path = "structural_tests.rs"]
-mod tests;
+pub(crate) mod tests;

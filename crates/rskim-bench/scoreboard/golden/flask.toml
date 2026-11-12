@@ -428,3 +428,118 @@ id = "flask-ast-try-finally-python"
 pattern = "try-finally"
 lang = "python"
 precision = "hard"
+
+# --- frozen answers (#540): refs, clash, plain-word first files, stakes -----------
+#
+# Every site below comes from `git grep -nw <name>` at 7374c85d and a hand read of
+# each hit line, with no skim output. The roles are def, call, ref, import,
+# comment, string and text. A [[refs]] entry lists every whole-word line of its
+# name, so its sites add up to the grep count.
+#
+# [[clash]] names have 2 or more definitions. Calls are not split by definition
+# (split = "none"), so every call is "unassigned".
+
+[[refs]]
+id = "flask-R01"
+query = "get_debug_flag"
+def = { path = "src/flask/helpers.py", line = 28 }
+sites = [
+    { path = "src/flask/app.py", line = 40, role = "import" },
+    { path = "src/flask/app.py", line = 714, role = "call" },
+    { path = "src/flask/cli.py", line = 24, role = "import" },
+    { path = "src/flask/cli.py", line = 369, role = "call" },
+    { path = "src/flask/cli.py", line = 973, role = "call" },
+    { path = "src/flask/helpers.py", line = 28, role = "def" },
+    { path = "src/flask/sansio/app.py", line = 25, role = "import" },
+    { path = "src/flask/sansio/app.py", line = 492, role = "call" },
+    { path = "tests/test_helpers.py", line = 8, role = "import" },
+    { path = "tests/test_helpers.py", line = 340, role = "call" },
+]
+origin = "curated"
+
+[[refs]]
+id = "flask-R02"
+query = "find_best_app"
+def = { path = "src/flask/cli.py", line = 41 }
+sites = [
+    { path = "src/flask/cli.py", line = 41, role = "def" },
+    { path = "src/flask/cli.py", line = 262, role = "call" },
+    { path = "tests/test_cli.py", line = 21, role = "import" },
+    { path = "tests/test_cli.py", line = 52, role = "call" },
+    { path = "tests/test_cli.py", line = 57, role = "call" },
+    { path = "tests/test_cli.py", line = 62, role = "call" },
+    { path = "tests/test_cli.py", line = 69, role = "call" },
+    { path = "tests/test_cli.py", line = 78, role = "call" },
+    { path = "tests/test_cli.py", line = 87, role = "call" },
+    { path = "tests/test_cli.py", line = 98, role = "call" },
+    { path = "tests/test_cli.py", line = 107, role = "call" },
+    { path = "tests/test_cli.py", line = 112, role = "ref" },
+    { path = "tests/test_cli.py", line = 118, role = "ref" },
+    { path = "tests/test_cli.py", line = 125, role = "ref" },
+    { path = "tests/test_cli.py", line = 132, role = "ref" },
+]
+origin = "curated"
+
+[[refs]]
+id = "flask-R03"
+query = "has_level_handler"
+def = { path = "src/flask/logging.py", line = 31 }
+sites = [
+    { path = "src/flask/logging.py", line = 31, role = "def" },
+    { path = "src/flask/logging.py", line = 76, role = "call" },
+    { path = "tests/test_logging.py", line = 8, role = "import" },
+    { path = "tests/test_logging.py", line = 72, role = "call" },
+    { path = "tests/test_logging.py", line = 76, role = "call" },
+    { path = "tests/test_logging.py", line = 79, role = "call" },
+    { path = "tests/test_logging.py", line = 83, role = "call" },
+]
+origin = "curated"
+
+[[clash]]
+id = "flask-D01"
+query = "send_static_file"
+defs = [
+    { path = "src/flask/app.py", line = 392 },
+    { path = "src/flask/blueprints.py", line = 82 },
+]
+calls = [
+    { path = "src/flask/app.py", line = 362, def = "unassigned" },
+    { path = "tests/test_blueprints.py", line = 233, def = "unassigned" },
+    { path = "tests/test_helpers.py", line = 48, def = "unassigned" },
+    { path = "tests/test_helpers.py", line = 58, def = "unassigned" },
+    { path = "tests/test_helpers.py", line = 66, def = "unassigned" },
+    { path = "tests/test_helpers.py", line = 77, def = "unassigned" },
+]
+split = "none"
+origin = "curated"
+
+# Plain-word queries with the files that hold the answer. The relevance regex was
+# written from the source before any skim run.
+[[concept]]
+id = "flask-C07"
+query = "session cookie"
+relevant = '(?i)session[_\s-]*cookie|SecureCookie'
+first = ["src/flask/sessions.py"]
+
+[[concept]]
+id = "flask-C08"
+query = "register blueprint"
+relevant = '(?i)register[_\s-]*blueprint'
+first = ["src/flask/sansio/blueprints.py", "src/flask/sansio/app.py"]
+
+# --- stakes: exit codes of a plain-text search (no flag) ----------------------------
+# A literal that no tracked file holds exits 1; a literal that a tracked file holds
+# exits 0 (the exit codes of rg).
+[[stakes]]
+id = "flask-Q01"
+query = "qzvx_absent_7713"
+flags = []
+expect = "exit"
+exit = 1
+
+[[stakes]]
+id = "flask-Q02"
+query = "FLASK_DEBUG"
+flags = []
+expect = "exit"
+exit = 0

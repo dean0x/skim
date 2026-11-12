@@ -308,12 +308,7 @@ fn corpus(name: &str, checks: Vec<CheckRecord>, ratchet: &[(&str, f64)]) -> Corp
         checks,
         ratchet: ratchet.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         structural: StructuralReport::default(),
-        info: CorpusInfo {
-            oracle_skipped_by_reason: BTreeMap::new(),
-            unindexed_hits: BTreeMap::new(),
-            idents: Vec::new(),
-            concepts: Vec::new(),
-        },
+        info: CorpusInfo::default(),
     }
 }
 
@@ -378,6 +373,25 @@ fn a_run_equal_to_its_baseline_passes() {
     )];
     let b = baseline_of(&c, &[("ident.mrr", 0.9)]);
     let g = gate(&c, &[("ident.mrr", 0.9)], true, Some(&b));
+    assert_eq!(g.status, GateStatus::Pass, "{:?}", g.failures);
+    assert!(g.failures.is_empty());
+}
+
+#[test]
+fn a_moved_info_reference_row_never_gates() {
+    // The baseline is blessed from a report with one value of the `rg -nw`
+    // rows; the current run states another, and nothing else differs.
+    let blessed = vec![corpus(
+        "skim",
+        vec![pass_record("skim-X01")],
+        &[("ident.mrr", 0.9)],
+    )];
+    let b = baseline_of(&blessed, &[("ident.mrr", 0.9)]);
+    let mut current = blessed.clone();
+    current[0].info.reference = BTreeMap::from([("bytes.rgw_text_median".to_string(), 99_999.0)]);
+
+    let g = gate(&current, &[("ident.mrr", 0.9)], true, Some(&b));
+
     assert_eq!(g.status, GateStatus::Pass, "{:?}", g.failures);
     assert!(g.failures.is_empty());
 }
