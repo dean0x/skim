@@ -260,7 +260,6 @@ mod tests {
 
     fn make_empty_result() -> HeatmapResult {
         HeatmapResult {
-            version: 1,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "test-repo".to_string(),
             window: make_window(),

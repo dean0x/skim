@@ -18,9 +18,12 @@ use super::view::{HeatmapView, text_warnings};
 // JSON output
 // ============================================================================
 
-/// Render the heatmap result as pretty-printed JSON.
-pub(crate) fn render_json(result: &HeatmapResult) -> anyhow::Result<String> {
-    Ok(serde_json::to_string_pretty(result)?)
+/// Render the view as compact JSON version 2 (one line).
+pub(crate) fn render_json(
+    result: &HeatmapResult,
+    view: &HeatmapView<'_>,
+) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&view.to_json(result))?)
 }
 
 // ============================================================================
@@ -253,7 +256,6 @@ mod tests {
 
     fn make_result() -> HeatmapResult {
         HeatmapResult {
-            version: 1,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "/home/dev/work/test-repo".to_string(),
             window: WindowInfo {
@@ -554,28 +556,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_json_roundtrip() {
+    fn test_json_is_compact_version_two() {
         let result = make_result();
-        let json = render_json(&result).unwrap();
+        let json = render_json(&result, &build_view(&result, &DEFAULT_VIEW)).unwrap();
+        assert_eq!(json.lines().count(), 1, "one line: {json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["version"], 2);
         assert_eq!(parsed["repository"], "/home/dev/work/test-repo");
-        assert!(parsed["files"].is_array());
-        assert!(parsed["modules"].is_array());
-        assert!(parsed["coupling_graph"].is_array());
+        assert_eq!(parsed["counts"]["hotspots"]["shown"], 1);
     }
 
     #[test]
     fn test_json_has_all_metric_keys() {
         let result = make_result();
-        let json = render_json(&result).unwrap();
+        let json = render_json(&result, &build_view(&result, &DEFAULT_VIEW)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let file = &parsed["files"][0];
-        assert!(file["churn"].is_object());
-        assert!(file["stability_score"].is_number());
+        assert_eq!(file["churn"]["commits"], 5);
+        assert_eq!(file["stability_score"], 42);
         assert!(file["authors"].is_object());
-        assert!(file["fix_risk"].is_object());
-        assert!(file["blast_radius"].is_array());
+        assert_eq!(file["fix_risk"]["keyword_pct"], 40.0);
+        assert_eq!(file["fix_risk"]["insufficient_data"], false);
+        assert_eq!(file["blast_radius"][0]["path"], "src/lib.rs");
     }
 
     // -----------------------------------------------------------------------

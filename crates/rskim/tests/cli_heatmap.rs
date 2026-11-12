@@ -272,10 +272,11 @@ fn test_heatmap_json_output_valid_json() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.lines().count(), 1, "compact JSON is one line");
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("expected valid JSON output");
 
-    assert_eq!(parsed["version"], 1, "version must be 1");
+    assert_eq!(parsed["version"], 2, "version must be 2");
     assert!(parsed["files"].is_array(), "files must be array");
     assert!(
         !parsed["files"].as_array().unwrap().is_empty(),
@@ -304,17 +305,30 @@ fn test_heatmap_json_has_all_metric_keys() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
+    // The hotspot order puts src/main.rs (4 commits) first.
     let file = &parsed["files"][0];
-    assert!(file["churn"].is_object(), "churn must be object");
+    assert_eq!(file["path"], "src/main.rs");
+    assert_eq!(file["churn"]["commits"], 4, "nested churn.commits");
     assert!(
         file["stability_score"].is_number(),
         "stability_score must be number"
     );
     assert!(file["authors"].is_object(), "authors must be object");
-    assert!(file["fix_risk"].is_object(), "fix_risk must be object");
+    assert_eq!(
+        file["fix_risk"]["keyword_pct"], 25.0,
+        "nested fix_risk.keyword_pct: 1 fix commit of 4"
+    );
+    assert_eq!(
+        file["fix_risk"]["insufficient_data"], true,
+        "nested fix_risk.insufficient_data: 4 commits are below support"
+    );
     assert!(
         file["blast_radius"].is_array(),
         "blast_radius must be array"
+    );
+    assert!(
+        parsed.get("file_targets").is_none(),
+        "file_targets only for a scoped run"
     );
 }
 
@@ -585,12 +599,12 @@ fn test_heatmap_top_flag_limits_output() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("expected valid JSON output");
-    // In JSON mode, --top=3 truncates the files array to at most 3 entries
+    // In JSON mode, --top=3 gives exactly 3 of the 10 files.
     let files = parsed["files"].as_array().unwrap();
-    assert!(
-        files.len() <= 3,
-        "expected at most 3 files in JSON output with --top=3, got {}",
-        files.len()
+    assert_eq!(files.len(), 3, "files with --top=3");
+    assert_eq!(
+        parsed["counts"]["hotspots"],
+        serde_json::json!({"total": 10, "shown": 3})
     );
 
     // Text output with --top=3 shows 3 hotspot rows and counts the other 7.
@@ -1061,9 +1075,14 @@ fn test_json_without_insights_unchanged() {
         parsed.get("top_files").is_none(),
         "regular --json should not have 'top_files' key"
     );
-    // But it should have the standard heatmap keys
+    // But it should have the standard heatmap keys. Module health is not in
+    // the default view: the array is empty and the count gives the total.
     assert!(parsed["files"].is_array(), "files must be present");
-    assert!(parsed["modules"].is_array(), "modules must be present");
+    assert_eq!(parsed["modules"], serde_json::json!([]));
+    assert_eq!(
+        parsed["counts"]["modules"],
+        serde_json::json!({"total": 1, "shown": 0})
+    );
 }
 
 #[test]
@@ -1137,14 +1156,20 @@ fn test_insights_help_text() {
 
 /// Run `skim heatmap --json` in `dir` and parse stdout.
 fn heatmap_json(dir: &Path) -> serde_json::Value {
+    heatmap_json_with(dir, &[])
+}
+
+/// Run `skim heatmap --json <args>` in `dir` and parse stdout.
+fn heatmap_json_with(dir: &Path, args: &[&str]) -> serde_json::Value {
     let output = common::skim()
         .args(["heatmap", "--json"])
+        .args(args)
         .current_dir(dir)
         .output()
         .expect("spawn skim heatmap --json");
     assert!(
         output.status.success(),
-        "skim heatmap --json failed: {}",
+        "skim heatmap --json {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("valid heatmap JSON")
@@ -1342,7 +1367,8 @@ fn test_heatmap_default_excludes_changelog_snapshot_and_generated_files() {
     }
     let kept = vec!["src/main.rs".to_string(), "src/schema.rs".to_string()];
 
-    let json = heatmap_json(dir.path());
+    // Module health is not in the default view; `--detail modules` gives it.
+    let json = heatmap_json_with(dir.path(), &["--detail", "modules"]);
     assert_eq!(sorted_paths(&json, "files"), kept);
     assert_eq!(sorted_paths(&json, "modules"), vec!["src".to_string()]);
     let endpoints: Vec<String> = json["coupling_graph"]
@@ -1439,7 +1465,7 @@ fn test_heatmap_modules_follow_package_manifests() {
 
     // The manifest commit touches all three packages; the root manifest has
     // no module, and `src` keeps the top-folder rule.
-    let json = heatmap_json(dir.path());
+    let json = heatmap_json_with(dir.path(), &["--detail", "modules"]);
     assert_eq!(
         module_commits(&json),
         vec![
@@ -1455,19 +1481,27 @@ fn test_heatmap_modules_follow_package_manifests() {
 fn test_heatmap_file_scope_keeps_the_package_module() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_package_repo(dir.path());
-
-    let output = common::skim()
-        .args(["heatmap", "--json", "crates/a/src/lib.rs"])
+    // `--detail` refuses file arguments, so the scope comes from `--diff`:
+    // one changed file on a branch, the fifth commit of `crates/a`.
+    StdCommand::new("git")
+        .args(["checkout", "-b", "feature-scope"])
         .current_dir(dir.path())
         .output()
-        .expect("spawn skim heatmap");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        .expect("git checkout");
+    git_commit(
+        dir.path(),
+        "crates/a/src/lib.rs",
+        "// branch",
+        "feat: change a on a branch",
+        recent_ts() + 5000,
     );
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
-    assert_eq!(module_commits(&json), vec![("crates/a".to_string(), 4)]);
+
+    let json = heatmap_json_with(dir.path(), &["--diff", "main", "--detail", "modules"]);
+    assert_eq!(
+        json["file_targets"],
+        serde_json::json!(["crates/a/src/lib.rs"])
+    );
+    assert_eq!(module_commits(&json), vec![("crates/a".to_string(), 5)]);
 }
 
 // ============================================================================
@@ -1776,5 +1810,55 @@ fn test_heatmap_detail_modules_text_lists_package_modules() {
             ("packages/x".to_string(), 4),
             ("src".to_string(), 3),
         ]
+    );
+}
+
+// ============================================================================
+// JSON version 2: counts and caps
+// ============================================================================
+
+#[test]
+fn test_heatmap_json_counts_give_total_and_shown_per_section() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+
+    let json = heatmap_json(dir.path());
+    // (counts key, array key, total, shown)
+    let sections = [
+        ("hotspots", "files", 40, 10),
+        ("coupling", "coupling_graph", 36, 5),
+        ("fix_risk", "fix_risk", 10, 5),
+        ("modules", "modules", 1, 0),
+        ("bus_factor", "bus_factor", 0, 0),
+    ];
+    for (count_key, array_key, total, shown) in sections {
+        assert_eq!(
+            json["counts"][count_key],
+            serde_json::json!({"total": total, "shown": shown}),
+            "{count_key}"
+        );
+        assert_eq!(
+            json[array_key].as_array().expect(array_key).len(),
+            shown,
+            "{array_key} length equals counts.{count_key}.shown"
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_detail_coupling_text_rows_equal_the_json_total() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &["--detail", "coupling"]);
+    let json = heatmap_json_with(dir.path(), &["--detail", "coupling"]);
+    let rows = section_rows(&text, "Coupling");
+    assert_eq!(rows.len(), 36, "{text}");
+    assert_eq!(json["counts"]["coupling"]["total"], 36);
+    assert_eq!(json["counts"]["coupling"]["shown"], 36);
+    assert_eq!(json["coupling_graph"].as_array().unwrap().len(), 36);
+    assert!(
+        !text.contains(" more ("),
+        "no row is hidden in a --detail view without --top:\n{text}"
     );
 }

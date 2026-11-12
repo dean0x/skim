@@ -352,14 +352,6 @@ fn run_with_source(
         apply_file_scope(&mut result, &config.files, &module_roots);
     }
 
-    // Compute display top_n: when files are explicitly targeted and --top
-    // was not given, show all targeted files rather than the global default.
-    let display_top_n = if !config.files.is_empty() && !config.top_explicit {
-        config.files.len()
-    } else {
-        config.top_n
-    };
-
     // Step 10: Render
     let elapsed = start_time.elapsed();
     let mut stdout = io::stdout().lock();
@@ -379,13 +371,12 @@ fn run_with_source(
         return Ok(ExitCode::SUCCESS);
     }
 
+    // The view sorts, gates and caps every section for both outputs.
+    let view = view::build_view(&result, &view::ViewSpec::from_config(&config));
     if config.format_json {
-        // Apply --top N limit to files (not needed for insights)
-        result.files.truncate(display_top_n);
-        let json = render_json(&result)?;
+        let json = render_json(&result, &view)?;
         writeln!(stdout, "{json}")?;
     } else {
-        let view = view::build_view(&result, &view::ViewSpec::from_config(&config));
         let text = render_text(&result, &view);
         write!(stdout, "{text}")?;
     }
@@ -432,10 +423,12 @@ fn apply_file_scope(result: &mut HeatmapResult, files: &[String], roots: &Module
 
     let target_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
 
-    // Warn about targets not found in results
+    // Warn about targets not found in results, once each, in argument order
+    // (a set order would change between runs).
     let result_paths: HashSet<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
-    for target in &target_set {
-        if !result_paths.contains(target) {
+    let mut warned: HashSet<&str> = HashSet::new();
+    for target in files.iter().map(String::as_str) {
+        if !result_paths.contains(target) && warned.insert(target) {
             result
                 .warnings
                 .push(format!("targeted file '{target}' not found in git history"));
@@ -596,7 +589,6 @@ fn compute_heatmap(
 
     // Step 9: Build result
     HeatmapResult {
-        version: 1,
         generated_at: format_epoch(now_epoch),
         repository,
         window: window_info,
@@ -630,7 +622,6 @@ mod tests {
             WindowInfo,
         };
         HeatmapResult {
-            version: 1,
             generated_at: "2025-01-01".to_string(),
             repository: "test".to_string(),
             window: WindowInfo {
@@ -763,6 +754,20 @@ mod tests {
                 w.contains("nonexistent.rs") && w.contains("not found in git history")
             })
         );
+    }
+
+    #[test]
+    fn test_apply_file_scope_warns_missing_targets_once_in_argument_order() {
+        let names = ["z.rs", "a.rs", "m.rs", "z.rs", "k.rs", "b.rs"];
+        let targets: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let mut result = make_test_result();
+        result.warnings.clear();
+        apply_file_scope(&mut result, &targets, &ModuleRoots::default());
+        let expected: Vec<String> = ["z.rs", "a.rs", "m.rs", "k.rs", "b.rs"]
+            .iter()
+            .map(|n| format!("targeted file '{n}' not found in git history"))
+            .collect();
+        assert_eq!(result.warnings, expected);
     }
 
     #[test]

@@ -13,8 +13,8 @@ use serde::Serialize;
 use super::metrics::edge_order;
 use super::noise;
 use super::types::{
-    CouplingEdge, DetailSection, FileMetrics, HeatmapConfig, HeatmapResult, ModuleHealth,
-    WindowInfo,
+    AuthorMetrics, ChurnMetrics, CouplingEdge, CouplingEntry, DetailSection, FileMetrics,
+    FixRiskMetrics, HeatmapConfig, HeatmapResult, ModuleHealth, WindowInfo,
 };
 
 // ============================================================================
@@ -43,6 +43,9 @@ const OWNERS_DEFAULT: usize = 3;
 /// Warning lines in a text view. With more warnings, the last of these
 /// lines counts the warnings that it does not show.
 const WARNING_LINES: usize = 2;
+
+/// Coupling partners of one `files[]` entry in the heatmap JSON.
+const BLAST_RADIUS_JSON_MAX: usize = 5;
 
 /// Version of the heatmap JSON that [`HeatmapJson`] writes.
 const JSON_VERSION: u8 = 2;
@@ -407,10 +410,6 @@ impl<'a> HeatmapView<'a> {
     }
 
     /// The JSON v2 shape of this view.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the JSON v2 render is the first caller")
-    )]
     #[must_use]
     pub(crate) fn to_json<'v>(&'v self, result: &'v HeatmapResult) -> HeatmapJson<'v> {
         HeatmapJson {
@@ -426,7 +425,7 @@ impl<'a> HeatmapView<'a> {
                 modules: self.modules.count(),
                 bus_factor: self.bus_factor.count(),
             },
-            files: &self.hotspots.rows,
+            files: self.hotspots.rows.iter().map(|f| FileJson::of(f)).collect(),
             coupling_graph: &self.coupling.rows,
             fix_risk: &self.fix_risk.rows,
             modules: &self.modules.rows,
@@ -446,7 +445,7 @@ impl<'a> HeatmapView<'a> {
 ///
 /// `files` holds the hotspot rows, with the nested `churn` and `fix_risk`
 /// objects. Any file can be a hotspot: `files[]` is never filtered by
-/// support.
+/// support. Every array of rows has the cap of its section.
 #[derive(Debug, Serialize)]
 pub(crate) struct HeatmapJson<'a> {
     version: u8,
@@ -455,7 +454,7 @@ pub(crate) struct HeatmapJson<'a> {
     window: &'a WindowInfo,
     base_rate: f64,
     counts: SectionCounts,
-    files: &'a [&'a FileMetrics],
+    files: Vec<FileJson<'a>>,
     coupling_graph: &'a [&'a CouplingEdge],
     fix_risk: &'a [FixRiskRow<'a>],
     modules: &'a [&'a ModuleHealth],
@@ -466,6 +465,34 @@ pub(crate) struct HeatmapJson<'a> {
     file_targets: Option<&'a [String]>,
 }
 
+/// One `files[]` entry: the keys of [`FileMetrics`], with the blast radius
+/// cut to its [`BLAST_RADIUS_JSON_MAX`] strongest partners.
+#[derive(Debug, Serialize)]
+pub(crate) struct FileJson<'a> {
+    path: &'a str,
+    churn: &'a ChurnMetrics,
+    stability_score: u8,
+    authors: &'a AuthorMetrics,
+    fix_risk: &'a FixRiskMetrics,
+    blast_radius: &'a [CouplingEntry],
+}
+
+impl<'a> FileJson<'a> {
+    /// The entry of `file`. The blast radius is already in rank order
+    /// (confidence desc, then support desc, then path asc).
+    fn of(file: &'a FileMetrics) -> Self {
+        let partners = &file.blast_radius;
+        Self {
+            path: &file.path,
+            churn: &file.churn,
+            stability_score: file.stability_score,
+            authors: &file.authors,
+            fix_risk: &file.fix_risk,
+            blast_radius: partners.get(..BLAST_RADIUS_JSON_MAX).unwrap_or(partners),
+        }
+    }
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================
@@ -474,7 +501,6 @@ pub(crate) struct HeatmapJson<'a> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::cmd::heatmap::types::{AuthorMetrics, ChurnMetrics, FixRiskMetrics};
 
     const EPS: f64 = 1e-9;
 
@@ -491,7 +517,6 @@ mod tests {
     /// commits (base rate 20%), 2 distinct authors.
     fn empty_result() -> HeatmapResult {
         HeatmapResult {
-            version: 1,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "repo".to_string(),
             window: WindowInfo {
@@ -1035,5 +1060,38 @@ mod tests {
         assert_eq!(entry["churn"]["commits"], 1);
         assert_eq!(entry["fix_risk"]["keyword_pct"], 100.0);
         assert_eq!(entry["fix_risk"]["insufficient_data"], true);
+    }
+
+    #[test]
+    fn test_json_v2_files_keep_the_five_strongest_blast_radius_partners() {
+        let mut result = empty_result();
+        let mut hub = file("src/hub.rs", 9);
+        // In rank order, as the coupling metric gives them.
+        hub.blast_radius = (0..7)
+            .map(|i| CouplingEntry {
+                path: format!("src/p{i}.rs"),
+                confidence: 0.9 - f64::from(i) * 0.05,
+                support: 3,
+            })
+            .collect();
+        result.files = vec![hub];
+        let view = build_view(&result, &DEFAULT_VIEW);
+        let json = serde_json::to_value(view.to_json(&result)).unwrap();
+        let partners: Vec<&str> = json["files"][0]["blast_radius"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            partners,
+            [
+                "src/p0.rs",
+                "src/p1.rs",
+                "src/p2.rs",
+                "src/p3.rs",
+                "src/p4.rs"
+            ]
+        );
     }
 }

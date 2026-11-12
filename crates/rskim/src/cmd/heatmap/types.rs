@@ -220,11 +220,12 @@ pub(crate) struct ResolvedWindow {
 // Heatmap output
 // ============================================================================
 
-/// Top-level output structure for `skim heatmap`.
-#[derive(Debug, Clone, Serialize)]
+/// The computed metrics of one `skim heatmap` run, before the view.
+///
+/// The outputs never serialize it directly: the ranked view (`view.rs`)
+/// and the insight engine give the text and the JSON shapes.
+#[derive(Debug, Clone)]
 pub(crate) struct HeatmapResult {
-    /// Schema version (always 1).
-    pub(crate) version: u8,
     pub(crate) generated_at: String,
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
@@ -234,15 +235,12 @@ pub(crate) struct HeatmapResult {
     pub(crate) excluded_patterns: Vec<String>,
     pub(crate) warnings: Vec<String>,
     /// Files targeted by `--diff` or positional args (present only when scoped).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) file_targets: Option<Vec<String>>,
     /// Fix commits in the window after exclusion: the numerator of the
     /// fix-risk base rate. The ranked view reads it; JSON v2 gives the rate.
-    #[serde(skip)]
     pub(crate) fix_commits_total: usize,
     /// Distinct author names in the window after exclusion, for the
     /// bus-factor gate. The ranked view reads it.
-    #[serde(skip)]
     pub(crate) window_authors: usize,
 }
 
@@ -257,7 +255,7 @@ pub(crate) struct WindowInfo {
 }
 
 /// Risk and coupling metrics for a single file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct FileMetrics {
     pub(crate) path: String,
     pub(crate) churn: ChurnMetrics,
