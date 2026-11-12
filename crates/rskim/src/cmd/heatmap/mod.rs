@@ -9,6 +9,7 @@
 //! 6. Module encapsulation: cross-boundary coupling health
 
 mod args;
+mod card;
 mod excludes;
 mod git_source;
 mod insights;
@@ -34,8 +35,12 @@ use metrics::{
     compute_encapsulation, compute_fix_after_touch, compute_stability, module_of,
 };
 use noise::{COUPLING_MAX_FILES, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS};
-use output::{render_insights_json, render_insights_text, render_json, render_text};
-use types::{CommitInfo, FileMetrics, HeatmapArgs, HeatmapConfig, HeatmapResult, ResolvedWindow};
+use output::{
+    render_cards_text, render_insights_json, render_insights_text, render_json, render_text,
+};
+use types::{
+    CommitInfo, FileMetrics, FileTargets, HeatmapArgs, HeatmapConfig, HeatmapResult, ResolvedWindow,
+};
 use window::{build_window_info, format_epoch, resolve_config};
 
 // ============================================================================
@@ -72,7 +77,8 @@ pub(crate) fn run(
     run_with_source(&git_source, raw_args, analytics)
 }
 
-/// Resolve `--diff` to a concrete file list, mutating `args.files`.
+/// Resolve `--diff` to a concrete file list, mutating `args.diff_files`.
+/// These paths come from git and get no card: they scope the default view.
 ///
 /// Returns `Some(ExitCode::FAILURE)` for any early-exit condition so that `run()`
 /// can propagate it directly. Returns `Ok(None)` when resolution succeeded and the
@@ -113,8 +119,8 @@ fn resolve_diff_files(
                 // AD-408-2 (OD2, 2026-07-17): use is_file() not exists() so that a
                 // path now occupied by a directory or dangling symlink triggers the
                 // warning below, just as a genuinely deleted path does.
-                // NOTE: this gates only the warning; `args.files` still receives the
-                // full diff list.  Actual output filtering happens downstream in
+                // NOTE: this gates only the warning; `args.diff_files` still receives
+                // the full diff list.  Actual output filtering happens downstream in
                 // apply_file_scope via set intersection.
                 if !abs.is_file() {
                     eprintln!(
@@ -123,7 +129,7 @@ fn resolve_diff_files(
                     );
                 }
             }
-            args.files = files;
+            args.diff_files = files;
             Ok(None)
         }
         Err(e) => {
@@ -157,7 +163,7 @@ struct PreparedCommits {
 /// metric computation.
 fn prepare_commits(
     source: &dyn GitDataSource,
-    args: HeatmapArgs,
+    mut args: HeatmapArgs,
 ) -> anyhow::Result<Option<PreparedCommits>> {
     // Step 1: Validate git environment
     if !source.is_git_repo() {
@@ -172,6 +178,18 @@ fn prepare_commits(
             return Ok(None);
         }
     };
+
+    // Step 1b: file arguments become repo-relative card targets, before any
+    // history is read. A path outside the root ends the run with no card.
+    if !args.files.is_empty() {
+        match card_targets(source, &repo_root, &args.files) {
+            Ok(targets) => args.files = targets,
+            Err(e) => {
+                eprintln!("skim heatmap: {e}");
+                return Ok(None);
+            }
+        }
+    }
 
     let mut warnings: Vec<String> = Vec::new();
 
@@ -291,6 +309,26 @@ fn prepare_commits(
     }))
 }
 
+/// Normalise the file arguments against the repository root, by text only,
+/// in argument order and each path once. The cwd prefix comes from git; the
+/// files themselves are never opened.
+fn card_targets(
+    source: &dyn GitDataSource,
+    repo_root: &str,
+    files: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let prefix = source.show_prefix()?;
+    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::with_capacity(files.len());
+    for arg in files {
+        let target = card::normalise_target(arg, repo_root, &prefix)?;
+        if seen.insert(target.clone()) {
+            targets.push(target);
+        }
+    }
+    Ok(targets)
+}
+
 /// Read the package roots from the tracked-file list of `repo_root`.
 ///
 /// The list is optional input: when it is not available, modules use the
@@ -338,7 +376,7 @@ fn run_with_source(
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
     let mut result = compute_heatmap(
-        commits,
+        &commits,
         &config,
         &window,
         now_epoch,
@@ -346,17 +384,44 @@ fn run_with_source(
         warnings,
         &module_roots,
     );
+    let spec = view::ViewSpec::from_config(&config);
 
-    // Apply file-targeting display filter (after full metric computation)
-    if !config.files.is_empty() {
-        apply_file_scope(&mut result, &config.files, &module_roots);
-    }
+    // File targets scope the result after the full metric computation, so
+    // the coupling of a target keeps its partners outside the scope.
+    let cards = match &config.targets {
+        FileTargets::All => None,
+        FileTargets::Diff(files) => {
+            warn_missing_targets(&mut result, files);
+            apply_file_scope(&mut result, files, &module_roots);
+            None
+        }
+        FileTargets::Cards(paths) => {
+            // A card says itself when its file is not in the window, so
+            // there is no warning for it.
+            let targets = card::history_paths(paths, &result.files);
+            let cards = card::build_cards(&commits, &result, &targets, spec.lists());
+            apply_file_scope(&mut result, &targets, &module_roots);
+            Some(cards)
+        }
+    };
 
     // Step 10: Render
     let elapsed = start_time.elapsed();
     let mut stdout = io::stdout().lock();
 
-    let spec = view::ViewSpec::from_config(&config);
+    // Cards early-return: `--insights` gives the same output, text or JSON.
+    if let Some(cards) = &cards {
+        let view = view::build_view(&result, &spec);
+        if config.format_json {
+            let json = render_json(&result, &view, Some(cards))?;
+            writeln!(stdout, "{json}")?;
+        } else {
+            let text = render_cards_text(&result, cards, spec.lists());
+            write!(stdout, "{text}")?;
+        }
+        record_heatmap_analytics(analytics, "skim heatmap", elapsed);
+        return Ok(ExitCode::SUCCESS);
+    }
 
     // Insights early-return: the findings come from the full result, ranked,
     // then capped at 20 or `--top`.
@@ -377,7 +442,7 @@ fn run_with_source(
     // The view sorts, gates and caps every section for both outputs.
     let view = view::build_view(&result, &spec);
     if config.format_json {
-        let json = render_json(&result, &view)?;
+        let json = render_json(&result, &view, None)?;
         writeln!(stdout, "{json}")?;
     } else {
         let text = render_text(&result, &view);
@@ -415,6 +480,22 @@ fn record_heatmap_analytics(
 // File-scope display filter (Step 5-alt)
 // ============================================================================
 
+/// Warn about each `--diff` file that is not in the window's history, once
+/// each, in argument order (a set order would change between runs).
+fn warn_missing_targets(result: &mut HeatmapResult, files: &[String]) {
+    use std::collections::HashSet;
+
+    let result_paths: HashSet<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
+    let mut warned: HashSet<&str> = HashSet::new();
+    for target in files.iter().map(String::as_str) {
+        if !result_paths.contains(target) && warned.insert(target) {
+            result
+                .warnings
+                .push(format!("targeted file '{target}' not found in git history"));
+        }
+    }
+}
+
 /// Filter heatmap results to only include targeted files.
 ///
 /// Filtering happens AFTER metric computation to preserve coupling accuracy.
@@ -425,18 +506,6 @@ fn apply_file_scope(result: &mut HeatmapResult, files: &[String], roots: &Module
     use std::collections::HashSet;
 
     let target_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
-
-    // Warn about targets not found in results, once each, in argument order
-    // (a set order would change between runs).
-    let result_paths: HashSet<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
-    let mut warned: HashSet<&str> = HashSet::new();
-    for target in files.iter().map(String::as_str) {
-        if !result_paths.contains(target) && warned.insert(target) {
-            result
-                .warnings
-                .push(format!("targeted file '{target}' not found in git history"));
-        }
-    }
 
     // Filter files
     result
@@ -468,7 +537,7 @@ fn apply_file_scope(result: &mut HeatmapResult, files: &[String], roots: &Module
 ///
 /// Debug timing is emitted to stderr when `config.debug` is enabled.
 fn compute_heatmap(
-    commits: Vec<CommitInfo>,
+    commits: &[CommitInfo],
     config: &HeatmapConfig,
     window: &ResolvedWindow,
     now_epoch: u64,
@@ -480,7 +549,7 @@ fn compute_heatmap(
 
     // Step 5: Compute metrics
     // Phase 1: churn must run first — max_churn feeds into stability.
-    let churn_map = compute_churn(&commits);
+    let churn_map = compute_churn(commits);
     let max_churn = churn_map.values().map(|m| m.commits).max().unwrap_or(1);
 
     // Phase 2: remaining 5 metrics are independent of each other — run in parallel.
@@ -502,19 +571,19 @@ fn compute_heatmap(
     ) = rayon::join(
         || {
             rayon::join(
-                || compute_stability(&commits, max_churn, now_epoch),
-                || compute_authors(&commits),
+                || compute_stability(commits, max_churn, now_epoch),
+                || compute_authors(commits),
             )
         },
         || {
             rayon::join(
                 || {
                     rayon::join(
-                        || compute_fix_after_touch(&commits, fix_window),
-                        || compute_coupling(&commits, coupling_threshold, MIN_PAIR_SUPPORT),
+                        || compute_fix_after_touch(commits, fix_window),
+                        || compute_coupling(commits, coupling_threshold, MIN_PAIR_SUPPORT),
                     )
                 },
-                || compute_encapsulation(&commits, MODULE_MIN_COMMITS, module_roots),
+                || compute_encapsulation(commits, MODULE_MIN_COMMITS, module_roots),
             )
         },
     );
@@ -745,13 +814,9 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_file_scope_warns_missing() {
+    fn test_warn_missing_targets_names_the_missing_diff_file() {
         let mut result = make_test_result();
-        apply_file_scope(
-            &mut result,
-            &["nonexistent.rs".to_string()],
-            &ModuleRoots::default(),
-        );
+        warn_missing_targets(&mut result, &["nonexistent.rs".to_string()]);
         assert!(
             result.warnings.iter().any(|w| {
                 w.contains("nonexistent.rs") && w.contains("not found in git history")
@@ -760,12 +825,12 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_file_scope_warns_missing_targets_once_in_argument_order() {
+    fn test_warn_missing_targets_once_in_argument_order() {
         let names = ["z.rs", "a.rs", "m.rs", "z.rs", "k.rs", "b.rs"];
         let targets: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
         let mut result = make_test_result();
         result.warnings.clear();
-        apply_file_scope(&mut result, &targets, &ModuleRoots::default());
+        warn_missing_targets(&mut result, &targets);
         let expected: Vec<String> = ["z.rs", "a.rs", "m.rs", "k.rs", "b.rs"]
             .iter()
             .map(|n| format!("targeted file '{n}' not found in git history"))
@@ -995,7 +1060,7 @@ mod tests {
             .unwrap()
             .expect("the run continues");
         let result = compute_heatmap(
-            p.commits,
+            &p.commits,
             &p.config,
             &p.window,
             p.now_epoch,
@@ -1074,7 +1139,7 @@ mod tests {
             .unwrap()
             .expect("the run continues");
         compute_heatmap(
-            p.commits,
+            &p.commits,
             &p.config,
             &p.window,
             p.now_epoch,

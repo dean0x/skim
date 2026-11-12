@@ -5,7 +5,7 @@
 //! ```text
 //! CLI args  ──parse_args()──►  HeatmapArgs
 //!                                  │
-//!                      resolve_diff_files() mutates diff_base/files
+//!                 resolve_diff_files() mutates diff_base/diff_files
 //!                                  │
 //!                         resolve_config()  (consumes HeatmapArgs)
 //!                                  │
@@ -72,12 +72,16 @@ pub(crate) struct HeatmapArgs {
     ///
     /// Consumed by `resolve_config` — copied into [`ResolvedWindow`].
     pub(crate) last_n: Option<usize>,
-    /// Explicit file targets — scope display to these paths.
+    /// Positional file arguments: one card each. `prepare_commits` replaces
+    /// them with their repo-relative paths before `resolve_config`.
     pub(crate) files: Vec<String>,
     /// Base branch/ref for `--diff` three-dot diff.
     ///
     /// Consumed by `resolve_diff_files` via `.take()`.
     pub(crate) diff_base: Option<String>,
+    /// The files that `--diff` names, repo-relative as git reports them.
+    /// Set by `resolve_diff_files`; they scope the default view.
+    pub(crate) diff_files: Vec<String>,
     /// True when `--top` was explicitly passed (vs. implied by file targeting).
     pub(crate) top_explicit: bool,
     /// Show only threshold-filtered one-liner insights.
@@ -102,6 +106,7 @@ impl Default for HeatmapArgs {
             last_n: None,
             files: Vec::new(),
             diff_base: None,
+            diff_files: Vec::new(),
             top_explicit: false,
             insights: false,
             detail: None,
@@ -181,14 +186,25 @@ pub(crate) struct HeatmapConfig {
     pub(crate) fix_window: usize,
     /// Enable debug output.
     pub(crate) debug: bool,
-    /// Explicit file targets — scope display to these paths.
-    pub(crate) files: Vec<String>,
+    /// The file targets of the run, by source.
+    pub(crate) targets: FileTargets,
     /// True when `--top` was explicitly passed (vs. implied by file targeting).
     pub(crate) top_explicit: bool,
     /// Show only threshold-filtered one-liner insights.
     pub(crate) insights: bool,
     /// The one section that `--detail` names, if given.
     pub(crate) detail: Option<DetailSection>,
+}
+
+/// The file targets of a run. The source decides the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileTargets {
+    /// No file targets: the full view.
+    All,
+    /// The files that `--diff` names: the default view, scoped to them.
+    Diff(Vec<String>),
+    /// Positional file arguments, as repo-relative paths: one card each.
+    Cards(Vec<String>),
 }
 
 /// Resolved window metadata produced by [`super::window::resolve_config`].
@@ -234,7 +250,8 @@ pub(crate) struct HeatmapResult {
     pub(crate) coupling_graph: Vec<CouplingEdge>,
     pub(crate) excluded_patterns: Vec<String>,
     pub(crate) warnings: Vec<String>,
-    /// Files targeted by `--diff` or positional args (present only when scoped).
+    /// Files targeted by `--diff` or positional args (present only when
+    /// scoped), in the path form of the history.
     pub(crate) file_targets: Option<Vec<String>>,
     /// Fix commits in the window after exclusion: the numerator of the
     /// fix-risk base rate. The ranked view reads it; JSON v2 gives the rate.

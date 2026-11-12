@@ -161,10 +161,6 @@ pub(crate) fn passes_bus_gate(
 /// True when `path` is a test file: a `tests/`, `test/` or `__tests__/`
 /// directory at any depth, or a file name of the form `*_test.*`, `*.test.*`,
 /// `*.spec.*` or `test_*.py`. Paths are repo-relative with `/` separators.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the card partner order is the first caller")
-)]
 #[must_use]
 pub(crate) fn is_test_path(path: &str) -> bool {
     let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));

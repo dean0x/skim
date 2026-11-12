@@ -230,13 +230,8 @@ pub(super) fn parse_args(raw: &[String]) -> anyhow::Result<HeatmapArgs> {
         }
     }
 
-    // Normalize file paths: strip leading ./
-    for f in &mut args.files {
-        if let Some(stripped) = f.strip_prefix("./") {
-            *f = stripped.to_string();
-        }
-    }
-
+    // File arguments stay as typed: `prepare_commits` normalises them
+    // against the repository root.
     Ok(args)
 }
 
@@ -552,9 +547,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_args_file_path_normalization() {
+    fn test_parse_args_keeps_file_arguments_as_typed() {
+        // The card normalises paths against the repository root later.
         let args = parse_args(&["./src/main.rs".to_string()]).unwrap();
-        assert_eq!(args.files, vec!["src/main.rs"]);
+        assert_eq!(args.files, vec!["./src/main.rs"]);
     }
 
     #[test]

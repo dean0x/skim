@@ -74,7 +74,6 @@ pub(crate) trait GitDataSource {
 
     /// Return the path of the cwd below the repository root
     /// (`git rev-parse --show-prefix`): empty at the root, else it ends in `/`.
-    #[expect(dead_code, reason = "the file card is the first caller")]
     fn show_prefix(&self) -> anyhow::Result<String>;
 }
 
@@ -273,9 +272,6 @@ fn tracked_files_from(result: anyhow::Result<CommandOutput>) -> Option<Vec<Strin
 }
 
 /// Read the output of `git rev-parse --show-prefix`.
-// rustc versions differ on whether this is live while its trait method has
-// no caller; remove this `allow` with the `expect` on `show_prefix`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn prefix_from(out: &CommandOutput) -> anyhow::Result<String> {
     if out.exit_code != Some(0) {
         anyhow::bail!("git rev-parse --show-prefix failed: {}", out.stderr.trim());

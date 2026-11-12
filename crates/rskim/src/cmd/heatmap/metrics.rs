@@ -446,7 +446,7 @@ impl ModuleRoots {
 ///
 /// git writes a path with unusual characters as `"..."` and escapes each such
 /// character with `\`; every `/` of the path stays in place in the quoted text.
-fn without_quotes(path: &str) -> (&str, bool) {
+pub(crate) fn without_quotes(path: &str) -> (&str, bool) {
     match path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
         Some(inner) => (inner, true),
         None => (path, false),

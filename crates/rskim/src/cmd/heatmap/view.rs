@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 
 use serde::Serialize;
 
+use super::card::Card;
 use super::metrics::edge_order;
 use super::noise;
 use super::types::{
@@ -86,6 +87,15 @@ pub(crate) struct ListCaps {
     /// Never above [`FIX_COMMITS_MAX`], also with a larger `--top`.
     pub(crate) fix_commits: usize,
     pub(crate) owners: usize,
+}
+
+impl ListCaps {
+    /// True when the fix-commit cap is at its maximum, so a larger `--top`
+    /// shows no more fix commits.
+    #[must_use]
+    pub(crate) fn fix_commits_at_max(self) -> bool {
+        self.fix_commits >= FIX_COMMITS_MAX
+    }
 }
 
 impl ViewSpec {
@@ -192,7 +202,8 @@ pub(crate) fn text_warnings(warnings: &[String]) -> (&[String], Option<String>) 
 // Sections and rows
 // ============================================================================
 
-/// The [`Count`] of each section, for JSON `counts`.
+/// The [`Count`] of each section, and of the cards when the run has file
+/// arguments, for JSON `counts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct SectionCounts {
     pub(crate) hotspots: Count,
@@ -200,6 +211,8 @@ pub(crate) struct SectionCounts {
     pub(crate) fix_risk: Count,
     pub(crate) modules: Count,
     pub(crate) bus_factor: Count,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cards: Option<Count>,
 }
 
 /// One section: the shown rows in order, and the count of rows that passed
@@ -391,9 +404,14 @@ impl<'a> HeatmapView<'a> {
         more_line(self.count(section).hidden(), self.spec.remedy(section))
     }
 
-    /// The JSON v2 shape of this view.
+    /// The JSON v2 shape of this view, with the cards of a run with file
+    /// arguments.
     #[must_use]
-    pub(crate) fn to_json<'v>(&'v self, result: &'v HeatmapResult) -> HeatmapJson<'v> {
+    pub(crate) fn to_json<'v>(
+        &'v self,
+        result: &'v HeatmapResult,
+        cards: Option<&'v Section<Card>>,
+    ) -> HeatmapJson<'v> {
         HeatmapJson {
             version: JSON_VERSION,
             generated_at: &result.generated_at,
@@ -406,6 +424,7 @@ impl<'a> HeatmapView<'a> {
                 fix_risk: self.fix_risk.count(),
                 modules: self.modules.count(),
                 bus_factor: self.bus_factor.count(),
+                cards: cards.map(Section::count),
             },
             files: self.hotspots.rows.iter().map(|f| FileJson::of(f)).collect(),
             coupling_graph: &self.coupling.rows,
@@ -415,6 +434,7 @@ impl<'a> HeatmapView<'a> {
             excluded_patterns: &result.excluded_patterns,
             warnings: &result.warnings,
             file_targets: result.file_targets.as_deref(),
+            cards: cards.map(|c| c.rows.as_slice()),
         }
     }
 }
@@ -445,6 +465,9 @@ pub(crate) struct HeatmapJson<'a> {
     warnings: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     file_targets: Option<&'a [String]>,
+    /// One card per shown file argument, in argument order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cards: Option<&'a [Card]>,
 }
 
 /// One `files[]` entry: the keys of [`FileMetrics`], with the blast radius
@@ -974,7 +997,7 @@ mod tests {
     fn test_json_v2_has_the_kept_and_the_new_keys() {
         let result = busy_result();
         let view = build_view(&result, &DEFAULT_VIEW);
-        let json = serde_json::to_value(view.to_json(&result)).unwrap();
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
             .unwrap()
@@ -1008,7 +1031,7 @@ mod tests {
     fn test_json_v2_counts_match_the_array_lengths() {
         let result = busy_result();
         let view = build_view(&result, &top_view(4));
-        let json = serde_json::to_value(view.to_json(&result)).unwrap();
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
         let sections = [
             ("hotspots", "files", 4, 12),
             ("coupling", "coupling_graph", 4, 6),
@@ -1036,7 +1059,7 @@ mod tests {
         single.fix_risk.fix_commits = 1;
         result.files = vec![single];
         let view = build_view(&result, &DEFAULT_VIEW);
-        let json = serde_json::to_value(view.to_json(&result)).unwrap();
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
         let entry = &json["files"][0];
         assert_eq!(entry["path"], "src/one.rs");
         assert_eq!(entry["churn"]["commits"], 1);
@@ -1058,7 +1081,7 @@ mod tests {
             .collect();
         result.files = vec![hub];
         let view = build_view(&result, &DEFAULT_VIEW);
-        let json = serde_json::to_value(view.to_json(&result)).unwrap();
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
         let partners: Vec<&str> = json["files"][0]["blast_radius"]
             .as_array()
             .unwrap()

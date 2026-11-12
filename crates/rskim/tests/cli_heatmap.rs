@@ -797,23 +797,34 @@ fn test_heatmap_file_not_in_history() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    let output = common::skim()
-        .arg("heatmap")
-        .arg("--json")
-        .arg("nonexistent.rs")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    // The card of a file with no commit in the window says so; the
+    // warnings do not repeat it.
+    let json = heatmap_json_with(dir.path(), &["nonexistent.rs"]);
+    assert_eq!(
+        json["cards"],
+        serde_json::json!([{
+            "path": "nonexistent.rs",
+            "in_window": false,
+            "commits": 0,
+            "counts": {
+                "owners": {"total": 0, "shown": 0},
+                "partners": {"total": 0, "shown": 0},
+                "fix_commits": {"total": 0, "shown": 0}
+            },
+            "owners": [],
+            "partners": [],
+            "fix_commits": []
+        }])
+    );
+    assert_eq!(json["warnings"], serde_json::json!([]));
 
-    assert!(output.status.success());
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let warnings = json["warnings"].as_array().unwrap();
-    assert!(
-        warnings.iter().any(|w| {
-            let s = w.as_str().unwrap();
-            s.contains("nonexistent.rs") && s.contains("not found in git history")
-        }),
-        "expected warning not found in: {warnings:?}"
+    let since = json["window"]["since"].as_str().unwrap();
+    let text = heatmap_stdout(dir.path(), &["nonexistent.rs"]);
+    assert_eq!(
+        card_lines(&text, "nonexistent.rs"),
+        [format!(
+            "nonexistent.rs: not in history window (5 commits since {since})"
+        )]
     );
 }
 
@@ -1117,12 +1128,13 @@ fn test_insights_with_file_targeting() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    // --insights with a positional file arg should succeed and show insights output
-    let stdout = heatmap_stdout(dir.path(), &["--insights", "src/main.rs"]);
-    let header = stdout.lines().next().unwrap_or_default();
-    assert!(
-        header.starts_with("Insights: ") && header.ends_with(", scoped to 1 files"),
-        "{stdout}"
+    // With a file argument, --insights shows the same card as the plain view.
+    let insights = heatmap_stdout(dir.path(), &["--insights", "src/main.rs"]);
+    assert_eq!(insights, heatmap_stdout(dir.path(), &["src/main.rs"]));
+    assert_eq!(
+        card_lines(&insights, "src/main.rs").first().copied(),
+        Some("src/main.rs: 4 commits"),
+        "{insights}"
     );
 }
 
@@ -2044,7 +2056,14 @@ fn test_heatmap_two_runs_give_identical_bytes() {
     // Many ties on commits, confidence, support and fix rate.
     create_ranked_repo(dir.path());
 
-    let views: [&[&str]; 4] = [&[], &["--json"], &["--insights"], &["--insights", "--json"]];
+    let views: [&[&str]; 6] = [
+        &[],
+        &["--json"],
+        &["--insights"],
+        &["--insights", "--json"],
+        &["src/hub/h0.rs"],
+        &["--json", "src/hub/h0.rs"],
+    ];
     for args in views {
         let first = heatmap_stdout(dir.path(), args);
         let second = heatmap_stdout(dir.path(), args);
@@ -2092,4 +2111,624 @@ fn test_heatmap_both_json_outputs_are_version_two_compact_and_capped() {
         let expected = if path.starts_with("src/hub/") { 5 } else { 1 };
         assert_eq!(partners, expected, "{path}");
     }
+}
+
+// ============================================================================
+// Per-file card
+// ============================================================================
+
+/// The file of the card fixture with partners, fix commits and two owners.
+const CARD_FILE: &str = "src/core.rs";
+
+/// Commit new content for every path of `paths` in one commit, as author
+/// `name`.
+fn git_commit_paths_as(dir: &Path, paths: &[&str], message: &str, timestamp: u64, name: &str) {
+    for path in paths {
+        let file_path = dir.join(path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).expect("create dirs");
+        }
+        std::fs::write(&file_path, format!("// {message}\n")).expect("write file");
+    }
+    let add_out = StdCommand::new("git")
+        .arg("add")
+        .arg("--")
+        .args(paths)
+        .current_dir(dir)
+        .output()
+        .expect("git add");
+    assert!(
+        add_out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let ts = format!("{timestamp}");
+    let commit_out = StdCommand::new("git")
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_NAME", name)
+        .env("GIT_AUTHOR_EMAIL", "author@example.com")
+        .env("GIT_AUTHOR_DATE", &ts)
+        .env("GIT_COMMITTER_DATE", &ts)
+        .current_dir(dir)
+        .output()
+        .expect("git commit");
+    assert!(
+        commit_out.status.success(),
+        "git commit failed for {message}: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+}
+
+/// 9 commits that all touch `src/core.rs`, newest last:
+/// - 1: core and `src/util.rs`, feat;
+/// - 2-3: core, util, `tests/core_test.rs` and `src/rare.rs`, fix;
+/// - 4-7: core, util and the test, fix;
+/// - 8: core and util, feat;
+/// - 9: core alone, fix, by the author `Ada|Lovelace`.
+///
+/// Core has two partners: util (8 shared commits, confidence 83%) and the
+/// test (6 shared, 58%). `src/rare.rs` shares only 2 commits. Core has 7 fix
+/// commits and two authors; the test file has one author.
+fn create_card_repo(dir: &Path) {
+    git_init(dir);
+    let mut ts = recent_ts();
+    let mut next_ts = move || {
+        ts += 60;
+        ts
+    };
+    let me = "Test User";
+    let pair = ["src/core.rs", "src/util.rs"];
+    let trio = ["src/core.rs", "src/util.rs", "tests/core_test.rs"];
+    let quad = [
+        "src/core.rs",
+        "src/util.rs",
+        "tests/core_test.rs",
+        "src/rare.rs",
+    ];
+    git_commit_paths_as(dir, &pair, "feat: core and util", next_ts(), me);
+    for n in 1..=2 {
+        git_commit_paths_as(dir, &quad, &format!("fix: core bug {n}"), next_ts(), me);
+    }
+    for n in 3..=6 {
+        git_commit_paths_as(dir, &trio, &format!("fix: core bug {n}"), next_ts(), me);
+    }
+    git_commit_paths_as(dir, &pair, "feat: more core", next_ts(), me);
+    git_commit_paths_as(
+        dir,
+        &["src/core.rs"],
+        "fix: core edge case",
+        next_ts(),
+        "Ada|Lovelace",
+    );
+}
+
+/// The card line of each fix commit of `path`, newest first, from git
+/// itself: the 7-char SHA, the UTC author date and the quoted subject.
+fn expected_fix_lines(dir: &Path, path: &str) -> Vec<String> {
+    let out = StdCommand::new("git")
+        .args([
+            "log",
+            "--format=%H%x00%ad%x00%s",
+            "--date=format-local:%Y-%m-%d",
+            "--",
+            path,
+        ])
+        .env("TZ", "UTC")
+        .current_dir(dir)
+        .output()
+        .expect("git log");
+    assert!(out.status.success(), "git log failed");
+    String::from_utf8(out.stdout)
+        .expect("utf-8 git log")
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\0');
+            let (hash, date, subject) = (fields.next()?, fields.next()?, fields.next()?);
+            subject
+                .starts_with("fix")
+                .then(|| format!("    {} {date} \"{subject}\"", &hash[..7]))
+        })
+        .collect()
+}
+
+/// The lines of the card of `path` in `text`: its title line and the
+/// indented lines below it. Empty when there is no such card.
+fn card_lines<'a>(text: &'a str, path: &str) -> Vec<&'a str> {
+    let title = format!("{path}: ");
+    let mut lines = text.lines().skip_while(|l| !l.starts_with(&title));
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    std::iter::once(first)
+        .chain(lines.take_while(|l| l.starts_with("  ")))
+        .collect()
+}
+
+/// The lines of `text` that are not indented, after the header line: card
+/// titles and the "more" line of the cards.
+fn top_level_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .skip(1)
+        .filter(|l| !l.starts_with("  "))
+        .collect()
+}
+
+fn owned_strings(lines: &[&str]) -> Vec<String> {
+    lines.iter().map(|l| (*l).to_string()).collect()
+}
+
+#[test]
+fn test_heatmap_card_lists_a_test_partner_first_and_three_fix_commits_from_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let fix = expected_fix_lines(dir.path(), CARD_FILE);
+    assert_eq!(fix.len(), 7);
+
+    let text = heatmap_stdout(dir.path(), &[CARD_FILE]);
+
+    // The author name with `|` keeps its date: the newest fix line is the
+    // one of git itself.
+    let mut expected = owned_strings(&[
+        "src/core.rs: 9 commits",
+        "  owners: Test User 89%, Ada|Lovelace 11%",
+        "  partners (confidence, shared commits):",
+        "     58%   6  tests/core_test.rs",
+        "     83%   8  src/util.rs",
+        "  fix commits from history (newest first):",
+    ]);
+    expected.extend(fix[..3].iter().cloned());
+    expected.push("  4 more fix commits (raise --top)".to_string());
+    assert_eq!(card_lines(&text, CARD_FILE), expected, "{text}");
+    assert!(expected.len() <= 12);
+    // The header line and the card, nothing else.
+    assert!(text.starts_with("Heatmap: "), "{text}");
+    assert_eq!(text.lines().count(), 1 + expected.len(), "{text}");
+}
+
+#[test]
+fn test_heatmap_card_owners_line_needs_two_authors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let fix = expected_fix_lines(dir.path(), "tests/core_test.rs");
+
+    let text = heatmap_stdout(dir.path(), &["tests/core_test.rs", CARD_FILE]);
+
+    // One author: no owners line. The partners tie on confidence and
+    // support, so the path decides.
+    let mut expected = owned_strings(&[
+        "tests/core_test.rs: 6 commits",
+        "  partners (confidence, shared commits):",
+        "    100%   6  src/core.rs",
+        "    100%   6  src/util.rs",
+        "  fix commits from history (newest first):",
+    ]);
+    expected.extend(fix[..3].iter().cloned());
+    expected.push("  3 more fix commits (raise --top)".to_string());
+    assert_eq!(card_lines(&text, "tests/core_test.rs"), expected, "{text}");
+
+    let owners: Vec<&str> = card_lines(&text, CARD_FILE)
+        .into_iter()
+        .filter(|l| l.starts_with("  owners: "))
+        .collect();
+    assert_eq!(owners, ["  owners: Test User 89%, Ada|Lovelace 11%"]);
+}
+
+#[test]
+fn test_heatmap_card_partners_need_three_shared_commits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let fix = expected_fix_lines(dir.path(), "src/rare.rs");
+
+    // src/rare.rs shares 2 commits with each of its 3 co-changed files.
+    let text = heatmap_stdout(dir.path(), &["src/rare.rs"]);
+    let mut expected = owned_strings(&[
+        "src/rare.rs: 2 commits",
+        "  partners (confidence, shared commits):",
+        "    (none)",
+        "  fix commits from history (newest first):",
+    ]);
+    expected.extend(fix.iter().cloned());
+    assert_eq!(card_lines(&text, "src/rare.rs"), expected, "{text}");
+}
+
+#[test]
+fn test_heatmap_six_file_arguments_give_five_cards_and_one_more_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let args = [
+        CARD_FILE,
+        "src/util.rs",
+        "tests/core_test.rs",
+        "src/rare.rs",
+        "src/none1.rs",
+        "src/none2.rs",
+    ];
+    let since = heatmap_json_with(dir.path(), &args)["window"]["since"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let text = heatmap_stdout(dir.path(), &args);
+
+    assert_eq!(
+        top_level_lines(&text),
+        [
+            "src/core.rs: 9 commits".to_string(),
+            "src/util.rs: 8 commits".to_string(),
+            "tests/core_test.rs: 6 commits".to_string(),
+            "src/rare.rs: 2 commits".to_string(),
+            format!("src/none1.rs: not in history window (9 commits since {since})"),
+            "1 more file (raise --top)".to_string(),
+        ],
+        "{text}"
+    );
+}
+
+#[test]
+fn test_heatmap_diff_gives_the_default_view_not_cards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    StdCommand::new("git")
+        .args(["checkout", "-b", "feature-card"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git checkout");
+    git_commit_paths_as(
+        dir.path(),
+        &[CARD_FILE],
+        "feat: branch change",
+        recent_ts() + 3600,
+        "Test User",
+    );
+
+    let text = heatmap_stdout(dir.path(), &["--diff", "main"]);
+
+    assert!(text.lines().any(|l| l == "Hotspots (commits):"), "{text}");
+    assert!(card_lines(&text, CARD_FILE).is_empty(), "{text}");
+}
+
+#[test]
+fn test_heatmap_card_of_a_file_outside_the_window_names_the_window() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let now = recent_ts();
+    git_commit(
+        dir.path(),
+        "src/old.rs",
+        "// old",
+        "feat: old",
+        now - 30 * 86400,
+    );
+    git_commit(dir.path(), "src/new.rs", "// new 1", "feat: new 1", now);
+    git_commit(
+        dir.path(),
+        "src/new.rs",
+        "// new 2",
+        "feat: new 2",
+        now + 60,
+    );
+    let since_epoch = (now - 86400).to_string();
+    let args = ["--since", since_epoch.as_str(), "src/old.rs"];
+    let window = heatmap_json_with(dir.path(), &args)["window"].clone();
+    assert_eq!(window["commits_analyzed"], 2);
+
+    let text = heatmap_stdout(dir.path(), &args);
+
+    assert_eq!(
+        card_lines(&text, "src/old.rs"),
+        [format!(
+            "src/old.rs: not in history window (2 commits since {})",
+            window["since"].as_str().unwrap()
+        )],
+        "{text}"
+    );
+}
+
+#[test]
+fn test_heatmap_card_is_the_same_with_insights_and_top_keeps_five_fix_commits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let fix = expected_fix_lines(dir.path(), CARD_FILE);
+
+    let plain = heatmap_stdout(dir.path(), &[CARD_FILE]);
+    assert_eq!(
+        heatmap_stdout(dir.path(), &["--insights", CARD_FILE]),
+        plain
+    );
+
+    // --top 9: every owner and partner, but at most 5 fix commits; --top
+    // cannot show the other fix commits.
+    let text = heatmap_stdout(dir.path(), &["--top", "9", CARD_FILE]);
+    let card = card_lines(&text, CARD_FILE);
+    let fix_rows: Vec<&str> = card
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("    ") && l.ends_with('"'))
+        .collect();
+    assert_eq!(fix_rows, fix[..5]);
+    assert_eq!(card.last().copied(), Some("  2 more fix commits (git log)"));
+
+    // --top 1: one row in each list, and one line with every hidden count.
+    let text = heatmap_stdout(dir.path(), &["--top", "1", CARD_FILE]);
+    let mut expected = owned_strings(&[
+        "src/core.rs: 9 commits",
+        "  owners: Test User 89%",
+        "  partners (confidence, shared commits):",
+        "     58%   6  tests/core_test.rs",
+        "  fix commits from history (newest first):",
+    ]);
+    expected.push(fix[0].clone());
+    expected.push("  1 more owner, 1 more partner, 6 more fix commits (raise --top)".to_string());
+    assert_eq!(card_lines(&text, CARD_FILE), expected, "{text}");
+}
+
+#[test]
+fn test_heatmap_four_path_forms_give_byte_identical_cards() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let toplevel = StdCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git rev-parse");
+    let toplevel = String::from_utf8(toplevel.stdout).unwrap();
+    let absolute = format!("{}/src/core.rs", toplevel.trim_end());
+
+    let plain = heatmap_stdout(dir.path(), &[CARD_FILE]);
+    assert_eq!(
+        card_lines(&plain, CARD_FILE).first().copied(),
+        Some("src/core.rs: 9 commits")
+    );
+    assert_eq!(heatmap_stdout(dir.path(), &["./src/core.rs"]), plain);
+    assert_eq!(heatmap_stdout(dir.path(), &[absolute.as_str()]), plain);
+    assert_eq!(heatmap_stdout(&dir.path().join("src"), &["core.rs"]), plain);
+    assert_eq!(
+        heatmap_stdout(&dir.path().join("tests"), &["../src/./core.rs"]),
+        plain
+    );
+}
+
+#[test]
+fn test_heatmap_card_path_outside_the_root_exits_1_with_no_card() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+
+    for arg in ["../outside.rs", "src/../../outside.rs", "/etc/hosts"] {
+        let output = common::skim()
+            .args(["heatmap", arg])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{arg}");
+        assert!(output.stdout.is_empty(), "{arg}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("'{arg}' is outside the repository")),
+            "{arg}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_card_of_a_fifo_path_returns_without_blocking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let made = StdCommand::new("mkfifo")
+        .arg(dir.path().join("pipe"))
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
+
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_skim"))
+        .args(["heatmap", "pipe"])
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .current_dir(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn skim");
+    // At most 300 polls of 100 ms: a run that opens the FIFO would block.
+    let mut status = None;
+    for _ in 0..300 {
+        status = child.try_wait().expect("try_wait");
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let Some(status) = status else {
+        child.kill().ok();
+        panic!("skim heatmap blocked on a FIFO path argument");
+    };
+    assert!(status.success());
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
+    let card = card_lines(&stdout, "pipe");
+    assert_eq!(card.len(), 1, "{stdout}");
+    assert!(
+        card[0].starts_with("pipe: not in history window ("),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn test_heatmap_card_ties_rank_by_path_and_two_runs_agree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Each hub file has 7 partners with the same confidence and support.
+    create_ranked_repo(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &["src/hub/h0.rs"]);
+
+    assert_eq!(
+        card_lines(&text, "src/hub/h0.rs"),
+        [
+            "src/hub/h0.rs: 6 commits",
+            "  partners (confidence, shared commits):",
+            "    100%   6  src/hub/h1.rs",
+            "    100%   6  src/hub/h2.rs",
+            "    100%   6  src/hub/h3.rs",
+            "    100%   6  src/hub/h4.rs",
+            "  fix commits from history (newest first):",
+            "    (none)",
+            "  3 more partners (raise --top)",
+        ],
+        "{text}"
+    );
+    assert_eq!(heatmap_stdout(dir.path(), &["src/hub/h0.rs"]), text);
+}
+
+#[test]
+fn test_heatmap_card_json_is_version_two_compact_and_capped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+    let args = [
+        "--json",
+        CARD_FILE,
+        "src/util.rs",
+        "tests/core_test.rs",
+        "src/rare.rs",
+        "src/none1.rs",
+        "src/none2.rs",
+    ];
+
+    let stdout = heatmap_stdout(dir.path(), &args);
+
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(json["version"], 2);
+    assert_eq!(
+        json["counts"]["cards"],
+        serde_json::json!({"total": 6, "shown": 5})
+    );
+    // No malformed git log record: the author name with `|` parses.
+    assert_eq!(json["warnings"], serde_json::json!([]));
+    let cards = json["cards"].as_array().unwrap();
+    assert_eq!(cards.len(), 5);
+    for card in cards {
+        for (key, cap) in [("owners", 3), ("partners", 4), ("fix_commits", 3)] {
+            let len = card[key].as_array().unwrap().len();
+            assert!(len <= cap, "{key}: {card}");
+            assert_eq!(card["counts"][key]["shown"], len, "{key}: {card}");
+        }
+    }
+
+    let core = &cards[0];
+    assert_eq!(core["path"], CARD_FILE);
+    assert_eq!(core["in_window"], true);
+    assert_eq!(core["commits"], 9);
+    let owners: Vec<(&str, u64)> = core["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["name"].as_str().unwrap(), o["commits"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(owners, [("Test User", 8), ("Ada|Lovelace", 1)]);
+    let partners: Vec<(&str, u64, bool)> = core["partners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["path"].as_str().unwrap(),
+                p["support"].as_u64().unwrap(),
+                p["test"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        partners,
+        [("tests/core_test.rs", 6, true), ("src/util.rs", 8, false)]
+    );
+    let subjects: Vec<&str> = core["fix_commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        subjects,
+        ["fix: core edge case", "fix: core bug 6", "fix: core bug 5"]
+    );
+    assert_eq!(
+        core["counts"]["fix_commits"],
+        serde_json::json!({"total": 7, "shown": 3})
+    );
+    let fix = expected_fix_lines(dir.path(), CARD_FILE);
+    let first = &core["fix_commits"][0];
+    assert_eq!(
+        format!(
+            "    {} {} \"{}\"",
+            first["sha"].as_str().unwrap(),
+            first["date"].as_str().unwrap(),
+            first["subject"].as_str().unwrap()
+        ),
+        fix[0]
+    );
+}
+
+#[test]
+fn test_heatmap_card_replaces_control_and_bidi_characters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    // Git path quoting off: the bidi mark of the partner file name reaches
+    // the numstat output as it is.
+    StdCommand::new("git")
+        .args(["config", "core.quotePath", "false"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config");
+    let partner = "src/b\u{202E}c.rs";
+    let subject = "fix: \u{1b}]0;title \u{202E}gnp.exe\rmore \u{2066}end";
+    let ts = recent_ts();
+    let files = ["src/a.rs", partner];
+    git_commit_paths_as(dir.path(), &files, "feat: one", ts, "Test User");
+    git_commit_paths_as(dir.path(), &files, "feat: two", ts + 60, "Test User");
+    git_commit_paths_as(dir.path(), &files, subject, ts + 120, "Eve\u{202E}x");
+    let fix = expected_fix_lines(dir.path(), "src/a.rs");
+    let sha = &fix[0][4..11];
+
+    let text = heatmap_stdout(dir.path(), &["src/a.rs"]);
+
+    let safe_subject = "fix: \u{FFFD}]0;title \u{FFFD}gnp.exe\u{FFFD}more \u{FFFD}end";
+    let card = card_lines(&text, "src/a.rs");
+    assert_eq!(card.len(), 6, "{text}");
+    assert_eq!(
+        card[1..],
+        [
+            "  owners: Test User 67%, Eve\u{FFFD}x 33%".to_string(),
+            "  partners (confidence, shared commits):".to_string(),
+            "    100%   3  src/b\u{FFFD}c.rs".to_string(),
+            "  fix commits from history (newest first):".to_string(),
+            format!("    {sha} {} \"{safe_subject}\"", &fix[0][12..22]),
+        ],
+        "{text}"
+    );
+    for unsafe_char in ['\u{1b}', '\r', '\u{202E}', '\u{2066}'] {
+        assert!(!text.contains(unsafe_char), "{text:?}");
+    }
+
+    let json = heatmap_json_with(dir.path(), &["src/a.rs"]);
+    let card = &json["cards"][0];
+    assert_eq!(card["fix_commits"][0]["subject"], safe_subject);
+    assert_eq!(card["owners"][1]["name"], "Eve\u{FFFD}x");
+    assert_eq!(card["partners"][0]["path"], "src/b\u{FFFD}c.rs");
+}
+
+#[test]
+fn test_heatmap_card_finds_a_non_ascii_file_name_in_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let ts = recent_ts();
+    git_commit(dir.path(), "src/café.rs", "// 1", "feat: one", ts);
+    git_commit(dir.path(), "src/café.rs", "// 2", "feat: two", ts + 60);
+
+    // Git quotes the name in its numstat output; the card target uses the
+    // same form.
+    let text = heatmap_stdout(dir.path(), &["src/café.rs"]);
+
+    assert_eq!(
+        top_level_lines(&text),
+        ["\"src/caf\\303\\251.rs\": 2 commits"],
+        "{text}"
+    );
 }

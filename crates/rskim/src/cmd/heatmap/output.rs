@@ -10,20 +10,23 @@
 
 use std::path::Path;
 
+use super::card::{Card, CardCounts};
 use super::noise;
-use super::types::{DetailSection, HeatmapResult, InsightsResult, Severity};
-use super::view::{HeatmapView, MoreRemedy, more_line, text_warnings};
+use super::types::{DetailSection, HeatmapResult, InsightsResult, Severity, WindowInfo};
+use super::view::{HeatmapView, ListCaps, MoreRemedy, Section, more_line, text_warnings};
 
 // ============================================================================
 // JSON output
 // ============================================================================
 
-/// Render the view as compact JSON version 2 (one line).
+/// Render the view as compact JSON version 2 (one line), with the cards of
+/// a run with file arguments.
 pub(crate) fn render_json(
     result: &HeatmapResult,
     view: &HeatmapView<'_>,
+    cards: Option<&Section<Card>>,
 ) -> anyhow::Result<String> {
-    Ok(serde_json::to_string(&view.to_json(result))?)
+    Ok(serde_json::to_string(&view.to_json(result, cards))?)
 }
 
 // ============================================================================
@@ -34,13 +37,7 @@ pub(crate) fn render_json(
 pub(crate) fn render_text(result: &HeatmapResult, view: &HeatmapView<'_>) -> String {
     let mut out = String::new();
     push_line(&mut out, &header_line("Heatmap", result));
-    let (warnings, more_warnings) = text_warnings(&result.warnings);
-    for warning in warnings {
-        push_line(&mut out, &format!("warning: {warning}"));
-    }
-    if let Some(line) = more_warnings {
-        push_line(&mut out, &line);
-    }
+    push_warnings(&mut out, &result.warnings);
     for section in DetailSection::ALL {
         if view.spec.shows(section) {
             push_section(&mut out, view, section);
@@ -52,6 +49,17 @@ pub(crate) fn render_text(result: &HeatmapResult, view: &HeatmapView<'_>) -> Str
 fn push_line(out: &mut String, line: &str) {
     out.push_str(line);
     out.push('\n');
+}
+
+/// The warning lines of a text view: at most two (see `text_warnings`).
+fn push_warnings(out: &mut String, warnings: &[String]) {
+    let (shown, more_warnings) = text_warnings(warnings);
+    for warning in shown {
+        push_line(out, &format!("warning: {warning}"));
+    }
+    if let Some(line) = more_warnings {
+        push_line(out, &line);
+    }
 }
 
 /// The header line: the repo name (never its absolute path), the window
@@ -185,6 +193,121 @@ fn empty_section_line(view: &HeatmapView<'_>, section: DetailSection) -> String 
         );
     }
     "  (none)".to_string()
+}
+
+// ============================================================================
+// Card rendering
+// ============================================================================
+
+/// Render the cards of a run with file arguments: the header line, the
+/// warning lines, each card, and one line with the count of file arguments
+/// that the cap leaves without a card. The plain and the `--insights` run
+/// give these same bytes.
+///
+/// At the default caps a card has 12 lines or fewer: the title, an owners
+/// line, the partners heading with 4 rows, the fix-commit heading with 3
+/// rows, and one line with the hidden counts.
+pub(crate) fn render_cards_text(
+    result: &HeatmapResult,
+    cards: &Section<Card>,
+    caps: ListCaps,
+) -> String {
+    let mut out = String::new();
+    push_line(&mut out, &header_line("Heatmap", result));
+    push_warnings(&mut out, &result.warnings);
+    for card in &cards.rows {
+        push_card(&mut out, card, &result.window, caps);
+    }
+    let hidden = cards.count().hidden();
+    if hidden > 0 {
+        push_line(
+            &mut out,
+            &format!("{} (raise --top)", more_items(hidden, "file", "files")),
+        );
+    }
+    out
+}
+
+/// One card. The commit subjects are in quotes under a "from history"
+/// heading: they are text from the repository, not instructions.
+fn push_card(out: &mut String, card: &Card, window: &WindowInfo, caps: ListCaps) {
+    if !card.in_window {
+        push_line(
+            out,
+            &format!(
+                "{}: not in history window ({} commits since {})",
+                card.path, window.commits_analyzed, window.since
+            ),
+        );
+        return;
+    }
+    push_line(out, &format!("{}: {} commits", card.path, card.commits));
+    if !card.owners.is_empty() {
+        let owners: Vec<String> = card
+            .owners
+            .iter()
+            .map(|o| format!("{} {:.0}%", o.name, o.share_pct))
+            .collect();
+        push_line(out, &format!("  owners: {}", owners.join(", ")));
+    }
+    push_line(out, "  partners (confidence, shared commits):");
+    if card.partners.is_empty() {
+        push_line(out, "    (none)");
+    }
+    for p in &card.partners {
+        push_line(
+            out,
+            &format!(
+                "    {:>3.0}% {:>3}  {}",
+                p.confidence * 100.0,
+                p.support,
+                p.path
+            ),
+        );
+    }
+    push_line(out, "  fix commits from history (newest first):");
+    if card.fix_commits.is_empty() {
+        push_line(out, "    (none)");
+    }
+    for f in &card.fix_commits {
+        push_line(out, &format!("    {} {} \"{}\"", f.sha, f.date, f.subject));
+    }
+    if let Some(line) = card_more_line(card.counts, caps) {
+        push_line(out, &format!("  {line}"));
+    }
+}
+
+/// The line with the hidden counts of a card, or `None` when the caps hide
+/// nothing. `--top` shows more owners and partners, and more fix commits up
+/// to their maximum; past it, only `git log` shows the others.
+fn card_more_line(counts: CardCounts, caps: ListCaps) -> Option<String> {
+    let mut by_top: Vec<String> = Vec::new();
+    for (count, one, many) in [
+        (counts.owners, "owner", "owners"),
+        (counts.partners, "partner", "partners"),
+    ] {
+        if count.hidden() > 0 {
+            by_top.push(more_items(count.hidden(), one, many));
+        }
+    }
+    let fix_hidden = counts.fix_commits.hidden();
+    let mut by_log = None;
+    if fix_hidden > 0 {
+        let fix = more_items(fix_hidden, "fix commit", "fix commits");
+        if caps.fix_commits_at_max() {
+            by_log = Some(format!("{fix} (git log)"));
+        } else {
+            by_top.push(fix);
+        }
+    }
+    let by_top = (!by_top.is_empty()).then(|| format!("{} (raise --top)", by_top.join(", ")));
+    let parts: Vec<String> = by_top.into_iter().chain(by_log).collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// `"N more <noun>"`, with the singular noun for 1.
+fn more_items(n: usize, one: &str, many: &str) -> String {
+    format!("{n} more {}", if n == 1 { one } else { many })
 }
 
 // ============================================================================
@@ -553,7 +676,7 @@ mod tests {
     #[test]
     fn test_json_is_compact_version_two() {
         let result = make_result();
-        let json = render_json(&result, &build_view(&result, &DEFAULT_VIEW)).unwrap();
+        let json = render_json(&result, &build_view(&result, &DEFAULT_VIEW), None).unwrap();
         assert_eq!(json.lines().count(), 1, "one line: {json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["version"], 2);
@@ -564,7 +687,7 @@ mod tests {
     #[test]
     fn test_json_has_all_metric_keys() {
         let result = make_result();
-        let json = render_json(&result, &build_view(&result, &DEFAULT_VIEW)).unwrap();
+        let json = render_json(&result, &build_view(&result, &DEFAULT_VIEW), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let file = &parsed["files"][0];
         assert_eq!(file["churn"]["commits"], 5);

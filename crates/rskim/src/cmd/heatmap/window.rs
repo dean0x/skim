@@ -4,7 +4,7 @@
 //! `--since` / `--last` / `--window` precedence, and display formatting.
 
 use super::git_source::GitDataSource;
-use super::types::{HeatmapArgs, HeatmapConfig, ResolvedWindow, WindowInfo};
+use super::types::{FileTargets, HeatmapArgs, HeatmapConfig, ResolvedWindow, WindowInfo};
 
 // ============================================================================
 // Preset mapping
@@ -113,6 +113,16 @@ pub(super) fn resolve_config(
         window.dual_count_since = Some(count_since);
     }
 
+    // `parse_args` refuses `--diff` with file arguments, so at most one list
+    // holds paths.
+    let targets = if !args.diff_files.is_empty() {
+        FileTargets::Diff(args.diff_files)
+    } else if !args.files.is_empty() {
+        FileTargets::Cards(args.files)
+    } else {
+        FileTargets::All
+    };
+
     // Build the resolved, immutable HeatmapConfig. Fields are moved from args
     // (heap allocations) or copied (scalars). `window_preset`, `last_n`, and
     // `diff_base` are intentionally absent — they were consumed above.
@@ -126,7 +136,7 @@ pub(super) fn resolve_config(
         coupling_threshold: args.coupling_threshold,
         fix_window: args.fix_window,
         debug: args.debug,
-        files: args.files,
+        targets,
         top_explicit: args.top_explicit,
         insights: args.insights,
         detail: args.detail,
@@ -546,7 +556,28 @@ mod tests {
         assert_eq!(config.detail, Some(DetailSection::FixRisk));
         assert_eq!(config.path.as_deref(), Some("src/"));
         assert_eq!(config.extra_excludes, vec!["*.generated.ts"]);
-        assert_eq!(config.files, vec!["src/main.rs"]);
+        assert_eq!(
+            config.targets,
+            FileTargets::Cards(vec!["src/main.rs".to_string()])
+        );
+    }
+
+    /// The `--diff` files scope the default view; no file argument gives
+    /// the full view.
+    #[test]
+    fn test_resolve_config_targets_follow_their_source() {
+        let source = MockGitSource::ok(None);
+        let mut warnings = Vec::new();
+        let mut diff = base_args();
+        diff.diff_files = vec!["src/lib.rs".to_string()];
+        let (config, _) = resolve_config(diff, &source, &mut warnings, NOW).unwrap();
+        assert_eq!(
+            config.targets,
+            FileTargets::Diff(vec!["src/lib.rs".to_string()])
+        );
+
+        let (config, _) = resolve_config(base_args(), &source, &mut warnings, NOW).unwrap();
+        assert_eq!(config.targets, FileTargets::All);
     }
 
     /// When `--since` is set, it wins regardless of preset/last_n.
