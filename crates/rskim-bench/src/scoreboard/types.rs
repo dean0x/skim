@@ -476,6 +476,14 @@ pub enum EntryKind {
     /// `[[ast]]`: one catalog pattern in one oracle language, scored against
     /// the structural oracle (#541).
     Ast,
+    /// `[[refs]]`: every site of one name, frozen with its role (#540).
+    Refs,
+    /// `[[clash]]`: a name with two or more definitions, frozen with its
+    /// definitions and calls (#540).
+    Clash,
+    /// `[[stakes]]`: a plain-text query whose lines, files, counts or exit
+    /// code are compared with the regex oracle (#540).
+    Stakes,
 }
 
 /// A HARD check (tolerance 0; the ledger in `known_failures.toml` names
@@ -569,11 +577,21 @@ impl CheckId {
             CheckId::OrderPrefixConsistent => kind == EntryKind::Prefix,
             // An `[[ast]]` entry is judged by the structural oracle; the
             // standalone `--ast` arm's ordering is `[[prefix]]` territory.
+            // `[[refs]]`, `[[clash]]` and `[[stakes]]` have their own
+            // oracles and checks, so no lexical or ordering check runs on
+            // them.
             CheckId::LexicalRecall
             | CheckId::LexicalPrecision
             | CheckId::LexicalSilentFn
             | CheckId::LexicalVerifyMode
-            | CheckId::OrderScoreMonotone => kind != EntryKind::Ast,
+            | CheckId::OrderScoreMonotone => matches!(
+                kind,
+                EntryKind::Ident
+                    | EntryKind::Concept
+                    | EntryKind::Lexical
+                    | EntryKind::Pagination
+                    | EntryKind::Prefix
+            ),
             CheckId::ResultsUniquePaths => true,
             CheckId::StructuralRecall
             | CheckId::StructuralPrecision
@@ -900,8 +918,41 @@ mod tests {
             EntryKind::Pagination,
             EntryKind::Prefix,
             EntryKind::Ast,
+            EntryKind::Refs,
+            EntryKind::Clash,
+            EntryKind::Stakes,
         ] {
             assert!(CheckId::ResultsUniquePaths.applies_to(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn lexical_and_ordering_checks_never_apply_to_refs_clash_or_stakes_entries() {
+        // A ledger entry that pairs one of these checks with such an entry
+        // would XFAIL nothing, so `applies_to` must refuse it.
+        for check in [
+            CheckId::LexicalRecall,
+            CheckId::LexicalPrecision,
+            CheckId::LexicalSilentFn,
+            CheckId::LexicalVerifyMode,
+            CheckId::OrderScoreMonotone,
+            CheckId::OrderPrefixConsistent,
+            CheckId::PaginationComplete,
+            CheckId::StructuralRecall,
+        ] {
+            for kind in [EntryKind::Refs, EntryKind::Clash, EntryKind::Stakes] {
+                assert!(!check.applies_to(kind), "{check} on {kind:?}");
+            }
+        }
+        // The five older kinds keep their lexical checks.
+        for kind in [
+            EntryKind::Ident,
+            EntryKind::Concept,
+            EntryKind::Lexical,
+            EntryKind::Pagination,
+            EntryKind::Prefix,
+        ] {
+            assert!(CheckId::LexicalRecall.applies_to(kind), "{kind:?}");
         }
     }
 
@@ -920,6 +971,9 @@ mod tests {
                 EntryKind::Lexical,
                 EntryKind::Pagination,
                 EntryKind::Prefix,
+                EntryKind::Refs,
+                EntryKind::Clash,
+                EntryKind::Stakes,
             ] {
                 assert!(!check.applies_to(kind), "{check} on {kind:?}");
             }

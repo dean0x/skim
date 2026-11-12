@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::scoreboard::MAX_PAGES;
 use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
-use crate::scoreboard::oracle::{LangFilter, LexicalQuery, MatchMode, ground_truth};
+use crate::scoreboard::oracle::{LangFilter, LexicalQuery, MatchMode, WholeWord, ground_truth};
 use crate::scoreboard::types::{Arm, CheckId, EntryKind, VerifyMode};
 use crate::scoreboard::universe::Universe;
 
@@ -71,6 +71,12 @@ pub struct ConceptEntry {
     pub query: String,
     /// A file is relevant iff this regex matches its text.
     pub relevant: String,
+    /// Repo-relative paths, any one of which is an acceptable first result
+    /// (`concept.first_right_top5`). Absent: the entry has no first-file
+    /// check. Present but empty is a golden error, because no result could
+    /// ever satisfy it.
+    #[serde(default)]
+    pub first: Option<Vec<String>>,
 }
 
 impl ConceptEntry {
@@ -257,6 +263,150 @@ pub struct AstEntry {
     pub expect_oracle_empty: bool,
 }
 
+/// What a frozen site is. The names follow the role rules of the search
+/// engine (`def`, `call`, `ref`, `import`, `comment`, `string`, `text`); the
+/// hand classification of the golden entries uses the same names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteRole {
+    Def,
+    Call,
+    Ref,
+    Import,
+    Comment,
+    String,
+    Text,
+}
+
+/// One frozen site of a `[[refs]]` entry: a line that holds the query as a
+/// whole word, with its role.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefSite {
+    pub path: String,
+    pub line: u32,
+    pub role: SiteRole,
+}
+
+/// `[[refs]]`: every site of one name. The `sites` set equals the whole-word
+/// line set of the query over the oracle universe at the pin (golden
+/// integrity), so a missing or an extra site exits 2 instead of moving the
+/// target. Frozen from `git grep -nw` and a read of each line, never from
+/// skim's output.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefsEntry {
+    pub id: String,
+    /// A bare identifier.
+    pub query: String,
+    /// The definition line; it is also one of `sites`.
+    pub def: DefSite,
+    pub sites: Vec<RefSite>,
+    pub origin: Origin,
+}
+
+/// The definition a `[[clash]]` call belongs to: the index into
+/// [`ClashEntry::defs`], or `"unassigned"` when the call is not split by
+/// definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum CallDef {
+    Index(usize),
+    Unassigned(Unassigned),
+}
+
+/// The one string a [`CallDef`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Unassigned {
+    Unassigned,
+}
+
+/// One frozen call site of a `[[clash]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClashCall {
+    pub path: String,
+    pub line: u32,
+    pub def: CallDef,
+}
+
+/// How a `[[clash]]` entry assigns calls to definitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClashSplit {
+    /// Calls are not split by definition (the only value v1 accepts).
+    None,
+    /// Every call carries the index of its definition. Reserved for a later
+    /// version; golden integrity refuses it today.
+    Exact,
+}
+
+/// `[[clash]]`: a name with two or more definitions. The `defs` are the
+/// definition sites and the `calls` are the call sites of the name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClashEntry {
+    pub id: String,
+    /// A bare identifier.
+    pub query: String,
+    pub defs: Vec<DefSite>,
+    pub calls: Vec<ClashCall>,
+    pub split: ClashSplit,
+    pub origin: Origin,
+}
+
+/// What a `[[stakes]]` entry compares against the regex oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StakesExpect {
+    Lines,
+    Files,
+    Counts,
+    Exit,
+}
+
+/// `[[stakes]]`: a plain-text query judged against the regex oracle, either
+/// for its matching lines, files or counts, or for its exit code.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StakesEntry {
+    pub id: String,
+    pub query: String,
+    /// rg-style tokens from [`STAKES_FLAGS`].
+    #[serde(default)]
+    pub flags: Vec<String>,
+    pub expect: StakesExpect,
+    /// The expected exit code. Required when `expect = "exit"`, forbidden
+    /// otherwise.
+    #[serde(default)]
+    pub exit: Option<u8>,
+}
+
+/// The closed set of flags a `[[stakes]]` entry may use: the flag set of the
+/// plain-text search. `-n` is accepted and does nothing. The second field is
+/// whether the flag takes a value (the token that follows it).
+pub const STAKES_FLAGS: &[(&str, bool)] = &[
+    ("-i", false),
+    ("-S", false),
+    ("-w", false),
+    ("-F", false),
+    ("-E", false),
+    ("-g", true),
+    ("-t", true),
+    ("-l", false),
+    ("-c", false),
+    ("-C", true),
+    ("-n", false),
+    ("--all", false),
+    ("--full", false),
+    ("--json", false),
+    ("--limit", true),
+    ("--offset", true),
+    ("--root", true),
+    ("-h", false),
+];
+
 /// One corpus's golden file.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,11 +426,17 @@ pub struct GoldenFile {
     pub prefixes: Vec<PrefixEntry>,
     #[serde(default, rename = "ast")]
     pub asts: Vec<AstEntry>,
+    #[serde(default, rename = "refs")]
+    pub refs: Vec<RefsEntry>,
+    #[serde(default, rename = "clash")]
+    pub clashes: Vec<ClashEntry>,
+    #[serde(default, rename = "stakes")]
+    pub stakes: Vec<StakesEntry>,
 }
 
 impl GoldenFile {
     /// Every `(id, kind)`, in file order within each kind (ident, concept,
-    /// lexical, pagination, prefix, ast).
+    /// lexical, pagination, prefix, ast, refs, clash, stakes).
     pub fn ids(&self) -> impl Iterator<Item = (&str, EntryKind)> {
         let idents = self
             .idents
@@ -303,12 +459,24 @@ impl GoldenFile {
             .iter()
             .map(|e| (e.id.as_str(), EntryKind::Prefix));
         let asts = self.asts.iter().map(|e| (e.id.as_str(), EntryKind::Ast));
+        let refs = self.refs.iter().map(|e| (e.id.as_str(), EntryKind::Refs));
+        let clashes = self
+            .clashes
+            .iter()
+            .map(|e| (e.id.as_str(), EntryKind::Clash));
+        let stakes = self
+            .stakes
+            .iter()
+            .map(|e| (e.id.as_str(), EntryKind::Stakes));
         idents
             .chain(concepts)
             .chain(lexicals)
             .chain(paginations)
             .chain(prefixes)
             .chain(asts)
+            .chain(refs)
+            .chain(clashes)
+            .chain(stakes)
     }
 
     /// The kind of the entry with `id`.
@@ -727,12 +895,21 @@ impl Violations {
 /// are non-empty and positive and their `flags` parse; a prefix without a
 /// query selects a standalone arm; every `[[ast]]` pattern is in skim's
 /// catalog and has an oracle query in the entry's language, and no
-/// `(pattern, lang)` pair has two entries; every ledger entry names an
-/// existing id whose kind its check applies to.
+/// `(pattern, lang)` pair has two entries; a concept's `first` list is
+/// non-empty with distinct, non-blank paths; a `[[refs]]` or `[[clash]]` query
+/// is a bare identifier; a `[[refs]]` entry has distinct sites that include its
+/// `def`; a `[[clash]]` has 2 or more distinct defs, distinct calls, every call
+/// `def` index in range and `split = "none"`; a `[[stakes]]` entry uses only
+/// flags of [`STAKES_FLAGS`] and has `exit` exactly when `expect = "exit"`;
+/// every ledger entry names an existing id whose kind its check applies to.
 ///
-/// With a universe: every `def.path` is indexed and its `def.line` contains
-/// the query; every lexically-computable pagination entry's ground truth fits
-/// [`pagination_bound`]; every `zero-hit` entry's ground truth is empty.
+/// With a universe: every `[[ident]]` `def.path` is indexed and its `def.line`
+/// holds the query as a whole word; every `[[refs]]` site set equals the
+/// whole-word line set of its query, and its `def` line is one of them; every
+/// `[[clash]]` def and call line holds the query as a whole word; every
+/// concept `first` path is indexed; every lexically-computable pagination
+/// entry's ground truth fits [`pagination_bound`]; every `zero-hit` entry's
+/// ground truth is empty.
 ///
 /// Two `[[ast]]` golden errors need the structural oracle's answers, so the
 /// pipeline checks them: an entry flagged `expect_oracle_empty` whose oracle
@@ -760,7 +937,7 @@ pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<I
         v.entry_err(&e.id, check_ident(e, ctx.universe));
     }
     for e in &golden.concepts {
-        v.entry_err(&e.id, non_blank(&e.query).and(e.relevance().map(|_| ())));
+        v.entry_err(&e.id, check_concept(e, ctx.universe));
     }
     for e in &golden.lexicals {
         v.entry_err(&e.id, check_lexical(e, ctx.universe));
@@ -777,6 +954,15 @@ pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<I
             v.entry_err(&e.id, check_ast(e, &catalog));
         }
         check_ast_pairs(golden, &mut v);
+    }
+    for e in &golden.refs {
+        v.entry_err(&e.id, check_refs(e, ctx.universe));
+    }
+    for e in &golden.clashes {
+        v.entry_err(&e.id, check_clash(e, ctx.universe));
+    }
+    for e in &golden.stakes {
+        v.entry_err(&e.id, check_stakes(e));
     }
     check_ledger(golden, ctx.ledger, &mut v);
 
@@ -804,32 +990,218 @@ fn non_blank(query: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many offending sites one violation message names.
+const SITES_SHOWN: usize = 5;
+
+/// The line at `path:line` in the oracle universe must hold `query` as a
+/// whole word.
+fn check_word_line(
+    universe: &Universe,
+    word: &WholeWord,
+    path: &str,
+    line: u32,
+    query: &str,
+) -> anyhow::Result<()> {
+    let text = universe.text(path).with_context(|| {
+        format!("{path}:{line} is not in the oracle's indexed universe at the pinned commit")
+    })?;
+    let idx = usize::try_from(line.checked_sub(1).context("line must be >= 1")?)?;
+    let held = text
+        .split('\n')
+        .nth(idx)
+        .with_context(|| format!("{path} has no line {line}"))?;
+    anyhow::ensure!(
+        word.in_line(held, query),
+        "{path}:{line} does not contain {query:?} as a whole word (line is {held:?})"
+    );
+    Ok(())
+}
+
+/// A `[[refs]]` or `[[clash]]` query is a bare identifier: letters, digits and
+/// underscore. The whole-word rule is then the same for the oracle and for
+/// `git grep -w`, which froze the sites.
+fn check_identifier(query: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !query.is_empty() && query.chars().all(|c| c == '_' || c.is_alphanumeric()),
+        "query {query:?} is not a bare identifier (letters, digits and underscore only)"
+    );
+    Ok(())
+}
+
+/// `path:line` of up to [`SITES_SHOWN`] sites, for a violation message.
+fn show_sites<'a>(sites: impl Iterator<Item = &'a (String, u32)>) -> String {
+    sites
+        .take(SITES_SHOWN)
+        .map(|(path, line)| format!("{path}:{line}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn check_ident(e: &IdentEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
     non_blank(&e.query)?;
     anyhow::ensure!(e.def.line >= 1, "def.line must be >= 1");
     let Some(universe) = universe else {
         return Ok(());
     };
-    let text = universe.text(&e.def.path).with_context(|| {
-        format!(
-            "def.path {:?} is not in the oracle's indexed universe at the pinned commit",
-            e.def.path
-        )
-    })?;
-    let idx = usize::try_from(e.def.line - 1)?;
-    let line = text
-        .split('\n')
-        .nth(idx)
-        .with_context(|| format!("{} has no line {}", e.def.path, e.def.line))?;
-    anyhow::ensure!(
-        line.contains(&e.query),
-        "{}:{} does not contain {:?} (line is {:?})",
-        e.def.path,
+    check_word_line(
+        universe,
+        &WholeWord::new()?,
+        &e.def.path,
         e.def.line,
-        e.query,
-        line
+        &e.query,
+    )
+}
+
+fn check_concept(e: &ConceptEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
+    non_blank(&e.query)?;
+    e.relevance()?;
+    let Some(first) = &e.first else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !first.is_empty(),
+        "`first` is empty; omit it or list the acceptable first files"
     );
+    let mut seen = BTreeSet::new();
+    for path in first {
+        anyhow::ensure!(!path.trim().is_empty(), "`first` has a blank path");
+        anyhow::ensure!(seen.insert(path.as_str()), "`first` lists {path:?} twice");
+        if let Some(universe) = universe {
+            anyhow::ensure!(
+                universe.contains(path),
+                "`first` path {path:?} is not in the oracle's indexed universe at the pinned commit"
+            );
+        }
+    }
     Ok(())
+}
+
+fn check_refs(e: &RefsEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
+    check_identifier(&e.query)?;
+    anyhow::ensure!(e.def.line >= 1, "def.line must be >= 1");
+    anyhow::ensure!(!e.sites.is_empty(), "entry has no sites");
+    anyhow::ensure!(
+        e.sites.iter().all(|s| s.line >= 1),
+        "every site line must be >= 1"
+    );
+    let mut frozen: BTreeSet<(String, u32)> = BTreeSet::new();
+    for s in &e.sites {
+        anyhow::ensure!(
+            frozen.insert((s.path.clone(), s.line)),
+            "site {}:{} is listed twice",
+            s.path,
+            s.line
+        );
+    }
+    anyhow::ensure!(
+        frozen.contains(&(e.def.path.clone(), e.def.line)),
+        "def is not one of the sites ({}:{})",
+        e.def.path,
+        e.def.line
+    );
+    let Some(universe) = universe else {
+        return Ok(());
+    };
+    let word = WholeWord::new()?;
+    check_word_line(universe, &word, &e.def.path, e.def.line, &e.query)?;
+    let truth = word.lines(universe.files(), &e.query);
+    let missing: Vec<&(String, u32)> = truth.difference(&frozen).collect();
+    let extra: Vec<&(String, u32)> = frozen.difference(&truth).collect();
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "{} whole-word line(s) are missing from sites, e.g. {}",
+            missing.len(),
+            show_sites(missing.iter().copied())
+        ));
+    }
+    if !extra.is_empty() {
+        problems.push(format!(
+            "{} site(s) are not a whole-word line at the pin, e.g. {}",
+            extra.len(),
+            show_sites(extra.iter().copied())
+        ));
+    }
+    anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
+    Ok(())
+}
+
+fn check_clash(e: &ClashEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
+    check_identifier(&e.query)?;
+    anyhow::ensure!(
+        e.defs.len() >= 2,
+        "a clash needs 2 or more defs, found {}",
+        e.defs.len()
+    );
+    anyhow::ensure!(
+        e.split == ClashSplit::None,
+        "split = \"exact\" is not accepted in v1; use split = \"none\""
+    );
+    anyhow::ensure!(
+        e.defs.iter().all(|d| d.line >= 1) && e.calls.iter().all(|c| c.line >= 1),
+        "every def and call line must be >= 1"
+    );
+    let mut seen = BTreeSet::new();
+    for d in &e.defs {
+        anyhow::ensure!(
+            seen.insert((d.path.as_str(), d.line)),
+            "def {}:{} is listed twice",
+            d.path,
+            d.line
+        );
+    }
+    seen.clear();
+    for c in &e.calls {
+        anyhow::ensure!(
+            seen.insert((c.path.as_str(), c.line)),
+            "call {}:{} is listed twice",
+            c.path,
+            c.line
+        );
+        if let CallDef::Index(i) = c.def {
+            anyhow::ensure!(
+                i < e.defs.len(),
+                "call {}:{} has def index {i}, out of range for {} defs",
+                c.path,
+                c.line,
+                e.defs.len()
+            );
+        }
+    }
+    let Some(universe) = universe else {
+        return Ok(());
+    };
+    let word = WholeWord::new()?;
+    for d in &e.defs {
+        check_word_line(universe, &word, &d.path, d.line, &e.query)?;
+    }
+    for c in &e.calls {
+        check_word_line(universe, &word, &c.path, c.line, &e.query)?;
+    }
+    Ok(())
+}
+
+fn check_stakes(e: &StakesEntry) -> anyhow::Result<()> {
+    non_blank(&e.query)?;
+    let mut tokens = e.flags.iter();
+    while let Some(flag) = tokens.next() {
+        let takes_value = STAKES_FLAGS
+            .iter()
+            .find(|(name, _)| *name == flag)
+            .map(|(_, takes_value)| *takes_value)
+            .with_context(|| format!("flag {flag:?} is not in the closed set of stakes flags"))?;
+        if takes_value {
+            tokens
+                .next()
+                .with_context(|| format!("flag {flag:?} needs a value"))?;
+        }
+    }
+    match (e.expect, e.exit) {
+        (StakesExpect::Exit, None) => anyhow::bail!("expect = \"exit\" requires `exit`"),
+        (StakesExpect::Exit, Some(_)) => Ok(()),
+        (_, Some(_)) => anyhow::bail!("`exit` is only valid with expect = \"exit\""),
+        (_, None) => Ok(()),
+    }
 }
 
 fn check_lexical(e: &LexicalEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
@@ -1270,6 +1642,452 @@ limits = [5, 20]
         }
     }
 
+    // --- [[refs]] / [[clash]] / [[stakes]] / concept `first` ---------------------
+
+    /// One entry of each new table, in the shape the design shows.
+    const NEW_TABLES: &str = r#"
+[[refs]]
+id = "skim-R01"
+query = "run"
+def = { path = "src/a.rs", line = 1 }
+sites = [
+  { path = "src/a.rs", line = 1, role = "def" },
+  { path = "src/a.rs", line = 2, role = "call" },
+]
+origin = "curated"
+
+[[clash]]
+id = "skim-D01"
+query = "run"
+defs = [ { path = "src/a.rs", line = 1 }, { path = "src/b.rs", line = 1 } ]
+calls = [
+  { path = "src/a.rs", line = 2, def = 0 },
+  { path = "src/c.rs", line = 3, def = "unassigned" },
+]
+split = "none"
+origin = "curated"
+
+[[stakes]]
+id = "skim-S01"
+query = "qzvx_absent_7713"
+flags = []
+expect = "exit"
+exit = 1
+"#;
+
+    fn refs(id: &str, query: &str, def: (&str, u32), sites: &[(&str, u32, &str)]) -> String {
+        let sites: Vec<String> = sites
+            .iter()
+            .map(|(p, l, r)| format!("{{ path = \"{p}\", line = {l}, role = \"{r}\" }}"))
+            .collect();
+        format!(
+            "[[refs]]\nid = \"{id}\"\nquery = \"{query}\"\n\
+             def = {{ path = \"{}\", line = {} }}\nsites = [{}]\norigin = \"curated\"\n",
+            def.0,
+            def.1,
+            sites.join(", ")
+        )
+    }
+
+    /// `calls` are `(path, line, def)` with `def` already in TOML form
+    /// (`0` or `"unassigned"`).
+    fn clash(
+        id: &str,
+        query: &str,
+        defs: &[(&str, u32)],
+        calls: &[(&str, u32, &str)],
+        split: &str,
+    ) -> String {
+        let defs: Vec<String> = defs
+            .iter()
+            .map(|(p, l)| format!("{{ path = \"{p}\", line = {l} }}"))
+            .collect();
+        let calls: Vec<String> = calls
+            .iter()
+            .map(|(p, l, d)| format!("{{ path = \"{p}\", line = {l}, def = {d} }}"))
+            .collect();
+        format!(
+            "[[clash]]\nid = \"{id}\"\nquery = \"{query}\"\ndefs = [{}]\ncalls = [{}]\n\
+             split = \"{split}\"\norigin = \"curated\"\n",
+            defs.join(", "),
+            calls.join(", ")
+        )
+    }
+
+    fn stakes(id: &str, query: &str, flags: &str, expect: &str, exit: Option<u8>) -> String {
+        let exit = exit.map(|c| format!("exit = {c}\n")).unwrap_or_default();
+        format!(
+            "[[stakes]]\nid = \"{id}\"\nquery = \"{query}\"\nflags = {flags}\nexpect = \"{expect}\"\n{exit}"
+        )
+    }
+
+    fn message_of(violations: &[IntegrityViolation], id: &str) -> String {
+        violations
+            .iter()
+            .filter(|v| v.id.as_deref() == Some(id))
+            .map(|v| v.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn the_new_tables_parse_with_every_field_and_pass_schema_integrity() {
+        let g = golden(&format!("{}{NEW_TABLES}", header()));
+        assert_eq!(g.refs[0].query, "run");
+        assert_eq!(g.refs[0].def.line, 1);
+        assert_eq!(g.refs[0].sites[1].role, SiteRole::Call);
+        assert_eq!(g.refs[0].origin, Origin::Curated);
+        assert_eq!(g.clashes[0].defs.len(), 2);
+        assert_eq!(g.clashes[0].split, ClashSplit::None);
+        assert_eq!(g.stakes[0].expect, StakesExpect::Exit);
+        assert_eq!(g.stakes[0].exit, Some(1));
+        assert!(g.stakes[0].flags.is_empty());
+        assert_eq!(check_integrity(&g, &ctx(&[])), Vec::new());
+    }
+
+    #[test]
+    fn every_site_role_name_loads() {
+        for (raw, want) in [
+            ("def", SiteRole::Def),
+            ("call", SiteRole::Call),
+            ("ref", SiteRole::Ref),
+            ("import", SiteRole::Import),
+            ("comment", SiteRole::Comment),
+            ("string", SiteRole::String),
+            ("text", SiteRole::Text),
+        ] {
+            let g = golden(&format!(
+                "{}{}",
+                header(),
+                refs("skim-R1", "run", ("a.rs", 1), &[("a.rs", 1, raw)])
+            ));
+            assert_eq!(g.refs[0].sites[0].role, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_call_def_is_an_index_or_the_word_unassigned() {
+        let g = golden(&format!("{}{NEW_TABLES}", header()));
+        assert_eq!(g.clashes[0].calls[0].def, CallDef::Index(0));
+        assert_eq!(
+            g.clashes[0].calls[1].def,
+            CallDef::Unassigned(Unassigned::Unassigned)
+        );
+    }
+
+    #[test]
+    fn typos_and_unknown_values_in_the_new_tables_do_not_load() {
+        let bad = [
+            // `site` for `sites`.
+            "[[refs]]\nid = \"skim-R1\"\nquery = \"q\"\ndef = { path = \"a.rs\", line = 1 }\n\
+             site = []\norigin = \"curated\"\n"
+                .to_string(),
+            // unknown role.
+            refs("skim-R1", "q", ("a.rs", 1), &[("a.rs", 1, "callee")]),
+            // a role on the clash call.
+            "[[clash]]\nid = \"skim-D1\"\nquery = \"q\"\ndefs = []\n\
+             calls = [{ path = \"a.rs\", line = 1, def = 0, role = \"call\" }]\n\
+             split = \"none\"\norigin = \"curated\"\n"
+                .to_string(),
+            // a call def that is neither an index nor "unassigned".
+            clash(
+                "skim-D1",
+                "q",
+                &[("a.rs", 1), ("b.rs", 1)],
+                &[("a.rs", 2, "\"first\"")],
+                "none",
+            ),
+            clash("skim-D1", "q", &[("a.rs", 1)], &[], "approx"),
+            // an `origin` on stakes (the table has none).
+            format!(
+                "{}origin = \"curated\"\n",
+                stakes("skim-S1", "q", "[]", "lines", None)
+            ),
+            stakes("skim-S1", "q", "[]", "bytes", None),
+            // `exit` out of range for an exit code.
+            stakes("skim-S1", "q", "[]", "exit", Some(1)).replace("exit = 1", "exit = 300"),
+        ];
+        for body in bad {
+            assert!(
+                parse_golden(&format!("{}{body}", header())).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_entries_are_indexed_by_id_and_share_the_id_rules() {
+        let g = golden(&format!("{}{NEW_TABLES}", header()));
+        assert_eq!(g.entry_kind("skim-R01"), Some(EntryKind::Refs));
+        assert_eq!(g.entry_kind("skim-D01"), Some(EntryKind::Clash));
+        assert_eq!(g.entry_kind("skim-S01"), Some(EntryKind::Stakes));
+        assert_eq!(g.ids().count(), 3);
+
+        let v = violations_for(&format!(
+            "{}{}{}",
+            header(),
+            refs("skim-R1", "run", ("a.rs", 1), &[("a.rs", 1, "def")]),
+            stakes("skim-R1", "q", "[]", "lines", None),
+        ));
+        assert!(
+            message_of(&v, "skim-R1").contains("used by 2 entries"),
+            "{v:?}"
+        );
+        let v = violations_for(&format!(
+            "{}{}",
+            header(),
+            stakes("zod-S1", "q", "[]", "lines", None)
+        ));
+        assert!(flagged(&v, "zod-S1"), "wrong corpus prefix: {v:?}");
+    }
+
+    // --- concept `first` ---------------------------------------------------------
+
+    #[test]
+    fn a_concept_without_first_still_loads_so_old_golden_files_stay_valid() {
+        let g = golden(DESIGN_EXAMPLE);
+        assert_eq!(g.concepts[0].first, None);
+        assert!(check_integrity(&g, &ctx(&[])).is_empty());
+    }
+
+    #[test]
+    fn a_concept_first_lists_the_acceptable_first_files() {
+        let g = golden(&format!(
+            "{}[[concept]]\nid = \"skim-C1\"\nquery = \"build lock\"\nrelevant = \"lock\"\n\
+             first = [\"src/a.rs\", \"src/b.rs\"]\n",
+            header()
+        ));
+        assert_eq!(
+            g.concepts[0].first,
+            Some(vec!["src/a.rs".to_string(), "src/b.rs".to_string()])
+        );
+        assert!(check_integrity(&g, &ctx(&[])).is_empty());
+    }
+
+    #[test]
+    fn an_empty_or_blank_concept_first_is_a_violation() {
+        for first in ["[]", "[\"\"]", "[\"a.rs\", \" \"]", "[\"a.rs\", \"a.rs\"]"] {
+            let v = violations_for(&format!(
+                "{}[[concept]]\nid = \"skim-C1\"\nquery = \"q\"\nrelevant = \"q\"\nfirst = {first}\n",
+                header()
+            ));
+            assert!(flagged(&v, "skim-C1"), "first = {first}: {v:?}");
+        }
+    }
+
+    // --- [[clash]] schema rules --------------------------------------------------
+
+    fn clash_violations(body: &str) -> Vec<IntegrityViolation> {
+        violations_for(&format!("{}{body}", header()))
+    }
+
+    #[test]
+    fn a_clash_needs_two_defs_a_call_def_in_range_and_no_split() {
+        let one_def = clash_violations(&clash(
+            "skim-D1",
+            "run",
+            &[("a.rs", 1)],
+            &[("a.rs", 2, "\"unassigned\"")],
+            "none",
+        ));
+        assert!(
+            message_of(&one_def, "skim-D1").contains("2 or more"),
+            "{one_def:?}"
+        );
+
+        let out_of_range = clash_violations(&clash(
+            "skim-D2",
+            "run",
+            &[("a.rs", 1), ("b.rs", 1)],
+            &[("a.rs", 2, "2")],
+            "none",
+        ));
+        assert!(
+            message_of(&out_of_range, "skim-D2").contains("out of range"),
+            "{out_of_range:?}"
+        );
+
+        let exact = clash_violations(&clash(
+            "skim-D3",
+            "run",
+            &[("a.rs", 1), ("b.rs", 1)],
+            &[("a.rs", 2, "0")],
+            "exact",
+        ));
+        assert!(message_of(&exact, "skim-D3").contains("split"), "{exact:?}");
+    }
+
+    #[test]
+    fn a_valid_clash_has_no_violation_and_an_index_may_name_the_last_def() {
+        let v = clash_violations(&clash(
+            "skim-D1",
+            "run",
+            &[("a.rs", 1), ("b.rs", 1)],
+            &[("a.rs", 2, "1"), ("a.rs", 3, "\"unassigned\"")],
+            "none",
+        ));
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn a_clash_with_a_repeated_def_or_call_site_is_a_violation() {
+        let repeated_def = clash_violations(&clash(
+            "skim-D1",
+            "run",
+            &[("a.rs", 1), ("a.rs", 1)],
+            &[],
+            "none",
+        ));
+        assert!(
+            message_of(&repeated_def, "skim-D1").contains("def a.rs:1 is listed twice"),
+            "{repeated_def:?}"
+        );
+        let repeated_call = clash_violations(&clash(
+            "skim-D2",
+            "run",
+            &[("a.rs", 1), ("b.rs", 1)],
+            &[("a.rs", 2, "0"), ("a.rs", 2, "1")],
+            "none",
+        ));
+        assert!(
+            message_of(&repeated_call, "skim-D2").contains("call a.rs:2 is listed twice"),
+            "{repeated_call:?}"
+        );
+    }
+
+    // --- [[refs]] schema rules ---------------------------------------------------
+
+    #[test]
+    fn a_refs_entry_needs_sites_that_are_distinct_and_include_its_def() {
+        let no_sites = clash_violations(&refs("skim-R1", "run", ("a.rs", 1), &[]));
+        assert!(
+            message_of(&no_sites, "skim-R1").contains("no sites"),
+            "{no_sites:?}"
+        );
+
+        let duplicate = clash_violations(&refs(
+            "skim-R2",
+            "run",
+            ("a.rs", 1),
+            &[("a.rs", 1, "def"), ("a.rs", 1, "call")],
+        ));
+        assert!(
+            message_of(&duplicate, "skim-R2").contains("is listed twice"),
+            "{duplicate:?}"
+        );
+
+        let def_missing =
+            clash_violations(&refs("skim-R3", "run", ("a.rs", 1), &[("a.rs", 2, "call")]));
+        assert!(
+            message_of(&def_missing, "skim-R3").contains("def is not one of the sites"),
+            "{def_missing:?}"
+        );
+
+        let ok = clash_violations(&refs(
+            "skim-R4",
+            "run",
+            ("a.rs", 1),
+            &[("a.rs", 1, "def"), ("a.rs", 2, "call")],
+        ));
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn the_refs_and_clash_queries_must_be_bare_identifiers() {
+        for query in ["", "two words", "a-b", "a.b", "run()", "$run"] {
+            let r = clash_violations(&refs("skim-R1", query, ("a.rs", 1), &[("a.rs", 1, "def")]));
+            assert!(flagged(&r, "skim-R1"), "refs {query:?}: {r:?}");
+            let c = clash_violations(&clash(
+                "skim-D1",
+                query,
+                &[("a.rs", 1), ("b.rs", 1)],
+                &[],
+                "none",
+            ));
+            assert!(flagged(&c, "skim-D1"), "clash {query:?}: {c:?}");
+        }
+        for query in ["run", "_run", "run2", "Run_Fast"] {
+            let r = clash_violations(&refs("skim-R1", query, ("a.rs", 1), &[("a.rs", 1, "def")]));
+            assert!(r.is_empty(), "refs {query:?}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_zero_line_in_a_def_or_site_is_a_violation() {
+        let v = clash_violations(&refs("skim-R1", "run", ("a.rs", 0), &[("a.rs", 0, "def")]));
+        assert!(flagged(&v, "skim-R1"), "{v:?}");
+        let v = clash_violations(&clash(
+            "skim-D1",
+            "run",
+            &[("a.rs", 0), ("b.rs", 1)],
+            &[("a.rs", 0, "0")],
+            "none",
+        ));
+        assert!(flagged(&v, "skim-D1"), "{v:?}");
+    }
+
+    // --- [[stakes]] schema rules -------------------------------------------------
+
+    #[test]
+    fn a_stakes_exit_is_required_for_expect_exit_and_forbidden_otherwise() {
+        let v = clash_violations(&stakes("skim-S1", "q", "[]", "exit", None));
+        assert!(
+            message_of(&v, "skim-S1").contains("requires `exit`"),
+            "{v:?}"
+        );
+        for expect in ["lines", "files", "counts"] {
+            let v = clash_violations(&stakes("skim-S2", "q", "[]", expect, Some(1)));
+            assert!(flagged(&v, "skim-S2"), "{expect}: {v:?}");
+            let ok = clash_violations(&stakes("skim-S3", "q", "[]", expect, None));
+            assert!(ok.is_empty(), "{expect}: {ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_stakes_query_must_not_be_blank() {
+        let v = clash_violations(&stakes("skim-S1", "  ", "[]", "lines", None));
+        assert!(flagged(&v, "skim-S1"), "{v:?}");
+    }
+
+    #[test]
+    fn stakes_flags_must_come_from_the_closed_set_with_their_values() {
+        for flags in [
+            "[]",
+            "[\"-i\"]",
+            "[\"-w\", \"-F\"]",
+            "[\"-g\", \"*.rs\"]",
+            "[\"-C\", \"2\", \"--limit\", \"5\"]",
+            "[\"--limit\", \"-1\"]",
+        ] {
+            let v = clash_violations(&stakes("skim-S1", "q", flags, "lines", None));
+            assert!(v.is_empty(), "{flags}: {v:?}");
+        }
+        for flags in [
+            "[\"-I\"]",
+            "[\"--hidden\"]",
+            "[\"pattern\"]",
+            "[\"-g\"]",
+            "[\"--limit\"]",
+        ] {
+            let v = clash_violations(&stakes("skim-S1", "q", flags, "lines", None));
+            assert!(flagged(&v, "skim-S1"), "{flags}: {v:?}");
+        }
+    }
+
+    // --- ledger pairing for the new kinds ----------------------------------------
+
+    #[test]
+    fn a_lexical_check_in_the_ledger_cannot_name_a_refs_clash_or_stakes_entry() {
+        let g = golden(&format!("{}{NEW_TABLES}", header()));
+        for id in ["skim-R01", "skim-D01", "skim-S01"] {
+            let refs = [LedgerRef {
+                check: CheckId::LexicalRecall,
+                id,
+            }];
+            assert!(flagged(&check_integrity(&g, &ctx(&refs)), id), "{id}");
+        }
+    }
+
     // --- flags -----------------------------------------------------------------
 
     #[test]
@@ -1609,6 +2427,193 @@ limits = [5, 20]
         );
         assert!(flagged(&v, "skim-Z1"), "{v:?}");
         assert!(!flagged(&v, "skim-Z2"), "{v:?}");
+    }
+
+    // --- whole-word integrity against the corpus universe ------------------------
+
+    /// `run` is a whole word on a.rs lines 1, 2 and 3 and b.rs line 1; lines
+    /// that hold it only inside a longer word are a.rs:4 and b.rs:2.
+    fn word_corpus() -> (FixtureRepo, String, Universe) {
+        let repo = FixtureRepo::new();
+        repo.write(
+            "src/a.rs",
+            "pub fn run() {}\nfn helper() { run(); }\n// rerun is not run\nlet runner = 1;\n",
+        );
+        repo.write("src/b.rs", "pub fn run(x: u32) {}\nfn rerun_it() {}\n");
+        let sha = repo.commit_all("init");
+        let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+        (repo, sha, universe)
+    }
+
+    fn word_violations(body: &str) -> Vec<IntegrityViolation> {
+        let (_repo, sha, u) = word_corpus();
+        check_against(&u, &sha, body)
+    }
+
+    #[test]
+    fn a_def_line_that_holds_the_query_only_inside_a_longer_word_is_a_violation() {
+        let (_repo, sha, u) = word_corpus();
+        let ident = |path: &str, line: u32| {
+            format!(
+                "[[ident]]\nid = \"skim-L01\"\nquery = \"run\"\n\
+                 def = {{ path = \"{path}\", line = {line} }}\norigin = \"seed\"\n"
+            )
+        };
+        assert!(check_against(&u, &sha, &ident("src/a.rs", 1)).is_empty());
+        for (path, line) in [("src/a.rs", 4), ("src/b.rs", 2)] {
+            let v = check_against(&u, &sha, &ident(path, line));
+            assert!(
+                message_of(&v, "skim-L01").contains("does not contain"),
+                "{path}:{line}: {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refs_site_set_equal_to_the_whole_word_lines_passes() {
+        let v = word_violations(&refs(
+            "skim-R1",
+            "run",
+            ("src/a.rs", 1),
+            &[
+                ("src/a.rs", 1, "def"),
+                ("src/a.rs", 2, "call"),
+                ("src/a.rs", 3, "comment"),
+                ("src/b.rs", 1, "def"),
+            ],
+        ));
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn a_refs_site_set_that_misses_a_whole_word_line_is_a_violation() {
+        let v = word_violations(&refs(
+            "skim-R1",
+            "run",
+            ("src/a.rs", 1),
+            &[
+                ("src/a.rs", 1, "def"),
+                ("src/a.rs", 2, "call"),
+                ("src/b.rs", 1, "def"),
+            ],
+        ));
+        let message = message_of(&v, "skim-R1");
+        assert!(
+            message.contains("missing") && message.contains("src/a.rs:3"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_refs_site_on_a_line_without_the_whole_word_is_a_violation() {
+        let v = word_violations(&refs(
+            "skim-R1",
+            "run",
+            ("src/a.rs", 1),
+            &[
+                ("src/a.rs", 1, "def"),
+                ("src/a.rs", 2, "call"),
+                ("src/a.rs", 3, "comment"),
+                ("src/a.rs", 4, "ref"),
+                ("src/b.rs", 1, "def"),
+            ],
+        ));
+        let message = message_of(&v, "skim-R1");
+        assert!(
+            message.contains("not a whole-word line") && message.contains("src/a.rs:4"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_refs_site_outside_the_universe_is_a_violation() {
+        let v = word_violations(&refs(
+            "skim-R1",
+            "run",
+            ("src/a.rs", 1),
+            &[
+                ("src/a.rs", 1, "def"),
+                ("src/a.rs", 2, "call"),
+                ("src/a.rs", 3, "comment"),
+                ("src/b.rs", 1, "def"),
+                ("src/gone.rs", 7, "call"),
+            ],
+        ));
+        assert!(message_of(&v, "skim-R1").contains("src/gone.rs:7"), "{v:?}");
+    }
+
+    #[test]
+    fn a_refs_def_that_is_not_a_whole_word_line_is_a_violation() {
+        let v = word_violations(&refs(
+            "skim-R1",
+            "run",
+            ("src/a.rs", 4),
+            &[
+                ("src/a.rs", 1, "def"),
+                ("src/a.rs", 2, "call"),
+                ("src/a.rs", 3, "comment"),
+                ("src/a.rs", 4, "def"),
+                ("src/b.rs", 1, "def"),
+            ],
+        ));
+        assert!(flagged(&v, "skim-R1"), "{v:?}");
+    }
+
+    #[test]
+    fn clash_defs_and_calls_must_be_whole_word_lines() {
+        let ok = word_violations(&clash(
+            "skim-D1",
+            "run",
+            &[("src/a.rs", 1), ("src/b.rs", 1)],
+            &[("src/a.rs", 2, "0"), ("src/a.rs", 3, "\"unassigned\"")],
+            "none",
+        ));
+        assert!(ok.is_empty(), "{ok:?}");
+
+        let bad_call = word_violations(&clash(
+            "skim-D2",
+            "run",
+            &[("src/a.rs", 1), ("src/b.rs", 1)],
+            &[("src/a.rs", 4, "\"unassigned\"")],
+            "none",
+        ));
+        assert!(
+            message_of(&bad_call, "skim-D2").contains("src/a.rs:4"),
+            "{bad_call:?}"
+        );
+
+        let bad_def = word_violations(&clash(
+            "skim-D3",
+            "run",
+            &[("src/a.rs", 1), ("src/b.rs", 2)],
+            &[],
+            "none",
+        ));
+        assert!(
+            message_of(&bad_def, "skim-D3").contains("src/b.rs:2"),
+            "{bad_def:?}"
+        );
+
+        let gone = word_violations(&clash(
+            "skim-D4",
+            "run",
+            &[("src/a.rs", 1), ("src/gone.rs", 1)],
+            &[],
+            "none",
+        ));
+        assert!(flagged(&gone, "skim-D4"), "{gone:?}");
+    }
+
+    #[test]
+    fn a_concept_first_path_must_be_in_the_universe() {
+        let concept = |first: &str| {
+            format!(
+                "[[concept]]\nid = \"skim-C1\"\nquery = \"run\"\nrelevant = \"run\"\nfirst = {first}\n"
+            )
+        };
+        assert!(word_violations(&concept("[\"src/a.rs\", \"src/b.rs\"]")).is_empty());
+        let v = word_violations(&concept("[\"src/a.rs\", \"src/gone.rs\"]"));
+        assert!(message_of(&v, "skim-C1").contains("src/gone.rs"), "{v:?}");
     }
 
     // --- loading and hashing --------------------------------------------------------
