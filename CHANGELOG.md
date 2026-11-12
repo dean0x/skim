@@ -38,9 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the exact hidden count. `skim heatmap <file>...` prints a "before you edit" card per file
   (at most 5): co-change partners with 3 or more shared commits (tests first), up to 3 fix
   commits from history (at most 5 at any `--top`), and owners when the file has 2 or more
-  authors. `--insights <file>` prints the same card. Control characters in card text from
-  history show as `U+FFFD`. In the card text, subjects and owner names are in double quotes,
-  with `\"` and `\\` for a quote and a backslash.
+  authors. `--insights <file>` prints the same card. Control, bidirectional and invisible
+  format characters in card text from history show as `U+FFFD`. In the card text, subjects
+  and owner names are in double quotes, with `\"` and `\\` for a quote and a backslash.
 
 ### Changed
 

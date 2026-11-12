@@ -231,23 +231,21 @@ The default **dual mode** is designed for repositories of any age: it avoids und
 `skim heatmap <FILE>...` prints one "before you edit" card per file argument, at most 5 (or `--top N`), then `N more files (raise --top)`. A duplicate path gives one card. `--insights <FILE>...` prints the same bytes. A card is 12 lines or fewer at the default caps:
 
 ```text
-crates/rskim/src/cmd/heatmap/noise.rs: 4 commits
+crates/rskim/src/cmd/heatmap/view.rs: 7 commits
   partners (confidence, shared commits):
-    100%   4  crates/rskim/src/cmd/heatmap/mod.rs
-     80%   3  crates/rskim/src/cmd/heatmap/insights.rs
-     68%   3  crates/rskim/src/cmd/heatmap/metrics.rs
-     68%   3  crates/rskim/src/cmd/heatmap/output.rs
+     69%   5  crates/rskim/tests/cli_heatmap.rs
+    100%   7  crates/rskim/src/cmd/heatmap/mod.rs
+     66%   5  crates/rskim/src/cmd/heatmap/output.rs
   fix commits from history (newest first):
-    6f21b03 2026-11-12 "fix(heatmap): module insights need 5 commits of support"
-    01d606b 2026-11-12 "feat(heatmap): noise rules, later-fix proximity and coupling cap"
-  1 more partner (raise --top)
+    81a22ee 2026-11-12 "fix(heatmap): cap file_targets and count missing --diff files"
+    ca69af4 2026-11-12 "fix(heatmap): address self-review issues"
 ```
 
 - **Owners** (`owners: "A" 89%, "B" 11%`) show only when the file has 2 or more distinct authors. Each name is in double quotes.
 - **Partners** are files with 3 or more shared commits and a confidence at or above `--coupling-threshold`. Test files come first.
 - **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first. In the text view, a `"` or `\` in a subject or an owner name shows as `\"` or `\\`.
 - A file with no commits in the window prints `<path>: not in history window (N commits since DATE)`, where N and DATE describe the window.
-- Control and bidirectional characters in subjects, author names and partner paths become U+FFFD. Each of these strings is cut at 72 characters.
+- Control characters, bidirectional characters and invisible format characters (for example zero-width characters and Unicode tag characters) in subjects, author names and partner paths become U+FFFD. Each of these strings is cut at 72 characters.
 - `./x`, an absolute path under the repository root, a path relative to the current folder and a path with `..` give the same card. A path outside the repository exits 1. skim does not open the file. An absolute path through a symbolic-link prefix (for example macOS `/var`) is refused.
 
 Metrics come from the full window; a card only narrows the display.
