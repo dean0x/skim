@@ -2173,3 +2173,98 @@ fn clash_entry_toml() -> &'static str {
        { path = \"src/c.rs\", line = 7, def = \"unassigned\" },\n\
      ]\n"
 }
+
+#[test]
+fn evaluate_judges_each_stakes_expectation_with_its_own_comparison() {
+    let repo = FixtureRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn launch() {}\nfn start() { launch(); }\n// launch is documented\n",
+    );
+    repo.write("src/main.rs", "fn main() { launch(); }\n");
+    repo.write("LICENSE", "launch it\n");
+    let commit = repo.commit_all("init");
+    let git = GitIsolation::new(repo.home());
+    let universe = Universe::compute(repo.root(), &git).unwrap();
+    let text = text_universe(repo.root(), &git).unwrap();
+
+    // One query, three expectations: the lines, the files and the counts.
+    let golden = parse_golden(&format!(
+        "corpus = \"skim\"\ncommit = \"{commit}\"\n\
+         [[stakes]]\nid = \"skim-S01\"\nquery = \"launch\"\nexpect = \"lines\"\n\
+         [[stakes]]\nid = \"skim-S02\"\nquery = \"launch\"\nexpect = \"files\"\n\
+         [[stakes]]\nid = \"skim-S03\"\nquery = \"launch\"\nexpect = \"counts\"\n",
+    ))
+    .unwrap();
+    let plan = plan(&golden).unwrap();
+    let stats = StatsSnapshot {
+        file_count: 3,
+        skipped_by_reason: BTreeMap::new(),
+        temporal_state: None,
+    };
+    let all_lines = [
+        ("LICENSE", 1),
+        ("src/lib.rs", 1),
+        ("src/lib.rs", 2),
+        ("src/lib.rs", 3),
+        ("src/main.rs", 1),
+    ];
+    let right_counts = [("LICENSE", 1), ("src/lib.rs", 3), ("src/main.rs", 1)];
+    let short_counts = [("LICENSE", 1), ("src/lib.rs", 2), ("src/main.rs", 1)];
+
+    // The `launch` line of src/lib.rs:3 is not listed.
+    let missing_line = stakes_page(
+        &[all_lines[0], all_lines[1], all_lines[2], all_lines[4]],
+        &short_counts,
+    );
+    // Every line is listed, one file count is short.
+    let short_count = stakes_page(&all_lines, &short_counts);
+    // Every line and count is right, one file is listed that holds no match.
+    let extra_file = ResultPage {
+        rows: rows(&["LICENSE", "src/lib.rs", "src/main.rs", "src/zz.rs"]),
+        ..stakes_page(&all_lines, &right_counts)
+    };
+
+    for (name, page, lines, files, counts) in [
+        ("a missing line", missing_line, false, true, false),
+        ("a short count", short_count, true, true, false),
+        ("an extra file", extra_file, true, false, true),
+        (
+            "an exact page",
+            stakes_page(&all_lines, &right_counts),
+            true,
+            true,
+            true,
+        ),
+    ] {
+        let observations: Vec<EntryObservation> = plan
+            .iter()
+            .map(|q| EntryObservation {
+                id: q.id.clone(),
+                full: page.clone(),
+                sweeps: Vec::new(),
+                limited: Vec::new(),
+                text: None,
+            })
+            .collect();
+        let e = evaluate(
+            &universe,
+            &text,
+            &stats,
+            &plan,
+            &observations,
+            &StructuralEvidence::default(),
+        )
+        .unwrap();
+        let passed = |id: &str, check: CheckId| {
+            e.outcomes
+                .iter()
+                .find(|(i, c, _)| i == id && *c == check)
+                .map(|(_, _, o)| o.is_pass())
+                .expect("the check ran")
+        };
+        assert_eq!(passed("skim-S01", CheckId::StakesLines), lines, "{name}");
+        assert_eq!(passed("skim-S02", CheckId::StakesFiles), files, "{name}");
+        assert_eq!(passed("skim-S03", CheckId::StakesCounts), counts, "{name}");
+    }
+}
