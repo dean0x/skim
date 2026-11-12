@@ -8,6 +8,9 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// Hardcoded patterns for files that should be excluded from heatmap analysis
 /// by default (lock files, build artifacts, minified bundles, logs, etc.).
+///
+/// The patterns match paths only. A file marked "generated" only in a header
+/// line, in a folder not named `generated`, stays in.
 pub(crate) const DEFAULT_EXCLUDES: &[&str] = &[
     // Lock files
     "Cargo.lock",
@@ -49,6 +52,13 @@ pub(crate) const DEFAULT_EXCLUDES: &[&str] = &[
     ".nyc_output/**",
     // Migration generated files
     "migrations/**/*.sql",
+    // Changelogs, test snapshots and generated code, at any depth
+    "**/CHANGELOG.md",
+    "**/*.snap",
+    "**/snapshots/**",
+    "**/*.pb.go",
+    "**/*_pb2.py",
+    "**/generated/**",
 ];
 
 // ============================================================================
@@ -136,6 +146,58 @@ mod tests {
         let set = build_exclude_set(true, &[]);
         assert!(!should_exclude("Cargo.lock", &set));
         assert!(!should_exclude("dist/main.js", &set));
+    }
+
+    /// Paths of changelogs, snapshots and generated code, at the root and nested.
+    const CHANGELOG_SNAPSHOT_GENERATED: &[&str] = &[
+        "CHANGELOG.md",
+        "crates/rskim/CHANGELOG.md",
+        "view.snap",
+        "src/__snapshots__/view.snap",
+        "snapshots/case.txt",
+        "tests/snapshots/case.txt",
+        "foo.pb.go",
+        "api/v1/foo.pb.go",
+        "foo_pb2.py",
+        "py/pkg/foo_pb2.py",
+        "generated/types.rs",
+        "src/generated/deep/types.rs",
+    ];
+
+    #[test]
+    fn test_changelog_snapshot_and_generated_paths_excluded_by_default() {
+        let set = build_exclude_set(false, &[]);
+        let kept: Vec<&str> = CHANGELOG_SNAPSHOT_GENERATED
+            .iter()
+            .copied()
+            .filter(|p| !should_exclude(p, &set))
+            .collect();
+        assert!(kept.is_empty(), "not excluded: {kept:?}");
+    }
+
+    #[test]
+    fn test_no_exclude_keeps_changelog_snapshot_and_generated_paths() {
+        let set = build_exclude_set(true, &[]);
+        let dropped: Vec<&str> = CHANGELOG_SNAPSHOT_GENERATED
+            .iter()
+            .copied()
+            .filter(|p| should_exclude(p, &set))
+            .collect();
+        assert!(dropped.is_empty(), "excluded: {dropped:?}");
+    }
+
+    /// Excludes match paths only. A file with a "generated" marker only in
+    /// its header, or with "generated" only in its file name, stays in.
+    #[test]
+    fn test_generated_marker_or_name_outside_generated_folder_not_excluded() {
+        let set = build_exclude_set(false, &[]);
+        for path in [
+            "src/schema.rs",
+            "src/generated.rs",
+            "src/generated_types.go",
+        ] {
+            assert!(!should_exclude(path, &set), "{path} must stay in");
+        }
     }
 
     #[test]
