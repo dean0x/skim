@@ -8,7 +8,7 @@ use super::flags::{
 };
 use super::helpers::{
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
-    confirm_proceed, load_or_create_settings, resolve_real_settings_path,
+    confirm_proceed, display_entries, load_or_create_settings, resolve_real_settings_path,
 };
 use super::state::{
     DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
@@ -226,9 +226,74 @@ fn permissions_blocks_fast_path(
     }
 }
 
+/// Remove the entries that skim no longer seeds from the agent config, and
+/// print one line when there are any. Returns them.
+///
+/// This step needs no consent and no terminal, and it runs for every
+/// permissions flag, the explicit opt-out included: it removes only entries
+/// that a seed-tier sidecar records, so it can only make the allow list
+/// smaller. It runs before the fast path and the consent prompt, so neither
+/// can skip it. On `--dry-run` it writes nothing and prints the planned
+/// removal instead.
+///
+/// A failure does not stop `skim init`: it prints one line on stderr that
+/// names the agent and the file, and the install continues with nothing
+/// removed. A dry-run prints the same line when the plan fails.
+fn prune_retired_permissions(
+    agent: AgentKind,
+    perm_dir: &std::path::Path,
+    dry_run: bool,
+) -> Vec<String> {
+    use crate::cmd::permissions::PruneMode;
+
+    let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) else {
+        return Vec::new();
+    };
+    let current = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+    let mode = if dry_run {
+        PruneMode::Plan
+    } else {
+        PruneMode::Apply
+    };
+    let removed = match protocol.prune_retired(perm_dir, &current, mode) {
+        Ok(removed) => removed,
+        Err(e) => {
+            eprintln!(
+                "  Note: {}: could not remove the entries that skim no longer seeds from {}, \
+                 so nothing was removed: {}",
+                protocol.agent_label(),
+                perm_dir.join(protocol.config_filename()).display(),
+                e.to_string().lines().collect::<Vec<_>>().join(" ")
+            );
+            return Vec::new();
+        }
+    };
+    if removed.is_empty() {
+        return removed;
+    }
+    if dry_run {
+        println!(
+            "  [dry-run] Would remove entries that skim no longer seeds: {}",
+            display_entries(&removed)
+        );
+    } else {
+        println!(
+            "  {} Permissions: removed {} entr{} that skim no longer seeds: {}",
+            check_mark(true),
+            removed.len(),
+            if removed.len() == 1 { "y" } else { "ies" },
+            display_entries(&removed)
+        );
+    }
+    removed
+}
+
 /// Resolve whether consent has been obtained to seed permissions.
 ///
 /// Calls `confirm_grant` at most once (the single consent resolution point).
+/// `removed` lists the entries that skim no longer seeds and that
+/// [`prune_retired_permissions`] removed; the prompt shows them so the user
+/// knows that the answer does not keep them.
 ///
 /// Returns `Ok(true)` when the user consented.
 /// Returns `Ok(false)` when consent was not obtained: non-TTY, explicit opt-out,
@@ -238,6 +303,7 @@ fn resolve_permissions_consent(
     flags: &InitFlags,
     agent: AgentKind,
     perm_dir: &std::path::Path,
+    removed: &[String],
 ) -> anyhow::Result<bool> {
     // Explicit opt-out.
     if flags.permissions == Some(false) {
@@ -350,7 +416,12 @@ fn resolve_permissions_consent(
     }
 
     // Non-negotiable TTY gate — confirm_grant returns false on non-TTY.
-    let granted = confirm_grant(protocol.agent_label(), &config_file, &entries_for_prompt);
+    let granted = confirm_grant(
+        protocol.agent_label(),
+        &config_file,
+        &entries_for_prompt,
+        removed,
+    );
     Ok(granted)
 }
 
@@ -524,6 +595,10 @@ fn run_install_single(
         println!();
     }
 
+    // Before the fast path, so that a current install still loses the entries
+    // that skim no longer seeds.
+    let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run);
+
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
 
@@ -611,7 +686,7 @@ fn run_install_single(
 
     // Resolve consent ONCE before any install action.
     // Returns Ok(false) on non-TTY (the test harness never has a TTY).
-    let grant_permissions = resolve_permissions_consent(flags, agent, perm_dir)?;
+    let grant_permissions = resolve_permissions_consent(flags, agent, perm_dir, &removed)?;
 
     // F2/F3: Print a loud notice when --permissions was explicitly requested
     // but refused because stdin is not a terminal.  A TTY user who types 'n'
@@ -1600,7 +1675,7 @@ fn print_dry_run_permissions(
         config_file.display()
     );
     for entry in &entries {
-        println!("    {entry}");
+        println!("    {}", entry.escape_debug());
     }
 
     Ok(())
