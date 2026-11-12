@@ -532,6 +532,8 @@ The 64 MiB memory cap (`MAX_OUTPUT_BYTES`) is unchanged — the removal of the t
 
 `RunnerError::Timeout` and `wait_with_timeout` no longer exist. Any code referencing them will not compile.
 
+**Refused-chain latch.** `run_with_env`, `run_stdout_degrade` and `stream_child` call `ensure_chain_open` before a start and `note_finished_child` on the result. A child that exits 126 with the exact refusal line (`find_refusal_line` in `main.rs`) sets the process-wide latch `CHAIN_REFUSAL` and the start returns `RunnerError::ChainRefused`. Every later start fails at once, and `main` prints the line once and exits 126. `run_inherited_passthrough` and the gh streaming start only call `ensure_chain_open`: their stderr is not captured. A unit test never sets the latch; `refusal_line_of` is the pure decision. A new start site that captures stderr must use both calls.
+
 ## Project-Local npx Launcher (`--via-npx`, `runner.rs`)
 
 The rewrite of `npx tsc`, `npx eslint`, `npx prettier`, `npx biome` and `npx oxlint` must start the project's own copy of the tool. The rewrite produces `skim <tool> <flag tail> --via-npx <rest>`, and skim then runs `npx --no-install <tool> <rest>`. The pieces:
