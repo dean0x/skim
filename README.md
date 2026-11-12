@@ -114,7 +114,7 @@ In auto permission mode, Claude Code runs a command without the PreToolUse rewri
 - **Noise rules:** fix risk and bus factor need 5 commits of a file, coupling needs 3 shared commits, modules need 5 commits; a fix-risk row needs the lower bound of its fix rate above the repository base rate; bus factor needs 2 or more authors in the window. Modules come from tracked `Cargo.toml` and `package.json` folders, else the top folder
 - **Default excludes:** lock files, build output, logs, vendored code, and at any depth `CHANGELOG.md`, `*.snap`, `snapshots/`, `*.pb.go`, `*_pb2.py` and `generated/` folders (`--no-exclude` keeps them; a file marked "generated" only in a header line stays in)
 - `--insights` gives the top 20 CRITICAL/WARNING findings, ranked by severity, score, support and path, then one `N more (raise --top)` line
-- `--json` gives JSON version 2: one compact line, each array capped like its section, with `counts.<section>.{total,shown}`
+- `--json` gives JSON version 2: one compact line, each array of rows capped like its section, with `counts.<section>.{total,shown}`; `file_targets[]` holds at most 20 targets, `warnings[]` has at most one line for each kind of warning, and `excluded_patterns[]` is the fixed pattern list
 - Configurable time windows: `--window sprint` (14d), `--last 200`, `--since 30d`, or full history; `--path` scopes the git log to a subdirectory, and `--diff <base>` gives the default view for the changed files
 
 ### Code Search (`skim search`)

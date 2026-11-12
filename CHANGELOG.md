@@ -44,9 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **BREAKING: `skim heatmap` JSON is version 2** (#589). The output is one compact line.
-  Each array has the cap of its section in the view (10 hotspot rows in `files[]` by
-  default), each `files[].blast_radius` holds at most 5 partners, and
+  Each array of rows has the cap of its section in the view (10 hotspot rows in `files[]`
+  by default), each `files[].blast_radius` holds at most 5 partners, and
   `counts.<section>.{total,shown}` gives the full and the shown count of each section.
+  `file_targets[]` holds at most 20 targets, with `counts.file_targets`. `warnings[]` has at
+  most one line for each kind of warning: the `--diff` files that are not in the window give
+  one line that counts them and names the first 3. `excluded_patterns[]` is the fixed
+  pattern list (the default excludes and the `--exclude` values).
   `files[]` keeps its per-file keys. `--insights --json` gives the top 20 findings, and
   `top_files` and `flagged_modules` hold only the shown findings. With file arguments,
   `cards[]` holds the cards. Readers of version 1 must update; `--top N` or

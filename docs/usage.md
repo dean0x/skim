@@ -274,7 +274,8 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 
 `--json` gives one compact line with `"version": 2`. This is a breaking change from version 1:
 
-- Each array has the cap of its section in the view (`files[]` holds the hotspot rows), and each `files[].blast_radius` holds at most 5 partners.
+- Each array of rows has the cap of its section in the view (`files[]` holds the hotspot rows), and each `files[].blast_radius` holds at most 5 partners.
+- `file_targets[]` holds at most 20 targets, and `counts.file_targets` gives their full and shown count. `warnings[]` has at most one line for each kind of warning: the `--diff` files that are not in the window give one line that counts them and names the first 3. `excluded_patterns[]` is the fixed pattern list: the default excludes and the `--exclude` values.
 - `counts.<section>.{total,shown}` gives the full and the shown count of each section (`hotspots`, `coupling`, `fix_risk`, `modules`, `bus_factor`).
 - `files[]` keeps its per-file keys; no support minimum applies to it.
 - With file arguments, `cards[]` holds the cards (`path`, `in_window`, `commits`, `counts`, `owners`, `partners`, `fix_commits`) and `counts.cards` their counts.

@@ -2141,6 +2141,50 @@ fn test_heatmap_both_json_outputs_are_version_two_compact_and_capped() {
     }
 }
 
+#[test]
+fn test_heatmap_large_diff_caps_file_targets_and_gives_one_missing_warning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+    StdCommand::new("git")
+        .args(["checkout", "-b", "feature-large"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git checkout");
+    // 31 changed files: the 24 hub and pair files of the window, and 7
+    // files that the default excludes keep out of the history.
+    let mut changed: Vec<String> = (0..8).map(|i| format!("src/hub/h{i}.rs")).collect();
+    for p in 0..8 {
+        changed.push(format!("src/pair/p{p}a.rs"));
+        changed.push(format!("src/pair/p{p}b.rs"));
+    }
+    changed.extend((0..6).map(|v| format!("vendor/v{v:02}.rs")));
+    changed.push("Cargo.lock".to_string());
+    git_commit_paths(
+        dir.path(),
+        &changed,
+        "feat: large change",
+        recent_ts() + 7200,
+    );
+    // git lists the changed files in path order.
+    changed.sort();
+
+    let json = heatmap_json_with(dir.path(), &["--diff", "main"]);
+    assert_eq!(json["file_targets"], serde_json::json!(changed[..20]));
+    assert_eq!(
+        json["counts"]["file_targets"],
+        serde_json::json!({"total": 31, "shown": 20})
+    );
+    let warning = "7 targeted files not found in git history: \
+                   'Cargo.lock', 'vendor/v00.rs', 'vendor/v01.rs' and 4 more";
+    assert_eq!(json["warnings"], serde_json::json!([warning]));
+
+    let text = heatmap_stdout(dir.path(), &["--diff", "main"]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() <= 30, "{} lines:\n{text}", lines.len());
+    assert!(lines[0].ends_with(", scoped to 31 files"), "{text}");
+    assert_eq!(lines[1], format!("warning: {warning}"), "{text}");
+}
+
 // ============================================================================
 // Per-file card
 // ============================================================================

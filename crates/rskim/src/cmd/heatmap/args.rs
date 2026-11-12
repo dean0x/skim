@@ -378,10 +378,14 @@ DEFAULT EXCLUDES (--no-exclude keeps them):
     \"generated\" only in a header line stays in.
 
 JSON (version 2):
-    One compact line. Each array has the cap of its section, and
+    One compact line. Each array of rows has the cap of its section, and
     counts.<section>.{{total,shown}} gives the full and shown counts. files[]
     holds the hotspot rows; no support minimum applies to it. With file
-    arguments, cards[] holds the cards. --insights --json gives insights[],
+    arguments, cards[] holds the cards. file_targets[] holds at most 20
+    targets, and counts.file_targets gives their full count. warnings[] has
+    at most one line for each kind of warning. excluded_patterns[] is the
+    fixed pattern list: the default excludes and the --exclude values.
+    --insights --json gives insights[],
     top_files[] and flagged_modules[] for the shown findings only.
 
 WINDOW PRESETS:

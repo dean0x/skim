@@ -48,6 +48,10 @@ const WARNING_LINES: usize = 2;
 /// Coupling partners of one `files[]` entry in the heatmap JSON.
 const BLAST_RADIUS_JSON_MAX: usize = 5;
 
+/// Entries of `file_targets[]` in the heatmap JSON, in argument order.
+/// `counts.file_targets` gives the full count.
+const FILE_TARGETS_JSON_MAX: usize = 20;
+
 /// Version of both heatmap JSON shapes: [`HeatmapJson`] and the insights
 /// JSON.
 pub(crate) const JSON_VERSION: u8 = 2;
@@ -202,8 +206,9 @@ pub(crate) fn text_warnings(warnings: &[String]) -> (&[String], Option<String>) 
 // Sections and rows
 // ============================================================================
 
-/// The [`Count`] of each section, and of the cards when the run has file
-/// arguments, for JSON `counts`.
+/// The [`Count`] of each section, of the cards when the run has file
+/// arguments, and of the file targets when the run is scoped to files, for
+/// JSON `counts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct SectionCounts {
     pub(crate) hotspots: Count,
@@ -213,6 +218,8 @@ pub(crate) struct SectionCounts {
     pub(crate) bus_factor: Count,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cards: Option<Count>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) file_targets: Option<Count>,
 }
 
 /// One section: the shown rows in order, and the count of rows that passed
@@ -412,6 +419,8 @@ impl<'a> HeatmapView<'a> {
         result: &'v HeatmapResult,
         cards: Option<&'v Section<Card>>,
     ) -> HeatmapJson<'v> {
+        let targets = result.file_targets.as_deref();
+        let shown_targets = targets.map(|t| t.get(..FILE_TARGETS_JSON_MAX).unwrap_or(t));
         HeatmapJson {
             version: JSON_VERSION,
             generated_at: &result.generated_at,
@@ -425,6 +434,10 @@ impl<'a> HeatmapView<'a> {
                 modules: self.modules.count(),
                 bus_factor: self.bus_factor.count(),
                 cards: cards.map(Section::count),
+                file_targets: targets.zip(shown_targets).map(|(all, shown)| Count {
+                    total: all.len(),
+                    shown: shown.len(),
+                }),
             },
             files: self.hotspots.rows.iter().map(|f| FileJson::of(f)).collect(),
             coupling_graph: &self.coupling.rows,
@@ -433,7 +446,7 @@ impl<'a> HeatmapView<'a> {
             bus_factor: &self.bus_factor.rows,
             excluded_patterns: &result.excluded_patterns,
             warnings: &result.warnings,
-            file_targets: result.file_targets.as_deref(),
+            file_targets: shown_targets,
             cards: cards.map(|c| c.rows.as_slice()),
         }
     }
@@ -447,7 +460,10 @@ impl<'a> HeatmapView<'a> {
 ///
 /// `files` holds the hotspot rows, with the nested `churn` and `fix_risk`
 /// objects. Any file can be a hotspot: `files[]` is never filtered by
-/// support. Every array of rows has the cap of its section.
+/// support. Every array of rows has the cap of its section, and
+/// `file_targets` has [`FILE_TARGETS_JSON_MAX`]. `warnings` holds at most one
+/// line for each kind of warning. `excluded_patterns` is the fixed pattern
+/// list: the default list and the `--exclude` values.
 #[derive(Debug, Serialize)]
 pub(crate) struct HeatmapJson<'a> {
     version: u8,
@@ -1051,6 +1067,31 @@ mod tests {
                 "{array_key}"
             );
         }
+    }
+
+    #[test]
+    fn test_json_v2_caps_file_targets_and_counts_them() {
+        let mut result = busy_result();
+        let targets: Vec<String> = (0..FILE_TARGETS_JSON_MAX + 7)
+            .map(|i| format!("src/t{i:02}.rs"))
+            .collect();
+        result.file_targets = Some(targets.clone());
+        let view = build_view(&result, &DEFAULT_VIEW);
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
+        assert_eq!(
+            json["file_targets"],
+            serde_json::json!(targets[..FILE_TARGETS_JSON_MAX])
+        );
+        assert_eq!(
+            json["counts"]["file_targets"],
+            serde_json::json!({"total": FILE_TARGETS_JSON_MAX + 7, "shown": FILE_TARGETS_JSON_MAX})
+        );
+
+        result.file_targets = None;
+        let view = build_view(&result, &DEFAULT_VIEW);
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
+        assert!(json.get("file_targets").is_none());
+        assert!(json["counts"].get("file_targets").is_none());
     }
 
     #[test]

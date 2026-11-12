@@ -485,20 +485,47 @@ fn record_heatmap_analytics(
 // File-scope display filter (Step 5-alt)
 // ============================================================================
 
-/// Warn about each `--diff` file that is not in the window's history, once
-/// each, in argument order (a set order would change between runs).
+/// Names in the warning about `--diff` files that are not in the window's
+/// history. The warning counts the files that it does not name.
+const MISSING_TARGET_NAMES: usize = 3;
+
+/// Add one warning for the `--diff` files that are not in the window's
+/// history. It counts each missing file once and names the first
+/// [`MISSING_TARGET_NAMES`] in argument order (a set order would change
+/// between runs). A large diff thus adds one warning, not one per file.
 fn warn_missing_targets(result: &mut HeatmapResult, files: &[String]) {
     use std::collections::HashSet;
 
     let result_paths: HashSet<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
-    let mut warned: HashSet<&str> = HashSet::new();
-    for target in files.iter().map(String::as_str) {
-        if !result_paths.contains(target) && warned.insert(target) {
-            result
-                .warnings
-                .push(format!("targeted file '{target}' not found in git history"));
+    let mut seen: HashSet<&str> = HashSet::new();
+    let missing: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|target| !result_paths.contains(target) && seen.insert(target))
+        .collect();
+    let warning = match missing.as_slice() {
+        [] => return,
+        [only] => format!("targeted file '{only}' not found in git history"),
+        _ => {
+            let names: Vec<String> = missing
+                .iter()
+                .take(MISSING_TARGET_NAMES)
+                .map(|name| format!("'{name}'"))
+                .collect();
+            let unnamed = missing.len().saturating_sub(MISSING_TARGET_NAMES);
+            let rest = if unnamed > 0 {
+                format!(" and {unnamed} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "{} targeted files not found in git history: {}{rest}",
+                missing.len(),
+                names.join(", ")
+            )
         }
-    }
+    };
+    result.warnings.push(warning);
 }
 
 /// Filter heatmap results to only include targeted files.
@@ -830,17 +857,37 @@ mod tests {
     }
 
     #[test]
-    fn test_warn_missing_targets_once_in_argument_order() {
+    fn test_warn_missing_targets_gives_one_counted_warning_in_argument_order() {
         let names = ["z.rs", "a.rs", "m.rs", "z.rs", "k.rs", "b.rs"];
         let targets: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
         let mut result = make_test_result();
         result.warnings.clear();
         warn_missing_targets(&mut result, &targets);
-        let expected: Vec<String> = ["z.rs", "a.rs", "m.rs", "k.rs", "b.rs"]
-            .iter()
-            .map(|n| format!("targeted file '{n}' not found in git history"))
-            .collect();
-        assert_eq!(result.warnings, expected);
+        assert_eq!(
+            result.warnings,
+            ["5 targeted files not found in git history: 'z.rs', 'a.rs', 'm.rs' and 2 more"]
+        );
+    }
+
+    #[test]
+    fn test_warn_missing_targets_names_all_of_a_few_files() {
+        let targets = ["x.rs".to_string(), "y.rs".to_string(), "x.rs".to_string()];
+        let mut result = make_test_result();
+        result.warnings.clear();
+        warn_missing_targets(&mut result, &targets);
+        assert_eq!(
+            result.warnings,
+            ["2 targeted files not found in git history: 'x.rs', 'y.rs'"]
+        );
+    }
+
+    #[test]
+    fn test_warn_missing_targets_adds_nothing_when_all_are_in_history() {
+        let mut result = make_test_result();
+        result.warnings.clear();
+        let present: Vec<String> = result.files.iter().map(|f| f.path.clone()).collect();
+        warn_missing_targets(&mut result, &present);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
     #[test]
