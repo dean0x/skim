@@ -46,6 +46,8 @@ pub use ast_walk::{
     AST_SIZE_LIMIT_DEFAULT, AstWalkConfig, AstWalkIter, AstWalkNode, ast_size_limit,
 };
 
+pub use decl::{DeclScan, Declaration, declarations, enclosing_declaration};
+
 /// Elision-marker vocabulary shared with the CLI so every truncation path
 /// spells the marker the same way (ADR-011 class 1).
 pub use transform::utils::{ElidedSide, elision_marker_line, get_comment_prefix};
@@ -81,6 +83,7 @@ pub fn node_kind_priority(kind: &str) -> u8 {
 }
 
 pub mod ast_walk;
+mod decl;
 mod parser;
 mod transform;
 mod types;

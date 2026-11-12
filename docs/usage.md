@@ -102,6 +102,58 @@ Don't print file path headers for multi-file output
 skim src/ --no-header
 ```
 
+### Symbol Read
+
+```
+--symbol <NAME>
+```
+
+Print the source lines of one named declaration. Use it when you need one function, method, type or constant and not the whole file.
+
+**Examples:**
+```bash
+skim src/lib.rs --symbol parse          # the declaration named parse
+skim src/lib.rs --symbol Point::norm    # only norm inside the impl of Point
+skim src/app.ts --symbol Router.run     # only run inside the class Router
+skim src/app.ts --symbol run -n         # lines are numbered from the first line of the declaration
+```
+
+**What it prints:**
+- stdout: the raw source lines of the declaration, from its first line to its last line. Skim does not change them.
+- stderr: one notice line, always. It states which lines you see and how many lines are not shown:
+  `[skim] --symbol "norm": lines 12-15 of 35 shown (11 above, 20 below not shown) — omit --symbol for the whole file`
+- If the search for declarations stopped at its limit (100,000 syntax nodes or a nesting depth of 500), the notice also states that more declarations with the name can exist.
+- If the name matches two or more declarations, skim prints all of them in file order. A header line starts each block: `==> lib.rs:12-15 norm (1 of 2) <==`. An empty line separates the blocks. Skim prints each source line once. When a declaration lies inside an earlier one, or shares a line with it, the later header says `lines shown above` (or `lines 3-5 shown above` for a part), and the block holds only the lines not yet printed. With `-n`, a header line has no number.
+
+**How a name matches:**
+- The name must equal the declaration name. The match is exact and case-sensitive.
+- Write `Type::name` or `Type.name` to select a declaration inside one container, such as an impl block or a class. Only one level of container is possible.
+- The kinds of declaration depend on the language. They include functions, methods, classes, structs, enums, interfaces, traits, type aliases, modules, constants and fields.
+
+**Combine with other options:**
+- `--max-lines N` and `--last-lines N` apply to the selected lines. The elision marker counts toward the limit.
+- `-n, --line-numbers` prints the source line number of each line. The first number is the first line of the declaration.
+- `--language` names the language of a file that has an unusual name.
+- `--mode` must be `full`, or must not be set. Any other mode exits with code 2.
+- Skim caches each symbol read apart from the whole-file read and apart from the reads of other names.
+- A symbol read adds no row to the token statistics.
+
+**Exit codes:**
+
+| Code | Cause |
+|------|-------|
+| 0 | The name matched at least one declaration. |
+| 1 | No declaration has that name. The message lists up to 10 declaration names of the file. If the search stopped at its limit of 100,000 syntax nodes or at its nesting depth of 500, the message names both limits and lists no names. The name can be in the part of the file that skim did not search. |
+| 2 | The command is not a symbol read: stdin, two or more files, a glob, a directory, an empty name, `--tokens`, or a `--mode` other than `full`. |
+| 3 | The file is Markdown, JSON, YAML or TOML, or skim cannot detect its language. For the last case, add `--language`. |
+
+**Known limits:**
+- `--symbol` prints raw source only. It has no structure, signatures or types view.
+- Markdown and the data formats (JSON, YAML, TOML) exit with code 3.
+- Functions in C and C++ files are not found. Their name is inside the declarator.
+- The printed range holds the declaration only. Attributes, doc comments and decorators above the declaration are not in it.
+- For `.tsx` files, `--symbol` uses the TSX grammar. The structure mode still parses `.tsx` files with the TypeScript grammar.
+
 ### Caching Control
 
 ```

@@ -4,6 +4,7 @@
 //! Design principle: Type-first development with explicit error handling.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 // ============================================================================
@@ -1243,8 +1244,31 @@ impl Parser {
             ))
         })?;
 
+        Self::with_grammar(language, &ts_language)
+    }
+
+    /// Create parser for a language and the extension of the file it will read.
+    ///
+    /// The extension picks the grammar where one language needs two: `tsx`
+    /// selects the TSX grammar for [`Language::TypeScript`], because the plain
+    /// TypeScript grammar reads JSX as a type assertion and loses every
+    /// declaration after it. Every other pair behaves like [`Parser::new`].
+    ///
+    /// [`Language::from_extension`] and the transform modes do not change: they
+    /// keep the TypeScript grammar for `.tsx`.
+    ///
+    /// # Errors
+    /// Same as [`Parser::new`].
+    pub fn new_for_extension(language: Language, ext: &str) -> Result<Self> {
+        if language == Language::TypeScript && ext.eq_ignore_ascii_case("tsx") {
+            return Self::with_grammar(language, &tree_sitter_typescript::LANGUAGE_TSX.into());
+        }
+        Self::new(language)
+    }
+
+    fn with_grammar(language: Language, grammar: &tree_sitter::Language) -> Result<Self> {
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&ts_language)?;
+        parser.set_language(grammar)?;
 
         Ok(Self {
             language,
@@ -1263,6 +1287,56 @@ impl Parser {
         self.tree_sitter_parser.parse(source, None).ok_or_else(|| {
             SkimError::ParseError(format!("Failed to parse {} source", self.language.name()))
         })
+    }
+
+    /// Parse source code into AST, stopping once `limit` has passed.
+    ///
+    /// Returns `Ok(None)` when the time bound stopped the parse. The caller
+    /// then has no tree for this source and must treat the file as unlabelled.
+    /// A stopped parse resets the parser, so the next parse starts from the
+    /// beginning of its own source and never resumes this one.
+    ///
+    /// The parser reads the clock about once per 100 parse steps, so a source
+    /// short enough to finish before the first read always parses, whatever the
+    /// limit. The clock starts when this method is called.
+    ///
+    /// # Errors
+    /// Returns `SkimError::ParseError` if parsing fails for a reason other than
+    /// the time bound.
+    pub fn parse_bounded(
+        &mut self,
+        source: &str,
+        limit: Duration,
+    ) -> Result<Option<tree_sitter::Tree>> {
+        let start = Instant::now();
+        let mut stopped = false;
+        // The callback returns true to stop the parse (tree-sitter 0.25
+        // `ParseOptions::progress_callback`; the C API cancels the parse when
+        // the callback returns true).
+        let mut stop_when_past_limit = |_: &tree_sitter::ParseState| {
+            stopped = start.elapsed() >= limit;
+            stopped
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut stop_when_past_limit);
+        let bytes = source.as_bytes();
+        let tree = self.tree_sitter_parser.parse_with_options(
+            &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+            None,
+            Some(options),
+        );
+
+        if tree.is_none() {
+            // A parse that stopped early would otherwise resume at its stop
+            // point on the next call, whatever source that call passes.
+            self.tree_sitter_parser.reset();
+            if !stopped {
+                return Err(SkimError::ParseError(format!(
+                    "Failed to parse {} source",
+                    self.language.name()
+                )));
+            }
+        }
+        Ok(tree)
     }
 
     /// Get language for this parser
