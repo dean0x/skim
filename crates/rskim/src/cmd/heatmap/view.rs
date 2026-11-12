@@ -7,6 +7,7 @@
 //! nothing. The gates themselves live in `noise.rs`.
 
 use std::cmp::Ordering;
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -200,6 +201,17 @@ pub(crate) fn text_warnings(warnings: &[String]) -> (&[String], Option<String>) 
         shown,
         Some(format!("{} more warnings (--json)", hidden.len())),
     )
+}
+
+/// The repository name that every output gives (the text header and both
+/// JSON shapes): the last component of the root path, never the path. A
+/// root with no name (`/`) or a name that is not UTF-8 gives `repository`.
+#[must_use]
+pub(crate) fn repo_name(repository: &str) -> &str {
+    Path::new(repository)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repository")
 }
 
 // ============================================================================
@@ -424,7 +436,7 @@ impl<'a> HeatmapView<'a> {
         HeatmapJson {
             version: JSON_VERSION,
             generated_at: &result.generated_at,
-            repository: &result.repository,
+            repository: repo_name(&result.repository),
             window: &result.window,
             base_rate: self.base_rate,
             counts: SectionCounts {
@@ -468,6 +480,7 @@ impl<'a> HeatmapView<'a> {
 pub(crate) struct HeatmapJson<'a> {
     version: u8,
     generated_at: &'a str,
+    /// The repository name ([`repo_name`]), the same as the text header.
     repository: &'a str,
     window: &'a WindowInfo,
     base_rate: f64,

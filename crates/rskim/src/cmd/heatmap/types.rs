@@ -243,6 +243,7 @@ pub(crate) struct ResolvedWindow {
 #[derive(Debug, Clone)]
 pub(crate) struct HeatmapResult {
     pub(crate) generated_at: String,
+    /// The repository root as git gives it. The outputs show only its name.
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
     pub(crate) files: Vec<FileMetrics>,
@@ -441,6 +442,7 @@ pub(crate) struct InsightCounts {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct InsightsResult {
     pub(crate) version: u8,
+    /// The repository name, the same as the text header (never the path).
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
     pub(crate) counts: InsightCounts,

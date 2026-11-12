@@ -2904,3 +2904,26 @@ fn test_heatmap_card_finds_a_non_ascii_file_name_in_history() {
         "{text}"
     );
 }
+
+#[test]
+fn test_heatmap_json_repository_is_the_repo_folder_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+    let name = dir
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("utf-8 temp folder name");
+
+    // The default JSON, the insights JSON and the card JSON all give the
+    // name that the text header shows, never the absolute path.
+    for args in [&[][..], &["--insights"][..], &["src/main.rs"][..]] {
+        let json = heatmap_json_with(dir.path(), args);
+        let repository = json["repository"].as_str().expect("repository string");
+        assert_eq!(repository, name, "--json {args:?}");
+        assert!(!repository.contains('/'), "--json {args:?}: {repository}");
+    }
+    let text = heatmap_stdout(dir.path(), &[]);
+    let header = text.lines().next().unwrap_or_default();
+    assert!(header.starts_with(&format!("Heatmap: {name} ")), "{header}");
+}

@@ -17,7 +17,7 @@ use super::types::{
     CompactFileEntry, CompactModuleEntry, Count, FileMetrics, HeatmapResult, Insight,
     InsightCategory, InsightCounts, InsightsResult, ModuleHealth, Severity,
 };
-use super::view::JSON_VERSION;
+use super::view::{JSON_VERSION, repo_name};
 
 // ============================================================================
 // Internal helpers
@@ -249,7 +249,7 @@ pub(crate) fn build_insights_result(
     ranked.truncate(cap);
     InsightsResult {
         version: JSON_VERSION,
-        repository: result.repository.clone(),
+        repository: repo_name(&result.repository).to_string(),
         window: result.window.clone(),
         counts: InsightCounts {
             insights: Count {
@@ -896,6 +896,14 @@ mod tests {
         }));
         result.modules.push(make_module("m", 50.0));
         result
+    }
+
+    #[test]
+    fn test_build_insights_result_gives_the_repository_name_not_the_path() {
+        let mut result = four_findings();
+        result.repository = "/home/dev/work/test-repo".to_string();
+        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        assert_eq!(ir.repository, "test-repo");
     }
 
     #[test]

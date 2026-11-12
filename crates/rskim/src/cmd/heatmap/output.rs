@@ -9,12 +9,12 @@
 //! ranked insights, already sorted, gated and capped, so this module sorts,
 //! filters and caps nothing.
 
-use std::path::Path;
-
 use super::card::{Card, CardCounts};
 use super::noise;
 use super::types::{DetailSection, HeatmapResult, InsightsResult, Severity, WindowInfo};
-use super::view::{HeatmapView, ListCaps, MoreRemedy, Section, more_line, text_warnings};
+use super::view::{
+    HeatmapView, ListCaps, MoreRemedy, Section, more_line, repo_name, text_warnings,
+};
 
 // ============================================================================
 // JSON output
@@ -86,15 +86,6 @@ fn header_line(label: &str, result: &HeatmapResult) -> String {
         items(window.commits_analyzed, "commit", "commits"),
         window.mode
     )
-}
-
-/// The last component of the repository path. A path with no name (`/`)
-/// or a name that is not UTF-8 gives `repository`.
-fn repo_name(repository: &str) -> &str {
-    Path::new(repository)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("repository")
 }
 
 /// One section: its heading, its rows (or one line that tells why there is
@@ -739,8 +730,29 @@ mod tests {
         assert_eq!(json.lines().count(), 1, "one line: {json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["version"], 2);
-        assert_eq!(parsed["repository"], "/home/dev/work/test-repo");
+        assert_eq!(parsed["repository"], "test-repo");
         assert_eq!(parsed["counts"]["hotspots"]["shown"], 1);
+    }
+
+    #[test]
+    fn test_json_repository_is_the_header_name_not_the_path() {
+        let result = make_result();
+        let view = build_view(&result, &DEFAULT_VIEW);
+        let json = render_json(&result, &view, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["repository"], "test-repo");
+        assert!(!json.contains("/home/dev"), "no absolute path: {json}");
+        let header = render_text(&result, &view);
+        assert!(header.starts_with("Heatmap: test-repo "), "{header}");
+    }
+
+    #[test]
+    fn test_json_repository_of_the_filesystem_root_is_the_word_repository() {
+        let mut result = make_result();
+        result.repository = "/".to_string();
+        let json = render_json(&result, &build_view(&result, &DEFAULT_VIEW), None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["repository"], "repository");
     }
 
     #[test]

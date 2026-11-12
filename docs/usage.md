@@ -278,7 +278,7 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 - `files[]` keeps its per-file keys; no support minimum applies to it.
 - With file arguments, `cards[]` holds the cards (`path`, `in_window`, `commits`, `counts`, `owners`, `partners`, `fix_commits`) and `counts.cards` their counts.
 - `--insights --json` gives `insights[]`, `top_files[]` and `flagged_modules[]` for the shown findings only, with `counts.insights`. Its `warnings[]` is the same list as in `--json`.
-- `repository` is still the absolute path; the text header gives only the repository name.
+- `repository` gives the repository name, the same name as the text header, never the absolute path. This is the same in `--insights --json` and with file arguments.
 
 #### Options
 
