@@ -1036,9 +1036,10 @@ mod tests {
         assert!(malformed_warnings(&prepared).is_empty());
     }
 
-    /// Three commits each in `crates/a`, `crates/b` and `packages/x`.
+    /// `MODULE_MIN_COMMITS` commits each in `crates/a`, `crates/b` and
+    /// `packages/x`, so every module reaches the module support minimum.
     fn package_commits() -> Vec<CommitInfo> {
-        (0..3)
+        (0..MODULE_MIN_COMMITS)
             .flat_map(|i| {
                 [
                     stub_commit(3 * i, &["crates/a/src/lib.rs"]),

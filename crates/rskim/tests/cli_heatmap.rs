@@ -1353,8 +1353,9 @@ fn test_heatmap_default_excludes_changelog_snapshot_and_generated_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     git_init(dir.path());
     let ts = recent_ts();
-    // Three commits of every file, so the pairs reach the coupling support.
-    for i in 0..3u64 {
+    // Five commits of every file, so the pairs reach the coupling support
+    // and `src` reaches the module support.
+    for i in 0..5u64 {
         let files: Vec<(&str, String)> = EXCLUDE_FIXTURE
             .iter()
             .map(|(p, c)| (*p, format!("{c} {i}")))
@@ -1433,7 +1434,9 @@ fn create_package_repo(dir: &Path) {
         "chore: manifests",
         ts,
     );
-    for i in 0..3u64 {
+    // Five commits of each source file, so every module reaches the module
+    // support minimum of 5 commits.
+    for i in 0..5u64 {
         for (n, path) in [
             "crates/a/src/lib.rs",
             "crates/b/src/lib.rs",
@@ -1466,10 +1469,10 @@ fn test_heatmap_modules_follow_package_manifests() {
     assert_eq!(
         module_commits(&json),
         vec![
-            ("crates/a".to_string(), 4),
-            ("crates/b".to_string(), 4),
-            ("packages/x".to_string(), 4),
-            ("src".to_string(), 3),
+            ("crates/a".to_string(), 6),
+            ("crates/b".to_string(), 6),
+            ("packages/x".to_string(), 6),
+            ("src".to_string(), 5),
         ]
     );
 }
@@ -1479,7 +1482,7 @@ fn test_heatmap_file_scope_keeps_the_package_module() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_package_repo(dir.path());
     // `--detail` refuses file arguments, so the scope comes from `--diff`:
-    // one changed file on a branch, the fifth commit of `crates/a`.
+    // one changed file on a branch, the seventh commit of `crates/a`.
     StdCommand::new("git")
         .args(["checkout", "-b", "feature-scope"])
         .current_dir(dir.path())
@@ -1498,7 +1501,7 @@ fn test_heatmap_file_scope_keeps_the_package_module() {
         json["file_targets"],
         serde_json::json!(["crates/a/src/lib.rs"])
     );
-    assert_eq!(module_commits(&json), vec![("crates/a".to_string(), 5)]);
+    assert_eq!(module_commits(&json), vec![("crates/a".to_string(), 7)]);
 }
 
 // ============================================================================
@@ -1802,10 +1805,10 @@ fn test_heatmap_detail_modules_text_lists_package_modules() {
     assert_eq!(
         rows,
         vec![
-            ("crates/a".to_string(), 4),
-            ("crates/b".to_string(), 4),
-            ("packages/x".to_string(), 4),
-            ("src".to_string(), 3),
+            ("crates/a".to_string(), 6),
+            ("crates/b".to_string(), 6),
+            ("packages/x".to_string(), 6),
+            ("src".to_string(), 5),
         ]
     );
 }

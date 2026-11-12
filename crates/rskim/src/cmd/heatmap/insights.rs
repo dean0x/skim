@@ -75,7 +75,7 @@ fn inverse_share(pct: f64) -> f64 {
 ///
 /// A finding needs the support minimum of its kind: 5 commits for the file
 /// kinds (stability, fix risk, bus factor), 3 shared commits for coupling and
-/// 3 commits for a module. Fix risk also needs the lift gate and keeps its
+/// 5 commits for a module. Fix risk also needs the lift gate and keeps its
 /// severity on `combined_pct`; bus factor needs the bus-factor gate. Coupling
 /// reads the canonical coupling graph: one finding per code-to-code pair.
 ///
@@ -773,6 +773,23 @@ mod tests {
                 InsightCategory::Encapsulation,
             ]
         );
+    }
+
+    #[test]
+    fn test_module_finding_needs_five_commits_of_support() {
+        let module_at = |commits: usize| {
+            let mut result = make_empty_result();
+            let mut module = make_module("src", 0.0);
+            module.total_commits = commits;
+            result.modules.push(module);
+            compute_insights(&result)
+        };
+
+        assert!(module_at(4).is_empty(), "4 commits give no module finding");
+        let at_five = module_at(5);
+        assert_eq!(at_five.len(), 1);
+        assert_eq!(at_five[0].category, InsightCategory::Encapsulation);
+        assert_eq!(at_five[0].support, 5);
     }
 
     // -----------------------------------------------------------------------

@@ -21,8 +21,11 @@ pub(crate) const MIN_FILE_SUPPORT: usize = 5;
 /// coupled. Prevents noise from one-off coincidences.
 pub(crate) const MIN_PAIR_SUPPORT: usize = 3;
 
-/// Minimum commits that touch a module before its encapsulation shows.
-pub(crate) const MODULE_MIN_COMMITS: usize = 3;
+/// Minimum commits that touch a module before its encapsulation shows, in
+/// the module section and as an insight. It equals the file minimum: with
+/// fewer commits, one cross-boundary commit moves the share by 25 points or
+/// more.
+pub(crate) const MODULE_MIN_COMMITS: usize = 5;
 
 /// Maximum number of files in a commit that coupling pairs.
 ///
