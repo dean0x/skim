@@ -1265,6 +1265,9 @@ fn test_heatmap_coupling_needs_three_shared_commits() {
     );
 }
 
+/// The one run warning of [`create_repo_with_60_file_commit`].
+const LARGE_COMMIT_WARNING: &str = "coupling: 1 commit with more than 50 files not paired";
+
 /// A repo with one commit of 60 files and one later single-file commit.
 fn create_repo_with_60_file_commit(dir: &Path) {
     git_init(dir);
@@ -1279,7 +1282,7 @@ fn create_repo_with_60_file_commit(dir: &Path) {
 fn test_heatmap_large_commit_warning_in_text_and_json() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_repo_with_60_file_commit(dir.path());
-    let expected = "coupling: 1 commit with more than 50 files not paired";
+    let expected = LARGE_COMMIT_WARNING;
 
     let json = heatmap_json(dir.path());
     let json_hits: Vec<&str> = json["warnings"]
@@ -1319,7 +1322,7 @@ fn test_heatmap_large_commit_warning_in_text_and_json() {
 fn test_insights_text_and_json_carry_the_run_warnings() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_repo_with_60_file_commit(dir.path());
-    let expected = "coupling: 1 commit with more than 50 files not paired";
+    let expected = LARGE_COMMIT_WARNING;
 
     let json = heatmap_json_with(dir.path(), &["--insights"]);
     assert_eq!(json["warnings"], serde_json::json!([expected]), "{json}");
@@ -2121,6 +2124,37 @@ fn test_heatmap_two_runs_give_identical_bytes() {
 }
 
 #[test]
+fn test_heatmap_two_runs_with_a_run_warning_give_identical_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+
+    let warning_line = format!("warning: {LARGE_COMMIT_WARNING}");
+    for args in [&[][..], &["--insights"][..]] {
+        let first = heatmap_stdout(dir.path(), args);
+        let second = heatmap_stdout(dir.path(), args);
+        assert_eq!(first, second, "two runs of {args:?} differ");
+        let hits = first.lines().filter(|l| *l == warning_line).count();
+        assert_eq!(hits, 1, "{args:?}:\n{first}");
+    }
+    for args in [&["--json"][..], &["--insights", "--json"][..]] {
+        let first = heatmap_stdout(dir.path(), args);
+        let second = heatmap_stdout(dir.path(), args);
+        assert_eq!(first, second, "two runs of {args:?} differ");
+        let json: serde_json::Value = serde_json::from_str(&first).expect("valid JSON");
+        assert_eq!(
+            json["warnings"],
+            serde_json::json!([LARGE_COMMIT_WARNING]),
+            "{args:?}"
+        );
+    }
+}
+
+/// Kinds of run warning: `WARNING_KINDS` in `cmd/heatmap/mod.rs`. The test
+/// can not import it from the binary crate; the debug binary under test
+/// asserts the same bound on every run.
+const WARNING_KINDS: usize = 8;
+
+#[test]
 fn test_heatmap_both_json_outputs_are_version_two_compact_and_capped() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_ranked_repo(dir.path());
@@ -2159,6 +2193,42 @@ fn test_heatmap_both_json_outputs_are_version_two_compact_and_capped() {
         let expected = if path.starts_with("src/hub/") { 5 } else { 1 };
         assert_eq!(partners, expected, "{path}");
     }
+    let ranked_patterns = json["excluded_patterns"].clone();
+
+    // The run warnings: at most one line for each kind, none twice, and the
+    // same list in both JSON outputs.
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+    let default = heatmap_json(dir.path());
+    let insights = heatmap_json_with(dir.path(), &["--insights"]);
+    for json in [&default, &insights] {
+        let warnings: Vec<&str> = json["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .map(|w| w.as_str().expect("warning text"))
+            .collect();
+        let distinct: std::collections::HashSet<&str> = warnings.iter().copied().collect();
+        assert!(warnings.len() <= WARNING_KINDS, "{warnings:?}");
+        assert_eq!(
+            distinct.len(),
+            warnings.len(),
+            "a warning twice: {warnings:?}"
+        );
+    }
+    assert_eq!(insights["warnings"], default["warnings"]);
+    assert_eq!(
+        default["warnings"],
+        serde_json::json!([LARGE_COMMIT_WARNING])
+    );
+
+    // excluded_patterns has no cap: it is the fixed list of the default
+    // excludes and the --exclude values, so the history does not change it.
+    // The cap of file_targets (20) has its exact test in
+    // test_heatmap_large_diff_caps_file_targets_and_gives_one_missing_warning.
+    let patterns = default["excluded_patterns"].as_array().expect("patterns");
+    assert!(!patterns.is_empty());
+    assert_eq!(default["excluded_patterns"], ranked_patterns);
 }
 
 #[test]

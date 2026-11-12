@@ -213,6 +213,20 @@ fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
     String::from_utf8(bytes).ok().map(Into::into)
 }
 
+/// Kinds of run warning: a shallow clone, more than one window flag, an
+/// unresolved `--last`, an unknown `--window` preset, malformed git log
+/// records, git log output at its limit, commits too large to pair and
+/// `--diff` files not in the window. Each kind adds at most one line, so a
+/// run has at most this many warnings in either JSON output.
+const WARNING_KINDS: usize = 8;
+
+/// True when `warnings` has at most [`WARNING_KINDS`] lines and no line
+/// twice.
+fn one_warning_per_kind(warnings: &[String]) -> bool {
+    let distinct: std::collections::HashSet<&str> = warnings.iter().map(String::as_str).collect();
+    warnings.len() <= WARNING_KINDS && distinct.len() == warnings.len()
+}
+
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
 struct PreparedCommits {
     commits: Vec<CommitInfo>,
@@ -486,6 +500,12 @@ fn run_with_source(
             Some(cards)
         }
     };
+    // The warning list is complete here, and both JSON outputs give it as is.
+    debug_assert!(
+        one_warning_per_kind(&result.warnings),
+        "more than one warning of a kind: {:?}",
+        result.warnings
+    );
 
     // Step 10: Render
     let elapsed = start_time.elapsed();
@@ -1187,12 +1207,14 @@ mod tests {
 
     /// Stub `GitDataSource`: `fetch_commits` returns `commits`, the
     /// configured count of malformed records and `cut_oldest`;
-    /// `list_tracked_files` follows `tracked`.
+    /// `list_tracked_files` follows `tracked`; `detect_shallow_clone`
+    /// gives `shallow`.
     struct StubSource {
         commits: Vec<CommitInfo>,
         malformed: usize,
         cut_oldest: Option<i64>,
         tracked: TrackedStub,
+        shallow: bool,
     }
 
     impl StubSource {
@@ -1203,6 +1225,7 @@ mod tests {
                 malformed,
                 cut_oldest: None,
                 tracked: TrackedStub::Unavailable,
+                shallow: false,
             }
         }
     }
@@ -1232,7 +1255,7 @@ mod tests {
             Ok("/stub/repo".to_string())
         }
         fn detect_shallow_clone(&self) -> bool {
-            false
+            self.shallow
         }
         fn fetch_commit_count_since(&self, _n: usize) -> anyhow::Result<Option<u64>> {
             Ok(None)
@@ -1336,6 +1359,58 @@ mod tests {
         assert!(cut_warnings(&prepared).is_empty());
     }
 
+    #[test]
+    fn test_a_run_with_every_warning_kind_gives_one_line_for_each_kind() {
+        // One commit too large to pair, in a shallow clone, with malformed
+        // records and git log output at its limit.
+        let paths: Vec<String> = (0..=COUPLING_MAX_FILES)
+            .map(|i| format!("src/f{i:02}.rs"))
+            .collect();
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let source = StubSource {
+            commits: vec![stub_commit(0, &paths)],
+            malformed: 1,
+            cut_oldest: Some(1_700_000_000),
+            tracked: TrackedStub::Unavailable,
+            shallow: true,
+        };
+        // Two window flags, and the stub has fewer than 5 commits.
+        let args = HeatmapArgs {
+            last_n: Some(5),
+            window_preset: Some("unknown".to_string()),
+            ..HeatmapArgs::default()
+        };
+        let p = prepare_commits(&source, args)
+            .unwrap()
+            .expect("the run continues");
+        let mut result = compute_heatmap(
+            &p.commits,
+            &p.config,
+            &p.window,
+            p.now_epoch,
+            p.repo_root,
+            p.warnings,
+            &p.module_roots,
+        );
+        warn_missing_targets(&mut result, &["gone.rs".to_string()]);
+
+        // `--last` comes before `--window`, so the unknown-preset kind
+        // cannot show with an unresolved `--last`: all other kinds show.
+        let distinct: std::collections::HashSet<&String> = result.warnings.iter().collect();
+        assert_eq!(
+            result.warnings.len(),
+            WARNING_KINDS - 1,
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(
+            distinct.len(),
+            result.warnings.len(),
+            "{:?}",
+            result.warnings
+        );
+    }
+
     /// `MODULE_MIN_COMMITS` commits each in `crates/a`, `crates/b` and
     /// `packages/x`, so every module reaches the module support minimum.
     fn package_commits() -> Vec<CommitInfo> {
@@ -1357,6 +1432,7 @@ mod tests {
             malformed: 0,
             cut_oldest: None,
             tracked,
+            shallow: false,
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()
@@ -1437,6 +1513,7 @@ mod tests {
             malformed: 0,
             cut_oldest: None,
             tracked: TrackedStub::Unavailable,
+            shallow: false,
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()
