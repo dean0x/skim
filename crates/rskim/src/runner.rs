@@ -90,6 +90,11 @@ pub(crate) enum RunnerError {
     /// A reader thread panicked instead of returning normally.
     #[error("{pipe} reader thread panicked")]
     ReaderPanicked { pipe: &'static str },
+
+    /// A skim process in the chain of starts refused to start, so this start was
+    /// not made, or its result was dropped.  See [`chain_refusal`].
+    #[error("a skim process that this one started refused to start")]
+    ChainRefused,
 }
 
 /// A stateless command runner.
@@ -174,6 +179,7 @@ impl CommandRunner {
         args: &[&str],
         env_vars: &[(&str, &str)],
     ) -> anyhow::Result<CommandOutput> {
+        ensure_chain_open()?;
         let start = Instant::now();
 
         let mut cmd = Command::new(program);
@@ -227,6 +233,8 @@ impl CommandRunner {
         let stderr = stderr_handle
             .join()
             .map_err(|_| RunnerError::ReaderPanicked { pipe: "stderr" })??;
+
+        note_finished_child(status.code(), stderr.as_bytes())?;
 
         // ADR-011 class 1 — loss-bearing, therefore unconditional and never
         // routed through `debug_log!`.  This is the only place that knows the
@@ -328,6 +336,7 @@ impl CommandRunner {
         program: &str,
         args: &[&str],
     ) -> anyhow::Result<(CommandOutput, bool)> {
+        ensure_chain_open()?;
         let start = Instant::now();
 
         let mut cmd = Command::new(program);
@@ -366,6 +375,8 @@ impl CommandRunner {
         let stderr = stderr_handle
             .join()
             .map_err(|_| RunnerError::ReaderPanicked { pipe: "stderr" })??;
+
+        note_finished_child(status.code(), stderr.as_bytes())?;
 
         let duration = start.elapsed();
 
@@ -415,6 +426,73 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         // wait() reaps the zombie; ignore result (process may already be reaped).
         let _ = self.0.wait();
+    }
+}
+
+// ============================================================================
+// Refused chain — one latch for every start in this process
+// ============================================================================
+
+/// The refusal line of the first child that told this process that the chain of
+/// skim starts is refused.  Set once, never cleared.
+static CHAIN_REFUSAL: OnceLock<String> = OnceLock::new();
+
+/// The refusal line that ended the work of this process, when a child reported
+/// one.  `main` prints it once and exits 126.
+///
+/// # Why a latch
+///
+/// The depth limit bounds the length of a chain of skim starts, not the number
+/// of starts. A handler that starts its tool again after a failed first start
+/// (`skim git status` probes, then runs) would start the tool again at every
+/// level of a chain that only the depth limit can stop. Once one start comes back
+/// refused, the chain cannot work, so every later start of this process fails at
+/// once and starts nothing. The starts are then linear in the depth.
+///
+/// Covered: the starts that capture stderr — [`CommandRunner::run_with_env`],
+/// [`CommandRunner::run_stdout_degrade`] and `stream_child` — both gate the start
+/// and read the result. The starts with inherited stdio (`run_inherited_passthrough`)
+/// and the gh streaming start only gate: their stderr goes to the terminal, and the
+/// exit code 126 alone is a real answer of many tools. They start the tool once and
+/// return, so the depth limit still bounds them to one start per level.
+///
+/// The latch is a process-wide static that a unit test must not set; the pure
+/// decision is [`refusal_line_of`].
+pub(crate) fn chain_refusal() -> Option<&'static str> {
+    CHAIN_REFUSAL.get().map(String::as_str)
+}
+
+/// The refusal line that a finished child reported, when it was a skim process
+/// that refused to start: exit 126 and a refusal line on stderr, both.  A tool
+/// that exits 126 for its own reason has no such line.
+fn refusal_line_of(exit_code: Option<i32>, stderr: &[u8]) -> Option<String> {
+    if exit_code != Some(i32::from(crate::RESTART_REFUSED_EXIT)) {
+        return None;
+    }
+    crate::find_refusal_line(&String::from_utf8_lossy(stderr)).map(str::to_owned)
+}
+
+/// Fail before a start when a skim process in the chain already refused.
+pub(crate) fn ensure_chain_open() -> Result<(), RunnerError> {
+    match CHAIN_REFUSAL.get() {
+        Some(_) => Err(RunnerError::ChainRefused),
+        None => Ok(()),
+    }
+}
+
+/// Read the result of a finished child.  When it is a refusal, set the latch and
+/// fail, so the refused result never reaches a parser or the terminal.
+pub(crate) fn note_finished_child(
+    exit_code: Option<i32>,
+    stderr: &[u8],
+) -> Result<(), RunnerError> {
+    match refusal_line_of(exit_code, stderr) {
+        Some(line) => {
+            // The first refusal stays; a second set is the same chain.
+            let _ = CHAIN_REFUSAL.set(line);
+            Err(RunnerError::ChainRefused)
+        }
+        None => Ok(()),
     }
 }
 
@@ -579,6 +657,253 @@ fn resolves_in(program: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
     std::env::split_paths(path_var).any(|dir| is_executable(&dir.join(program)))
 }
 
+// ============================================================================
+// npx launcher — project-local node tools (skim#587)
+// ============================================================================
+
+/// The flag the rewrite hook puts after the tool words of an `npx <tool>` rewrite:
+/// `skim prettier --write --via-npx src`.
+///
+/// It is skim's own flag. The dispatcher removes it before any handler or child
+/// sees the arguments, and only on the explicit surface (see
+/// `cmd::dispatch::take_via_npx`).
+pub(crate) const VIA_NPX_FLAG: &str = "--via-npx";
+
+/// Most directory levels [`local_node_bin`] looks at: the start folder and 63
+/// parents. Same bound as the other ancestor walks in this crate.
+const LOCAL_BIN_WALK_LEVELS: usize = 64;
+
+/// Exit code when the project-local bin is gone at start time. It is the shell
+/// code for "command not found".
+const LOCAL_BIN_GONE_EXIT: u8 = 127;
+
+/// The node tools whose `npx <tool>` rewrite starts the project-local copy.
+///
+/// A closed set: the rule table in `cmd::rewrite::rules` lists which rewrite
+/// rules use it, and its table test keeps the two in step. The tool name that
+/// reaches the file system always comes from [`NpxTool::bin`], never from
+/// command text (a path probe on command text is the hazard `program_resolves`
+/// documents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NpxTool {
+    Tsc,
+    Eslint,
+    Prettier,
+    Biome,
+    Oxlint,
+}
+
+impl NpxTool {
+    /// Every tool, for tests and table checks.
+    pub(crate) const ALL: [NpxTool; 5] = [
+        NpxTool::Tsc,
+        NpxTool::Eslint,
+        NpxTool::Prettier,
+        NpxTool::Biome,
+        NpxTool::Oxlint,
+    ];
+
+    /// The tool for a bin name, or `None` for any other name.
+    pub(crate) fn from_bin(bin: &str) -> Option<Self> {
+        NpxTool::ALL.into_iter().find(|tool| tool.bin() == bin)
+    }
+
+    /// The bin name: the file under `node_modules/.bin` and the word after
+    /// `npx --no-install`.
+    pub(crate) fn bin(self) -> &'static str {
+        match self {
+            NpxTool::Tsc => "tsc",
+            NpxTool::Eslint => "eslint",
+            NpxTool::Prettier => "prettier",
+            NpxTool::Biome => "biome",
+            NpxTool::Oxlint => "oxlint",
+        }
+    }
+}
+
+/// Return `true` when `tool` is an executable file in `node_modules/.bin` of
+/// `start` or of one of its parents, up to and including the repository root.
+///
+/// This is the folder walk `npx --no-install` makes, so a hit here means the
+/// start will run the project's own copy. The walk:
+/// - uses the canonical form of `start`, so `..` and links do not change the
+///   answer; a `start` that does not canonicalize gives `false`;
+/// - looks at most [`LOCAL_BIN_WALK_LEVELS`] levels up;
+/// - stops after a folder that has a `.git` entry (file or folder), so a bin
+///   above the repository root does not count;
+/// - treats every stat error as "not found".
+///
+/// Nothing is cached and nothing goes into the `program_resolves` cache: the
+/// answer depends on a folder, and the file system can change between calls.
+pub(crate) fn local_node_bin(start: &std::path::Path, tool: NpxTool) -> bool {
+    let Ok(start) = start.canonicalize() else {
+        return false;
+    };
+    for dir in start.ancestors().take(LOCAL_BIN_WALK_LEVELS) {
+        let bin = dir.join("node_modules").join(".bin").join(tool.bin());
+        if is_executable(&bin) {
+            return true;
+        }
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return false;
+        }
+    }
+    false
+}
+
+/// What one child start runs: the program, its arguments and why.
+///
+/// Built by [`Launch::resolve`] at every place that starts a child, so the
+/// argument vector and the error text exist once. For a plain start the program
+/// and the arguments are the caller's. For a start requested with `--via-npx`
+/// the program is `npx` and the arguments are `--no-install <tool> <args…>`,
+/// the same shape as the last step of `CommandRunner::run_with_env_node_fallback`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Launch {
+    /// The program to start.
+    pub(crate) spawn: String,
+    /// The arguments for [`Launch::spawn`].
+    pub(crate) argv: Vec<String>,
+    /// The tool the user asked for. Used in messages; analytics labels use the
+    /// same name because the handlers never see the launcher.
+    pub(crate) label: String,
+    /// The tool started through npx, or `None` for a plain start.
+    pub(crate) via: Option<NpxTool>,
+}
+
+/// The project-local bin is gone: the start is refused.
+///
+/// Neither `npx` nor the bare tool starts. The bare tool would be a different
+/// program from the one the rewrite chose, and `npx --no-install` would make a
+/// registry lookup that fails with a confusing message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalBinGone {
+    tool: NpxTool,
+}
+
+impl LocalBinGone {
+    /// The `error:` line.
+    pub(crate) fn error_line(&self) -> String {
+        let bin = self.tool.bin();
+        format!(
+            "error: '{bin}' is not installed in this project \
+             (no node_modules/.bin/{bin} in this folder or a parent)"
+        )
+    }
+
+    /// The `hint:` line.
+    pub(crate) fn hint_line(&self) -> String {
+        "hint: install the project dependencies (for example 'npm install'), \
+         then run the command again"
+            .to_string()
+    }
+
+    /// Print both lines to stderr and return the exit code (127).
+    pub(crate) fn report(&self) -> std::process::ExitCode {
+        eprintln!("{}", self.error_line());
+        eprintln!("{}", self.hint_line());
+        std::process::ExitCode::from(LOCAL_BIN_GONE_EXIT)
+    }
+}
+
+/// The tool the user asked to start through npx; set once, on the explicit
+/// surface only.
+static NPX_REQUEST: OnceLock<NpxTool> = OnceLock::new();
+
+/// Record that this run starts `tool` through npx.
+///
+/// Called only from `cmd::dispatch::dispatch_explicit`. The wrapper surface
+/// never calls it, so a wrapper start is never redirected. Same shape as
+/// `cmd::set_passthrough_flag`: a process-wide latch, no unit test sets it.
+pub(crate) fn request_npx(tool: NpxTool) {
+    let _ = NPX_REQUEST.set(tool);
+}
+
+/// The one reader of [`NPX_REQUEST`].
+fn requested_npx_tool() -> Option<NpxTool> {
+    NPX_REQUEST.get().copied()
+}
+
+impl Launch {
+    /// Decide how to start `program` with `args`, just before the start.
+    ///
+    /// When this run asked for npx and `program` is that tool, the project-local
+    /// bin is checked again in the current folder. The check runs here, and not
+    /// earlier in dispatch, so that a path that starts no child (`skim eslint
+    /// --via-npx` reading stdin) does no file system work.
+    pub(crate) fn resolve(program: &str, args: &[String]) -> Result<Launch, LocalBinGone> {
+        let request = requested_npx_tool();
+        // A plain start reads no folder: only a run that asked for npx pays.
+        let cwd = request.and_then(|_| std::env::current_dir().ok());
+        Launch::plan(request, cwd.as_deref(), program, args)
+    }
+
+    /// Pure core of [`Launch::resolve`], with the request and the folder passed in.
+    fn plan(
+        request: Option<NpxTool>,
+        cwd: Option<&std::path::Path>,
+        program: &str,
+        args: &[String],
+    ) -> Result<Launch, LocalBinGone> {
+        let Some(tool) = request.filter(|tool| tool.bin() == program) else {
+            return Ok(Launch {
+                spawn: program.to_string(),
+                argv: args.to_vec(),
+                label: program.to_string(),
+                via: None,
+            });
+        };
+        if !cwd.is_some_and(|dir| local_node_bin(dir, tool)) {
+            return Err(LocalBinGone { tool });
+        }
+        let mut argv = Vec::with_capacity(args.len() + 2);
+        argv.push("--no-install".to_string());
+        argv.push(tool.bin().to_string());
+        argv.extend_from_slice(args);
+        Ok(Launch {
+            spawn: "npx".to_string(),
+            argv,
+            label: tool.bin().to_string(),
+            via: Some(tool),
+        })
+    }
+
+    /// The arguments as `&str`, for [`CommandRunner::run_with_env`].
+    pub(crate) fn argv_refs(&self) -> Vec<&str> {
+        self.argv.iter().map(String::as_str).collect()
+    }
+
+    /// The `error:` line for a start that failed with "not found".
+    ///
+    /// Names npx when the start went through npx: the tool itself was never
+    /// looked up, so "tool not found" would be wrong.
+    pub(crate) fn spawn_error_line(&self) -> String {
+        match self.via {
+            Some(_) => format!(
+                "error: 'npx' not found; it must be on PATH to run the project's '{}'",
+                self.label
+            ),
+            None => format!("error: '{}' not found", self.spawn),
+        }
+    }
+
+    /// The install hint to print after [`Launch::spawn_error_line`]: the caller's
+    /// `hint`, or `None` for an npx start. A global install does not help an
+    /// npx start, which looks only at the project.
+    pub(crate) fn install_hint<'h>(&self, hint: &'h str) -> Option<&'h str> {
+        self.via.is_none().then_some(hint)
+    }
+
+    /// Return `true` when this start went through npx and npx itself failed:
+    /// non-zero exit (or a signal) and nothing on stdout.
+    ///
+    /// The text is then npm's, not the tool's, so a parser has nothing to
+    /// summarise. The caller forwards it raw and passes the exit code on.
+    pub(crate) fn npx_failed(&self, out: &CommandOutput) -> bool {
+        self.via.is_some() && out.exit_code != Some(0) && out.stdout.trim().is_empty()
+    }
+}
+
 /// Maximum bytes we will read from a single pipe (64 MiB).
 ///
 /// Prevents unbounded memory growth when a child process produces
@@ -683,6 +1008,51 @@ mod tests {
             }
             self.remaining -= n;
             Ok(n)
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // The refused-chain decision.  The latch itself is a process-wide static, so
+    // a unit test never sets it; `cli_wrapper_path_loop.rs` runs it end to end.
+    // ------------------------------------------------------------------------
+
+    fn refusal_text() -> String {
+        crate::LoopRefusal::TooDeep.plain_line("skim")
+    }
+
+    #[test]
+    fn a_child_that_exits_126_with_the_refusal_line_is_a_refusal() {
+        let line = refusal_text();
+        let stderr = format!("a warning\n{line}\n");
+        assert_eq!(
+            refusal_line_of(Some(126), stderr.as_bytes()),
+            Some(line.clone())
+        );
+    }
+
+    #[test]
+    fn the_refusal_line_survives_bytes_that_are_not_utf8() {
+        let line = refusal_text();
+        let mut stderr = vec![0xff, 0xfe, b'\n'];
+        stderr.extend_from_slice(line.as_bytes());
+        stderr.push(b'\n');
+        assert_eq!(refusal_line_of(Some(126), &stderr), Some(line));
+    }
+
+    #[test]
+    fn a_tool_that_exits_126_for_its_own_reason_is_not_a_refusal() {
+        assert_eq!(
+            refusal_line_of(Some(126), b"bash: ./tool: Permission denied\n"),
+            None
+        );
+        assert_eq!(refusal_line_of(Some(126), b""), None);
+    }
+
+    #[test]
+    fn the_refusal_line_without_exit_126_is_not_a_refusal() {
+        let stderr = refusal_text();
+        for code in [Some(0), Some(1), Some(127), None] {
+            assert_eq!(refusal_line_of(code, stderr.as_bytes()), None, "{code:?}");
         }
     }
 
@@ -1630,6 +2000,316 @@ mod tests {
         assert!(
             !is_executable(&dir.path().join("absent")),
             "a missing path is not"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // npx launcher (skim#587)
+    // ------------------------------------------------------------------------
+
+    /// Put an executable `tool` stub in `<root>/node_modules/.bin`.
+    #[cfg(unix)]
+    fn install_local_bin(root: &std::path::Path, tool: NpxTool) -> std::path::PathBuf {
+        let bin_dir = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).expect("create .bin");
+        make_executable(&bin_dir, tool.bin())
+    }
+
+    /// Mark `root` as a repository root, so a "not found" walk stops there and
+    /// the answer does not depend on what the host has above the temp folder.
+    #[cfg(unix)]
+    fn mark_repo_root(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join(".git")).expect("create .git");
+    }
+
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn test_npx_tool_names_round_trip_and_stay_closed() {
+        for tool in NpxTool::ALL {
+            assert_eq!(NpxTool::from_bin(tool.bin()), Some(tool));
+        }
+        assert_eq!(
+            NpxTool::from_bin("vitest"),
+            None,
+            "test-family tools are out"
+        );
+        assert_eq!(NpxTool::from_bin("TSC"), None, "names are case-sensitive");
+        assert_eq!(
+            NpxTool::from_bin("../tsc"),
+            None,
+            "a path is not a bin name"
+        );
+        assert_eq!(NpxTool::from_bin(""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_finds_the_bin_in_the_start_folder() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Tsc);
+        assert!(local_node_bin(root.path(), NpxTool::Tsc));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_finds_the_bin_in_a_parent_folder() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Eslint);
+        let nested = root.path().join("packages").join("a");
+        std::fs::create_dir_all(&nested).expect("create nested");
+        assert!(local_node_bin(&nested, NpxTool::Eslint));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_is_per_tool() {
+        let root = tempfile::tempdir().expect("tempdir");
+        mark_repo_root(root.path());
+        install_local_bin(root.path(), NpxTool::Eslint);
+        assert!(!local_node_bin(root.path(), NpxTool::Tsc));
+    }
+
+    /// The walk includes the repository root and stops there: a bin above the
+    /// root is the host's, not the project's.
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_stops_after_the_repository_root() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        install_local_bin(outer.path(), NpxTool::Tsc);
+
+        // `.git` as a folder.
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+        let pkg = repo.join("pkg");
+        std::fs::create_dir_all(&pkg).expect("create pkg");
+        assert!(
+            !local_node_bin(&pkg, NpxTool::Tsc),
+            "a bin above the repository root must not count"
+        );
+
+        // The root's own bin does count.
+        install_local_bin(&repo, NpxTool::Tsc);
+        assert!(local_node_bin(&pkg, NpxTool::Tsc));
+
+        // `.git` as a file (worktree or submodule) marks the root too.
+        let linked = outer.path().join("linked");
+        std::fs::create_dir_all(&linked).expect("create linked");
+        std::fs::write(linked.join(".git"), b"gitdir: elsewhere\n").expect("write .git file");
+        let sub = linked.join("sub");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        assert!(!local_node_bin(&sub, NpxTool::Tsc));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_rejects_broken_link_non_executable_and_folder() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("tempdir");
+        mark_repo_root(root.path());
+        let bin_dir = root.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).expect("create .bin");
+
+        // Broken link.
+        symlink(root.path().join("absent-target"), bin_dir.join("tsc")).expect("link");
+        assert!(!local_node_bin(root.path(), NpxTool::Tsc));
+
+        // Regular file without the execute bit.
+        std::fs::write(bin_dir.join("eslint"), b"#!/bin/sh\n").expect("write");
+        assert!(!local_node_bin(root.path(), NpxTool::Eslint));
+
+        // A folder with the tool's name.
+        std::fs::create_dir_all(bin_dir.join("oxlint")).expect("create folder");
+        assert!(!local_node_bin(root.path(), NpxTool::Oxlint));
+    }
+
+    /// A link that points at an executable counts: that is how package managers
+    /// install most bins.
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_follows_a_link_to_an_executable() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = make_executable(root.path(), "real-biome");
+        let bin_dir = root.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).expect("create .bin");
+        symlink(&real, bin_dir.join("biome")).expect("link");
+        assert!(local_node_bin(root.path(), NpxTool::Biome));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_missing_start_folder_is_not_found() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Tsc);
+        assert!(!local_node_bin(&root.path().join("absent"), NpxTool::Tsc));
+    }
+
+    /// The walk covers 64 levels: the start folder and 63 parents.
+    #[cfg(unix)]
+    #[test]
+    fn test_local_node_bin_walk_is_bounded_to_64_levels() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Tsc);
+
+        let nest = |levels: usize| {
+            let mut dir = root.path().to_path_buf();
+            for _ in 0..levels {
+                dir.push("d");
+            }
+            std::fs::create_dir_all(&dir).expect("create nest");
+            dir
+        };
+        assert!(
+            local_node_bin(&nest(63), NpxTool::Tsc),
+            "a bin 63 parents up is inside the 64 levels"
+        );
+        assert!(
+            !local_node_bin(&nest(64), NpxTool::Tsc),
+            "a bin 64 parents up is outside the 64 levels"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_plan_without_a_request_keeps_program_and_args() {
+        let args = sv(&["--noEmit", "-p", "."]);
+        let launch = Launch::plan(None, None, "tsc", &args).expect("plain start");
+        assert_eq!(launch.spawn, "tsc");
+        assert_eq!(launch.argv, args);
+        assert_eq!(launch.label, "tsc");
+        assert_eq!(launch.via, None);
+    }
+
+    /// The argv shape matches `run_with_env_node_fallback`: npx, `--no-install`,
+    /// the tool, then the prepared arguments in order.
+    #[cfg(unix)]
+    #[test]
+    fn test_plan_with_a_request_starts_npx_no_install_tool_then_args() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Eslint);
+        let args = sv(&["--format", "json", "src"]);
+        let launch = Launch::plan(Some(NpxTool::Eslint), Some(root.path()), "eslint", &args)
+            .expect("npx start");
+        assert_eq!(launch.spawn, "npx");
+        assert_eq!(
+            launch.argv,
+            sv(&["--no-install", "eslint", "--format", "json", "src"])
+        );
+        assert_eq!(launch.label, "eslint", "the label stays the tool name");
+        assert_eq!(launch.via, Some(NpxTool::Eslint));
+    }
+
+    /// The request names one tool. A start of any other program is untouched,
+    /// even with a local bin present for it.
+    #[cfg(unix)]
+    #[test]
+    fn test_plan_request_does_not_redirect_other_programs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Eslint);
+        let args = sv(&["status"]);
+        let launch =
+            Launch::plan(Some(NpxTool::Tsc), Some(root.path()), "git", &args).expect("plain start");
+        assert_eq!((launch.spawn.as_str(), launch.via), ("git", None));
+        let launch = Launch::plan(Some(NpxTool::Tsc), Some(root.path()), "eslint", &args)
+            .expect("plain start");
+        assert_eq!((launch.spawn.as_str(), launch.via), ("eslint", None));
+    }
+
+    /// Fail closed: with the bin gone, no start plan exists at all, so neither
+    /// npx nor the bare tool can start.
+    #[cfg(unix)]
+    #[test]
+    fn test_plan_refuses_when_the_local_bin_is_gone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        mark_repo_root(root.path());
+        let gone = Launch::plan(
+            Some(NpxTool::Tsc),
+            Some(root.path()),
+            "tsc",
+            &sv(&["--noEmit"]),
+        )
+        .expect_err("no local bin means no start");
+        assert_eq!(gone, LocalBinGone { tool: NpxTool::Tsc });
+        assert!(gone.error_line().starts_with("error: "));
+        assert!(gone.error_line().contains("tsc"));
+        assert!(gone.hint_line().starts_with("hint: "));
+    }
+
+    /// An unreadable current folder is "not found", never "start anyway".
+    #[test]
+    fn test_plan_refuses_when_the_current_folder_is_unknown() {
+        let result = Launch::plan(Some(NpxTool::Prettier), None, "prettier", &sv(&["src"]));
+        assert_eq!(
+            result,
+            Err(LocalBinGone {
+                tool: NpxTool::Prettier
+            })
+        );
+    }
+
+    #[test]
+    fn test_spawn_error_line_and_hint_for_a_plain_start() {
+        let launch = Launch::plan(None, None, "tsc", &[]).expect("plain start");
+        assert_eq!(launch.spawn_error_line(), "error: 'tsc' not found");
+        assert_eq!(
+            launch.install_hint("npm install -g typescript"),
+            Some("npm install -g typescript")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_spawn_error_line_names_npx_and_gives_no_install_hint() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Biome);
+        let launch = Launch::plan(
+            Some(NpxTool::Biome),
+            Some(root.path()),
+            "biome",
+            &sv(&["check"]),
+        )
+        .expect("npx start");
+        let line = launch.spawn_error_line();
+        assert!(line.starts_with("error: 'npx' not found"), "{line}");
+        assert!(line.contains("biome"), "{line}");
+        assert_eq!(
+            launch.install_hint("npm install -g @biomejs/biome"),
+            None,
+            "a global install does not help an npx start"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_npx_failed_only_for_an_npx_start_with_failure_and_blank_stdout() {
+        let root = tempfile::tempdir().expect("tempdir");
+        install_local_bin(root.path(), NpxTool::Tsc);
+        let via = Launch::plan(Some(NpxTool::Tsc), Some(root.path()), "tsc", &[]).expect("npx");
+        let plain = Launch::plan(None, None, "tsc", &[]).expect("plain");
+        let out = |stdout: &str, exit_code: Option<i32>| CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: "npm error code E404".to_string(),
+            exit_code,
+            duration: Duration::ZERO,
+        };
+
+        assert!(via.npx_failed(&out("", Some(1))));
+        assert!(via.npx_failed(&out("  \n", Some(127))), "blank is blank");
+        assert!(via.npx_failed(&out("", None)), "a signal kill is a failure");
+        assert!(
+            !via.npx_failed(&out("", Some(0))),
+            "exit 0 is a real answer"
+        );
+        assert!(
+            !via.npx_failed(&out("src/a.ts(1,1): error TS1", Some(2))),
+            "a tool that printed a report is parsed, not forwarded"
+        );
+        assert!(
+            !plain.npx_failed(&out("", Some(1))),
+            "a plain start keeps its existing handling"
         );
     }
 }

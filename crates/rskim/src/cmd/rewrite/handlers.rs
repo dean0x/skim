@@ -115,6 +115,7 @@ pub(super) fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
         category: RewriteCategory::Read,
         masks_output: false,
         matched_prefix: Some(CAT_HANDLER_PREFIX),
+        npx_tool: None,
     })
 }
 
@@ -223,6 +224,7 @@ fn try_rewrite_head_tail(args: &[&str], line_flag: &str) -> Option<RewriteResult
         category: RewriteCategory::Read,
         masks_output: false,
         matched_prefix: None,
+        npx_tool: None,
     })
 }
 

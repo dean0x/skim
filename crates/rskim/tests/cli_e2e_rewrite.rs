@@ -153,13 +153,18 @@ fn test_rewrite_npx_vitest_with_args() {
         ));
 }
 
+// The five `npx <tool>` rules that start the project's own copy carry
+// `--via-npx` after the rewritten tool words (skim#587). The `skim rewrite`
+// CLI prints that form without a project probe; the hook adds the probe (see
+// `cli_npx_local_bin.rs`).
+
 #[test]
 fn test_rewrite_npx_tsc() {
     skim_cmd()
         .args(["rewrite", "npx", "tsc"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim tsc"));
+        .stdout("skim tsc --via-npx\n");
 }
 
 #[test]
@@ -168,7 +173,7 @@ fn test_rewrite_npx_tsc_with_args() {
         .args(["rewrite", "npx", "tsc", "--noEmit"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim tsc --noEmit"));
+        .stdout("skim tsc --via-npx --noEmit\n");
 }
 
 // ============================================================================
@@ -1258,7 +1263,7 @@ fn test_rewrite_npx_eslint() {
         .args(["rewrite", "npx", "eslint", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim eslint src/"));
+        .stdout("skim eslint --via-npx src/\n");
 }
 
 #[test]
@@ -1533,7 +1538,20 @@ fn test_rewrite_npx_prettier_write() {
         .args(["rewrite", "npx", "prettier", "--write", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim prettier"));
+        .stdout("skim prettier --write --via-npx src/\n");
+}
+
+/// AD-RW-11: `npx prettier --check` is acknowledged like `prettier --check`:
+/// the CLI echoes the typed command, so it carries no `--via-npx`. (The hook
+/// calls the rule engine directly and does rewrite it; that case is in
+/// `cli_npx_local_bin.rs`.)
+#[test]
+fn test_rewrite_npx_prettier_check_acknowledged() {
+    skim_cmd()
+        .args(["rewrite", "npx", "prettier", "--check", "src/"])
+        .assert()
+        .success()
+        .stdout("npx prettier --check src/\n");
 }
 
 /// AD-RW-11: `rustfmt --check` is acknowledged as already-compact.
@@ -2367,7 +2385,7 @@ fn test_rewrite_npx_biome_check() {
         .args(["rewrite", "npx", "biome", "check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim biome"));
+        .stdout("skim biome check --via-npx .\n");
 }
 
 #[test]
@@ -2421,7 +2439,7 @@ fn test_rewrite_npx_oxlint() {
         .args(["rewrite", "npx", "oxlint", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim oxlint"));
+        .stdout("skim oxlint --via-npx src/\n");
 }
 
 // ============================================================================

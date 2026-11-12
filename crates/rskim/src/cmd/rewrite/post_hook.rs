@@ -334,6 +334,7 @@ mod tests {
             category: RewriteCategory::Read,
             masks_output,
             matched_prefix,
+            npx_tool: None,
         }
     }
 

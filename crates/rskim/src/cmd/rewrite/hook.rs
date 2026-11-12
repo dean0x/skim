@@ -12,10 +12,11 @@ use crate::cmd::session::AgentKind;
 
 use crate::cmd::hooks::claude::POST_TOOL_USE_EVENT;
 
-use super::compound::{command_needs_passthrough, split_compound, try_rewrite_compound};
+use super::compound::{command_needs_passthrough, split_compound, try_rewrite_compound_with};
 use super::engine::try_rewrite;
 use super::post_hook::run_post_hook;
 use super::types::{CompoundSplitResult, RewriteResult};
+use crate::runner::NpxTool;
 
 // ============================================================================
 // B1 — Drift detection types and pure detector
@@ -404,6 +405,68 @@ fn withholds_rewrite(input: &serde_json::Value, result: &RewriteResult) -> bool 
     is_auto_permission_mode(input) && !result.masks_output
 }
 
+/// The folder the hook judges a project-local tool in.
+///
+/// The `cwd` field of the hook input when it is an absolute path that resolves;
+/// the working folder of the hook process when the field is absent. A `cwd` that
+/// is relative, not a string, or not a folder that resolves gives `None`: the
+/// hook then cannot say where the command will run, and the caller must not
+/// rewrite. A relative `cwd` is never read against the hook process, which runs
+/// in a folder the agent does not choose.
+fn hook_cwd(input: &serde_json::Value) -> Option<std::path::PathBuf> {
+    match input.get("cwd") {
+        None => std::env::current_dir().ok(),
+        Some(serde_json::Value::String(cwd)) => {
+            let cwd = std::path::Path::new(cwd);
+            if cwd.is_absolute() {
+                cwd.canonicalize().ok()
+            } else {
+                None
+            }
+        }
+        Some(_) => None,
+    }
+}
+
+/// The check that a project holds the tool an `npx <tool>` rewrite starts.
+///
+/// The tool must be an executable in `node_modules/.bin` of the hook folder or
+/// a parent up to the repository root (`runner::local_node_bin`); without it the
+/// handler would refuse to start. The folder is read only when the check is
+/// called, and the tool name comes from the rule, never from command text.
+fn local_bin_probe(input: &serde_json::Value) -> impl Fn(NpxTool) -> bool + '_ {
+    move |tool| hook_cwd(input).is_some_and(|cwd| crate::runner::local_node_bin(&cwd, tool))
+}
+
+/// The rewrite the hook sends for a command that passed [`command_gates`].
+///
+/// `npx_ok` says whether the project holds the tool of an `npx <tool>` rule
+/// (see [`local_bin_probe`]). A rewrite that needs the tool and does not find it
+/// is not made: that one segment stays as typed, and every other segment of a
+/// compound still rewrites. The drop never reaches a segment that routes through
+/// a masking tool, so that segment keeps its rewrite.
+fn hook_rewrite(
+    tokens: &[&str],
+    has_operator_chars: bool,
+    npx_ok: &dyn Fn(NpxTool) -> bool,
+) -> Option<RewriteResult> {
+    let single = |tokens: &[&str]| try_rewrite(tokens).filter(|r| r.npx_tool.is_none_or(npx_ok));
+    if !has_operator_chars {
+        return single(tokens);
+    }
+    // Defer joining until the compound branch — avoids a dead allocation on the
+    // common non-compound path where `original` is never read.
+    let original = tokens.join(" ");
+    match split_compound(&original) {
+        CompoundSplitResult::Bail => None,
+        CompoundSplitResult::Simple(simple_tokens) => {
+            let token_refs: Vec<&str> = simple_tokens.iter().map(|s| s.as_str()).collect();
+            single(&token_refs)
+        }
+        CompoundSplitResult::Compound(segments) => try_rewrite_compound_with(&segments, npx_ok),
+    }
+}
+
 /// Why [`command_gates`] declined a command.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Decline {
@@ -528,8 +591,11 @@ fn log_provenance_findings(agent_kind: AgentKind) {
 /// 5. Run command through rewrite logic
 /// 6. In auto permission mode, a rewrite that needs no masking is withheld: exit
 ///    0, empty stdout (see [`withholds_rewrite`])
-/// 7. On match: emit hook response JSON, exit 0
-/// 8. On no match: exit 0, empty stdout (passthrough)
+/// 7. An `npx <tool>` segment is rewritten only when the project holds the tool
+///    (see [`hook_rewrite`]); else that segment stays as typed, and a command
+///    with nothing else to rewrite gets exit 0, empty stdout
+/// 8. On match: emit hook response JSON, exit 0
+/// 9. On no match: exit 0, empty stdout (passthrough)
 ///
 /// Drift is detected and logged to hook.log on every PreToolUse invocation. For
 /// diagnosis run `skim doctor`.
@@ -665,23 +731,11 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         }
     };
 
-    // Fast path for non-compound commands. The RewriteResult is kept
-    // structured (parts vector) until after session-id injection (#317).
-    let rewritten = if !has_operator_chars {
-        try_rewrite(&tokens)
-    } else {
-        // Defer joining until the compound branch — avoids a dead allocation on the
-        // common non-compound path where `original` is never read.
-        let original = tokens.join(" ");
-        match split_compound(&original) {
-            CompoundSplitResult::Bail => None,
-            CompoundSplitResult::Simple(simple_tokens) => {
-                let token_refs: Vec<&str> = simple_tokens.iter().map(|s| s.as_str()).collect();
-                try_rewrite(&token_refs)
-            }
-            CompoundSplitResult::Compound(segments) => try_rewrite_compound(&segments),
-        }
-    };
+    // The RewriteResult is kept structured (parts vector) until after
+    // session-id injection (#317). An `npx <tool>` segment without its tool in
+    // the project (or with a folder the hook cannot read) is not rewritten; the
+    // rest of the command is, so a masking segment keeps its rewrite.
+    let rewritten = hook_rewrite(&tokens, has_operator_chars, &local_bin_probe(&json));
 
     match rewritten {
         Some(result) if withholds_rewrite(&json, &result) => {
@@ -1000,17 +1054,18 @@ mod tests {
     // withholds_rewrite
     // ========================================================================
 
-    /// The rewrite the hook finds for `command`, by the same engine calls it makes.
+    /// The rewrite the hook finds for `command` when `npx_ok` answers the
+    /// local-bin check, by the same calls the hook makes.
+    fn rewrite_with(command: &str, npx_ok: &dyn Fn(NpxTool) -> bool) -> Option<RewriteResult> {
+        let (tokens, has_operator_chars) =
+            command_gates(command).unwrap_or_else(|_| panic!("{command:?} must pass the gates"));
+        hook_rewrite(&tokens, has_operator_chars, npx_ok)
+    }
+
+    /// The rewrite the hook finds for `command` in a project that holds every tool.
     fn rewrite_of(command: &str) -> RewriteResult {
-        let rewritten = match split_compound(command) {
-            CompoundSplitResult::Simple(tokens) => {
-                let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-                try_rewrite(&refs)
-            }
-            CompoundSplitResult::Compound(segments) => try_rewrite_compound(&segments),
-            CompoundSplitResult::Bail => None,
-        };
-        rewritten.unwrap_or_else(|| panic!("{command:?} must have a rewrite"))
+        rewrite_with(command, &|_| true)
+            .unwrap_or_else(|| panic!("{command:?} must have a rewrite"))
     }
 
     fn auto_input() -> serde_json::Value {
@@ -1064,6 +1119,189 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // hook_cwd and local_bin_probe
+    // ========================================================================
+
+    /// A project folder: a `.git` marker, and when `tool` is given an
+    /// executable of that name in `node_modules/.bin`.
+    #[cfg(unix)]
+    fn project_with(tool: Option<&str>) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(".git")).expect("git marker");
+        if let Some(tool) = tool {
+            let bin_dir = dir.path().join("node_modules").join(".bin");
+            std::fs::create_dir_all(&bin_dir).expect("create .bin");
+            let bin = bin_dir.join(tool);
+            std::fs::write(&bin, b"#!/bin/sh\n").expect("write bin");
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("make executable");
+        }
+        dir
+    }
+
+    #[test]
+    fn test_hook_cwd_absent_is_the_process_folder() {
+        assert_eq!(
+            hook_cwd(&serde_json::json!({})),
+            std::env::current_dir().ok()
+        );
+    }
+
+    #[test]
+    fn test_hook_cwd_absolute_folder_is_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = serde_json::json!({ "cwd": dir.path().to_str().expect("UTF-8") });
+        assert_eq!(hook_cwd(&input), dir.path().canonicalize().ok());
+    }
+
+    #[test]
+    fn test_hook_cwd_rejects_what_it_cannot_trust() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent");
+        for cwd in [
+            serde_json::json!("relative/folder"),
+            serde_json::json!("."),
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!(["/"]),
+            serde_json::json!({ "path": "/" }),
+            serde_json::json!(missing.to_str().expect("UTF-8")),
+        ] {
+            assert_eq!(hook_cwd(&serde_json::json!({ "cwd": cwd })), None, "{cwd}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_bin_probe_follows_the_local_bin() {
+        let with_bin = project_with(Some("tsc"));
+        let without_bin = project_with(None);
+        let other_tool = project_with(Some("eslint"));
+        let cwd = |dir: &tempfile::TempDir| serde_json::json!({ "cwd": dir.path().to_str().expect("UTF-8") });
+
+        assert!(local_bin_probe(&cwd(&with_bin))(NpxTool::Tsc));
+        assert!(!local_bin_probe(&cwd(&without_bin))(NpxTool::Tsc));
+        assert!(
+            !local_bin_probe(&cwd(&other_tool))(NpxTool::Tsc),
+            "another tool's bin does not count"
+        );
+    }
+
+    #[test]
+    fn test_local_bin_probe_is_false_when_the_folder_is_unknown() {
+        for cwd in [
+            serde_json::json!("relative"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                !local_bin_probe(&serde_json::json!({ "cwd": cwd }))(NpxTool::Tsc),
+                "{cwd}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // hook_rewrite: an npx segment without its tool
+    // ========================================================================
+
+    #[test]
+    fn test_hook_rewrite_leaves_a_lone_npx_command_as_typed_without_the_tool() {
+        assert!(rewrite_with("npx tsc --noEmit", &|_| false).is_none());
+    }
+
+    /// An operator character inside quotes makes a single command that still
+    /// goes through the operator branch: the check must apply there too.
+    #[test]
+    fn test_hook_rewrite_applies_the_tool_check_to_a_quoted_operator_command() {
+        let command = "npx eslint \"a;b\"";
+        assert!(
+            rewrite_with(command, &|_| true).is_some(),
+            "{command:?} must rewrite when the tool is there"
+        );
+        assert!(rewrite_with(command, &|_| false).is_none(), "{command:?}");
+    }
+
+    #[test]
+    fn test_hook_rewrite_rewrites_a_lone_npx_command_with_the_tool() {
+        let result = rewrite_with("npx tsc --noEmit", &|_| true).expect("must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim tsc --via-npx --noEmit");
+        assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
+    }
+
+    /// The regression: an npx first segment without its tool must not take the
+    /// masking rewrite of a later segment with it.
+    #[test]
+    fn test_hook_rewrite_keeps_a_masking_segment_after_an_npx_segment_without_the_tool() {
+        for (command, expected) in [
+            ("npx tsc && env", "npx tsc && skim env"),
+            ("npx eslint . ; printenv", "npx eslint . ; skim printenv"),
+            (
+                "npx tsc && curl -v https://example.com",
+                "npx tsc && skim curl -v https://example.com",
+            ),
+        ] {
+            let result = rewrite_with(command, &|_| false)
+                .unwrap_or_else(|| panic!("{command:?}: the masking segment must rewrite"));
+            assert_eq!(result.tokens.join(" "), expected, "{command:?}");
+            assert!(result.masks_output, "{command:?}");
+            assert_eq!(result.npx_tool, None, "{command:?}");
+            assert!(
+                !withholds_rewrite(&auto_input(), &result),
+                "{command:?}: auto mode must keep it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_rewrite_rewrites_both_segments_when_the_tool_is_present() {
+        let result = rewrite_with("npx tsc && env", &|_| true).expect("must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim tsc --via-npx && skim env");
+        assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
+        assert!(result.masks_output);
+    }
+
+    #[test]
+    fn test_hook_rewrite_keeps_the_other_segments_of_a_compound_without_the_tool() {
+        let result = rewrite_with("npx tsc && cargo test", &|_| false).expect("must rewrite");
+        assert_eq!(result.tokens.join(" "), "npx tsc && skim cargo test");
+        assert!(!result.masks_output);
+        assert!(
+            withholds_rewrite(&auto_input(), &result),
+            "with nothing to mask, auto mode still withholds it"
+        );
+    }
+
+    #[test]
+    fn test_hook_rewrite_with_an_unreadable_folder_leaves_only_the_npx_segment() {
+        for cwd in [
+            serde_json::json!("relative"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let input = serde_json::json!({ "cwd": cwd });
+            let probe = local_bin_probe(&input);
+            let result = rewrite_with("npx tsc && env", &probe).expect("must rewrite");
+            assert_eq!(result.tokens.join(" "), "npx tsc && skim env", "{cwd}");
+            assert!(rewrite_with("npx tsc --noEmit", &probe).is_none(), "{cwd}");
+        }
+    }
+
+    #[test]
+    fn test_hook_rewrite_never_asks_about_the_folder_without_a_first_npx_segment() {
+        let never = |_: NpxTool| -> bool { panic!("no npx first segment: the folder is not read") };
+
+        assert!(rewrite_with("cargo test", &never).is_some());
+        assert!(rewrite_with("cargo test && npx tsc", &never).is_some());
+        // A later npx segment stays as typed and is not asked about.
+        let later = rewrite_with("cd x && npx tsc && env", &never).expect("env must rewrite");
+        assert_eq!(later.tokens.join(" "), "cd x && npx tsc && skim env");
     }
 
     // ========================================================================

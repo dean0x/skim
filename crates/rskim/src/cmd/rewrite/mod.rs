@@ -47,6 +47,7 @@ use suggest::{print_help, print_suggest};
 use types::{CommandSegment, CompoundOp, CompoundSplitResult, RewriteCategory, RewriteResult};
 
 // Re-export the clap command for completions.rs
+pub(crate) use rules::npx_flag_tails;
 pub(super) use suggest::command;
 
 // ============================================================================

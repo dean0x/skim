@@ -17,6 +17,7 @@ use super::engine::try_rewrite;
 use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
+use crate::runner::NpxTool;
 
 // ---- Round-trip safety (#317) ----
 
@@ -1018,7 +1019,25 @@ pub(super) fn is_bare_cat_pipeline(segments: &[CommandSegment]) -> bool {
 /// [`is_bare_cat_pipeline`]: `<source> | cat` rewrites its source, because
 /// bare `cat` renders the stream for a reader rather than consuming its bytes.
 /// Returns `Some(RewriteResult)` if ANY segment was rewritten, `None` otherwise.
+///
+/// This form asks no question about the folder the command runs in: an
+/// `npx <tool>` first segment rewrites. The `skim rewrite` command and
+/// `discover` use it. The PreToolUse hook uses [`try_rewrite_compound_with`].
 pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<RewriteResult> {
+    try_rewrite_compound_with(segments, &|_| true)
+}
+
+/// [`try_rewrite_compound`] with a check for the `npx <tool>` first segment.
+///
+/// `npx_ok` says whether the project holds the tool. When it says no, the
+/// first segment stays as typed and every other segment still rewrites. A
+/// segment that routes through a masking tool must keep its rewrite, whatever
+/// happens to an `npx` segment before it. `npx_ok` is asked at most once, for
+/// the first segment only.
+pub(super) fn try_rewrite_compound_with(
+    segments: &[CommandSegment],
+    npx_ok: &dyn Fn(NpxTool) -> bool,
+) -> Option<RewriteResult> {
     if segments.is_empty() {
         return None;
     }
@@ -1033,11 +1052,18 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
     let mut any_rewritten = false;
     let mut any_masks_output = false;
     let mut first_category: Option<RewriteCategory> = None;
+    let mut first_segment_npx_tool: Option<NpxTool> = None;
     let mut parts: Vec<String> = Vec::new();
 
-    for seg in segments {
+    for (index, seg) in segments.iter().enumerate() {
         let token_refs: Vec<&str> = seg.tokens.iter().map(|s| s.as_str()).collect();
-        let rewrite = try_rewrite(&token_refs);
+        // A rewrite that starts a project-local bin through npx is right only
+        // for a command that runs in the folder the hook checked, and only
+        // when that folder holds the bin. Only the first segment runs there:
+        // an earlier `cd` can move a later one. A later `npx` segment, and a
+        // first one without its bin, stay as typed.
+        let rewrite = try_rewrite(&token_refs)
+            .filter(|r| r.npx_tool.is_none_or(|tool| index == 0 && npx_ok(tool)));
 
         let segment_text = match &rewrite {
             Some(r) => {
@@ -1045,6 +1071,9 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
                 any_masks_output |= r.masks_output;
                 if first_category.is_none() {
                     first_category = Some(r.category);
+                }
+                if index == 0 {
+                    first_segment_npx_tool = r.npx_tool;
                 }
                 // Splice redirects back at their original positions.
                 let mut rewritten_tokens = r.tokens.clone();
@@ -1076,6 +1105,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
         category: first_category.unwrap_or(RewriteCategory::Build),
         masks_output: any_masks_output,
         matched_prefix: None,
+        npx_tool: first_segment_npx_tool,
     })
 }
 
@@ -1949,6 +1979,143 @@ mod tests {
     #[test]
     fn test_compound_empty_returns_none() {
         assert!(try_rewrite_compound(&[]).is_none());
+    }
+
+    // ========================================================================
+    // npx local-bin requirement in a compound (skim#587)
+    // ========================================================================
+
+    /// The compound rewrite of `command`, which must split as a compound.
+    fn compound_rewrite_of(command: &str) -> Option<RewriteResult> {
+        match split_compound(command) {
+            CompoundSplitResult::Compound(segments) => try_rewrite_compound(&segments),
+            other => panic!("expected Compound for `{command}`, got {other:?}"),
+        }
+    }
+
+    /// Only the first segment of a compound runs in the folder the hook knows,
+    /// so a later `npx` segment stays as typed. With nothing else to rewrite,
+    /// the whole compound is left alone.
+    #[test]
+    fn test_compound_later_npx_segment_is_left_as_typed() {
+        for command in [
+            "cd x && npx tsc",
+            "echo hi && npx eslint .",
+            "cd x ; npx prettier --write src",
+            "false || npx oxlint src",
+            "cd x && npx biome check .",
+        ] {
+            assert!(
+                compound_rewrite_of(command).is_none(),
+                "`{command}` has an npx segment past the first and nothing else to rewrite"
+            );
+        }
+    }
+
+    /// A first-segment npx rewrite stays, a later one does not, and the result
+    /// takes its requirement from the first segment.
+    #[test]
+    fn test_compound_rewrites_only_the_first_npx_segment() {
+        let result = compound_rewrite_of("npx tsc && npx eslint .")
+            .expect("the first segment is an npx rule and must rewrite");
+        assert_eq!(
+            result.tokens.join(" "),
+            "skim tsc --via-npx && npx eslint ."
+        );
+        assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
+    }
+
+    /// A later non-npx segment is still rewritten beside a first npx segment,
+    /// and an operator other than `&&` makes no difference.
+    #[test]
+    fn test_compound_first_npx_segment_keeps_later_non_npx_rewrites() {
+        let result = compound_rewrite_of("npx eslint . ; cargo test")
+            .expect("both segments rewrite: the npx one is first");
+        assert_eq!(
+            result.tokens.join(" "),
+            "skim eslint --via-npx . ; skim cargo test"
+        );
+        assert_eq!(result.npx_tool, Some(NpxTool::Eslint));
+    }
+
+    /// A later npx segment does not stop other segments from being rewritten,
+    /// and it adds no requirement: the first segment has none.
+    #[test]
+    fn test_compound_later_npx_segment_does_not_set_the_requirement() {
+        let result = compound_rewrite_of("cargo test && npx tsc")
+            .expect("the first segment is a plain rule and must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim cargo test && npx tsc");
+        assert_eq!(result.npx_tool, None);
+    }
+
+    /// A later segment of the test family has its own npx fallback and carries
+    /// no requirement, so it is rewritten as before.
+    #[test]
+    fn test_compound_later_test_family_npx_segment_still_rewrites() {
+        let result = compound_rewrite_of("cd x && npx vitest run")
+            .expect("npx vitest is not a local-bin rule and must rewrite");
+        assert_eq!(result.tokens.join(" "), "cd x && skim vitest run");
+        assert_eq!(result.npx_tool, None);
+    }
+
+    /// The bare-`| cat` shape rewrites its source, and the source is the first
+    /// segment, so an npx source keeps its requirement.
+    #[test]
+    fn test_compound_npx_source_of_a_cat_pipe_keeps_the_requirement() {
+        let result = compound_rewrite_of("npx tsc --noEmit | cat")
+            .expect("the source of a bare `| cat` pipeline must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim tsc --via-npx --noEmit | cat");
+        assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
+    }
+
+    /// The compound rewrite of `command` when `npx_ok` answers the local-bin check.
+    fn compound_rewrite_with(
+        command: &str,
+        npx_ok: &dyn Fn(NpxTool) -> bool,
+    ) -> Option<RewriteResult> {
+        match split_compound(command) {
+            CompoundSplitResult::Compound(segments) => try_rewrite_compound_with(&segments, npx_ok),
+            other => panic!("expected Compound for `{command}`, got {other:?}"),
+        }
+    }
+
+    /// A first npx segment without its tool stays as typed. A masking segment
+    /// after it keeps its rewrite, and the result carries no npx requirement.
+    #[test]
+    fn test_compound_first_npx_segment_without_the_tool_keeps_a_masking_segment() {
+        let result = compound_rewrite_with("npx tsc && env", &|_| false)
+            .expect("the masking segment must rewrite");
+        assert_eq!(result.tokens.join(" "), "npx tsc && skim env");
+        assert!(result.masks_output);
+        assert_eq!(result.npx_tool, None);
+    }
+
+    /// With nothing else to rewrite, a first npx segment without its tool leaves
+    /// the compound alone.
+    #[test]
+    fn test_compound_first_npx_segment_without_the_tool_and_nothing_else_is_none() {
+        assert!(compound_rewrite_with("npx tsc && echo hi", &|_| false).is_none());
+    }
+
+    /// The tool check is asked for the first segment alone, with that segment's
+    /// own tool, and a yes keeps the requirement on the result.
+    #[test]
+    fn test_compound_asks_the_tool_check_for_the_first_segment_only() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let npx_ok = |tool: NpxTool| {
+            asked.borrow_mut().push(tool);
+            true
+        };
+
+        let result =
+            compound_rewrite_with("npx tsc && npx eslint . && env", &npx_ok).expect("must rewrite");
+
+        assert_eq!(
+            result.tokens.join(" "),
+            "skim tsc --via-npx && npx eslint . && skim env"
+        );
+        assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
+        assert_eq!(*asked.borrow(), vec![NpxTool::Tsc]);
     }
 
     /// `ls | head` must NOT be rewritten — `ls` is a catch-all rule and must not
