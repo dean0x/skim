@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 // ============================================================================
 // Query model
@@ -175,7 +175,7 @@ const WORD_CHAR_CLASS: &str = r"[\p{Alphabetic}\p{Nd}_]";
 /// Whole-word matching of a literal over lines, the ground truth for a
 /// `-w` search. A match is a whole word iff the character before it and the
 /// character after it (if any) are not word characters
-/// ([`WORD_CHAR_CLASS`]). The literal is compared case-sensitively and
+/// (`WORD_CHAR_CLASS`). The literal is compared case-sensitively and
 /// byte for byte, never as a regex.
 ///
 /// Limit: for a literal that starts or ends with a non-word character this
@@ -209,23 +209,43 @@ impl WholeWord {
         if word.is_empty() {
             return false;
         }
+        self.any_bounded(line, |from| {
+            line[from..]
+                .find(word)
+                .map(|rel| (from + rel, from + rel + word.len()))
+        })
+    }
+
+    /// Whether the match `start..end` of `line` has no word character right
+    /// before it and none right after it.
+    fn bounded(&self, line: &str, start: usize, end: usize) -> bool {
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !self.is_word_char(c));
+        let after_ok = line[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !self.is_word_char(c));
+        before_ok && after_ok
+    }
+
+    /// Whether some match of `line` is [`bounded`](Self::bounded). `find(from)`
+    /// returns the leftmost match that starts at or after the byte `from`.
+    /// After a rejected match the search resumes one character past its start,
+    /// so overlapping matches are all tried. Every step moves `from` forward,
+    /// so the loop ends within `line.len() + 1` steps.
+    fn any_bounded(&self, line: &str, find: impl Fn(usize) -> Option<(usize, usize)>) -> bool {
         let mut from = 0;
-        while let Some(rel) = line[from..].find(word) {
-            let start = from + rel;
-            let end = start + word.len();
-            let before_ok = line[..start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !self.is_word_char(c));
-            let after_ok = line[end..]
-                .chars()
-                .next()
-                .is_none_or(|c| !self.is_word_char(c));
-            if before_ok && after_ok {
+        while let Some((start, end)) = find(from) {
+            if self.bounded(line, start, end) {
                 return true;
             }
             // Step one character on (not one byte, to stay on a boundary).
-            from = start + line[start..].chars().next().map_or(1, char::len_utf8);
+            let Some(next) = line[start..].chars().next() else {
+                return false;
+            };
+            from = start + next.len_utf8();
         }
         false
     }
@@ -251,6 +271,187 @@ impl WholeWord {
         }
         out
     }
+}
+
+// ============================================================================
+// Line-level ground truth (literal and regex lines, the `rg` flag set)
+// ============================================================================
+
+/// How a [`LineQuery`] reads its pattern, with the two switches that change
+/// what a hit is.
+///
+/// This is not a [`MatchMode`] variant on purpose. `MatchMode` names the
+/// file-level modes of the golden `lexical` table, and `verify_mode` in the
+/// search JSON has a value for each of them. A line-level query has no such
+/// value, and a file-level mode has no lines to judge. Two types keep both
+/// facts in the signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineMode {
+    /// The pattern is literal text (`-F`, and the default).
+    Literal { case_insensitive: bool, word: bool },
+    /// The pattern is a regex (`-E`).
+    Regex { case_insensitive: bool, word: bool },
+}
+
+impl LineMode {
+    fn word(self) -> bool {
+        match self {
+            LineMode::Literal { word, .. } | LineMode::Regex { word, .. } => word,
+        }
+    }
+}
+
+/// Whether a search ignores case. `-i` always does. `-S` (smart case) does
+/// when no character of `pattern` is uppercase (`char::is_uppercase`). With
+/// both flags, `-i` wins.
+pub fn is_case_insensitive(pattern: &str, ignore_case: bool, smart_case: bool) -> bool {
+    ignore_case || (smart_case && !pattern.chars().any(char::is_uppercase))
+}
+
+/// How a [`LineQuery`] finds a match.
+#[derive(Debug, Clone)]
+enum Finder {
+    /// Case-sensitive literal text, found with `str::find`. The regex crate
+    /// is not involved.
+    Exact(String),
+    /// Everything else, compiled by the regex crate.
+    Pattern(Regex),
+}
+
+impl Finder {
+    /// The leftmost match that starts at or after the byte `from` (a
+    /// character boundary of `line`), as `(start, end)`. `from` may equal
+    /// `line.len()`: an empty match can sit at the end of the line. A regex
+    /// reads the whole `line` for context, so `^` stays at the line start.
+    fn find_from(&self, line: &str, from: usize) -> Option<(usize, usize)> {
+        match self {
+            Finder::Exact(text) => line[from..]
+                .find(text.as_str())
+                .map(|rel| (from + rel, from + rel + text.len())),
+            Finder::Pattern(re) => re.find_at(line, from).map(|m| (m.start(), m.end())),
+        }
+    }
+}
+
+/// A line-level ground-truth query: the lines that hold a match of a literal
+/// or a regex, in the way `rg -n` reads files.
+///
+/// The rules (the oracle's specification of the plain-text search):
+///
+/// - A literal is matched as text. A regex is the regex crate's syntax.
+/// - Case is exact unless the mode says otherwise. [`is_case_insensitive`]
+///   turns `-i` and `-S` into that switch.
+/// - The unit is a line. A line is a hit when it holds a match. An
+///   empty-match regex matches every line.
+/// - With `word`, a match counts only when the character before it and the
+///   one after it (if any) are not in `[\p{Alphabetic}\p{Nd}_]`. This is a
+///   post-filter: the leftmost match at each start is tried in turn, and a
+///   match that fails the filter is dropped. Limit: for a pattern that starts
+///   or ends with a non-word character, or that can match at more than one
+///   length from one start, this can differ from `rg -w`.
+///
+/// Limit: the engine and this oracle both use the regex crate. The frozen hit
+/// lists in this module's tests guard against a fault in that crate.
+#[derive(Debug, Clone)]
+pub struct LineQuery {
+    raw: String,
+    mode: LineMode,
+    finder: Finder,
+    /// Set exactly when the mode asks for whole words.
+    boundary: Option<WholeWord>,
+}
+
+impl LineQuery {
+    /// Compile `pattern` under `mode`.
+    ///
+    /// # Errors
+    ///
+    /// - a literal pattern is empty (a regex may be, and then matches every
+    ///   line);
+    /// - a regex does not compile.
+    pub fn new(pattern: &str, mode: LineMode) -> anyhow::Result<Self> {
+        let finder = match mode {
+            LineMode::Literal { .. } if pattern.is_empty() => {
+                anyhow::bail!("a literal pattern must not be empty")
+            }
+            LineMode::Literal {
+                case_insensitive: false,
+                ..
+            } => Finder::Exact(pattern.to_string()),
+            LineMode::Literal {
+                case_insensitive: true,
+                ..
+            } => Finder::Pattern(compile_pattern(&regex::escape(pattern), true)?),
+            LineMode::Regex {
+                case_insensitive, ..
+            } => Finder::Pattern(compile_pattern(pattern, case_insensitive)?),
+        };
+        let boundary = if mode.word() {
+            Some(WholeWord::new()?)
+        } else {
+            None
+        };
+        Ok(LineQuery {
+            raw: pattern.to_string(),
+            mode,
+            finder,
+            boundary,
+        })
+    }
+
+    /// The pattern as given.
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// The mode.
+    pub fn mode(&self) -> LineMode {
+        self.mode
+    }
+
+    /// Whether `line` (without its `\n`) is a hit.
+    pub fn matches_line(&self, line: &str) -> bool {
+        match &self.boundary {
+            None => self.finder.find_from(line, 0).is_some(),
+            Some(boundary) => boundary.any_bounded(line, |from| self.finder.find_from(line, from)),
+        }
+    }
+}
+
+fn compile_pattern(pattern: &str, case_insensitive: bool) -> anyhow::Result<Regex> {
+    RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| anyhow::anyhow!("pattern {pattern:?} does not compile: {e}"))
+}
+
+/// The lines of `text` as `rg` reads them, with 1-based numbers. Lines split
+/// on `\n` only, so a `\r` stays in the line. A final `\n` ends the last line
+/// and does not start another. An empty text has no line.
+fn numbered_lines(text: &str) -> impl Iterator<Item = (u32, &str)> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    (!text.is_empty())
+        .then(|| body.split('\n'))
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map_while(|(idx, line)| Some((u32::try_from(idx + 1).ok()?, line)))
+}
+
+/// Every `(path, 1-based line)` over `files` that is a hit of `query`.
+pub fn line_truth<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    query: &LineQuery,
+) -> BTreeSet<(String, u32)> {
+    let mut out = BTreeSet::new();
+    for (path, text) in files {
+        for (number, line) in numbered_lines(text) {
+            if query.matches_line(line) {
+                out.insert((path.to_string(), number));
+            }
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -599,8 +800,8 @@ pub struct RgLine {
     pub end: usize,
 }
 
-/// Simulated `rg -n -F --sort path <pattern>` output (see
-/// [`simulate_rg_fixed`]).
+/// Simulated `rg -n --sort path` output (see [`simulate_rg_fixed`] and
+/// [`simulate_rg_word`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RgSimulation {
     output: Vec<u8>,
@@ -646,20 +847,47 @@ pub fn simulate_rg_fixed<'a>(
     files: impl IntoIterator<Item = (&'a str, &'a str)>,
     pattern: &str,
 ) -> RgSimulation {
+    render_rg(files, |line| line.contains(pattern))
+}
+
+/// Simulate `rg -n -w --sort path <word>` over `files` for a bare
+/// identifier: one `path:line:content\n` record per line that holds `word`
+/// as a whole word ([`LineQuery`] with `word` set, case-sensitive), files in
+/// [`rg_path_cmp`] order. What is not modeled is the same as for
+/// [`simulate_rg_fixed`].
+///
+/// # Errors
+///
+/// Returns an error if `word` is empty.
+pub fn simulate_rg_word<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    word: &str,
+) -> anyhow::Result<RgSimulation> {
+    let query = LineQuery::new(
+        word,
+        LineMode::Literal {
+            case_insensitive: false,
+            word: true,
+        },
+    )?;
+    Ok(render_rg(files, |line| query.matches_line(line)))
+}
+
+/// The `rg -n --sort path` output for the lines of `files` that `is_hit`
+/// accepts.
+fn render_rg<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+    is_hit: impl Fn(&str) -> bool,
+) -> RgSimulation {
     let mut ordered: Vec<(&str, &str)> = files.into_iter().collect();
     ordered.sort_by(|a, b| rg_path_cmp(a.0, b.0));
 
     let mut sim = RgSimulation::default();
     for (path, text) in ordered {
-        if text.is_empty() {
-            continue;
-        }
-        let body = text.strip_suffix('\n').unwrap_or(text);
-        for (idx, line) in body.split('\n').enumerate() {
-            if !line.contains(pattern) {
+        for (line_no, line) in numbered_lines(text) {
+            if !is_hit(line) {
                 continue;
             }
-            let line_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
             sim.output.extend_from_slice(path.as_bytes());
             sim.output.push(b':');
             sim.output.extend_from_slice(line_no.to_string().as_bytes());
@@ -1240,5 +1468,284 @@ mod tests {
             got.into_iter().collect::<Vec<_>>(),
             [("w.rs".to_string(), 2)]
         );
+    }
+
+    // --- line-level ground truth (literal and regex) ---------------------------
+
+    // One frozen fixture. Every table below was derived by hand from these
+    // lines (`\r` and `é` are real bytes of the text), not by running the
+    // oracle:
+    //
+    //   src/a.rs     1 `fn run() {}`
+    //                2 `let running = run();`
+    //                3 `// Run it`
+    //                4 `RUN run_all`
+    //                5 `` (the text ends in `\n\n`)
+    //   docs/b.txt   1 `x_run y\r`
+    //                2 `run-time`
+    //                3 `érun`
+    //                4 `érun run`
+    //   blank.txt    1 `` (the text is `\n`)
+    //   empty.txt    no line (the text is empty)
+    const LINE_FIXTURE: [(&str, &str); 4] = [
+        (
+            "src/a.rs",
+            "fn run() {}\nlet running = run();\n// Run it\nRUN run_all\n\n",
+        ),
+        (
+            "docs/b.txt",
+            "x_run y\r\nrun-time\n\u{e9}run\n\u{e9}run run\n",
+        ),
+        ("blank.txt", "\n"),
+        ("empty.txt", ""),
+    ];
+
+    fn literal(case_insensitive: bool, word: bool) -> LineMode {
+        LineMode::Literal {
+            case_insensitive,
+            word,
+        }
+    }
+
+    fn regex_mode(case_insensitive: bool, word: bool) -> LineMode {
+        LineMode::Regex {
+            case_insensitive,
+            word,
+        }
+    }
+
+    fn lq(pattern: &str, mode: LineMode) -> LineQuery {
+        LineQuery::new(pattern, mode).unwrap()
+    }
+
+    fn truth(pattern: &str, mode: LineMode) -> BTreeSet<(String, u32)> {
+        line_truth(LINE_FIXTURE, &lq(pattern, mode))
+    }
+
+    fn hits(table: &[(&str, &[u32])]) -> BTreeSet<(String, u32)> {
+        table
+            .iter()
+            .flat_map(|(path, lines)| lines.iter().map(move |n| (path.to_string(), *n)))
+            .collect()
+    }
+
+    #[test]
+    fn a_case_sensitive_literal_hits_every_line_that_holds_it_as_a_substring() {
+        // `Run` (line 3) has a capital; `running`, `x_run`, `run_all` and
+        // `érun` hold `run` inside a longer word and count here.
+        assert_eq!(
+            truth("run", literal(false, false)),
+            hits(&[("src/a.rs", &[1, 2, 4]), ("docs/b.txt", &[1, 2, 3, 4])])
+        );
+    }
+
+    #[test]
+    fn a_whole_word_literal_drops_the_hits_inside_a_longer_word() {
+        // Line 2 of a.rs hits through its second `run`; `RUN run_all` does not
+        // (`run_` is followed by `_`); `x_run` and `érun` have a word
+        // character before; the last line of b.txt hits through its second
+        // `run`.
+        assert_eq!(
+            truth("run", literal(false, true)),
+            hits(&[("src/a.rs", &[1, 2]), ("docs/b.txt", &[2, 4])])
+        );
+    }
+
+    #[test]
+    fn a_case_insensitive_literal_adds_the_capitalised_lines() {
+        assert_eq!(
+            truth("run", literal(true, false)),
+            hits(&[("src/a.rs", &[1, 2, 3, 4]), ("docs/b.txt", &[1, 2, 3, 4])])
+        );
+    }
+
+    #[test]
+    fn a_case_insensitive_whole_word_literal_keeps_the_capitalised_words() {
+        assert_eq!(
+            truth("run", literal(true, true)),
+            hits(&[("src/a.rs", &[1, 2, 3, 4]), ("docs/b.txt", &[2, 4])])
+        );
+    }
+
+    #[test]
+    fn case_folding_is_unicode() {
+        assert_eq!(
+            truth("\u{c9}RUN", literal(true, false)),
+            hits(&[("docs/b.txt", &[3, 4])])
+        );
+        assert!(truth("\u{c9}RUN", literal(false, false)).is_empty());
+    }
+
+    #[test]
+    fn an_empty_match_regex_hits_every_line_and_no_line_past_the_last() {
+        // a.rs has 5 lines (the last one empty) and no 6th; blank.txt has its
+        // one empty line; empty.txt has none.
+        assert_eq!(
+            truth("", regex_mode(false, false)),
+            hits(&[
+                ("src/a.rs", &[1, 2, 3, 4, 5]),
+                ("docs/b.txt", &[1, 2, 3, 4]),
+                ("blank.txt", &[1])
+            ])
+        );
+        assert_eq!(
+            truth("x*", regex_mode(false, false)),
+            truth("", regex_mode(false, false)),
+            "a pattern that can match nothing also matches every line"
+        );
+    }
+
+    #[test]
+    fn a_regex_with_alternation_and_anchors_hits_the_anchored_lines() {
+        assert_eq!(
+            truth("^(fn|let) |time$", regex_mode(false, false)),
+            hits(&[("src/a.rs", &[1, 2]), ("docs/b.txt", &[2])])
+        );
+    }
+
+    #[test]
+    fn a_whole_word_regex_judges_the_match_not_the_bare_literal() {
+        // Only `running` (line 2 of a.rs) matches `run[a-z]*ing`, and it is a
+        // whole word there.
+        assert_eq!(
+            truth("run[a-z]*ing", regex_mode(false, true)),
+            hits(&[("src/a.rs", &[2])])
+        );
+    }
+
+    #[test]
+    fn a_whole_word_literal_agrees_with_the_whole_word_oracle() {
+        let ww = WholeWord::new().unwrap();
+        for word in ["run", "running", "Run", "run_all"] {
+            assert_eq!(
+                truth(word, literal(false, true)),
+                ww.lines(LINE_FIXTURE, word),
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn smart_case_is_insensitive_only_for_a_pattern_without_an_uppercase_character() {
+        for (pattern, ignore_case, smart_case, want) in [
+            ("run", false, false, false),
+            ("run", true, false, true),
+            ("run", false, true, true),
+            ("Run", false, true, false),
+            ("run_9", false, true, true),
+            ("r\u{e9}", false, true, true),
+            ("r\u{c9}", false, true, false),
+            ("", false, true, true),
+            // `-i` wins over `-S`.
+            ("Run", true, true, true),
+        ] {
+            assert_eq!(
+                is_case_insensitive(pattern, ignore_case, smart_case),
+                want,
+                "{pattern:?} i={ignore_case} S={smart_case}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_literal_and_a_broken_regex_are_refused() {
+        assert!(LineQuery::new("", literal(false, false)).is_err());
+        assert!(LineQuery::new("", literal(true, true)).is_err());
+        let err = LineQuery::new("(", regex_mode(false, false)).unwrap_err();
+        assert!(err.to_string().contains("\"(\""), "{err}");
+    }
+
+    #[test]
+    fn a_whole_word_empty_regex_needs_a_non_word_character_on_both_sides() {
+        let q = lq("", regex_mode(false, true));
+        for line in ["", " ", "a  b", "-"] {
+            assert!(q.matches_line(line), "{line:?}");
+        }
+        // Every gap of these touches a word character; the gap at the end of
+        // the line is tried too.
+        for line in ["abc", "a b", "a-b"] {
+            assert!(!q.matches_line(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_overlapping_match_can_be_the_whole_word() {
+        // `a-a` at 1 has `x` before it; the overlapping `a-a` at 3 does not.
+        for mode in [
+            literal(false, true),
+            literal(true, true),
+            regex_mode(false, true),
+        ] {
+            assert!(lq("a-a", mode).matches_line("xa-a-a"), "{mode:?}");
+            assert!(!lq("a-a", mode).matches_line("xa-a-ax"), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_regex_anchor_stays_at_the_line_start_after_a_rejected_match() {
+        // `^.` matches `-` at 0, which has a word character after it. The
+        // search then resumes at 1, where `^` cannot match. (Run on the slice
+        // `a-` it would match `a`, a whole word between `-` and `-`.)
+        assert!(!lq("^.", regex_mode(false, true)).matches_line("-a-"));
+    }
+
+    #[test]
+    fn line_numbers_count_newlines_and_keep_carriage_returns() {
+        // Line 1 of b.txt is `x_run y\r`: `\r` is not a word character, so
+        // `y` is a whole word there.
+        assert_eq!(
+            truth("y", literal(false, true)),
+            hits(&[("docs/b.txt", &[1])])
+        );
+    }
+
+    // --- the rival simulation ----------------------------------------------------
+
+    #[test]
+    fn simulated_rg_word_gives_the_frozen_bytes_of_the_fixture() {
+        // Files come in `rg --sort path` order (blank.txt, docs/, empty.txt,
+        // src/). The four whole-word lines are 22, 23, 23 and 32 bytes
+        // (`é` is 2 bytes).
+        let sim = simulate_rg_word(LINE_FIXTURE, "run").unwrap();
+        assert_eq!(
+            String::from_utf8(sim.output().to_vec()).unwrap(),
+            "docs/b.txt:2:run-time\n\
+             docs/b.txt:4:\u{e9}run run\n\
+             src/a.rs:1:fn run() {}\n\
+             src/a.rs:2:let running = run();\n"
+        );
+        assert_eq!(sim.total_bytes(), 100);
+        let ends: Vec<usize> = sim.lines().iter().map(|l| l.end).collect();
+        assert_eq!(ends, [22, 45, 68, 100]);
+        assert_eq!(sim.bytes_through("docs/b.txt", 4), Some(45));
+        assert_eq!(sim.bytes_through("src/a.rs", 2), Some(100));
+        assert_eq!(
+            sim.bytes_through("src/a.rs", 4),
+            None,
+            "`run_all` is not the word `run`"
+        );
+    }
+
+    #[test]
+    fn simulated_rg_word_keeps_carriage_returns_and_terminates_the_last_line() {
+        let sim = simulate_rg_word([("w.rs", "foo\r\nbar foo")], "foo").unwrap();
+        assert_eq!(sim.output(), b"w.rs:1:foo\r\nw.rs:2:bar foo\n");
+    }
+
+    #[test]
+    fn simulated_rg_word_is_never_larger_than_the_substring_simulation() {
+        let word = simulate_rg_word(LINE_FIXTURE, "run").unwrap();
+        let fixed = simulate_rg_fixed(LINE_FIXTURE, "run");
+        assert!(word.total_bytes() < fixed.total_bytes());
+        assert!(
+            word.lines()
+                .iter()
+                .all(|l| fixed.bytes_through(&l.path, l.line).is_some())
+        );
+    }
+
+    #[test]
+    fn simulated_rg_word_refuses_an_empty_word() {
+        assert!(simulate_rg_word(LINE_FIXTURE, "").is_err());
     }
 }
