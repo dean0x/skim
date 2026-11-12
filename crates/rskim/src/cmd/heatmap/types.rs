@@ -437,7 +437,7 @@ pub(crate) struct InsightCounts {
 }
 
 /// The `--insights` result: the shown findings in rank order, their count,
-/// and the files and modules of the shown findings.
+/// the files and modules of the shown findings, and the run warnings.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct InsightsResult {
     pub(crate) version: u8,
@@ -447,6 +447,9 @@ pub(crate) struct InsightsResult {
     pub(crate) insights: Vec<Insight>,
     pub(crate) top_files: Vec<CompactFileEntry>,
     pub(crate) flagged_modules: Vec<CompactModuleEntry>,
+    /// Every warning of the run: the same list as the default JSON
+    /// `warnings`.
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Condensed file entry for [`InsightsResult`].

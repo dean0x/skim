@@ -386,7 +386,8 @@ JSON (version 2):
     at most one line for each kind of warning. excluded_patterns[] is the
     fixed pattern list: the default excludes and the --exclude values.
     --insights --json gives insights[],
-    top_files[] and flagged_modules[] for the shown findings only.
+    top_files[] and flagged_modules[] for the shown findings only, and the
+    same warnings[] as --json.
 
 WINDOW PRESETS:
     sprint     14 days

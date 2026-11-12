@@ -3,7 +3,8 @@
 //! The default text view is plain ASCII with no color: one header line, at
 //! most two warning lines, then for each section one heading line and one
 //! line per row, with no blank line. The insights text has the same header
-//! line, then one line per finding. Both JSON shapes are compact (one line).
+//! line and warning lines, then one line per finding. Both JSON shapes are
+//! compact (one line).
 //! The renderers take the rows from the ranked view (`view.rs`) and the
 //! ranked insights, already sorted, gated and capped, so this module sorts,
 //! filters and caps nothing.
@@ -314,11 +315,13 @@ fn more_items(n: usize, one: &str, many: &str) -> String {
 // Insights rendering
 // ============================================================================
 
-/// Render `--insights` text: the header line, one line per shown finding in
-/// rank order, and a "more" line when the cap hides findings.
+/// Render `--insights` text: the header line, the warning lines, one line
+/// per shown finding in rank order, and a "more" line when the cap hides
+/// findings.
 pub(crate) fn render_insights_text(result: &HeatmapResult, insights: &InsightsResult) -> String {
     let mut out = String::new();
     push_line(&mut out, &header_line("Insights", result));
+    push_warnings(&mut out, &insights.warnings);
     if insights.insights.is_empty() {
         push_line(&mut out, "  (no notable findings)");
     }
@@ -738,6 +741,7 @@ mod tests {
                 encapsulation_pct: 30.0,
                 cross_boundary: 3,
             }],
+            warnings: vec![],
         }
     }
 
@@ -765,6 +769,51 @@ mod tests {
                 "  WARNING  b.rs: moderate instability (score 55/100, 6 commits)",
                 "  3 more (raise --top)",
             ]
+        );
+    }
+
+    #[test]
+    fn test_insights_text_shows_the_run_warnings_after_the_header() {
+        let result = make_result();
+        let mut insights = insights_of(vec![], 0);
+        insights.warnings = vec!["first".to_string(), "second".to_string()];
+        let text = render_insights_text(&result, &insights);
+        assert_eq!(
+            text.lines().skip(1).collect::<Vec<_>>(),
+            [
+                "warning: first",
+                "warning: second",
+                "  (no notable findings)"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insights_text_counts_the_warnings_past_the_text_cap() {
+        let result = make_result();
+        let mut insights = insights_of(vec![], 0);
+        insights.warnings = (1..=4).map(|i| format!("warning number {i}")).collect();
+        let text = render_insights_text(&result, &insights);
+        assert_eq!(
+            text.lines().skip(1).take(2).collect::<Vec<_>>(),
+            ["warning: warning number 1", "3 more warnings (--json)"]
+        );
+    }
+
+    #[test]
+    fn test_insights_json_carries_every_run_warning() {
+        let mut insights = insights_of(vec![], 0);
+        insights.warnings = (1..=4).map(|i| format!("warning number {i}")).collect();
+        let json = render_insights_json(&insights).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed["warnings"],
+            serde_json::json!([
+                "warning number 1",
+                "warning number 2",
+                "warning number 3",
+                "warning number 4"
+            ])
         );
     }
 

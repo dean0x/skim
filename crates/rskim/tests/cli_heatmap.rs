@@ -1316,6 +1316,26 @@ fn test_heatmap_large_commit_warning_in_text_and_json() {
 }
 
 #[test]
+fn test_insights_text_and_json_carry_the_run_warnings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+    let expected = "coupling: 1 commit with more than 50 files not paired";
+
+    let json = heatmap_json_with(dir.path(), &["--insights"]);
+    assert_eq!(json["warnings"], serde_json::json!([expected]), "{json}");
+
+    let text = heatmap_stdout(dir.path(), &["--insights"]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("Insights: "), "{text}");
+    assert_eq!(lines[1], format!("warning: {expected}"), "{text}");
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("warning: ")).count(),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
 fn test_heatmap_proximity_counts_feat_then_later_fix() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ts = recent_ts();

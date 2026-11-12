@@ -263,7 +263,7 @@ By default the analysis leaves out lock files, build and dist output, minified b
 
 #### Insights Mode
 
-`--insights` emits the CRITICAL/WARNING findings, one per line, ranked by severity, then score, then support, then path. Each finding kind has the support minimum of its section (see Noise Rules), so no CRITICAL finding comes from too few commits. The view shows 20 findings, then one `N more (raise --top)` line.
+`--insights` emits the CRITICAL/WARNING findings, one per line, ranked by severity, then score, then support, then path. Each finding kind has the support minimum of its section (see Noise Rules), so no CRITICAL finding comes from too few commits. The header line and up to two warning lines come first, as in the default view. The view shows 20 findings, then one `N more (raise --top)` line.
 
 ```bash
 skim heatmap --insights                  # Top 20 findings
@@ -279,7 +279,7 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 - `counts.<section>.{total,shown}` gives the full and the shown count of each section (`hotspots`, `coupling`, `fix_risk`, `modules`, `bus_factor`).
 - `files[]` keeps its per-file keys; no support minimum applies to it.
 - With file arguments, `cards[]` holds the cards (`path`, `in_window`, `commits`, `counts`, `owners`, `partners`, `fix_commits`) and `counts.cards` their counts.
-- `--insights --json` gives `insights[]`, `top_files[]` and `flagged_modules[]` for the shown findings only, with `counts.insights`.
+- `--insights --json` gives `insights[]`, `top_files[]` and `flagged_modules[]` for the shown findings only, with `counts.insights`. Its `warnings[]` is the same list as in `--json`.
 - `repository` is still the absolute path; the text header gives only the repository name.
 
 #### Options

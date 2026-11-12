@@ -238,7 +238,8 @@ fn insight_order(x: &Insight, y: &Insight) -> Ordering {
 }
 
 /// The `--insights` result: the first `cap` findings of `ranked` (already in
-/// rank order), their count, and the files and modules of those findings.
+/// rank order), their count, the files and modules of those findings, and
+/// every warning of the run.
 pub(crate) fn build_insights_result(
     result: &HeatmapResult,
     mut ranked: Vec<Insight>,
@@ -259,6 +260,7 @@ pub(crate) fn build_insights_result(
         top_files: build_compact_files(result, &ranked),
         flagged_modules: build_flagged_modules(result, &ranked),
         insights: ranked,
+        warnings: result.warnings.clone(),
     }
 }
 
@@ -894,6 +896,14 @@ mod tests {
         }));
         result.modules.push(make_module("m", 50.0));
         result
+    }
+
+    #[test]
+    fn test_build_insights_result_keeps_every_run_warning() {
+        let mut result = four_findings();
+        result.warnings = vec!["first".into(), "second".into(), "third".into()];
+        let ir = build_insights_result(&result, compute_insights(&result), 1);
+        assert_eq!(ir.warnings, ["first", "second", "third"]);
     }
 
     #[test]

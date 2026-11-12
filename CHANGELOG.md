@@ -52,7 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one line that counts them and names the first 3. `excluded_patterns[]` is the fixed
   pattern list (the default excludes and the `--exclude` values).
   `files[]` keeps its per-file keys. `--insights --json` gives the top 20 findings, and
-  `top_files` and `flagged_modules` hold only the shown findings. With file arguments,
+  `top_files` and `flagged_modules` hold only the shown findings. `--insights --json` has
+  the same `warnings[]` as `--json`, and the `--insights` text shows the same warning lines
+  as the default view. With file arguments,
   `cards[]` holds the cards. Readers of version 1 must update; `--top N` or
   `--detail <section>` gives more rows.
 - **`skim heatmap` shows fewer signals, each with enough support** (#589). Fix risk and bus
