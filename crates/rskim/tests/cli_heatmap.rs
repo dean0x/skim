@@ -1128,3 +1128,169 @@ fn test_insights_help_text() {
         .success()
         .stdout(predicate::str::contains("--insights"));
 }
+
+// ============================================================================
+// Noise and metrics: pair support, the coupling file cap, fix proximity
+// ============================================================================
+
+/// Run `skim heatmap --json` in `dir` and parse stdout.
+fn heatmap_json(dir: &Path) -> serde_json::Value {
+    let output = common::skim()
+        .args(["heatmap", "--json"])
+        .current_dir(dir)
+        .output()
+        .expect("spawn skim heatmap --json");
+    assert!(
+        output.status.success(),
+        "skim heatmap --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("valid heatmap JSON")
+}
+
+/// The `files[]` entry of `path` in heatmap JSON.
+fn file_entry<'a>(json: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
+    json["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .find(|f| f["path"] == path)
+        .unwrap_or_else(|| panic!("{path} missing from files[]"))
+}
+
+#[test]
+fn test_heatmap_coupling_needs_three_shared_commits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ts = recent_ts();
+    git_init(dir.path());
+    // src/a.rs and src/b.rs share 2 commits; src/c.rs and src/d.rs share 3.
+    for i in 0..2u64 {
+        git_commit_files(
+            dir.path(),
+            &[
+                ("src/a.rs", &format!("// a{i}")),
+                ("src/b.rs", &format!("// b{i}")),
+            ],
+            &format!("feat: ab {i}"),
+            ts + i * 100,
+        );
+    }
+    for i in 0..3u64 {
+        git_commit_files(
+            dir.path(),
+            &[
+                ("src/c.rs", &format!("// c{i}")),
+                ("src/d.rs", &format!("// d{i}")),
+            ],
+            &format!("feat: cd {i}"),
+            ts + 1000 + i * 100,
+        );
+    }
+
+    let json = heatmap_json(dir.path());
+
+    let edges: Vec<(String, String, u64)> = json["coupling_graph"]
+        .as_array()
+        .expect("coupling_graph array")
+        .iter()
+        .map(|e| {
+            (
+                e["a"].as_str().unwrap().to_string(),
+                e["b"].as_str().unwrap().to_string(),
+                e["support"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        edges,
+        vec![("src/c.rs".to_string(), "src/d.rs".to_string(), 3)],
+        "only the pair with 3 shared commits is coupled"
+    );
+    assert_eq!(
+        file_entry(&json, "src/a.rs")["blast_radius"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "a pair with 2 shared commits has no blast radius"
+    );
+}
+
+/// A repo with one commit of 60 files and one later single-file commit.
+fn create_repo_with_60_file_commit(dir: &Path) {
+    git_init(dir);
+    let ts = recent_ts();
+    let names: Vec<String> = (0..60).map(|i| format!("bulk/f{i:02}.rs")).collect();
+    let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "// bulk")).collect();
+    git_commit_files(dir, &files, "chore: bulk reformat", ts);
+    git_commit(dir, "src/main.rs", "fn main() {}", "feat: main", ts + 100);
+}
+
+#[test]
+fn test_heatmap_large_commit_warning_in_text_and_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+    let expected = "coupling: 1 commit with more than 50 files not paired";
+
+    let json = heatmap_json(dir.path());
+    let json_hits: Vec<&str> = json["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|w| w.as_str())
+        .filter(|w| w.contains("files not paired"))
+        .collect();
+    assert_eq!(json_hits, vec![expected]);
+    assert_eq!(
+        json["coupling_graph"].as_array().unwrap().len(),
+        0,
+        "the 60-file commit makes no pairs"
+    );
+
+    let output = common::skim()
+        .args(["heatmap"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn skim heatmap");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let text_hits: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("files not paired"))
+        .collect();
+    assert_eq!(text_hits.len(), 1, "one warning line, got: {stdout}");
+    assert!(
+        text_hits[0].ends_with(expected),
+        "warning line: {}",
+        text_hits[0]
+    );
+}
+
+#[test]
+fn test_heatmap_proximity_counts_feat_then_later_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ts = recent_ts();
+    git_init(dir.path());
+    git_commit(dir.path(), "src/a.rs", "// v1", "feat: add a", ts);
+    git_commit(dir.path(), "src/a.rs", "// v2", "fix: repair a", ts + 100);
+
+    let json = heatmap_json(dir.path());
+    let fix_risk = &file_entry(&json, "src/a.rs")["fix_risk"];
+    // 2 commits; the feat is followed by a later fix: 1 / 2 = 50%.
+    assert_eq!(fix_risk["proximity_pct"].as_f64(), Some(50.0));
+    assert_eq!(fix_risk["fix_commits"].as_u64(), Some(1));
+}
+
+#[test]
+fn test_heatmap_proximity_ignores_fix_then_later_feat() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ts = recent_ts();
+    git_init(dir.path());
+    git_commit(dir.path(), "src/a.rs", "// v1", "fix: repair a", ts);
+    git_commit(dir.path(), "src/a.rs", "// v2", "feat: extend a", ts + 100);
+
+    let json = heatmap_json(dir.path());
+    let fix_risk = &file_entry(&json, "src/a.rs")["fix_risk"];
+    assert_eq!(fix_risk["proximity_pct"].as_f64(), Some(0.0));
+    assert_eq!(fix_risk["fix_commits"].as_u64(), Some(1));
+}
