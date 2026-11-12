@@ -111,6 +111,9 @@ missing or an extra site cannot move the target. Each corpus holds 3+ `[[refs]]`
   recorded shape.
 - **Integrity** (`golden.rs` `check_refs`, `check_clash`, `check_stakes`): `sites` equal the whole-word line set at the
   pin; a clash has 2+ `defs` and `split = "none"`; a stakes exit agrees with the oracle's hit count.
+- **Stakes flags** (`runner.rs` `observe`): the oracle reads `-i`, `-S`, `-w`, `-F` and `-E`, but the runner passes no
+  stakes flag to skim, so a `[[stakes]]` entry with `flags` is a harness error (exit 2). Pass the flags through before
+  you remove that refusal.
 - `SEARCH_PATHS` does not change for these tables: `rskim-bench` and `rskim-oracle` are already in it.
 
 Pagination and prefix checks compare skim with **its own full list** (`--limit 1_000_000`), so oracle-less entries

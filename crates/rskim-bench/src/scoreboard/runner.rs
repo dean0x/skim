@@ -513,7 +513,9 @@ impl SkimRunner {
     /// # Errors
     ///
     /// An `[[ast]]` entry (its rows come from its pattern's single
-    /// [`SkimRunner::ast_list`] call); any call error; an oracle-less
+    /// [`SkimRunner::ast_list`] call); a `[[stakes]]` entry with `flags` (the
+    /// runner passes none of them to skim, so skim would answer another
+    /// query than the one the regex oracle judges); any call error; an oracle-less
     /// (`--ast` / `--blast-radius`) pagination entry whose full list exceeds
     /// `min(limits) × (MAX_PAGES − 1)` — golden integrity cannot bound those
     /// in advance; or an entry that ranks by temporal data whose pages
@@ -525,6 +527,15 @@ impl SkimRunner {
              (SkimRunner::ast_list), not per entry",
             q.id
         );
+        if let Some(stakes) = q.stakes_oracle() {
+            anyhow::ensure!(
+                stakes.entry.flags.is_empty(),
+                "{}: the runner does not pass the [[stakes]] flags {:?} to skim, so skim would \
+                 answer another query than the one the regex oracle judges; use flags = []",
+                q.id,
+                stakes.entry.flags
+            );
+        }
         let mut timings = Vec::new();
         let query = q.query.as_deref();
         let (full, t) = self.page(root, q.arm, query, &q.flags, FULL_LIST_LIMIT, 0)?;
@@ -864,6 +875,24 @@ mod tests {
             .observe(Path::new("/c"), &plan[0])
             .expect_err("an [[ast]] entry's rows come from its pattern's call");
         assert!(format!("{err:#}").contains("ast_list"), "{err:#}");
+    }
+
+    #[test]
+    fn a_stakes_entry_with_flags_is_refused_because_the_runner_cannot_pass_them() {
+        let golden = crate::scoreboard::golden::parse_golden(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
+             [[stakes]]\nid = \"skim-Q09\"\nquery = \"Launch\"\nflags = [\"-i\"]\nexpect = \"lines\"\n",
+        )
+        .unwrap();
+        let plan = crate::scoreboard::metrics::plan(&golden).unwrap();
+        // The binary does not exist: the refusal comes before any call.
+        let runner = SkimRunner::new("/nonexistent/skim", SkimSandbox::new("/sb"));
+        let err = runner
+            .observe(Path::new("/c"), &plan[0])
+            .expect_err("skim would run without the -i the oracle reads");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("skim-Q09"), "{msg}");
+        assert!(msg.contains("\"-i\""), "{msg}");
     }
 
     // --- the exit status of the process -----------------------------------------

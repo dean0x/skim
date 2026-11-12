@@ -488,7 +488,8 @@ fn count_reasons<'a>(skips: impl Iterator<Item = &'a SkippedFile>) -> BTreeMap<S
 /// - `too_large`: more than [`MAX_FILE_BYTES`] bytes;
 /// - `unreadable`: an I/O error, or a handle that is not a regular file;
 /// - `vanished`: tracked, but absent from the work tree;
-/// - `outside_root`: the real path leaves the canonical root;
+/// - `outside_root`: the real path leaves the canonical root, or git printed
+///   a path that is not a plain relative path;
 /// - `symlink`: a tracked entry of mode `120000`, or a walked entry whose
 ///   file type is a symlink. It is counted and never read.
 ///
@@ -618,15 +619,7 @@ pub fn text_universe(root: &Path, git: &GitIsolation) -> anyhow::Result<TextUniv
             Ok(p) => p,
             Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
         };
-        if !is_safe_relative(&path) {
-            continue;
-        }
-        let outcome = if is_symlink_entry {
-            TextOutcome::LeftOut("symlink")
-        } else {
-            read_text(&abs, &canonical_root)
-        };
-        match outcome {
+        match candidate_outcome(&path, is_symlink_entry, &abs, &canonical_root) {
             TextOutcome::Admitted(text) => {
                 anyhow::ensure!(
                     universe.files.insert(path.clone(), text).is_none(),
@@ -639,6 +632,25 @@ pub fn text_universe(root: &Path, git: &GitIsolation) -> anyhow::Result<TextUniv
         }
     }
     Ok(universe)
+}
+
+/// What one candidate gives. A path that is not a plain relative path
+/// (absolute, or with a `..` component) leaves the root: it is counted
+/// `outside_root` and never read, so the accounting stays complete. A tracked
+/// symlink is counted `symlink` and never read. Any other path is read.
+fn candidate_outcome(
+    path: &str,
+    is_symlink_entry: bool,
+    abs: &Path,
+    canonical_root: &Path,
+) -> TextOutcome {
+    if !is_safe_relative(path) {
+        return TextOutcome::LeftOut("outside_root");
+    }
+    if is_symlink_entry {
+        return TextOutcome::LeftOut("symlink");
+    }
+    read_text(abs, canonical_root)
 }
 
 /// `root` joined with the raw path bytes git printed, so a file whose name is
@@ -1295,6 +1307,30 @@ mod tests {
         assert!(t.contains("tracked.txt") && t.contains("new.txt"));
         assert!(t.contains(".gitignore"), "a tracked hidden file is listed");
         assert!(!t.contains("ignored.txt") && !t.contains(".hidden/secret.txt"));
+    }
+
+    #[test]
+    fn a_path_that_leaves_the_root_is_counted_outside_root_and_never_read() {
+        let repo = FixtureRepo::new();
+        repo.write("inside.txt", "inside\n");
+        let root = std::fs::canonicalize(repo.root()).unwrap();
+        // Both files exist and are readable, so a read would admit them.
+        for (path, abs) in [
+            ("../escape.txt", root.join("inside.txt")),
+            ("/etc/passwd", root.join("inside.txt")),
+        ] {
+            for symlink_entry in [false, true] {
+                assert_eq!(
+                    candidate_outcome(path, symlink_entry, &abs, &root),
+                    TextOutcome::LeftOut("outside_root"),
+                    "{path} (symlink entry: {symlink_entry})"
+                );
+            }
+        }
+        assert_eq!(
+            candidate_outcome("inside.txt", false, &root.join("inside.txt"), &root),
+            TextOutcome::Admitted("inside\n".to_string())
+        );
     }
 
     #[test]

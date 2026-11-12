@@ -225,7 +225,9 @@ pin), 2 or more concept entries with `first`, and 2 `[[stakes]]` entries (one ze
 | `[[concept]]` `first` | An optional list of paths: the files that hold the answer to a plain-word question. A concept entry without `first` still loads. | Each path is a file of the indexed universe at the pin. |
 
 PR 1 freezes only the `[[stakes]]` entries that need no new flag: the no-match exit code. The `lines`, `files` and
-`counts` kinds are checked on fixtures, and get golden entries when the flags exist.
+`counts` kinds are checked on fixtures, and get golden entries when the flags exist. The runner does not pass
+`flags` to skim yet, so a `[[stakes]]` entry with a flag stops the run (exit 2) instead of a comparison of two
+different queries.
 
 | Check | Class | Runs on | Passes iff / measures |
 |---|---|---|---|
