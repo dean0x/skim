@@ -190,15 +190,12 @@ impl PermissionsProtocol for CodexPermissions {
     }
 
     fn is_current(&self, config_dir: &Path, entries: &[String]) -> bool {
-        let sidecar_path = config_dir.join(SIDECAR_FILENAME);
         let config_path = config_dir.join(CONFIG_FILENAME);
 
-        let sidecar = match load_sidecar(&sidecar_path) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
-        if sidecar.entries != entries {
+        // Recorded entries that a prune removes do not count: the prune runs
+        // first and regenerates the file from the rest.
+        let record = retired_seed_entries(config_dir, entries);
+        if record.kept != entries {
             return false;
         }
 
@@ -208,7 +205,7 @@ impl PermissionsProtocol for CodexPermissions {
 
         // Ok(None) means oversized → treat as not current (return false).
         hash_if_bounded(&config_path)
-            .map(|opt| opt.map(|h| h == sidecar.config_hash).unwrap_or(false))
+            .map(|opt| opt.map(|h| h == record.config_hash).unwrap_or(false))
             .unwrap_or(false)
     }
 }
@@ -518,6 +515,21 @@ mod tests {
             !contents.contains("\"skim rg\"") && !contents.contains("\"skim tree\""),
             "rules file must not allow 'skim rg' or 'skim tree', got:\n{contents}"
         );
+    }
+
+    /// The rules file is judged as if the prune had run: a rule that a prune
+    /// removes does not make it stale. A dry-run only plans the prune and the
+    /// real run applies it first, so both runs give the same result.
+    #[test]
+    fn test_is_current_judges_rules_as_if_pruned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = seeded_entries(p.as_ref());
+        let mut older = entries.clone();
+        older.push("rg".to_string());
+        p.seed(dir.path(), PermissionsTier::Seed, &older).unwrap();
+
+        assert!(p.is_current(dir.path(), &entries));
     }
 
     /// A prune regenerates the rules file from the recorded entries that

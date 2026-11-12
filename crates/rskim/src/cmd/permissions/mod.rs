@@ -34,6 +34,9 @@
 //! file, because one sidecar serves all projects. The skim-owned writers
 //! (Gemini, Codex) regenerate their file from the recorded entries that skim
 //! still seeds, but only when the file is still exactly what skim wrote.
+//! [`PermissionsProtocol::is_current`] judges the config as if that removal
+//! had run, so a `--dry-run`, which only plans it, gives the same result as
+//! the real run.
 //!
 //! ## Registry invariant
 //!
@@ -199,6 +202,11 @@ pub(crate) trait PermissionsProtocol {
     ) -> anyhow::Result<Vec<String>>;
 
     /// Check whether all `entries` are already present in the agent config.
+    ///
+    /// The config is judged as if [`prune_retired`](PermissionsProtocol::prune_retired)
+    /// had run: an entry that the prune removes does not make the config
+    /// stale. Every `skim init` prunes before it calls this, and `--dry-run`
+    /// only plans the prune, so both runs give the same result.
     ///
     /// Returns `false` on any I/O or parse error (non-fatal).
     ///

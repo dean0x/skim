@@ -8,7 +8,7 @@ use super::flags::{
 };
 use super::helpers::{
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
-    confirm_proceed, load_or_create_settings, resolve_real_settings_path,
+    confirm_proceed, display_entries, load_or_create_settings, resolve_real_settings_path,
 };
 use super::state::{
     DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
@@ -235,15 +235,19 @@ fn permissions_blocks_fast_path(
 /// smaller. It runs before the fast path and the consent prompt, so neither
 /// can skip it. On `--dry-run` it writes nothing and prints the planned
 /// removal instead.
+///
+/// A failure does not stop `skim init`: it prints one line on stderr that
+/// names the agent and the file, and the install continues with nothing
+/// removed. A dry-run prints the same line when the plan fails.
 fn prune_retired_permissions(
     agent: AgentKind,
     perm_dir: &std::path::Path,
     dry_run: bool,
-) -> anyhow::Result<Vec<String>> {
+) -> Vec<String> {
     use crate::cmd::permissions::PruneMode;
 
     let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let current = crate::cmd::permissions::seeded_entries(protocol.as_ref());
     let mode = if dry_run {
@@ -251,14 +255,26 @@ fn prune_retired_permissions(
     } else {
         PruneMode::Apply
     };
-    let removed = protocol.prune_retired(perm_dir, &current, mode)?;
+    let removed = match protocol.prune_retired(perm_dir, &current, mode) {
+        Ok(removed) => removed,
+        Err(e) => {
+            eprintln!(
+                "  Note: {}: could not remove the entries that skim no longer seeds from {}, \
+                 so nothing was removed: {}",
+                protocol.agent_label(),
+                perm_dir.join(protocol.config_filename()).display(),
+                e.to_string().lines().collect::<Vec<_>>().join(" ")
+            );
+            return Vec::new();
+        }
+    };
     if removed.is_empty() {
-        return Ok(removed);
+        return removed;
     }
     if dry_run {
         println!(
             "  [dry-run] Would remove entries that skim no longer seeds: {}",
-            removed.join(", ")
+            display_entries(&removed)
         );
     } else {
         println!(
@@ -266,10 +282,10 @@ fn prune_retired_permissions(
             check_mark(true),
             removed.len(),
             if removed.len() == 1 { "y" } else { "ies" },
-            removed.join(", ")
+            display_entries(&removed)
         );
     }
-    Ok(removed)
+    removed
 }
 
 /// Resolve whether consent has been obtained to seed permissions.
@@ -580,9 +596,8 @@ fn run_install_single(
     }
 
     // Before the fast path, so that a current install still loses the entries
-    // that skim no longer seeds, and before `permissions_blocks_fast_path`,
-    // so that its staleness check sees the result.
-    let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run)?;
+    // that skim no longer seeds.
+    let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run);
 
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
@@ -1660,7 +1675,7 @@ fn print_dry_run_permissions(
         config_file.display()
     );
     for entry in &entries {
-        println!("    {entry}");
+        println!("    {}", entry.escape_debug());
     }
 
     Ok(())

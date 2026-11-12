@@ -29,6 +29,7 @@ use std::path::Path;
 use super::{hash_if_bounded, remove_entries, retired_seed_entries, write_seed_sidecar};
 use crate::cmd::init::{
     MAX_SETTINGS_SIZE, atomic_write_settings, backup_settings_file, load_or_create_settings,
+    resolve_real_settings_path,
 };
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
@@ -187,8 +188,12 @@ impl PermissionsProtocol for ClaudePermissions {
             return Ok(Vec::new());
         }
 
+        // A symlinked settings.json is written through to its target, as the
+        // hook install does; the plan resolves it too, so that a path the real
+        // run cannot resolve shows no planned removal.
+        let real_path = resolve_real_settings_path(&config_path)?;
         // load_or_create_settings enforces MAX_SETTINGS_SIZE.
-        let mut settings = load_or_create_settings(&config_path)?;
+        let mut settings = load_or_create_settings(&real_path)?;
         // An absent or wrongly typed allow list holds nothing to remove.
         let removed = get_allow_array_mut(&mut settings)
             .map(|allow| remove_entries(allow, &record.retired))
@@ -198,12 +203,12 @@ impl PermissionsProtocol for ClaudePermissions {
         }
 
         if !removed.is_empty() {
-            backup_settings_file(config_dir, &config_path)?;
-            atomic_write_settings(&settings, &config_path)?;
+            backup_settings_file(config_dir, &real_path)?;
+            atomic_write_settings(&settings, &real_path)?;
         }
         // Also when nothing was removed: a stale record of a retired entry
         // would remove a later entry that the user adds.
-        write_seed_sidecar(config_dir, &config_path, &record.kept)?;
+        write_seed_sidecar(config_dir, &real_path, &record.kept)?;
         Ok(removed)
     }
 
@@ -229,11 +234,8 @@ impl PermissionsProtocol for ClaudePermissions {
 
         let existing: HashSet<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
 
+        // An entry that a prune removes does not count: the prune runs first.
         entries.iter().all(|e| existing.contains(e.as_str()))
-            && !retired_seed_entries(config_dir, entries)
-                .retired
-                .iter()
-                .any(|r| existing.contains(r.as_str()))
     }
 }
 
@@ -780,11 +782,6 @@ mod tests {
         let p = protocol();
         let entries = vec!["Bash(skim df:*)".to_string()];
 
-        assert!(
-            !p.is_current(dir.path(), &entries),
-            "a retired seeded entry still in the allow list must make the config stale"
-        );
-
         let settings_before = std::fs::read(dir.path().join("settings.json")).unwrap();
         let planned = p
             .prune_retired(dir.path(), &entries, PruneMode::Plan)
@@ -816,6 +813,48 @@ mod tests {
             p.is_current(dir.path(), &entries),
             "config must be current after the prune"
         );
+    }
+
+    /// The config is judged as if the prune had run: an entry that a prune
+    /// removes does not make it stale. A dry-run only plans the prune and the
+    /// real run applies it first, so both runs give the same result.
+    #[test]
+    fn test_is_current_judges_config_as_if_pruned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_prior_seed(
+            dir.path(),
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+        );
+        let entries = vec!["Bash(skim df:*)".to_string()];
+
+        assert!(protocol().is_current(dir.path(), &entries));
+    }
+
+    /// A prune writes through a symlinked settings.json the same way the hook
+    /// install does: the link stays a link and its target loses the entry.
+    #[cfg(unix)]
+    #[test]
+    fn test_prune_writes_through_symlinked_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_prior_seed(
+            dir.path(),
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+        );
+        let link = dir.path().join("settings.json");
+        let target = dir.path().join("dotfiles-settings.json");
+        std::fs::rename(&link, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let entries = vec!["Bash(skim df:*)".to_string()];
+
+        let removed = protocol()
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+
+        assert_eq!(removed, vec!["Bash(skim rg:*)".to_string()]);
+        assert!(link.is_symlink(), "settings.json must stay a link");
+        assert_eq!(allow_entries(dir.path()), vec!["Bash(skim df:*)"]);
     }
 
     /// The sidecar never gains an entry in a prune: an entry in the current

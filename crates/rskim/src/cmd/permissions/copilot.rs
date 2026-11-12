@@ -38,7 +38,10 @@
 use std::path::Path;
 
 use super::{remove_entries, retired_seed_entries, write_seed_sidecar};
-use crate::cmd::init::{MAX_SETTINGS_SIZE, atomic_write_settings, load_or_create_settings};
+use crate::cmd::init::{
+    MAX_SETTINGS_SIZE, atomic_write_settings, backup_config_file, load_or_create_settings,
+    resolve_real_settings_path,
+};
 use crate::cmd::permissions::sidecar::{SIDECAR_FILENAME, load_sidecar};
 use crate::cmd::permissions::{
     PermissionsProtocol, PermissionsTier, PruneMode, RemoveOutcome, SeedOutcome,
@@ -46,6 +49,9 @@ use crate::cmd::permissions::{
 
 /// Config filename (relative to copilot_home).
 const CONFIG_FILENAME: &str = "permissions-config.json";
+
+/// Backup of the config file, written next to it before a prune changes it.
+const BACKUP_FILENAME: &str = "permissions-config.json.bak";
 
 pub(super) struct CopilotPermissions;
 
@@ -223,8 +229,13 @@ impl PermissionsProtocol for CopilotPermissions {
             return Ok(Vec::new());
         }
 
+        // The file is shared by every project, so it is written the way the
+        // Claude Code writer writes settings.json: through a symlink to its
+        // target, after a backup. The plan resolves the path too, so that a
+        // path the real run cannot resolve shows no planned removal.
+        let real_path = resolve_real_settings_path(&config_path)?;
         // load_or_create_settings (inside) enforces MAX_SETTINGS_SIZE.
-        let mut map = load_permissions_map(&config_path)?;
+        let mut map = load_permissions_map(&real_path)?;
         let mut removed: Vec<String> = Vec::new();
         for allow in map
             .values_mut()
@@ -240,11 +251,12 @@ impl PermissionsProtocol for CopilotPermissions {
         }
 
         if !removed.is_empty() {
-            atomic_write_settings(&serde_json::Value::Object(map), &config_path)?;
+            backup_config_file(&real_path, &config_dir.join(BACKUP_FILENAME))?;
+            atomic_write_settings(&serde_json::Value::Object(map), &real_path)?;
         }
         // Also when nothing was removed: a stale record of a retired entry
         // would remove a later entry that the user adds.
-        write_seed_sidecar(config_dir, &config_path, &record.kept)?;
+        write_seed_sidecar(config_dir, &real_path, &record.kept)?;
         Ok(removed)
     }
 
@@ -277,18 +289,8 @@ impl PermissionsProtocol for CopilotPermissions {
         let existing: std::collections::HashSet<&str> =
             allow.iter().filter_map(|v| v.as_str()).collect();
 
-        // A retired entry in any project makes the file stale (a prune
-        // removes it from every project).
-        let retired = retired_seed_entries(config_dir, entries).retired;
-        let retired_present = map
-            .values()
-            .filter_map(|project| project.get("allow"))
-            .filter_map(serde_json::Value::as_array)
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .any(|s| retired.iter().any(|r| r == s));
-
-        entries.iter().all(|e| existing.contains(e.as_str())) && !retired_present
+        // An entry that a prune removes does not count: the prune runs first.
+        entries.iter().all(|e| existing.contains(e.as_str()))
     }
 }
 
@@ -530,10 +532,6 @@ mod tests {
         write_sidecar(&dir.path().join(SIDECAR_FILENAME), &sidecar).unwrap();
 
         let entries = vec!["Bash(skim df:*)".to_string()];
-        assert!(
-            !p.is_current(dir.path(), &entries),
-            "a retired seeded entry still in the allow list must make the config stale"
-        );
 
         let config_before = std::fs::read(&config_path).unwrap();
         let planned = p
@@ -587,10 +585,12 @@ mod tests {
         );
     }
 
-    /// A retired entry that remains only in another project still makes the
-    /// file stale, so the next `skim init` offers the re-seed.
+    /// The file is judged as if the prune had run: an entry that a prune
+    /// removes, here from another project, does not make it stale. A dry-run
+    /// only plans the prune and the real run applies it first, so both runs
+    /// give the same result.
     #[test]
-    fn test_is_current_false_for_retired_entry_in_other_project() {
+    fn test_is_current_judges_file_as_if_pruned() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = protocol();
         let project_key = find_git_root_from_cwd()
@@ -612,7 +612,72 @@ mod tests {
         };
         write_sidecar(&dir.path().join(SIDECAR_FILENAME), &sidecar).unwrap();
 
-        assert!(!p.is_current(dir.path(), &["Bash(skim df:*)".to_string()]));
+        assert!(p.is_current(dir.path(), &["Bash(skim df:*)".to_string()]));
+    }
+
+    /// Write `config` to `path` and a seed-tier sidecar in `dir` that records
+    /// `Bash(skim df:*)` and `Bash(skim rg:*)`.
+    fn write_prior_seed(dir: &Path, path: &Path, config: &serde_json::Value) {
+        std::fs::write(path, serde_json::to_string_pretty(config).unwrap()).unwrap();
+        let sidecar = PermissionSidecar {
+            version: 1,
+            tier: "seed".to_string(),
+            entries: vec!["Bash(skim df:*)".to_string(), "Bash(skim rg:*)".to_string()],
+            source_mirrors: std::collections::HashMap::new(),
+            config_hash: hash_if_bounded(path).unwrap().unwrap(),
+        };
+        write_sidecar(&dir.join(SIDECAR_FILENAME), &sidecar).unwrap();
+    }
+
+    /// A prune keeps a copy of the file as it was before the write, the same
+    /// way the Claude Code writer does.
+    #[test]
+    fn test_prune_backs_up_the_file_before_it_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join(CONFIG_FILENAME);
+        let config =
+            serde_json::json!({ "/p": { "allow": ["Bash(skim df:*)", "Bash(skim rg:*)"] } });
+        write_prior_seed(dir.path(), &config_path, &config);
+        let before = std::fs::read(&config_path).unwrap();
+
+        protocol()
+            .prune_retired(
+                dir.path(),
+                &["Bash(skim df:*)".to_string()],
+                PruneMode::Apply,
+            )
+            .unwrap();
+
+        let backup = dir.path().join("permissions-config.json.bak");
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+    }
+
+    /// A prune writes through a symlinked file the same way the Claude Code
+    /// writer does: the link stays a link and its target loses the entry.
+    #[cfg(unix)]
+    #[test]
+    fn test_prune_writes_through_symlinked_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let link = dir.path().join(CONFIG_FILENAME);
+        let target = dir.path().join("dotfiles-permissions.json");
+        let config =
+            serde_json::json!({ "/p": { "allow": ["Bash(skim df:*)", "Bash(skim rg:*)"] } });
+        write_prior_seed(dir.path(), &target, &config);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let removed = protocol()
+            .prune_retired(
+                dir.path(),
+                &["Bash(skim df:*)".to_string()],
+                PruneMode::Apply,
+            )
+            .unwrap();
+
+        assert_eq!(removed, vec!["Bash(skim rg:*)".to_string()]);
+        assert!(link.is_symlink(), "the file must stay a link");
+        let map: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(map["/p"]["allow"], serde_json::json!(["Bash(skim df:*)"]));
     }
 
     // ---- remove_seeded: happy path ----

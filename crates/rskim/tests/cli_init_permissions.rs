@@ -581,6 +581,12 @@ fn write_older_claude_seed(cfg: &std::path::Path, allow: &[&str], recorded: &[&s
         serde_json::to_string_pretty(&settings).unwrap(),
     )
     .unwrap();
+    write_older_seed_sidecar(cfg, recorded);
+}
+
+/// The seed-tier sidecar that an older skim wrote in `dir` after it seeded
+/// `recorded`.
+fn write_older_seed_sidecar(dir: &std::path::Path, recorded: &[&str]) {
     let sidecar = serde_json::json!({
         "version": 1,
         "tier": "seed",
@@ -589,7 +595,7 @@ fn write_older_claude_seed(cfg: &std::path::Path, allow: &[&str], recorded: &[&s
         "config_hash": "written-by-an-older-skim",
     });
     std::fs::write(
-        cfg.join("skim-permissions.json"),
+        dir.join("skim-permissions.json"),
         serde_json::to_string_pretty(&sidecar).unwrap(),
     )
     .unwrap();
@@ -798,6 +804,11 @@ fn test_dry_run_shows_planned_removal_and_writes_nothing() {
         1,
         "the planned removal must be shown on exactly one line, got:\n{stdout}"
     );
+    assert!(
+        !stdout.contains("Would seed"),
+        "once the planned removal is done every entry is in place, so the real run \
+         seeds nothing and the dry-run must not show a seed step, got:\n{stdout}"
+    );
     assert_eq!(
         std::fs::read(cfg.join("settings.json")).unwrap(),
         settings_before,
@@ -808,4 +819,124 @@ fn test_dry_run_shows_planned_removal_and_writes_nothing() {
         sidecar_before,
         "dry-run must not change the sidecar"
     );
+}
+
+/// On an install that is otherwise current, a re-run still removes the
+/// entries that skim no longer seeds and still reports the install as up to
+/// date: the removal runs before the up-to-date check.
+#[test]
+fn test_rerun_on_current_install_removes_entries_and_is_up_to_date() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
+    let init = || {
+        common::skim_sandboxed(home.path())
+            .args(["init", "--agent", "claude", "--no-guidance"])
+            .output()
+            .expect("skim must run")
+    };
+    assert!(init().status.success(), "the first install must exit 0");
+    // An older skim seeded its entries into the installed settings.json.
+    let settings_path = cfg.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings["permissions"] = serde_json::json!({ "allow": OLDER_CLAUDE_SEED });
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    write_older_seed_sidecar(&cfg, OLDER_CLAUDE_SEED);
+
+    let out = init();
+
+    assert!(out.status.success(), "the re-run must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "removed 2 entries that skim no longer seeds: Bash(skim rg:*), Bash(skim tree:*)"
+        ),
+        "stdout must report the removal, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Already up to date. Nothing to do."),
+        "the install must still be reported as up to date, got:\n{stdout}"
+    );
+    let left: Vec<&str> = OLDER_CLAUDE_SEED
+        .iter()
+        .copied()
+        .filter(|e| !e.contains(" rg:") && !e.contains(" tree:"))
+        .collect();
+    assert_eq!(claude_allow(&cfg), left, "only rg and tree must be removed");
+}
+
+/// When the removal of the entries that skim no longer seeds cannot read the
+/// config file, the install still completes. One stderr line names the agent
+/// and the file and says that nothing was removed; the file does not change.
+#[test]
+fn test_install_completes_when_removal_cannot_read_the_config() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "COPILOT_CONFIG_DIR");
+    let project = git_project_dir(&home);
+    let config = cfg.join("permissions-config.json");
+    std::fs::write(&config, b"{ not json").unwrap();
+    write_older_seed_sidecar(&cfg, &["Bash(skim df:*)", "Bash(skim rg:*)"]);
+
+    let out = common::skim_sandboxed(home.path())
+        .args(["init", "--agent", "copilot", "--no-guidance"])
+        .current_dir(&project)
+        .output()
+        .expect("skim must run");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the install must exit 0, stderr:\n{stderr}"
+    );
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("nothing was removed"))
+        .collect();
+    assert_eq!(notices.len(), 1, "one stderr line, got:\n{stderr}");
+    assert!(
+        notices[0].contains("GitHub Copilot CLI") && notices[0].contains("permissions-config.json"),
+        "the line must name the agent and the file, got: {}",
+        notices[0]
+    );
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        b"{ not json",
+        "the file must not change"
+    );
+}
+
+/// An entry with a control character is shown with that character escaped,
+/// on the planned-removal line of a dry-run and on the removal line.
+#[test]
+fn test_removal_lines_show_control_characters_escaped() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
+    let entry = "Bash(skim rg\u{1b}[2J:*)";
+    write_older_claude_seed(
+        &cfg,
+        &["Bash(skim df:*)", entry],
+        &["Bash(skim df:*)", entry],
+    );
+    let listed = |extra: &[&str]| {
+        let out = common::skim_sandboxed(home.path())
+            .args(["init", "--agent", "claude", "--no-guidance"])
+            .args(extra)
+            .output()
+            .expect("skim must run");
+        assert!(out.status.success(), "skim init must exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        stdout
+            .split_once("no longer seeds: ")
+            .and_then(|(_, rest)| rest.lines().next())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no removal line, got:\n{stdout}"))
+    };
+
+    assert_eq!(listed(&["--dry-run"]), r"Bash(skim rg\u{1b}[2J:*)");
+    assert_eq!(listed(&[]), r"Bash(skim rg\u{1b}[2J:*)");
+    assert_eq!(claude_allow(&cfg), vec!["Bash(skim df:*)"]);
 }
