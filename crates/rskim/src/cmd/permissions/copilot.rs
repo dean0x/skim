@@ -40,7 +40,9 @@ use std::path::Path;
 use super::{remove_entries, retired_seed_entries, write_seed_sidecar};
 use crate::cmd::init::{MAX_SETTINGS_SIZE, atomic_write_settings, load_or_create_settings};
 use crate::cmd::permissions::sidecar::{SIDECAR_FILENAME, load_sidecar};
-use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
+use crate::cmd::permissions::{
+    PermissionsProtocol, PermissionsTier, PruneMode, RemoveOutcome, SeedOutcome,
+};
 
 /// Config filename (relative to copilot_home).
 const CONFIG_FILENAME: &str = "permissions-config.json";
@@ -104,23 +106,6 @@ impl PermissionsProtocol for CopilotPermissions {
         // Load the full per-project config map.
         let mut map = load_permissions_map(&config_path)?;
 
-        // Read before the sidecar is rewritten below.
-        let retired = retired_seed_entries(config_dir, entries);
-
-        // One sidecar serves every project in this file, and it is rewritten
-        // below without the retired entries, so remove them from every
-        // project now; no later run would know they were skim's.
-        let mut entries_removed: Vec<String> = Vec::new();
-        for allow in map
-            .values_mut()
-            .filter_map(|project| project.get_mut("allow"))
-            .filter_map(serde_json::Value::as_array_mut)
-        {
-            entries_removed.extend(remove_entries(allow, &retired));
-        }
-        entries_removed.sort();
-        entries_removed.dedup();
-
         // Ensure the project key and allow array exist.
         let project_obj = map
             .entry(project_key.clone())
@@ -142,12 +127,7 @@ impl PermissionsProtocol for CopilotPermissions {
             }
         }
 
-        if entries_added.is_empty() && entries_removed.is_empty() {
-            // The config needs no change. Drop a stale record of a retired
-            // entry, so that a later entry the user adds is not removed.
-            if !retired.is_empty() {
-                write_seed_sidecar(config_dir, &config_path, entries)?;
-            }
+        if entries_added.is_empty() {
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
@@ -160,10 +140,7 @@ impl PermissionsProtocol for CopilotPermissions {
         // seed-set for this agent.
         write_seed_sidecar(config_dir, &config_path, entries)?;
 
-        Ok(SeedOutcome::Added {
-            entries_added,
-            entries_removed,
-        })
+        Ok(SeedOutcome::Added { entries_added })
     }
 
     fn remove_seeded(&self, config_dir: &Path) -> anyhow::Result<RemoveOutcome> {
@@ -231,6 +208,46 @@ impl PermissionsProtocol for CopilotPermissions {
         Ok(RemoveOutcome::Removed { entries_removed })
     }
 
+    /// Needs no project root: one sidecar serves every project in the file,
+    /// so the retired entries go from every project.
+    fn prune_retired(
+        &self,
+        config_dir: &Path,
+        current: &[String],
+        mode: PruneMode,
+    ) -> anyhow::Result<Vec<String>> {
+        let record = retired_seed_entries(config_dir, current);
+        let config_path = config_dir.join(CONFIG_FILENAME);
+        // No file means nothing to remove, and no file to hash for the sidecar.
+        if record.retired.is_empty() || !config_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        // load_or_create_settings (inside) enforces MAX_SETTINGS_SIZE.
+        let mut map = load_permissions_map(&config_path)?;
+        let mut removed: Vec<String> = Vec::new();
+        for allow in map
+            .values_mut()
+            .filter_map(|project| project.get_mut("allow"))
+            .filter_map(serde_json::Value::as_array_mut)
+        {
+            removed.extend(remove_entries(allow, &record.retired));
+        }
+        removed.sort();
+        removed.dedup();
+        if mode == PruneMode::Plan {
+            return Ok(removed);
+        }
+
+        if !removed.is_empty() {
+            atomic_write_settings(&serde_json::Value::Object(map), &config_path)?;
+        }
+        // Also when nothing was removed: a stale record of a retired entry
+        // would remove a later entry that the user adds.
+        write_seed_sidecar(config_dir, &config_path, &record.kept)?;
+        Ok(removed)
+    }
+
     fn is_current(&self, config_dir: &Path, entries: &[String]) -> bool {
         let config_path = config_dir.join(CONFIG_FILENAME);
         if !config_path.exists() {
@@ -260,9 +277,9 @@ impl PermissionsProtocol for CopilotPermissions {
         let existing: std::collections::HashSet<&str> =
             allow.iter().filter_map(|v| v.as_str()).collect();
 
-        // A retired entry in any project makes the file stale (seed removes
-        // it from every project).
-        let retired = retired_seed_entries(config_dir, entries);
+        // A retired entry in any project makes the file stale (a prune
+        // removes it from every project).
+        let retired = retired_seed_entries(config_dir, entries).retired;
         let retired_present = map
             .values()
             .filter_map(|project| project.get("allow"))
@@ -484,11 +501,12 @@ mod tests {
         );
     }
 
-    /// A re-seed removes an entry that an earlier seed run recorded but that
+    /// A prune removes an entry that an earlier seed run recorded but that
     /// the current seed list no longer contains, from every project in the
-    /// file: one sidecar serves all projects.
+    /// file: one sidecar serves all projects. The plan names the same entry
+    /// without writing.
     #[test]
-    fn test_seed_removes_entry_retired_from_seed_list() {
+    fn test_prune_removes_entry_retired_from_seed_list() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = protocol();
         let project_key = find_git_root_from_cwd()
@@ -517,7 +535,21 @@ mod tests {
             "a retired seeded entry still in the allow list must make the config stale"
         );
 
-        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        let config_before = std::fs::read(&config_path).unwrap();
+        let planned = p
+            .prune_retired(dir.path(), &entries, PruneMode::Plan)
+            .unwrap();
+        assert_eq!(planned, vec!["Bash(skim rg:*)".to_string()]);
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "a plan must not write"
+        );
+
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+        assert_eq!(removed, planned, "the plan must name what is removed");
 
         let map: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -543,9 +575,15 @@ mod tests {
             vec!["OtherEntry"],
             "the retired entry must also be removed from the other project"
         );
+        let sidecar = load_sidecar(&dir.path().join(SIDECAR_FILENAME)).unwrap();
+        assert_eq!(sidecar.tier, "seed");
+        assert_eq!(
+            sidecar.entries, entries,
+            "sidecar must record the entries skim still seeds"
+        );
         assert!(
             p.is_current(dir.path(), &entries),
-            "config must be current after the re-seed"
+            "config must be current after the prune"
         );
     }
 

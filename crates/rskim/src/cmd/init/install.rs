@@ -226,9 +226,58 @@ fn permissions_blocks_fast_path(
     }
 }
 
+/// Remove the entries that skim no longer seeds from the agent config, and
+/// print one line when there are any. Returns them.
+///
+/// This step needs no consent and no terminal, and it runs for every
+/// permissions flag, the explicit opt-out included: it removes only entries
+/// that a seed-tier sidecar records, so it can only make the allow list
+/// smaller. It runs before the fast path and the consent prompt, so neither
+/// can skip it. On `--dry-run` it writes nothing and prints the planned
+/// removal instead.
+fn prune_retired_permissions(
+    agent: AgentKind,
+    perm_dir: &std::path::Path,
+    dry_run: bool,
+) -> anyhow::Result<Vec<String>> {
+    use crate::cmd::permissions::PruneMode;
+
+    let Some(protocol) = crate::cmd::permissions::permissions_protocol_for_agent(agent) else {
+        return Ok(Vec::new());
+    };
+    let current = crate::cmd::permissions::seeded_entries(protocol.as_ref());
+    let mode = if dry_run {
+        PruneMode::Plan
+    } else {
+        PruneMode::Apply
+    };
+    let removed = protocol.prune_retired(perm_dir, &current, mode)?;
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    if dry_run {
+        println!(
+            "  [dry-run] Would remove entries that skim no longer seeds: {}",
+            removed.join(", ")
+        );
+    } else {
+        println!(
+            "  {} Permissions: removed {} entr{} that skim no longer seeds: {}",
+            check_mark(true),
+            removed.len(),
+            if removed.len() == 1 { "y" } else { "ies" },
+            removed.join(", ")
+        );
+    }
+    Ok(removed)
+}
+
 /// Resolve whether consent has been obtained to seed permissions.
 ///
 /// Calls `confirm_grant` at most once (the single consent resolution point).
+/// `removed` lists the entries that skim no longer seeds and that
+/// [`prune_retired_permissions`] removed; the prompt shows them so the user
+/// knows that the answer does not keep them.
 ///
 /// Returns `Ok(true)` when the user consented.
 /// Returns `Ok(false)` when consent was not obtained: non-TTY, explicit opt-out,
@@ -238,6 +287,7 @@ fn resolve_permissions_consent(
     flags: &InitFlags,
     agent: AgentKind,
     perm_dir: &std::path::Path,
+    removed: &[String],
 ) -> anyhow::Result<bool> {
     // Explicit opt-out.
     if flags.permissions == Some(false) {
@@ -350,7 +400,12 @@ fn resolve_permissions_consent(
     }
 
     // Non-negotiable TTY gate — confirm_grant returns false on non-TTY.
-    let granted = confirm_grant(protocol.agent_label(), &config_file, &entries_for_prompt);
+    let granted = confirm_grant(
+        protocol.agent_label(),
+        &config_file,
+        &entries_for_prompt,
+        removed,
+    );
     Ok(granted)
 }
 
@@ -387,32 +442,14 @@ fn write_permissions(state: &DetectedState, tier: PermissionsTier) -> anyhow::Re
     };
 
     match outcome {
-        crate::cmd::permissions::SeedOutcome::Added {
-            entries_added,
-            entries_removed,
-        } => {
-            if !entries_added.is_empty() {
-                println!(
-                    "  {} Permissions: added {} entr{} to {}",
-                    check_mark(true),
-                    entries_added.len(),
-                    if entries_added.len() == 1 { "y" } else { "ies" },
-                    protocol.config_filename()
-                );
-            }
-            if !entries_removed.is_empty() {
-                println!(
-                    "  {} Permissions: removed {} entr{} that skim no longer seeds: {}",
-                    check_mark(true),
-                    entries_removed.len(),
-                    if entries_removed.len() == 1 {
-                        "y"
-                    } else {
-                        "ies"
-                    },
-                    entries_removed.join(", ")
-                );
-            }
+        crate::cmd::permissions::SeedOutcome::Added { entries_added } => {
+            println!(
+                "  {} Permissions: added {} entr{} to {}",
+                check_mark(true),
+                entries_added.len(),
+                if entries_added.len() == 1 { "y" } else { "ies" },
+                protocol.config_filename()
+            );
         }
         crate::cmd::permissions::SeedOutcome::AlreadyCurrent => {
             println!("  {} Permissions: already current", check_mark(true));
@@ -542,6 +579,11 @@ fn run_install_single(
         println!();
     }
 
+    // Before the fast path, so that a current install still loses the entries
+    // that skim no longer seeds, and before `permissions_blocks_fast_path`,
+    // so that its staleness check sees the result.
+    let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run)?;
+
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
 
@@ -629,7 +671,7 @@ fn run_install_single(
 
     // Resolve consent ONCE before any install action.
     // Returns Ok(false) on non-TTY (the test harness never has a TTY).
-    let grant_permissions = resolve_permissions_consent(flags, agent, perm_dir)?;
+    let grant_permissions = resolve_permissions_consent(flags, agent, perm_dir, &removed)?;
 
     // F2/F3: Print a loud notice when --permissions was explicitly requested
     // but refused because stdin is not a terminal.  A TTY user who types 'n'

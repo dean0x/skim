@@ -374,8 +374,16 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
 /// - `agent_label` — human-readable agent name for the prompt (e.g. "Claude Code").
 /// - `config_file` — exact path of the file that will be modified.
 /// - `entries` — each entry that will be added, printed verbatim.
+/// - `removed` — entries that skim no longer seeds and that are removed with
+///   or without consent; printed verbatim so the user knows the answer does
+///   not keep them. Empty for most runs.
 #[allow(clippy::disallowed_methods)] // TTY interaction: flush after print! before blocking read; bounded init output
-pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[String]) -> bool {
+pub(crate) fn confirm_grant(
+    agent_label: &str,
+    config_file: &Path,
+    entries: &[String],
+    removed: &[String],
+) -> bool {
     use std::io::{BufRead, IsTerminal, Read, Write};
 
     // Non-TTY: refuse immediately without printing anything.
@@ -394,6 +402,15 @@ pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[St
     println!("  Entries to add ({} total):", entries.len());
     for entry in entries {
         println!("    {entry}");
+    }
+    if !removed.is_empty() {
+        println!(
+            "  Entries that skim no longer seeds, removed with or without consent ({} total):",
+            removed.len()
+        );
+        for entry in removed {
+            println!("    {entry}");
+        }
     }
     println!();
     println!("These entries grant skim read-only tool permissions at install time.");
@@ -634,7 +651,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config_file = dir.path().join("settings.json");
         let entries = vec!["Bash(skim df:*)".to_string()];
-        let result = confirm_grant("Claude Code", &config_file, &entries);
+        let result = confirm_grant("Claude Code", &config_file, &entries, &[]);
         assert!(
             !result,
             "confirm_grant must return false in a non-TTY context"
@@ -653,7 +670,7 @@ mod tests {
         ];
         for _ in 0..3 {
             assert!(
-                !confirm_grant("Claude Code", &config_file, &entries),
+                !confirm_grant("Claude Code", &config_file, &entries, &[]),
                 "confirm_grant must consistently return false in non-TTY context"
             );
         }

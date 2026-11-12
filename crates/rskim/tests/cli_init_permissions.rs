@@ -567,3 +567,245 @@ fn test_permissions_auto_detect_with_codex_override_succeeds() {
         "skim-permissions.json must not be written for Codex in auto-detect mode"
     );
 }
+
+// ============================================================================
+// Entries that skim no longer seeds: a re-run removes them, with no prompt
+// ============================================================================
+
+/// The Claude Code state that an older skim left after a seed run: `allow` in
+/// `settings.json`, and a seed-tier sidecar that records `recorded`.
+fn write_older_claude_seed(cfg: &std::path::Path, allow: &[&str], recorded: &[&str]) {
+    let settings = serde_json::json!({ "permissions": { "allow": allow } });
+    std::fs::write(
+        cfg.join("settings.json"),
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let sidecar = serde_json::json!({
+        "version": 1,
+        "tier": "seed",
+        "entries": recorded,
+        "source_mirrors": {},
+        "config_hash": "written-by-an-older-skim",
+    });
+    std::fs::write(
+        cfg.join("skim-permissions.json"),
+        serde_json::to_string_pretty(&sidecar).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The strings in `permissions.allow` of the Claude Code `settings.json`.
+fn claude_allow(cfg: &std::path::Path) -> Vec<String> {
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.join("settings.json")).unwrap()).unwrap();
+    settings["permissions"]["allow"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The entries the sidecar records.
+fn sidecar_entries(cfg: &std::path::Path) -> Vec<String> {
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cfg.join("skim-permissions.json")).unwrap())
+            .unwrap();
+    sidecar["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The 8 entries an older skim seeded for Claude Code, in seed order.
+const OLDER_CLAUDE_SEED: &[&str] = &[
+    "Bash(skim df:*)",
+    "Bash(skim diff:*)",
+    "Bash(skim du:*)",
+    "Bash(skim grep:*)",
+    "Bash(skim ls:*)",
+    "Bash(skim rg:*)",
+    "Bash(skim tree:*)",
+    "Bash(skim wc:*)",
+];
+
+/// A plain `skim init` (no permissions flag, no terminal) removes an entry
+/// that an older skim seeded and that skim no longer seeds. It prints one
+/// line for the removal, and every other entry stays.
+#[test]
+fn test_rerun_removes_entry_skim_no_longer_seeds() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
+    write_older_claude_seed(
+        &cfg,
+        &["Bash(skim df:*)", "Bash(skim rg:*)", "Bash(git status:*)"],
+        &["Bash(skim df:*)", "Bash(skim rg:*)"],
+    );
+
+    let out = common::skim_sandboxed(home.path())
+        .args(["init", "--agent", "claude", "--no-guidance"])
+        .output()
+        .expect("skim must run");
+
+    assert!(out.status.success(), "the re-run must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("removed 1 entry that skim no longer seeds: Bash(skim rg:*)"),
+        "stdout must report the removal, got:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("that skim no longer seeds").count(),
+        1,
+        "the removal must be reported on exactly one line, got:\n{stdout}"
+    );
+    assert_eq!(
+        claude_allow(&cfg),
+        vec!["Bash(skim df:*)", "Bash(git status:*)"],
+        "the entry must be gone and every other entry must stay"
+    );
+    assert_eq!(
+        sidecar_entries(&cfg),
+        vec!["Bash(skim df:*)"],
+        "the sidecar must keep only the entries that skim still seeds"
+    );
+}
+
+/// An explicit `--permissions` with no terminal adds nothing (no consent),
+/// but still removes the entries that skim no longer seeds.
+#[test]
+fn test_rerun_removes_entries_without_a_terminal() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
+    write_older_claude_seed(&cfg, OLDER_CLAUDE_SEED, OLDER_CLAUDE_SEED);
+
+    let out = common::skim_sandboxed(home.path())
+        .args([
+            "init",
+            "--agent",
+            "claude",
+            "--permissions",
+            "--no-guidance",
+        ])
+        .output()
+        .expect("skim must run");
+
+    assert!(out.status.success(), "the re-run must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "removed 2 entries that skim no longer seeds: Bash(skim rg:*), Bash(skim tree:*)"
+        ),
+        "stdout must report the removal, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--permissions was requested but not granted"),
+        "consent must still be refused with no terminal, got:\n{stdout}"
+    );
+    let left: Vec<&str> = OLDER_CLAUDE_SEED
+        .iter()
+        .copied()
+        .filter(|e| !e.contains(" rg:") && !e.contains(" tree:"))
+        .collect();
+    assert_eq!(claude_allow(&cfg), left, "only rg and tree must be removed");
+    assert_eq!(sidecar_entries(&cfg), left);
+}
+
+/// The explicit opt-out `--no-permissions` adds nothing, but the entries
+/// that skim no longer seeds are still removed.
+#[test]
+fn test_rerun_with_no_permissions_still_removes_entry_skim_no_longer_seeds() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
+    write_older_claude_seed(
+        &cfg,
+        &["Bash(skim df:*)", "Bash(skim tree:*)"],
+        &["Bash(skim df:*)", "Bash(skim tree:*)"],
+    );
+
+    let out = common::skim_sandboxed(home.path())
+        .args([
+            "init",
+            "--agent",
+            "claude",
+            "--no-permissions",
+            "--no-guidance",
+        ])
+        .output()
+        .expect("skim must run");
+
+    assert!(out.status.success(), "the re-run must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("removed 1 entry that skim no longer seeds: Bash(skim tree:*)"),
+        "stdout must report the removal, got:\n{stdout}"
+    );
+    assert_eq!(claude_allow(&cfg), vec!["Bash(skim df:*)"]);
+}
+
+/// With no sidecar, skim has no record of the entry, so it stays and no
+/// removal is reported.
+#[test]
+fn test_rerun_keeps_entry_that_skim_did_not_record() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
+    write_older_claude_seed(&cfg, &["Bash(skim rg:*)"], &[]);
+    std::fs::remove_file(cfg.join("skim-permissions.json")).unwrap();
+
+    let out = common::skim_sandboxed(home.path())
+        .args(["init", "--agent", "claude", "--no-guidance"])
+        .output()
+        .expect("skim must run");
+
+    assert!(out.status.success(), "the re-run must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("no longer seeds"),
+        "nothing may be reported as removed, got:\n{stdout}"
+    );
+    assert_eq!(claude_allow(&cfg), vec!["Bash(skim rg:*)"]);
+}
+
+/// `--dry-run` shows the planned removal on one line and changes no file.
+#[test]
+fn test_dry_run_shows_planned_removal_and_writes_nothing() {
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
+    write_older_claude_seed(&cfg, OLDER_CLAUDE_SEED, OLDER_CLAUDE_SEED);
+    let settings_before = std::fs::read(cfg.join("settings.json")).unwrap();
+    let sidecar_before = std::fs::read(cfg.join("skim-permissions.json")).unwrap();
+
+    let out = common::skim_sandboxed(home.path())
+        .args(["init", "--agent", "claude", "--dry-run", "--no-guidance"])
+        .output()
+        .expect("skim must run");
+
+    assert!(out.status.success(), "dry-run must exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "[dry-run] Would remove entries that skim no longer seeds: \
+             Bash(skim rg:*), Bash(skim tree:*)"
+        ),
+        "dry-run must show the planned removal, got:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("no longer seeds").count(),
+        1,
+        "the planned removal must be shown on exactly one line, got:\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read(cfg.join("settings.json")).unwrap(),
+        settings_before,
+        "dry-run must not change settings.json"
+    );
+    assert_eq!(
+        std::fs::read(cfg.join("skim-permissions.json")).unwrap(),
+        sidecar_before,
+        "dry-run must not change the sidecar"
+    );
+}

@@ -32,11 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The optional permission setup now allows only read-only commands.** `skim init
   --permissions` seeds 6 tools (`df`, `diff`, `du`, `grep`, `ls`, `wc`); `rg` and `tree` are
-  no longer in the list. On the next `skim init --permissions`, an install that an older skim
-  seeded removes its `rg` and `tree` entries and prints `removed 2 entries that skim no longer
-  seeds`. For Copilot CLI, the entries go from every project in `permissions-config.json`.
-  Other allow-list entries stay as they are. To keep `rg` or `tree` allowed, add the entry
-  yourself.
+  no longer in the list. The next `skim init` removes the `rg` and `tree` entries that an older
+  skim seeded and prints `removed 2 entries that skim no longer seeds`. This removal needs no
+  consent and no terminal, and it runs with or without `--permissions` (also with
+  `--no-permissions`); `--dry-run` shows it and changes nothing. skim removes only the entries
+  that its own record of the earlier setup names. For Copilot CLI, the entries go from every
+  project in `permissions-config.json`. Other allow-list entries stay as they are. To keep `rg`
+  or `tree` allowed, add the entry yourself.
 
 - **Machine-contract flags on `skim git` now serve git's own bytes verbatim** (#576,
   ADR-022) — `--porcelain` (including `=v1`/`=v2`), `--null`/`-z` (matched anywhere in a

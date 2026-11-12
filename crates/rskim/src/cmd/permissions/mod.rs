@@ -7,7 +7,9 @@
 //!
 //! skim **never self-approves**: permissions seeding happens ONLY at `skim init`
 //! time, gated on interactive human consent via `confirm_grant()`. The runtime
-//! hook **never** writes permissions. The `permissions_protocol_for_agent`
+//! hook **never** writes permissions. The one change made without consent is
+//! the removal of entries that skim no longer seeds (see below), because it
+//! can only make the allow list smaller. The `permissions_protocol_for_agent`
 //! factory returns `None` for agents whose permission format is not supported
 //! or is deliberately excluded (see per-agent notes below).
 //!
@@ -24,12 +26,14 @@
 //!
 //! ## Retired seed entries
 //!
-//! When a tool leaves the seed list, the user-owned writers (Claude, Copilot)
-//! remove its entry on the next seed run, but only when a seed-tier sidecar
-//! recorded it ([`retired_seed_entries`]). Copilot removes it from every
-//! project in its file, because one sidecar serves all projects. The
-//! skim-owned writers (Gemini, Codex) regenerate their whole file, so they
-//! need no extra step.
+//! When a tool leaves the seed list, every `skim init` removes its entry
+//! ([`PermissionsProtocol::prune_retired`]), with no consent prompt and also
+//! with no terminal, because the removal can only make the allow list
+//! smaller. Only an entry that a seed-tier sidecar recorded is removed
+//! ([`retired_seed_entries`]). Copilot removes it from every project in its
+//! file, because one sidecar serves all projects. The skim-owned writers
+//! (Gemini, Codex) regenerate their file from the recorded entries that skim
+//! still seeds, but only when the file is still exactly what skim wrote.
 //!
 //! ## Registry invariant
 //!
@@ -60,18 +64,22 @@ pub(crate) use crate::cmd::init::PermissionsTier;
 /// Result of a [`PermissionsProtocol::seed`] call.
 #[derive(Debug)]
 pub(crate) enum SeedOutcome {
-    /// The agent config was changed.
+    /// New entries were added to the agent config.
     ///
     /// `entries_added` contains only the entries actually inserted; entries
     /// that were already present are skipped (idempotent dedup).
-    /// `entries_removed` contains the retired seed entries that were taken
-    /// out (see [`retired_seed_entries`]); it is empty for most runs.
-    Added {
-        entries_added: Vec<String>,
-        entries_removed: Vec<String>,
-    },
+    Added { entries_added: Vec<String> },
     /// All requested entries were already present — config was not modified.
     AlreadyCurrent,
+}
+
+/// Whether a [`PermissionsProtocol::prune_retired`] call changes files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PruneMode {
+    /// Return what would be removed and write nothing (`--dry-run`).
+    Plan,
+    /// Remove the entries and rewrite the sidecar.
+    Apply,
 }
 
 /// Result of a [`PermissionsProtocol::remove_seeded`] call.
@@ -161,6 +169,34 @@ pub(crate) trait PermissionsProtocol {
     ///   `NothingToRemove` is returned — the sidecar still correctly records what was
     ///   seeded and may inform future operations.
     fn remove_seeded(&self, config_dir: &Path) -> anyhow::Result<RemoveOutcome>;
+
+    /// Remove the entries that a seed-tier sidecar records but that `current`
+    /// (the current seed list) no longer contains; return the entries that
+    /// were in the config and are now gone.
+    ///
+    /// This step needs no consent and no terminal: it only takes out entries
+    /// that skim itself recorded, so it can only make the allow list smaller.
+    /// The sidecar is the only record of what is skim's
+    /// ([`retired_seed_entries`]): with no seed-tier sidecar (missing,
+    /// unreadable, or mirror tier) nothing is removed, and that is not an
+    /// error.
+    ///
+    /// With [`PruneMode::Apply`] the writer removes the entries from its
+    /// config and rewrites the sidecar so that it records only the entries
+    /// that skim still seeds, also when the config no longer held the retired
+    /// ones (a stale record must not remove a later entry that the user adds).
+    /// The sidecar never gains an entry here: the user did not consent to new
+    /// entries. With [`PruneMode::Plan`] nothing is written and the result is
+    /// the list that `Apply` would remove.
+    ///
+    /// Call this before [`seed`](PermissionsProtocol::seed): `seed` records
+    /// only the current list, so it would drop the record of a retired entry.
+    fn prune_retired(
+        &self,
+        config_dir: &Path,
+        current: &[String],
+        mode: PruneMode,
+    ) -> anyhow::Result<Vec<String>>;
 
     /// Check whether all `entries` are already present in the agent config.
     ///
@@ -261,30 +297,48 @@ pub(crate) fn seeded_entries(protocol: &dyn PermissionsProtocol) -> Vec<String> 
     entries
 }
 
-/// Entries that an earlier seed-tier run recorded in the sidecar at
-/// `config_dir` but that `entries` (the current seed list) no longer contains.
+/// The entries that a seed-tier sidecar records, split by the current seed
+/// list. Empty (all fields) when there is no seed-tier sidecar.
+#[derive(Debug, Default)]
+pub(super) struct SeedRecord {
+    /// Recorded entries that the current seed list still contains.
+    pub(super) kept: Vec<String>,
+    /// Recorded entries that the current seed list no longer contains.
+    pub(super) retired: Vec<String>,
+    /// The config file hash that the sidecar recorded.
+    pub(super) config_hash: String,
+}
+
+/// Split the entries that an earlier seed-tier run recorded in the sidecar at
+/// `config_dir` into the ones that `entries` (the current seed list) still
+/// contains and the retired ones that it no longer contains.
 ///
-/// The user-owned writers (Claude, Copilot) merge into the allow list, so
-/// without this step a tool that left the seed list keeps its entry after a
-/// re-seed. Only a `"seed"`-tier sidecar is consulted: a mirror-tier sidecar
-/// records mirrors of the user's own rules, which a seed run must not remove.
-/// A missing or unreadable sidecar gives an empty list (nothing is known to
-/// be skim's, so nothing is removed).
-pub(super) fn retired_seed_entries(config_dir: &Path, entries: &[String]) -> Vec<String> {
+/// This is the single source of "what is retired". Only a `"seed"`-tier
+/// sidecar is consulted: a mirror-tier sidecar records mirrors of the user's
+/// own rules, which must not be removed. A missing or unreadable sidecar
+/// gives an empty record (nothing is known to be skim's, so nothing is
+/// removed).
+pub(super) fn retired_seed_entries(config_dir: &Path, entries: &[String]) -> SeedRecord {
     match sidecar::load_sidecar(&config_dir.join(sidecar::SIDECAR_FILENAME)) {
-        Ok(recorded) if recorded.tier == "seed" => recorded
-            .entries
-            .into_iter()
-            .filter(|e| !entries.contains(e))
-            .collect(),
-        _ => Vec::new(),
+        Ok(recorded) if recorded.tier == "seed" => {
+            let (kept, retired) = recorded
+                .entries
+                .into_iter()
+                .partition(|e| entries.contains(e));
+            SeedRecord {
+                kept,
+                retired,
+                config_hash: recorded.config_hash,
+            }
+        }
+        _ => SeedRecord::default(),
     }
 }
 
 /// Write the seed-tier sidecar for `entries`, with the hash of `config_path`
 /// as it is on disk now. Used by the user-owned writers (Claude, Copilot)
-/// after a config write, and also when only the sidecar's record of a retired
-/// entry is stale (the entry is already gone from the config).
+/// after a config write, and by a prune also when only the sidecar's record
+/// of a retired entry is stale (the entry is already gone from the config).
 pub(super) fn write_seed_sidecar(
     config_dir: &Path,
     config_path: &Path,
@@ -310,7 +364,7 @@ pub(super) fn write_seed_sidecar(
 
 /// Remove every string in `targets` from `allow`; return the removed strings
 /// in their allow-list order. Used by the user-owned writers (Claude, Copilot)
-/// to take out [`retired_seed_entries`].
+/// to take out the retired entries of a [`SeedRecord`].
 pub(super) fn remove_entries(
     allow: &mut Vec<serde_json::Value>,
     targets: &[String],

@@ -46,7 +46,9 @@ use super::{hash_if_bounded, retired_seed_entries};
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
-use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
+use crate::cmd::permissions::{
+    PermissionsProtocol, PermissionsTier, PruneMode, RemoveOutcome, SeedOutcome,
+};
 
 /// Config path (relative to config_dir) for the Gemini policy file.
 const CONFIG_FILENAME: &str = "policies/skim.toml";
@@ -115,46 +117,10 @@ impl PermissionsProtocol for GeminiPermissions {
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
-        // The file is regenerated whole, so retired entries go with it; read
-        // them before the sidecar is rewritten, only to report them.
-        let entries_removed = retired_seed_entries(config_dir, entries);
-
-        // Generate the TOML content from entries.
-        let toml_content = generate_toml(entries)?;
-
-        // Ensure parent directory exists.
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Atomic write (tmp + rename).
-        let tmp_path = config_path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, &toml_content)?;
-        std::fs::rename(&tmp_path, &config_path)?;
-
-        // Compute hash and write sidecar.
-        // The file was just written by skim; exceeding the size bound here is unexpected.
-        let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "generated Gemini policy file unexpectedly exceeds size limit — \
-                 this is an internal error; please file a bug report"
-            )
-        })?;
-        let sidecar = PermissionSidecar {
-            version: 1,
-            // tier is hardcoded to "seed": Mirror requests produce the same seed-set for
-            // this agent.
-            tier: "seed".to_string(),
-            entries: entries.to_vec(),
-            source_mirrors: std::collections::HashMap::new(),
-            config_hash,
-        };
-        let sidecar_path = config_dir.join(SIDECAR_FILENAME);
-        write_sidecar(&sidecar_path, &sidecar)?;
+        write_policy(config_dir, entries)?;
 
         Ok(SeedOutcome::Added {
             entries_added: entries.to_vec(),
-            entries_removed,
         })
     }
 
@@ -203,6 +169,34 @@ impl PermissionsProtocol for GeminiPermissions {
         })
     }
 
+    /// Regenerates the policy from the recorded entries that skim still
+    /// seeds, but only when the file is still exactly what skim wrote (its
+    /// hash matches the sidecar). A file changed by hand could lack a
+    /// recorded entry, and a regenerated file would add that entry back, so
+    /// such a file is left as it is and nothing is removed.
+    fn prune_retired(
+        &self,
+        config_dir: &Path,
+        current: &[String],
+        mode: PruneMode,
+    ) -> anyhow::Result<Vec<String>> {
+        let record = retired_seed_entries(config_dir, current);
+        if record.retired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let config_path = config_dir.join(CONFIG_FILENAME);
+        // Ok(None) means oversized: treat it as changed by hand.
+        let unchanged = config_path.exists()
+            && matches!(hash_if_bounded(&config_path), Ok(Some(h)) if h == record.config_hash);
+        if !unchanged {
+            return Ok(Vec::new());
+        }
+        if mode == PruneMode::Apply {
+            write_policy(config_dir, &record.kept)?;
+        }
+        Ok(record.retired)
+    }
+
     fn is_current(&self, config_dir: &Path, entries: &[String]) -> bool {
         let sidecar_path = config_dir.join(SIDECAR_FILENAME);
         let config_path = config_dir.join(CONFIG_FILENAME);
@@ -230,6 +224,48 @@ impl PermissionsProtocol for GeminiPermissions {
 // ============================================================================
 // Internal helpers
 // ============================================================================
+
+/// Validate `entries`, write the policy file for them atomically, and write
+/// the seed-tier sidecar that records them with the new file's hash.
+fn write_policy(config_dir: &Path, entries: &[String]) -> anyhow::Result<()> {
+    // Validate all entries before any write.
+    for entry in entries {
+        validate_gemini_entry(entry)?;
+    }
+    let config_path = config_dir.join(CONFIG_FILENAME);
+
+    // Generate the TOML content from entries.
+    let toml_content = generate_toml(entries)?;
+
+    // Ensure parent directory exists.
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Atomic write (tmp + rename).
+    let tmp_path = config_path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, &toml_content)?;
+    std::fs::rename(&tmp_path, &config_path)?;
+
+    // Compute hash and write sidecar.
+    // The file was just written by skim; exceeding the size bound here is unexpected.
+    let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "generated Gemini policy file unexpectedly exceeds size limit — \
+             this is an internal error; please file a bug report"
+        )
+    })?;
+    let sidecar = PermissionSidecar {
+        version: 1,
+        // tier is hardcoded to "seed": Mirror requests produce the same seed-set for
+        // this agent.
+        tier: "seed".to_string(),
+        entries: entries.to_vec(),
+        source_mirrors: std::collections::HashMap::new(),
+        config_hash,
+    };
+    write_sidecar(&config_dir.join(SIDECAR_FILENAME), &sidecar)
+}
 
 /// Generate TOML content for the given entry patterns.
 ///
@@ -427,16 +463,89 @@ mod tests {
         let entries = seeded_entries(p.as_ref());
         assert!(!p.is_current(dir.path(), &entries));
 
-        match p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap() {
-            SeedOutcome::Added {
-                entries_removed, ..
-            } => assert_eq!(entries_removed, vec!["skim rg", "skim tree"]),
-            SeedOutcome::AlreadyCurrent => panic!("re-seed must rewrite the policy file"),
-        }
+        let outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        assert!(
+            matches!(outcome, SeedOutcome::Added { .. }),
+            "re-seed must rewrite the policy file"
+        );
         let contents = std::fs::read_to_string(dir.path().join(p.config_filename())).unwrap();
         assert!(
             !contents.contains("skim rg") && !contents.contains("skim tree"),
             "policy must not allow 'skim rg' or 'skim tree', got:\n{contents}"
+        );
+    }
+
+    /// A prune regenerates the policy from the recorded entries that skim
+    /// still seeds, and adds none of the current list that was not recorded.
+    /// The plan names the same entries without writing.
+    #[test]
+    fn test_prune_regenerates_policy_without_retired_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let old: Vec<String> = ["skim df", "skim rg", "skim tree"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
+        let config_path = dir.path().join(p.config_filename());
+        let entries = seeded_entries(p.as_ref());
+
+        let before = std::fs::read(&config_path).unwrap();
+        let planned = p
+            .prune_retired(dir.path(), &entries, PruneMode::Plan)
+            .unwrap();
+        assert_eq!(planned, vec!["skim rg", "skim tree"]);
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            before,
+            "a plan must not write"
+        );
+
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+        assert_eq!(removed, planned, "the plan must name what is removed");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("skim df"), "a kept entry must stay");
+        assert!(
+            !contents.contains("skim rg")
+                && !contents.contains("skim tree")
+                && !contents.contains("skim wc"),
+            "policy must hold only the kept entries, got:\n{contents}"
+        );
+        let sidecar = load_sidecar(&dir.path().join(SIDECAR_FILENAME)).unwrap();
+        assert_eq!(sidecar.tier, "seed");
+        assert_eq!(sidecar.entries, vec!["skim df"]);
+        assert!(
+            p.is_current(dir.path(), &sidecar.entries),
+            "the sidecar hash must match the regenerated file"
+        );
+    }
+
+    /// A policy file changed by hand is not regenerated: it could lack a
+    /// recorded entry, and a regenerated file would add that entry back.
+    #[test]
+    fn test_prune_leaves_hand_edited_policy_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let old: Vec<String> = ["skim df", "skim rg"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
+        let config_path = dir.path().join(p.config_filename());
+        std::fs::write(&config_path, "# edited by hand\n").unwrap();
+
+        let entries = seeded_entries(p.as_ref());
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+
+        assert!(removed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "# edited by hand\n"
         );
     }
 

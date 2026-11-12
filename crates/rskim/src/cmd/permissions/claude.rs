@@ -33,7 +33,9 @@ use crate::cmd::init::{
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
-use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
+use crate::cmd::permissions::{
+    PermissionsProtocol, PermissionsTier, PruneMode, RemoveOutcome, SeedOutcome,
+};
 
 /// Config file name for Claude Code.
 const CONFIG_FILENAME: &str = "settings.json";
@@ -80,13 +82,8 @@ impl PermissionsProtocol for ClaudePermissions {
 
         let mut settings = load_or_create_settings(&config_path)?;
 
-        // Read before the sidecar is rewritten below.
-        let retired = retired_seed_entries(config_dir, entries);
-
         // Navigate to permissions.allow, erroring loudly if type is wrong.
         let allow_array = get_or_create_allow_array(&mut settings, &config_path)?;
-
-        let entries_removed = remove_entries(allow_array, &retired);
 
         // Collect already-present entries for dedup (HashSet for O(1) membership — consistent
         // with is_current() which uses the same idiom).
@@ -103,12 +100,7 @@ impl PermissionsProtocol for ClaudePermissions {
             }
         }
 
-        if entries_added.is_empty() && entries_removed.is_empty() {
-            // The config needs no change. Drop a stale record of a retired
-            // entry, so that a later entry the user adds is not removed.
-            if !retired.is_empty() {
-                write_seed_sidecar(config_dir, &config_path, entries)?;
-            }
+        if entries_added.is_empty() {
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
@@ -126,10 +118,7 @@ impl PermissionsProtocol for ClaudePermissions {
         atomic_write_settings(&settings, &config_path)?;
         write_seed_sidecar(config_dir, &config_path, entries)?;
 
-        Ok(SeedOutcome::Added {
-            entries_added,
-            entries_removed,
-        })
+        Ok(SeedOutcome::Added { entries_added })
     }
 
     fn remove_seeded(&self, config_dir: &Path) -> anyhow::Result<RemoveOutcome> {
@@ -185,6 +174,39 @@ impl PermissionsProtocol for ClaudePermissions {
         Ok(RemoveOutcome::Removed { entries_removed })
     }
 
+    fn prune_retired(
+        &self,
+        config_dir: &Path,
+        current: &[String],
+        mode: PruneMode,
+    ) -> anyhow::Result<Vec<String>> {
+        let record = retired_seed_entries(config_dir, current);
+        let config_path = config_dir.join(CONFIG_FILENAME);
+        // No file means nothing to remove, and no file to hash for the sidecar.
+        if record.retired.is_empty() || !config_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        // load_or_create_settings enforces MAX_SETTINGS_SIZE.
+        let mut settings = load_or_create_settings(&config_path)?;
+        // An absent or wrongly typed allow list holds nothing to remove.
+        let removed = get_allow_array_mut(&mut settings)
+            .map(|allow| remove_entries(allow, &record.retired))
+            .unwrap_or_default();
+        if mode == PruneMode::Plan {
+            return Ok(removed);
+        }
+
+        if !removed.is_empty() {
+            backup_settings_file(config_dir, &config_path)?;
+            atomic_write_settings(&settings, &config_path)?;
+        }
+        // Also when nothing was removed: a stale record of a retired entry
+        // would remove a later entry that the user adds.
+        write_seed_sidecar(config_dir, &config_path, &record.kept)?;
+        Ok(removed)
+    }
+
     fn is_current(&self, config_dir: &Path, entries: &[String]) -> bool {
         let config_path = config_dir.join(CONFIG_FILENAME);
         if !config_path.exists() {
@@ -209,6 +231,7 @@ impl PermissionsProtocol for ClaudePermissions {
 
         entries.iter().all(|e| existing.contains(e.as_str()))
             && !retired_seed_entries(config_dir, entries)
+                .retired
                 .iter()
                 .any(|r| existing.contains(r.as_str()))
     }
@@ -526,10 +549,7 @@ pub(crate) fn seed_mirrors(
     if entries_added.is_empty() {
         Ok(SeedOutcome::AlreadyCurrent)
     } else {
-        Ok(SeedOutcome::Added {
-            entries_added,
-            entries_removed: Vec::new(),
-        })
+        Ok(SeedOutcome::Added { entries_added })
     }
 }
 
@@ -746,10 +766,11 @@ mod tests {
             .collect()
     }
 
-    /// A re-seed removes an entry that an earlier seed run recorded but that
-    /// the current seed list no longer contains. Unrelated entries stay.
+    /// A prune removes an entry that an earlier seed run recorded but that
+    /// the current seed list no longer contains. Unrelated entries stay, and
+    /// the plan names the same entry without writing.
     #[test]
-    fn test_seed_removes_entry_retired_from_seed_list() {
+    fn test_prune_removes_entry_retired_from_seed_list() {
         let dir = tempfile::TempDir::new().unwrap();
         write_prior_seed(
             dir.path(),
@@ -764,16 +785,21 @@ mod tests {
             "a retired seeded entry still in the allow list must make the config stale"
         );
 
-        match p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap() {
-            SeedOutcome::Added {
-                entries_added,
-                entries_removed,
-            } => {
-                assert!(entries_added.is_empty(), "nothing new to add");
-                assert_eq!(entries_removed, vec!["Bash(skim rg:*)".to_string()]);
-            }
-            SeedOutcome::AlreadyCurrent => panic!("re-seed must remove the retired entry"),
-        }
+        let settings_before = std::fs::read(dir.path().join("settings.json")).unwrap();
+        let planned = p
+            .prune_retired(dir.path(), &entries, PruneMode::Plan)
+            .unwrap();
+        assert_eq!(planned, vec!["Bash(skim rg:*)".to_string()]);
+        assert_eq!(
+            std::fs::read(dir.path().join("settings.json")).unwrap(),
+            settings_before,
+            "a plan must not write"
+        );
+
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+        assert_eq!(removed, planned, "the plan must name what is removed");
 
         assert_eq!(
             allow_entries(dir.path()),
@@ -781,18 +807,43 @@ mod tests {
             "the retired entry must be removed and every other entry kept"
         );
         let sidecar = load_sidecar(&dir.path().join("skim-permissions.json")).unwrap();
-        assert_eq!(sidecar.entries, entries, "sidecar must record the new list");
+        assert_eq!(sidecar.tier, "seed");
+        assert_eq!(
+            sidecar.entries, entries,
+            "sidecar must record the entries skim still seeds"
+        );
         assert!(
             p.is_current(dir.path(), &entries),
-            "config must be current after the re-seed"
+            "config must be current after the prune"
         );
     }
 
-    /// When the retired entry is already gone from the config, a re-seed
-    /// still rewrites the sidecar. An entry that the user adds back later is
-    /// then the user's own, and the next seed run keeps it.
+    /// The sidecar never gains an entry in a prune: an entry in the current
+    /// list that the sidecar did not record is not recorded, and not added.
     #[test]
-    fn test_seed_drops_stale_record_of_retired_entry() {
+    fn test_prune_records_no_new_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_prior_seed(
+            dir.path(),
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+        );
+        let p = protocol();
+        let entries = vec!["Bash(skim df:*)".to_string(), "Bash(skim wc:*)".to_string()];
+
+        p.prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+
+        assert_eq!(allow_entries(dir.path()), vec!["Bash(skim df:*)"]);
+        let sidecar = load_sidecar(&dir.path().join("skim-permissions.json")).unwrap();
+        assert_eq!(sidecar.entries, vec!["Bash(skim df:*)".to_string()]);
+    }
+
+    /// When the retired entry is already gone from the config, a prune still
+    /// rewrites the sidecar. An entry that the user adds back later is then
+    /// the user's own, and the next prune keeps it.
+    #[test]
+    fn test_prune_drops_stale_record_of_retired_entry() {
         let dir = tempfile::TempDir::new().unwrap();
         write_prior_seed(
             dir.path(),
@@ -802,8 +853,10 @@ mod tests {
         let p = protocol();
         let entries = vec!["Bash(skim df:*)".to_string()];
 
-        let outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
-        assert!(matches!(outcome, SeedOutcome::AlreadyCurrent));
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+        assert!(removed.is_empty(), "nothing was in the config to remove");
         let sidecar = load_sidecar(&dir.path().join("skim-permissions.json")).unwrap();
         assert_eq!(sidecar.entries, entries, "stale record must be dropped");
 
@@ -817,18 +870,21 @@ mod tests {
         )
         .unwrap();
 
-        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+        assert!(removed.is_empty());
         assert_eq!(
             allow_entries(dir.path()),
             vec!["Bash(skim df:*)", "Bash(skim rg:*)"],
-            "an entry the user added after the re-seed must stay"
+            "an entry the user added after the prune must stay"
         );
     }
 
     /// Only a seed-tier sidecar is pruned: entries that a mirror run recorded
     /// mirror the user's own rules and stay in place.
     #[test]
-    fn test_seed_keeps_entries_recorded_by_mirror_tier() {
+    fn test_prune_keeps_entries_recorded_by_mirror_tier() {
         let dir = tempfile::TempDir::new().unwrap();
         write_prior_seed(dir.path(), &["Bash(skim rg:*)"], &["Bash(skim rg:*)"]);
         let sidecar_path = dir.path().join("skim-permissions.json");
@@ -838,13 +894,34 @@ mod tests {
 
         let p = protocol();
         let entries = vec!["Bash(skim df:*)".to_string()];
-        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
 
+        assert!(removed.is_empty());
         assert_eq!(
             allow_entries(dir.path()),
-            vec!["Bash(skim rg:*)", "Bash(skim df:*)"],
-            "a mirror-tier entry must not be removed by a seed run"
+            vec!["Bash(skim rg:*)"],
+            "a mirror-tier entry must not be removed by a prune"
         );
+    }
+
+    /// A corrupt sidecar names nothing as skim's: a prune removes nothing and
+    /// does not fail.
+    #[test]
+    fn test_prune_with_corrupt_sidecar_removes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_prior_seed(dir.path(), &["Bash(skim rg:*)"], &["Bash(skim rg:*)"]);
+        std::fs::write(dir.path().join("skim-permissions.json"), b"{ not json").unwrap();
+
+        let p = protocol();
+        let entries = vec!["Bash(skim df:*)".to_string()];
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+
+        assert!(removed.is_empty());
+        assert_eq!(allow_entries(dir.path()), vec!["Bash(skim rg:*)"]);
     }
 
     // ---- seed: security negatives ----
