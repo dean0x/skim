@@ -216,6 +216,31 @@ fn test_heatmap_help_contains_flag_names() {
         .stdout(predicate::str::contains("--diff"));
 }
 
+#[test]
+fn test_heatmap_help_describes_the_short_view_detail_and_cards() {
+    let out = common::skim()
+        .args(["heatmap", "--help"])
+        .output()
+        .expect("spawn skim heatmap --help");
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout).unwrap();
+
+    let detail = help
+        .lines()
+        .find(|l| l.trim_start().starts_with("--detail"))
+        .unwrap_or_else(|| panic!("no --detail line:\n{help}"));
+    assert!(
+        detail.contains("hotspots|coupling|fix-risk|modules|bus-factor"),
+        "{detail}"
+    );
+    for needle in ["CHANGELOG.md", "--no-exclude", "version 2", "5 commits"] {
+        assert!(help.contains(needle), "help has no {needle:?}:\n{help}");
+    }
+    for stale in ["default: 20", "agent-friendly", "Top Churn", "%%"] {
+        assert!(!help.contains(stale), "help still says {stale:?}:\n{help}");
+    }
+}
+
 // ============================================================================
 // Not a git repo
 // ============================================================================
