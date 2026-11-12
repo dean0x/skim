@@ -26,6 +26,11 @@
 //! - **Minified gate** — producer phase, skipped for json / yaml / yml /
 //!   toml (`index.rs:880-881`); see `is_minified`.
 //!
+//! The text universe ([`text_universe`]) is a second, wider universe: every
+//! text file a plain-text search must read, with no extension allow-list and
+//! no minified gate (#540). It is the oracle for `lexical.recall_tracked`,
+//! `universe.accounted` and the whole-word line checks of golden integrity.
+//!
 //! Git runs under a [`GitIsolation`]: the same isolated `HOME` the skim
 //! subprocess gets, with `GIT_CONFIG_NOSYSTEM=1`, so global excludes cannot
 //! diverge from skim's `git_global(true)`.
@@ -471,6 +476,265 @@ fn count_reasons<'a>(skips: impl Iterator<Item = &'a SkippedFile>) -> BTreeMap<S
 }
 
 // ============================================================================
+// Text universe
+// ============================================================================
+
+/// Why a file is left out of the [`TextUniverse`]. These are the `left_out`
+/// keys of the plain-text search's JSON envelope, so the two sides compare
+/// key for key:
+///
+/// - `binary`: a NUL byte in the first `BINARY_PROBE_BYTES` bytes;
+/// - `not_utf8`: the content is not strict UTF-8;
+/// - `too_large`: more than [`MAX_FILE_BYTES`] bytes;
+/// - `unreadable`: an I/O error, or a handle that is not a regular file;
+/// - `vanished`: tracked, but absent from the work tree;
+/// - `outside_root`: the real path leaves the canonical root;
+/// - `symlink`: a tracked entry of mode `120000`, or a walked entry whose
+///   file type is a symlink. It is counted and never read.
+///
+/// A file that is both too large and binary counts as `too_large`: the size
+/// is known from the metadata, before any byte is read.
+pub const LEFT_OUT_REASONS: [&str; 7] = [
+    "binary",
+    "not_utf8",
+    "too_large",
+    "unreadable",
+    "vanished",
+    "outside_root",
+    "symlink",
+];
+
+/// git's index mode of a symlink.
+const MODE_SYMLINK: &str = "120000";
+
+/// git's index mode of a gitlink (a submodule).
+const MODE_GITLINK: &str = "160000";
+
+/// The files a plain-text search must be able to read: the text files of the
+/// work tree, with no language allow-list and no minified gate, and a count
+/// for each reason a candidate is left out ([`LEFT_OUT_REASONS`]).
+///
+/// The candidates are the tracked files (`git ls-files`, gitlinks and
+/// skip-worktree entries dropped) plus the untracked, not-ignored files with
+/// no hidden path component. Hidden and secret-bearing tracked files are
+/// listed. Like [`Universe`], the oracle lists untracked files with `git`,
+/// which does not read `.ignore` files; on a verified-clean clone the
+/// untracked half is empty.
+///
+/// A path that is not UTF-8 is keyed by its lossy decoding (the JSON rule of
+/// the search output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextUniverse {
+    files: BTreeMap<String, String>,
+    left_out: BTreeMap<&'static str, u64>,
+}
+
+impl TextUniverse {
+    fn new() -> Self {
+        TextUniverse {
+            files: BTreeMap::new(),
+            left_out: LEFT_OUT_REASONS.iter().map(|&r| (r, 0)).collect(),
+        }
+    }
+
+    /// Number of files in the universe.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether no file is in the universe.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Whether `path` is in the universe.
+    pub fn contains(&self, path: &str) -> bool {
+        self.files.contains_key(path)
+    }
+
+    /// Text of a file of the universe.
+    pub fn text(&self, path: &str) -> Option<&str> {
+        self.files.get(path).map(String::as_str)
+    }
+
+    /// `(path, text)` for every file, byte-wise sorted.
+    pub fn files(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.files.iter().map(|(p, t)| (p.as_str(), t.as_str()))
+    }
+
+    /// How many candidates each reason of [`LEFT_OUT_REASONS`] left out; every
+    /// reason is a key, zero counts included.
+    pub fn left_out(&self) -> &BTreeMap<&'static str, u64> {
+        &self.left_out
+    }
+
+    /// Candidates left out for `reason` (`0` for a name that is not a reason).
+    pub fn left_out_count(&self, reason: &str) -> u64 {
+        self.left_out.get(reason).copied().unwrap_or(0)
+    }
+
+    fn count(&mut self, reason: &'static str) {
+        *self.left_out.entry(reason).or_insert(0) += 1;
+    }
+}
+
+/// What reading one candidate gave.
+#[derive(Debug, PartialEq, Eq)]
+enum TextOutcome {
+    Admitted(String),
+    LeftOut(&'static str),
+    /// Not a candidate at all: a directory (a gitlink or a nested
+    /// repository).
+    Skipped,
+}
+
+/// Compute the text universe of the repository whose toplevel is `root`.
+///
+/// # Errors
+///
+/// Returns an error if `root` is not the toplevel of a git repository, if
+/// `git ls-files` fails to spawn, times out or exits non-zero, if its output
+/// cannot be parsed, or if two non-UTF-8 paths decode to the same lossy
+/// string.
+pub fn text_universe(root: &Path, git: &GitIsolation) -> anyhow::Result<TextUniverse> {
+    if !root.join(".git").exists() {
+        anyhow::bail!("{} is not a git repository root (no .git)", root.display());
+    }
+    let canonical_root = std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing {}", root.display()))?;
+    let tracked = tracked_entries(root, git)?;
+    let untracked: BTreeSet<Vec<u8>> = ls_files(root, git, &["--others", "--exclude-standard"])?
+        .into_iter()
+        .filter(|p| !tracked.contains_key(p) && !has_hidden_component(p))
+        .collect();
+
+    let mut universe = TextUniverse::new();
+    let candidates = tracked
+        .into_iter()
+        .chain(untracked.into_iter().map(|p| (p, false)));
+    for (raw, is_symlink_entry) in candidates {
+        let abs = abs_path(root, &raw);
+        let path = match String::from_utf8(raw) {
+            Ok(p) => p,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        if !is_safe_relative(&path) {
+            continue;
+        }
+        let outcome = if is_symlink_entry {
+            TextOutcome::LeftOut("symlink")
+        } else {
+            read_text(&abs, &canonical_root)
+        };
+        match outcome {
+            TextOutcome::Admitted(text) => {
+                anyhow::ensure!(
+                    universe.files.insert(path.clone(), text).is_none(),
+                    "two paths of {} decode to {path:?}",
+                    root.display()
+                );
+            }
+            TextOutcome::LeftOut(reason) => universe.count(reason),
+            TextOutcome::Skipped => {}
+        }
+    }
+    Ok(universe)
+}
+
+/// `root` joined with the raw path bytes git printed, so a file whose name is
+/// not UTF-8 is still read.
+fn abs_path(root: &Path, raw: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        root.join(std::ffi::OsStr::from_bytes(raw))
+    }
+    #[cfg(not(unix))]
+    {
+        root.join(String::from_utf8_lossy(raw).as_ref())
+    }
+}
+
+/// The tracked entries of `git ls-files -t -s -z`: raw path to "is a
+/// symlink". Gitlinks (`160000`) and skip-worktree entries (tag `S`) are
+/// dropped, as the search drops them.
+fn tracked_entries(root: &Path, git: &GitIsolation) -> anyhow::Result<BTreeMap<Vec<u8>, bool>> {
+    let mut entries = BTreeMap::new();
+    for record in split_records(&ls_files_raw(root, git, &["-t", "-s"])?) {
+        let tab = record
+            .iter()
+            .position(|&b| b == b'\t')
+            .context("git ls-files -s record has no tab")?;
+        let meta =
+            std::str::from_utf8(&record[..tab]).context("git ls-files -s metadata is not UTF-8")?;
+        let mut fields = meta.split(' ');
+        let (Some(tag), Some(mode), Some(_object), Some(_stage), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            anyhow::bail!("unexpected git ls-files -t -s record {meta:?}");
+        };
+        if mode == MODE_GITLINK || tag == "S" {
+            continue;
+        }
+        entries.insert(record[tab + 1..].to_vec(), mode == MODE_SYMLINK);
+    }
+    Ok(entries)
+}
+
+/// Read one candidate and admit it or name the reason it is left out.
+/// `canonical_root` is the canonical work-tree root.
+fn read_text(abs: &Path, canonical_root: &Path) -> TextOutcome {
+    use std::io::Read as _;
+
+    let meta = match std::fs::symlink_metadata(abs) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return TextOutcome::LeftOut("vanished");
+        }
+        Err(_) => return TextOutcome::LeftOut("unreadable"),
+    };
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        return TextOutcome::LeftOut("symlink");
+    }
+    if kind.is_dir() {
+        return TextOutcome::Skipped;
+    }
+    if !kind.is_file() {
+        return TextOutcome::LeftOut("unreadable");
+    }
+    match std::fs::canonicalize(abs) {
+        Ok(real) if real.starts_with(canonical_root) => {}
+        Ok(_) => return TextOutcome::LeftOut("outside_root"),
+        Err(_) => return TextOutcome::LeftOut("unreadable"),
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return TextOutcome::LeftOut("too_large");
+    }
+    // Bounded read: a file that grew since the metadata call is cut at the cap.
+    let mut bytes = Vec::new();
+    let read =
+        std::fs::File::open(abs).and_then(|f| f.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes));
+    if read.is_err() {
+        return TextOutcome::LeftOut("unreadable");
+    }
+    if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_FILE_BYTES) {
+        return TextOutcome::LeftOut("too_large");
+    }
+    if has_nul_probe(&bytes) {
+        return TextOutcome::LeftOut("binary");
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => TextOutcome::Admitted(text),
+        Err(_) => TextOutcome::LeftOut("not_utf8"),
+    }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -518,6 +782,20 @@ fn has_hidden_component(path: &[u8]) -> bool {
 /// repository discovery fenced at `root`'s parent so a non-repository `root`
 /// can never borrow an enclosing checkout. Returns the raw path bytes.
 fn ls_files(root: &Path, git: &GitIsolation, extra: &[&str]) -> anyhow::Result<Vec<Vec<u8>>> {
+    Ok(split_records(&ls_files_raw(root, git, extra)?))
+}
+
+/// The NUL-separated, non-empty records of `git ls-files -z` output.
+fn split_records(stdout: &[u8]) -> Vec<Vec<u8>> {
+    stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// The stdout of `git -C <root> ls-files -z <extra>`; see [`ls_files`].
+fn ls_files_raw(root: &Path, git: &GitIsolation, extra: &[&str]) -> anyhow::Result<Vec<u8>> {
     let canonical = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalizing {}", root.display()))?;
     let mut cmd = Command::new("git");
@@ -541,12 +819,7 @@ fn ls_files(root: &Path, git: &GitIsolation, extra: &[&str]) -> anyhow::Result<V
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(out
-        .stdout
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect())
+    Ok(out.stdout)
 }
 
 #[cfg(test)]
@@ -887,5 +1160,150 @@ mod tests {
         let cov = universe(&repo).coverage();
         assert_eq!((cov.indexed_tracked, cov.tracked_text), (0, 0));
         assert!((cov.ratio() - 1.0).abs() < 1e-9);
+    }
+
+    // --- text universe -----------------------------------------------------------
+
+    fn text(repo: &FixtureRepo) -> TextUniverse {
+        text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap()
+    }
+
+    #[test]
+    fn the_text_universe_has_no_extension_allow_list_and_no_minified_gate() {
+        let repo = FixtureRepo::new();
+        repo.write("src/main.rs", "fn main() {}\n");
+        repo.write("LICENSE", "MIT\n");
+        repo.write("scripts/build", "#!/bin/sh\necho build\n");
+        repo.write("notes.txt", "a note\n");
+        repo.write("bundle.js", one_long_line(70_000, 0));
+        repo.commit_all("init");
+
+        let t = text(&repo);
+        for path in [
+            "src/main.rs",
+            "LICENSE",
+            "scripts/build",
+            "notes.txt",
+            "bundle.js",
+        ] {
+            assert!(t.contains(path), "{path}");
+        }
+        assert_eq!(t.text("LICENSE"), Some("MIT\n"));
+        assert_eq!(t.len(), 5);
+        // The allow-listed universe drops three of them.
+        assert_eq!(universe(&repo).len(), 1);
+    }
+
+    #[test]
+    fn every_left_out_reason_is_a_key_and_a_clean_tree_leaves_none_out() {
+        let repo = FixtureRepo::new();
+        repo.write("a.rs", "fn a() {}\n");
+        repo.commit_all("init");
+
+        let t = text(&repo);
+        let keys: Vec<&str> = t.left_out().keys().copied().collect();
+        let mut expected = LEFT_OUT_REASONS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        assert!(t.left_out().values().all(|&n| n == 0), "{:?}", t.left_out());
+    }
+
+    #[test]
+    fn each_left_out_reason_counts_its_files() {
+        let repo = FixtureRepo::new();
+        repo.write("ok.txt", "fine\n");
+        repo.write("blob.bin", b"abc\0def".as_slice());
+        repo.write("latin1.txt", [0x66u8, 0x6f, 0xe9, 0x0a].as_slice());
+        let big = vec![b'x'; usize::try_from(MAX_FILE_BYTES).unwrap() + 1];
+        repo.write("huge.txt", big);
+        repo.write("gone.txt", "will vanish\n");
+        repo.write("real.rs", "fn real() {}\n");
+        std::os::unix::fs::symlink("real.rs", repo.root().join("link.rs")).unwrap();
+        repo.commit_all("init");
+        std::fs::remove_file(repo.root().join("gone.txt")).unwrap();
+
+        let t = text(&repo);
+        assert!(t.contains("ok.txt") && t.contains("real.rs"));
+        assert_eq!(t.len(), 2);
+        for (reason, n) in [
+            ("binary", 1),
+            ("not_utf8", 1),
+            ("too_large", 1),
+            ("vanished", 1),
+            ("symlink", 1),
+            ("unreadable", 0),
+            ("outside_root", 0),
+        ] {
+            assert_eq!(t.left_out_count(reason), n, "{reason}");
+        }
+        assert_eq!(t.left_out_count("no_such_reason"), 0);
+    }
+
+    #[test]
+    fn a_file_over_the_cap_that_is_also_binary_counts_as_too_large() {
+        let repo = FixtureRepo::new();
+        let mut big = vec![b'x'; usize::try_from(MAX_FILE_BYTES).unwrap() + 1];
+        big[0] = 0;
+        repo.write("huge.bin", big);
+        repo.commit_all("init");
+
+        let t = text(&repo);
+        assert_eq!(t.left_out_count("too_large"), 1);
+        assert_eq!(t.left_out_count("binary"), 0);
+    }
+
+    #[test]
+    fn gitlinks_skip_worktree_entries_and_directories_are_not_candidates() {
+        let repo = FixtureRepo::new();
+        repo.write("kept.txt", "kept\n");
+        repo.write("sparse.txt", "sparse\n");
+        repo.commit_all("init");
+        // A gitlink: a submodule entry in the index, a directory in the tree.
+        repo.git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,1111111111111111111111111111111111111111,sub",
+        ]);
+        std::fs::create_dir(repo.root().join("sub")).unwrap();
+        repo.git(&["update-index", "--skip-worktree", "sparse.txt"]);
+        std::fs::remove_file(repo.root().join("sparse.txt")).unwrap();
+
+        let t = text(&repo);
+        assert_eq!(
+            t.files().map(|(p, _)| p).collect::<Vec<_>>(),
+            vec!["kept.txt"]
+        );
+        assert!(
+            t.left_out().values().all(|&n| n == 0),
+            "neither entry is counted: {:?}",
+            t.left_out()
+        );
+    }
+
+    #[test]
+    fn untracked_files_join_unless_ignored_or_under_a_hidden_component() {
+        let repo = FixtureRepo::new();
+        repo.write(".gitignore", "ignored.txt\n");
+        repo.write("tracked.txt", "t\n");
+        repo.commit_all("init");
+        repo.write("new.txt", "n\n");
+        repo.write("ignored.txt", "i\n");
+        repo.write(".hidden/secret.txt", "h\n");
+
+        let t = text(&repo);
+        assert!(t.contains("tracked.txt") && t.contains("new.txt"));
+        assert!(t.contains(".gitignore"), "a tracked hidden file is listed");
+        assert!(!t.contains("ignored.txt") && !t.contains(".hidden/secret.txt"));
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_repository_root_is_an_error_for_the_text_universe() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = text_universe(dir.path(), &GitIsolation::new(dir.path())).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not a git repository root"),
+            "{err:#}"
+        );
     }
 }
