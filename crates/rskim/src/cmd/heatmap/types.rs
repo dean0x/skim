@@ -56,6 +56,9 @@ pub(crate) struct HeatmapArgs {
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
+    /// Keep doc files and non-code folders in the hotspots, the modules
+    /// and the insights (`--include-docs`).
+    pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
     pub(crate) extra_excludes: Vec<String>,
     /// Coupling confidence threshold (default 0.5).
@@ -98,6 +101,7 @@ impl Default for HeatmapArgs {
             format_json: false,
             top_n: 20,
             no_exclude: false,
+            include_docs: false,
             extra_excludes: Vec::new(),
             coupling_threshold: 0.5,
             fix_window: 5,
@@ -178,6 +182,9 @@ pub(crate) struct HeatmapConfig {
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
+    /// Keep doc files and non-code folders in the hotspots, the modules
+    /// and the insights (`--include-docs`).
+    pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
     pub(crate) extra_excludes: Vec<String>,
     /// Coupling confidence threshold (default 0.5).
@@ -431,10 +438,20 @@ impl Count {
     }
 }
 
+/// True when `n` is zero (a serde `skip_serializing_if` predicate).
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// The [`Count`] of the insights list, for insights JSON `counts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct InsightCounts {
     pub(crate) insights: Count,
+    /// Findings left out because their file or module is not product code
+    /// (absent at zero; see `--include-docs`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) left_out: usize,
 }
 
 /// The `--insights` result: the shown findings in rank order, their count,

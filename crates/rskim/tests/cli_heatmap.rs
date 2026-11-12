@@ -370,7 +370,7 @@ fn test_heatmap_text_output_contains_sections() {
     let headings: Vec<&str> = text
         .lines()
         .skip(1)
-        .filter(|l| !l.starts_with(' '))
+        .filter(|l| !l.starts_with(' ') && !l.starts_with("Before you edit"))
         .collect();
     assert_eq!(
         headings,
@@ -872,6 +872,16 @@ fn test_heatmap_files_no_top_truncation() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let targets = json["file_targets"].as_array().unwrap();
     assert_eq!(targets.len(), 3);
+    // Named files keep every path: the non-code rule does not drop the
+    // file under the top tests/ folder from files[].
+    let files: Vec<&str> = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(files.contains(&"tests/test_lib.rs"), "{json}");
+    assert!(json.get("left_out").is_none(), "{json}");
 }
 
 #[test]
@@ -1438,13 +1448,26 @@ fn test_heatmap_default_excludes_changelog_snapshot_and_generated_files() {
         assert!(!stdout.contains(path), "{path} in text output:\n{stdout}");
     }
 
-    let all = common::skim()
+    // --no-exclude alone keeps the excluded files, but the non-code rule
+    // still leaves out the doc file and the two files under tests/.
+    let code_only = common::skim()
         .args(["heatmap", "--json", "--no-exclude"])
         .current_dir(dir.path())
         .output()
         .expect("spawn skim heatmap --no-exclude");
+    assert!(code_only.status.success());
+    let code_only: serde_json::Value =
+        serde_json::from_slice(&code_only.stdout).expect("valid JSON");
+    assert_eq!(code_only["left_out"]["hotspots"], 3, "{code_only}");
+
+    let all = common::skim()
+        .args(["heatmap", "--json", "--no-exclude", "--include-docs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn skim heatmap --no-exclude --include-docs");
     assert!(all.status.success());
     let all: serde_json::Value = serde_json::from_slice(&all.stdout).expect("valid JSON");
+    assert!(all.get("left_out").is_none(), "{all}");
     let mut every: Vec<String> = EXCLUDE_FIXTURE.iter().map(|(p, _)| p.to_string()).collect();
     every.sort();
     assert_eq!(sorted_paths(&all, "files"), every);
@@ -1680,6 +1703,31 @@ fn create_ranked_repo(dir: &Path) {
     }
 }
 
+/// Issue #597: a card lists only commits whose subject says they fix
+/// something, not commits that mention a fix keyword in a description.
+#[test]
+fn test_heatmap_card_fix_commits_skip_subjects_that_only_mention_a_keyword() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let mut ts = recent_ts();
+    let file = ["src/a.rs".to_string()];
+    for subject in [
+        "feat: add a",
+        "docs: explain later-fix proximity",
+        "feat: add bug report template",
+        "fix(a): handle empty input",
+        "Revert \"feat: add a\"",
+    ] {
+        ts += 60;
+        git_commit_paths(dir.path(), &file, subject, ts);
+    }
+    let text = heatmap_stdout(dir.path(), &["src/a.rs", "--top", "5"]);
+    assert!(text.contains("\"fix(a): handle empty input\""), "{text}");
+    assert!(text.contains("Revert"), "{text}");
+    assert!(!text.contains("later-fix"), "{text}");
+    assert!(!text.contains("bug report"), "{text}");
+}
+
 #[test]
 fn test_heatmap_default_text_fits_in_thirty_lines_with_more_lines() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1687,8 +1735,14 @@ fn test_heatmap_default_text_fits_in_thirty_lines_with_more_lines() {
 
     let text = heatmap_stdout(dir.path(), &[]);
     let lines: Vec<&str> = text.lines().collect();
-    // header 1; hotspots 1 + 10 + 1; coupling 1 + 5 + 1; fix risk 1 + 5 + 1.
-    assert_eq!(lines.len(), 27, "{text}");
+    // header 1; hotspots 1 + 10 + 1; coupling 1 + 5 + 1; fix risk 1 + 5 + 1;
+    // the card hint 1.
+    assert_eq!(lines.len(), 28, "{text}");
+    assert_eq!(
+        lines.last(),
+        Some(&"Before you edit a file: skim heatmap <file>"),
+        "{text}"
+    );
     assert!(lines.len() <= 30);
     for more in [
         "  30 more (--detail hotspots)",
@@ -1894,20 +1948,32 @@ fn test_heatmap_json_counts_give_total_and_shown_per_section() {
 }
 
 #[test]
-fn test_heatmap_detail_coupling_text_rows_equal_the_json_total() {
+fn test_heatmap_detail_coupling_caps_at_25_rows_and_top_shows_the_json_total() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_ranked_repo(dir.path());
 
     let text = heatmap_stdout(dir.path(), &["--detail", "coupling"]);
     let json = heatmap_json_with(dir.path(), &["--detail", "coupling"]);
     let rows = section_rows(&text, "Coupling");
-    assert_eq!(rows.len(), 36, "{text}");
+    assert_eq!(rows.len(), 25, "{text}");
+    assert_eq!(
+        text.lines().last(),
+        Some("  11 more (raise --top)"),
+        "{text}"
+    );
     assert_eq!(json["counts"]["coupling"]["total"], 36);
-    assert_eq!(json["counts"]["coupling"]["shown"], 36);
-    assert_eq!(json["coupling_graph"].as_array().unwrap().len(), 36);
+    assert_eq!(json["counts"]["coupling"]["shown"], 25);
+    assert_eq!(json["coupling_graph"].as_array().unwrap().len(), 25);
     assert!(
-        !text.contains(" more ("),
-        "no row is hidden in a --detail view without --top:\n{text}"
+        !text.contains("skim heatmap <file>"),
+        "no card hint: {text}"
+    );
+
+    let all = heatmap_stdout(dir.path(), &["--detail", "coupling", "--top", "36"]);
+    assert_eq!(section_rows(&all, "Coupling").len(), 36, "{all}");
+    assert!(
+        !all.contains(" more ("),
+        "no row is hidden at --top 36:\n{all}"
     );
 }
 

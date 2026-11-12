@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The default text view is 30 lines or fewer: one header line (repository name,
   `since..until` dates, commit count, window), the top 10 hotspots by commit count, the top 5
   code-to-code coupling pairs and the top 5 fix-risk files above the repository base rate,
-  each row with its number and support. `--detail <section>` shows all rows of one section:
+  each row with its number and support. The last line points to the per-file card.
+  `--detail <section>` shows 25 rows of one section (`--top N` raises it):
   `hotspots`, `coupling`, `fix-risk`, `modules` or `bus-factor`. `--top N` now sets the rows
   of every view, `--insights` and the cards too. A capped list ends with one line that gives
   the exact hidden count. `skim heatmap <file>...` prints a "before you edit" card per file
@@ -60,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TypeScript grammar (#571 stays open).
 
 ### Changed
+
+- **`skim heatmap` leaves doc files and non-code folders out of its rankings** (#597). Doc
+  files (`*.md`, `*.rst`, `*.txt` and similar) and the top folders `docs`, `doc`, `.github`,
+  `.devflow`, `tests` and `test` no longer fill the hotspots, the modules and the insights.
+  The `N more` line counts the rows left out and names `--include-docs`, which keeps them.
+  JSON gives `left_out.{hotspots,modules}`, and `--insights --json` gives `counts.left_out`.
 
 - **The optional permission setup now allows only read-only commands.** `skim init
   --permissions` seeds 6 tools (`df`, `diff`, `du`, `grep`, `ls`, `wc`); `rg` and `tree` are
@@ -149,6 +156,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change, tracked separately.
 
 ### Fixed
+
+- **A commit counts as a fix only when its subject says so** (#597). `skim heatmap` fix risk
+  and `skim search --risky` counted a commit as a fix when a fix keyword was anywhere in its
+  subject, so `docs: explain later-fix proximity` and `feat: add bug report template` raised
+  the fix rate of their files. Now a keyword counts only as a `[fix]` tag, as the
+  conventional type (`fix:`, `fix(scope):`, `fix!:`), or as the first word of the subject
+  (`Revert "..."`, `docs: fix link`, `net/http: fix race`). The keywords stay `fix`, `bug`, `hotfix`, `patch` and
+  `revert`. An existing `skim search` index takes the new rule at its next rebuild, which the
+  next commit starts.
 
 - **`skim heatmap` sections report the right files** (#589). Hotspots are the true top N by
   commit count over all files. The fix-after-touch signal counts a commit that a later fix

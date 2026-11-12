@@ -1,5 +1,5 @@
 //! Noise rules for `skim heatmap`: support minimums, the fix-risk lift gate,
-//! the bus-factor gate, the test and doc path classes, and the insight
+//! the bus-factor gate, the test, doc and non-code path classes, and the insight
 //! thresholds.
 //!
 //! Pure functions over counts and path strings, std only. The views and the
@@ -48,6 +48,11 @@ const WILSON_Z: f64 = 1.96;
 
 /// File extensions (case-insensitive) that mark a doc file.
 const DOC_EXTENSIONS: &[&str] = &["md", "mdx", "markdown", "rst", "txt", "adoc"];
+
+/// Top folders that hold no product code. Their files stay out of the
+/// hotspots and the insights, and their modules out of the module ranking,
+/// unless `--include-docs` is given.
+const NON_CODE_DIRS: &[&str] = &["docs", "doc", ".github", ".devflow", "tests", "test"];
 
 // ============================================================================
 // Insight thresholds
@@ -187,6 +192,17 @@ pub(crate) fn is_doc_path(path: &str) -> bool {
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| DOC_EXTENSIONS.iter().any(|d| ext.eq_ignore_ascii_case(d)))
+}
+
+/// True when `path` (a file or a module folder) is not product code: a doc
+/// file ([`is_doc_path`]), or a path whose top folder is `docs`, `doc`,
+/// `.github`, `.devflow`, `tests` or `test`. A git-quoted path is read
+/// without its opening quote.
+#[must_use]
+pub(crate) fn is_non_code_path(path: &str) -> bool {
+    let unquoted = path.strip_prefix('"').unwrap_or(path);
+    let top = unquoted.split('/').next().unwrap_or(unquoted);
+    is_doc_path(path) || NON_CODE_DIRS.contains(&top)
 }
 
 // ============================================================================
@@ -364,5 +380,37 @@ mod tests {
         assert!(is_doc_path(r#""docs/a\tb.RST""#));
         assert!(!is_doc_path(r#""src/caf\303\251.rs""#));
         assert!(!is_doc_path(r#""docs/caf\303\251.md/x.rs""#));
+    }
+
+    #[test]
+    fn test_is_non_code_path_matches_doc_files_and_non_code_top_folders() {
+        for path in [
+            "CLAUDE.md",
+            "README.md",
+            "crates/x/notes.txt",
+            "docs",
+            "docs/usage.html",
+            ".github/workflows/ci.yml",
+            ".devflow/project.json",
+            "tests/fixtures/a.rs",
+            "test",
+            r#""docs/caf\303\251.png""#,
+        ] {
+            assert!(is_non_code_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_is_non_code_path_keeps_code_and_nested_test_folders() {
+        for path in [
+            "src/main.rs",
+            "crates/rskim",
+            "crates/rskim/tests/cli_heatmap.rs",
+            "docsite/index.ts",
+            "plugins/a.ts",
+            r#""src/caf\303\251.rs""#,
+        ] {
+            assert!(!is_non_code_path(path), "{path}");
+        }
     }
 }

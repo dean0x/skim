@@ -310,7 +310,7 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         };
 
         // AD-407-2: Skip merge commits (>1 parent, including octopus merges).
-        // Merge subjects (e.g. "merge(#NNN): …") never match FIX_REGEX, so
+        // Merge subjects (e.g. "merge(#NNN): …") are not fix subjects, so
         // letting them through would corrupt fix-risk classification.
         // `Info::parent_ids` is filled in by the walk itself, so this test needs
         // no object-store access: the skip runs BEFORE the object load, the
