@@ -2511,7 +2511,7 @@ check = "clash.def_count"
 ids = ["fixture-D01"]
 
 [[xfail]]
-issue = "#555"
+issue = "#553"
 check = "clash.calls_recall"
 ids = ["fixture-D01"]
 
