@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use super::hash_if_bounded;
+use super::{hash_if_bounded, remove_entries, retired_seed_entries};
 use crate::cmd::init::{
     MAX_SETTINGS_SIZE, atomic_write_settings, backup_settings_file, load_or_create_settings,
 };
@@ -80,8 +80,13 @@ impl PermissionsProtocol for ClaudePermissions {
 
         let mut settings = load_or_create_settings(&config_path)?;
 
+        // Read before the sidecar is rewritten below.
+        let retired = retired_seed_entries(config_dir, entries);
+
         // Navigate to permissions.allow, erroring loudly if type is wrong.
         let allow_array = get_or_create_allow_array(&mut settings, &config_path)?;
+
+        let entries_removed = remove_entries(allow_array, &retired);
 
         // Collect already-present entries for dedup (HashSet for O(1) membership — consistent
         // with is_current() which uses the same idiom).
@@ -98,7 +103,7 @@ impl PermissionsProtocol for ClaudePermissions {
             }
         }
 
-        if entries_added.is_empty() {
+        if entries_added.is_empty() && entries_removed.is_empty() {
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
@@ -133,7 +138,10 @@ impl PermissionsProtocol for ClaudePermissions {
         let sidecar_path = config_dir.join(SIDECAR_FILENAME);
         write_sidecar(&sidecar_path, &sidecar)?;
 
-        Ok(SeedOutcome::Added { entries_added })
+        Ok(SeedOutcome::Added {
+            entries_added,
+            entries_removed,
+        })
     }
 
     fn remove_seeded(&self, config_dir: &Path) -> anyhow::Result<RemoveOutcome> {
@@ -212,6 +220,9 @@ impl PermissionsProtocol for ClaudePermissions {
         let existing: HashSet<&str> = allow.iter().filter_map(|v| v.as_str()).collect();
 
         entries.iter().all(|e| existing.contains(e.as_str()))
+            && !retired_seed_entries(config_dir, entries)
+                .iter()
+                .any(|r| existing.contains(r.as_str()))
     }
 }
 
@@ -527,7 +538,10 @@ pub(crate) fn seed_mirrors(
     if entries_added.is_empty() {
         Ok(SeedOutcome::AlreadyCurrent)
     } else {
-        Ok(SeedOutcome::Added { entries_added })
+        Ok(SeedOutcome::Added {
+            entries_added,
+            entries_removed: Vec::new(),
+        })
     }
 }
 
@@ -699,7 +713,7 @@ mod tests {
         let outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
 
         match outcome {
-            SeedOutcome::Added { entries_added } => {
+            SeedOutcome::Added { entries_added, .. } => {
                 assert!(
                     !entries_added.contains(&existing_entry),
                     "already-present entry must not be in entries_added"
@@ -711,6 +725,101 @@ mod tests {
             }
             SeedOutcome::AlreadyCurrent => panic!("should have added one new entry"),
         }
+    }
+
+    /// Write `allow` to settings.json and a seed-tier sidecar that records `recorded`.
+    fn write_prior_seed(dir: &Path, allow: &[&str], recorded: &[&str]) {
+        let settings = serde_json::json!({ "permissions": { "allow": allow } });
+        let settings_path = dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+        let sidecar = PermissionSidecar {
+            version: 1,
+            tier: "seed".to_string(),
+            entries: recorded.iter().map(|s| s.to_string()).collect(),
+            source_mirrors: std::collections::HashMap::new(),
+            config_hash: compute_file_hash(&settings_path).unwrap(),
+        };
+        write_sidecar(&dir.join("skim-permissions.json"), &sidecar).unwrap();
+    }
+
+    fn allow_entries(dir: &Path) -> Vec<String> {
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap())
+                .unwrap();
+        after["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// A re-seed removes an entry that an earlier seed run recorded but that
+    /// the current seed list no longer contains. Unrelated entries stay.
+    #[test]
+    fn test_seed_removes_entry_retired_from_seed_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_prior_seed(
+            dir.path(),
+            &["Bash(skim df:*)", "Bash(skim rg:*)", "UserEntry"],
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+        );
+        let p = protocol();
+        let entries = vec!["Bash(skim df:*)".to_string()];
+
+        assert!(
+            !p.is_current(dir.path(), &entries),
+            "a retired seeded entry still in the allow list must make the config stale"
+        );
+
+        match p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap() {
+            SeedOutcome::Added {
+                entries_added,
+                entries_removed,
+            } => {
+                assert!(entries_added.is_empty(), "nothing new to add");
+                assert_eq!(entries_removed, vec!["Bash(skim rg:*)".to_string()]);
+            }
+            SeedOutcome::AlreadyCurrent => panic!("re-seed must remove the retired entry"),
+        }
+
+        assert_eq!(
+            allow_entries(dir.path()),
+            vec!["Bash(skim df:*)", "UserEntry"],
+            "the retired entry must be removed and every other entry kept"
+        );
+        let sidecar = load_sidecar(&dir.path().join("skim-permissions.json")).unwrap();
+        assert_eq!(sidecar.entries, entries, "sidecar must record the new list");
+        assert!(
+            p.is_current(dir.path(), &entries),
+            "config must be current after the re-seed"
+        );
+    }
+
+    /// Only a seed-tier sidecar is pruned: entries that a mirror run recorded
+    /// mirror the user's own rules and stay in place.
+    #[test]
+    fn test_seed_keeps_entries_recorded_by_mirror_tier() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_prior_seed(dir.path(), &["Bash(skim rg:*)"], &["Bash(skim rg:*)"]);
+        let sidecar_path = dir.path().join("skim-permissions.json");
+        let mut sidecar = load_sidecar(&sidecar_path).unwrap();
+        sidecar.tier = "mirror".to_string();
+        write_sidecar(&sidecar_path, &sidecar).unwrap();
+
+        let p = protocol();
+        let entries = vec!["Bash(skim df:*)".to_string()];
+        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+
+        assert_eq!(
+            allow_entries(dir.path()),
+            vec!["Bash(skim rg:*)", "Bash(skim df:*)"],
+            "a mirror-tier entry must not be removed by a seed run"
+        );
     }
 
     // ---- seed: security negatives ----

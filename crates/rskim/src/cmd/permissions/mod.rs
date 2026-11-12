@@ -14,11 +14,19 @@
 //! ## Seed derivation
 //!
 //! The seeded tool list is the intersection of `READ_ONLY_SUBCOMMANDS` and
-//! `wrapper_targets()` — always exactly 8 tools:
-//! `df`, `diff`, `du`, `grep`, `ls`, `rg`, `tree`, `wc`.
+//! `wrapper_targets()` — always exactly 7 tools:
+//! `df`, `diff`, `du`, `grep`, `ls`, `tree`, `wc`.
 //!
 //! A `Bash(skim <tool>:*)` prefix entry does NOT bound the wrapped tool's
-//! arguments, so only arg-safe read-only tools may ever be seeded.
+//! arguments, so only arg-safe read-only tools may ever be seeded. A tool with
+//! an option that starts another program (`rg --pre`) is not arg-safe.
+//!
+//! ## Retired seed entries
+//!
+//! When a tool leaves the seed list, the user-owned writers (Claude, Copilot)
+//! remove its entry on the next seed run, but only when a seed-tier sidecar
+//! recorded it ([`retired_seed_entries`]). The skim-owned writers (Gemini,
+//! Codex) regenerate their whole file, so they need no extra step.
 //!
 //! ## Registry invariant
 //!
@@ -49,11 +57,16 @@ pub(crate) use crate::cmd::init::PermissionsTier;
 /// Result of a [`PermissionsProtocol::seed`] call.
 #[derive(Debug)]
 pub(crate) enum SeedOutcome {
-    /// New entries were added to the agent config.
+    /// The agent config was changed.
     ///
     /// `entries_added` contains only the entries actually inserted; entries
     /// that were already present are skipped (idempotent dedup).
-    Added { entries_added: Vec<String> },
+    /// `entries_removed` contains the retired seed entries that were taken
+    /// out (see [`retired_seed_entries`]); it is empty for most runs.
+    Added {
+        entries_added: Vec<String>,
+        entries_removed: Vec<String>,
+    },
     /// All requested entries were already present — config was not modified.
     AlreadyCurrent,
 }
@@ -224,7 +237,7 @@ pub(super) fn hash_if_bounded(path: &std::path::Path) -> anyhow::Result<Option<S
 /// Compute the agent-native seed entries for a permissions protocol.
 ///
 /// The seed tool list is `READ_ONLY_SUBCOMMANDS ∩ wrapper_targets()`, which
-/// is always exactly the 8 tools declared in `READ_ONLY_SUBCOMMANDS` (registry
+/// is always exactly the 7 tools declared in `READ_ONLY_SUBCOMMANDS` (registry
 /// tests enforce that it is a strict subset of `wrapper_targets()`).
 ///
 /// Each tool is mapped through `protocol.render_entry(tool)` to produce the
@@ -243,6 +256,44 @@ pub(crate) fn seeded_entries(protocol: &dyn PermissionsProtocol) -> Vec<String> 
     // sorting here makes the invariant explicit and testable).
     entries.sort();
     entries
+}
+
+/// Entries that an earlier seed-tier run recorded in the sidecar at
+/// `config_dir` but that `entries` (the current seed list) no longer contains.
+///
+/// The user-owned writers (Claude, Copilot) merge into the allow list, so
+/// without this step a tool that left the seed list keeps its entry after a
+/// re-seed. Only a `"seed"`-tier sidecar is consulted: a mirror-tier sidecar
+/// records mirrors of the user's own rules, which a seed run must not remove.
+/// A missing or unreadable sidecar gives an empty list (nothing is known to
+/// be skim's, so nothing is removed).
+pub(super) fn retired_seed_entries(config_dir: &Path, entries: &[String]) -> Vec<String> {
+    match sidecar::load_sidecar(&config_dir.join(sidecar::SIDECAR_FILENAME)) {
+        Ok(recorded) if recorded.tier == "seed" => recorded
+            .entries
+            .into_iter()
+            .filter(|e| !entries.contains(e))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Remove every string in `targets` from `allow`; return the removed strings
+/// in their allow-list order. Used by the user-owned writers (Claude, Copilot)
+/// to take out [`retired_seed_entries`].
+pub(super) fn remove_entries(
+    allow: &mut Vec<serde_json::Value>,
+    targets: &[String],
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    allow.retain(|v| match v.as_str() {
+        Some(s) if targets.iter().any(|t| t == s) => {
+            removed.push(s.to_string());
+            false
+        }
+        _ => true,
+    });
+    removed
 }
 
 // ============================================================================
@@ -309,14 +360,14 @@ mod tests {
         );
     }
 
-    // ---- literal-8 seed pin (Claude) ----
+    // ---- literal-7 seed pin (Claude) ----
 
-    /// Claude seeded entries must equal exactly the 8 `Bash(skim <tool>:*)` strings.
+    /// Claude seeded entries must equal exactly the 7 `Bash(skim <tool>:*)` strings.
     ///
     /// This test pins the entry set. Any future addition requires a deliberate
     /// edit to READ_ONLY_SUBCOMMANDS AND this assertion — drift is never silent.
     #[test]
-    fn test_claude_seeded_entries_exact_8() {
+    fn test_claude_seeded_entries_exact_7() {
         let protocol = permissions_protocol_for_agent(AgentKind::ClaudeCode).unwrap();
         let entries = seeded_entries(protocol.as_ref());
         assert_eq!(
@@ -327,23 +378,33 @@ mod tests {
                 "Bash(skim du:*)",
                 "Bash(skim grep:*)",
                 "Bash(skim ls:*)",
-                "Bash(skim rg:*)",
                 "Bash(skim tree:*)",
                 "Bash(skim wc:*)",
             ],
-            "Claude seeded entries must be exactly the 8 Bash(skim <tool>:*) strings (sorted)"
+            "Claude seeded entries must be exactly the 7 Bash(skim <tool>:*) strings (sorted)"
         );
     }
 
+    /// No agent's seed list may name `rg`: its `--pre`, `--hostname-bin` and
+    /// `-z` options start another program, and every seeded rule is a prefix
+    /// rule that does not bound the arguments.
     #[test]
-    fn test_claude_seeded_entries_count_is_8() {
-        let protocol = permissions_protocol_for_agent(AgentKind::ClaudeCode).unwrap();
-        let entries = seeded_entries(protocol.as_ref());
-        assert_eq!(
-            entries.len(),
-            8,
-            "seed must always derive exactly 8 entries"
-        );
+    fn test_no_agent_seeds_rg() {
+        for &agent in &[
+            AgentKind::ClaudeCode,
+            AgentKind::GeminiCli,
+            AgentKind::CodexCli,
+            AgentKind::CopilotCli,
+        ] {
+            let p = permissions_protocol_for_agent(agent).unwrap();
+            let rg_entry = p.render_entry("rg");
+            let entries = seeded_entries(p.as_ref());
+            assert!(
+                !entries.contains(&rg_entry),
+                "{agent:?} must not seed '{rg_entry}', got {entries:?}"
+            );
+            assert_eq!(entries.len(), 7, "{agent:?} must seed exactly 7 entries");
+        }
     }
 
     // ---- per-agent render_entry ----

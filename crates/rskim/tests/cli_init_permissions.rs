@@ -168,15 +168,15 @@ fn test_permissions_non_tty_writes_nothing_copilot() {
 }
 
 // ============================================================================
-// --dry-run: must enumerate 8 entries for Claude, not write anything
+// --dry-run: must enumerate 7 entries for Claude, not write anything
 // ============================================================================
 
 /// `skim init --agent claude --permissions --dry-run` must:
 /// - Exit 0.
-/// - Print all 8 `Bash(skim <tool>:*)` entries (F1: dry-run bypasses consent).
+/// - Print all 7 `Bash(skim <tool>:*)` entries, and no `rg` entry (F1: dry-run bypasses consent).
 /// - Write NO sidecar or any other file.
 #[test]
-fn test_permissions_dry_run_enumerates_8_claude_entries() {
+fn test_permissions_dry_run_enumerates_7_claude_entries() {
     let home = TempDir::new().unwrap();
     let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
 
@@ -197,16 +197,20 @@ fn test_permissions_dry_run_enumerates_8_claude_entries() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // Dry-run must mention all 8 Bash(skim <tool>:*) entries regardless of TTY.
+    // Dry-run must mention all 7 Bash(skim <tool>:*) entries regardless of TTY.
     // Consent is not required to DISPLAY what would happen; the line annotates
     // that real-install consent would still be required.
-    for tool in &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"] {
+    for tool in &["df", "diff", "du", "grep", "ls", "tree", "wc"] {
         let entry = format!("Bash(skim {tool}:*)");
         assert!(
             stdout.contains(&entry),
             "dry-run must enumerate '{entry}' in stdout, got:\n{stdout}"
         );
     }
+    assert!(
+        !stdout.contains("Bash(skim rg:*)"),
+        "dry-run must not offer 'Bash(skim rg:*)', got:\n{stdout}"
+    );
 
     // Sanity: the consent-annotation line must be present.
     assert!(

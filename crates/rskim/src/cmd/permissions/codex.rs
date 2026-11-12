@@ -42,7 +42,7 @@
 
 use std::path::Path;
 
-use super::hash_if_bounded;
+use super::{hash_if_bounded, retired_seed_entries};
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
@@ -108,6 +108,10 @@ impl PermissionsProtocol for CodexPermissions {
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
+        // The file is regenerated whole, so retired entries go with it; read
+        // them before the sidecar is rewritten, only to report them.
+        let entries_removed = retired_seed_entries(config_dir, entries);
+
         // Generate the rules file content.
         let content = generate_rules(entries);
 
@@ -143,6 +147,7 @@ impl PermissionsProtocol for CodexPermissions {
 
         Ok(SeedOutcome::Added {
             entries_added: entries.to_vec(),
+            entries_removed,
         })
     }
 
@@ -450,6 +455,35 @@ mod tests {
         let sidecar = load_sidecar(&sidecar_path).unwrap();
         assert_eq!(sidecar.entries, entries);
         assert!(!sidecar.config_hash.is_empty());
+    }
+
+    /// An install that an older skim seeded with `rg` is stale for the
+    /// current list, and a re-seed regenerates the rules file without it.
+    #[test]
+    fn test_reseed_drops_rule_retired_from_seed_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let old = vec!["df".to_string(), "rg".to_string()];
+        p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
+
+        let entries = seeded_entries(p.as_ref());
+        assert!(
+            !p.is_current(dir.path(), &entries),
+            "an install that recorded 'rg' must be stale for the current list"
+        );
+
+        let outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        match outcome {
+            SeedOutcome::Added {
+                entries_removed, ..
+            } => assert_eq!(entries_removed, vec!["rg".to_string()]),
+            SeedOutcome::AlreadyCurrent => panic!("re-seed must rewrite the rules file"),
+        }
+        let contents = std::fs::read_to_string(dir.path().join("rules/skim.rules")).unwrap();
+        assert!(
+            !contents.contains("\"skim rg\""),
+            "rules file must not allow 'skim rg', got:\n{contents}"
+        );
     }
 
     #[test]

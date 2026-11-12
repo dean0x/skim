@@ -212,8 +212,13 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 ///
 /// INVARIANT: every entry must also be in `KNOWN_SUBCOMMANDS` and in
 /// `wrapper_targets()`. Tests enforce both.
+///
+/// INVARIANT: no entry may have an option that starts another program, because
+/// a seeded prefix entry does not bound the arguments. That is why `rg` is not
+/// here: `--pre`, `--hostname-bin` and `-z`/`--search-zip` start programs.
+/// `test_read_only_subcommands_exclude_program_start_tools` enforces this.
 pub(crate) static READ_ONLY_SUBCOMMANDS: &[&str] =
-    &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"];
+    &["df", "diff", "du", "grep", "ls", "tree", "wc"];
 
 /// Check whether `tool` is a read-only subcommand.
 ///
@@ -370,7 +375,7 @@ mod tests {
         }
     }
 
-    /// Pin test: READ_ONLY_SUBCOMMANDS must equal exactly these 8 tools.
+    /// Pin test: READ_ONLY_SUBCOMMANDS must equal exactly these 7 tools.
     ///
     /// Any future addition must be accompanied by a deliberate test edit,
     /// preventing silent formula drift.
@@ -378,10 +383,25 @@ mod tests {
     fn test_read_only_subcommands_exact_contents() {
         assert_eq!(
             READ_ONLY_SUBCOMMANDS,
-            &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"],
-            "READ_ONLY_SUBCOMMANDS must equal exactly the declared 8-tool set; \
+            &["df", "diff", "du", "grep", "ls", "tree", "wc"],
+            "READ_ONLY_SUBCOMMANDS must equal exactly the declared 7-tool set; \
              update this test intentionally if adding a new read-only tool"
         );
+    }
+
+    /// A seeded prefix entry (`Bash(skim <tool>:*)`) does not bound the
+    /// arguments, so a tool with an option that starts another program must
+    /// never be in READ_ONLY_SUBCOMMANDS. `find` has `-exec`/`-ok`; `rg` has
+    /// `--pre`, `--hostname-bin` and `-z`/`--search-zip`.
+    #[test]
+    fn test_read_only_subcommands_exclude_program_start_tools() {
+        for tool in ["find", "rg"] {
+            assert!(
+                !READ_ONLY_SUBCOMMANDS.contains(&tool),
+                "'{tool}' has an option that starts another program; \
+                 it must not be in READ_ONLY_SUBCOMMANDS"
+            );
+        }
     }
 
     /// is_read_only returns true for each declared entry.

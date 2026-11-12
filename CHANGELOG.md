@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The optional permission setup now allows only read-only commands.** `skim init
+  --permissions` seeds 7 tools (`df`, `diff`, `du`, `grep`, `ls`, `tree`, `wc`); `rg` is no
+  longer in the list. On the next `skim init --permissions`, an install that an older skim
+  seeded removes its `rg` entry and prints `removed 1 entry that skim no longer seeds`. Other
+  allow-list entries stay as they are. To keep `rg` allowed, add the entry yourself.
+
 - **Machine-contract flags on `skim git` now serve git's own bytes verbatim** (#576,
   ADR-022) — `--porcelain` (including `=v1`/`=v2`), `--null`/`-z` (matched anywhere in a
   single-dash cluster, so `git status -sz` counts), `--stat`, `--shortstat`, `--numstat`,

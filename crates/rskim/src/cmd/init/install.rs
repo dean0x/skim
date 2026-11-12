@@ -387,14 +387,32 @@ fn write_permissions(state: &DetectedState, tier: PermissionsTier) -> anyhow::Re
     };
 
     match outcome {
-        crate::cmd::permissions::SeedOutcome::Added { entries_added } => {
-            println!(
-                "  {} Permissions: added {} entr{} to {}",
-                check_mark(true),
-                entries_added.len(),
-                if entries_added.len() == 1 { "y" } else { "ies" },
-                protocol.config_filename()
-            );
+        crate::cmd::permissions::SeedOutcome::Added {
+            entries_added,
+            entries_removed,
+        } => {
+            if !entries_added.is_empty() {
+                println!(
+                    "  {} Permissions: added {} entr{} to {}",
+                    check_mark(true),
+                    entries_added.len(),
+                    if entries_added.len() == 1 { "y" } else { "ies" },
+                    protocol.config_filename()
+                );
+            }
+            if !entries_removed.is_empty() {
+                println!(
+                    "  {} Permissions: removed {} entr{} that skim no longer seeds: {}",
+                    check_mark(true),
+                    entries_removed.len(),
+                    if entries_removed.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    entries_removed.join(", ")
+                );
+            }
         }
         crate::cmd::permissions::SeedOutcome::AlreadyCurrent => {
             println!("  {} Permissions: already current", check_mark(true));

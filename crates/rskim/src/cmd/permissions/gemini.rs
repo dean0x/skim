@@ -42,7 +42,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use super::hash_if_bounded;
+use super::{hash_if_bounded, retired_seed_entries};
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
@@ -115,6 +115,10 @@ impl PermissionsProtocol for GeminiPermissions {
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
+        // The file is regenerated whole, so retired entries go with it; read
+        // them before the sidecar is rewritten, only to report them.
+        let entries_removed = retired_seed_entries(config_dir, entries);
+
         // Generate the TOML content from entries.
         let toml_content = generate_toml(entries)?;
 
@@ -150,6 +154,7 @@ impl PermissionsProtocol for GeminiPermissions {
 
         Ok(SeedOutcome::Added {
             entries_added: entries.to_vec(),
+            entries_removed,
         })
     }
 
