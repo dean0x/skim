@@ -49,9 +49,6 @@ fn git_not_found(e: anyhow::Error) -> anyhow::Error {
 /// glob or pathspec magic applies. A new method that takes a path from the
 /// user must do the same. (`CliGitSource::fetch_diff_files` takes a revision,
 /// not a path: see `build_diff_args`.)
-///
-/// Long-term, this trait will be replaced by `rskim_search::TemporalSource` +
-/// `GixSource` once the heatmap pipeline migrates from CLI git to the gix library.
 pub(crate) trait GitDataSource {
     /// Return `true` when the cwd is inside a git repository.
     fn is_git_repo(&self) -> bool;

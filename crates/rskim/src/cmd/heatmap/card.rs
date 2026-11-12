@@ -456,7 +456,7 @@ fn fix_commits_of(touched: &[&CommitInfo]) -> Vec<FixCommit> {
     let mut fixes: Vec<&CommitInfo> = touched
         .iter()
         .copied()
-        .filter(|c| rskim_search::is_fix_commit(&c.message))
+        .filter(|c| super::metrics::is_fix_commit(&c.message))
         .collect();
     fixes.sort_by(|x, y| {
         y.timestamp

@@ -75,7 +75,6 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--session"
             | "--agent"
             | "--format"
-            | "--blast-radius"
             | "--session-id"
     )
 }
@@ -2216,7 +2215,6 @@ mod tests {
         "--session",
         "--agent",
         "--format",
-        "--blast-radius",
         "--session-id",
     ];
 

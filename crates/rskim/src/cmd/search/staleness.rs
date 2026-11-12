@@ -6,7 +6,7 @@
 //!
 //! # Module layout
 //!
-//! This module owns four distinct concerns, separated into sibling modules to
+//! This module owns three distinct concerns, separated into sibling modules to
 //! keep each one's scope clear:
 //!
 //! 1. **Git plumbing** ([`super::gitdir`]) — `HeadState`, `resolve_git_dir`,
@@ -16,14 +16,10 @@
 //! 2. **Index staleness policy** (this file) — `StalenessCheck`, `WorkingTreeDelta`,
 //!    `scan_working_tree`, `check_staleness`, `RefreshOutcome`, `auto_refresh_if_stale`.
 //!
-//! 3. **Temporal-DB concerns** ([`super::temporal_state`]) — `ReanchorPolicy`,
-//!    `AnchorState`, `temporal_anchor_state`, `temporal_db_is_stale`,
-//!    `warn_if_temporal_unverifiable`, `try_rebuild_temporal_nonfatal`.
+//! 3. **Git-fixture test helpers** (this file, `#[cfg(test)]`) — `create_real_git_repo`,
+//!    `create_real_git_repo_with_dates`, `create_real_git_worktree`.
 //!
-//! 4. **Git-fixture test helpers** (this file, `#[cfg(test)]`) — `create_real_git_repo`,
-//!    `create_real_git_repo_with_dates`, `create_real_git_worktree`, `plant_meta_raw`.
-//!
-//! Re-exports from (1) and (3) preserve the `staleness::*` access path used by
+//! Re-exports from (1) preserve the `staleness::*` access path used by
 //! `mod.rs`, `hooks.rs`, and the test suite — callers do not need to know which
 //! sub-module owns each item.
 
@@ -42,16 +38,6 @@ pub(super) use super::gitdir::{
 // but not within `staleness.rs` itself — suppress the false-positive unused_imports lint.
 #[allow(unused_imports)]
 pub(super) use super::gitdir::resolve_repo_toplevel;
-
-// Re-export temporal-DB items (owned by temporal_state.rs).
-#[cfg(test)]
-pub(super) use super::temporal_state::TEMPORAL_META_READ_COUNT;
-#[cfg(test)]
-pub(super) use super::temporal_state::temporal_anchor_state;
-pub(super) use super::temporal_state::{
-    AnchorState, ReanchorPolicy, anchor_state_on_db, temporal_db_is_stale,
-    try_rebuild_temporal_nonfatal, warn_if_temporal_unverifiable,
-};
 
 // ============================================================================
 // Staleness outcome
@@ -413,8 +399,8 @@ pub(super) fn check_staleness(
     // enclosing repository via resolve_repo_toplevel) must NOT use HEAD-based
     // invalidation.  A commit anywhere in the enclosing repo changes the repo HEAD
     // even when no files under the subtree changed, so `HeadChanged` would trigger a
-    // full lexical+temporal rebuild on every unrelated commit (e.g. a commit to
-    // `crates/rskim` when `--root crates/rskim-search` is in use).  For adopted roots
+    // full rebuild on every unrelated commit (e.g. a commit to
+    // `crates/rskim` when `--root crates/rskim-core` is in use).  For adopted roots
     // the working-tree metadata scan already detects any real change under the subtree
     // (mtime + size, same as the standard path), so HEAD-based invalidation is both
     // redundant and over-broad.  `resolve_git_dir` returning `None` is the correct
@@ -511,46 +497,13 @@ impl RefreshOutcome {
 ///
 /// This is a convenience wrapper for the query path: call it before opening
 /// the reader so callers always get a fresh index.
-///
-/// # HEAD threading (O-A / #289)
-///
-/// `read_git_head(root)` is called ONCE at function entry and the result is
-/// threaded into `rebuild_temporal`. Note that `check_staleness` also calls
-/// `read_git_head` internally — both calls are advisory and safe because the
-/// lexical manifest records the HEAD that `build_index` writes, and
-/// `rebuild_temporal` records the HEAD passed here. If a commit lands between
-/// the two reads the manifest will record the pre-commit HEAD and temporal.db
-/// will record the post-commit HEAD; both will appear stale on the next query,
-/// triggering one more refresh. This is the accepted TOCTOU trade-off.
-/// AD-413 Finding 2: returns the `HeadState` resolved at function entry so
-/// temporal-consuming call sites do not need a second `git_head_state` call.
-/// All four call sites in `mod.rs` (--ast arm, `run_update`, `execute_query`,
-/// `run_temporal_standalone`) previously discarded this value and re-called
-/// `git_head_state` right after returning, triggering an extra full HEAD-ladder
-/// traversal on every query (three traversals instead of two on a linked
-/// worktree with packed-refs).
 pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
-    reanchor: ReanchorPolicy,
-    // Pre-resolved HeadState from the caller, or None to resolve here.
-    // When Some, the resolution syscall is skipped so callers that have
-    // already called git_head_state do not incur a second HEAD-ladder
-    // traversal (Finding [low/performance] fix).  None preserves the
-    // previous behaviour.
-    pre_resolved_head: Option<HeadState>,
-) -> anyhow::Result<(RefreshOutcome, FileManifest, HeadState)> {
+) -> anyhow::Result<(RefreshOutcome, FileManifest)> {
     use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
-
-    // Classify git HEAD state once at function entry so rebuild_temporal records
-    // the same SHA that will be in the manifest after build_index runs.
-    // Step 6 (AD-413-7): use the three-state HeadState rather than Option<String>
-    // so the same read feeds both the temporal rebuild and the anchor check.
-    // Finding [low/performance] fix: use the caller-supplied value when present.
-    let head_state = pre_resolved_head.unwrap_or_else(|| git_head_state(root));
-    let current_head: Option<&str> = head_state.sha();
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);
 
@@ -560,33 +513,7 @@ pub(super) fn auto_refresh_if_stale(
             // Defensive fallback: should not happen (Current implies manifest loaded).
             FileManifest::new(root.to_path_buf(), cache_dir.to_path_buf())
         });
-
-        // AD-TMP-2: temporal.db has its own staleness gate, independent of
-        // lexical staleness (#357 BUG B). The lexical index is current, but
-        // temporal.db may be missing or HEAD-divergent (post-upgrade, manual
-        // delete, or 2nd+ query after a --rebuild that predated this fix).
-        // Check and self-heal here BEFORE the early return, so that a bare
-        // `skim search --hot` (routed via auto_refresh_if_stale) always has
-        // fresh temporal data when the lexical index is current.
-        // Non-fatal by SEARCH-ADR-006/D5: temporal failure must NOT fail the query.
-        //
-        // Guard ordering (#357 cycle-2 finding 19): `let Some(head)` is evaluated
-        // FIRST (short-circuits on non-git dirs where current_head=None BEFORE the
-        // temporal_db_is_stale() call, avoiding a wasted DB open).
-        // `temporal_db_is_stale` only runs when HEAD is readable.
-        // AD-414-14: pass the git_dir so Check 3 (shallow→full) can probe the
-        // `.git/shallow` file. Stored in a local so the PathBuf lifetime extends
-        // across the condition expression.
-        let git_dir_for_stale = resolve_git_dir(root);
-        if let Some(head) = current_head
-            && temporal_db_is_stale(cache_dir, head, git_dir_for_stale.as_deref())
-        {
-            // `head` is `Some` here by construction, so `head_state` is
-            // `Resolved` and AD-414-22's unborn arm is unreachable from this gate.
-            try_rebuild_temporal_nonfatal(root, cache_dir, &head_state, "self-heal", reanchor);
-        }
-
-        return Ok((RefreshOutcome::UpToDate, manifest, head_state));
+        return Ok((RefreshOutcome::UpToDate, manifest));
     }
 
     // All rebuild paths share the same config.
@@ -604,8 +531,8 @@ pub(super) fn auto_refresh_if_stale(
     // Tracks whether a pipeline build actually ran. Every arm below rebuilds
     // unconditionally EXCEPT WorkingTreeChanged, which may skip the rebuild when
     // a concurrent peer already refreshed the index (AD-379-8). When the build is
-    // skipped we must report `UpToDate` and skip the post-rebuild temporal hook
-    // (nothing was rebuilt), so the steady-state no-op contract (AC7/AC14) holds.
+    // skipped we must report `UpToDate`, so the steady-state no-op contract
+    // (AC7/AC14) holds.
     let mut build_ran = true;
 
     match staleness {
@@ -683,38 +610,19 @@ pub(super) fn auto_refresh_if_stale(
         // return UpToDate (steady-state no-op contract AC7/AC14).
         let manifest = existing_manifest
             .unwrap_or_else(|| FileManifest::new(root.to_path_buf(), cache_dir.to_path_buf()));
-        return Ok((RefreshOutcome::UpToDate, manifest, head_state));
+        return Ok((RefreshOutcome::UpToDate, manifest));
     }
 
     // After a rebuild, load the freshly written manifest for the caller.
-    // This manifest was written by `build_index` and records `current_head`.
+    // This manifest was written by `build_index` and records the current HEAD.
     let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
-
-    // ── #289 temporal build hook point ───────────────────────────────────────
-    // Populate temporal.db AFTER the lexical+AST manifest is persisted.
-    // (applies SEARCH-ADR-006: temporal is a derived satellite; must not be written
-    // off a half-built index)
-    //
-    // `rebuild_temporal` acquires its own bounded `.skim-build.lock` around
-    // the parse+sync phase and degrades gracefully on non-git dirs, gix errors,
-    // or CapacityExceeded — a temporal failure MUST NOT fail the lexical refresh.
-    //
-    // `head_state` is the HEAD classification read at function entry above.
-    // try_rebuild_temporal_nonfatal no-ops gracefully on a non-git project
-    // (`NotARepo`); AD-414-22: an unborn HEAD (`Unresolved`) builds an empty
-    // temporal.db plus the AC-16 notice on the explicit arms only.
-    // `reanchor` is threaded from the caller: only the explicit build arms
-    // (`--build`, `--rebuild`, `--update`) pass `Allow`; query-triggered refreshes
-    // pass `Refuse` so anchor mismatch leaves temporal.db untouched (PF-017).
-    try_rebuild_temporal_nonfatal(root, cache_dir, &head_state, "post-rebuild", reanchor);
-    // ─────────────────────────────────────────────────────────────────────────
 
     let outcome = if is_no_index {
         RefreshOutcome::FirstBuild
     } else {
         RefreshOutcome::Incremental
     };
-    Ok((outcome, manifest, head_state))
+    Ok((outcome, manifest))
 }
 
 // ============================================================================
@@ -723,10 +631,9 @@ pub(super) fn auto_refresh_if_stale(
 
 /// Create a real git repository with commits.
 ///
-/// Canonical shared helper used by `staleness_tests.rs`, `temporal_build_tests.rs`,
-/// and `mod.rs` test modules — eliminates the three near-verbatim copies that would
-/// otherwise drift independently (see #357 cycle-2 findings 9/14, and the plan's
-/// step 6 recommendation). `pub(super)` makes it accessible to all `#[cfg(test)]`
+/// Canonical shared helper used by the `staleness_tests.rs` and `mod.rs` test
+/// modules — eliminates near-verbatim copies that would otherwise drift
+/// independently. `pub(super)` makes it accessible to all `#[cfg(test)]`
 /// users within `crate::cmd::search` via `super::staleness::create_real_git_repo`.
 ///
 /// For tests that need per-commit date control, use [`create_real_git_repo_with_dates`].
@@ -876,31 +783,6 @@ pub(super) fn create_real_git_worktree(
         .output()
         .expect("git rev-parse HEAD in worktree");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// Test-only helper: write a single `meta` key/value pair directly via raw SQL,
-/// bypassing the `TemporalDb::set_meta` version-attestation guard (AD-408-3).
-///
-/// Tests need to construct adversarial persisted states — a half-attested DB
-/// (`git_head` present, `data_version` absent), a corrupt/non-integer
-/// `data_version`, or a future/legacy version — that the production `set_meta`
-/// guard deliberately rejects with a `debug_assert!`. Those raw-bytes scenarios
-/// (simulating a DB written by another / older / corrupt binary) belong at the
-/// storage layer, not the guarded domain API.
-///
-/// Requires the `meta` table to already exist (created by `TemporalDb::open`)
-/// and opens its own short-lived connection, so any live `TemporalDb` handle on
-/// the same file must be dropped first to avoid write contention. `pub(super)`
-/// makes it reachable from all `#[cfg(test)]` modules within
-/// `crate::cmd::search` (`staleness_tests.rs`, `temporal_tests.rs`).
-#[cfg(test)]
-pub(super) fn plant_meta_raw(db_path: &std::path::Path, key: &str, value: &str) {
-    let conn = rusqlite::Connection::open(db_path).expect("open temporal.db for meta plant");
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-        rusqlite::params![key, value],
-    )
-    .expect("plant meta row");
 }
 
 /// Test-only re-export of `scan_working_tree` for AC9 / AC7 integration tests

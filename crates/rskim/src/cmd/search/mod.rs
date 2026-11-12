@@ -13,9 +13,7 @@
 //! - `hooks` — git hook installation/removal
 //! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
 
-mod ast;
 mod build_lock;
-mod degraded;
 mod gitdir;
 pub(crate) mod hooks;
 mod index;
@@ -23,9 +21,6 @@ mod manifest;
 mod query;
 mod snippet;
 mod staleness;
-mod temporal;
-mod temporal_build;
-mod temporal_state;
 mod types;
 mod walk;
 
@@ -33,42 +28,9 @@ use std::io::{BufWriter, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use serde::Serialize;
-
 // ============================================================================
 // User-facing message constants
 // ============================================================================
-
-/// Warning message emitted (to stderr or JSON envelope) when a standalone
-/// temporal query (`--hot`/`--cold`/`--risky`/`--blast-radius`) finds no
-/// temporal data after the self-heal attempt.
-///
-/// Single source of truth for AC9 and for every other "no temporal data"
-/// message in this module tree (used in run_temporal_standalone, the --ast arm,
-/// and temporal.rs --blast-radius path via `super::NO_TEMPORAL_DATA_MSG`).
-/// Changing the production message here immediately breaks the AC9 test,
-/// preventing silent regression to the old manual-rebuild advice (#357 cycle-2).
-pub(super) const NO_TEMPORAL_DATA_MSG: &str =
-    "no temporal data — run 'skim search' on a git repo to auto-populate";
-
-/// git HEAD is inside a repo but the symbolic-ref could not be resolved to a SHA.
-///
-/// Causes: (1) unborn branch — HEAD points to a branch that has no commits yet;
-/// (2) unsupported ref backend (e.g. reftable — tracked in #481).
-/// Named constant so tests can assert against it without hardcoding the text.
-/// AD-413-8. Must NOT contain "run 'skim search' on a git repo" (AC18(a)/AC33(c)).
-pub(super) const HEAD_UNRESOLVED_TEMPORAL_MSG: &str = "git HEAD could not be resolved to a SHA (unborn branch, or unsupported ref \
-     backend such as reftable — tracked in #481); temporal data unavailable";
-
-/// Anchor refusal prefix — temporal data on disk was built from a different
-/// repository than the one this root now resolves to.
-///
-/// The full emitted message appends "(recorded: …, live: …); run …" so tests
-/// can assert `stderr.contains(SUBDIR_ROOT_TEMPORAL_MSG)` for the stable prefix.
-/// Must NOT contain "run 'skim search' on a git repo" (AC18(a)/AC33(c)).
-/// AD-413-16.
-pub(super) const SUBDIR_ROOT_TEMPORAL_MSG: &str =
-    "temporal data on disk was built from a different repository";
 
 /// Canonical enumeration of all recognised flags for `skim search`.
 ///
@@ -78,8 +40,43 @@ pub(super) const SUBDIR_ROOT_TEMPORAL_MSG: &str =
 /// `print_help` is intentionally separate (different format and prose
 /// descriptions).
 const KNOWN_FLAGS: &str = "--build, --rebuild, --update, --stats, --install-hooks, \
-    --remove-hooks, --json, -j, --limit, -n, --offset, --root, --ast, --hot, --cold, \
-    --risky, --blast-radius, --weights, --phrase, --near, --lang, --help, -h";
+    --remove-hooks, --json, -j, --limit, -n, --offset, --root, --phrase, --near, --lang, \
+    --help, -h";
+
+/// Exit code for a flag that `skim search` no longer accepts.
+const REMOVED_FLAG_EXIT_CODE: u8 = 2;
+
+/// Flags that `skim search` no longer accepts, each with the advice that
+/// replaces it.
+///
+/// A removed flag is refused during flag parsing, before any file is read or
+/// written. The refusal prints one line on stderr and nothing on stdout.
+const REMOVED_FLAGS: [(&str, &str); 6] = [
+    ("--ast", "use ast-grep for structural search"),
+    ("--hot", "use skim heatmap for churn and fix density"),
+    ("--cold", "use skim heatmap for churn and fix density"),
+    ("--risky", "use skim heatmap for churn and fix density"),
+    (
+        "--blast-radius",
+        "use skim heatmap, or git log --name-only -- FILE, for co-change",
+    ),
+    ("--weights", "there is no fused ranking"),
+];
+
+/// The refusal message for `arg` when it names a removed flag, in the bare
+/// (`--ast`) or the attached-value (`--ast=x`) form.
+///
+/// The message quotes the flag name from [`REMOVED_FLAGS`], never the argument
+/// text, so an attached value cannot reach the terminal.
+fn removed_flag_message(arg: &str) -> Option<String> {
+    REMOVED_FLAGS.iter().find_map(|(flag, advice)| {
+        let is_flag = arg == *flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='));
+        is_flag.then(|| format!("skim search: {flag} was removed in 3.0.0; {advice}"))
+    })
+}
 
 // ============================================================================
 // Public entry point
@@ -95,6 +92,8 @@ const KNOWN_FLAGS: &str = "--build, --rebuild, --update, --stats, --install-hook
 /// - `skim search --install-hooks` — install git hooks
 /// - `skim search --remove-hooks` — remove git hooks
 /// - `skim search [--json] [--limit N] <QUERY>` — search
+/// - A removed flag (`--ast`, `--hot`, `--cold`, `--risky`, `--blast-radius`,
+///   `--weights`) — refuse with exit 2 and name the replacement
 /// - No args / `--help` / `-h` — print help
 ///
 /// # AD-375-1 — The `index` positional was removed (#375, avoids PF-006).
@@ -122,15 +121,6 @@ pub(crate) fn run(
     // parse_flags so the `--` end-of-flags boundary has a single owner.
     let flags = parse_flags(args)?;
 
-    // ── Validation order (deterministic — tests rely on this ordering) ──────
-    // --ast pattern validated before dispatch; composes freely with temporal flags
-    // (mutual exclusion of sort modes is enforced earlier, in parse_flags).
-    //   1. single-node pattern → #283 error.
-    //   2. unknown pattern → lists available names.
-    if let Some(ref raw_ast) = flags.ast {
-        ast::validate_ast_pattern(raw_ast)?;
-    }
-
     // AD-403-5 / PF-006: single pre-dispatch guard for positional-flag inert notice.
     // Fires before `match flags.action` so it covers every arm. A whitespace-only
     // query is treated as no-text (mirrors the `!text.trim().is_empty()` guard below).
@@ -143,6 +133,10 @@ pub(crate) fn run(
         SearchAction::Help => {
             print_help();
             Ok(ExitCode::SUCCESS)
+        }
+        SearchAction::Removed(ref message) => {
+            eprintln!("{message}");
+            Ok(ExitCode::from(REMOVED_FLAG_EXIT_CODE))
         }
         SearchAction::Build => run_build(false, &flags.root_override, analytics),
         SearchAction::Rebuild => run_build(true, &flags.root_override, analytics),
@@ -158,165 +152,6 @@ pub(crate) fn run(
         // response consistent with what is_empty() returns for a zero-length query.
         SearchAction::Query(ref text) if !text.trim().is_empty() => {
             run_query(text.trim(), &flags, analytics)
-        }
-        // Empty query + --ast → standalone AST dispatch.  This arm now also handles
-        // --ast combined with a temporal sort (--hot/--cold/--risky) and/or
-        // --blast-radius (the interim guard that blocked the combination was removed):
-        //
-        // - --blast-radius: temporal::resolve_blast_radius_file_ids resolves co-change
-        //   peers to FileIds; run_ast_standalone intersects them with the AST result
-        //   set BEFORE truncation (avoids PF-006 silent feature-drop).
-        // - --hot/--cold/--risky: the opened temporal DB is threaded in; run_ast_standalone
-        //   enriches + re-sorts the AST matches by temporal score, then truncates to --limit.
-        //
-        // Ordered BEFORE the temporal-only arm so `--ast --hot` lands here (the AST
-        // filter is honoured), never silently in run_temporal_standalone (R1/GAP-6).
-        SearchAction::Query(_) if let Some(ref raw) = flags.ast => {
-            // AD-377-2 / PF-006: standalone --ast (empty text) runs no weighted RRF,
-            // so any supplied --weights is wholly inert.  Emit the SAME fully-inert
-            // notice as the execute_query_with_manifest paths via the single shared
-            // helper/const (PF-008) so AC8 asserts an identical substring.  `has_text`
-            // is false on this arm (a non-empty query routes to run_query above),
-            // `has_ast` true.  stderr only — stdout (incl. --json) stays byte-identical
-            // (AC9).
-            if let Some(notice) = query::weights_inert_notice(
-                flags.weights,
-                /* has_text */ false,
-                /* has_ast */ true,
-                flags.blast_radius.is_some(),
-            ) {
-                eprintln!("{notice}");
-            }
-            // PF-006: --lang is only honored when a text query is present (the lexical
-            // reader applies lang_filter at query time). On the standalone --ast path
-            // there is no text query, so --lang is inert — emit a notice rather than
-            // silently ignoring it. Use --ast with a text query to combine both filters.
-            if flags.lang.is_some() {
-                eprintln!(
-                    "skim search: note: --lang has no effect on standalone --ast queries \
-                     (no text term); to filter by language, add a text query: \
-                     `skim search TERM --ast PATTERN --lang LANG`."
-                );
-            }
-            let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
-            std::fs::create_dir_all(&cache_dir)?;
-            // SEARCH-ADR-006: refresh BOTH indexes before opening either engine.
-            // Finding 2 fix: destructure the HeadState returned by auto_refresh_if_stale
-            // so we do not re-call git_head_state on the temporal-consuming path below.
-            let (_outcome, manifest, head_state) = staleness::auto_refresh_if_stale(
-                &root,
-                &cache_dir,
-                analytics,
-                staleness::ReanchorPolicy::Refuse,
-                None,
-            )?;
-            // Step 7 wiring (d): advisory on the --ast temporal-consuming branch.
-            // Finding 2 fix: use head_state from auto_refresh_if_stale instead of
-            // a second git_head_state call.
-            if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
-                staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
-            }
-            // Resolve blast-radius → FileIds BEFORE calling run_ast_standalone.
-            // temporal::resolve_blast_radius_file_ids is the single resolver for all
-            // three blast-radius call sites, so JSON-aware warning and PF-004 widening
-            // live in one place.  Passes cache_dir (not db_path) so the funnel owns the
-            // path construction (Finding 2 / AD-413-16).
-            // Finding 1/3 fix: pass head_state so the resolver does not re-derive it.
-            let sorted = manifest.sorted_paths();
-            let blast_file_ids = temporal::resolve_blast_radius_file_ids(
-                flags.blast_radius.as_deref(),
-                &root,
-                &cache_dir,
-                &sorted,
-                flags.json,
-                &head_state,
-            )?;
-            // Open the temporal DB only when a sort is requested.  Absent DB or empty
-            // dimension → degrade: emit notice on stderr, pass None so temporal_active
-            // falls to false and raw AST order is preserved (AC-A3).
-            // open_temporal_state_for folds the emptiness probe (Finding [medium/complexity]):
-            // it returns Unavailable(Empty) when the dimension has no rows, collapsing the
-            // former three-way shape (Open-non-empty / Open-empty / Unavailable) into
-            // a two-way dispatch so all degradation flows through a single Unavailable arm.
-            let temporal_db = if let Some(sort) = flags.temporal_sort {
-                match temporal::open_temporal_state_for(&root, &cache_dir, &head_state, Some(sort))
-                {
-                    temporal::TemporalOpen::Open(db) => Some(db),
-                    temporal::TemporalOpen::Unavailable(u) => {
-                        eprintln!(
-                            "skim search: {}",
-                            temporal::degraded_notice(
-                                &u,
-                                sort.flag_name(),
-                                temporal::Fallback::Ast
-                            )
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let mut stdout = BufWriter::new(std::io::stdout());
-            // AD-404 (mod.rs): pass Page so run_ast_standalone honors --offset.
-            // This is the call site the whole ticket is about (the P1 defect was
-            // passing `flags.limit` here and silently losing `flags.offset`).
-            let result = ast::run_ast_standalone(
-                raw,
-                types::Page::new(flags.limit, flags.offset),
-                flags.json,
-                &cache_dir,
-                &manifest,
-                blast_file_ids,
-                flags.temporal_sort,
-                temporal_db.as_ref(),
-                &root,
-                &mut stdout,
-            );
-            stdout.flush()?;
-            result
-        }
-        // Empty query with temporal flags (no --ast) → standalone temporal dispatch.
-        SearchAction::Query(_) if flags.temporal_sort.is_some() || flags.blast_radius.is_some() => {
-            // AD-377-2 / PF-006 (blocking-review fix #1): the temporal-only and
-            // blast-radius-only standalone paths (e.g. `--hot --weights x,y,z`,
-            // `--blast-radius FILE --weights x,y,z` with NO text and NO --ast) run
-            // no weighted RRF — `run_temporal_standalone` ranks purely by hotspot /
-            // bug-fix / co-change score and never consumes `--weights`.  Without
-            // this guard the flag was silently ignored on exactly the path this
-            // ticket exists to fix.  `has_text` and `has_ast` are both false on this
-            // arm (a non-empty query routes to run_query, --ast to the arm above), so
-            // weights_inert_notice returns the SAME fully-inert notice (PF-008).
-            // stderr only — JSON stdout stays byte-identical (AC9).
-            if let Some(notice) = query::weights_inert_notice(
-                flags.weights,
-                /* has_text */ false,
-                /* has_ast */ false,
-                flags.blast_radius.is_some(),
-            ) {
-                eprintln!("{notice}");
-            }
-            // PF-006: --lang is only honored on text-query paths (lexical reader
-            // applies lang_filter at query time). Standalone temporal queries
-            // (--hot/--cold/--risky/--blast-radius with no text) have no lexical
-            // layer, so --lang is inert — emit a notice rather than silently ignoring it.
-            if flags.lang.is_some() {
-                eprintln!(
-                    "skim search: note: --lang has no effect on standalone temporal queries \
-                     (no text term); to filter by language, add a text query: \
-                     `skim search TERM --hot --lang LANG`."
-                );
-            }
-            // AD-404 (mod.rs): pass Page so run_temporal_standalone honors --offset
-            // on the --hot/--cold/--risky/--blast-radius-only paths.
-            run_temporal_standalone(
-                types::Page::new(flags.limit, flags.offset),
-                flags.json,
-                &flags.root_override,
-                flags.temporal_sort,
-                flags.blast_radius.as_deref(),
-                analytics,
-            )
         }
         SearchAction::Query(_) => {
             // Empty query (no positional args and no action flag) → help.
@@ -351,6 +186,11 @@ enum SearchAction {
     /// `parse_flags`. Help detection (empty args, `--help`, `-h`) is
     /// handled entirely by `parse_flags`.
     Help,
+    /// Refuse a removed flag: print the message on stderr and exit 2.
+    ///
+    /// Produced by `parse_flags` for the first removed flag it meets, so the
+    /// refusal happens before any index or cache file is touched.
+    Removed(String),
 }
 
 /// Parsed flags from the CLI args passed to `skim search`.
@@ -366,28 +206,6 @@ struct Flags {
     /// `None` (the default) is equivalent to offset 0.
     offset: Option<usize>,
     root_override: Option<PathBuf>,
-    /// Sort mode for temporal queries — mutually exclusive.
-    temporal_sort: Option<types::TemporalSort>,
-    /// Raw path for blast-radius pre-filtering. Normalized later in run_query.
-    blast_radius: Option<String>,
-    /// Raw AST pattern string for structural pattern search (#199).
-    ///
-    /// Validated at dispatch time (before opening the index).  Space-separated
-    /// `--ast try-catch` and equals form `--ast=try-catch` are both accepted.
-    /// Whitespace-only values are rejected in `parse_flags`.
-    ast: Option<String>,
-    /// Composite RRF weights for the weighted-ranking query paths (#200, #377).
-    ///
-    /// Parsed from `--weights lexical,ast,temporal` and validated at flag-parse
-    /// time.  `None` → use `CompositeWeights6::with_six_signal_defaults()` (0.5, 0.3, 0.2).
-    ///
-    /// AD-377-1/AD-377-3: honored on BOTH composite paths — the `--blast-radius`
-    /// UNION ranking (all 3 weights) AND the text+`--ast` intersection ranking
-    /// (lexical + ast only; the temporal weight is inert whenever `--ast` is
-    /// present because the AST intersection fuses only lexical+ast).  On every
-    /// other path (pure-lexical, standalone `--ast`, temporal-only, blast-only)
-    /// the flag is inert and a one-line stderr notice fires (AD-377-2, PF-006).
-    weights: Option<rskim_search::CompositeWeights6>,
     /// v5 positional search: require contiguous, ordered phrase match (`--phrase`).
     phrase: bool,
     /// v5 positional search: max word-token distance for `--near N` (unordered).
@@ -414,10 +232,6 @@ impl Default for Flags {
             limit: 20,
             offset: None,
             root_override: None,
-            temporal_sort: None,
-            blast_radius: None,
-            ast: None,
-            weights: None,
             phrase: false,
             near: None,
             lang: None,
@@ -434,6 +248,17 @@ impl Flags {
     /// (the `Default` impl above) rather than duplicating all defaults here.
     fn help() -> Self {
         Default::default()
+    }
+
+    /// Construct a `Flags` value that signals "refuse a removed flag."
+    ///
+    /// Like [`Flags::help`], every field other than `action` is at its default
+    /// and is never read on the dispatch path.
+    fn removed(message: String) -> Self {
+        Flags {
+            action: SearchAction::Removed(message),
+            ..Default::default()
+        }
     }
 }
 
@@ -493,7 +318,7 @@ fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
 /// Accepts both file extensions (`rs`, `py`, `ts`) and language display names
 /// (`rust`, `python`, `typescript`); case-insensitive.  Returns an actionable
 /// error listing accepted values when the input is unrecognised.
-pub(super) fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
+fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
     use rskim_core::Language;
     // Normalize to lowercase once so both the extension lookup and the name
     // match arm are case-insensitive.  Without this `--lang RS` (uppercase
@@ -526,64 +351,6 @@ pub(super) fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language
     }
 }
 
-/// Parse a temporal flag arm (`--hot`, `--cold`, `--risky`, `--blast-radius`).
-///
-/// Returns `Ok(true)` when the flag consumed an extra token (i.e. the space-
-/// separated `--blast-radius <path>` form), `Ok(false)` for single-token arms,
-/// and `Err` on validation failure.
-///
-/// The caller is responsible for advancing `i` by one additional position when
-/// this function returns `Ok(true)`.
-fn parse_temporal_flag(
-    arg: &str,
-    next_arg: Option<&String>,
-    temporal_sort: &mut Option<types::TemporalSort>,
-    blast_radius: &mut Option<String>,
-) -> anyhow::Result<bool> {
-    match arg {
-        "--hot" | "--cold" | "--risky" => {
-            let new_sort = match arg {
-                "--hot" => types::TemporalSort::Hot,
-                "--cold" => types::TemporalSort::Cold,
-                _ => types::TemporalSort::Risky,
-            };
-            if let Some(existing) = *temporal_sort {
-                anyhow::bail!(
-                    "{} and {} are mutually exclusive",
-                    new_sort.flag_name(),
-                    existing.flag_name()
-                );
-            }
-            *temporal_sort = Some(new_sort);
-            Ok(false)
-        }
-        "--blast-radius" => {
-            let val =
-                next_arg.ok_or_else(|| anyhow::anyhow!("--blast-radius requires a file path"))?;
-            // AD-412-3: bail so --help/-h is never consumed as the file-path value
-            // (parity with take_flag_value; e.g. `skim search --blast-radius --help`).
-            // AD-412-4: {val:?} (Debug, quoted) neutralises ANSI-escape injection.
-            if matches!(val.as_str(), "--help" | "-h") {
-                anyhow::bail!(
-                    "--blast-radius requires a file path (got {val:?}); \
-                     to print help, run: `skim search --help`"
-                );
-            }
-            *blast_radius = Some(val.clone());
-            Ok(true)
-        }
-        s if s.starts_with("--blast-radius=") => {
-            let val = s.trim_start_matches("--blast-radius=");
-            if val.is_empty() {
-                anyhow::bail!("--blast-radius requires a file path");
-            }
-            *blast_radius = Some(val.to_string());
-            Ok(false)
-        }
-        _ => unreachable!("parse_temporal_flag called with non-temporal arg: {arg}"),
-    }
-}
-
 /// Extract a value from a flag that supports both space-separated and equals forms.
 ///
 /// Handles `--flag value` (space-separated) and `--flag=value` (equals) forms.
@@ -600,12 +367,12 @@ fn parse_temporal_flag(
 /// # Examples
 ///
 /// ```text
-/// take_flag_value("--ast=try-catch", None, "--ast")           → Ok(("try-catch", false))
-/// take_flag_value("--ast", Some("try-catch"), "--ast")         → Ok(("try-catch", true))
-/// take_flag_value("--ast", None, "--ast")                      → Err(…missing…)
-/// take_flag_value("--ast=  ", None, "--ast")                   → Err(…empty…)
-/// take_flag_value("--ast", Some("--help"), "--ast")            → Err(…requires a value; to print help…)
-/// take_flag_value("--ast", Some("-h"), "--ast")                → Err(…requires a value; to print help…)
+/// take_flag_value("--root=src", None, "--root")            → Ok(("src", false))
+/// take_flag_value("--root", Some("src"), "--root")         → Ok(("src", true))
+/// take_flag_value("--root", None, "--root")                → Err(…missing…)
+/// take_flag_value("--root=  ", None, "--root")             → Err(…empty…)
+/// take_flag_value("--root", Some("--help"), "--root")      → Err(…requires a value; to print help…)
+/// take_flag_value("--root", Some("-h"), "--root")          → Err(…requires a value; to print help…)
 /// ```
 fn take_flag_value(
     arg: &str,
@@ -623,7 +390,7 @@ fn take_flag_value(
     // Space-separated form: the value is in the next token.
     let val =
         next_arg.ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
-    // AD-412-3: bail so --help/-h is never consumed as a flag value (e.g. `--ast --help`).
+    // AD-412-3: bail so --help/-h is never consumed as a flag value (e.g. `--root --help`).
     if matches!(val.as_str(), "--help" | "-h") {
         anyhow::bail!(
             "{flag} requires a value (got {:?}); \
@@ -646,14 +413,15 @@ fn take_flag_value(
 /// - `--limit` / `-n` value that is not a valid `usize`.
 /// - `--limit=<value>` with a non-numeric value.
 /// - `--root` without a following value.
-/// - `--ast` without a value or with a whitespace-only value.
-/// - `--weights` without a value or with an invalid weight string.
 /// - Unrecognised dash-leading flags — any `--foo` or `-x` (length >= 2) that is
 ///   not a known flag (see `KNOWN_FLAGS`). Bare `-` is a positional query token;
 ///   a literal dash-leading term is searchable after the `--` end-of-flags separator.
 /// - Combining a text query with an action flag (`--build` / `--rebuild` /
 ///   `--update` / `--stats` / `--install-hooks` / `--remove-hooks`) — an
 ///   ambiguous mixed form.
+///
+/// A removed flag (see `REMOVED_FLAGS`) is not an error here: the returned
+/// `Flags` carries `SearchAction::Removed`, which `run` turns into exit 2.
 fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     // AD-412-3: empty args → help immediately. --help/-h before `--` → help via the
     // match arm below. Post-`--` tokens are drained as literal query text (AD-412-2).
@@ -667,10 +435,6 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
     let mut offset: Option<usize> = None;
     let mut root_override: Option<PathBuf> = None;
     let mut query_parts: Vec<String> = Vec::new();
-    let mut temporal_sort: Option<types::TemporalSort> = None;
-    let mut blast_radius: Option<String> = None;
-    let mut ast: Option<String> = None;
-    let mut weights: Option<rskim_search::CompositeWeights6> = None;
     let mut phrase = false;
     let mut near: Option<u32> = None;
     let mut lang: Option<rskim_core::Language> = None;
@@ -687,7 +451,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             "--json" | "-j" => json = true,
             s if s == "--limit" || s == "-n" || s.starts_with("--limit=") => {
                 // Both space-separated (`--limit 10`, `-n 10`) and equals (`--limit=10`)
-                // forms are handled by take_flag_value — same idiom as --root and --ast.
+                // forms are handled by take_flag_value — same idiom as --root.
                 // `-n` is a short alias; errors always say "--limit" for consistency.
                 // `-n` has no equals form so the "--limit=" prefix never fires for it.
                 let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--limit")?;
@@ -713,35 +477,10 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                     i += 1;
                 }
             }
-            s if s == "--ast" || s.starts_with("--ast=") => {
-                // Space-separated (`--ast try-catch`) and equals (`--ast=try-catch`) forms.
-                let (val, consumed) = take_flag_value(s, args.get(i + 1), "--ast")?;
-                ast = Some(val);
-                if consumed {
-                    i += 1;
-                }
-            }
-            s if s == "--weights" || s.starts_with("--weights=") => {
-                // Composite RRF weights: `--weights l,a,t` or `--weights=l,a,t` (#200).
-                // Parse and validate immediately so invalid values produce a clear CLI
-                // error before any index I/O (AC5: non-zero exit with actionable message).
-                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--weights")?;
-                weights = Some(
-                    rskim_search::CompositeWeights6::parse_weights_flag(&raw)
-                        .map_err(|e| anyhow::anyhow!("--weights: {e}"))?,
-                );
-                if consumed {
-                    i += 1;
-                }
-            }
-            s if matches!(s, "--hot" | "--cold" | "--risky" | "--blast-radius")
-                || s.starts_with("--blast-radius=") =>
-            {
-                let consumed_next =
-                    parse_temporal_flag(s, args.get(i + 1), &mut temporal_sort, &mut blast_radius)?;
-                if consumed_next {
-                    i += 1;
-                }
+            // A removed flag ends parsing at once: the refusal must come before
+            // any later token can raise a different error or touch the index.
+            s if let Some(message) = removed_flag_message(s) => {
+                return Ok(Flags::removed(message));
             }
             // AD-403-6: When BOTH --phrase and --near are given, the composed semantic is
             // PhraseNear(n) — ordered, total span <= n — NOT just phrase.  See
@@ -807,10 +546,6 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
         limit,
         offset,
         root_override,
-        temporal_sort,
-        blast_radius,
-        ast,
-        weights,
         phrase,
         near,
         lang,
@@ -933,28 +668,6 @@ fn run_build(
     // before `new_manifest.save()` — zero extra I/O (AC-405-12).
     query::emit_ast_coverage_notice(&result.ast_coverage);
 
-    // AD-TMP-1: --rebuild/--build must produce a COMPLETE index (lexical + AST +
-    // temporal), matching user expectation that "rebuild" rebuilds everything (#357 BUG A).
-    // run_build goes through build_index directly, bypassing auto_refresh_if_stale where
-    // the only other temporal hook lives, so temporal must be populated here too.
-    // Non-fatal by SEARCH-ADR-006/D5: a temporal failure must NOT fail the explicit build.
-    // Step 7 wiring (a): classify HEAD state once, emit the advisory, then rebuild.
-    // The `force` flag is intentionally NOT forwarded: rebuild_temporal always does a
-    // full history walk (no cache) — see `parse_history(root, 0)` in
-    // `rebuild_temporal_with_source` (temporal_build.rs, "Single full-history walk").
-    let head_state = staleness::git_head_state(&root);
-    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
-    staleness::try_rebuild_temporal_nonfatal(
-        &root,
-        &cache_dir,
-        // AD-414-22: pass the classified state, not just its SHA — an unborn HEAD
-        // on this explicit arm must build a zero-row temporal.db and emit the
-        // AC-16 empty-history notice rather than silently doing nothing.
-        &head_state,
-        "--rebuild hook",
-        staleness::ReanchorPolicy::Allow, // explicit build arm re-anchors (PF-017)
-    );
-
     Ok(ExitCode::SUCCESS)
 }
 
@@ -968,17 +681,7 @@ fn run_update(
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
-    // Finding 2 fix: destructure HeadState from auto_refresh_if_stale.
-    let (outcome, manifest, head_state) = staleness::auto_refresh_if_stale(
-        &root,
-        &cache_dir,
-        analytics,
-        staleness::ReanchorPolicy::Allow,
-        None,
-    )?;
-    // Step 7 wiring (b): emit the HEAD-unresolvable advisory on --update (AC23).
-    // Finding 2 fix: use head_state from above instead of a second git_head_state call.
-    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
+    let (outcome, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
     if !outcome.refreshed() {
         eprintln!("skim search: index is current");
     } else {
@@ -1042,19 +745,6 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         return Ok(ExitCode::FAILURE);
     }
 
-    // Step 7 wiring (c): emit HEAD-unresolvable advisory BEFORE the `if json` split
-    // so both text and JSON modes see it (wiring it inside one branch loses the other,
-    // F3; wiring it in the early-return above would fire even without an index, AC24).
-    // Finding [reliability] fix: resolve HeadState ONCE here and thread it into both
-    // warn_if_temporal_unverifiable and build_stats_json.  The previous code used
-    // warn_if_temporal_unverifiable_at (which called git_head_state internally) and
-    // then build_stats_json called git_head_state a second time — two unsynchronised
-    // snapshots instead of one.  On a linked worktree each git_head_state traversal
-    // is ~10 syscalls; on a repo that gets a commit between the two reads the advisory
-    // and the JSON key would describe a different HEAD than the other.
-    let head_state = staleness::git_head_state(&root);
-    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
-
     let mut out = BufWriter::new(std::io::stdout());
 
     // AC6/AC11/AD-414-10: gather_stats performs the self-heal (AC-14), snapshots
@@ -1067,7 +757,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     // AC-13 / T-13: if gather_stats returns Err (CRC-level corruption the structural
     // probe cannot detect), emit a structured JSON error and exit FAILURE in --json mode;
     // propagate the error in text mode.
-    let snapshot = match gather_stats(&cache_dir, &root, head_state) {
+    let snapshot = match gather_stats(&cache_dir, &root) {
         Ok(s) => s,
         Err(e) => {
             if json {
@@ -1093,8 +783,6 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     } else {
         // Text rendering from the shared snapshot.
         // AD-380-4: the TRUE total over all on-disk artifacts (AC-6/AC-7).
-        // AD-380-5: temporal DB reported separately (scales with git history).
-        // AD-414-10: temporal DB state uses PRE-REFRESH snapshot (AC-15).
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", snapshot.file_count)?;
         writeln!(out, "  total n-grams : {}", snapshot.total_ngrams)?;
@@ -1104,18 +792,6 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             snapshot.index_size_bytes
         )?;
         writeln!(out, "  total on disk : {} bytes", snapshot.total_on_disk)?;
-        writeln!(
-            out,
-            "  temporal db   : {} bytes",
-            snapshot.temporal_db_bytes
-        )?;
-        // AC-15: "empty" is shown as "empty (0 rows)" in text mode for clarity.
-        let ts_text = if snapshot.pre_refresh_temporal_state == "empty" {
-            "empty (0 rows)"
-        } else {
-            snapshot.pre_refresh_temporal_state
-        };
-        writeln!(out, "  temporal state: {ts_text}")?;
         if let Some(ts) = snapshot.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
         }
@@ -1179,14 +855,13 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
 /// NOT recursively walk the cache directory. Each artifact is stat'd via
 /// `metadata().len()` and a missing one counts as 0 bytes (fail-soft, AC-7).
 /// Adding a new index artifact means extending this list (one source of truth).
-const ON_DISK_ARTIFACTS: [&str; 7] = [
+const ON_DISK_ARTIFACTS: [&str; 6] = [
     "index.skidx",       // lexical n-gram index
     "index.skpost",      // lexical posting lists
     "index.skfiles",     // binary file manifest (this ticket)
     "ast_index.skidx",   // AST n-gram index header + metadata
     "ast_index.skpost",  // AST posting lists
     "ast_index.skcache", // AST extraction cache
-    "temporal.db",       // hotspot / risk / co-change SQLite DB
 ];
 
 /// Return the byte length of one artifact in `cache_dir`, or 0 when it is absent
@@ -1204,63 +879,12 @@ fn artifact_len(cache_dir: &std::path::Path, name: &str) -> u64 {
 /// pair, undercounting the real footprint. This iterates a FIXED filename list
 /// via `metadata()` (O(1), no directory walk, AC-7) and treats a missing
 /// artifact as 0 bytes so partial indexes (e.g. a lexical-only build before AST
-/// or temporal ran) report exactly the sum of the files that exist (AC-7).
+/// ran) report exactly the sum of the files that exist (AC-7).
 fn total_on_disk_bytes(cache_dir: &std::path::Path) -> u64 {
     ON_DISK_ARTIFACTS
         .iter()
         .map(|name| artifact_len(cache_dir, name))
         .sum()
-}
-
-// ============================================================================
-// Temporal state helper (AD-414-10)
-// ============================================================================
-
-/// AD-414-10: compute the temporal DB state for `--stats` reporting.
-///
-/// Returns one of five JSON values: `"ready"` / `"empty"` / `"corrupt"` /
-/// `"newer-schema"` / `"missing"` — each maps to one of the five AC-15
-/// observable states.  Other `Unavailable` reasons (NotGitRepo,
-/// HeadUnresolved, RepositoryMismatch, Unreadable) collapse to `"missing"`
-/// because the DB is effectively inaccessible in those states.
-///
-/// For text output, the caller converts `"empty"` to `"empty (0 rows)"`.
-fn temporal_state_json_str(
-    root: &std::path::Path,
-    cache_dir: &std::path::Path,
-    head_state: &staleness::HeadState,
-) -> &'static str {
-    use temporal::{DegradedReason, TemporalOpen, dimension_is_empty, open_temporal_state};
-    use types::TemporalSort;
-    match open_temporal_state(root, cache_dir, head_state) {
-        TemporalOpen::Open(db) => {
-            if dimension_is_empty(&db, TemporalSort::Hot) {
-                "empty"
-            } else {
-                "ready"
-            }
-        }
-        // Exhaustive on purpose (no `_` arm): a newly added DegradedReason must be
-        // classified deliberately here rather than silently collapsing to "missing"
-        // and quietly widening what AC-15's five values mean.
-        TemporalOpen::Unavailable(u) => match u.reason {
-            DegradedReason::Corrupt => "corrupt",
-            DegradedReason::UnsupportedVersion => "newer-schema",
-            // The DB is effectively inaccessible in these states — report "missing".
-            DegradedReason::NotGitRepo
-            | DegradedReason::HeadUnresolved
-            | DegradedReason::RepositoryMismatch
-            | DegradedReason::Missing
-            | DegradedReason::Unreadable => "missing",
-            // Not reachable from open_temporal_state (post-open classifications),
-            // but enumerated so the match stays exhaustive.
-            // GhostFilter is build-time only (never returned by open_temporal_state),
-            // but included here so adding new variants fails loudly (no `_` arm).
-            DegradedReason::Empty | DegradedReason::NoRankedRows | DegradedReason::GhostFilter => {
-                "empty"
-            }
-        },
-    }
 }
 
 // ============================================================================
@@ -1282,8 +906,6 @@ struct StatsGathered {
     /// second full manifest decode that `check_staleness` already performs inside
     /// `auto_refresh_if_stale` is avoided (Finding [medium/performance] fix).
     pre_refresh_git_head: Option<String>,
-    /// Temporal DB state string BEFORE any self-heal — one of five AC-15 values.
-    pre_refresh_temporal_state: &'static str,
     /// Live git HEAD resolution state for the `git_head_state` JSON key (AC-20).
     git_head_state_str: &'static str,
     /// Staleness classification at INVOCATION TIME — the verdict from
@@ -1299,7 +921,6 @@ struct StatsGathered {
     index_size_bytes: u64,
     last_updated: Option<u64>,
     total_on_disk: u64,
-    temporal_db_bytes: u64,
     // --- Manifest-derived data (post-heal) ---
     skip_entries: Vec<types::SkippedEntry>,
     ast_coverage: rskim_search::AstCoverage,
@@ -1312,16 +933,9 @@ struct StatsGathered {
 /// Implements the repair-then-report pattern (Finding [medium/architecture] CQS fix):
 /// the self-heal (`auto_refresh_if_stale`) and the data collection live here so
 /// [`build_stats_json`] is a pure serialiser with no I/O side effects.
-///
-/// `head_state` is resolved **once** by the caller ([`run_stats`]) and moved in
-/// so both [`staleness::warn_if_temporal_unverifiable`] and this function share the
-/// same snapshot without a second `git_head_state` traversal (Finding [low/performance]
-/// fix — the pre-resolved value is forwarded to `auto_refresh_if_stale` which would
-/// otherwise re-resolve it internally).
 fn gather_stats(
     cache_dir: &std::path::Path,
     root: &std::path::Path,
-    head_state: staleness::HeadState,
 ) -> anyhow::Result<StatsGathered> {
     let cache_dir_display = cache_dir.display().to_string();
 
@@ -1334,22 +948,13 @@ fn gather_stats(
     // and returns just the git_head string; the entry table is never materialised.
     let pre_refresh_git_head = manifest::FileManifest::load_git_head(root, cache_dir);
 
-    // Pre-refresh temporal state: must be snapshotted BEFORE `auto_refresh_if_stale`
-    // because that call may rebuild `temporal.db`, changing the state from e.g.
-    // "missing" to "ready" — and AC-15 / AD-414-10 require reporting the state at
-    // invocation time (same contract as `pre_refresh_git_head`).
-    let pre_refresh_temporal_state = temporal_state_json_str(root, cache_dir, &head_state);
-
-    // Compute git_head_state_str BEFORE consuming head_state by value below.
-    let git_head_state_str = match &head_state {
+    let git_head_state_str = match staleness::git_head_state(root) {
         staleness::HeadState::Resolved(_) => "resolved",
         staleness::HeadState::Unresolved => "unresolved",
         staleness::HeadState::NotARepo => "not_a_repo",
     };
 
     // AC-14: self-heal structural corruption before opening the reader.
-    // Finding [low/performance] fix: pass the pre-resolved head_state so
-    // `auto_refresh_if_stale` skips the internal `git_head_state` traversal.
     // Finding [medium/architecture] CQS fix: repair lives here, not in
     // `build_stats_json`, so the reporting function has no I/O side effects.
     let noop_analytics = crate::analytics::AnalyticsConfig {
@@ -1366,13 +971,7 @@ fn gather_stats(
     // is discarded — auto_refresh_if_stale loads the authoritative post-heal manifest.
     let (staleness_status, _pre_check_manifest) = staleness::check_staleness(cache_dir, root);
 
-    let (_, loaded_manifest, _) = staleness::auto_refresh_if_stale(
-        root,
-        cache_dir,
-        &noop_analytics,
-        staleness::ReanchorPolicy::Refuse,
-        Some(head_state),
-    )?;
+    let (_, loaded_manifest) = staleness::auto_refresh_if_stale(root, cache_dir, &noop_analytics)?;
 
     // AD-414-7: opens successfully for F-Body-A/B/C after the self-heal above.
     // Only CRC-level corruption not detectable by the structural probe propagates
@@ -1381,7 +980,6 @@ fn gather_stats(
     let stats = reader.stats();
 
     let total_on_disk = total_on_disk_bytes(cache_dir);
-    let temporal_db_bytes = artifact_len(cache_dir, "temporal.db");
 
     // Collect skip and coverage data from the post-heal manifest.
     let skip_entries: Vec<types::SkippedEntry> = loaded_manifest.skipped().cloned().collect();
@@ -1389,7 +987,6 @@ fn gather_stats(
 
     Ok(StatsGathered {
         pre_refresh_git_head,
-        pre_refresh_temporal_state,
         git_head_state_str,
         staleness_status,
         file_count: stats.file_count,
@@ -1397,7 +994,6 @@ fn gather_stats(
         index_size_bytes: stats.index_size_bytes,
         last_updated: stats.last_updated,
         total_on_disk,
-        temporal_db_bytes,
         skip_entries,
         ast_coverage,
         cache_dir_display,
@@ -1455,161 +1051,6 @@ fn run_query(
     let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
 
-    // Self-heal ordering (#357 BUG B, cycle-2 finding 8): auto_refresh_if_stale
-    // MUST run BEFORE opening temporal.db or resolving blast-radius paths, so that
-    // a missing or HEAD-divergent temporal.db is rebuilt before we attempt to open
-    // it.  This mirrors the ordering used by the two standalone arms:
-    //   - run_temporal_standalone: refresh first, then open_temporal_state
-    //   - standalone --ast arm:    refresh first, then open_temporal_state
-    //
-    // Previously, temporal_db was opened at the top of this function BEFORE
-    // auto_refresh_if_stale fired, so a lexical-Current but temporal-stale DB was
-    // consumed pre-heal by both blast-radius resolution and apply_temporal_enrichment.
-    //
-    // Fix: call auto_refresh_if_stale here unconditionally when temporal data is
-    // needed, then open temporal_db with the now-fresh file.  The --ast subpath
-    // reuses the manifest returned here directly (no second auto_refresh call).
-    // The pure-lexical subpath passes the manifest to execute_query_with_manifest
-    // so it skips its own internal refresh.
-    //
-    // SEARCH-ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
-    // swallows temporal errors internally — callers only see lexical failures.
-    // Finding 2 fix: destructure HeadState from auto_refresh_if_stale so the
-    // temporal-consuming arms do not need a second git_head_state call.
-    // The pure-lexical (no temporal/AST) path skips the early refresh; its
-    // head_state is not needed because it cannot reach warn_if_temporal_unverifiable
-    // (the guard below only fires when temporal_sort or blast_radius is set).
-    let (pre_loaded_manifest_from_refresh, refresh_head_state) =
-        if flags.temporal_sort.is_some() || flags.blast_radius.is_some() || flags.ast.is_some() {
-            let (_outcome, manifest, head_state) = staleness::auto_refresh_if_stale(
-                &root,
-                &cache_dir,
-                analytics,
-                staleness::ReanchorPolicy::Refuse,
-                None,
-            )?;
-            (Some(manifest), Some(head_state))
-        } else {
-            // No temporal or AST flag: skip early refresh; execute_query_with_manifest
-            // will call auto_refresh_if_stale internally exactly once.
-            (None, None)
-        };
-
-    // Step 7 wiring (d): emit the HEAD-unresolvable advisory on temporal-consuming
-    // arms only (AC23). Plain lexical queries that do not request temporal data must
-    // NOT produce advisory stderr output (A1 wiring correction, #414 SE-1/AC-30).
-    // Finding 2 fix: use refresh_head_state from auto_refresh_if_stale instead of
-    // a second git_head_state call (refresh_head_state is always Some on this path
-    // because the guard above ensures auto_refresh_if_stale ran for temporal flags).
-    if (flags.temporal_sort.is_some() || flags.blast_radius.is_some())
-        && let Some(hs) = &refresh_head_state
-    {
-        staleness::warn_if_temporal_unverifiable(&cache_dir, hs);
-    }
-
-    // blast-radius and temporal enrichment each call open_temporal_state independently
-    // so no shared temporal_db handle is needed here.  resolve_blast_radius_paths
-    // (below) uses open_temporal_state internally; the enrichment arm (below the query
-    // execution) opens it again to get fresh state post-refresh.  Two SQLite opens are
-    // cheap and keep the two concerns separate (AD-414-1).
-
-    // Resolve blast-radius partner paths BEFORE querying so the file_filter
-    // is applied inside the search engine (before LIMIT). This ensures the
-    // limit applies to the filtered set rather than silently discarding
-    // co-change partners that ranked beyond the top-N unfiltered results.
-    // Passes cache_dir (not db_path) so the funnel owns path construction
-    // and the AD-413-16 guard is enforced inside resolve_blast_radius_paths
-    // (Finding 2).
-    // Finding 1/3 fix: pass head_state so the resolver does not re-derive it.
-    // T-7/AC-7: resolve_blast_radius_paths returns BlastRadiusResolution so the
-    // caller can push a DegradedJson entry for ALL degraded cases including
-    // RepositoryMismatch (previously silent — AD-414-12 / Finding B).
-    let blast_radius_resolution = temporal::resolve_blast_radius_paths(
-        flags.blast_radius.as_deref(),
-        &root,
-        &cache_dir,
-        flags.json,
-        refresh_head_state
-            .as_ref()
-            .unwrap_or(&staleness::HeadState::NotARepo),
-    )?;
-    let (blast_radius_paths, blast_degraded) = match blast_radius_resolution {
-        temporal::BlastRadiusResolution::NotRequested => (None, None),
-        temporal::BlastRadiusResolution::Allowed(paths) => (Some(paths), None),
-        temporal::BlastRadiusResolution::Filtered { allow, degraded } => {
-            (Some(allow), Some(degraded))
-        }
-        temporal::BlastRadiusResolution::Degraded(u) => (None, Some(u)),
-    };
-
-    // Resolve AST file filter (#199): open the AST engine (already refreshed
-    // above), execute the structural query, collect matching FileIds.
-    // Applied at the FileId level inside execute_query (no path round-trip).
-    //
-    // IMPORTANT: auto_refresh_if_stale was already called above so the AST index
-    // is fresh before we open it here (applies SEARCH-ADR-006: self-heal ordering is
-    // load-bearing).  The manifest from that call is passed into execute_query so
-    // it skips a redundant refresh+load — each query path refreshes exactly once.
-    //
-    // Missing index (after refresh) → fail loud (return Err, #199).
-    // Query execution failure → degrade gracefully (warn, no AST filter).
-    // AC-405-10 / AD-405-7: compute ast_coverage once here, before the match, so
-    // the empty-hits branch and compound_ast_coverage share a single O(N) pass.
-    // Carried forward in the tuple as `cached_ast_coverage` to avoid a second call
-    // at the compound_ast_coverage site below (eliminating the redundant double pass
-    // on the compound --ast empty-hits path).
-    let (ast_scored, pre_loaded_manifest, cached_ast_coverage) =
-        if let Some(ref raw_ast) = flags.ast {
-            // The refresh already ran above: `pre_loaded_manifest_from_refresh` is always
-            // `Some` when `flags.ast.is_some()` (the early-refresh condition includes
-            // `|| flags.ast.is_some()`). Reuse that manifest directly rather than calling
-            // auto_refresh_if_stale a second time (the second call was idempotent but
-            // wasteful — it returned `(false, manifest)` immediately on Current).
-            let manifest = pre_loaded_manifest_from_refresh
-                .expect("manifest must be present when flags.ast is Some (invariant)");
-            let engine = ast::open_ast_engine(&cache_dir)?;
-            // Compute coverage once: reused by both the empty-hits message below and
-            // the compound_ast_coverage binding after this block (no second pass).
-            let coverage = manifest.ast_coverage();
-            // Changed from #199 (lossy HashSet) to #198 (scored vec for RRF).
-            // resolve_ast_scored returns Vec<(FileId, f64)> sorted FileId-ASC,
-            // preserving AST scores so intersect_and_rank can build the rank map.
-            let ast_scored = match ast::resolve_ast_scored(&engine, raw_ast) {
-                Ok(hits) => {
-                    if hits.is_empty() {
-                        // AC-405-10: append excluded-file count when non-zero so the
-                        // compound path mirrors the standalone path in output.rs.
-                        let excluded = coverage.size_excluded_files;
-                        if excluded > 0 {
-                            eprintln!(
-                                "skim search: --ast {:?} matched no indexed files \
-                             ({excluded} file(s) excluded from AST indexing by size cap \
-                             — run `skim search --stats --json`.)",
-                                raw_ast
-                            );
-                        } else {
-                            eprintln!("skim search: --ast {:?} matched no indexed files", raw_ast);
-                        }
-                    }
-                    Some(hits)
-                }
-                Err(e) => {
-                    // Query execution failure: degrade gracefully (warn, no AST filter).
-                    // Warning always goes to stderr — even in --json mode — so it does
-                    // not pollute the JSON stream (sibling warnings also go to stderr).
-                    eprintln!("skim search: AST query warning: {e}");
-                    None
-                }
-            };
-            (ast_scored, Some(manifest), Some(coverage))
-        } else {
-            // Pure-lexical path: no --ast flag. Pass the manifest from the early
-            // refresh (if we did one) so execute_query_with_manifest skips its own
-            // auto_refresh_if_stale call. When no refresh was needed (no temporal or
-            // AST flag), pass None so execute_query_with_manifest does its own refresh.
-            (None, pre_loaded_manifest_from_refresh, None)
-        };
-
     // AD-403-6: degenerate --near diagnostic (fail loud, never silently — SEARCH-ADR-001).
     // Emitted here on the text-query path ONLY (has_text is true by construction).
     // Case (a): single-word query + --near N (N cannot constrain anything).
@@ -1619,168 +1060,35 @@ fn run_query(
         eprintln!("{notice}");
     }
 
-    // GAP-1: when a temporal sort is active, fetch a bounded candidate
-    // window (limit*5 ≥ 100) so the re-sort can promote a temporally-hot file that
-    // ranks beyond `--limit` in raw lexical/composite order; truncate to --limit
-    // AFTER the sort (below). Without a sort, query exactly --limit (unchanged).
-    let query_limit = if flags.temporal_sort.is_some() {
-        temporal::resort_window(flags.limit)
-    } else {
-        flags.limit
-    };
-
     let config = types::QueryConfig {
         text: text.to_string(),
-        limit: query_limit,
+        limit: flags.limit,
         // AD-372-3 / RESOLVED Decision 3: offset is applied AFTER verification in
         // resolve_paths_and_snippets_verified (rank → verify → skip offset → take limit).
         // On the exact-symbol path query.rs sets sq.offset=None so the reader returns
         // the full ranked intersection; effective_offset from config.offset is then
         // passed to the post-verify skip.  On the multi-word path offset is also
         // applied post-verify (same code path).
-        //
-        // Double-offset guard (finding #372): when a temporal sort is active, offset
-        // is applied ONCE post-temporal-sort (in the drain below), never inside
-        // execute_query_with_manifest.  Pass None here so the pre-sort verify step
-        // does not consume the offset; the correct single application is the drain.
-        offset: if flags.temporal_sort.is_some() {
-            None
-        } else {
-            flags.offset
-        },
+        offset: flags.offset,
         json: flags.json,
-        root: root.clone(),
-        cache_dir: cache_dir.clone(),
-        blast_radius_paths,
-        ast_scored,
-        composite_weights: flags.weights,
+        root,
+        cache_dir,
         phrase: flags.phrase,
         near: flags.near,
         lang: flags.lang,
     };
 
-    // Pass the already-refreshed manifest to execute_query_with_manifest.  When
-    // pre_loaded_manifest is Some (temporal or AST flag active — refresh happened
-    // above), execute_query skips its own auto_refresh_if_stale.  When None
-    // (pure-lexical, no temporal/AST flag), execute_query refreshes internally,
-    // preserving the invariant: exactly one auto_refresh_if_stale call per query.
-    let mut output = query::execute_query_with_manifest(&config, pre_loaded_manifest, analytics)?;
+    let output = query::execute_query(&config, analytics)?;
 
-    // AD-404-9 / AD-404-10: apply temporal enrichment + paginate on the text+temporal arm.
-    //
-    // Double-offset guard (AD-404-9): config.offset is None when temporal_sort is active
-    // (mod.rs:1086-1090), so execute_query_with_manifest does NOT apply offset on this
-    // path; the drain below is the SINGLE application (no double-offset bug).
-    //
-    // Guard drift fix (AD-404-10): the pagination (offset drain + limit truncate) MUST
-    // run whenever temporal_sort is active, even when temporal_db is absent (degraded).
-    // The old guard `if let (Some(sort), Some(db))` silently dropped --limit and --offset
-    // on the degraded path (no temporal.db). Fix: bind the condition once and hoist
-    // pagination out of the DB-presence branch so it runs unconditionally on temporal arms.
-    let page = types::Page::new(flags.limit, flags.offset);
-    if let Some(sort) = flags.temporal_sort {
-        // AD-414-1: two-way match via open_temporal_state_for.  The arms are:
-        //   Open(db)        → dimension is non-empty; enrich + check coverage
-        //   Unavailable(u)  → DB missing / corrupt / empty / etc.
-        // open_temporal_state_for folds the emptiness probe so the former third
-        // arm (Open+empty) is now Unavailable(Empty) inside the funnel.
-        // Produces a TemporalUnavailable when enrichment cannot be applied so
-        // the fallback path (degraded_notice + DegradedJson) is shared.
-        let head = refresh_head_state
-            .as_ref()
-            .unwrap_or(&staleness::HeadState::NotARepo);
-        let maybe_unavail: Option<temporal::TemporalUnavailable> =
-            match temporal::open_temporal_state_for(&root, &cache_dir, head, Some(sort)) {
-                temporal::TemporalOpen::Open(db) => {
-                    let cov = temporal::apply_temporal_enrichment(&mut output.results, sort, &db)?;
-                    // `cov.total > 0` is load-bearing (AC-8 / AC-17(b)): a query that
-                    // matched NOTHING has no ranking to degrade, so a zero-result query
-                    // on a healthy DB must stay silent and must not gain a `degraded`
-                    // key.  Without this clause a zero-result query would emit a
-                    // spurious NoRankedRows notice (cause text lives in degraded.rs).
-                    // Mirrors the identical guard on the standalone --ast arm
-                    // (ast.rs, `run_ast_standalone`).
-                    if cov.ranked == 0 && cov.total > 0 {
-                        // AD-414-13 zero-coverage: enrichment ran but no result received a
-                        // temporal score (e.g. all files are untracked or newly added).
-                        // Skip the re-sort; preserve lexical order; emit degraded signal.
-                        // DegradedReason::no_ranked_rows is the SSOT builder (Finding [medium/complexity]).
-                        Some(temporal::DegradedReason::no_ranked_rows(cov))
-                    } else {
-                        None
-                    }
-                }
-                temporal::TemporalOpen::Unavailable(u) => Some(u),
-            };
-
-        if let Some(ref u) = maybe_unavail {
-            // DegradedJson::new is the single constructor: it calls degraded_notice
-            // internally so DegradedJson.message is always identical to the stderr
-            // notice (AD-414-1 SSOT; Finding [medium/architecture]).
-            // flag_name() keeps the --prefixed form for the human-readable notice;
-            // json_name() returns the bare form required by DegradedJson.requested
-            // (AC-4 / RD-5).
-            let dj = temporal::DegradedJson::new(
-                u,
-                sort.json_name(),
-                "lexical",
-                sort.flag_name(),
-                temporal::Fallback::Lexical,
-            );
-            eprintln!("skim search: {}", dj.message);
-            output.degraded.push(dj);
-        }
-
-        // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
-        //
-        // AD-414-8: page.apply, output.total, and output.has_more remain OUTSIDE the
-        // DB-presence match arm so the widened resort_window pool is truncated on
-        // every arm including NoRankedRows, preventing S4 regression.
-        //
-        // AD-404-11 / D-5: capture pre-page count BEFORE page.apply so we can emit
-        // the sound `has_more` terminator — replaces the unsound `len < limit`
-        // heuristic on this path.  `pre_page_len > page.depth()` is true when the
-        // re-sorted resort window contains more results than the current page consumes.
-        let pre_page_len = output.results.len();
-        page.apply(&mut output.results);
-        output.total = output.results.len();
-        output.has_more = pre_page_len > page.depth();
-    }
-
-    // T-7/AC-7: if blast-radius was requested but temporal data was unavailable
-    // (empty / corrupt / missing DB), push a DegradedJson entry so the JSON output
-    // carries the reason in output.degraded (AD-414-12).  The stderr notice was
-    // already emitted inside resolve_blast_radius_paths; this wires the machine-
-    // readable counterpart.  Blast-radius degradation is independent of temporal-
-    // sort degradation: both can be present simultaneously (two entries in the vec).
-    if let Some(u) = blast_degraded {
-        // DegradedJson::for_blast_radius uses blast_radius_degraded_msg as the SSOT
-        // so DegradedJson.message matches what resolve_blast_radius_paths already
-        // printed to stderr (AC-7 / AC-19(b) byte-identical contract; audit #414-6).
-        output
-            .degraded
-            .push(temporal::DegradedJson::for_blast_radius(&u));
-    }
-
-    // AD-404-11 / D-5: emit bounded-page notice on all text-query paths when
-    // has_more is true (pure-text and text+temporal both reach here).
+    // AD-404-11 / D-5: emit bounded-page notice when has_more is true.
     // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
     if output.has_more {
+        let page = config.page();
         eprintln!(
             "{}",
-            temporal::bounded_page_notice(output.total, page.offset(), page.limit())
+            query::bounded_page_notice(output.total, page.offset(), page.limit())
         );
     }
-
-    // AD-405-7 / AC-405-17: emit AST coverage notice on compound --ast paths (D-4
-    // cadence).  Notice goes to stderr so --json stdout stays byte-identical.
-    // Pure-lexical paths carry None → ast_coverage key absent from JSON (D-5).
-    // Wire coverage into output for the JSON key (D-5): omit when clean so the
-    // key is absent on healthy repos (avoids noise for well-maintained codebases).
-    if let Some(ref cov) = cached_ast_coverage {
-        query::emit_ast_coverage_notice(cov);
-    }
-    output.ast_coverage = cached_ast_coverage.filter(|c| !c.is_clean());
 
     let mut stdout = BufWriter::new(std::io::stdout());
     if flags.json {
@@ -1793,235 +1101,14 @@ fn run_query(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Step 9: `NotGitRepo` JSON — preserves AC9 `warning` key byte-for-byte and
-/// adds the new `degraded` sibling so machine consumers can parse the reason.
-#[derive(Serialize)]
-struct WarningWithDegradedJson<'a> {
-    warning: &'a str,
-    degraded: Vec<temporal::DegradedJson>,
-}
-
-/// Step 9: JSON object emitted on stdout for non-`NotGitRepo` degraded reasons
-/// on the standalone temporal arm (`--hot`/`--cold`/`--risky`/`--blast-radius`).
-/// Every `--json` invocation emits exactly one parseable object (SE-6).
-#[derive(Serialize)]
-struct DegradedOnlyJson {
-    degraded: Vec<temporal::DegradedJson>,
-}
-
-/// Emit the degraded disclosure for the standalone temporal arm and nothing else.
-///
-/// Extracted so every standalone early-out — the `open_temporal_state_for`
-/// `Unavailable` arm and the AD-414-24 empty-DB blast-radius probe — produces a
-/// byte-identical pair of signals (stderr notice + `--json` object) instead of
-/// each site re-deriving the shape.
-///
-/// * `requested` — bare flag name (`TemporalSort::json_name`, or
-///   `"blast-radius"`); `DegradedJson.requested` per AC-4 / RD-5.
-/// * `applied` is always `"none"` here (F2 / AD-414-19): the standalone arm
-///   serves no result set, so claiming `"lexical"` would be false.
-/// * `flag = ""` suppresses the human-readable fallback tail, keeping the legacy
-///   byte-identical assertions on this arm valid.
-///
-/// `NotGitRepo` keeps its AC9 `warning` key on stdout with `degraded` as a
-/// sibling; every other reason prints the notice on stderr and, in `--json`
-/// mode, one parseable object on stdout (SE-6).
-fn report_standalone_degraded(
-    u: &temporal::TemporalUnavailable,
-    requested: &'static str,
-    json: bool,
-) -> anyhow::Result<()> {
-    // DegradedJson::new is the single constructor (Finding [medium/architecture]):
-    // it calls degraded_notice internally so DegradedJson.message always matches
-    // what is printed to stderr (AD-414-1 SSOT).
-    let dj = temporal::DegradedJson::new(u, requested, "none", "", temporal::Fallback::NoResults);
-    if u.reason == temporal::DegradedReason::NotGitRepo {
-        // NotGitRepo: preserve AC9 byte-identical `warning` on stdout and add
-        // `degraded` as a sibling key for machine consumers.
-        if json {
-            // Clone the message so dj can be moved into the vec while we still
-            // hold a reference for the `warning` field.
-            let msg_str = dj.message.clone();
-            let msg = WarningWithDegradedJson {
-                warning: &msg_str,
-                degraded: vec![dj],
-            };
-            println!("{}", serde_json::to_string(&msg)?);
-        } else {
-            eprintln!("skim search: {}", dj.message);
-        }
-    } else {
-        eprintln!("skim search: {}", dj.message);
-        if json {
-            let msg = DegradedOnlyJson { degraded: vec![dj] };
-            println!("{}", serde_json::to_string(&msg)?);
-        }
-    }
-    Ok(())
-}
-
-/// Execute a standalone temporal query (no text search term provided).
-///
-/// Opens the temporal DB from the resolved cache directory, ensures it is
-/// fresh via `auto_refresh_if_stale` (mirrors the standalone `--ast` arm —
-/// the `SearchAction::Query(_) if let Some(ref raw) = flags.ast` branch —
-/// per the locked decision 2026-06-24, resolving the BLOCKER for #357),
-/// dispatches the query (hotspot, cold, risky, or blast-radius), and writes
-/// the result as JSON or plain text to stdout. Degrades gracefully when the
-/// temporal DB is absent after self-heal — prints a warning and returns exit 0.
-///
-/// # False comment reconciled (mod.rs:737-740 in the old code)
-///
-/// The prior comment claimed "auto_refresh_if_stale guarantees freshness here"
-/// but the function NEVER called auto_refresh_if_stale, so temporal.db was
-/// never self-healed on the standalone --hot/--cold/--risky path.
-/// The call below fixes that gap (#357 BLOCKER).
-#[allow(clippy::disallowed_methods)] // Temporal search output; streaming handle for sorted result set
-fn run_temporal_standalone(
-    page: types::Page,
-    json: bool,
-    root_override: &Option<PathBuf>,
-    temporal_sort: Option<types::TemporalSort>,
-    blast_radius: Option<&str>,
-    analytics: &crate::analytics::AnalyticsConfig,
-) -> anyhow::Result<ExitCode> {
-    let (root, cache_dir) = resolve_root_and_cache(root_override)?;
-    std::fs::create_dir_all(&cache_dir)?;
-
-    // Self-heal: ensure the lexical+AST+temporal index is fresh before querying.
-    // This mirrors the standalone --ast arm (`SearchAction::Query(_) if let
-    // Some(ref raw) = flags.ast`) and is the fix for the BLOCKER in #357 —
-    // bare --hot/--cold/--risky/--blast-radius never called auto_refresh_if_stale,
-    // so temporal.db was never self-healed on these paths even though the false
-    // comment above claimed it was guaranteed.
-    // SEARCH-ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
-    // swallows temporal errors internally — callers only see lexical failures.
-    // Finding 2 fix: destructure HeadState from auto_refresh_if_stale so we do
-    // not re-call git_head_state for the advisory below.
-    let (_outcome, _manifest, head_state) = staleness::auto_refresh_if_stale(
-        &root,
-        &cache_dir,
-        analytics,
-        staleness::ReanchorPolicy::Refuse,
-        None,
-    )?;
-
-    // Step 7 wiring (d): temporal-consuming standalone arm (--hot/--cold/--risky/--blast-radius).
-    // Finding 2 fix: use head_state from auto_refresh_if_stale above.
-    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
-
-    // open_temporal_state_for is the single funnel with emptiness probe folded in
-    // (Finding [medium/complexity]); it returns a typed TemporalOpen so the caller
-    // matches on Open/Unavailable instead of Ok/Err.
-    // RepositoryMismatch → wrong-repo rows rejected; Missing/Empty/Corrupt → no data.
-    // Both arms degrade gracefully (exit 0, AC-F3).
-    // degraded_notice is the SSOT for all stderr/JSON degradation messages.
-    //
-    // Step 9 differentiation:
-    //   NotGitRepo → AC9-byte-identical `warning` key on stdout + `degraded` sibling.
-    //   All other reasons → notice on stderr; in --json mode emit one JSON on stdout (SE-6).
-    // json_name() returns the bare form (e.g. "hot") required by DegradedJson.requested (AC-4).
-    // flag_name() (e.g. "--hot") is kept only for human-readable message text.
-    //
-    // AC-7: on the standalone arm `--blast-radius FILE` may be the ONLY temporal flag
-    // (temporal_sort is None).  Falling back to "" there would ship a degraded element
-    // whose `requested` names no flag at all, so a machine consumer could not tell WHICH
-    // request was not honoured.  The sort wins when both are supplied (it selects the
-    // ranking; blast-radius only filters).
-    let requested_flag: &'static str = match (temporal_sort, blast_radius) {
-        (Some(s), _) => s.json_name(),
-        (None, Some(_)) => "blast-radius",
-        (None, None) => "",
-    };
-    // open_temporal_state_for folds the G-3 emptiness probe (Finding [medium/complexity]):
-    // when temporal_sort is Some(s) and the dimension has no rows, returns
-    // Unavailable(Empty) so the existing Unavailable arm handles it uniformly.
-    // When temporal_sort is None (blast-radius only), passes None — no empty probe,
-    // since cochange emptiness never borrows the shallow/empty wording (G-3).
-    let db = match temporal::open_temporal_state_for(&root, &cache_dir, &head_state, temporal_sort)
-    {
-        temporal::TemporalOpen::Open(db) => db,
-        temporal::TemporalOpen::Unavailable(u) => {
-            // Covers all reasons including Empty (folded from the former separate
-            // probe).  `report_standalone_degraded` owns the stderr/JSON shape and
-            // the "applied = none" contract (F2 / AD-414-19).
-            report_standalone_degraded(&u, requested_flag, json)?;
-            return Ok(ExitCode::SUCCESS);
-        }
-    };
-
-    // AD-414-24 (F-C2-02): disclosure parity for standalone `--blast-radius`.
-    //
-    // `open_temporal_state_for` probes emptiness for the requested *sort*
-    // dimension.  With `--blast-radius FILE` as the only temporal flag there is
-    // no sort, so `sort = None` is passed and no probe runs (G-3: co-change
-    // emptiness must never borrow the shallow/empty wording).  An entirely empty
-    // temporal DB then reached `query_standalone`, which returned
-    // `{"mode":"blast-radius","total":0,"results":[]}` with no `degraded` key and
-    // nothing on stderr — indistinguishable from a healthy DB in which this file
-    // simply has no co-change partners.  The composite arm
-    // (`resolve_blast_radius_paths`) has always disclosed this case, so the two
-    // arms disagreed on the same DB state.
-    //
-    // The predicate mirrors the composite arm exactly — partner set empty AND the
-    // hotspot table empty — so a DB that holds co-change rows but no hotspot rows
-    // (reachable in synthetic fixtures) is never misreported as `empty`.  The
-    // cheap `dimension_is_empty` probe is evaluated first, so a healthy DB never
-    // pays for the partner lookup.  Every other `Unavailable` reason
-    // (missing / corrupt / newer-schema / repository-mismatch / not-a-repo) is
-    // already surfaced by the `open_temporal_state_for` arm above.
-    if temporal_sort.is_none()
-        && let Some(raw_path) = blast_radius
-        && temporal::dimension_is_empty(&db, types::TemporalSort::Hot)
-    {
-        let normalized = temporal::normalize_blast_radius_path(raw_path, &root)?;
-        if db.cochanges_for_file(&normalized)?.is_empty() {
-            report_standalone_degraded(&temporal::empty_temporal_state(&db), "blast-radius", json)?;
-            return Ok(ExitCode::SUCCESS);
-        }
-    }
-
-    let (output, has_more) =
-        temporal::query_standalone(temporal_sort, blast_radius, page, &db, &root)?;
-
-    // AD-404-8: bounded-page-notice — emitted on stderr when has_more is true
-    // (more results exist beyond this page, or the temporal ranking window was
-    // exceeded).  Goes to stderr (#377 seam, PF-006) so --json stdout stays
-    // byte-identical.  The notice surfaces the pagination seam for agents that
-    // detect the last page via has_more rather than the unsound `len < limit`
-    // heuristic (D-5).
-    if has_more {
-        eprintln!(
-            "{}",
-            temporal::bounded_page_notice(output.result_count(), page.offset(), page.limit())
-        );
-    }
-
-    let mut stdout = BufWriter::new(std::io::stdout());
-    if json {
-        temporal::format_temporal_json(&output, has_more, &mut stdout)?;
-    } else {
-        temporal::format_temporal_text(&output, page, &mut stdout)?;
-    }
-    stdout.flush()?;
-
-    Ok(ExitCode::SUCCESS)
-}
-
 // ============================================================================
 // Help text
 // ============================================================================
 
 /// Full `skim search` help text.
 ///
-/// Extracted to a `const` (from the old inline `println!` literal) so AC10 can
-/// assert its contents as a falsifiable unit test (PF-008 doc-drift guard): the
-/// test verifies the `--weights` section names *both* composite paths and the
-/// temporal-inert-on-`--ast` rule, and that the obsolete "Only active on the
-/// `--blast-radius` composite ranking path" wording is gone.
-///
-/// AD-409-8: The `--weights` temporal axis (blast-radius path) ranks co-change partners by
-/// Jaccard co-change strength; higher Jaccard -> higher temporal rank contribution (#409).
+/// Extracted to a `const` (from the old inline `println!` literal) so tests can
+/// assert its contents as a falsifiable unit test (PF-008 doc-drift guard).
 pub(super) const SEARCH_HELP_TEXT: &str = "\
 Usage: skim search [OPTIONS] [QUERY]
 
@@ -2070,80 +1157,15 @@ Positional query options:
                    Example: \"alpha beta gamma\" --phrase --near 4 matches if alpha,
                    beta, and gamma appear in that order within 4 word-token positions.
 
-  --phrase and --near are honored on any text query including text + --ast and
-  text + --blast-radius. They are inert on all other arms (no text query).
-
 Language filter option:
   --lang LANG      Filter results to files of a given language (e.g. --lang rust,
                    --lang python). Accepted as language name or extension.
 
-AST structural query options (#199):
-  --ast PATTERN    Filter/list by AST structural pattern.
-                   PATTERN is a named catalog pattern or a containment query:
-                     Named:        --ast try-catch
-                     Containment:  --ast \"for_statement > await_expression\"
-                   Use `--ast` alone for standalone AST-only output (file-level),
-                   or combine with a text query for intersection results.
-
-  Limitations:
-    #283 -- Single-node queries (e.g. --ast try_statement) are not yet supported;
-           use a named pattern or a containment query instead.
-    Size cap -- Files larger than 1 MiB are excluded from AST indexing and will
-           not appear in --ast results (they remain fully text-searchable).
-           Run `skim search --stats` or `skim search --stats --json` to see
-           which files are excluded (`ast_coverage` / ast eligible/excluded lines).
-           The `--ast` JSON envelope includes an `ast_coverage` key when any
-           files are excluded, listing per-language counts and a bounded sample.
-
-  --ast composes with: text query, --phrase, --near, --lang, --hot/--cold/--risky,
-  --blast-radius, --limit, --offset, and --json.  When heatmap data is absent,
-  temporal sorts degrade gracefully: a warning is printed to stderr and results are
-  returned unsorted (exit 0).
-
-AST standalone examples:
-  skim search --ast try-catch                   Files with try/catch blocks
-  skim search --ast \"for_statement > await_expression\"  Async-in-loop pattern
-  skim search \"error\" --ast try-catch           Text+AST intersection (lexical snippets preserved)
-  skim search --ast try-catch --blast-radius src/auth.rs  AST ∩ co-change
-  skim search --ast god-function --hot           AST matches sorted by hotspot score
-  skim search \"error\" --ast try-catch --hot --blast-radius src/auth.rs --limit 20 --json
-                                                 Full CLI surface: text + AST + temporal + co-change + JSON
-
-Temporal query options (auto-populated by 'skim search' on a git repo):
-  --hot                        Sort/list by hotspot score descending
-  --cold                       Sort/list by hotspot score ascending
-  --risky                      Sort/list by bug-fix density descending
-  --blast-radius FILE          Restrict to co-change partners of FILE
-
-Temporal flag composition:
-  --hot and --cold/--risky are mutually exclusive (pick one sort mode).
-  --blast-radius is composable with any sort mode and with text queries.
-
-Composite ranking options (#200, #377):
-  --weights L,A,T      Tune composite RRF ranking. Exactly 3 comma-separated ratio
-                       values: lexical, ast, temporal.
-                       Default: 0.5,0.3,0.2
-                       Values are ratios only — NOT normalized; zero and non-sum-to-1
-                       are allowed. Negative, NaN, and inf are rejected.
-                       Active on TWO composite paths:
-                         - --blast-radius (no --ast): all three weights apply
-                           (lexical + ast + temporal).
-                           The temporal component ranks co-change partners by
-                           Jaccard co-change strength (#409): higher
-                           strength → higher temporal rank contribution.
-                         - text + --ast (the intersection path): lexical and ast
-                           apply. The temporal weight is INERT whenever --ast is
-                           present, since the AST intersection fuses only the
-                           lexical and ast signals.
-                       On any other query (pure-lexical, standalone --ast,
-                       --hot/--cold/--risky-only, --blast-radius-only) --weights is
-                       inert; supplying it there prints a one-line notice to stderr
-                       (#377).
-                       The 3 extended signals (import_graph, dir_proximity,
-                       structural_coupling) are fixed at 0.0 until measured.
-
-  Example: --weights 0.8,0.1,0.1  (lexical-heavy)
-           --weights 0.2,0.2,0.6  (temporal-heavy; needs --blast-radius, no --ast)
+Removed flags (each exits 2 and names its replacement):
+  --ast                        Use ast-grep for structural search
+  --hot, --cold, --risky       Use skim heatmap for churn and fix density
+  --blast-radius               Use skim heatmap, or git log --name-only -- FILE
+  --weights                    There is no fused ranking
 
 General examples:
   skim search \"authenticate\"                Search for 'authenticate'
@@ -2153,20 +1175,13 @@ General examples:
   skim search --rebuild                     Rebuild from scratch
   skim search --update                      Refresh stale index
   skim search --stats                       Show index statistics
-  skim search --install-hooks               Install hooks (clone-wide in a linked worktree)
-  skim search --hot                         Top hotspot files (standalone)
-  skim search --hot --limit 5 --offset 5   Hotspot page 2 (items 6-10)
-  skim search --risky                       Top risky files (standalone)
-  skim search --blast-radius src/auth.rs    Co-change partners of auth.rs
-  skim search --blast-radius src/auth.rs --offset 10  Co-change page 2
-  skim search \"auth\" --hot                  Text results sorted by hotspot
-  skim search \"auth\" --blast-radius src/auth.rs  Text within co-change partners";
+  skim search --install-hooks               Install hooks (clone-wide in a linked worktree)";
 
 fn print_help() {
     // AD-375-3: the `index` subcommand line was removed with #375 (avoids PF-008).
     // `skim search index` now runs a QUERY for the word "index"; builds go through
     // --build / --rebuild / --update (already documented in Options above).
-    // Body lives in SEARCH_HELP_TEXT so AC10 can assert it without driving the CLI.
+    // Body lives in SEARCH_HELP_TEXT so tests can assert it without driving the CLI.
     println!("{SEARCH_HELP_TEXT}");
 }
 
@@ -2194,7 +1209,7 @@ fn print_help() {
 /// AD-395-6: `skipped` / `skipped_by_reason` are additive keys (AC11 back-compat).
 /// `skipped_by_reason` uses `BTreeMap` for byte-stable key order (PF-012).
 ///
-/// **Snapshot asymmetry (AD-414-10 / AC-22):** `git_head` and `temporal_state` are
+/// **Snapshot asymmetry (AD-414-10 / AC-22):** `git_head` and `staleness` are
 /// PRE-heal snapshots from `snapshot`; all other fields reflect the post-heal state.
 fn build_stats_json(snapshot: &StatsGathered) -> anyhow::Result<serde_json::Value> {
     let skipped_arr: Vec<serde_json::Value> = snapshot
@@ -2210,8 +1225,7 @@ fn build_stats_json(snapshot: &StatsGathered) -> anyhow::Result<serde_json::Valu
         *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
     }
     // AD-405-9 / AC-405-9 / AC-405-15: `ast_coverage` is additive (never replaces
-    // existing keys) and OMITTED when clean (is_clean() == true), matching the
-    // same guard used on the standalone --ast and compound --ast surfaces.
+    // existing keys) and OMITTED when clean (is_clean() == true).
     let ast_coverage_val: Option<serde_json::Value> = if snapshot.ast_coverage.is_clean() {
         None
     } else {
@@ -2225,11 +1239,9 @@ fn build_stats_json(snapshot: &StatsGathered) -> anyhow::Result<serde_json::Valu
         "total_ngrams": snapshot.total_ngrams,
         "index_size_bytes": snapshot.index_size_bytes,
         "total_on_disk_bytes": snapshot.total_on_disk,
-        "temporal_db_bytes": snapshot.temporal_db_bytes,
         "last_updated": snapshot.last_updated,
         "git_head": snapshot.pre_refresh_git_head,
         "git_head_state": snapshot.git_head_state_str,
-        "temporal_state": snapshot.pre_refresh_temporal_state,
         "staleness": snapshot.staleness_status.to_string(),
         "cache_dir": snapshot.cache_dir_display,
         "skipped": skipped_arr,
@@ -2251,23 +1263,18 @@ fn build_stats_json(snapshot: &StatsGathered) -> anyhow::Result<serde_json::Valu
 ///
 /// Used by `index_tests.rs` for:
 /// - AC4 (#395): assert `skipped` array / `skipped_by_reason` JSON fields.
-/// - AC11 (#395): assert all nine pre-existing keys survive with unchanged types.
+/// - AC11 (#395): assert all pre-existing keys survive with unchanged types.
 ///
-/// Resolves the live `HeadState` from `root`, runs the same gather+serialise
-/// sequence as the production `run_stats --json` path.
+/// Runs the same gather+serialise sequence as the production `run_stats --json`
+/// path.
 #[cfg(test)]
 pub(crate) fn stats_json_for_test(
     cache_dir: &std::path::Path,
     root: &std::path::Path,
 ) -> anyhow::Result<serde_json::Value> {
-    let head_state = staleness::git_head_state(root);
-    let snapshot = gather_stats(cache_dir, root, head_state)?;
+    let snapshot = gather_stats(cache_dir, root)?;
     build_stats_json(&snapshot)
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -2340,8 +1347,8 @@ mod tests {
         );
     }
 
-    /// AC-6 (#380): when AST and temporal artifacts also exist, the total includes
-    /// them — it MUST NOT report lexical-only.
+    /// AC-6 (#380): when AST artifacts also exist, the total includes them — it
+    /// MUST NOT report lexical-only.
     #[test]
     fn test_total_on_disk_includes_all_artifacts() {
         let dir = tempfile::tempdir().unwrap();
@@ -2354,7 +1361,6 @@ mod tests {
             ("ast_index.skidx", 7),
             ("ast_index.skpost", 11),
             ("ast_index.skcache", 13),
-            ("temporal.db", 100),
         ];
         for (name, n) in &sizes {
             std::fs::write(cache_dir.join(name), vec![0u8; *n as usize]).unwrap();
@@ -2363,10 +1369,10 @@ mod tests {
         let lexical_only: u64 = 10 + 20 + 5;
 
         let total = total_on_disk_bytes(cache_dir);
-        assert_eq!(total, expected, "total must sum all 7 artifacts (AC-6)");
+        assert_eq!(total, expected, "total must sum all 6 artifacts (AC-6)");
         assert!(
             total > lexical_only,
-            "total ({total}) must exceed lexical-only ({lexical_only}) when AST+temporal exist (AC-6 negative)"
+            "total ({total}) must exceed lexical-only ({lexical_only}) when AST artifacts exist (AC-6 negative)"
         );
     }
 
@@ -2385,7 +1391,7 @@ mod tests {
     #[test]
     fn test_artifact_len_missing_is_zero() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(artifact_len(dir.path(), "temporal.db"), 0);
+        assert_eq!(artifact_len(dir.path(), "index.skidx"), 0);
     }
 
     #[test]
@@ -2570,58 +1576,6 @@ mod tests {
         );
     }
 
-    /// Double-offset guard (#372): when `--hot`/`--cold`/`--risky` is active,
-    /// the QueryConfig built inside `run_query` must carry `offset: None` so that
-    /// `execute_query_with_manifest` (the pre-sort path) does NOT consume the
-    /// offset.  The single correct application is the post-sort `drain` in
-    /// `run_query`.
-    ///
-    /// This test exercises the config-building logic directly by checking the
-    /// flags value and asserting that the temporal branch suppresses the offset
-    /// in the config.  It is a whitebox unit test of the dispatch invariant, not
-    /// an end-to-end integration (which would require a live temporal DB).
-    ///
-    /// PF-007 (discriminating): if `offset: if flags.temporal_sort.is_some() { None }
-    /// else { flags.offset }` is removed, this test catches the regression by
-    /// confirming the temporal flag was parsed (so the guard condition fires).
-    #[test]
-    fn test_double_offset_guard_temporal_sort_suppresses_config_offset() {
-        // Parse flags that combine --offset and --hot.
-        // We cannot call run_query directly (requires a real index), but we can
-        // verify that the parsed flags correctly encode the pre-conditions for
-        // the guard inside run_query.
-        let flags = parse_flags(&[
-            "authenticate".to_string(),
-            "--hot".to_string(),
-            "--offset".to_string(),
-            "5".to_string(),
-        ])
-        .unwrap();
-        // Offset is present in parsed flags.
-        assert_eq!(
-            flags.offset,
-            Some(5),
-            "offset must be parsed and stored in Flags"
-        );
-        // Temporal sort is set — this is the pre-condition for the double-offset guard.
-        assert_eq!(
-            flags.temporal_sort,
-            Some(types::TemporalSort::Hot),
-            "temporal_sort must be Hot when --hot is supplied"
-        );
-        // Verify the guard expression: when temporal_sort is Some, config.offset
-        // should be None (suppressed for the pre-sort path).
-        let config_offset = if flags.temporal_sort.is_some() {
-            None
-        } else {
-            flags.offset
-        };
-        assert_eq!(
-            config_offset, None,
-            "QueryConfig.offset must be None when temporal_sort is active (double-offset guard)"
-        );
-    }
-
     #[test]
     fn test_parse_flags_root_space() {
         let flags = parse_flags(&["--root".to_string(), "/tmp/proj".to_string()]).unwrap();
@@ -2733,27 +1687,6 @@ mod tests {
     // AD-412-3: --help/-h must not be silently consumed as a flag value
     // ============================================================================
 
-    /// `--ast --help`: `--help` must not be swallowed as the AST pattern value.
-    ///
-    /// Before the AD-412-3 fix, `take_flag_value("--ast", Some("--help"), "--ast")`
-    /// returned Ok(("--help", true)), so `ast = Some("--help")` propagated into
-    /// `validate_ast_pattern` which produced a confusing "unknown pattern" error
-    /// instead of pointing the user at the help surface.  The fix bails early with
-    /// a clear "requires a value; to print help, run: skim search --help" message.
-    #[test]
-    fn test_parse_flags_help_after_ast_is_not_consumed_as_value() {
-        let err = parse_flags(&["--ast".to_string(), "--help".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--ast requires a value"),
-            "AD-412-3: --help must not be silently consumed as the --ast value; got: {msg}"
-        );
-        assert!(
-            msg.contains("skim search --help"),
-            "error must point at the help surface; got: {msg}"
-        );
-    }
-
     /// `--limit --help`: `--help` must not be swallowed as the limit value.
     #[test]
     fn test_parse_flags_help_after_limit_is_not_consumed_as_value() {
@@ -2785,53 +1718,6 @@ mod tests {
         assert!(
             msg.contains("skim search --help"),
             "error must point at the help surface; got: {msg}"
-        );
-    }
-
-    /// Same as above but with the `-h` short form.
-    #[test]
-    fn test_parse_flags_short_h_after_ast_is_not_consumed_as_value() {
-        let err = parse_flags(&["--ast".to_string(), "-h".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--ast requires a value"),
-            "AD-412-3: -h must not be silently consumed as the --ast value; got: {msg}"
-        );
-    }
-
-    /// `--blast-radius --help`: `--help` must not be swallowed as the file path.
-    ///
-    /// `--blast-radius` consumes its value via `parse_temporal_flag` rather than
-    /// `take_flag_value`, so it needs the same AD-412-3 guard.  Without it,
-    /// `blast_radius = Some("--help")` ran a degraded co-change search for a file
-    /// literally named "--help" (exit 0) instead of honoring the help request —
-    /// the same silent-wrong-behavior class AD-412-3 fixed for `--root`.
-    ///
-    /// PF-007 (discriminating): asserts the specific "--blast-radius requires a
-    /// file path" message and the help-surface pointer, so reverting the guard
-    /// (which yields Ok with a bogus blast_radius) makes `unwrap_err()` panic.
-    #[test]
-    fn test_parse_flags_help_after_blast_radius_is_not_consumed_as_value() {
-        let err = parse_flags(&["--blast-radius".to_string(), "--help".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--blast-radius requires a file path"),
-            "AD-412-3: --help must not be silently consumed as the --blast-radius value; got: {msg}"
-        );
-        assert!(
-            msg.contains("skim search --help"),
-            "error must point at the help surface; got: {msg}"
-        );
-    }
-
-    /// Same as above but with the `-h` short form.
-    #[test]
-    fn test_parse_flags_short_h_after_blast_radius_is_not_consumed_as_value() {
-        let err = parse_flags(&["--blast-radius".to_string(), "-h".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--blast-radius requires a file path"),
-            "AD-412-3: -h must not be silently consumed as the --blast-radius value; got: {msg}"
         );
     }
 
@@ -3147,546 +2033,124 @@ mod tests {
         assert_eq!(flags.limit, 1);
     }
 
-    // ============================================================================
-    // resolve_blast_radius_paths — BlastRadiusResolution degradation paths
-    // ============================================================================
+    // ── Removed flags ─────────────────────────────────────────────────────────
 
-    /// When blast_radius is Some but temporal.db is absent (temporal data not yet
-    /// auto-populated), the function must return `Ok(Degraded(_))` without panicking.
-    /// A stderr warning is expected; the caller uses the resolution to push a DegradedJson entry.
-    #[test]
-    fn test_resolve_blast_radius_filter_no_db_returns_none() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        // cache_dir has no temporal.db — open_temporal_state returns Unavailable(Missing)
-        // and the function degrades gracefully to BlastRadiusResolution::Degraded.
-        let result = temporal::resolve_blast_radius_paths(
-            Some("src/auth.rs"),
-            root,
-            dir.path(),
-            false,
-            &staleness::HeadState::NotARepo,
-        );
-        assert!(
-            result.is_ok(),
-            "must not error when temporal.db is absent, got: {:?}",
-            result.unwrap_err()
-        );
-        assert!(
-            matches!(
-                result.unwrap(),
-                temporal::BlastRadiusResolution::Degraded(_)
-            ),
-            "must return Degraded(_) (graceful degradation) when temporal.db is absent"
-        );
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
     }
 
-    // ============================================================================
-    // AD-413-16 / PF-016: RepositoryMismatch must return Filtered(empty, reason).
-    // ============================================================================
-
-    /// When blast_radius is Some and temporal.db exists but belongs to a
-    /// different repository (AnchorDiffers), `resolve_blast_radius_paths` must
-    /// return `Ok(Filtered { allow: empty, degraded: RepositoryMismatch })`.
-    ///
-    /// `Filtered` with an empty allowlist forces zero results on all blast-radius
-    /// call sites (PF-016 / AD-413-16), AND the `degraded` field ensures the caller
-    /// pushes a `DegradedJson` entry — previously this case was silent (Finding B).
+    /// Each removed flag yields a one-line message that names the flag and the
+    /// replacement, so a reader knows what to run instead.
     #[test]
-    fn test_resolve_blast_radius_anchor_differs_returns_empty_set() {
-        use staleness::HeadState;
-
-        // Set up:
-        //   parent_dir/.git/HEAD   ← fake git repo (so resolve_repo_toplevel
-        //                            discovers parent_dir as the live toplevel)
-        //   parent_dir/sub/        ← `root` (no own .git, so it is a subdir root)
-        //   parent_dir/sub/temporal.db ← DB whose META_GIT_TOPLEVEL is a
-        //                                 sentinel for a *different* repo path,
-        //                                 triggering AnchorDiffers.
-        let parent_dir = tempfile::TempDir::new().unwrap();
-        let git_dir = parent_dir.path().join(".git");
-        std::fs::create_dir_all(&git_dir).unwrap();
-        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-
-        let sub_dir = parent_dir.path().join("sub");
-        std::fs::create_dir_all(&sub_dir).unwrap();
-
-        let db_path = sub_dir.join("temporal.db");
-
-        // Write temporal.db whose git_toplevel is a sentinel that does NOT match
-        // parent_dir — `anchor_state_on_db` will return AnchorDiffers.
-        {
-            let db = rskim_search::TemporalDb::open(&db_path).expect("must create temporal.db");
-            db.set_meta(rskim_search::META_GIT_TOPLEVEL, "/other/repo/sentinel")
-                .expect("must set toplevel");
-        }
-
-        // sub_dir has no .git → resolve_repo_toplevel walks up to parent_dir.
-        // Stored toplevel ("/other/repo/sentinel") ≠ parent_dir → AnchorDiffers.
-        let result = temporal::resolve_blast_radius_paths(
-            Some("src/auth.rs"),
-            &sub_dir, // root
-            &sub_dir, // cache_dir (DB lives at sub_dir/temporal.db)
-            false,
-            &HeadState::NotARepo,
-        );
-
-        assert!(
-            result.is_ok(),
-            "must not return Err on AnchorDiffers, got: {:?}",
-            result.unwrap_err()
-        );
-        let resolution = result.unwrap();
-        match resolution {
-            temporal::BlastRadiusResolution::Filtered {
-                ref allow,
-                ref degraded,
-            } => {
-                assert!(
-                    allow.is_empty(),
-                    "empty allowlist forces zero results on all blast-radius arms (PF-016)"
-                );
-                assert_eq!(
-                    degraded.reason,
-                    temporal::DegradedReason::RepositoryMismatch,
-                    "RepositoryMismatch must carry its reason so output.degraded receives an entry (Finding B)"
-                );
-            }
-            other => panic!(
-                "expected BlastRadiusResolution::Filtered for AnchorDiffers, got: {:?}",
-                other
-            ),
-        }
-    }
-
-    // ============================================================================
-    // F12: Missing temporal.db must produce exit 0 (graceful degradation), not
-    //      exit 1. AC says: "Missing temporal.db → warning on stderr, exit 0".
-    // ============================================================================
-
-    /// AC8: Standalone temporal mode (e.g. `skim search --hot`) with no temporal.db
-    /// must return `ExitCode::SUCCESS` (not FAILURE) AND must not create a corrupt
-    /// temporal.db in the cache directory.
-    ///
-    /// Discriminating: asserts both exit code AND absent/non-corrupt DB file.
-    #[test]
-    fn test_standalone_temporal_no_db_returns_exit_0() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().to_string_lossy().to_string();
-        // No temporal.db exists in the temp dir's cache — standalone path should
-        // degrade gracefully with exit 0.
-        let result = run(
-            &["--hot".to_string(), "--root".to_string(), root],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "missing temporal.db must be a warning (exit 0), not an error (exit 1)"
-        );
-
-        // AC8 postcondition: no corrupt temporal.db created as a side effect.
-        // The cache dir is the auto-resolved .skim/search/ under the temp root.
-        // We enumerate likely cache paths; if temporal.db was created anywhere,
-        // it must be openable (not corrupt).
-        // Most directly: verify it was not created at the root itself.
-        let temporal_at_root = dir.path().join("temporal.db");
-        if temporal_at_root.exists() {
-            // If it somehow exists, it must at least be valid SQLite.
+    fn removed_flag_message_names_flag_and_replacement() {
+        for (flag, advice) in REMOVED_FLAGS {
+            let message = removed_flag_message(flag)
+                .unwrap_or_else(|| panic!("{flag} must be refused as a removed flag"));
             assert!(
-                rskim_search::TemporalDb::open(&temporal_at_root).is_ok(),
-                "temporal.db at root must not be corrupt (AC8 postcondition)"
+                message.starts_with("skim search: "),
+                "message must carry the program prefix: {message:?}"
+            );
+            assert!(
+                message.contains(flag) && message.contains(advice),
+                "message must name {flag} and its replacement {advice:?}: {message:?}"
+            );
+            assert!(!message.contains('\n'), "message must be one line");
+        }
+    }
+
+    /// The attached-value form (`--ast=x`) is refused too, and the attached text
+    /// never reaches the message.
+    #[test]
+    fn removed_flag_message_covers_attached_value_without_echoing_it() {
+        let message = removed_flag_message("--ast=try-catch\u{1b}[31m").unwrap();
+        assert!(message.contains("--ast was removed"), "got {message:?}");
+        assert!(
+            !message.contains("try-catch") && !message.contains('\u{1b}'),
+            "attached text must not reach the message: {message:?}"
+        );
+    }
+
+    /// Flags and words that only start like a removed flag are not refused.
+    #[test]
+    fn removed_flag_message_ignores_lookalikes() {
+        for arg in [
+            "--ast-grep",
+            "--hotfix",
+            "--weightsx",
+            "--root",
+            "ast",
+            "-hot",
+        ] {
+            assert_eq!(
+                removed_flag_message(arg),
+                None,
+                "{arg} is not a removed flag"
             );
         }
     }
 
-    // ============================================================================
-    // #413 / AD-413-8 — the degraded message is TRIAGED by HEAD state
-    // ============================================================================
-
-    /// AC18 — the unresolvable-HEAD message must not repeat the "not a git repo"
-    /// lie, must name BOTH remaining causes, and must carry the real ticket number.
-    ///
-    /// AC18(c)/SEARCH-ADR-004: the `#481` literal is asserted against the constant itself,
-    /// not against a regex for `#<n>`, so a placeholder ticket number or a renumber
-    /// fails this test rather than shipping.
+    /// A removed flag ends parsing at once: a later bad value must not replace
+    /// the refusal with a different error.
     #[test]
-    fn test_head_unresolved_message_content_ac18() {
+    fn parse_flags_removed_flag_wins_over_later_tokens() {
+        let flags = parse_flags(&args(&["--ast", "try-catch", "--limit", "abc"])).unwrap();
         assert!(
-            !HEAD_UNRESOLVED_TEMPORAL_MSG.contains("run 'skim search' on a git repo"),
-            "AC18(a): the unresolvable-HEAD message must NOT claim this is not a git repo"
-        );
-        assert!(
-            HEAD_UNRESOLVED_TEMPORAL_MSG.contains("unborn branch"),
-            "AC18(b): must name the unborn-branch cause"
-        );
-        assert!(
-            HEAD_UNRESOLVED_TEMPORAL_MSG.contains("reftable"),
-            "AC18(b): must name the unsupported-ref-backend (reftable) cause"
-        );
-        assert!(
-            HEAD_UNRESOLVED_TEMPORAL_MSG.contains("#481"),
-            "AC18(c)/SEARCH-ADR-004: must cite the filed reftable ticket #481 verbatim"
-        );
-        assert!(
-            !SUBDIR_ROOT_TEMPORAL_MSG.contains("run 'skim search' on a git repo"),
-            "AC33(c): the anchor-refusal message must NOT claim this is not a git repo"
+            matches!(&flags.action, SearchAction::Removed(m) if m.contains("--ast")),
+            "expected a removal refusal, got {:?}",
+            flags.action
         );
     }
 
-    /// AC19 back-compat + AD-413-8 triage — `degraded_notice` returns the
-    /// byte-identical `NO_TEMPORAL_DATA_MSG` for a genuine non-repo, and a DIFFERENT
-    /// message for a repo whose HEAD cannot be resolved (AD-414-1).
-    ///
-    /// Finding 1/3 fix: the function is pure (takes pre-resolved head+anchor),
-    /// so the test constructs states directly — no filesystem fixtures needed.
+    /// A removed flag after a text query still refuses; the query is not run.
     #[test]
-    fn test_degraded_notice_triage_ac18_ac19() {
-        // Genuine non-repo → byte-identical legacy text (AC19).
-        assert_eq!(
-            temporal::degraded_notice(
-                &temporal::TemporalUnavailable {
-                    reason: temporal::DegradedReason::NotGitRepo,
-                    detail: String::new(),
-                },
-                "",
-                temporal::Fallback::Lexical
-            ),
-            NO_TEMPORAL_DATA_MSG,
-            "AC19: NotARepo must keep the byte-identical legacy message"
-        );
-
-        // Repo whose HEAD exists but does not resolve → the triaged message (AC18).
-        assert_eq!(
-            temporal::degraded_notice(
-                &temporal::TemporalUnavailable {
-                    reason: temporal::DegradedReason::HeadUnresolved,
-                    detail: String::new(),
-                },
-                "",
-                temporal::Fallback::Lexical
-            ),
-            HEAD_UNRESOLVED_TEMPORAL_MSG,
-            "AD-413-8: Unresolved HEAD must not get the non-repo message"
+    fn parse_flags_removed_flag_after_text_query_is_refused() {
+        let flags = parse_flags(&args(&["needle", "--hot"])).unwrap();
+        assert!(
+            matches!(&flags.action, SearchAction::Removed(m) if m.contains("--hot")),
+            "expected a removal refusal, got {:?}",
+            flags.action
         );
     }
 
-    /// AC33(f): `degraded_notice` Resolved+Differs branch returns a message that
-    /// contains SUBDIR_ROOT_TEMPORAL_MSG and the recorded/live path snippets
-    /// (AD-414-1).
-    ///
-    /// Finding 1/3 fix: the function is pure, so the test passes states directly.
-    /// No filesystem or SQLite fixtures are needed for the dispatch logic.
+    /// After `--`, a removed flag name is query text, not a flag.
     #[test]
-    fn test_degraded_notice_resolved_differs_returns_subdir_msg() {
-        let recorded = std::path::PathBuf::from("/wrong/repo/path");
-        let live = std::path::PathBuf::from("/correct/repo/path");
-        let msg = temporal::degraded_notice(
-            &temporal::TemporalUnavailable {
-                reason: temporal::DegradedReason::RepositoryMismatch,
-                detail: format!("(recorded: {:?}, live: {:?})", recorded, live),
-            },
-            "",
-            temporal::Fallback::Lexical,
-        );
-
-        assert!(
-            msg.contains(SUBDIR_ROOT_TEMPORAL_MSG),
-            "AC33(f): Resolved+Differs branch must contain SUBDIR_ROOT_TEMPORAL_MSG, got: {msg:?}"
-        );
-        assert!(
-            msg.contains("/wrong/repo/path"),
-            "AC33(f): message must include the recorded anchor path, got: {msg:?}"
-        );
-        assert!(
-            !msg.contains(NO_TEMPORAL_DATA_MSG),
-            "AC33(f): Resolved+Differs must NOT return the non-repo message, got: {msg:?}"
-        );
-        assert!(
-            !msg.contains(HEAD_UNRESOLVED_TEMPORAL_MSG),
-            "AC33(f): Resolved+Differs must NOT return the unresolved-HEAD message, got: {msg:?}"
-        );
+    fn parse_flags_removed_flag_name_after_double_dash_is_query_text() {
+        let flags = parse_flags(&args(&["--", "--ast"])).unwrap();
+        assert_eq!(flags.action, SearchAction::Query("--ast".to_string()));
     }
 
-    /// `degraded_notice` for Empty (non-shallow, no flag) returns the §2.3
-    /// normative text (AC-2).
-    ///
-    /// A hand-written cause literal outside the builder drifts silently;
-    /// this test pins the §2.3 text directly so any drift fails at the assertion site.
+    /// The refusal exits 2, the code for a refused command line.
     #[test]
-    fn test_degraded_notice_empty_non_shallow_ac2() {
-        const EMPTY_CAUSE_PREFIX: &str = "temporal data is empty (0 rows) \u{2014} this repository has no commit history skim can analyse";
-        const EMPTY_REMEDY: &str = "run 'skim search --rebuild'";
-
-        // Standalone call (no flag) — returns just cause + remediation.
-        let msg = temporal::degraded_notice(
-            &temporal::TemporalUnavailable {
-                reason: temporal::DegradedReason::Empty,
-                detail: String::new(),
-            },
-            "",
-            temporal::Fallback::Lexical,
-        );
-        assert!(
-            msg.contains(EMPTY_CAUSE_PREFIX),
-            "AC-2: Empty must contain the §2.3 cause prefix, got: {msg:?}"
-        );
-        assert!(
-            msg.contains(EMPTY_REMEDY),
-            "AC-2: Empty must contain the --rebuild remedy, got: {msg:?}"
-        );
-        assert!(
-            !msg.contains("SKIM_DEBUG"),
-            "AC-2: Empty must NOT contain the old SKIM_DEBUG hint, got: {msg:?}"
-        );
-        assert!(
-            !msg.contains("no temporal data"),
-            "AC-7/AC-2: Empty cause must NOT contain the forbidden 'no temporal data' substring, got: {msg:?}"
-        );
-
-        // With flag — the Lexical tail is appended.
-        let msg_with_flag = temporal::degraded_notice(
-            &temporal::TemporalUnavailable {
-                reason: temporal::DegradedReason::Empty,
-                detail: String::new(),
-            },
-            "--hot",
-            temporal::Fallback::Lexical,
-        );
-        assert!(
-            msg_with_flag.contains("--hot not applied"),
-            "AC-2(c): Empty with flag must carry 'not applied' tail, got: {msg_with_flag:?}"
-        );
-        assert!(
-            msg_with_flag.contains("lexical relevance order"),
-            "AC-2(d): Empty with flag must contain 'lexical', got: {msg_with_flag:?}"
-        );
+    fn removed_flag_exit_code_is_two() {
+        assert_eq!(REMOVED_FLAG_EXIT_CODE, 2);
     }
 
-    // ============================================================================
-    // AC9 — User-facing message accuracy: strings reference auto-refresh, not
-    //        stale manual-refresh advice.
-    // ============================================================================
-
-    /// AC9: The no-temporal-data message for --hot/--cold/--risky must reference
-    /// 'skim search' auto-populate, NOT the old 'skim heatmap' advice.
-    ///
-    /// PF-007 discriminating: asserts against the `NO_TEMPORAL_DATA_MSG` production
-    /// constant (not a locally-declared copy), so changing the production string
-    /// immediately breaks this test.
-    ///
-    /// Coverage note: this test guards the content of the production constant and
-    /// verifies that run() exits 0 on a non-git dir with --json --hot (the exit-0
-    /// contract of the degradation path).  The JSON emission path — that production
-    /// stdout actually contains `{"warning": NO_TEMPORAL_DATA_MSG}` — requires
-    /// subprocess spawning to capture stdout; that level of coverage is provided
-    /// by `test_hot_json_warning_content_on_non_git_dir` below, which spawns the
-    /// binary and asserts the parsed `warning` field equals the production constant.
-    #[test]
-    fn test_no_temporal_data_message_references_auto_refresh() {
-        // Assert against the production constant — NOT a local string literal.
-        // This is the single source of truth: if the production constant changes,
-        // the assertions below break immediately (PF-007 fix, #357 cycle-2 finding 12).
-
-        // AC9 guard: must NOT contain the old 'skim heatmap' advice.
-        assert!(
-            !NO_TEMPORAL_DATA_MSG.contains("skim heatmap"),
-            "NO_TEMPORAL_DATA_MSG must NOT reference 'skim heatmap' (AC9 regression guard)"
-        );
-        // AC9 guard: must reference the auto-refresh path.
-        assert!(
-            NO_TEMPORAL_DATA_MSG.contains("skim search"),
-            "NO_TEMPORAL_DATA_MSG must reference 'skim search' auto-refresh (AC9)"
-        );
-        assert!(
-            NO_TEMPORAL_DATA_MSG.contains("auto-populate"),
-            "NO_TEMPORAL_DATA_MSG must mention 'auto-populate' (AC9)"
-        );
-
-        // Exit-0 contract: --json --hot on a non-git dir must still exit SUCCESS.
-        // (The warning is emitted to stdout as JSON; captured content is verified
-        // in test_hot_json_warning_content_on_non_git_dir below.)
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().to_string_lossy().to_string();
-        let result = run(
-            &[
-                "--json".to_string(),
-                "--hot".to_string(),
-                "--root".to_string(),
-                root,
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "--json --hot on non-git dir must exit 0 (AC9 degradation contract)"
-        );
-    }
-
-    /// AC9 JSON path: the production code must emit
-    /// `{"warning": NO_TEMPORAL_DATA_MSG}` on stdout when --json --hot is
-    /// invoked on a dir with no temporal data.
-    ///
-    /// PF-007 discriminating: captures the actual binary's stdout via subprocess
-    /// and asserts the JSON `warning` field equals the production constant — so a
-    /// regression where the code emits a different string, or emits nothing, or
-    /// emits plain text instead of JSON, fails this test (#357 cycle-2 finding 4).
-    #[test]
-    fn test_hot_json_warning_content_on_non_git_dir() {
-        let bin = skim_bin_path();
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().to_string_lossy().to_string();
-
-        let output = std::process::Command::new(&bin)
-            .args(["search", "--json", "--hot", "--root", &root])
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
-
-        assert!(
-            output.status.success(),
-            "--json --hot on non-git dir must exit 0; got {:?}",
-            output.status
-        );
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!(
-                "stdout must be valid JSON; got {:?}\nparse error: {e}",
-                stdout
-            )
-        });
-
-        let warning = parsed
-            .get("warning")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("JSON must have a 'warning' string field; got: {parsed:?}"));
-
-        assert_eq!(
-            warning, NO_TEMPORAL_DATA_MSG,
-            "JSON 'warning' field must equal NO_TEMPORAL_DATA_MSG (AC9 JSON path, PF-007)"
-        );
-    }
-
-    // ============================================================================
-    // AC9 — format_temporal_text Hotspots/Coldspots header newline regression
-    // ============================================================================
-
-    /// Hotspots/Coldspots text header must NOT have a blank line between the
-    /// header text and the column header row.
-    ///
-    /// Regression guard against the writeln!("...\n") double-newline introduced
-    /// by a prior clippy refactor. The header must be immediately followed by the
-    /// column header on the next line.
-    #[test]
-    fn test_format_temporal_text_hotspots_no_blank_line_after_header() {
-        use std::io::BufWriter;
-
-        use super::temporal::{TemporalQueryOutput, format_temporal_text};
-        use rskim_search::HotspotRow;
-
-        let rows = vec![HotspotRow {
-            file_path: "src/hot.rs".to_string(),
-            score: 0.8,
-            changes_30d: 3,
-            changes_90d: 5,
-        }];
-        let output = TemporalQueryOutput::Hotspots(rows);
-
-        let mut buf = Vec::new();
-        let mut writer = BufWriter::new(&mut buf);
-        format_temporal_text(
-            &output,
-            crate::cmd::search::types::Page::first(10),
-            &mut writer,
-        )
-        .unwrap();
-        drop(writer);
-
-        let text = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-
-        // Line 0: "Hotspots (top 1, 90-day decay):"
-        // Line 1: "  Score  30d  90d  Path"  (column header — NOT a blank line)
-        assert!(
-            !lines.is_empty() && lines[0].contains("Hotspots"),
-            "first line must contain 'Hotspots', got: {:?}",
-            lines.first()
-        );
-        assert!(
-            lines.len() >= 2 && !lines[1].trim().is_empty(),
-            "second line must be the column header (not blank), got: {:?}",
-            lines.get(1)
-        );
-        assert!(
-            lines.get(1).map(|l| l.contains("Score")).unwrap_or(false),
-            "second line must be the 'Score' column header (no blank line after header), \
-             got: {:?}",
-            lines.get(1)
-        );
-    }
-
-    /// Coldspots text header must NOT have a blank line after it (same regression
-    /// as Hotspots but for the --cold path).
-    #[test]
-    fn test_format_temporal_text_coldspots_no_blank_line_after_header() {
-        use std::io::BufWriter;
-
-        use super::temporal::{TemporalQueryOutput, format_temporal_text};
-        use rskim_search::HotspotRow;
-
-        let rows = vec![HotspotRow {
-            file_path: "src/cold.rs".to_string(),
-            score: 0.1,
-            changes_30d: 0,
-            changes_90d: 1,
-        }];
-        let output = TemporalQueryOutput::Coldspots(rows);
-
-        let mut buf = Vec::new();
-        let mut writer = BufWriter::new(&mut buf);
-        format_temporal_text(
-            &output,
-            crate::cmd::search::types::Page::first(10),
-            &mut writer,
-        )
-        .unwrap();
-        drop(writer);
-
-        let text = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-
-        assert!(
-            !lines.is_empty() && lines[0].contains("Coldspots"),
-            "first line must contain 'Coldspots'"
-        );
-        assert!(
-            lines.get(1).map(|l| l.contains("Score")).unwrap_or(false),
-            "second line must be the 'Score' column header (no blank line after header), \
-             got: {:?}",
-            lines.get(1)
-        );
-    }
-
-    // ============================================================================
-    // #357 BUG A — run_build (--rebuild / --build) must populate temporal.db
-    // ============================================================================
-
-    /// Shared git-repo helper — delegates to the canonical `staleness::create_real_git_repo`
-    /// (#357 cycle-2 findings 9/14: removes the third near-verbatim copy, per plan step 6).
-    /// Named identically to its counterpart in `staleness_tests.rs` and
-    /// `temporal_build_tests.rs` so readers scanning the three test files see a
-    /// single shared-helper relationship rather than three apparently-distinct helpers
-    /// (#357 cycle-2 finding 3).
+    /// Shared git-repo helper — delegates to the canonical `staleness::create_real_git_repo`.
+    /// Named identically to its counterpart in `staleness_tests.rs` so readers
+    /// scanning the two test files see a single shared-helper relationship rather
+    /// than two apparently-distinct helpers.
     fn create_real_git_repo(
         dir: &std::path::Path,
         commit_specs: &[(&str, &[(&str, &str)])],
     ) -> String {
         staleness::create_real_git_repo(dir, commit_specs)
+    }
+
+    /// Locate the single per-root search cache directory beneath an isolated
+    /// `SKIM_CACHE_DIR`, without re-reading the env var in this process.
+    fn only_search_cache_dir(cache_root: &std::path::Path) -> std::path::PathBuf {
+        let search_dir = cache_root.join("search");
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&search_dir)
+            .unwrap_or_else(|e| panic!("no search cache dir at {search_dir:?}: {e}"))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one per-root cache dir under {search_dir:?}, got {entries:?}"
+        );
+        entries.pop().unwrap()
     }
 
     /// Shared helper for #402 unit tests: create a real git repo with a
@@ -3737,751 +2201,9 @@ mod tests {
         dir
     }
 
-    /// BUG A discriminating test: after `skim search --rebuild` on a git repo with
-    /// ≥2 commits, temporal.db MUST exist, contain non-empty hotspots, and
-    /// META_GIT_HEAD MUST equal the repo HEAD.
-    ///
-    /// PF-007: exit-0 alone is vacuous — this asserts the DISCRIMINATING observables
-    /// (non-empty hotspots + exact HEAD match) so the test fails the moment BUG A
-    /// returns (i.e. if the temporal hook were removed from run_build).
-    #[test]
-    fn test_rebuild_populates_temporal_db() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-
-        let head = create_real_git_repo(
-            root,
-            &[
-                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
-                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
-                (
-                    "fix: fix auth bug",
-                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
-                ),
-            ],
-        );
-        assert_eq!(head.len(), 40, "HEAD must be a 40-char SHA");
-
-        let root_str = root.to_string_lossy().to_string();
-        let result = run(
-            &["--rebuild".to_string(), "--root".to_string(), root_str],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(result, ExitCode::SUCCESS, "--rebuild must exit 0");
-
-        // Locate the cache dir (resolves to <root>/.skim/search/).
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-        let temporal_db_path = cache_dir.join("temporal.db");
-
-        // Discriminating: temporal.db must exist.
-        assert!(
-            temporal_db_path.exists(),
-            "temporal.db must exist after --rebuild on a git repo (#357 BUG A)"
-        );
-
-        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
-
-        // Discriminating: META_GIT_HEAD must equal the repo HEAD (exact match).
-        let stored_head = db
-            .get_meta(rskim_search::META_GIT_HEAD)
-            .unwrap()
-            .expect("META_GIT_HEAD must be set in temporal.db after --rebuild");
-        assert_eq!(
-            stored_head, head,
-            "META_GIT_HEAD in temporal.db must match the repo HEAD after --rebuild (#357 BUG A)"
-        );
-
-        // Discriminating: hotspots must be non-empty (data was actually indexed).
-        let hotspots = db.top_hotspots(20).unwrap();
-        assert!(
-            !hotspots.is_empty(),
-            "temporal.db must contain non-empty hotspot data after --rebuild (#357 BUG A)"
-        );
-    }
-
-    /// BUG A parity: `--build` (force=false) must populate temporal.db identically
-    /// to `--rebuild` (force=true) on a fresh git repo with no prior index.
-    ///
-    /// PF-007: asserts META_GIT_HEAD equality between --build and --rebuild runs
-    /// (both must have temporal data; comparing both to the same repo HEAD).
-    #[test]
-    fn test_build_populates_temporal_db_same_as_rebuild() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-
-        let head = create_real_git_repo(
-            root,
-            &[
-                ("feat: first", &[("lib.rs", "pub fn foo() {}")]),
-                ("feat: second", &[("main.rs", "fn main() {}")]),
-            ],
-        );
-        assert_eq!(head.len(), 40, "HEAD must be a 40-char SHA");
-
-        let root_str = root.to_string_lossy().to_string();
-        let result = run(
-            &["--build".to_string(), "--root".to_string(), root_str],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(result, ExitCode::SUCCESS, "--build must exit 0");
-
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-        let temporal_db_path = cache_dir.join("temporal.db");
-
-        assert!(
-            temporal_db_path.exists(),
-            "temporal.db must exist after --build on a git repo (#357 BUG A parity)"
-        );
-
-        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
-        let stored_head = db
-            .get_meta(rskim_search::META_GIT_HEAD)
-            .unwrap()
-            .expect("META_GIT_HEAD must be set in temporal.db after --build");
-        assert_eq!(
-            stored_head, head,
-            "META_GIT_HEAD in temporal.db must match the repo HEAD after --build (#357 BUG A)"
-        );
-
-        let hotspots = db.top_hotspots(20).unwrap();
-        assert!(
-            !hotspots.is_empty(),
-            "temporal.db must contain non-empty hotspot data after --build (#357 BUG A parity)"
-        );
-    }
-
-    /// BUG A NEGATIVE: `--rebuild` on a non-git directory must succeed (exit 0),
-    /// must NOT create temporal.db (no git history to index), and must create the
-    /// lexical index (build still succeeds for lexical+AST).
-    ///
-    /// PF-007 discriminating: assert SUCCESS && !temporal.db.exists() && index.skidx exists.
-    #[test]
-    fn test_rebuild_non_git_dir_succeeds_no_temporal_db() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-
-        // Write at least one indexable file so build_index has something to do.
-        std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
-
-        let root_str = root.to_string_lossy().to_string();
-        let result = run(
-            &["--rebuild".to_string(), "--root".to_string(), root_str],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "--rebuild on non-git dir must exit 0 (non-fatal temporal, SEARCH-ADR-006/D5)"
-        );
-
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-
-        // Discriminating: no temporal.db (no git history).
-        let temporal_db_path = cache_dir.join("temporal.db");
-        assert!(
-            !temporal_db_path.exists(),
-            "temporal.db must NOT be created on a non-git dir (no history to walk)"
-        );
-
-        // Discriminating: lexical index must still exist (build succeeded for lexical).
-        let index_path = cache_dir.join("index.skidx");
-        assert!(
-            index_path.exists(),
-            "index.skidx must exist after --rebuild even when temporal fails on non-git dir"
-        );
-    }
-
-    // ============================================================================
-    // #357 BUG B — temporal.db self-heals when lexical is Current but temporal stale
-    // ============================================================================
-
-    /// BUG B discriminating: when the lexical index is Current but temporal.db is
-    /// deleted, a subsequent auto_refresh-routed query recreates temporal.db with
-    /// META_GIT_HEAD == current HEAD and non-empty hotspots.
-    ///
-    /// Drive via `run()` with a text query (routes through auto_refresh_if_stale),
-    /// not staleness::auto_refresh_if_stale directly — ensures the full dispatch
-    /// path self-heals (PF-007: assert recreation + exact HEAD match).
-    ///
-    /// This test FAILS on the pre-fix code because auto_refresh_if_stale returned
-    /// early on StalenessCheck::Current without checking temporal.db staleness.
-    #[test]
-    fn test_bug_b_temporal_db_self_heals_when_lexical_is_current() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-
-        let head = create_real_git_repo(
-            root,
-            &[
-                ("feat: add module", &[("src/lib.rs", "pub fn greet() {}")]),
-                (
-                    "fix: fix greet",
-                    &[("src/lib.rs", "pub fn greet() { // fixed }")],
-                ),
-            ],
-        );
-        assert_eq!(head.len(), 40, "HEAD must be a 40-char SHA");
-
-        let root_str = root.to_string_lossy().to_string();
-
-        // First query: builds lexical+AST+temporal (NoIndex → refresh).
-        let exit_code = run(
-            &[
-                "greet".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-                "--limit".to_string(),
-                "5".to_string(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
-
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-        let temporal_db_path = cache_dir.join("temporal.db");
-
-        // Confirm temporal.db was created by the first query.
-        assert!(
-            temporal_db_path.exists(),
-            "temporal.db must exist after first query (setup invariant for BUG B test)"
-        );
-
-        // Delete temporal.db — lexical stays Current (HEAD unchanged).
-        std::fs::remove_file(&temporal_db_path).unwrap();
-        assert!(
-            !temporal_db_path.exists(),
-            "temporal.db must be deleted (test setup)"
-        );
-
-        // Second query: lexical is Current (HEAD unchanged), but temporal.db is missing.
-        // BUG B fix: auto_refresh_if_stale must self-heal temporal.db on the Current branch.
-        let result = run(
-            &[
-                "greet".to_string(),
-                "--root".to_string(),
-                root_str,
-                "--limit".to_string(),
-                "5".to_string(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "second query must succeed after temporal.db deletion (#357 BUG B)"
-        );
-
-        // Discriminating: temporal.db must be recreated.
-        assert!(
-            temporal_db_path.exists(),
-            "temporal.db must be recreated by the second query when lexical is Current (#357 BUG B)"
-        );
-
-        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
-
-        // Discriminating: META_GIT_HEAD must equal the current HEAD (not stale).
-        let stored_head = db
-            .get_meta(rskim_search::META_GIT_HEAD)
-            .unwrap()
-            .expect("META_GIT_HEAD must be set in recreated temporal.db");
-        assert_eq!(
-            stored_head, head,
-            "META_GIT_HEAD in recreated temporal.db must match the current repo HEAD (#357 BUG B)"
-        );
-
-        // Discriminating: hotspots must be non-empty.
-        let hotspots = db.top_hotspots(20).unwrap();
-        assert!(
-            !hotspots.is_empty(),
-            "recreated temporal.db must contain non-empty hotspot data (#357 BUG B)"
-        );
-    }
-
-    /// BUG B BLOCKER: `--hot` on a stale temporal.db (lexical Current) self-heals
-    /// and returns populated hotspot results.
-    ///
-    /// Per locked decision 2026-06-24: run_temporal_standalone is wired to
-    /// auto_refresh_if_stale so bare --hot self-heals a stale temporal.db.
-    ///
-    /// PF-007 discriminating observables (DB-inspection approach):
-    /// - temporal.db is RECREATED by the self-heal (existence check).
-    /// - META_GIT_HEAD in the recreated temporal.db equals the repo HEAD (exact
-    ///   HEAD equality — fails if the wrong SHA or no SHA is written).
-    /// - top_hotspots() returns a non-empty list (data was populated, not empty).
-    ///
-    /// Note: the test verifies the self-heal via direct DB inspection rather than
-    /// stdout/stderr capture (stdout/stderr from run() cannot be reliably captured
-    /// in a Rust unit test without process spawning). The DB-inspection assertions
-    /// are discriminating: the test FAILS if temporal.db stays deleted (pre-fix
-    /// behavior), if META_GIT_HEAD is wrong, or if hotspots are empty.
-    /// The 'no temporal data' stderr message and ranked-row stdout guard are the
-    /// natural follow-on once the DB is confirmed populated; they are not
-    /// additionally asserted here since stdout is not capturable in unit tests.
-    #[test]
-    fn test_bug_b_hot_self_heals_stale_temporal_db() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-
-        let head = create_real_git_repo(
-            root,
-            &[
-                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
-                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
-                (
-                    "fix: fix auth",
-                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
-                ),
-            ],
-        );
-        assert_eq!(head.len(), 40);
-
-        let root_str = root.to_string_lossy().to_string();
-
-        // Build index first (NoIndex → full build including temporal).
-        let exit_code = run(
-            &[
-                "auth".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-                "--limit".to_string(),
-                "5".to_string(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
-
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-        let temporal_db_path = cache_dir.join("temporal.db");
-
-        // Confirm temporal.db was created.
-        assert!(
-            temporal_db_path.exists(),
-            "temporal.db must exist after initial query (test setup for BUG B BLOCKER)"
-        );
-
-        // Delete temporal.db to simulate a stale/missing temporal.db while lexical is Current.
-        std::fs::remove_file(&temporal_db_path).unwrap();
-
-        // Run `--hot` on a stale temporal.db (lexical still Current).
-        // Pre-fix: would print 'no temporal data' warning and exit 0 with NO rows.
-        // Post-fix: auto_refresh_if_stale self-heals, --hot returns populated rows.
-        let result = run(
-            &[
-                "--hot".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-                "--limit".to_string(),
-                "5".to_string(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "--hot after temporal.db deletion must exit 0 (#357 BUG B BLOCKER)"
-        );
-
-        // Discriminating: temporal.db must be recreated by the self-heal.
-        assert!(
-            temporal_db_path.exists(),
-            "--hot must trigger temporal.db self-heal when lexical is Current (#357 BUG B BLOCKER)"
-        );
-
-        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
-        let stored_head = db
-            .get_meta(rskim_search::META_GIT_HEAD)
-            .unwrap()
-            .expect("META_GIT_HEAD must be set after --hot self-heals temporal.db");
-        assert_eq!(
-            stored_head, head,
-            "META_GIT_HEAD must match repo HEAD after --hot self-heal (#357 BUG B BLOCKER)"
-        );
-
-        // Discriminating: hotspots must be non-empty (populated, not empty degradation).
-        let hotspots = db.top_hotspots(20).unwrap();
-        assert!(
-            !hotspots.is_empty(),
-            "--hot self-healed temporal.db must contain non-empty hotspot data (#357 BUG B BLOCKER)"
-        );
-    }
-
-    /// BUG B BLOCKER — CLI-level discriminating test for `--hot` self-heal.
-    ///
-    /// Spawns the binary as a subprocess to capture real stdout/stderr so we can
-    /// assert the TWO discriminating CLI observables the plan requires (plan lines
-    /// 165 & 217, PF-007):
-    ///   (a) at least one ranked hotspot row is present on stdout (data rendered),
-    ///   (b) the 'no temporal data' degradation message is ABSENT from stderr
-    ///       (self-heal took the render path, not the degradation path).
-    ///
-    /// The unit-level `test_bug_b_hot_self_heals_stale_temporal_db` proves the
-    /// DB was populated; this test proves `run_temporal_standalone` actually USED
-    /// that DB to render ranked rows instead of falling through to the degradation
-    /// arm (#357 cycle-2 finding 5).
-    #[test]
-    fn test_hot_self_heal_renders_ranked_rows_not_degradation() {
-        let bin = skim_bin_path();
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let root_str = root.to_string_lossy().to_string();
-
-        // Build a git repo with enough commits that --hot has data to render.
-        create_real_git_repo(
-            root,
-            &[
-                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
-                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
-                (
-                    "fix: fix auth",
-                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
-                ),
-            ],
-        );
-
-        // Phase 1: build the index (lexical+AST+temporal) via a text query.
-        std::process::Command::new(&bin)
-            .args(["search", "auth", "--root", &root_str, "--limit", "5"])
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {bin} for setup: {e}"));
-
-        // Phase 2: delete temporal.db so the lexical index is Current but temporal
-        // is stale — this is the BUG B BLOCKER scenario.
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-        let temporal_db_path = cache_dir.join("temporal.db");
-        assert!(
-            temporal_db_path.exists(),
-            "temporal.db must exist after setup query (precondition for BUG B BLOCKER test)"
-        );
-        std::fs::remove_file(&temporal_db_path).unwrap();
-
-        // Phase 3: run `--hot` as a subprocess — self-heal fires, then renders.
-        let output = std::process::Command::new(&bin)
-            .args(["search", "--hot", "--root", &root_str, "--limit", "5"])
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {bin} for --hot: {e}"));
-
-        assert!(
-            output.status.success(),
-            "--hot after temporal.db deletion must exit 0; got {:?}",
-            output.status
-        );
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // (a) At least one ranked row must appear on stdout.
-        // The text format emits hotspot rows as "  <score>  <file>" lines.
-        // We check for a non-empty stdout that contains at least one non-header line
-        // after the "Hotspots" header — any file path line is sufficient.
-        assert!(
-            !stdout.trim().is_empty(),
-            "--hot must print ranked rows to stdout after self-heal (BUG B BLOCKER, \
-             plan lines 165/217); got empty stdout. stderr={stderr:?}"
-        );
-
-        // (b) The degradation message must NOT appear on stderr.
-        assert!(
-            !stderr.contains(NO_TEMPORAL_DATA_MSG),
-            "--hot must NOT emit the 'no temporal data' message after self-heal \
-             (BUG B BLOCKER); got stderr={stderr:?}"
-        );
-    }
-
-    /// BUG A BLOCKER — CLI-level discriminating test for `--rebuild` temporal population.
-    ///
-    /// Spawns the binary as a subprocess to drive the full CLI path, then spawns
-    /// it again for `--hot`.  Asserts the TWO discriminating CLI observables (PF-007):
-    ///   (a) at least one ranked hotspot row is present on stdout (temporal data populated),
-    ///   (b) the 'no temporal data' degradation message is ABSENT from stderr
-    ///       (--rebuild populated temporal.db; --hot rendered from it).
-    ///
-    /// The unit-level `test_rebuild_populates_temporal_db` proves temporal.db was
-    /// written; this test proves the CLI `--hot` command actually USES that DB to
-    /// render ranked rows instead of emitting the degradation message (#357 BUG A).
-    #[test]
-    fn test_rebuild_then_hot_renders_ranked_rows_not_degradation() {
-        let bin = skim_bin_path();
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let root_str = root.to_string_lossy().to_string();
-
-        // Build a git repo with enough commits that --hot has hotspot data to render.
-        create_real_git_repo(
-            root,
-            &[
-                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
-                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
-                (
-                    "fix: fix auth",
-                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
-                ),
-            ],
-        );
-
-        // Phase 1: build the index via `--rebuild` (this is the BUG A path).
-        // Pre-fix: --rebuild did NOT populate temporal.db.
-        // Post-fix: --rebuild calls try_rebuild_temporal_nonfatal (AD-TMP-1).
-        let rebuild_out = std::process::Command::new(&bin)
-            .args(["search", "--rebuild", "--root", &root_str])
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {bin} for --rebuild: {e}"));
-        assert!(
-            rebuild_out.status.success(),
-            "--rebuild must exit 0; got {:?}; stderr={}",
-            rebuild_out.status,
-            String::from_utf8_lossy(&rebuild_out.stderr)
-        );
-
-        // Phase 2: run `--hot` as a subprocess — temporal.db was populated by --rebuild.
-        let output = std::process::Command::new(&bin)
-            .args(["search", "--hot", "--root", &root_str, "--limit", "5"])
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {bin} for --hot: {e}"));
-
-        assert!(
-            output.status.success(),
-            "--hot after --rebuild must exit 0; got {:?}",
-            output.status
-        );
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // (a) At least one ranked row must appear on stdout (temporal data was populated).
-        assert!(
-            !stdout.trim().is_empty(),
-            "--hot must print ranked rows to stdout after --rebuild (BUG A BLOCKER, \
-             AD-TMP-1); got empty stdout. stderr={stderr:?}"
-        );
-
-        // (b) The degradation message must NOT appear on stderr.
-        assert!(
-            !stderr.contains(NO_TEMPORAL_DATA_MSG),
-            "--hot must NOT emit the 'no temporal data' message when --rebuild already \
-             populated temporal.db (BUG A BLOCKER); got stderr={stderr:?}"
-        );
-    }
-
-    // ========================================================================
-    // #377 — inert-`--weights` notice at the CLI surface
-    // ========================================================================
-
-    /// AC6 (#377, API contract, NEGATIVE): invalid `--weights` MUST error at
-    /// parse time on EVERY query shape — pure-lexical, text+--ast, and standalone
-    /// --ast. Validation happens in `parse_flags` BEFORE any path dispatch, so the
-    /// inert-weights path can never mask a validation error. A valid 3-tuple parses.
-    #[test]
-    fn test_parse_flags_invalid_weights_errors_on_every_path_ac6() {
-        let s = |x: &str| x.to_string();
-        // Path-shaping suffixes: pure-lexical (text only), text+--ast, standalone --ast.
-        let shapes: [Vec<String>; 3] = [
-            vec![s("token")],
-            vec![s("token"), s("--ast"), s("try-catch")],
-            vec![s("--ast"), s("try-catch")],
-        ];
-        // Each invalid weights string must be rejected regardless of path shape.
-        for bad in ["nan,0,0", "-1,0,0", "inf,0,0", "0.5,0.3"] {
-            for shape in &shapes {
-                let mut args = vec![s("--weights"), s(bad)];
-                args.extend(shape.iter().cloned());
-                assert!(
-                    parse_flags(&args).is_err(),
-                    "AC6: invalid --weights {bad:?} must error at parse time for args {args:?}"
-                );
-            }
-        }
-        // Control: a valid 3-tuple parses on each shape.
-        for shape in &shapes {
-            let mut args = vec![s("--weights"), s("0.8,0.1,0.1")];
-            args.extend(shape.iter().cloned());
-            let flags = parse_flags(&args).unwrap_or_else(|e| {
-                panic!("AC6 control: valid --weights must parse for args {args:?}: {e}")
-            });
-            assert!(
-                flags.weights.is_some(),
-                "AC6 control: valid --weights must populate flags.weights for args {args:?}"
-            );
-        }
-    }
-
-    /// Blocking-review fix #1 (CLI): the temporal-standalone dispatch arm
-    /// (`--hot`/`--cold`/`--risky`/`--blast-radius` with NO text and NO --ast) must
-    /// emit the fully-inert `--weights` notice on stderr — it previously called
-    /// `run_temporal_standalone` and silently ignored the flag, the exact bug this
-    /// ticket fixes. Driven as a subprocess so real stderr is captured.
-    ///
-    /// Discriminating (PF-007): the test FAILS if the dispatch-arm guard is removed
-    /// (no notice on stderr). Both `--hot --weights` and `--blast-radius --weights`
-    /// are covered.
-    #[test]
-    fn test_temporal_standalone_weights_emits_inert_notice_ac7_fix1() {
-        let bin = skim_bin_path();
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let root_str = root.to_string_lossy().to_string();
-
-        // Dedicated isolated cache dir so this subprocess test is immune to
-        // concurrent SKIM_CACHE_DIR mutations from serial tests (e.g.
-        // test_ac13_402_memo_cache_hit_and_miss in walk_tests.rs sets and
-        // then drops SKIM_CACHE_DIR in the parent process; if the subprocess
-        // inherits that value the cache dir is deleted under it mid-build).
-        let cache_tmp = tempfile::TempDir::new().unwrap();
-        let cache_dir_str = cache_tmp.path().to_string_lossy().to_string();
-
-        // A git repo with commits so temporal data exists (the arm runs, not an error path).
-        create_real_git_repo(
-            root,
-            &[
-                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
-                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
-                (
-                    "fix: fix auth",
-                    &[("src/auth.rs", "fn authenticate() { // fixed }")],
-                ),
-            ],
-        );
-
-        // (1) --hot --weights (temporal-only standalone): notice on stderr, exit 0.
-        let hot = std::process::Command::new(&bin)
-            .args([
-                "search",
-                "--hot",
-                "--weights",
-                "0.5,0.3,0.2",
-                "--root",
-                &root_str,
-            ])
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .env("SKIM_CACHE_DIR", &cache_dir_str)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
-        assert!(
-            hot.status.success(),
-            "--hot --weights must exit 0; stderr={}",
-            String::from_utf8_lossy(&hot.stderr)
-        );
-        let hot_stderr = String::from_utf8_lossy(&hot.stderr);
-        assert!(
-            hot_stderr.contains("note: --weights"),
-            "fix #1: `--hot --weights` MUST emit the inert-weights notice on stderr (the temporal \
-             standalone arm previously ignored --weights silently); got stderr={hot_stderr:?}"
-        );
-
-        // (2) --blast-radius --weights (blast-only standalone): same notice on stderr.
-        let blast = std::process::Command::new(&bin)
-            .args([
-                "search",
-                "--blast-radius",
-                "src/auth.rs",
-                "--weights",
-                "0.5,0.3,0.2",
-                "--root",
-                &root_str,
-            ])
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .env("SKIM_CACHE_DIR", &cache_dir_str)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"));
-        assert!(
-            blast.status.success(),
-            "--blast-radius --weights must exit 0; stderr={}",
-            String::from_utf8_lossy(&blast.stderr)
-        );
-        let blast_stderr = String::from_utf8_lossy(&blast.stderr);
-        assert!(
-            blast_stderr.contains("note: --weights"),
-            "fix #1: `--blast-radius --weights` (no text/--ast) MUST emit the inert-weights notice \
-             on stderr; got stderr={blast_stderr:?}"
-        );
-    }
-
-    /// AC9 (API contract / JSON purity, NEGATIVE): the inert-weights notice MUST go
-    /// to stderr even in --json mode; stdout MUST be valid JSON byte-identical to
-    /// the no-weights run. Driven via standalone `--ast --json --weights` (wholly
-    /// inert) so the fully-inert notice fires while stdout stays pure JSON.
-    #[test]
-    fn test_inert_weights_notice_json_purity_ac9() {
-        let bin = skim_bin_path();
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let root_str = root.to_string_lossy().to_string();
-
-        // One file with a nested loop so `--ast rust-nested-loop` matches.
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(
-            root.join("src/loops.rs"),
-            "fn f() { for i in 0..3 { for j in 0..3 { let _ = (i, j); } } }",
-        )
-        .unwrap();
-
-        let run_json = |extra: &[&str]| {
-            let mut args = vec!["search", "--ast", "rust-nested-loop", "--json"];
-            args.extend_from_slice(extra);
-            args.extend_from_slice(&["--root", &root_str]);
-            std::process::Command::new(&bin)
-                .args(&args)
-                .env("SKIM_DISABLE_ANALYTICS", "1")
-                .output()
-                .unwrap_or_else(|e| panic!("failed to spawn {bin}: {e}"))
-        };
-
-        let base = run_json(&[]);
-        assert!(
-            base.status.success(),
-            "baseline --ast --json must exit 0; stderr={}",
-            String::from_utf8_lossy(&base.stderr)
-        );
-        let base_stdout = String::from_utf8_lossy(&base.stdout).to_string();
-        serde_json::from_str::<serde_json::Value>(base_stdout.trim()).unwrap_or_else(|e| {
-            panic!("AC9: baseline stdout must be valid JSON: {e}\n{base_stdout}")
-        });
-
-        let weighted = run_json(&["--weights", "0.8,0.1,0.1"]);
-        assert!(
-            weighted.status.success(),
-            "--ast --json --weights must exit 0; stderr={}",
-            String::from_utf8_lossy(&weighted.stderr)
-        );
-        let weighted_stdout = String::from_utf8_lossy(&weighted.stdout).to_string();
-        let weighted_stderr = String::from_utf8_lossy(&weighted.stderr);
-
-        // (1) stdout must STILL be valid JSON.
-        serde_json::from_str::<serde_json::Value>(weighted_stdout.trim()).unwrap_or_else(|e| {
-            panic!("AC9: --weights stdout must remain valid JSON: {e}\n{weighted_stdout}")
-        });
-        // (2) stdout must be byte-identical to the no-weights run.
-        assert_eq!(
-            weighted_stdout, base_stdout,
-            "AC9: --weights must NOT change stdout — the inert notice goes to stderr only"
-        );
-        // (3) the notice MUST appear on stderr but NOT in stdout JSON.
-        assert!(
-            weighted_stderr.contains("note: --weights"),
-            "AC9: the inert-weights notice must appear on stderr; got stderr={weighted_stderr:?}"
-        );
-        assert!(
-            !weighted_stdout.contains("note: --weights"),
-            "AC9: the inert-weights notice must NOT leak into stdout JSON"
-        );
-    }
-
     // =========================================================================
-    // Step 11: T-13/T-14/T-15 — actionable lexical error, stats self-heal,
-    // and temporal_state key (AD-414-7, AD-414-10, AC-13, AC-14, AC-15)
+    // Step 11: T-13/T-14 — actionable lexical error and stats self-heal
+    // (AD-414-7, AD-414-10, AC-13, AC-14)
     // =========================================================================
 
     /// T-13 / AC-13: a size-preserving byte flip in `index.skpost` (with
@@ -4611,7 +2333,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
 
-        // Need a real git repo so temporal self-heal also works.
+        // Need a real git repo so the HEAD-based staleness check also runs.
         create_real_git_repo(
             root,
             &[
@@ -4726,154 +2448,6 @@ mod tests {
             "T-14b: index.skpost must be restored after self-heal"
         );
     }
-
-    /// T-15 / AC-15: `--stats --json` reports `temporal_state` with the five
-    /// distinct values: `ready` / `empty` / `corrupt` / `newer-schema` / `missing`.
-    ///
-    /// Also extends the #413/AC20 shared back-compat key-list test (C4): the
-    /// `temporal_state` key is present in the additive set alongside `git_head_state`.
-    ///
-    /// PF-012: temporal.db corruption fixture uses 0xAB×1024 (deterministic).
-    /// SKIM_CACHE_DIR isolation: #[serial] prevents concurrent env-var mutations
-    /// from other in-process tests racing the resolve_search_cache_dir call.
-    #[serial_test::serial]
-    #[test]
-    fn t15_temporal_state_five_distinct_values() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-
-        create_real_git_repo(
-            root,
-            &[
-                ("feat: p", &[("src/p.rs", "fn p() {}")]),
-                ("feat: q", &[("src/q.rs", "fn q() {}")]),
-            ],
-        );
-        let root_str = root.to_string_lossy().to_string();
-
-        // Build index (includes temporal.db).
-        let result = run(
-            &[
-                "--rebuild".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "T-15 setup: --rebuild must succeed"
-        );
-
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-        let db_path = cache_dir.join("temporal.db");
-
-        // ---- (1) Healthy: temporal_state == "ready" -------------------------
-        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 healthy: must succeed");
-        assert_eq!(
-            stats["temporal_state"].as_str().unwrap_or(""),
-            "ready",
-            "T-15(1): healthy DB must report temporal_state == 'ready'; got: {:?}",
-            stats["temporal_state"]
-        );
-        // Key-list contract (T-15/AC-15/AC20): temporal_state must be present.
-        assert!(
-            stats.get("temporal_state").is_some(),
-            "T-15: temporal_state key must be present in --stats --json"
-        );
-
-        // ---- (2) Missing: temporal_state == "missing" -----------------------
-        std::fs::remove_file(&db_path).unwrap();
-        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 missing: must succeed");
-        assert_eq!(
-            stats["temporal_state"].as_str().unwrap_or(""),
-            "missing",
-            "T-15(2): absent temporal.db must report 'missing'; got: {:?}",
-            stats["temporal_state"]
-        );
-
-        // ---- (3) Corrupt: temporal_state == "corrupt" -----------------------
-        // PF-012: deterministic fixture, never /dev/urandom.
-        {
-            let corrupt_bytes: Vec<u8> = vec![0xABu8; 1024];
-            std::fs::write(&db_path, &corrupt_bytes).unwrap();
-        }
-        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 corrupt: must succeed");
-        assert_eq!(
-            stats["temporal_state"].as_str().unwrap_or(""),
-            "corrupt",
-            "T-15(3): 0xAB×1024 corrupt DB must report 'corrupt'; got: {:?}",
-            stats["temporal_state"]
-        );
-
-        // ---- (4) Newer schema: temporal_state == "newer-schema" -------------
-        // Restore a valid DB then bump user_version to 99.
-        let result = run(
-            &[
-                "--rebuild".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "T-15 setup newer-schema: --rebuild must succeed"
-        );
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.pragma_update(None, "user_version", 99i64).unwrap();
-        }
-        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 newer-schema: must succeed");
-        assert_eq!(
-            stats["temporal_state"].as_str().unwrap_or(""),
-            "newer-schema",
-            "T-15(4): user_version=99 DB must report 'newer-schema'; got: {:?}",
-            stats["temporal_state"]
-        );
-
-        // ---- (5) Empty: temporal_state == "empty" ---------------------------
-        // Restore DB then clear all rows (zero hotspot rows).
-        //
-        // Step 4 left user_version=99 in temporal.db; rebuild_temporal_with_source
-        // correctly refuses to overwrite a newer-schema DB (R1 / AD-414-11).  Delete
-        // the file BEFORE calling --rebuild so the explicit rebuild creates a fresh
-        // schema-2 DB.  The backoff sentinel (if any) is cleared automatically by
-        // BuildLoudness::Loud (F1 / AD-414-16) — no manual deletion needed.
-        let _ = std::fs::remove_file(&db_path);
-        let result = run(
-            &[
-                "--rebuild".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "T-15 setup empty: --rebuild must succeed"
-        );
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute("DELETE FROM hotspot", []).unwrap();
-            conn.execute("DELETE FROM risk", []).unwrap();
-            conn.execute("DELETE FROM cochange", []).unwrap();
-        }
-        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 empty: must succeed");
-        assert_eq!(
-            stats["temporal_state"].as_str().unwrap_or(""),
-            "empty",
-            "T-15(5): zero-row DB must report 'empty'; got: {:?}",
-            stats["temporal_state"]
-        );
-    }
-
     // ========================================================================
     // T-16 / F5 / AD-414-23 — the `--stats` staleness contract, via the CLI
     // ========================================================================
@@ -5136,289 +2710,6 @@ mod tests {
         assert!(
             built.is_empty(),
             "T-16d/AD-414-23: --stats must not build a missing index; found {built:?}"
-        );
-    }
-
-    // ========================================================================
-    // T-17 / AC-17(a) — healthy-state silence via production reason-table iteration
-    // ========================================================================
-
-    /// T-17 / AC-17(a) — healthy-state silence: no cause substring on stderr.
-    ///
-    /// Iterates the production `DegradedReason` table via `cause_substrings_for_guard`
-    /// and asserts that NONE of the cause substrings appear on stderr across the six
-    /// healthy invocations listed in §AC-17:
-    ///   1. `skim search TERM`
-    ///   2. `skim search TERM --json`
-    ///   3. `skim search TERM --hot --json`
-    ///   4. `skim search --hot --json`  (standalone temporal, no text query)
-    ///   5. `skim search --stats`
-    ///   6. `skim search --stats --json`
-    ///
-    /// The production table is the source of truth (AC-17(a): "iterate the production
-    /// reason table, not hand-written literals"), so a newly added `DegradedReason`
-    /// variant that fires on healthy state will automatically fail this test.
-    ///
-    /// Driven as a subprocess so real stderr is captured (an in-process call captures
-    /// nothing on its own for `eprintln!` output).
-    #[test]
-    fn t17_ac17a_healthy_state_no_degraded_cause_on_stderr() {
-        let bin = skim_bin_path();
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let root_str = root.to_string_lossy().to_string();
-        let cache = tempfile::TempDir::new().unwrap();
-        let cache_str = cache.path().to_string_lossy().to_string();
-
-        // Build a real git repo with ≥2 commits so temporal.db is populated.
-        create_real_git_repo(
-            root,
-            &[
-                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
-                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
-                (
-                    "fix: fix auth",
-                    &[("src/auth.rs", "fn authenticate() { /* fixed */ }")],
-                ),
-            ],
-        );
-
-        // Build the lexical + AST + temporal index.
-        let build_status = std::process::Command::new(&bin)
-            .args(["search", "--build", "--root", &root_str])
-            .env("SKIM_CACHE_DIR", &cache_str)
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .status()
-            .expect("T-17 setup: failed to spawn skim --build");
-        assert!(
-            build_status.success(),
-            "T-17 setup: skim search --build must succeed"
-        );
-
-        // Cause substrings from the production DegradedReason table — never hand-written.
-        // AC-17(a): the production table is authoritative; a new variant that fires on
-        // healthy state fails this test automatically.
-        let cause_subs = temporal::cause_substrings_for_guard();
-
-        // Six healthy invocations in §AC-17 order.
-        let invocations: &[(&str, &[&str])] = &[
-            ("skim search TERM", &["auth"]),
-            ("skim search TERM --json", &["auth", "--json"]),
-            (
-                "skim search TERM --hot --json",
-                &["auth", "--hot", "--json"],
-            ),
-            ("skim search --hot --json", &["--hot", "--json"]),
-            ("skim search --stats", &["--stats"]),
-            ("skim search --stats --json", &["--stats", "--json"]),
-        ];
-
-        for (label, args) in invocations {
-            let out = std::process::Command::new(&bin)
-                .arg("search")
-                .args(*args)
-                .args(["--root", &root_str])
-                .env("SKIM_CACHE_DIR", &cache_str)
-                .env("SKIM_DISABLE_ANALYTICS", "1")
-                .env("NO_COLOR", "1")
-                .output()
-                .unwrap_or_else(|e| panic!("T-17 '{label}': failed to spawn skim: {e}"));
-
-            let stderr = String::from_utf8_lossy(&out.stderr);
-
-            for cause in cause_subs {
-                assert!(
-                    !stderr.contains(cause),
-                    "T-17/AC-17(a): healthy-state stderr must not contain cause substring \
-                     '{cause}' on invocation '{label}'; got stderr:\n{stderr}"
-                );
-            }
-        }
-    }
-
-    // ========================================================================
-    // T-16c / AC-16 case (i) — no-commit repository, driven through the CLI
-    // ========================================================================
-
-    /// `git init` with files but no commits, leaving HEAD unborn.
-    ///
-    /// Deliberately NOT `create_real_git_repo`, whose whole job is to produce
-    /// commits: the unborn state is the fixture under test.
-    fn init_git_repo_without_commits(dir: &std::path::Path) {
-        for args in [
-            vec!["init"],
-            vec!["config", "user.email", "test@t.com"],
-            vec!["config", "user.name", "T"],
-            vec!["config", "commit.gpgsign", "false"],
-        ] {
-            let status = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(dir)
-                .output()
-                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-            assert!(status.status.success(), "git {args:?} failed");
-        }
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/a.rs"), "fn alpha() {}\n").unwrap();
-        std::fs::write(dir.join("src/b.rs"), "fn beta() {}\n").unwrap();
-        // Precondition: HEAD must NOT resolve, or the fixture is not unborn.
-        let head = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        assert!(
-            !head.status.success(),
-            "fixture precondition: HEAD must be unborn (no commits)"
-        );
-    }
-
-    /// Locate the single per-root search cache directory beneath an isolated
-    /// `SKIM_CACHE_DIR`, without re-reading the env var in this process.
-    fn only_search_cache_dir(cache_root: &std::path::Path) -> std::path::PathBuf {
-        let search_dir = cache_root.join("search");
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&search_dir)
-            .unwrap_or_else(|e| panic!("no search cache dir at {search_dir:?}: {e}"))
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.is_dir())
-            .collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "expected exactly one per-root cache dir under {search_dir:?}, got {entries:?}"
-        );
-        entries.pop().unwrap()
-    }
-
-    /// T-16c / AC-16 case (i) + AD-414-22: `skim search --build` on a repository
-    /// with **no commits** must exit 0, write a present-but-empty `temporal.db`,
-    /// and print exactly one non-debug-gated empty-history notice that does NOT
-    /// mention `shallow`.
-    ///
-    /// Regression pinned: before AD-414-22 this arm printed only the lexical
-    /// "indexed N files" line and created no `temporal.db` at all, because
-    /// `HeadState::Unresolved.sha()` is `None` and `try_rebuild_temporal_nonfatal`
-    /// returned before any temporal code ran — making AC-16's "no commits" case
-    /// unreachable from every CLI arm even though `zero_row_notice` had produced
-    /// its text since #414 landed.
-    ///
-    /// Driven as a subprocess so the real `run()` → `run_build()` entry point and
-    /// its real stderr are exercised (PF-007); an in-process call captures no
-    /// `eprintln!` output of its own.
-    ///
-    /// The expected notice text is taken from the production `DegradedReason`
-    /// table, never hand-written (AC-19: assert against production constants).
-    #[serial_test::serial]
-    #[test]
-    fn t16c_ac16_no_commit_repo_build_writes_empty_temporal_db_and_notice() {
-        let bin = skim_bin_path();
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let root_str = root.to_string_lossy().to_string();
-        let cache = tempfile::TempDir::new().unwrap();
-        let cache_str = cache.path().to_string_lossy().to_string();
-
-        init_git_repo_without_commits(root);
-
-        let out = std::process::Command::new(&bin)
-            .args(["search", "--build", "--root", &root_str])
-            .env("SKIM_CACHE_DIR", &cache_str)
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .env("NO_COLOR", "1")
-            .env_remove("SKIM_DEBUG")
-            .output()
-            .expect("T-16c: failed to spawn skim --build");
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-        assert!(
-            out.status.success(),
-            "T-16c/AC-24: --build on a no-commit repo must exit 0; stderr:\n{stderr}"
-        );
-
-        // AC-16: one notice, WITHOUT SKIM_DEBUG, naming the stage that produced
-        // zero data. Text comes from the production SSOT.
-        let expected_cause = degraded::DegradedReason::Empty.cause("");
-        assert!(
-            stderr.contains(&expected_cause),
-            "T-16c/AC-16(i): stderr must carry the empty-history notice \
-             {expected_cause:?}; got stderr:\n{stderr}"
-        );
-        assert!(
-            !stderr.to_ascii_lowercase().contains("shallow"),
-            "T-16c/AC-16(i): the no-commits notice must not mention 'shallow' on a \
-             non-shallow repository; got stderr:\n{stderr}"
-        );
-
-        // The empty temporal.db itself.
-        let search_cache = only_search_cache_dir(cache.path());
-        let db_path = search_cache.join("temporal.db");
-        assert!(
-            db_path.exists(),
-            "T-16c/AD-414-22: --build must create temporal.db even with no commits; \
-             cache dir contents: {:?}",
-            std::fs::read_dir(&search_cache)
-                .unwrap()
-                .map(|e| e.unwrap().file_name())
-                .collect::<Vec<_>>()
-        );
-        let db = rskim_search::TemporalDb::open_existing(&db_path).unwrap();
-        assert!(
-            db.top_hotspots(1).unwrap().is_empty(),
-            "T-16c: the no-commit temporal.db must carry zero hotspot rows"
-        );
-        assert_eq!(
-            db.get_meta(rskim_search::META_GIT_HEAD).unwrap(),
-            None,
-            "T-16c/AD-414-22: there is no commit to record, so META_GIT_HEAD must be \
-             absent — this is the state warn_if_temporal_unverifiable relies on"
-        );
-    }
-
-    /// T-16c (negative) / AD-414-22: a plain text query on the same no-commit
-    /// repository must stay SILENT and must not create `temporal.db`.
-    ///
-    /// The empty-history build belongs to the explicit build arms only. The
-    /// wave-wide loudness policy forbids a temporal notice from a plain query,
-    /// and the quiet path has no per-HEAD backoff key to bound a history re-walk
-    /// with — so this test is the discriminating guard against wiring AD-414-22
-    /// into `ReanchorPolicy::Refuse` as well.
-    #[serial_test::serial]
-    #[test]
-    fn t16c_negative_no_commit_repo_plain_query_stays_silent() {
-        let bin = skim_bin_path();
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
-        let root_str = root.to_string_lossy().to_string();
-        let cache = tempfile::TempDir::new().unwrap();
-        let cache_str = cache.path().to_string_lossy().to_string();
-
-        init_git_repo_without_commits(root);
-
-        let out = std::process::Command::new(&bin)
-            .args(["search", "alpha", "--root", &root_str])
-            .env("SKIM_CACHE_DIR", &cache_str)
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .env("NO_COLOR", "1")
-            .env_remove("SKIM_DEBUG")
-            .output()
-            .expect("T-16c negative: failed to spawn skim query");
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-        assert!(
-            out.status.success(),
-            "T-16c negative: a plain query on a no-commit repo must exit 0; \
-             stderr:\n{stderr}"
-        );
-        let empty_cause = degraded::DegradedReason::Empty.cause("");
-        assert!(
-            !stderr.contains(&empty_cause),
-            "T-16c negative: a plain query must emit no temporal notice; got stderr:\n{stderr}"
-        );
-        let search_cache = only_search_cache_dir(cache.path());
-        assert!(
-            !search_cache.join("temporal.db").exists(),
-            "T-16c negative: the quiet query path must not build temporal.db for an \
-             unborn HEAD (AD-414-22 is an explicit-arm behaviour)"
         );
     }
 }

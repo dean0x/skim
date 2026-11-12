@@ -58,16 +58,6 @@ pub(super) enum HeadState {
     Resolved(String),
 }
 
-impl HeadState {
-    /// Return the commit SHA when resolved, or `None` for `NotARepo` / `Unresolved`.
-    pub(super) fn sha(&self) -> Option<&str> {
-        match self {
-            HeadState::Resolved(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-}
-
 // ============================================================================
 // Git directory resolution
 // ============================================================================

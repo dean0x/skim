@@ -204,9 +204,8 @@ pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     let pipeline = Pipeline::new(config)?;
 
     // Acquire the shared advisory build lock. The single bounded implementation
-    // lives in `build_lock::acquire` so that both the lexical build (here) and
-    // the temporal rebuild (called from staleness.rs) use ONE lock loop with
-    // consistent wait message and deadline. The lock is held for the duration of
+    // lives in `build_lock::acquire`, so the wait message and deadline stay in one
+    // place. The lock is held for the duration of
     // `pipeline.run()` and released when `_lock` drops at function end.
     // (applies SEARCH-ADR-006: serialises concurrent skim processes)
     let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;

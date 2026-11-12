@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use super::acquire_bounded;
-// `acquire` is tested indirectly: e2e tests in index_tests.rs / temporal_build_tests.rs
+// `acquire` is tested indirectly: e2e tests in index_tests.rs
 // call super::super::build_lock::acquire.  Import it here to confirm it compiles.
 #[allow(unused_imports)]
 use super::acquire;

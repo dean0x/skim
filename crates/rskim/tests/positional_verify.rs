@@ -409,7 +409,7 @@ fn near_returns_range_covering_full_span_ac9() {
 }
 
 // ============================================================================
-// CLI integration tests — ACs 1-11, 13, 15, 16, AC17 control
+// CLI integration tests — ACs 1-10, 13, 15, 16
 // ============================================================================
 //
 // Each test builds a purpose-built corpus in a `tempfile::tempdir()`, indexes
@@ -418,12 +418,6 @@ fn near_returns_range_covering_full_span_ac9() {
 //
 // AC12 (reader pure tests) is CI-gated: the rskim-search lib-test binary hangs
 // at startup on this machine (PF-010).  Do NOT add it here.
-//
-// AC17 (--phrase + --blast-radius peer gate) requires injecting co-change edges
-// into a temporal DB.  Building temporal history in a temp dir is fragile; it is
-// CI-gated.  The non-positional UNION control assertion is covered in
-// `cli_ac17_blast_radius_control_exits_zero` below (proves the non-positional
-// path is unchanged).  See design plan §AC17 for the CI-only test spec.
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 
@@ -878,99 +872,6 @@ fn cli_ac10_all_short_fallback_correctness_and_anchor() {
     );
 }
 
-// ── AC11: composition --phrase + --ast ───────────────────────────────────────
-
-/// AC11: `--phrase 'encode varint' --ast match-with-arms` must return EXACTLY
-/// the files that satisfy BOTH constraints.  Three negative files prove the
-/// intersection is strict (PF-007, never exit-0-only):
-///   - B: match-with-arms BUT superstring (not the phrase) → excluded.
-///   - C: exact phrase BUT no match → excluded.
-///   - D: match-with-arms BUT no phrase → excluded.
-///
-/// AD-393-7: the compound-AST resolve threads VerifyMode::Phrase into its
-/// verify step, so the token-exact predicate gates inclusion on both paths.
-#[test]
-fn cli_ac11_phrase_ast_composition() {
-    let proj = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
-
-    // A: real phrase 'encode varint' in a comment + valid match expression.
-    // The comment ensures "encode varint" appear as adjacent word tokens.
-    fs::write(
-        proj.path().join("a.rs"),
-        "fn process(r: u32) -> u32 {\n\
-         \x20   // encode varint\n\
-         \x20   match r {\n\
-         \x20       0 => 0,\n\
-         \x20       _ => 1,\n\
-         \x20   }\n\
-         }\n",
-    )
-    .unwrap();
-    // B: match block + superstring 'encode_length varint_writer' (one token each).
-    fs::write(
-        proj.path().join("b.rs"),
-        "fn handle_b() {\n\
-         \x20   // encode_length varint_writer\n\
-         \x20   match 0u32 {\n\
-         \x20       0 => 0,\n\
-         \x20       _ => 1,\n\
-         \x20   }\n\
-         }\n",
-    )
-    .unwrap();
-    // C: real phrase but NO match block.
-    fs::write(
-        proj.path().join("c.rs"),
-        "// encode varint\n\
-         fn plain() { let x = 1; }\n",
-    )
-    .unwrap();
-    // D: match block but no phrase.
-    fs::write(
-        proj.path().join("d.rs"),
-        "fn check(x: u32) -> u32 {\n\
-         \x20   match x {\n\
-         \x20       0 => 0,\n\
-         \x20       _ => x,\n\
-         \x20   }\n\
-         }\n",
-    )
-    .unwrap();
-    build_index(proj.path(), cache.path());
-
-    let json = search_json(
-        proj.path(),
-        cache.path(),
-        &["--phrase", "encode varint", "--ast", "match-with-arms"],
-    );
-    let got = paths(&json);
-
-    // Positive: A must be present.
-    assert!(
-        got.contains("a.rs"),
-        "AC11: a.rs (phrase AND match-with-arms) must be included; got {got:?}"
-    );
-    // Negative: B, C, D must all be absent (strict subset, PF-007).
-    assert!(
-        !got.contains("b.rs"),
-        "AC11: b.rs (superstring inside match) must be EXCLUDED; got {got:?}"
-    );
-    assert!(
-        !got.contains("c.rs"),
-        "AC11: c.rs (phrase but no match) must be EXCLUDED; got {got:?}"
-    );
-    assert!(
-        !got.contains("d.rs"),
-        "AC11: d.rs (match but no phrase) must be EXCLUDED; got {got:?}"
-    );
-    assert_eq!(
-        got,
-        HashSet::from(["a.rs".to_string()]),
-        "AC11: must return EXACTLY {{a.rs}}; got {got:?}"
-    );
-}
-
 // ── AC13: non-positional lexical no-regression ────────────────────────────────
 
 /// AC13: non-positional single-token and multi-word queries must return the
@@ -1147,76 +1048,6 @@ fn cli_ac16_lang_filter_on_positional_and_fallback() {
     assert!(
         !got2.contains("a.py"),
         "AC16 sub-case 2: --lang rust must EXCLUDE a.py (all-short fallback); got {got2:?}"
-    );
-}
-
-// ── AC17 control: non-positional --blast-radius UNION is unchanged ────────────
-
-/// AC17 CONTROL: `skim search --blast-radius <file>` (no `--phrase`) must exit
-/// 0 with valid JSON.  This proves the non-positional blast-radius UNION path
-/// is unchanged and the co-change-only peer gate (D18 / AD-393-12) is guarded
-/// by `config.phrase || config.near.is_some()` — so non-positional queries keep
-/// their "include all peers unconditionally" semantics.
-///
-/// Full AC17 (positional peer gate requires temporal DB with injected co-change
-/// edges) is CI-gated.  Local test infrastructure cannot build temporal history
-/// in a temp dir reliably; see design plan §AC17 for the CI-only test spec.
-#[test]
-fn cli_ac17_blast_radius_control_exits_zero() {
-    let proj = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
-
-    // Build a small corpus: the blast-radius target + a file with encode varint.
-    fs::write(proj.path().join("target.rs"), "fn target() {}\n").unwrap();
-    fs::write(
-        proj.path().join("peer.rs"),
-        "fn peer() { let _ = encode varint; }\n",
-    )
-    .unwrap();
-    fs::write(
-        proj.path().join("superstring.rs"),
-        "fn s() { let _ = encode_length varint_writer; }\n",
-    )
-    .unwrap();
-    build_index(proj.path(), cache.path());
-
-    // Non-positional blast-radius: exits 0 and returns valid JSON
-    // (no temporal DB → no co-change peers, graceful degradation).
-    let json_control = search_json(
-        proj.path(),
-        cache.path(),
-        &["encode", "--blast-radius", "target.rs"],
-    );
-    // Must be valid JSON with a results array (content may be empty without temporal DB).
-    assert!(
-        json_control["results"].is_array(),
-        "AC17 control: non-positional --blast-radius must return valid JSON with results array"
-    );
-
-    // Positional blast-radius: exits 0, returns valid JSON, peer.rs returned
-    // (it contains the exact phrase), superstring.rs excluded.
-    let json_pos = search_json(
-        proj.path(),
-        cache.path(),
-        &["--phrase", "encode varint", "--blast-radius", "target.rs"],
-    );
-    let got_pos = paths(&json_pos);
-
-    // PF-007: discriminating positive assertion — peer.rs MUST appear.
-    // Without temporal data the lexical UNION layer still yields peer.rs (it
-    // contains the exact phrase "encode varint" as adjacent word tokens), and
-    // it passes Phrase verification.  An empty result set would satisfy only
-    // the superstring.rs exclusion assertion below, hiding a fully-broken path.
-    assert!(
-        got_pos.contains("peer.rs"),
-        "AC17 control: peer.rs (contains exact phrase 'encode varint') must be PRESENT \
-         in --phrase + --blast-radius results; got {got_pos:?}"
-    );
-
-    // Exclusion assertion: superstring false positive must not appear.
-    assert!(
-        !got_pos.contains("superstring.rs"),
-        "AC17 control: superstring.rs must be excluded from --phrase + --blast-radius; got {got_pos:?}"
     );
 }
 
@@ -1733,10 +1564,10 @@ fn ac403_5_all_short_word_path() {
 
 // ── AC-403-6: inert-flag notice on non-text arms ──────────────────────────────
 
-/// AC-403-6: --phrase or --near on any non-text arm (--build, standalone temporal,
+/// AC-403-6: --phrase or --near on any non-text arm (--build,
 /// etc.) must emit a notice to stderr.  Exit code is 0.  stdout is unchanged.
 ///
-/// Tested arms: --build and standalone --hot (no text query).
+/// Tested arm: --build (no text query).
 #[test]
 fn ac403_6_inert_flag_notice_on_nontex_arms() {
     let proj = tempfile::tempdir().unwrap();
@@ -2370,194 +2201,6 @@ fn ac403_2_predicate_identity_all_golden_fixtures() {
              at k-1 boundary -- a regression in the identity invariant."
         );
     }
-}
-
-// ── AC-403-10: text + --near N composition with --ast and --blast-radius ──────
-
-/// AC-403-10a: `text + --near N + --ast <pattern>` must return a non-empty
-/// result set that is a STRICT SUBSET of `text + --near N` alone.
-///
-/// Corpus:
-///   a.rs  "encode xx varint" (span 2 <= N=3) + match expression  -> in composed
-///   b.rs  "encode xx varint" (span 2 <= N=3), no match            -> in near alone, NOT composed
-///   c.rs  "encode aa bb cc varint" (span 4 > N=3) + match        -> excluded by near
-///
-/// Subset property: composed ⊆ near_alone.
-/// Strict: b.rs is in near_alone but NOT in composed (explicit exclusion assertion).
-#[test]
-fn ac403_10_near_ast_composition_strict_subset() {
-    let proj = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
-
-    // a.rs: "encode xx varint" tokens (span 2) inside a match block.
-    fs::write(
-        proj.path().join("a.rs"),
-        "fn process(r: u32) -> u32 {\n\
-         \x20   // encode xx varint\n\
-         \x20   match r {\n\
-         \x20       0 => 0,\n\
-         \x20       _ => 1,\n\
-         \x20   }\n\
-         }\n",
-    )
-    .unwrap();
-
-    // b.rs: same encode/varint span but NO match expression.
-    // query_substring_present: "encode" present, "varint" present -> passes Substring.
-    // Near(3): span=2 <=3 -> passes Near verify.
-    // --ast match-with-arms: no match block -> EXCLUDED from composed.
-    fs::write(
-        proj.path().join("b.rs"),
-        "// encode xx varint\nfn plain() { let x = 1; }\n",
-    )
-    .unwrap();
-
-    // c.rs: match block present but encode..varint span=4 > N=3 -> excluded by --near.
-    fs::write(
-        proj.path().join("c.rs"),
-        "fn check(r: u32) -> u32 {\n\
-         \x20   // encode aa bb cc varint\n\
-         \x20   match r {\n\
-         \x20       0 => 0,\n\
-         \x20       _ => 1,\n\
-         \x20   }\n\
-         }\n",
-    )
-    .unwrap();
-
-    build_index(proj.path(), cache.path());
-
-    // Baseline: text + --near 3 alone.
-    let j_near = search_json(proj.path(), cache.path(), &["--near", "3", "encode varint"]);
-    let near_set = paths(&j_near);
-
-    // Composed: text + --near 3 + --ast match-with-arms.
-    let j_composed = search_json(
-        proj.path(),
-        cache.path(),
-        &["--near", "3", "--ast", "match-with-arms", "encode varint"],
-    );
-    let composed_set = paths(&j_composed);
-
-    // Composed must be non-empty.
-    assert!(
-        !composed_set.is_empty(),
-        "AC-403-10a: composed (--near 3 + --ast match-with-arms) must return >= 1 result; got empty"
-    );
-
-    // Positive: a.rs satisfies BOTH near and ast.
-    assert!(
-        composed_set.contains("a.rs"),
-        "AC-403-10a: a.rs (encode/varint span=2 AND match-with-arms) must be in composed; \
-         got {composed_set:?}"
-    );
-
-    // Strict subset: every file in composed must also be in near_alone.
-    for file in &composed_set {
-        assert!(
-            near_set.contains(file.as_str()),
-            "AC-403-10a: {file} is in (--near 3 + --ast) but NOT in (--near 3 alone) -- \
-             MONOTONICITY VIOLATED; near_set={near_set:?}"
-        );
-    }
-
-    // Exclusion: b.rs has near=true but no match -> absent from composed.
-    assert!(
-        !composed_set.contains("b.rs"),
-        "AC-403-10a: b.rs (span<=3 but no match-with-arms) must be EXCLUDED from composed; \
-         got {composed_set:?}"
-    );
-
-    // Exclusion: c.rs has match but span>3 -> excluded by near.
-    assert!(
-        !composed_set.contains("c.rs"),
-        "AC-403-10a: c.rs (match-with-arms but span>3) must be EXCLUDED from composed; \
-         got {composed_set:?}"
-    );
-}
-
-/// AC-403-10b: `text + --near N + --blast-radius FILE` must return a non-empty
-/// result set that is a STRICT SUBSET of `text + --blast-radius FILE` alone.
-///
-/// Corpus:
-///   target.rs  the blast-radius reference file
-///   a.rs       "encode xx varint" (span 2 <= N=3)           -> in both
-///   b.rs       "encode aa bb cc varint" (span 4 > N=3)      -> in blast alone, NOT composed
-///
-/// Without temporal data the blast-radius path falls back to lexical union using
-/// Substring verify (query_substring_present: EACH token must appear anywhere in
-/// content).  b.rs contains both "encode" and "varint" as substrings so it passes
-/// Substring verify but fails Near(3) verify (span 4 > 3).
-///
-/// Subset property: composed ⊆ blast_alone.
-/// Strict: b.rs is in blast_alone but NOT in composed (explicit exclusion assertion).
-#[test]
-fn ac403_10_near_blast_radius_composition_strict_subset() {
-    let proj = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
-
-    fs::write(proj.path().join("target.rs"), "fn target() {}\n").unwrap();
-
-    // a.rs: encode(0) xx(1) varint(2) -- span=2 <=3. Both in blast_alone and composed.
-    fs::write(proj.path().join("a.rs"), "// encode xx varint\n").unwrap();
-
-    // b.rs: encode(0) aa(1) bb(2) cc(3) varint(4) -- span=4 >3.
-    // Substring verify passes (each token present); Near(3) verify fails.
-    // -> in blast_alone (non-positional), EXCLUDED from composed.
-    fs::write(proj.path().join("b.rs"), "// encode aa bb cc varint\n").unwrap();
-
-    build_index(proj.path(), cache.path());
-
-    // Baseline: text + --blast-radius alone (Substring verify).
-    let j_blast = search_json(
-        proj.path(),
-        cache.path(),
-        &["encode varint", "--blast-radius", "target.rs"],
-    );
-    let blast_set = paths(&j_blast);
-
-    // Composed: text + --near 3 + --blast-radius (Near(3) verify).
-    let j_composed = search_json(
-        proj.path(),
-        cache.path(),
-        &[
-            "--near",
-            "3",
-            "encode varint",
-            "--blast-radius",
-            "target.rs",
-        ],
-    );
-    let composed_set = paths(&j_composed);
-
-    // Composed must be non-empty.
-    assert!(
-        !composed_set.is_empty(),
-        "AC-403-10b: composed (--near 3 + --blast-radius) must return >= 1 result; got empty. \
-         Check that a.rs was indexed and span=2 <=3 passes Near(3) verify."
-    );
-
-    // Positive: a.rs (span=2 <=3) must appear in composed.
-    assert!(
-        composed_set.contains("a.rs"),
-        "AC-403-10b: a.rs (encode/varint span=2) must be in composed; got {composed_set:?}"
-    );
-
-    // Strict subset: every file in composed must also be in blast_alone.
-    for file in &composed_set {
-        assert!(
-            blast_set.contains(file.as_str()),
-            "AC-403-10b: {file} is in (--near 3 + --blast-radius) but NOT in (--blast-radius alone) -- \
-             MONOTONICITY VIOLATED; blast_set={blast_set:?}"
-        );
-    }
-
-    // Exclusion: b.rs passes Substring verify but Near(3) span=4>3 -> excluded.
-    assert!(
-        !composed_set.contains("b.rs"),
-        "AC-403-10b: b.rs (encode/varint span=4 > near N=3) must be EXCLUDED from composed; \
-         got {composed_set:?}"
-    );
 }
 
 // ── AC-403-16 (E2E): line_number anchors at FIRST matched word; line_range clamp ──

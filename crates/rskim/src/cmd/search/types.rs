@@ -10,39 +10,18 @@ use rskim_search::SearchField;
 use serde::Serialize;
 
 // ============================================================================
-// Pagination value type (AD-404-1/2/3)
+// Pagination value type (AD-404-1)
 // ============================================================================
 
 /// A pagination cursor that bundles `limit` and `offset` into one value.
 ///
 /// ## AD-404-1: why a struct, not two loose `usize` arguments
 ///
-/// The P1 root cause (mod.rs:201-212 passing `limit` but silently never
-/// threading `offset`) happened because `run_ast_standalone` accepted
-/// `limit: usize` as a positional argument — a positional argument can be
-/// forgotten in a function call whereas a struct field cannot be omitted when
-/// the struct literal is constructed.  `Page` does NOT make omission a compile
-/// error — `Page::new(flags.limit, None)` compiles fine — but it expresses
-/// pagination as an indivisible concept so every call site must visibly choose
+/// A positional `limit: usize` argument can be passed on without its `offset`,
+/// which silently drops pagination. `Page` expresses pagination as one
+/// indivisible concept, so every call site must visibly choose
 /// `Page::first(limit)` (offset=0) or `Page::new(limit, flags.offset)`, making
-/// the intent clear at every dispatch site.  The real guard is the dispatch-level
-/// argv test (`cli_search_offset.rs`).
-///
-/// ## AD-404-2: depth() arithmetic
-///
-/// `depth() = limit.saturating_add(offset)` is the minimum candidates the
-/// pre-verify pool must hold.  `saturating_add` guards a hostile
-/// `--offset near usize::MAX` from overflowing (applies PF-004: widen before
-/// adding an offset).  Zero-regression property: when offset==0, depth()==limit,
-/// so every raw-order widening is a provable no-op for existing behavior.
-///
-/// ## AD-404-3: apply() ownership and position
-///
-/// `apply` is a consuming drain-then-truncate that implements the canonical
-/// `skip(offset) -> take(limit)` sequence.  It must run AFTER any temporal
-/// re-sort and AFTER the verify gate, never before — the comment at each call
-/// site cites this rule.  It takes `&mut Vec<T>` (not `Vec<T>`) so callers keep
-/// their named binding and can inspect the result immediately after.
+/// the intent clear at every dispatch site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Page {
     limit: usize,
@@ -68,7 +47,7 @@ impl Page {
     /// "intentionally no offset" from "accidentally forgot offset".
     ///
     /// `#[allow(dead_code)]`: this function is a test helper called only from
-    /// `#[cfg(test)]` modules (`ast_tests.rs`, `temporal_tests.rs`).  The bin
+    /// `#[cfg(test)]` modules (`types_tests.rs`).  The bin
     /// crate's dead_code lint fires because no non-test code calls it; the
     /// attribute silences the false positive while keeping the function available
     /// to all test modules that need it.
@@ -90,28 +69,6 @@ impl Page {
     pub(super) fn offset(self) -> usize {
         self.offset
     }
-
-    /// Minimum pre-verify pool size to guarantee this page is fully fillable.
-    ///
-    /// `limit.saturating_add(offset)` — safe against `offset` near `usize::MAX`
-    /// (PF-004 / AD-404-2).  When offset==0, depth()==limit (zero-regression at
-    /// all existing call sites).
-    #[must_use]
-    #[inline]
-    pub(super) fn depth(self) -> usize {
-        self.limit.saturating_add(self.offset)
-    }
-
-    /// Apply skip-then-take to `rows`: drain the first `offset` elements, then
-    /// truncate to `limit`.  Position is load-bearing: call AFTER verify gate
-    /// and AFTER any temporal re-sort.  See AD-404-3.
-    pub(super) fn apply<T>(self, rows: &mut Vec<T>) {
-        if self.offset > 0 {
-            let skip = self.offset.min(rows.len());
-            rows.drain(..skip);
-        }
-        rows.truncate(self.limit);
-    }
 }
 
 impl QueryConfig {
@@ -119,86 +76,22 @@ impl QueryConfig {
     ///
     /// This is the canonical way to derive a `Page` from a `QueryConfig` rather
     /// than repeating `Page::new(config.limit, config.offset)` at each call site.
-    /// Upstream tickets (#403, #405) MUST call `config.page()` rather than
-    /// constructing their own `Page` so that any change to `QueryConfig`'s offset
-    /// handling propagates automatically.
+    /// Callers MUST use `config.page()` rather than constructing their own
+    /// `Page`, so that any change to `QueryConfig`'s offset handling propagates
+    /// automatically.
     ///
     /// ## AD-404-4: additive pool widening
     ///
     /// The candidate pool passed to the lexical engine MUST be computed as
     /// `candidate_pool(page.limit(), K).saturating_add(page.offset())` — the
-    /// additive form (not the multiplicative `candidate_pool(page.depth(), K)`
-    /// form, which is D-2 / Decision 2 violation).  The call sites in `query.rs`
-    /// cite this decision; this accessor ensures callers consistently derive the
-    /// same `limit` and `offset` values that drive the pool calculation.
+    /// additive form, never `candidate_pool(limit + offset, K)`, which multiplies
+    /// the offset by `K`.  The call sites in `query.rs` cite this decision; this
+    /// accessor ensures callers consistently derive the same `limit` and `offset`
+    /// values that drive the pool calculation.
     #[must_use]
     pub(super) fn page(&self) -> Page {
         Page::new(self.limit, self.offset)
     }
-}
-
-// ============================================================================
-// Temporal query types (Issue #189)
-// ============================================================================
-
-/// Sort mode for temporal queries. Mutually exclusive with each other.
-///
-/// When combined with a text query, the sort is applied to the text results.
-/// When used standalone (no query text), produces a ranked list from temporal DB.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TemporalSort {
-    /// Sort by hotspot score descending (most active files first).
-    Hot,
-    /// Sort by hotspot score ascending (least active files first).
-    Cold,
-    /// Sort by fix_density descending (most bug-prone files first).
-    Risky,
-}
-
-impl TemporalSort {
-    /// Human-readable flag name for use in error messages and `degraded_notice` calls.
-    ///
-    /// Returns the `--`-prefixed form (e.g. `"--hot"`).  Use [`Self::json_name`]
-    /// for `DegradedJson.requested` where the plan contract (AC-4/AC-7) requires
-    /// the bare form.
-    pub(super) fn flag_name(self) -> &'static str {
-        match self {
-            Self::Hot => "--hot",
-            Self::Cold => "--cold",
-            Self::Risky => "--risky",
-        }
-    }
-
-    /// Bare name for `DegradedJson.requested` (AC-4 / AC-7: no `--` prefix).
-    ///
-    /// `flag_name()` keeps the `--`-prefixed form for message text and
-    /// `degraded_notice` calls where the dashed form is correct.
-    pub(super) fn json_name(self) -> &'static str {
-        match self {
-            Self::Hot => "hot",
-            Self::Cold => "cold",
-            Self::Risky => "risky",
-        }
-    }
-}
-
-/// Temporal annotation attached to a resolved search result.
-///
-/// Fields are `None` when the file is not present in the temporal database.
-#[derive(Debug, Clone, Serialize, Default)]
-pub(super) struct TemporalAnnotation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hotspot_score: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk_score: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fix_density: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cochange_jaccard: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub changes_30d: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub changes_90d: Option<u32>,
 }
 
 // ============================================================================
@@ -227,15 +120,6 @@ pub(super) struct SnippetContext {
 // Query types
 // ============================================================================
 
-/// Path-to-Jaccard map type used by [`QueryConfig::blast_radius_paths`].
-///
-/// AD-409-1: The map carries co-change partner path → Jaccard score. The
-/// blast-radius target (seed) is also present in this map, keyed to
-/// [`super::temporal::SEED_STRENGTH`] — a finite sentinel strictly greater than
-/// the Jaccard maximum of 1.0 — so it always ranks first in the temporal layer
-/// after the ranking fix in ticket #409.
-pub(super) type BlastRadiusStrengths = std::collections::HashMap<String, f64>;
-
 /// Configuration for a query execution run.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -255,50 +139,6 @@ pub(super) struct QueryConfig {
     pub root: PathBuf,
     /// Cache directory containing the index files.
     pub cache_dir: PathBuf,
-    /// Optional map of allowed file paths to co-change Jaccard strengths (blast-radius
-    /// pre-filter).
-    ///
-    /// AD-409-1: When `Some`, keys are repo-relative paths; values are co-change
-    /// Jaccard scores for partner paths, or [`super::temporal::SEED_STRENGTH`] (2.0)
-    /// for the blast-radius target itself. The seed's score exceeds the Jaccard maximum
-    /// of 1.0, ensuring the target always ranks first in the temporal layer.
-    ///
-    /// When `Some`, only files whose repo-relative path is in this map are scored. The
-    /// filter is applied inside the search engine (before LIMIT) so that the limit
-    /// applies to the filtered result set rather than being wasted on files that would
-    /// be discarded.
-    ///
-    /// In the UNION composite path (#200), this map drives the temporal ranked list:
-    /// each path's Jaccard score (or the seed sentinel) is the raw temporal score,
-    /// merged with the lexical results via weighted RRF (UNION semantics).
-    pub blast_radius_paths: Option<BlastRadiusStrengths>,
-    /// Optional scored AST results from a structural pattern query (#198).
-    ///
-    /// When `Some`, carries `Vec<(FileId, f64)>` sorted ASC by FileId (the
-    /// frozen Wave-4 contract from #287).  The compound intersector in
-    /// `execute_query_with_manifest` uses these scores for weighted-RRF fusion
-    /// with the lexical results (replaces the old lossy HashSet gate from #199).
-    ///
-    /// `None` means "no AST filter" — pure-lexical path (all existing callers
-    /// compile unchanged because they initialize this field explicitly).
-    pub ast_scored: Option<Vec<(rskim_search::FileId, f64)>>,
-    /// Optional composite weights for the weighted-ranking query paths (#200, #377).
-    ///
-    /// When `Some`, the weighted RRF paths use these ratios instead of the default
-    /// six-signal profile.  AD-377-1/AD-377-3 — applied on BOTH composite paths:
-    /// - `--blast-radius` UNION re-ranking (`run_blast_radius_composite_query`):
-    ///   lexical + ast + temporal all weighted.
-    /// - text+`--ast` intersection (`run_compound_query`): lexical + ast weighted;
-    ///   the temporal weight is INERT here because `intersect_and_rank` fuses only
-    ///   the lexical and ast rank terms.  Supplying a non-zero temporal weight on a
-    ///   `--ast` path triggers the temporal-scoped inert-weights stderr notice
-    ///   (AD-377-2).
-    ///
-    /// `None` → use `CompositeWeights6::with_six_signal_defaults()` when composite
-    /// ranking is active.  AD-377-4: on the compound path `Some(0,0,0)` is a valid
-    /// "no ranking signal" request that returns the full intersection at score 0.0
-    /// (FileId-ASC), diverging intentionally from the blast path's empty result.
-    pub composite_weights: Option<rskim_search::CompositeWeights6>,
     /// v5 positional: require contiguous ordered phrase (`--phrase`).
     pub phrase: bool,
     /// v5 positional: max word-token distance (`--near N`).
@@ -308,8 +148,8 @@ pub(super) struct QueryConfig {
     /// When `Some`, only files of this language are returned.  Threaded into
     /// every [`rskim_search::SearchQuery`] construction site in `query.rs` so
     /// the reader's `lang_filter` path is exercised on ALL search paths
-    /// (exact-symbol, BM25F UNION, positional phrase/near, compound AST, and
-    /// blast-radius).  `None` means no language restriction (all files).
+    /// (exact-symbol, BM25F UNION, and positional phrase/near).  `None` means
+    /// no language restriction (all files).
     pub lang: Option<rskim_core::Language>,
 }
 
@@ -320,19 +160,6 @@ pub(super) struct ResolvedResult {
     /// Repo-relative path (forward slashes, no leading `.`).
     pub path: String,
     /// Relevance score (higher is better).
-    ///
-    /// Semantics depend on the active query path:
-    /// - **Plain lexical / AST path** (no `--blast-radius`): BM25F magnitude from
-    ///   the lexical ranking layer.
-    /// - **Composite UNION blast-radius path** (`--blast-radius` with composite
-    ///   ranking active, #200): fused weighted-RRF score —
-    ///   `Σᵢ wᵢ / (RRF_K + rankᵢ(file))`.  This is a small positive number
-    ///   (typically well below 1.0) and is NOT a BM25F magnitude.  Consumers
-    ///   reading this field as BM25F on the composite path will silently
-    ///   misinterpret it.
-    ///
-    /// The `field` value `"co_change_partner"` indicates a co-change-only result
-    /// whose score is the temporal RRF term alone (no lexical component).
     pub score: f64,
     /// Name of the AST field type (e.g. `"function_signature"`).
     pub field: String,
@@ -359,19 +186,6 @@ pub(super) struct ResolvedResult {
     /// this field with semantically-true reader-level positions.
     #[serde(skip)]
     pub match_positions: Vec<Range<usize>>,
-    /// Optional temporal data for this file, populated when temporal flags are active.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temporal: Option<TemporalAnnotation>,
-    /// Layers that contributed non-zero signal for this file (#201).
-    ///
-    /// Absent on degraded rows (pure-lexical path without `--ast`), present on
-    /// compound paths.  Uses `skip_serializing_if` so existing pure-lexical JSON
-    /// consumers see no new key (additive, back-compat with pre-#201 schema).
-    ///
-    /// `["lexical","ast"]` for text+`--ast` intersection (AC-F6).
-    /// `["lexical"]` for pure-lexical or blast-radius paths (no AST layer).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub layers_matched: Vec<&'static str>,
 }
 
 /// Output produced by a query execution run.
@@ -406,27 +220,6 @@ pub(super) struct QueryOutput {
     /// Index statistics (included when available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_stats: Option<rskim_search::IndexStats>,
-    /// AST size-coverage for the query invocation (D-5 / AD-405-9).
-    ///
-    /// Present ONLY on `--ast` paths (standalone and compound).  Absent on
-    /// pure-lexical queries (`None` → key omitted from JSON via
-    /// `skip_serializing_if`).  When present and not clean, the coverage
-    /// object carries the counts and bounded excluded-file sample; when
-    /// `is_clean()` the field is set to `None` (omit from JSON entirely).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ast_coverage: Option<rskim_search::AstCoverage>,
-    /// AD-414-5 / AD-414-12: degradation signals emitted on this query.
-    ///
-    /// An array of objects — one per subsystem that could not deliver the
-    /// requested ranking.  **Absent from JSON when empty** (additive,
-    /// back-compat; `#[serde(skip_serializing_if)]`).  Consumers that check
-    /// for the key can detect degraded queries without parsing stderr.
-    ///
-    /// The array is `pub` so callers outside `query.rs` (e.g. `mod.rs`
-    /// enrichment arms) can push signals after `execute_query_with_manifest`
-    /// returns.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub degraded: Vec<super::temporal::DegradedJson>,
 }
 
 // ============================================================================

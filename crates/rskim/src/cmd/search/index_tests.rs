@@ -2891,9 +2891,6 @@ fn test_index_nested_dir_fileid_roundtrip() {
             json: false,
             root: root.to_path_buf(),
             cache_dir: cache.path().to_path_buf(),
-            blast_radius_paths: None,
-            ast_scored: None,
-            composite_weights: None,
             phrase: false,
             near: None,
             lang: None,
@@ -3004,9 +3001,6 @@ fn test_manifest_old_version_triggers_auto_rebuild_on_next_query() {
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: None,
-        composite_weights: None,
         phrase: false,
         near: None,
         lang: None,
@@ -3404,9 +3398,6 @@ fn test_ac8_changed_skip_triggers_one_rebuild() {
             json: false,
             root: root.to_path_buf(),
             cache_dir: cache_dir.clone(),
-            blast_radius_paths: None,
-            ast_scored: None,
-            composite_weights: None,
             phrase: false,
             near: None,
             lang: None,
@@ -3524,9 +3515,6 @@ fn test_ac2_longline_recall_query_and_json_surface() {
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache.path().to_path_buf(),
-        blast_radius_paths: None,
-        ast_scored: None,
-        composite_weights: None,
         phrase: false,
         near: None,
         lang: None,
@@ -3635,9 +3623,6 @@ fn test_ac3_mixed_shortlong_recall_both_needles() {
                 json: false,
                 root: root.to_path_buf(),
                 cache_dir: cache.path().to_path_buf(),
-                blast_radius_paths: None,
-                ast_scored: None,
-                composite_weights: None,
                 phrase: false,
                 near: None,
                 lang: None,
@@ -3729,9 +3714,6 @@ fn test_ac4_stats_json_and_bundle_zero_results() {
             json: false,
             root: root.to_path_buf(),
             cache_dir: cache.path().to_path_buf(),
-            blast_radius_paths: None,
-            ast_scored: None,
-            composite_weights: None,
             phrase: false,
             near: None,
             lang: None,
@@ -3782,12 +3764,12 @@ fn test_ac4_stats_json_and_bundle_zero_results() {
     );
 }
 
-/// AC11 (#395) — additive `--stats --json` back-compat: all nine pre-existing
+/// AC11 (#395) — additive `--stats --json` back-compat: all eight pre-existing
 /// keys survive with unchanged types; `skipped`/`skipped_by_reason` are purely
 /// additive; the envelope parses as a single JSON object (PF-007 discriminating).
 ///
 /// NEGATIVE: if any pre-existing key were renamed, retyped, or removed, this
-/// test fails.  The nine-key superset assertion (not an exact-set assertion)
+/// test fails.  The eight-key superset assertion (not an exact-set assertion)
 /// allows future additive keys without breaking the test, while preventing
 /// removal of any existing key.
 #[test]
@@ -3812,14 +3794,13 @@ fn test_ac11_stats_json_back_compat_keys() {
     let stats_json = super::super::stats_json_for_test(cache.path(), root)
         .expect("stats_json_for_test must succeed");
 
-    // The nine pre-existing keys that must survive #395 unchanged (AC11).
+    // The pre-existing keys that must survive #395 unchanged (AC11).
     // This list was fixed before #395; extending it requires deliberate confirmation here.
     const PRE_EXISTING_KEYS: &[&str] = &[
         "file_count",
         "total_ngrams",
         "index_size_bytes",
         "total_on_disk_bytes",
-        "temporal_db_bytes",
         "last_updated",
         "git_head",
         "staleness",
@@ -3865,7 +3846,7 @@ fn test_ac11_stats_json_back_compat_keys() {
         stats_json["cache_dir"]
     );
 
-    // Additive keys must be PRESENT alongside the nine pre-existing ones —
+    // Additive keys must be PRESENT alongside the pre-existing ones —
     // not replacing them (AC11 additive invariant).
     assert!(
         stats_json["skipped"].is_array(),
@@ -3903,13 +3884,12 @@ fn test_ac11_stats_json_back_compat_keys() {
         "AC17/F10: an empty `.git` directory with no HEAD must report not_a_repo"
     );
 
-    // AC20 key-set equality: the object must contain EXACTLY the eleven
+    // AC20 key-set equality: the object must contain EXACTLY the ten
     // pre-existing keys plus this wave's additive keys.  `ast_coverage` is
     // absent here because the fixture is clean (one small file, within cap).
-    // #414 extends this constant by appending "temporal_state".
     // AD-413-13: key-set contract for the AC20 additive extension.
     const EXPECTED_STATS_JSON_KEYS: &[&str] = &[
-        // eleven pre-existing keys (AC11 / AC20) — alphabetical
+        // ten pre-existing keys (AC11 / AC20) — alphabetical
         "cache_dir",
         "file_count",
         "git_head",
@@ -3918,13 +3898,10 @@ fn test_ac11_stats_json_back_compat_keys() {
         "skipped",
         "skipped_by_reason",
         "staleness",
-        "temporal_db_bytes",
         "total_ngrams",
         "total_on_disk_bytes",
         // #413 additive key (AC20)
         "git_head_state",
-        // #414 additive key (AC-15 / AD-414-10)
-        "temporal_state",
     ];
     let mut actual_keys: Vec<&str> = stats_json
         .as_object()
@@ -4189,34 +4166,17 @@ fn test_ac_405_text_stats_ast_section_column_alignment() {
 }
 
 // ============================================================================
-// #413 / #407 / AC26 — wave-level format-version pin
+// #413 / AC26 — wave-level format-version pin
 // ============================================================================
 
-/// AC26 (NEGATIVE, one shared wave-level pin) — #413 changes HEAD *resolution*,
-/// #414 adds integrity probes and a bounded self-heal, and #407 bumps
-/// `TEMPORAL_DATA_VERSION` 1→2 via the AD-408-4 data-version self-heal.
-/// None of these changes touch the lexical/AST/manifest on-disk format versions.
-///
-/// AD-407-6: `TEMPORAL_DATA_VERSION` moves from 1 to 2 in ticket #407 to
-/// trigger a global one-query self-heal for all pre-#407 `temporal.db` files
-/// that were built with the first-parent-only walk.  This is NOT a PRAGMA
-/// `user_version` schema migration — `CURRENT_VERSION` stays 2, no v3 block
-/// is added to `run_migrations`.  Only the data-version meta row changes.
+/// AC26 (NEGATIVE, one shared wave-level pin) — #413 changes HEAD *resolution*
+/// and #414 adds integrity probes and a bounded self-heal. Neither touches the
+/// lexical/AST/manifest on-disk format versions.
 ///
 /// Why this is load-bearing: every one of these constants is a rebuild trigger
-/// in `check_staleness` / `staleness.rs`.  Bumping `TEMPORAL_DATA_VERSION`
-/// forces exactly one quiet self-heal of `temporal.db` per root (one slow
-/// query), while bumping a FORMAT_VERSION forces a full cold rebuild of the
-/// lexical or AST index for every user on their next query (many seconds of
-/// I/O) — a far more disruptive event.  This test keeps both distinctions
-/// honest: the lexical/AST/manifest constants stay at their #413 values, and
-/// `TEMPORAL_DATA_VERSION` has moved from 1 to 2 exactly as #407 intends.
-///
-/// Scope note: `rskim_search::temporal::storage::CURRENT_VERSION` (the SQLite
-/// `PRAGMA user_version` migration counter, currently 2) is **private** to
-/// `rskim-search`, so it cannot be asserted from this crate; it belongs to a
-/// companion pin inside `rskim-search` (`test_schema_version_unchanged_at_two`
-/// in `storage_tests.rs`), and the pair is one logical test.
+/// in `check_staleness` / `staleness.rs`. Bumping a FORMAT_VERSION forces a full
+/// cold rebuild of the lexical or AST index for every user on their next query
+/// (many seconds of I/O). This test keeps the constants at their #413 values.
 #[test]
 fn test_ac26_no_on_disk_format_version_is_bumped() {
     use super::super::manifest::FileManifest;
@@ -4241,17 +4201,5 @@ fn test_ac26_no_on_disk_format_version_is_bumped() {
         rskim_search::AST_CACHE_FORMAT_VERSION,
         2,
         "AC26: AstNgramCache CACHE_FORMAT_VERSION must stay 2"
-    );
-    // AD-407-6: TEMPORAL_DATA_VERSION moved from 1 (pre-#407, first-parent-only
-    // walk) to 2 (post-#407, full-DAG walk with merge-commit skip).  This is the
-    // AD-408-4 data-version self-heal mechanism — a global one-query rebuild for
-    // pre-#407 `temporal.db` files.  It is NOT a PRAGMA user_version migration
-    // (CURRENT_VERSION stays 2; run_migrations gains no v3 block).
-    assert_eq!(
-        rskim_search::TEMPORAL_DATA_VERSION,
-        2,
-        "AC26: TEMPORAL_DATA_VERSION must be 2 — #407 bumped it from 1 to 2 via the \
-         AD-408-4 data-version self-heal to trigger a global rebuild of pre-#407 \
-         temporal.db files (AD-407-6)"
     );
 }

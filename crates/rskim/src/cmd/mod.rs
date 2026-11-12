@@ -455,11 +455,10 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
 ///   (e.g. `C:foo`) that escape the root on that platform.
 ///
 /// This is the **single canonical containment guard** for untrusted git-history
-/// and git-diff paths. All three call sites that stat a
+/// and git-diff paths. Both call sites that stat a
 /// repo-relative string from git output MUST delegate here — not inline their
 /// own variant — so the invariant stays in one place and cannot drift:
 /// - `cmd::search::walk::list_tracked_files` (git index paths)
-/// - `cmd::search::temporal_build::rel_is_regular_file` (temporal history paths)
 /// - `cmd::heatmap::resolve_diff_files` (git diff paths)
 ///
 /// Note: the guard does NOT defend against in-tree symlinks whose targets resolve

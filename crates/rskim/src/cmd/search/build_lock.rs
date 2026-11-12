@@ -2,10 +2,9 @@
 //!
 //! # Responsibility
 //!
-//! This module owns ONE bounded lock-acquisition implementation used by both
-//! `index.rs` (lexical/AST build) and `temporal_build.rs` (temporal rebuild).
-//! Neither module implements its own lock loop; both delegate here so that the
-//! poll interval, deadline, and waiting message stay in sync.
+//! This module owns ONE bounded lock-acquisition implementation used by
+//! `index.rs` (lexical/AST build), so that the poll interval, deadline, and
+//! waiting message live in one place.
 //!
 //! # Usage
 //!
