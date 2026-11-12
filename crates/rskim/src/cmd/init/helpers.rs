@@ -62,7 +62,10 @@ pub(super) fn resolve_symlink(link: &Path) -> anyhow::Result<PathBuf> {
 // ============================================================================
 
 /// Resolve symlinks on the settings path, returning the original path if not a symlink.
-pub(super) fn resolve_real_settings_path(path: &Path) -> anyhow::Result<PathBuf> {
+///
+/// `pub(crate)` so that the permissions writers follow a symlinked config the
+/// same way the hook install does.
+pub(crate) fn resolve_real_settings_path(path: &Path) -> anyhow::Result<PathBuf> {
     if path.is_symlink() {
         resolve_symlink(path)
     } else {
@@ -297,6 +300,16 @@ pub(super) fn guidance_content_mdc(version: &str) -> String {
 ///
 /// Used by the Claude permissions writer before modifying `settings.json`.
 pub(crate) fn backup_settings_file(config_dir: &Path, real_path: &Path) -> anyhow::Result<()> {
+    backup_config_file(real_path, &config_dir.join(SETTINGS_BACKUP))
+}
+
+/// Copy `real_path` byte for byte to `backup_path` before a write.
+///
+/// Rejects a `real_path` that is a symlink: the caller resolved it with
+/// [`resolve_real_settings_path`], so a symlink here means the path changed
+/// after resolution. Used for config files whose backup is not
+/// `settings.json.bak` (Copilot CLI's `permissions-config.json`).
+pub(crate) fn backup_config_file(real_path: &Path, backup_path: &Path) -> anyhow::Result<()> {
     if real_path.is_symlink() {
         anyhow::bail!(
             "settings path became a symlink after resolution: {}\n\
@@ -304,9 +317,22 @@ pub(crate) fn backup_settings_file(config_dir: &Path, real_path: &Path) -> anyho
             real_path.display()
         );
     }
-    let backup_path = config_dir.join(SETTINGS_BACKUP);
-    std::fs::copy(real_path, &backup_path)?;
+    std::fs::copy(real_path, backup_path)?;
     Ok(())
+}
+
+/// Allow-list entries as one line of display text, separated by `, `.
+///
+/// Each control character is shown as an escape (`\u{1b}`, `\n`), so the line
+/// shows each entry exactly as the file stores it. Unlike
+/// [`crate::cmd::sanitize_for_display`] the whole entry is kept, because these
+/// lines tell the user what changes in the allow list.
+pub(super) fn display_entries(entries: &[String]) -> String {
+    entries
+        .iter()
+        .map(|entry| entry.escape_debug().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ============================================================================
@@ -388,9 +414,18 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
 ///
 /// - `agent_label` — human-readable agent name for the prompt (e.g. "Claude Code").
 /// - `config_file` — exact path of the file that will be modified.
-/// - `entries` — each entry that will be added, printed verbatim.
+/// - `entries` — each entry that will be added, printed in full with each
+///   control character shown as an escape.
+/// - `removed` — entries that skim no longer seeds and that are removed with
+///   or without consent; printed the same way, so the user knows the answer
+///   does not keep them. Empty for most runs.
 #[allow(clippy::disallowed_methods)] // TTY interaction: flush after print! before blocking read; bounded init output
-pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[String]) -> bool {
+pub(crate) fn confirm_grant(
+    agent_label: &str,
+    config_file: &Path,
+    entries: &[String],
+    removed: &[String],
+) -> bool {
     use std::io::{BufRead, IsTerminal, Read, Write};
 
     // Non-TTY: refuse immediately without printing anything.
@@ -408,7 +443,16 @@ pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[St
     println!("  Agent:  {agent_label}");
     println!("  Entries to add ({} total):", entries.len());
     for entry in entries {
-        println!("    {entry}");
+        println!("    {}", entry.escape_debug());
+    }
+    if !removed.is_empty() {
+        println!(
+            "  Entries that skim no longer seeds, removed with or without consent ({} total):",
+            removed.len()
+        );
+        for entry in removed {
+            println!("    {}", entry.escape_debug());
+        }
     }
     println!();
     println!("These entries grant skim read-only tool permissions at install time.");
@@ -665,7 +709,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config_file = dir.path().join("settings.json");
         let entries = vec!["Bash(skim df:*)".to_string()];
-        let result = confirm_grant("Claude Code", &config_file, &entries);
+        let result = confirm_grant("Claude Code", &config_file, &entries, &[]);
         assert!(
             !result,
             "confirm_grant must return false in a non-TTY context"
@@ -684,7 +728,7 @@ mod tests {
         ];
         for _ in 0..3 {
             assert!(
-                !confirm_grant("Claude Code", &config_file, &entries),
+                !confirm_grant("Claude Code", &config_file, &entries, &[]),
                 "confirm_grant must consistently return false in non-TTY context"
             );
         }
