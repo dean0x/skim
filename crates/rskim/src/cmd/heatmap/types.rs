@@ -365,11 +365,12 @@ pub(crate) enum Severity {
 
 /// Category of a threshold-filtered finding.
 ///
-/// Using an enum (instead of `String`) gives compile-time exhaustiveness in
-/// `sort_key` and eliminates `.to_string()` allocations at each insight push.
+/// Using an enum (instead of `String`) gives compile-time exhaustiveness and
+/// eliminates `.to_string()` allocations at each insight push. Ord is derived
+/// so the insight rank order can break its last ties on the category.
 /// Serialized as kebab-case so JSON output matches the documented schema
 /// (`"fix-risk"`, `"bus-factor"`, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum InsightCategory {
     Stability,
@@ -387,14 +388,45 @@ pub(crate) struct Insight {
     pub(crate) file: String,
     pub(crate) message: String,
     pub(crate) metric_value: f64,
+    /// Commits behind the finding: commits of the file or the module, or the
+    /// shared commits of a coupled pair.
+    pub(crate) support: usize,
+    /// How bad the finding is, `0.0..=1.0`, for the rank order: stability
+    /// `(100 - score) / 100`, fix risk the Wilson lower bound of the fix
+    /// rate, bus factor the top-author share, coupling the confidence,
+    /// encapsulation `(100 - pct) / 100`.
+    pub(crate) score: f64,
 }
 
-/// Standalone insights result (separate from HeatmapResult — does NOT add fields to it).
+/// Rows that passed the gates of a list, and the rows shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct Count {
+    pub(crate) total: usize,
+    pub(crate) shown: usize,
+}
+
+impl Count {
+    /// Rows that the cap hides.
+    #[must_use]
+    pub(crate) fn hidden(self) -> usize {
+        self.total.saturating_sub(self.shown)
+    }
+}
+
+/// The [`Count`] of the insights list, for insights JSON `counts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct InsightCounts {
+    pub(crate) insights: Count,
+}
+
+/// The `--insights` result: the shown findings in rank order, their count,
+/// and the files and modules of the shown findings.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct InsightsResult {
     pub(crate) version: u8,
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
+    pub(crate) counts: InsightCounts,
     pub(crate) insights: Vec<Insight>,
     pub(crate) top_files: Vec<CompactFileEntry>,
     pub(crate) flagged_modules: Vec<CompactModuleEntry>,

@@ -997,10 +997,11 @@ fn test_insights_text_no_metric_sections() {
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("Top Churn").not())
-        .stdout(predicate::str::contains("Blast Radius").not())
-        .stdout(predicate::str::contains("Module Health").not())
-        .stdout(predicate::str::contains("Bus Factor").not());
+        .stdout(predicate::str::contains("Hotspots (").not())
+        .stdout(predicate::str::contains("Coupling (").not())
+        .stdout(predicate::str::contains("Fix risk (").not())
+        .stdout(predicate::str::contains("Modules (").not())
+        .stdout(predicate::str::contains("Bus factor (").not());
 }
 
 #[test]
@@ -1021,11 +1022,12 @@ fn test_insights_json_output() {
     );
 
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.lines().count(), 1, "compact JSON is one line");
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("expected valid JSON from --insights --json");
 
     assert!(parsed["insights"].is_array(), "insights must be array");
-    assert_eq!(parsed["version"], 1, "version must be 1");
+    assert_eq!(parsed["version"], 2, "version must be 2");
 }
 
 #[test]
@@ -1042,13 +1044,14 @@ fn test_insights_json_has_top_files() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
-    assert!(
-        parsed["top_files"].is_array(),
-        "top_files must be array in insights JSON"
-    );
-    assert!(
-        parsed["flagged_modules"].is_array(),
-        "flagged_modules must be array in insights JSON"
+    // No file reaches 5 commits and no pair 3 shared commits, and `src`
+    // keeps 4 of its 5 commits inside: no finding, so the lists are empty.
+    assert_eq!(parsed["insights"], serde_json::json!([]));
+    assert_eq!(parsed["top_files"], serde_json::json!([]));
+    assert_eq!(parsed["flagged_modules"], serde_json::json!([]));
+    assert_eq!(
+        parsed["counts"]["insights"],
+        serde_json::json!({"total": 0, "shown": 0})
     );
 }
 
@@ -1099,31 +1102,14 @@ fn test_insights_empty_repo() {
         base_ts,
     );
 
-    // With only 1 commit, the tool might succeed or fail depending on min threshold.
-    // Both outcomes are valid; assert specific behavior on each path so a panic or
-    // unexpected output is caught rather than silently passing.
-    let output = common::skim()
-        .args(["heatmap", "--insights"])
-        .env("NO_COLOR", "1")
-        .current_dir(dir.path())
-        .output()
-        .expect("spawn skim heatmap --insights");
-
-    if output.status.success() {
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        // Either findings or empty-state message — any other output is a regression.
-        assert!(
-            stdout.contains("Insights") || stdout.contains("no notable findings"),
-            "expected Insights header or empty-state message on success, got: {stdout}"
-        );
-    } else {
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        // On failure the tool must emit a known diagnostic — not a panic or silent crash.
-        assert!(
-            stderr.contains("No commits") || stderr.contains("No analyzable"),
-            "expected known diagnostic on non-zero exit, got stderr: {stderr}"
-        );
-    }
+    // One commit is below every support minimum: exit 0, the header line,
+    // and the empty-state line only.
+    let stdout = heatmap_stdout(dir.path(), &["--insights"]);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    assert!(lines[0].starts_with("Insights: "), "{stdout}");
+    assert!(lines[0].contains(", 1 commits, "), "{stdout}");
+    assert_eq!(lines[1], "  (no notable findings)");
 }
 
 #[test]
@@ -1132,13 +1118,12 @@ fn test_insights_with_file_targeting() {
     create_test_repo(dir.path());
 
     // --insights with a positional file arg should succeed and show insights output
-    common::skim()
-        .args(["heatmap", "--insights", "src/main.rs"])
-        .env("NO_COLOR", "1")
-        .current_dir(dir.path())
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Insights"));
+    let stdout = heatmap_stdout(dir.path(), &["--insights", "src/main.rs"]);
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        header.starts_with("Insights: ") && header.ends_with(", scoped to 1 files"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -1861,4 +1846,250 @@ fn test_heatmap_detail_coupling_text_rows_equal_the_json_total() {
         !text.contains(" more ("),
         "no row is hidden in a --detail view without --top:\n{text}"
     );
+}
+
+// ============================================================================
+// --top on every view, insights cap, bus factor, stable bytes
+// ============================================================================
+
+/// The finding lines of `--insights` text: every line after the header,
+/// without the "more" line.
+fn insight_rows(text: &str) -> Vec<&str> {
+    text.lines()
+        .skip(1)
+        .filter(|l| !l.contains(" more ("))
+        .collect()
+}
+
+#[test]
+fn test_heatmap_top_gives_exact_rows_in_every_view() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+
+    // Default text: 3 rows per section and the exact hidden count.
+    let text = heatmap_stdout(dir.path(), &["--top", "3"]);
+    for (heading, more) in [
+        ("Hotspots", "  37 more (--detail hotspots)"),
+        ("Coupling", "  33 more (--detail coupling)"),
+        ("Fix risk", "  7 more (--detail fix-risk)"),
+    ] {
+        assert_eq!(section_rows(&text, heading).len(), 3, "{heading}:\n{text}");
+        assert!(
+            section_lines(&text, heading).contains(&more),
+            "{heading}:\n{text}"
+        );
+    }
+
+    // --json: 3 entries per array, and counts give total and shown.
+    let json = heatmap_json_with(dir.path(), &["--top", "3"]);
+    for (count_key, array_key, total) in [
+        ("hotspots", "files", 40),
+        ("coupling", "coupling_graph", 36),
+        ("fix_risk", "fix_risk", 10),
+    ] {
+        assert_eq!(json[array_key].as_array().unwrap().len(), 3, "{array_key}");
+        assert_eq!(
+            json["counts"][count_key],
+            serde_json::json!({"total": total, "shown": 3}),
+            "{count_key}"
+        );
+    }
+
+    // --insights --json and --insights text: 3 findings and the exact rest.
+    let insights = heatmap_json_with(dir.path(), &["--insights", "--top", "3"]);
+    let total = insights["counts"]["insights"]["total"].as_u64().unwrap();
+    assert!(total > 3, "the fixture has more than 3 findings: {total}");
+    assert_eq!(insights["insights"].as_array().unwrap().len(), 3);
+    assert_eq!(insights["counts"]["insights"]["shown"], 3);
+    let text = heatmap_stdout(dir.path(), &["--insights", "--top", "3"]);
+    assert_eq!(insight_rows(&text).len(), 3, "{text}");
+    assert_eq!(
+        text.lines().last(),
+        Some(format!("  {} more (raise --top)", total - 3).as_str())
+    );
+}
+
+#[test]
+fn test_heatmap_insights_show_twenty_findings_and_one_more_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+
+    let json = heatmap_json_with(dir.path(), &["--insights"]);
+    let total = json["counts"]["insights"]["total"].as_u64().unwrap();
+    assert!(total > 20, "the fixture has more than 20 findings: {total}");
+    let shown = json["insights"].as_array().unwrap();
+    assert_eq!(shown.len(), 20);
+
+    let text = heatmap_stdout(dir.path(), &["--insights"]);
+    assert_eq!(insight_rows(&text).len(), 20, "{text}");
+    let more: Vec<&str> = text.lines().filter(|l| l.contains(" more (")).collect();
+    assert_eq!(more, [format!("  {} more (raise --top)", total - 20)]);
+
+    // top_files holds the files of the shown findings only, once each, in
+    // finding order (module findings name no file).
+    let mut expected: Vec<&str> = Vec::new();
+    for insight in shown {
+        let file = insight["file"].as_str().unwrap();
+        if insight["category"] != "encapsulation" && !expected.contains(&file) {
+            expected.push(file);
+        }
+    }
+    let top_files: Vec<&str> = json["top_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(top_files, expected);
+}
+
+/// Commit `filename` as author `name` at `timestamp`.
+fn git_commit_as(dir: &Path, filename: &str, message: &str, timestamp: u64, name: &str) {
+    std::fs::write(dir.join(filename), format!("// {message}\n")).expect("write file");
+    let add_out = StdCommand::new("git")
+        .args(["add", "--", filename])
+        .current_dir(dir)
+        .output()
+        .expect("git add");
+    assert!(add_out.status.success(), "git add failed for {filename}");
+    let ts = format!("{timestamp}");
+    let commit_out = StdCommand::new("git")
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_NAME", name)
+        .env("GIT_AUTHOR_EMAIL", "other@example.com")
+        .env("GIT_AUTHOR_DATE", &ts)
+        .env("GIT_COMMITTER_DATE", &ts)
+        .current_dir(dir)
+        .output()
+        .expect("git commit");
+    assert!(
+        commit_out.status.success(),
+        "git commit failed for {message}: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+}
+
+#[test]
+fn test_heatmap_one_author_window_has_no_bus_factor_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // One author; src/a.rs has 5 commits, all by that author.
+    create_five_commit_repo(dir.path(), "feat");
+
+    let text = heatmap_stdout(dir.path(), &["--detail", "bus-factor"]);
+    assert_eq!(section_lines(&text, "Bus factor"), ["  (none)"], "{text}");
+    let json = heatmap_json_with(dir.path(), &["--detail", "bus-factor"]);
+    assert_eq!(json["bus_factor"], serde_json::json!([]));
+    assert_eq!(json["counts"]["bus_factor"]["total"], 0);
+
+    let text = heatmap_stdout(dir.path(), &["--insights"]);
+    assert!(!text.contains("bus-factor"), "{text}");
+    let insights = heatmap_json_with(dir.path(), &["--insights"]);
+    let categories: Vec<&str> = insights["insights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["category"].as_str().unwrap())
+        .collect();
+    assert!(!categories.contains(&"bus-factor"), "{categories:?}");
+    let risky: Vec<&serde_json::Value> = insights["top_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["bus_factor_risk"] == true)
+        .collect();
+    assert!(risky.is_empty(), "{risky:?}");
+}
+
+#[test]
+fn test_heatmap_two_author_window_shows_a_bus_factor_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // src/a.rs: 5 commits, all by Test User; src/b.rs: 1 commit by Other Dev.
+    create_five_commit_repo(dir.path(), "feat");
+    git_commit_as(
+        dir.path(),
+        "src/b.rs",
+        "feat: add b",
+        recent_ts() + 600,
+        "Other Dev",
+    );
+
+    let text = heatmap_stdout(dir.path(), &["--detail", "bus-factor"]);
+    assert_eq!(
+        section_lines(&text, "Bus factor"),
+        ["  100%   5  src/a.rs"],
+        "{text}"
+    );
+    let json = heatmap_json_with(dir.path(), &["--detail", "bus-factor"]);
+    assert_eq!(
+        json["bus_factor"],
+        serde_json::json!([
+            {"path": "src/a.rs", "top_author_pct": 100.0, "support": 5, "authors": 1}
+        ])
+    );
+
+    let insights = heatmap_json_with(dir.path(), &["--insights"]);
+    let bus: Vec<&str> = insights["insights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["category"] == "bus-factor")
+        .map(|i| i["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(bus, ["src/a.rs"]);
+}
+
+#[test]
+fn test_heatmap_two_runs_give_identical_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Many ties on commits, confidence, support and fix rate.
+    create_ranked_repo(dir.path());
+
+    let views: [&[&str]; 4] = [&[], &["--json"], &["--insights"], &["--insights", "--json"]];
+    for args in views {
+        let first = heatmap_stdout(dir.path(), args);
+        let second = heatmap_stdout(dir.path(), args);
+        assert!(!first.is_empty(), "{args:?}");
+        assert_eq!(first, second, "two runs of {args:?} differ");
+    }
+}
+
+#[test]
+fn test_heatmap_both_json_outputs_are_version_two_compact_and_capped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+
+    for (args, caps) in [
+        (
+            &["--json"][..],
+            &[
+                ("files", 10),
+                ("coupling_graph", 5),
+                ("fix_risk", 5),
+                ("modules", 0),
+                ("bus_factor", 0),
+            ][..],
+        ),
+        (
+            &["--insights", "--json"][..],
+            &[("insights", 20), ("top_files", 20), ("flagged_modules", 20)][..],
+        ),
+    ] {
+        let stdout = heatmap_stdout(dir.path(), args);
+        assert_eq!(stdout.lines().count(), 1, "{args:?} is one line");
+        let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        assert_eq!(json["version"], 2, "{args:?}");
+        for (key, cap) in caps {
+            let len = json[*key].as_array().expect(key).len();
+            assert!(len <= *cap, "{args:?} {key}: {len} > {cap}");
+        }
+    }
+
+    // Every hub file has 7 partners; files[] keeps the 5 strongest.
+    let json = heatmap_json(dir.path());
+    for file in json["files"].as_array().unwrap() {
+        let partners = file["blast_radius"].as_array().unwrap().len();
+        let path = file["path"].as_str().unwrap();
+        let expected = if path.starts_with("src/hub/") { 5 } else { 1 };
+        assert_eq!(partners, expected, "{path}");
+    }
 }

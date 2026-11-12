@@ -2,17 +2,17 @@
 //!
 //! The default text view is plain ASCII with no color: one header line, at
 //! most two warning lines, then for each section one heading line and one
-//! line per row, with no blank line. The renderers take the rows from the
-//! ranked view (`view.rs`), already sorted, gated and capped, so this module
-//! sorts, filters and caps nothing.
+//! line per row, with no blank line. The insights text has the same header
+//! line, then one line per finding. Both JSON shapes are compact (one line).
+//! The renderers take the rows from the ranked view (`view.rs`) and the
+//! ranked insights, already sorted, gated and capped, so this module sorts,
+//! filters and caps nothing.
 
 use std::path::Path;
 
-use colored::Colorize;
-
 use super::noise;
-use super::types::{DetailSection, HeatmapResult, Insight, InsightsResult, Severity};
-use super::view::{HeatmapView, text_warnings};
+use super::types::{DetailSection, HeatmapResult, InsightsResult, Severity};
+use super::view::{HeatmapView, MoreRemedy, more_line, text_warnings};
 
 // ============================================================================
 // JSON output
@@ -191,48 +191,42 @@ fn empty_section_line(view: &HeatmapView<'_>, section: DetailSection) -> String 
 // Insights rendering
 // ============================================================================
 
-/// Total width of the insights header separator line.
-const HEADER_WIDTH: usize = 76;
-
-/// Render `--insights` text output: a filtered list of one-liner findings.
-///
-/// Color application is unconditional — the `colored` crate strips ANSI codes
-/// when `NO_COLOR` is set or stdout is not a TTY.
-pub(crate) fn render_insights_text(insights: &[Insight]) -> String {
+/// Render `--insights` text: the header line, one line per shown finding in
+/// rank order, and a "more" line when the cap hides findings.
+pub(crate) fn render_insights_text(result: &HeatmapResult, insights: &InsightsResult) -> String {
     let mut out = String::new();
-
-    // Header line: "─── Insights ───────────────────────────────────────────────────────────"
-    let label = " Insights ";
-    let prefix = "───";
-    let suffix_len = HEADER_WIDTH.saturating_sub(prefix.len() + label.len());
-    let suffix = "─".repeat(suffix_len);
-    let header = format!("{prefix}{label}{suffix}");
-    out.push_str(&header.bold().to_string());
-    out.push('\n');
-    out.push('\n'); // blank line after header
-
-    if insights.is_empty() {
-        out.push_str("  (no notable findings)\n");
-        return out;
+    push_line(&mut out, &header_line("Insights", result));
+    if insights.insights.is_empty() {
+        push_line(&mut out, "  (no notable findings)");
     }
-
-    for insight in insights {
-        let severity_str = match insight.severity {
-            Severity::Critical => "CRITICAL ".red().bold().to_string(),
-            Severity::Warning => "WARNING  ".yellow().bold().to_string(),
-        };
-        out.push_str(&format!(
-            "  {severity_str}  {}: {}\n",
-            insight.file, insight.message
-        ));
+    for insight in &insights.insights {
+        push_line(
+            &mut out,
+            &format!(
+                "  {} {}: {}",
+                severity_label(&insight.severity),
+                insight.file,
+                insight.message
+            ),
+        );
     }
-
+    if let Some(more) = more_line(insights.counts.insights.hidden(), MoreRemedy::Top) {
+        push_line(&mut out, &format!("  {more}"));
+    }
     out
 }
 
-/// Render `--insights --json` output as pretty-printed JSON.
+/// The severity column of an insight line, padded to one width.
+fn severity_label(severity: &Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "CRITICAL",
+        Severity::Warning => "WARNING ",
+    }
+}
+
+/// Render `--insights --json` as compact JSON version 2 (one line).
 pub(crate) fn render_insights_json(insights_result: &InsightsResult) -> anyhow::Result<String> {
-    Ok(serde_json::to_string_pretty(insights_result)?)
+    Ok(serde_json::to_string(insights_result)?)
 }
 
 // ============================================================================
@@ -244,8 +238,9 @@ pub(crate) fn render_insights_json(insights_result: &InsightsResult) -> anyhow::
 mod tests {
     use super::*;
     use crate::cmd::heatmap::types::{
-        AuthorMetrics, ChurnMetrics, CouplingEdge, CouplingEntry, FileMetrics, FixRiskMetrics,
-        InsightCategory, ModuleHealth, WindowInfo,
+        AuthorMetrics, ChurnMetrics, CompactFileEntry, CompactModuleEntry, Count, CouplingEdge,
+        CouplingEntry, FileMetrics, FixRiskMetrics, Insight, InsightCategory, InsightCounts,
+        ModuleHealth, WindowInfo,
     };
     use crate::cmd::heatmap::view::{ViewSpec, build_view};
 
@@ -584,82 +579,30 @@ mod tests {
     // Insights rendering tests
     // -----------------------------------------------------------------------
 
-    fn make_insight(
-        severity: Severity,
-        category: InsightCategory,
-        file: &str,
-        msg: &str,
-    ) -> Insight {
+    fn make_insight(severity: Severity, file: &str, msg: &str) -> Insight {
         Insight {
             severity,
-            category,
+            category: InsightCategory::Stability,
             file: file.to_string(),
             message: msg.to_string(),
             metric_value: 42.0,
+            support: 5,
+            score: 0.58,
         }
     }
 
-    #[test]
-    fn test_insights_text_contains_findings() {
-        let insights = vec![
-            make_insight(
-                Severity::Critical,
-                InsightCategory::Stability,
-                "a.rs",
-                "critically unstable (score 22/100)",
-            ),
-            make_insight(
-                Severity::Warning,
-                InsightCategory::FixRisk,
-                "b.rs",
-                "elevated fix-risk (40.0% combined)",
-            ),
-        ];
-        let text = render_insights_text(&insights);
-        assert!(
-            text.contains("Insights"),
-            "expected Insights header in output"
-        );
-        assert!(
-            text.contains("critically unstable"),
-            "expected CRITICAL message in output"
-        );
-        assert!(
-            text.contains("elevated fix-risk"),
-            "expected WARNING message in output"
-        );
-    }
-
-    #[test]
-    fn test_insights_text_empty_state() {
-        let insights: Vec<Insight> = vec![];
-        let text = render_insights_text(&insights);
-        assert!(
-            text.contains("(no notable findings)"),
-            "expected empty-state message, got: {text}"
-        );
-    }
-
-    #[test]
-    fn test_insights_json_valid() {
-        use crate::cmd::heatmap::types::{CompactFileEntry, CompactModuleEntry, InsightsResult};
-
-        let ir = InsightsResult {
-            version: 1,
-            repository: "test-repo".to_string(),
-            window: WindowInfo {
-                mode: "90d".to_string(),
-                since: "2024-10-01".to_string(),
-                until: "2025-01-01".to_string(),
-                commits_analyzed: 5,
-                effective_strategy: None,
+    fn insights_of(insights: Vec<Insight>, total: usize) -> InsightsResult {
+        InsightsResult {
+            version: 2,
+            repository: "/home/dev/work/test-repo".to_string(),
+            window: make_result().window,
+            counts: InsightCounts {
+                insights: Count {
+                    total,
+                    shown: insights.len(),
+                },
             },
-            insights: vec![make_insight(
-                Severity::Critical,
-                InsightCategory::Stability,
-                "a.rs",
-                "critically unstable (score 22/100)",
-            )],
+            insights,
             top_files: vec![CompactFileEntry {
                 path: "a.rs".to_string(),
                 stability: 22,
@@ -668,73 +611,76 @@ mod tests {
                 bus_factor_risk: false,
             }],
             flagged_modules: vec![CompactModuleEntry {
-                path: "src/".to_string(),
+                path: "src".to_string(),
                 encapsulation_pct: 30.0,
                 cross_boundary: 3,
             }],
-        };
-
-        let json = render_insights_json(&ir).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(parsed["version"], 1);
-        assert!(parsed["insights"].is_array());
+        }
     }
 
     #[test]
-    fn test_insights_json_schema() {
-        use crate::cmd::heatmap::types::{CompactFileEntry, CompactModuleEntry, InsightsResult};
+    fn test_insights_text_gives_header_rows_and_more_line() {
+        let result = make_result();
+        let shown = vec![
+            make_insight(
+                Severity::Critical,
+                "a.rs",
+                "critically unstable (score 22/100, 9 commits)",
+            ),
+            make_insight(
+                Severity::Warning,
+                "b.rs",
+                "moderate instability (score 55/100, 6 commits)",
+            ),
+        ];
+        let text = render_insights_text(&result, &insights_of(shown, 5));
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "Insights: test-repo 2024-10-01..2025-01-01, 10 commits, dual window (count)",
+                "  CRITICAL a.rs: critically unstable (score 22/100, 9 commits)",
+                "  WARNING  b.rs: moderate instability (score 55/100, 6 commits)",
+                "  3 more (raise --top)",
+            ]
+        );
+    }
 
-        let ir = InsightsResult {
-            version: 1,
-            repository: "repo".to_string(),
-            window: WindowInfo {
-                mode: "90d".to_string(),
-                since: "2024-10-01".to_string(),
-                until: "2025-01-01".to_string(),
-                commits_analyzed: 3,
-                effective_strategy: None,
-            },
-            insights: vec![],
-            top_files: vec![CompactFileEntry {
-                path: "x.rs".to_string(),
-                stability: 80,
-                churn_commits: 2,
-                fix_risk_pct: 10.0,
-                bus_factor_risk: false,
-            }],
-            flagged_modules: vec![CompactModuleEntry {
-                path: "lib/".to_string(),
-                encapsulation_pct: 45.0,
-                cross_boundary: 2,
-            }],
-        };
+    #[test]
+    fn test_insights_text_empty_state() {
+        let result = make_result();
+        let text = render_insights_text(&result, &insights_of(vec![], 0));
+        assert_eq!(text.lines().nth(1), Some("  (no notable findings)"));
+        assert_eq!(text.lines().count(), 2, "{text}");
+    }
 
-        let json = render_insights_json(&ir).unwrap();
+    #[test]
+    fn test_insights_json_is_compact_with_counts_and_ranked_fields() {
+        let shown = vec![make_insight(
+            Severity::Critical,
+            "a.rs",
+            "critically unstable",
+        )];
+        let json = render_insights_json(&insights_of(shown, 4)).unwrap();
+        assert_eq!(json.lines().count(), 1, "one line: {json}");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-
-        // Required top-level keys
-        assert!(parsed["version"].is_number(), "version must be number");
-        assert!(
-            parsed["repository"].is_string(),
-            "repository must be string"
+        assert_eq!(parsed["version"], 2);
+        assert_eq!(
+            parsed["counts"]["insights"],
+            serde_json::json!({"total": 4, "shown": 1})
         );
-        assert!(parsed["window"].is_object(), "window must be object");
-        assert!(parsed["insights"].is_array(), "insights must be array");
-        assert!(parsed["top_files"].is_array(), "top_files must be array");
-        assert!(
-            parsed["flagged_modules"].is_array(),
-            "flagged_modules must be array"
-        );
+        let insight = &parsed["insights"][0];
+        assert_eq!(insight["severity"], "Critical");
+        assert_eq!(insight["category"], "stability");
+        assert_eq!(insight["support"], 5);
+        assert_eq!(insight["score"], 0.58);
 
-        // top_files entry keys
+        // top_files and flagged_modules entry keys
         let tf = &parsed["top_files"][0];
         assert!(tf["path"].is_string());
         assert!(tf["stability"].is_number());
         assert!(tf["churn_commits"].is_number());
         assert!(tf["fix_risk_pct"].is_number());
         assert!(tf["bus_factor_risk"].is_boolean());
-
-        // flagged_modules entry keys
         let fm = &parsed["flagged_modules"][0];
         assert!(fm["path"].is_string());
         assert!(fm["encapsulation_pct"].is_number());

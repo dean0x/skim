@@ -13,7 +13,7 @@ use serde::Serialize;
 use super::metrics::edge_order;
 use super::noise;
 use super::types::{
-    AuthorMetrics, ChurnMetrics, CouplingEdge, CouplingEntry, DetailSection, FileMetrics,
+    AuthorMetrics, ChurnMetrics, Count, CouplingEdge, CouplingEntry, DetailSection, FileMetrics,
     FixRiskMetrics, HeatmapConfig, HeatmapResult, ModuleHealth, WindowInfo,
 };
 
@@ -47,8 +47,9 @@ const WARNING_LINES: usize = 2;
 /// Coupling partners of one `files[]` entry in the heatmap JSON.
 const BLAST_RADIUS_JSON_MAX: usize = 5;
 
-/// Version of the heatmap JSON that [`HeatmapJson`] writes.
-const JSON_VERSION: u8 = 2;
+/// Version of both heatmap JSON shapes: [`HeatmapJson`] and the insights
+/// JSON.
+pub(crate) const JSON_VERSION: u8 = 2;
 
 /// Rows of `section` in the default view. Zero means that the section is not
 /// in the default view: module health and bus factor show only with
@@ -125,10 +126,6 @@ impl ViewSpec {
     }
 
     /// The caps of the insights and the card lists.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the insights and the cards are the first callers")
-    )]
     #[must_use]
     pub(crate) fn lists(self) -> ListCaps {
         let cap = |default: usize| self.top.unwrap_or(default);
@@ -194,21 +191,6 @@ pub(crate) fn text_warnings(warnings: &[String]) -> (&[String], Option<String>) 
 // ============================================================================
 // Sections and rows
 // ============================================================================
-
-/// Rows that passed the gates of a section, and the rows shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub(crate) struct Count {
-    pub(crate) total: usize,
-    pub(crate) shown: usize,
-}
-
-impl Count {
-    /// Rows that the cap hides.
-    #[must_use]
-    pub(crate) fn hidden(self) -> usize {
-        self.total.saturating_sub(self.shown)
-    }
-}
 
 /// The [`Count`] of each section, for JSON `counts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

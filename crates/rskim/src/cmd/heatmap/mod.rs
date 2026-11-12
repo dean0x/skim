@@ -356,15 +356,18 @@ fn run_with_source(
     let elapsed = start_time.elapsed();
     let mut stdout = io::stdout().lock();
 
-    // Insights early-return (before truncation — insights use full dataset)
+    let spec = view::ViewSpec::from_config(&config);
+
+    // Insights early-return: the findings come from the full result, ranked,
+    // then capped at 20 or `--top`.
     if config.insights {
-        let insights = compute_insights(&result);
+        let ranked = compute_insights(&result);
+        let insights_result = build_insights_result(&result, ranked, spec.lists().insights);
         if config.format_json {
-            let insights_result = build_insights_result(&result, insights);
             let json = render_insights_json(&insights_result)?;
             writeln!(stdout, "{json}")?;
         } else {
-            let text = render_insights_text(&insights);
+            let text = render_insights_text(&result, &insights_result);
             write!(stdout, "{text}")?;
         }
         record_heatmap_analytics(analytics, "skim heatmap --insights", elapsed);
@@ -372,7 +375,7 @@ fn run_with_source(
     }
 
     // The view sorts, gates and caps every section for both outputs.
-    let view = view::build_view(&result, &view::ViewSpec::from_config(&config));
+    let view = view::build_view(&result, &spec);
     if config.format_json {
         let json = render_json(&result, &view)?;
         writeln!(stdout, "{json}")?;
