@@ -1617,17 +1617,21 @@ fn stakes_lines_files_and_counts_compare_the_page_with_the_regex_oracle() {
     assert!(check_stakes_files(&exact, &truth).is_pass());
     assert!(check_stakes_counts(&exact, &truth).is_pass());
 
-    // A missing line: the file is still found, the count is short.
+    // A missing line: it is the only line of src/main.rs, so the lines, the
+    // files and the counts all fail on that file.
     let short = stakes_page(&lines[..3], &[("LICENSE", 1), ("src/lib.rs", 2)]);
     let d = detail(&check_stakes_lines(&short, &truth));
     assert!(
         d.contains("1 matching line(s) missing") && d.contains("src/main.rs:1"),
         "{d}"
     );
+    let d = detail(&check_stakes_files(&short, &truth));
     assert!(
-        is_fail(&check_stakes_files(&short, &truth)),
-        "main.rs is gone"
+        d.contains("1 file(s) missing") && d.contains("src/main.rs"),
+        "{d}"
     );
+    let d = detail(&check_stakes_counts(&short, &truth));
+    assert!(d.contains("src/main.rs has 0 line(s), the oracle 1"), "{d}");
 
     // An extra line in a known file: files agree, lines and counts differ.
     let mut more = lines.to_vec();
@@ -1636,10 +1640,10 @@ fn stakes_lines_files_and_counts_compare_the_page_with_the_regex_oracle() {
         &more,
         &[("LICENSE", 1), ("src/lib.rs", 3), ("src/main.rs", 1)],
     );
+    let d = detail(&check_stakes_lines(&extra, &truth));
     assert!(
-        detail(&check_stakes_lines(&extra, &truth)).contains("src/lib.rs:3 not in the oracle")
-            || detail(&check_stakes_lines(&extra, &truth))
-                .contains("not in the oracle: src/lib.rs:3")
+        d.contains("1 matching line(s) not in the oracle: src/lib.rs:3"),
+        "{d}"
     );
     assert!(check_stakes_files(&extra, &truth).is_pass());
     let d = detail(&check_stakes_counts(&extra, &truth));
@@ -2144,6 +2148,38 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
             outcome(&e, id, CheckId::ResultsUniquePaths).is_pass(),
             "{id}"
         );
+    }
+
+    // A frozen call the page lists with no role is not a call: only the clash
+    // call recall fails, and it names the site and the missing role.
+    let unlabelled_clash_page = ResultPage {
+        occurrences: vec![
+            occ("src/a.rs", 2, Some(Role::Call)),
+            occ("src/c.rs", 7, None),
+        ],
+        ..clash_page.clone()
+    };
+    let mut unlabelled = observe(false);
+    unlabelled
+        .iter_mut()
+        .find(|o| o.id == "skim-D01")
+        .expect("the clash entry is planned")
+        .full = unlabelled_clash_page;
+    let e = evaluate(
+        &universe,
+        &text,
+        &stats,
+        &plan,
+        &unlabelled,
+        &StructuralEvidence::default(),
+    )
+    .unwrap();
+    let calls = outcome(&e, "skim-D01", CheckId::ClashCallsRecall);
+    assert!(is_fail(&calls), "a call with no role must fail");
+    let d = detail(&calls);
+    assert!(d.contains("src/c.rs:7 (role none)"), "{d}");
+    for check in [CheckId::ClashDefsComplete, CheckId::ClashDefCount] {
+        assert!(outcome(&e, "skim-D01", check).is_pass(), "{check}");
     }
 
     // The samples the new rows read; a frozen entry is not oracle-less.

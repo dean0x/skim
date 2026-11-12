@@ -2230,22 +2230,34 @@ fn exact_refs_entry() -> String {
     refs_entry(&[("src/staleness.rs", 2, "def"), ("src/other.rs", 2, "call")])
 }
 
-/// A `[[clash]]` entry for `check_staleness`; `defs` are `(path, line)`. The
-/// fixture defines the name once, so a test that needs two definitions treats
-/// the call line as the second one: the entry only has to hold whole-word lines.
-fn clash_entry(defs: &[(&str, u32)], split: &str) -> String {
+/// A `[[clash]]` entry for `check_staleness`; `defs` and `calls` are
+/// `(path, line)`. The fixture defines the name once and holds it as a whole
+/// word on two lines only, so a test that needs two definitions treats the call
+/// line as the second one, and freezes that same line as the call: the entry
+/// only has to hold whole-word lines. Its calls are not split by definition.
+fn clash_entry(defs: &[(&str, u32)], calls: &[(&str, u32)], split: &str) -> String {
     let defs: Vec<String> = defs
         .iter()
         .map(|(path, line)| format!("{{ path = \"{path}\", line = {line} }}"))
         .collect();
+    let calls: String = calls
+        .iter()
+        .map(|(path, line)| {
+            format!("  {{ path = \"{path}\", line = {line}, def = \"unassigned\" }},\n")
+        })
+        .collect();
     format!(
         "\n[[clash]]\nid = \"fixture-D01\"\nquery = \"check_staleness\"\nsplit = \"{split}\"\n\
-         origin = \"curated\"\ndefs = [ {} ]\ncalls = []\n",
+         origin = \"curated\"\ndefs = [ {} ]\ncalls = [\n{calls}]\n",
         defs.join(", ")
     )
 }
 
 const TWO_DEFS: &[(&str, u32)] = &[("src/staleness.rs", 2), ("src/other.rs", 2)];
+
+/// The call line of the fixture, which `TWO_DEFS` also lists as its second
+/// definition.
+const CLASH_CALLS: &[(&str, u32)] = &[("src/other.rs", 2)];
 
 /// A `[[concept]]` entry on the fixture's `build lock` query, which freezes
 /// `first`. The query is the one of `fixture-C01`, so the stub already
@@ -2270,7 +2282,7 @@ fn stakes_entries() -> String {
 fn frozen_answer_entries() -> String {
     [
         exact_refs_entry(),
-        clash_entry(TWO_DEFS, "none"),
+        clash_entry(TWO_DEFS, CLASH_CALLS, "none"),
         concept_with_first("fixture-C02", "src/lock.rs"),
         concept_with_first("fixture-C03", "src/marker.rs"),
         stakes_entries(),
@@ -2346,13 +2358,13 @@ fn a_refs_entry_whose_sites_differ_from_the_whole_word_lines_exits_2_at_integrit
 
 #[test]
 fn a_clash_with_one_definition_or_a_split_exits_2_at_integrity() {
-    let err = integrity_failure_of(&clash_entry(&TWO_DEFS[..1], "none"));
+    let err = integrity_failure_of(&clash_entry(&TWO_DEFS[..1], CLASH_CALLS, "none"));
     assert!(
         err.contains("fixture-D01") && err.contains("2 or more"),
         "{err}"
     );
 
-    let err = integrity_failure_of(&clash_entry(TWO_DEFS, "exact"));
+    let err = integrity_failure_of(&clash_entry(TWO_DEFS, CLASH_CALLS, "exact"));
     assert!(
         err.contains("fixture-D01") && err.contains("split"),
         "{err}"
@@ -2360,7 +2372,7 @@ fn a_clash_with_one_definition_or_a_split_exits_2_at_integrity() {
 
     // The two-definition entry with no split passes integrity.
     let h = Harness::new();
-    h.write_golden_with(DEF_LINE, &clash_entry(TWO_DEFS, "none"));
+    h.write_golden_with(DEF_LINE, &clash_entry(TWO_DEFS, CLASH_CALLS, "none"));
     assert_exit(&h.run(), 0);
 }
 
@@ -2406,6 +2418,14 @@ fn the_frozen_answer_entries_are_judged_against_the_output_the_current_binary_pr
     );
     let d = detail_of(&report, "fixture-D01", "clash.def_count");
     assert!(d.contains("no definitions.count"), "{d}");
+    // The frozen call line is in the output with no role, so the call recall
+    // fails on it.
+    assert_eq!(
+        result("fixture-D01", "clash.calls_recall").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-D01", "clash.calls_recall");
+    assert!(d.contains("src/other.rs:2 (role none)"), "{d}");
 
     // `build lock` lists src/lock.rs, not src/marker.rs.
     assert_eq!(
@@ -2449,7 +2469,7 @@ fn a_zero_hit_stakes_entry_passes_once_the_run_exits_1() {
 #[test]
 fn a_search_that_counts_a_different_number_of_files_fails_the_universe_accounting() {
     let h = frozen_answer_harness();
-    let files = h.universe.len();
+    let files = h.text.len();
     // One file more than the text universe holds, with no reason for it.
     fs::write(
         h.stub_dir.path().join("stats.json"),
@@ -2491,6 +2511,11 @@ check = "clash.def_count"
 ids = ["fixture-D01"]
 
 [[xfail]]
+issue = "#555"
+check = "clash.calls_recall"
+ids = ["fixture-D01"]
+
+[[xfail]]
 issue = "#556"
 check = "concept.first_right_top5"
 ids = ["fixture-C03"]
@@ -2513,6 +2538,7 @@ fn the_new_hard_failures_are_ledgered_by_id_and_a_first_bless_needs_no_reason() 
         "refs.calls_recall",
         "clash.defs_complete",
         "clash.def_count",
+        "clash.calls_recall",
         "concept.first_right_top5",
         "stakes.exit",
     ] {
@@ -2629,13 +2655,13 @@ fn the_skim_golden_file_freezes_both_definitions_of_run_parsed_command() {
 }
 
 #[test]
-fn each_other_golden_file_holds_a_clash_entry_or_a_header_note_that_none_exists() {
-    for corpus in ["ripgrep", "flask", "zod"] {
-        let raw = real_golden_text(corpus);
-        let golden = parse_golden(&raw).unwrap_or_else(|e| panic!("{corpus}: {e:#}"));
+fn each_golden_file_holds_a_clash_entry() {
+    for corpus in CORPORA {
+        let golden =
+            parse_golden(&real_golden_text(corpus)).unwrap_or_else(|e| panic!("{corpus}: {e:#}"));
         assert!(
-            !golden.clashes.is_empty() || raw.contains("none found"),
-            "{corpus} has no [[clash]] entry and no \"none found\" note"
+            !golden.clashes.is_empty(),
+            "{corpus} holds no [[clash]] entry, expected 1 or more"
         );
     }
 }
