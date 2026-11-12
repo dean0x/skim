@@ -40,6 +40,10 @@ const FIX_COMMITS_MAX: usize = 5;
 /// Owners on one card.
 const OWNERS_DEFAULT: usize = 3;
 
+/// Warning lines in a text view. With more warnings, the last of these
+/// lines counts the warnings that it does not show.
+const WARNING_LINES: usize = 2;
+
 /// Version of the heatmap JSON that [`HeatmapJson`] writes.
 const JSON_VERSION: u8 = 2;
 
@@ -82,13 +86,6 @@ pub(crate) struct ListCaps {
 
 impl ViewSpec {
     /// The spec of `config`. The `--top` value counts only when it was given.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the text render and JSON v2 are the first callers"
-        )
-    )]
     #[must_use]
     pub(crate) fn from_config(config: &HeatmapConfig) -> Self {
         Self {
@@ -116,10 +113,6 @@ impl ViewSpec {
 
     /// True when the text view shows `section`: in a `--detail` view only the
     /// named section, else hotspots, coupling and fix risk.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the text render is the first caller")
-    )]
     #[must_use]
     pub(crate) fn shows(self, section: DetailSection) -> bool {
         match self.detail {
@@ -179,6 +172,20 @@ pub(crate) fn more_line(hidden: usize, remedy: MoreRemedy) -> Option<String> {
         MoreRemedy::Detail(section) => format!("{hidden} more (--detail {})", section.name()),
         MoreRemedy::Top => format!("{hidden} more (raise --top)"),
     })
+}
+
+/// The warnings that a text view prints in full, and the line that counts
+/// the others, or `None` when every warning fits in [`WARNING_LINES`] lines.
+#[must_use]
+pub(crate) fn text_warnings(warnings: &[String]) -> (&[String], Option<String>) {
+    if warnings.len() <= WARNING_LINES {
+        return (warnings, None);
+    }
+    let (shown, hidden) = warnings.split_at(WARNING_LINES - 1);
+    (
+        shown,
+        Some(format!("{} more warnings (--json)", hidden.len())),
+    )
 }
 
 // ============================================================================
@@ -278,13 +285,6 @@ pub(crate) struct HeatmapView<'a> {
 }
 
 /// Build the ranked view of `result` for `spec`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the text render and JSON v2 are the first callers"
-    )
-)]
 #[must_use]
 pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> HeatmapView<'a> {
     let base_rate = noise::base_rate(result.fix_commits_total, result.window.commits_analyzed);
@@ -401,10 +401,6 @@ impl<'a> HeatmapView<'a> {
     }
 
     /// The "more" line of `section`, or `None` when no row of it is hidden.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the text render is the first caller")
-    )]
     #[must_use]
     pub(crate) fn more(&self, section: DetailSection) -> Option<String> {
         more_line(self.count(section).hidden(), self.spec.remedy(section))

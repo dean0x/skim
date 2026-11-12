@@ -327,15 +327,21 @@ fn test_heatmap_text_output_contains_sections() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
-    common::skim()
-        .args(["heatmap"])
-        .current_dir(dir.path())
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Top Churn"))
-        .stdout(predicate::str::contains("Blast Radius"))
-        .stdout(predicate::str::contains("Module Health"))
-        .stdout(predicate::str::contains("Bus Factor"));
+    let text = heatmap_stdout(dir.path(), &[]);
+    let headings: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with(' '))
+        .collect();
+    assert_eq!(
+        headings,
+        [
+            "Hotspots (commits):",
+            "Coupling (confidence, shared commits):",
+            "Fix risk (fix commits/commits, lift, base rate):",
+        ],
+        "module health and bus factor are not in the default view:\n{text}"
+    );
 }
 
 // ============================================================================
@@ -587,19 +593,13 @@ fn test_heatmap_top_flag_limits_output() {
         files.len()
     );
 
-    // Text output with --top=3 should succeed and show Top Churn section
-    let text_output = common::skim()
-        .args(["heatmap", "--top=3"])
-        .current_dir(dir.path())
-        .output()
-        .expect("spawn skim heatmap text");
+    // Text output with --top=3 shows 3 hotspot rows and counts the other 7.
+    let text = heatmap_stdout(dir.path(), &["--top=3"]);
+    assert_eq!(section_rows(&text, "Hotspots").len(), 3, "{text}");
     assert!(
-        text_output.status.success(),
-        "expected exit 0 for text --top=3, stderr: {}",
-        String::from_utf8_lossy(&text_output.stderr)
+        section_lines(&text, "Hotspots").contains(&"  7 more (--detail hotspots)"),
+        "{text}"
     );
-    let text = String::from_utf8(text_output.stdout).unwrap();
-    assert!(text.contains("Top Churn"));
 }
 
 // ============================================================================
@@ -686,8 +686,9 @@ fn test_heatmap_explicit_files_text_header() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let header = stdout.lines().next().unwrap_or_default();
     assert!(
-        stdout.contains("scoped to 1 files"),
+        header.starts_with("Heatmap: ") && header.ends_with(", scoped to 1 files"),
         "header missing scope: {stdout}"
     );
 }
@@ -877,10 +878,11 @@ fn test_heatmap_diff_flag() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // The diff output should include the scope annotation
+    // The diff output should include the scope annotation: one changed file.
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let header = stdout.lines().next().unwrap_or_default();
     assert!(
-        stdout.contains("scoped to"),
+        header.starts_with("Heatmap: ") && header.ends_with(", scoped to 1 files"),
         "should show scoped header: {stdout}"
     );
 }
@@ -1488,5 +1490,291 @@ fn test_heatmap_detail_unknown_name_lists_valid_names() {
             "--detail must be one of hotspots, coupling, fix-risk, modules, bus-factor; got: churn"
         ),
         "stderr: {stderr}"
+    );
+}
+
+// ============================================================================
+// Text view: header, sections, caps
+// ============================================================================
+
+/// Run `skim heatmap <args>` in `dir`, require exit 0, and return stdout.
+fn heatmap_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = common::skim()
+        .arg("heatmap")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn skim heatmap");
+    assert!(
+        output.status.success(),
+        "skim heatmap {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf-8 stdout")
+}
+
+/// The indented lines under the text heading that starts with `heading`.
+fn section_lines<'a>(text: &'a str, heading: &str) -> Vec<&'a str> {
+    text.lines()
+        .skip_while(|l| !l.starts_with(heading))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .collect()
+}
+
+/// The rows of a text section: its lines without the "more" line and
+/// without a "(none" line.
+fn section_rows<'a>(text: &'a str, heading: &str) -> Vec<&'a str> {
+    section_lines(text, heading)
+        .into_iter()
+        .filter(|l| !l.contains(" more (") && !l.trim_start().starts_with('('))
+        .collect()
+}
+
+/// Commit new content for every path of `paths` in one commit.
+fn git_commit_paths(dir: &Path, paths: &[String], message: &str, timestamp: u64) {
+    for path in paths {
+        let file_path = dir.join(path);
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).expect("create dirs");
+        }
+        std::fs::write(&file_path, format!("// {message}\n")).expect("write file");
+    }
+    let add_out = StdCommand::new("git")
+        .arg("add")
+        .arg("--")
+        .args(paths)
+        .current_dir(dir)
+        .output()
+        .expect("git add");
+    assert!(
+        add_out.status.success(),
+        "git add failed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let ts = format!("{timestamp}");
+    let commit_out = StdCommand::new("git")
+        .args(["commit", "-m", message])
+        .env("GIT_AUTHOR_DATE", &ts)
+        .env("GIT_COMMITTER_DATE", &ts)
+        .current_dir(dir)
+        .output()
+        .expect("git commit");
+    assert!(
+        commit_out.status.success(),
+        "git commit failed for {message}: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+}
+
+/// 40 files with many ties, one author, 62 commits:
+/// - `src/hub/h0.rs`..`h7.rs`: 6 commits that touch all 8 (28 pairs with 6
+///   shared commits each; each hub file has 7 partners);
+/// - `src/pair/pNa.rs` with `src/pair/pNb.rs`, N = 0..8: 5 shared commits
+///   per pair (8 pairs). Pairs 0-4 have only fix commits, so their 10 files
+///   are above the fix base rate (25 of 62 commits);
+/// - `src/solo/s00.rs`..`s15.rs`: 1 commit each.
+fn create_ranked_repo(dir: &Path) {
+    git_init(dir);
+    let mut ts = recent_ts();
+    let mut next_ts = move || {
+        ts += 60;
+        ts
+    };
+    let hub: Vec<String> = (0..8).map(|i| format!("src/hub/h{i}.rs")).collect();
+    for c in 0..6 {
+        git_commit_paths(dir, &hub, &format!("feat: hub {c}"), next_ts());
+    }
+    for p in 0..8 {
+        let pair = [format!("src/pair/p{p}a.rs"), format!("src/pair/p{p}b.rs")];
+        let kind = if p < 5 { "fix" } else { "feat" };
+        for c in 0..5 {
+            git_commit_paths(dir, &pair, &format!("{kind}: pair {p} {c}"), next_ts());
+        }
+    }
+    for s in 0..16 {
+        let solo = [format!("src/solo/s{s:02}.rs")];
+        git_commit_paths(dir, &solo, &format!("feat: solo {s}"), next_ts());
+    }
+}
+
+#[test]
+fn test_heatmap_default_text_fits_in_thirty_lines_with_more_lines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &[]);
+    let lines: Vec<&str> = text.lines().collect();
+    // header 1; hotspots 1 + 10 + 1; coupling 1 + 5 + 1; fix risk 1 + 5 + 1.
+    assert_eq!(lines.len(), 27, "{text}");
+    assert!(lines.len() <= 30);
+    for more in [
+        "  30 more (--detail hotspots)",
+        "  31 more (--detail coupling)",
+        "  5 more (--detail fix-risk)",
+    ] {
+        assert!(lines.contains(&more), "missing {more:?}:\n{text}");
+    }
+}
+
+#[test]
+fn test_heatmap_text_ranks_ties_by_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_ranked_repo(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &[]);
+    let mut expected: Vec<String> = (0..8).map(|i| format!("    6  src/hub/h{i}.rs")).collect();
+    expected.push("    5  src/pair/p0a.rs".to_string());
+    expected.push("    5  src/pair/p0b.rs".to_string());
+    assert_eq!(section_rows(&text, "Hotspots"), expected);
+    assert_eq!(
+        section_rows(&text, "Coupling"),
+        [
+            "  100%   6  src/hub/h0.rs <-> src/hub/h1.rs",
+            "  100%   6  src/hub/h0.rs <-> src/hub/h2.rs",
+            "  100%   6  src/hub/h0.rs <-> src/hub/h3.rs",
+            "  100%   6  src/hub/h0.rs <-> src/hub/h4.rs",
+            "  100%   6  src/hub/h0.rs <-> src/hub/h5.rs",
+        ]
+    );
+    // 5 fix commits of 5; base rate 25 / 62 = 40.3%; lift 1 / 0.403 = 2.5.
+    assert_eq!(
+        section_rows(&text, "Fix risk"),
+        [
+            "  5/5  lift 2.5  base 40%  src/pair/p0a.rs",
+            "  5/5  lift 2.5  base 40%  src/pair/p0b.rs",
+            "  5/5  lift 2.5  base 40%  src/pair/p1a.rs",
+            "  5/5  lift 2.5  base 40%  src/pair/p1b.rs",
+            "  5/5  lift 2.5  base 40%  src/pair/p2a.rs",
+        ]
+    );
+}
+
+#[test]
+fn test_heatmap_hotspots_are_the_ten_highest_churn_files_in_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let ts = recent_ts();
+    // Commit k touches every file with k or more commits, so `src/fNN.rs`
+    // gets NN commits. `src/e10.rs` ties with `src/f10.rs` on 10 commits.
+    for k in 1..=12usize {
+        let mut paths: Vec<String> = (k..=12).map(|i| format!("src/f{i:02}.rs")).collect();
+        if k <= 10 {
+            paths.push("src/e10.rs".to_string());
+        }
+        git_commit_paths(
+            dir.path(),
+            &paths,
+            &format!("feat: step {k}"),
+            ts + k as u64 * 60,
+        );
+    }
+
+    let text = heatmap_stdout(dir.path(), &[]);
+    let rows: Vec<(u64, &str)> = section_rows(&text, "Hotspots")
+        .iter()
+        .map(|row| {
+            let (count, path) = row.trim_start().split_once("  ").expect("count and path");
+            (count.parse().expect("commit count"), path)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (12, "src/f12.rs"),
+            (11, "src/f11.rs"),
+            (10, "src/e10.rs"),
+            (10, "src/f10.rs"),
+            (9, "src/f09.rs"),
+            (8, "src/f08.rs"),
+            (7, "src/f07.rs"),
+            (6, "src/f06.rs"),
+            (5, "src/f05.rs"),
+            (4, "src/f04.rs"),
+        ]
+    );
+    assert!(
+        section_lines(&text, "Hotspots").contains(&"  3 more (--detail hotspots)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn test_heatmap_text_header_states_the_window() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &[]);
+    let header = text.lines().next().expect("header line");
+    let pattern = regex::Regex::new(
+        r"^Heatmap: \S+ \d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}, 5 commits, dual window \((time|count)\)$",
+    )
+    .unwrap();
+    assert!(pattern.is_match(header), "header: {header}");
+    let name = dir.path().file_name().unwrap().to_str().unwrap();
+    assert!(header.contains(name), "header has the repo name: {header}");
+    assert!(!header.contains('/'), "header has no path: {header}");
+}
+
+/// A repo with 5 commits of `src/a.rs`, each with the message `prefix: N`.
+fn create_five_commit_repo(dir: &Path, prefix: &str) {
+    git_init(dir);
+    let ts = recent_ts();
+    for i in 0..5u64 {
+        git_commit(
+            dir,
+            "src/a.rs",
+            &format!("// {i}"),
+            &format!("{prefix}: change {i}"),
+            ts + i * 60,
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_fix_risk_gives_one_reason_line_at_zero_and_full_base_rate() {
+    for (prefix, rate) in [("feat", "0%"), ("fix", "100%")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_five_commit_repo(dir.path(), prefix);
+
+        let text = heatmap_stdout(dir.path(), &[]);
+        assert_eq!(
+            section_lines(&text, "Fix risk"),
+            [format!("  (none: the fix base rate is {rate})")],
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_detail_modules_text_lists_package_modules() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_package_repo(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &["--detail", "modules"]);
+    let headings: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with(' '))
+        .collect();
+    assert_eq!(headings, ["Modules (encapsulation, commits):"], "{text}");
+    let mut rows: Vec<(String, u64)> = section_rows(&text, "Modules")
+        .iter()
+        .map(|row| {
+            let mut parts = row.split_whitespace();
+            let _encapsulation = parts.next().expect("encapsulation");
+            let commits = parts.next().expect("commits").parse().expect("number");
+            (parts.next().expect("path").to_string(), commits)
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("crates/a".to_string(), 4),
+            ("crates/b".to_string(), 4),
+            ("packages/x".to_string(), 4),
+            ("src".to_string(), 3),
+        ]
     );
 }

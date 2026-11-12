@@ -379,14 +379,14 @@ fn run_with_source(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Apply --top N limit to files (not needed for insights)
-    result.files.truncate(display_top_n);
-
     if config.format_json {
+        // Apply --top N limit to files (not needed for insights)
+        result.files.truncate(display_top_n);
         let json = render_json(&result)?;
         writeln!(stdout, "{json}")?;
     } else {
-        let text = render_text(&result, display_top_n);
+        let view = view::build_view(&result, &view::ViewSpec::from_config(&config));
+        let text = render_text(&result, &view);
         write!(stdout, "{text}")?;
     }
 
