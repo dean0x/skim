@@ -9,7 +9,8 @@
 //! gives the child its own parser cache, switches analytics off and pins the
 //! working directory. File names are therefore relative and the headers of a
 //! multi-match read are deterministic. The cache key of a symbol read is pinned
-//! in `cli_cache.rs`.
+//! in `cli_cache.rs`. One test, the analytics guard at the end of this file,
+//! switches analytics back on against a database and a cache of its own.
 //!
 //! The raw source of every expected output is sliced from the fixture itself,
 //! so a test states which fixture lines a read must print and not a second copy
@@ -156,6 +157,32 @@ fn listed_names(stderr: &str) -> &str {
         .unwrap_or_else(|| panic!("no declaration list in: {stderr}"))
         .1
         .trim_end()
+}
+
+/// Run `skim <args>` like [`run`], but with analytics switched ON.
+///
+/// The analytics database and the parser cache both live under `state`, a
+/// directory of its own, so the run cannot reach the real database or the real
+/// cache. Every other sandbox pin (home, config dirs, working directory) stays.
+fn run_recording(home: &Path, state: &Path, args: &[&str]) -> Run {
+    finish(
+        common::skim_sandboxed(home)
+            .env_remove("SKIM_DISABLE_ANALYTICS")
+            .env("SKIM_ANALYTICS_DB", state.join("analytics.db"))
+            .env("SKIM_CACHE_DIR", state.join("cache"))
+            .args(args)
+            .output(),
+    )
+}
+
+/// The number of rows in the `token_savings` table of the database under
+/// `state`. A missing table is a failure, not a count of zero: the caller has
+/// already shown that a recording run creates it.
+fn recorded_rows(state: &Path) -> i64 {
+    let conn = rusqlite::Connection::open(state.join("analytics.db"))
+        .expect("the analytics database must open");
+    conn.query_row("SELECT COUNT(*) FROM token_savings", [], |row| row.get(0))
+        .expect("the token_savings table must exist")
 }
 
 // ============================================================================
@@ -831,5 +858,55 @@ fn a_match_before_the_node_cap_is_found_and_the_notice_names_the_cap() {
         "[skim] --symbol \"dup\": lines 1-1 of 20002 shown (0 above, 20001 below not shown); \
          the declaration walk stopped at its syntax-node or depth cap, so more declarations \
          with this name may exist — omit --symbol for the whole file\n"
+    );
+}
+
+// ============================================================================
+// A symbol read records no analytics row
+// ============================================================================
+
+#[test]
+fn a_symbol_read_records_no_analytics_row() {
+    // The row of a whole-file read counts the saved tokens. A symbol read shows
+    // a selection of the file, so the same row would count the selection as a
+    // saving. Every other test here runs with analytics off, so only this one
+    // can see a symbol read that starts to record.
+    let home = rust_home();
+    let state = TempDir::new().unwrap();
+
+    // Control: a whole-file read of the same file records a row in this exact
+    // environment. The writer thread is joined before the process exits, so
+    // the count is read after a finished write and not during one.
+    let whole = run_recording(home.path(), state.path(), &["lib.rs"]);
+    assert_eq!(whole.code, Some(0), "stderr: {}", whole.stderr);
+    let before = recorded_rows(state.path());
+    assert!(
+        before >= 1,
+        "the control read must record a row, or the checks below prove nothing"
+    );
+
+    let found = run_recording(
+        home.path(),
+        state.path(),
+        &["lib.rs", "--symbol", "checksum"],
+    );
+    assert_eq!(found.code, Some(0), "stderr: {}", found.stderr);
+    assert_eq!(found.stdout, lines(RUST_SRC, 28, 35));
+    assert_eq!(
+        recorded_rows(state.path()),
+        before,
+        "a successful symbol read must not add an analytics row"
+    );
+
+    let missing = run_recording(
+        home.path(),
+        state.path(),
+        &["lib.rs", "--symbol", "no_such_name"],
+    );
+    assert_eq!(missing.code, Some(1), "stderr: {}", missing.stderr);
+    assert_eq!(
+        recorded_rows(state.path()),
+        before,
+        "a symbol read that finds nothing must not add an analytics row"
     );
 }
