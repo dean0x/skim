@@ -14,8 +14,10 @@
 //! [`crate::scoreboard::universe::Universe::files`].
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+
+use regex::Regex;
 
 // ============================================================================
 // Query model
@@ -160,6 +162,95 @@ pub fn ground_truth<'a>(
     out.sort();
     out.dedup();
     out
+}
+
+// ============================================================================
+// Whole-word lines (the `-w` boundary rule)
+// ============================================================================
+
+/// The word-character class of the `-w` boundary rule:
+/// `[\p{Alphabetic}\p{Nd}_]`.
+const WORD_CHAR_CLASS: &str = r"[\p{Alphabetic}\p{Nd}_]";
+
+/// Whole-word matching of a literal over lines, the ground truth for a
+/// `-w` search. A match is a whole word iff the character before it and the
+/// character after it (if any) are not word characters
+/// ([`WORD_CHAR_CLASS`]). The literal is compared case-sensitively and
+/// byte for byte, never as a regex.
+///
+/// Limit: for a literal that starts or ends with a non-word character this
+/// rule can differ from `rg -w`. Golden queries for the whole-word tables are
+/// bare identifiers, and the golden integrity checks refuse any other query.
+#[derive(Debug, Clone)]
+pub struct WholeWord {
+    class: Regex,
+}
+
+impl WholeWord {
+    /// Build the matcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the word-character class does not compile.
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(WholeWord {
+            class: Regex::new(WORD_CHAR_CLASS)?,
+        })
+    }
+
+    fn is_word_char(&self, c: char) -> bool {
+        let mut buf = [0u8; 4];
+        self.class.is_match(c.encode_utf8(&mut buf))
+    }
+
+    /// Whether `line` holds `word` as a whole word. An empty `word` never
+    /// matches. Overlapping occurrences are all tried.
+    pub fn in_line(&self, line: &str, word: &str) -> bool {
+        if word.is_empty() {
+            return false;
+        }
+        let mut from = 0;
+        while let Some(rel) = line[from..].find(word) {
+            let start = from + rel;
+            let end = start + word.len();
+            let before_ok = line[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !self.is_word_char(c));
+            let after_ok = line[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !self.is_word_char(c));
+            if before_ok && after_ok {
+                return true;
+            }
+            // Step one character on (not one byte, to stay on a boundary).
+            from = start + line[start..].chars().next().map_or(1, char::len_utf8);
+        }
+        false
+    }
+
+    /// Every `(path, 1-based line)` over `files` whose line holds `word` as
+    /// a whole word. Lines are split on `\n` only (the line number is 1 + the
+    /// count of `\n` bytes before the line).
+    pub fn lines<'a>(
+        &self,
+        files: impl IntoIterator<Item = (&'a str, &'a str)>,
+        word: &str,
+    ) -> BTreeSet<(String, u32)> {
+        let mut out = BTreeSet::new();
+        for (path, text) in files {
+            for (idx, line) in text.split('\n').enumerate() {
+                let Ok(number) = u32::try_from(idx + 1) else {
+                    break;
+                };
+                if self.in_line(line, word) {
+                    out.insert((path.to_string(), number));
+                }
+            }
+        }
+        out
+    }
 }
 
 // ============================================================================
@@ -1052,5 +1143,102 @@ mod tests {
         let sim = simulate_rg_fixed([("a.rs", "bar\n")], "foo");
         assert_eq!(sim.total_bytes(), 0);
         assert!(sim.lines().is_empty());
+    }
+
+    // --- whole-word lines -----------------------------------------------------
+
+    fn ww() -> WholeWord {
+        WholeWord::new().unwrap()
+    }
+
+    #[test]
+    fn a_word_between_non_word_characters_is_a_whole_word() {
+        let w = ww();
+        for line in [
+            "foo",
+            "foo()",
+            "a.foo(b)",
+            "let x = foo;",
+            "-foo-",
+            "::foo::bar",
+            "\tfoo\r",
+        ] {
+            assert!(w.in_line(line, "foo"), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_word_next_to_a_letter_digit_or_underscore_is_not_a_whole_word() {
+        let w = ww();
+        for line in [
+            "foobar",
+            "barfoo",
+            "foo_bar",
+            "_foo",
+            "foo2",
+            "2foo",
+            "\u{e9}foo",
+            "foo\u{e9}",
+            "\u{663}foo",
+        ] {
+            assert!(!w.in_line(line, "foo"), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_whole_word_counts_when_an_earlier_occurrence_is_inside_a_longer_word() {
+        let w = ww();
+        assert!(w.in_line("foobar foo", "foo"));
+        assert!(w.in_line("xfoo foo!", "foo"));
+        assert!(!w.in_line("foobar xfoo", "foo"));
+    }
+
+    #[test]
+    fn overlapping_occurrences_are_all_tried() {
+        let w = ww();
+        // "aa" starts at 0 (a letter follows) and at 1 (a letter precedes):
+        // neither is a whole word.
+        assert!(!w.in_line("aaa-", "aa"));
+        // "a-a" starts at 1 (a letter precedes) and, overlapping it, at 3
+        // ('-' precedes, the line ends): only the second is a whole word.
+        assert!(w.in_line("xa-a-a", "a-a"));
+    }
+
+    #[test]
+    fn matching_is_case_sensitive_and_literal() {
+        let w = ww();
+        assert!(!w.in_line("Foo", "foo"));
+        assert!(!w.in_line("foo", "f.o"), "the word is not a regex");
+        assert!(w.in_line("a.b", "a.b"));
+    }
+
+    #[test]
+    fn an_empty_word_never_matches() {
+        assert!(!ww().in_line("anything", ""));
+        assert!(ww().lines([("a.rs", "x\n")], "").is_empty());
+    }
+
+    #[test]
+    fn whole_word_lines_give_path_and_one_based_line_over_every_file() {
+        let files = [
+            ("a.rs", "fn foo() {}\nlet foobar = 1;\n// foo again\n"),
+            ("b.txt", "nothing\nfoo\n"),
+            ("c.rs", "foo_bar\n"),
+        ];
+        let got = ww().lines(files, "foo");
+        let want: BTreeSet<(String, u32)> = [("a.rs", 1), ("a.rs", 3), ("b.txt", 2)]
+            .into_iter()
+            .map(|(p, l)| (p.to_string(), l))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_crlf_line_keeps_its_line_number() {
+        let got = ww().lines([("w.rs", "x\r\nfoo\r\ny")], "foo");
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            [("w.rs".to_string(), 2)]
+        );
     }
 }
