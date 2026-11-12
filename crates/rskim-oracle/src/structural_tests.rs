@@ -1200,7 +1200,7 @@ fn field<'v>(package: &'v toml::Value, key: &str) -> Option<&'v str> {
 /// this crate, read from this crate's lock entry: a dependency listed as
 /// `name version` (the lock holds several versions of it) carries its
 /// version, and a bare `name` is the lock's one package of that name.
-fn locked_dependency_versions() -> BTreeMap<String, String> {
+pub(crate) fn locked_dependency_versions() -> BTreeMap<String, String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let lock: toml::Table = raw
@@ -1239,7 +1239,7 @@ fn locked_dependency_versions() -> BTreeMap<String, String> {
 /// line must be `; Grammar: <crate> <locked version>.`, with the language
 /// constant in parentheses before the full stop for a crate that ships two
 /// grammars, and no other line may start `; Grammar:`.
-fn grammar_header_problem(
+pub(crate) fn grammar_header_problem(
     source: &str,
     lang: OracleLang,
     locked: &BTreeMap<String, String>,
