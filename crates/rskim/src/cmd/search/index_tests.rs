@@ -70,7 +70,8 @@ fn test_index_writes_skidx_and_skpost() {
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
 
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     assert!(
         find_file_with_ext(cache.path(), "skidx"),
@@ -87,7 +88,8 @@ fn test_index_writes_manifest_sidecar() {
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
 
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     assert!(
         find_file_with_ext(cache.path(), "skfiles"),
@@ -160,7 +162,8 @@ fn test_manifest_size_grounded_ceiling() {
         "corpus must be >= 8 KiB (got {source_bytes} bytes)"
     );
 
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let skfiles = cache.path().join("index.skfiles");
     let binary_bytes = fs::metadata(&skfiles).unwrap().len();
@@ -371,7 +374,8 @@ fn test_index_incremental_modified_file_reindexed() {
     let args = index_args(project.path(), cache.path());
 
     // First build — record the SHA for src/main.rs before modification.
-    run(&args, &TEST_ANALYTICS).unwrap();
+    let exit_code = run(&args, &TEST_ANALYTICS).unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
     let manifest1 =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
     let sha_before = manifest1
@@ -420,7 +424,8 @@ fn test_index_force_flag_ignores_manifest() {
     let args = index_args(project.path(), cache.path());
 
     // First build to populate the manifest (creates cache entries for all files).
-    run(&args, &TEST_ANALYTICS).unwrap();
+    let exit_code = run(&args, &TEST_ANALYTICS).unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     // Force rebuild via build_index directly so we can inspect IndexResult.
     // cache_hits must be zero — --force means the manifest is intentionally ignored.
@@ -838,7 +843,8 @@ fn test_sha_computed_in_classify_phase() {
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
 
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
@@ -953,8 +959,9 @@ fn test_adr006_desync_aborts_before_manifest_save() {
     let cache = tempfile::tempdir().unwrap();
 
     // Stage 1: clean first build — establishes the "old manifest" on disk.
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
         .expect("first build must succeed");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     // Record old manifest state: load from disk and note the modification time
     // of the manifest file so we can assert it was NOT overwritten.
@@ -1083,8 +1090,9 @@ fn test_adr006_self_heal_after_abort() {
     let cache = tempfile::tempdir().unwrap();
 
     // First build — establishes the old manifest.
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
         .expect("first build must succeed");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let old_manifest = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
         .expect("old manifest must be loadable");
@@ -1194,8 +1202,9 @@ fn test_ac10_402_unioned_file_desync_abort_preserves_manifest() {
 
     // Stage 1: first build includes secretdoc.md via the union — establishes
     // the "old manifest" on disk (has both src/a.rs AND secretdoc.md).
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
         .expect("first build must succeed");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let old_entry_count =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
@@ -2634,8 +2643,9 @@ fn test_ac7_cached_zero_count_entry_aborts_via_desync() {
     let cache = tempfile::tempdir().unwrap();
 
     // First build — establishes the old manifest on disk.
-    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
+    let exit_code = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS)
         .expect("first build must succeed");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     // Record the old manifest mtime to confirm it was NOT overwritten after abort.
     let skfiles_path = cache
@@ -3960,32 +3970,9 @@ fn test_ac4_run_build_stderr_names_skipped_bundle() {
     // Genuine >= 64 KiB single-line bundle — must appear in stderr skip sample.
     fs::write(root.join("bundle.js"), "x".repeat(70_000)).unwrap();
 
-    // Locate the skim binary.
-    //
-    // CARGO_BIN_EXE_<name> is populated by Cargo ONLY for integration tests
-    // compiled from the `tests/` directory; it is never set for in-source unit
-    // tests (this file is compiled into the binary crate's test binary, not an
-    // integration test crate).  The `unwrap_or_else` branch is therefore always
-    // taken in practice.
-    //
-    // The fallback walks up from `current_exe()`:
-    //   target/<profile>/deps/rskim-<hash>  →  pop "deps/"  →  pop "<profile>/"
-    //   →  push "skim"
-    // This assumes a freshly-built binary exists at `target/<profile>/skim`.
-    //
-    // PRECONDITION: invoke this test via `cargo test -p rskim --bins` (or
-    // `--all-targets`), which builds the `skim` binary alongside the test
-    // binary.  A runner that builds only test binaries (e.g. `cargo test --lib`)
-    // may leave a stale or absent `skim` at the expected path, causing this test
-    // to exercise wrong/old code.  The assertion on "minified (avg line " fails
-    // loud in that case rather than false-passing.
-    let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
-        let mut p = std::env::current_exe().unwrap();
-        p.pop(); // deps/
-        p.pop(); // debug/ or release/
-        p.push("skim");
-        p.to_string_lossy().to_string()
-    });
+    // A stale `skim` binary fails the "minified (avg line " assertion below
+    // rather than false-passing (see `skim_bin_path` for the precondition).
+    let bin = super::super::tests::skim_bin_path();
 
     let output = std::process::Command::new(&bin)
         .args(["search", "--build", "--root"])
@@ -4140,13 +4127,7 @@ fn test_ac_405_text_stats_ast_section_column_alignment() {
     let n_lines = rskim_core::AST_SIZE_LIMIT_DEFAULT as usize / line.len() + 1;
     fs::write(root.join("huge.rs"), line.repeat(n_lines)).unwrap();
 
-    let bin = std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
-        let mut p = std::env::current_exe().unwrap();
-        p.pop(); // deps/
-        p.pop(); // debug/ or release/
-        p.push("skim");
-        p.to_string_lossy().to_string()
-    });
+    let bin = super::super::tests::skim_bin_path();
 
     // Step 1: build the index (using the binary so build and stats share the
     // same SKIM_CACHE_DIR-based cache resolution).

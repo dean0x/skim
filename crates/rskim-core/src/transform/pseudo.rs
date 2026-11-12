@@ -3561,6 +3561,8 @@ mod tests {
     // THRESHOLD RATIONALE — 2.8 ≈ 2^1.5 is the exponent-space midpoint between
     // linear (2.0×) and quadratic (4.0×), matching the Go guards in minimal.rs.
     // These shapes measure 2.01×–2.07× at the guard sizes, so 2.8 leaves ~35 % headroom.
+    // The Python guard is the exception: it grows N 4× against 8.0 = 4^1.5, the
+    // same midpoint, because its doubling form failed on CI runner noise alone.
 
     /// Time the pseudo transform for `source` in `language`.
     ///
@@ -3670,23 +3672,29 @@ mod tests {
             "pseudo must still strip Python parameter annotations, got: {out}"
         );
 
-        let (t1_min, t1_median) = time_pseudo(&python_return_type_source(1000), Language::Python);
+        // A 4× step (not the 2× doubling of the other guards). The doubling form
+        // allowed only 1.4× runner noise (2.8 / 2.0) and failed on a CI runner at
+        // 2.93× with no walker change. The threshold 8.0 = 4^1.5 keeps the same
+        // exponent-space midpoint, and allows 2× noise. N=2000 is the largest
+        // size under MAX_AST_NODES: N=4000 returns Err(ComplexityLimit).
+        let (t1_min, t1_median) = time_pseudo(&python_return_type_source(500), Language::Python);
         let (t2_min, _) = time_pseudo(&python_return_type_source(2000), Language::Python);
 
         // Noise floor uses MEDIAN (absolute gate).
         assert!(
-            t1_median >= 6.0,
-            "N=1000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
-             reliably (expected ≥ 6ms; ~27.3ms measured). DO NOT convert to a skip."
+            t1_median >= 4.0,
+            "N=500 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 4ms; ~10.2ms measured). DO NOT convert to a skip."
         );
 
-        // A3 discrimination evidence: under a quadratic walk the ratio was 3.79×;
-        // normal implementation measures 2.04×.
+        // A3 discrimination evidence at this 4× step: with a per-node sibling walk
+        // injected the ratio was 10.6×–10.75×; the normal walker measures 4.15×–4.22×.
         let ratio = t2_min / t1_min;
         assert!(
-            ratio < 2.8,
-            "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.04×). N=1000 min {t1_min:.2}ms, \
+            ratio < 8.0,
+            "Growing N 4× from 500 to 2000 must produce a ratio below 8.0 \
+             (got {ratio:.2}×; measured 4.2×). O(N) → ~4.0×; O(N²) → ~16×; \
+             8.0 = 4^1.5 is the exponent-space midpoint. N=500 min {t1_min:.2}ms, \
              N=2000 min {t2_min:.2}ms."
         );
     }

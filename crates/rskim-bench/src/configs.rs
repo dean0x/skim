@@ -115,16 +115,16 @@ mod tests {
     fn sourcegraph_style_structural_boosted() {
         let cfg = sourcegraph_style();
         // Structural fields (0-3) should be 3.0
-        for i in 0..4 {
+        for (i, boost) in cfg.field_boosts.iter().enumerate().take(4) {
             assert!(
-                (cfg.field_boosts[i] - 3.0).abs() < f32::EPSILON,
+                (boost - 3.0).abs() < f32::EPSILON,
                 "field_boosts[{i}] should be 3.0"
             );
         }
         // Implementation fields (4-7) should be 1.0
-        for i in 4..8 {
+        for (i, boost) in cfg.field_boosts.iter().enumerate().skip(4).take(4) {
             assert!(
-                (cfg.field_boosts[i] - 1.0).abs() < f32::EPSILON,
+                (boost - 1.0).abs() < f32::EPSILON,
                 "field_boosts[{i}] should be 1.0"
             );
         }

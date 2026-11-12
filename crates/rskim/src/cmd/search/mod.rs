@@ -2281,18 +2281,35 @@ mod tests {
         session_id: None,
     };
 
-    /// Locate the `skim` binary for subprocess-level tests.
+    /// Locate the built `skim` binary for subprocess-level tests.
     ///
-    /// Returns `CARGO_BIN_EXE_skim` when set by cargo test; falls back to walking
-    /// up from `current_exe()` (deps/ → debug or release/).
-    fn skim_bin_path() -> String {
-        std::env::var("CARGO_BIN_EXE_skim").unwrap_or_else(|_| {
-            let mut p = std::env::current_exe().unwrap();
-            p.pop(); // deps/
-            p.pop(); // debug/ or release/
-            p.push("skim");
-            p.to_string_lossy().to_string()
-        })
+    /// Cargo sets `CARGO_BIN_EXE_skim` only for integration tests, so these
+    /// in-source unit tests walk up from `current_exe()` to the first ancestor
+    /// that holds `skim`. The walk covers both cargo layouts for the test binary:
+    /// `target/<profile>/deps/skim-<hash>` and, from cargo 1.100,
+    /// `target/<profile>/build/rskim/<hash>/out/skim-<hash>`.
+    ///
+    /// PRECONDITION: the `skim` binary is built (`cargo test -p rskim --bins`,
+    /// `--all-targets`, or `cargo build -p rskim` before nextest). A stale binary
+    /// at that path exercises old code; the callers' output assertions catch that.
+    pub(super) fn skim_bin_path() -> String {
+        if let Ok(bin) = std::env::var("CARGO_BIN_EXE_skim") {
+            return bin;
+        }
+        let exe = std::env::current_exe().expect("test binary path must resolve");
+        let name = format!("skim{}", std::env::consts::EXE_SUFFIX);
+        exe.ancestors()
+            .skip(1)
+            .map(|dir| dir.join(&name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no built `{name}` above {}; run `cargo build -p rskim` first",
+                    exe.display()
+                )
+            })
+            .to_string_lossy()
+            .into_owned()
     }
 
     // ========================================================================
@@ -3907,7 +3924,7 @@ mod tests {
         let root_str = root.to_string_lossy().to_string();
 
         // First query: builds lexical+AST+temporal (NoIndex → refresh).
-        run(
+        let exit_code = run(
             &[
                 "greet".to_string(),
                 "--root".to_string(),
@@ -3918,6 +3935,7 @@ mod tests {
             &TEST_ANALYTICS,
         )
         .unwrap();
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         let cache_dir = index::resolve_search_cache_dir(root).unwrap();
         let temporal_db_path = cache_dir.join("temporal.db");
@@ -4021,7 +4039,7 @@ mod tests {
         let root_str = root.to_string_lossy().to_string();
 
         // Build index first (NoIndex → full build including temporal).
-        run(
+        let exit_code = run(
             &[
                 "auth".to_string(),
                 "--root".to_string(),
@@ -4032,6 +4050,7 @@ mod tests {
             &TEST_ANALYTICS,
         )
         .unwrap();
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         let cache_dir = index::resolve_search_cache_dir(root).unwrap();
         let temporal_db_path = cache_dir.join("temporal.db");
