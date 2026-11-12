@@ -13,6 +13,7 @@ mod excludes;
 mod git_source;
 mod insights;
 mod metrics;
+mod noise;
 mod output;
 mod types;
 mod window;
@@ -28,9 +29,10 @@ use excludes::{build_exclude_set, should_exclude};
 use git_source::{CliGitSource, GitDataSource};
 use insights::{build_insights_result, compute_insights};
 use metrics::{
-    compute_authors, compute_churn, compute_coupling, compute_encapsulation,
+    CouplingResult, compute_authors, compute_churn, compute_coupling, compute_encapsulation,
     compute_fix_after_touch, compute_stability,
 };
+use noise::{COUPLING_MAX_FILES, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS};
 use output::{render_insights_json, render_insights_text, render_json, render_text};
 use types::{CommitInfo, FileMetrics, HeatmapArgs, HeatmapConfig, HeatmapResult, ResolvedWindow};
 use window::{build_window_info, format_epoch, resolve_config};
@@ -436,10 +438,6 @@ fn apply_file_scope(result: &mut HeatmapResult, files: &[String]) {
 // Pure metric computation (Steps 5-9)
 // ============================================================================
 
-/// Minimum number of co-occurrences required before a coupling pair or module
-/// is included in results. Prevents noise from one-off coincidences.
-const MIN_SUPPORT_THRESHOLD: usize = 3;
-
 /// Compute all six risk metrics from commits and assemble a `HeatmapResult`.
 ///
 /// No git I/O — all repository data is pre-fetched by callers (Steps 1-4 in
@@ -453,7 +451,7 @@ fn compute_heatmap(
     window: &ResolvedWindow,
     now_epoch: u64,
     repository: String,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
 ) -> HeatmapResult {
     let t0 = Instant::now();
 
@@ -467,7 +465,17 @@ fn compute_heatmap(
     let coupling_threshold = config.coupling_threshold;
     let (
         (stability_map, author_map),
-        ((fix_risk_map, (blast_radius_map, coupling_graph)), modules),
+        (
+            (
+                fix_risk_map,
+                CouplingResult {
+                    blast_radius: blast_radius_map,
+                    graph: coupling_graph,
+                    large_commits_skipped,
+                },
+            ),
+            modules,
+        ),
     ) = rayon::join(
         || {
             rayon::join(
@@ -480,13 +488,24 @@ fn compute_heatmap(
                 || {
                     rayon::join(
                         || compute_fix_after_touch(&commits, fix_window),
-                        || compute_coupling(&commits, coupling_threshold, MIN_SUPPORT_THRESHOLD),
+                        || compute_coupling(&commits, coupling_threshold, MIN_PAIR_SUPPORT),
                     )
                 },
-                || compute_encapsulation(&commits, MIN_SUPPORT_THRESHOLD),
+                || compute_encapsulation(&commits, MODULE_MIN_COMMITS),
             )
         },
     );
+
+    if large_commits_skipped > 0 {
+        let noun = if large_commits_skipped == 1 {
+            "commit"
+        } else {
+            "commits"
+        };
+        warnings.push(format!(
+            "coupling: {large_commits_skipped} {noun} with more than {COUPLING_MAX_FILES} files not paired"
+        ));
+    }
 
     if config.debug {
         let elapsed = t0.elapsed();

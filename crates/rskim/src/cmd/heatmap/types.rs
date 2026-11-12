@@ -234,15 +234,20 @@ pub(crate) struct AuthorMetrics {
 }
 
 /// Fix-after-touch risk metrics for a file.
+///
+/// The rates are raw: they are filled for every file, also below the file
+/// support minimum.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FixRiskMetrics {
     /// Percentage of commits with fix keywords.
     pub(crate) keyword_pct: f64,
-    /// Percentage of commits followed by a fix within the window.
+    /// Percentage of commits followed by a later fix within the window.
     pub(crate) proximity_pct: f64,
     /// Union of keyword and proximity signals.
     pub(crate) combined_pct: f64,
-    /// True when <2 commits — not enough data.
+    /// Number of fix commits that touch this file.
+    pub(crate) fix_commits: usize,
+    /// True when the file has fewer commits than the file support minimum (5).
     pub(crate) insufficient_data: bool,
 }
 
@@ -252,6 +257,7 @@ impl Default for FixRiskMetrics {
             keyword_pct: 0.0,
             proximity_pct: 0.0,
             combined_pct: 0.0,
+            fix_commits: 0,
             // Default to `true` so callers that skip the lookup (no history) are
             // marked as having insufficient data rather than misleadingly showing
             // zero-risk metrics.

@@ -3,8 +3,10 @@
 //! Zero I/O. All functions accept `&[CommitInfo]` and return computed values.
 //! `now_epoch` is a parameter (not `SystemTime::now()`) for deterministic tests.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use super::noise::{BUS_FACTOR_TOP_SHARE_PCT, COUPLING_MAX_FILES, MIN_FILE_SUPPORT};
 use super::types::{
     AuthorMetrics, ChurnMetrics, CommitInfo, CouplingEdge, CouplingEntry, FixRiskMetrics,
     ModuleHealth,
@@ -48,30 +50,50 @@ pub(crate) fn compute_churn(commits: &[CommitInfo]) -> HashMap<String, ChurnMetr
 // Metric 2: Coupling
 // ============================================================================
 
-/// Maximum number of files in a commit that participates in coupling pair generation.
-///
-/// Commits touching more than this many files (e.g. large reformats) still count
-/// toward `weighted_total` for each file, but are skipped for pair enumeration.
-/// This caps worst-case pair allocations at 50*49 = 2450 per commit instead of
-/// unbounded O(n^2).
-const COUPLING_MAX_FILES: usize = 50;
+/// Output of [`compute_coupling`].
+#[derive(Debug)]
+pub(crate) struct CouplingResult {
+    /// Per-file partners, each list sorted by [`entry_order`].
+    pub(crate) blast_radius: HashMap<String, Vec<CouplingEntry>>,
+    /// Undirected edges, sorted by [`edge_order`].
+    pub(crate) graph: Vec<CouplingEdge>,
+    /// Commits with more than [`COUPLING_MAX_FILES`] files. They are not
+    /// paired and add nothing to the weighted totals.
+    pub(crate) large_commits_skipped: usize,
+}
+
+/// Partner order: confidence desc, then support desc, then path asc.
+fn entry_order(x: &CouplingEntry, y: &CouplingEntry) -> Ordering {
+    y.confidence
+        .total_cmp(&x.confidence)
+        .then_with(|| y.support.cmp(&x.support))
+        .then_with(|| x.path.cmp(&y.path))
+}
+
+/// Edge order: confidence desc, then support desc, then `a` asc, then `b` asc.
+fn edge_order(x: &CouplingEdge, y: &CouplingEdge) -> Ordering {
+    y.confidence
+        .total_cmp(&x.confidence)
+        .then_with(|| y.support.cmp(&x.support))
+        .then_with(|| x.a.cmp(&y.a))
+        .then_with(|| x.b.cmp(&y.b))
+}
 
 /// Compute file coupling from commit co-occurrences.
 ///
 /// Weights each pair's contribution by `1.0 / sqrt(files_in_commit)` to
 /// discount large commits (e.g. reformatting all files at once).
 ///
-/// Commits with more than [`COUPLING_MAX_FILES`] files are excluded from pair
-/// enumeration (but still contribute to each file's `weighted_total`).
-///
-/// Returns:
-/// - per-file blast radius map: `HashMap<String, Vec<CouplingEntry>>`
-/// - global coupling graph: `Vec<CouplingEdge>`
+/// A commit with more than [`COUPLING_MAX_FILES`] files adds to neither the
+/// pair counts nor the weighted totals, so the same commits make the
+/// numerator and the denominator of each confidence; the result counts these
+/// commits. A single-file commit still adds to the weighted total of its
+/// file, because it is a real solo change.
 pub(crate) fn compute_coupling(
     commits: &[CommitInfo],
     threshold: f64,
     min_support: usize,
-) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
+) -> CouplingResult {
     // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b).
     // &str keys borrow from PathBuf::to_str() on each FileChangeInfo.path — valid
     // for the entire function because `commits` (and all CommitInfos) outlive
@@ -79,23 +101,30 @@ pub(crate) fn compute_coupling(
     let mut co_occur: HashMap<(&str, &str), (f64, usize)> = HashMap::new();
     // weighted_total[a] = weighted sum of commits touching a
     let mut weighted_total: HashMap<&str, f64> = HashMap::new();
+    let mut large_commits_skipped = 0usize;
 
     for commit in commits {
+        let n = commit.changed_files.len();
+        // A commit above the cap adds to neither map: the same commits must
+        // make the numerator and the denominator of every confidence.
+        if n > COUPLING_MAX_FILES {
+            large_commits_skipped += 1;
+            continue;
+        }
         let files: Vec<&str> = commit
             .changed_files
             .iter()
             .map(|f| f.path.to_str().unwrap_or_default())
             .collect();
-        let n = files.len();
         let weight = 1.0 / (n as f64).sqrt();
 
-        // Every commit contributes to weighted_total for its files
+        // Every commit within the cap adds to the weighted totals of its
+        // files, also a single-file commit: it is a real solo change.
         for f in &files {
             *weighted_total.entry(f).or_insert(0.0) += weight;
         }
 
-        // Skip large commits for pair enumeration to avoid O(n^2) blowup
-        if !(2..=COUPLING_MAX_FILES).contains(&n) {
+        if n < 2 {
             continue;
         }
 
@@ -152,12 +181,11 @@ pub(crate) fn compute_coupling(
         }
     }
 
-    // Sort each blast radius by confidence descending
     for entries in blast_radius.values_mut() {
-        entries.sort_by(|x, y| y.confidence.total_cmp(&x.confidence));
+        entries.sort_by(entry_order);
     }
 
-    let coupling_graph: Vec<CouplingEdge> = graph_edges
+    let mut graph: Vec<CouplingEdge> = graph_edges
         .into_iter()
         .map(|((a, b), (confidence, support))| CouplingEdge {
             a,
@@ -166,8 +194,13 @@ pub(crate) fn compute_coupling(
             support,
         })
         .collect();
+    graph.sort_by(edge_order);
 
-    (blast_radius, coupling_graph)
+    CouplingResult {
+        blast_radius,
+        graph,
+        large_commits_skipped,
+    }
 }
 
 // ============================================================================
@@ -276,7 +309,7 @@ pub(crate) fn compute_authors(commits: &[CommitInfo]) -> HashMap<String, AuthorM
 
             let max_count = author_counts.values().copied().max().unwrap_or(0);
             let top_author_pct = (max_count as f64 / total as f64) * 100.0;
-            let single_owner_risk = top_author_pct > 80.0;
+            let single_owner_risk = top_author_pct > BUS_FACTOR_TOP_SHARE_PCT;
 
             // Authors with >5% of commits
             let threshold = (total as f64 * 0.05).ceil() as usize;
@@ -300,11 +333,17 @@ pub(crate) fn compute_authors(commits: &[CommitInfo]) -> HashMap<String, AuthorM
 
 /// Compute fix-after-touch risk per file.
 ///
+/// `commits` is newest first, the order `git log` gives, so a later commit
+/// has a lower index.
+///
 /// - `keyword_pct`: percentage of commits touching the file that are fix commits.
-/// - `proximity_pct`: percentage of non-fix commits after which a fix commit
-///   also touching the file appears within `window` commits.
+/// - `proximity_pct`: percentage of the commits of the file that are non-fix
+///   commits followed by a later fix commit, also touching the file, within
+///   `window` commits.
 /// - `combined_pct`: union (not sum) of the two signals.
-/// - `insufficient_data`: true when the file has <2 commits.
+/// - `fix_commits`: the count of fix commits touching the file.
+/// - `insufficient_data`: true when the file has fewer than
+///   [`MIN_FILE_SUPPORT`] commits. The raw rates are filled for every file.
 pub(crate) fn compute_fix_after_touch(
     commits: &[CommitInfo],
     window: usize,
@@ -329,60 +368,38 @@ pub(crate) fn compute_fix_after_touch(
     file_indices
         .into_iter()
         .map(|(path, indices)| {
+            // A file is in the map only when a commit touched it.
             let total = indices.len();
-            if total < 2 {
-                return (
-                    path,
-                    FixRiskMetrics {
-                        keyword_pct: 0.0,
-                        proximity_pct: 0.0,
-                        combined_pct: 0.0,
-                        insufficient_data: true,
-                    },
-                );
-            }
+            debug_assert!(total > 0, "{path}: no commit index");
+            let pct = |count: usize| (count as f64 / total.max(1) as f64) * 100.0;
 
             // Keyword: fix commits touching this file
-            let keyword_count = indices.iter().filter(|&&i| is_fix[i]).count();
-            let keyword_pct = (keyword_count as f64 / total as f64) * 100.0;
+            let fix_commits = indices.iter().filter(|&&i| is_fix[i]).count();
 
-            // Proximity: non-fix commit at index i, followed by a fix commit
-            // also touching this file within the next `window` commits
+            // Proximity: a non-fix commit at index idx, followed by a later fix
+            // commit (a lower index) that also touches this file, within
+            // `window` commits.
             let index_set: HashSet<usize> = indices.iter().copied().collect();
-            let non_fix_indices: Vec<usize> =
-                indices.iter().copied().filter(|&i| !is_fix[i]).collect();
-
-            // Count non-fix indices followed by a fix within window (no need to
-            // materialise a set — uniqueness is guaranteed because each non-fix
-            // index appears at most once in non_fix_indices).
-            let proximity_count: usize = non_fix_indices
+            let proximity_count = indices
                 .iter()
                 .copied()
+                .filter(|&idx| !is_fix[idx])
                 .filter(|&idx| {
-                    let upper = (idx + 1 + window).min(commits.len());
-                    ((idx + 1)..upper).any(|j| is_fix[j] && index_set.contains(&j))
+                    (idx.saturating_sub(window)..idx).any(|j| is_fix[j] && index_set.contains(&j))
                 })
                 .count();
 
-            let proximity_pct = if non_fix_indices.is_empty() {
-                0.0
-            } else {
-                (proximity_count as f64 / total as f64) * 100.0
-            };
-
             // Union: fix commits (keyword) ∪ non-fix commits followed by a fix (proximity).
             // The two sets are disjoint by construction (proximity_count only counts non-fix
-            // indices), so union_count = keyword_count + proximity_count.
-            let union_count = keyword_count + proximity_count;
-            let combined_pct = (union_count as f64 / total as f64) * 100.0;
-
+            // indices), so union_count = fix_commits + proximity_count.
             (
                 path,
                 FixRiskMetrics {
-                    keyword_pct,
-                    proximity_pct,
-                    combined_pct,
-                    insufficient_data: false,
+                    keyword_pct: pct(fix_commits),
+                    proximity_pct: pct(proximity_count),
+                    combined_pct: pct(fix_commits + proximity_count),
+                    fix_commits,
+                    insufficient_data: total < MIN_FILE_SUPPORT,
                 },
             )
         })
@@ -552,9 +569,10 @@ mod tests {
 
     #[test]
     fn test_coupling_empty() {
-        let (blast, graph) = compute_coupling(&[], 0.5, 1);
-        assert!(blast.is_empty());
-        assert!(graph.is_empty());
+        let result = compute_coupling(&[], 0.5, 1);
+        assert!(result.blast_radius.is_empty());
+        assert!(result.graph.is_empty());
+        assert_eq!(result.large_commits_skipped, 0);
     }
 
     #[test]
@@ -569,17 +587,28 @@ mod tests {
             make_commit("h2", "Alice", 2, "msg", &["a.rs"]),
             make_commit("h3", "Alice", 3, "msg", &["a.rs"]),
         ];
-        let (blast, _graph) = compute_coupling(&commits, 0.5, 1);
+        let result = compute_coupling(&commits, 0.5, 1);
         // confidence ~0.261 < 0.5, so no coupling entries for a.rs
-        let a_entries = blast.get("a.rs").map(|v| v.len()).unwrap_or(0);
+        let a_entries = result
+            .blast_radius
+            .get("a.rs")
+            .map(|v| v.len())
+            .unwrap_or(0);
         assert_eq!(a_entries, 0);
     }
 
     #[test]
     fn test_coupling_below_min_support_excluded() {
         let commits = vec![make_commit("h1", "Alice", 1000, "msg", &["a.rs", "b.rs"])];
-        let (blast, _graph) = compute_coupling(&commits, 0.0, 5); // min_support=5, only 1 commit
-        assert_eq!(blast.get("a.rs").map(|v| v.len()).unwrap_or(0), 0);
+        let result = compute_coupling(&commits, 0.0, 5); // min_support=5, only 1 commit
+        assert_eq!(
+            result
+                .blast_radius
+                .get("a.rs")
+                .map(|v| v.len())
+                .unwrap_or(0),
+            0
+        );
     }
 
     #[test]
@@ -590,34 +619,174 @@ mod tests {
             make_commit("h2", "A", 2, "m", &["a.rs", "b.rs"]),
             make_commit("h3", "A", 3, "m", &["a.rs", "b.rs"]),
         ];
-        let (blast, graph) = compute_coupling(&commits, 0.5, 3);
-        let a_entries = blast.get("a.rs").unwrap();
-        assert!(!a_entries.is_empty());
+        let result = compute_coupling(&commits, 0.5, 3);
+        let a_entries = result.blast_radius.get("a.rs").unwrap();
+        assert_eq!(a_entries.len(), 1);
         assert_eq!(a_entries[0].path, "b.rs");
-        assert!(!graph.is_empty());
+        assert_eq!(a_entries[0].support, 3);
+        assert_eq!(result.graph.len(), 1);
+    }
+
+    /// `n` file names `bulk_0.rs` .. `bulk_{n-1}.rs`, plus the `extra` names.
+    fn file_names(n: usize, extra: &[&str]) -> Vec<String> {
+        extra
+            .iter()
+            .map(|s| s.to_string())
+            .chain((0..n).map(|i| format!("bulk_{i}.rs")))
+            .collect()
     }
 
     #[test]
     fn test_coupling_large_commit_excluded_from_pairs() {
-        // Build a commit with COUPLING_MAX_FILES + 1 files — must not generate pairs,
-        // but the files should still appear in weighted_total (so they are not lost
-        // from the churn perspective).
-        let many_files: Vec<String> = (0..=COUPLING_MAX_FILES)
-            .map(|i| format!("file_{i}.rs"))
-            .collect();
+        // A commit with COUPLING_MAX_FILES + 1 files makes no pairs, adds to no
+        // weighted total, and is counted once.
+        let many_files = file_names(COUPLING_MAX_FILES + 1, &[]);
         let file_refs: Vec<&str> = many_files.iter().map(String::as_str).collect();
         let commits = vec![make_commit("h1", "A", 1, "m", &file_refs)];
 
         // With threshold=0.0 and min_support=1, any pair would be included if generated.
-        // The large-commit cap means zero pairs should appear.
-        let (blast, graph) = compute_coupling(&commits, 0.0, 1);
+        let result = compute_coupling(&commits, 0.0, 1);
         assert!(
-            blast.is_empty(),
+            result.blast_radius.is_empty(),
             "large commit must not generate coupling pairs"
         );
         assert!(
-            graph.is_empty(),
+            result.graph.is_empty(),
             "large commit must not generate graph edges"
+        );
+        assert_eq!(result.large_commits_skipped, 1);
+    }
+
+    #[test]
+    fn test_coupling_commit_at_cap_is_paired() {
+        // Exactly COUPLING_MAX_FILES files is not above the cap: all pairs count.
+        let files = file_names(COUPLING_MAX_FILES, &[]);
+        let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let commits = vec![make_commit("h1", "A", 1, "m", &file_refs)];
+        let result = compute_coupling(&commits, 0.0, 1);
+        assert_eq!(result.large_commits_skipped, 0);
+        assert_eq!(
+            result.graph.len(),
+            COUPLING_MAX_FILES * (COUPLING_MAX_FILES - 1) / 2
+        );
+    }
+
+    /// Confidence of a.rs -> b.rs, or `None` when the pair is absent.
+    fn confidence_a_to_b(result: &CouplingResult) -> Option<f64> {
+        result
+            .blast_radius
+            .get("a.rs")?
+            .iter()
+            .find(|e| e.path == "b.rs")
+            .map(|e| e.confidence)
+    }
+
+    #[test]
+    fn test_coupling_large_commit_does_not_change_pair_confidence() {
+        // Newest first: 3 pair commits and 1 solo commit of a.rs.
+        let small = vec![
+            make_commit("h4", "A", 4, "m", &["a.rs"]),
+            make_commit("h3", "A", 3, "m", &["a.rs", "b.rs"]),
+            make_commit("h2", "A", 2, "m", &["a.rs", "b.rs"]),
+            make_commit("h1", "A", 1, "m", &["a.rs", "b.rs"]),
+        ];
+        // The same history plus one 60-file commit that touches both files.
+        let big_files = file_names(58, &["a.rs", "b.rs"]);
+        let big_refs: Vec<&str> = big_files.iter().map(String::as_str).collect();
+        let mut with_large = vec![make_commit("h5", "A", 5, "m", &big_refs)];
+        with_large.extend(small.iter().cloned());
+
+        let without = compute_coupling(&small, 0.0, 1);
+        let with = compute_coupling(&with_large, 0.0, 1);
+
+        let expected = confidence_a_to_b(&without).expect("pair present without it");
+        let got = confidence_a_to_b(&with).expect("pair present with it");
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "confidence with the 60-file commit ({got}) must equal the confidence without it ({expected})"
+        );
+        assert_eq!(without.large_commits_skipped, 0);
+        assert_eq!(with.large_commits_skipped, 1);
+    }
+
+    #[test]
+    fn test_coupling_ties_sort_by_path_and_by_edge_ends() {
+        // a.rs pairs 3 times with each of e, c, d, b: equal confidence and support.
+        let mut commits = Vec::new();
+        for (i, partner) in ["e.rs", "c.rs", "d.rs", "b.rs"].iter().enumerate() {
+            for k in 0..3u64 {
+                let ts = (i as u64) * 10 + k;
+                commits.push(make_commit("h", "A", ts, "m", &["a.rs", partner]));
+            }
+        }
+        let result = compute_coupling(&commits, 0.0, 3);
+
+        let partners: Vec<&str> = result.blast_radius["a.rs"]
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(partners, vec!["b.rs", "c.rs", "d.rs", "e.rs"]);
+
+        let edges: Vec<(&str, &str)> = result
+            .graph
+            .iter()
+            .map(|e| (e.a.as_str(), e.b.as_str()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                ("a.rs", "b.rs"),
+                ("a.rs", "c.rs"),
+                ("a.rs", "d.rs"),
+                ("a.rs", "e.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_entry_order_is_confidence_then_support_then_path() {
+        let entry = |path: &str, confidence: f64, support: usize| CouplingEntry {
+            path: path.to_string(),
+            confidence,
+            support,
+        };
+        let mut entries = [
+            entry("z.rs", 0.5, 3),
+            entry("b.rs", 0.9, 3),
+            entry("y.rs", 0.5, 7),
+            entry("a.rs", 0.5, 3),
+        ];
+        entries.sort_by(entry_order);
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["b.rs", "y.rs", "a.rs", "z.rs"]);
+    }
+
+    #[test]
+    fn test_edge_order_is_confidence_then_support_then_a_then_b() {
+        let edge = |a: &str, b: &str, confidence: f64, support: usize| CouplingEdge {
+            a: a.to_string(),
+            b: b.to_string(),
+            confidence,
+            support,
+        };
+        let mut edges = [
+            edge("b.rs", "c.rs", 0.5, 3),
+            edge("a.rs", "d.rs", 0.5, 3),
+            edge("a.rs", "c.rs", 0.5, 3),
+            edge("x.rs", "y.rs", 0.5, 9),
+            edge("z.rs", "w.rs", 0.9, 3),
+        ];
+        edges.sort_by(edge_order);
+        let pairs: Vec<(&str, &str)> = edges.iter().map(|e| (e.a.as_str(), e.b.as_str())).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("z.rs", "w.rs"),
+                ("x.rs", "y.rs"),
+                ("a.rs", "c.rs"),
+                ("a.rs", "d.rs"),
+                ("b.rs", "c.rs"),
+            ]
         );
     }
 
@@ -723,6 +892,8 @@ mod tests {
     // compute_fix_after_touch
     // -----------------------------------------------------------------------
 
+    // All commit lists below are newest first, the order `git log` gives.
+
     #[test]
     fn test_fix_risk_empty() {
         let result = compute_fix_after_touch(&[], 5);
@@ -737,55 +908,116 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_risk_keyword_detection() {
-        let commits = vec![
-            make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
-            make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
-        ];
-        let result = compute_fix_after_touch(&commits, 5);
-        let m = &result["a.rs"];
-        assert!(!m.insufficient_data);
-        // 1 fix commit out of 2 = 50%
-        assert!((m.keyword_pct - 50.0).abs() < 1e-9);
+    fn test_fix_risk_single_fix_commit_keeps_raw_keyword_rate() {
+        // One fix commit: below support, but the raw rate and churn stay.
+        let commits = vec![make_commit("h1", "Alice", 1, "fix: crash", &["a.rs"])];
+        let m = &compute_fix_after_touch(&commits, 5)["a.rs"];
+        assert!(m.insufficient_data);
+        assert!(
+            (m.keyword_pct - 100.0).abs() < 1e-9,
+            "keyword_pct {}",
+            m.keyword_pct
+        );
+        assert_eq!(m.fix_commits, 1);
+        assert_eq!(compute_churn(&commits)["a.rs"].commits, 1);
     }
 
     #[test]
-    fn test_fix_risk_proximity_detection() {
-        // commit 0: feat touching a.rs
-        // commit 1: fix touching a.rs (within window of commit 0)
+    fn test_fix_risk_support_minimum_is_five_commits() {
+        let history = |n: u64| -> Vec<CommitInfo> {
+            (0..n)
+                .rev()
+                .map(|i| make_commit("h", "Alice", i, "feat: work", &["a.rs"]))
+                .collect()
+        };
+        assert!(compute_fix_after_touch(&history(4), 5)["a.rs"].insufficient_data);
+        assert!(!compute_fix_after_touch(&history(5), 5)["a.rs"].insufficient_data);
+    }
+
+    #[test]
+    fn test_fix_risk_keyword_detection() {
         let commits = vec![
+            make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
             make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
-            make_commit("h2", "Alice", 2, "fix: quick patch", &["a.rs"]),
         ];
         let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
-        assert!(!m.insufficient_data);
-        // total=2, proximity_set={0}, proximity_pct = 1/2*100 = 50%
-        assert!((m.proximity_pct - 50.0).abs() < 1e-9);
+        // 1 fix commit out of 2 = 50%
+        assert!((m.keyword_pct - 50.0).abs() < 1e-9);
+        assert_eq!(m.fix_commits, 1);
+    }
+
+    #[test]
+    fn test_fix_risk_proximity_counts_feat_followed_by_later_fix() {
+        // feat at ts 1, then a later fix at ts 2 on the same file.
+        let commits = vec![
+            make_commit("h2", "Alice", 2, "fix: quick patch", &["a.rs"]),
+            make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
+        ];
+        let m = &compute_fix_after_touch(&commits, 5)["a.rs"];
+        // total=2, the feat is followed by a fix: proximity_pct = 1/2*100 = 50%
+        assert!(
+            (m.proximity_pct - 50.0).abs() < 1e-9,
+            "proximity {}",
+            m.proximity_pct
+        );
+    }
+
+    #[test]
+    fn test_fix_risk_proximity_ignores_feat_after_fix() {
+        // fix at ts 1, then a later feat at ts 2: no fix follows the feat.
+        let commits = vec![
+            make_commit("h2", "Alice", 2, "feat: extend", &["a.rs"]),
+            make_commit("h1", "Alice", 1, "fix: quick patch", &["a.rs"]),
+        ];
+        let m = &compute_fix_after_touch(&commits, 5)["a.rs"];
+        assert!(
+            m.proximity_pct.abs() < 1e-9,
+            "proximity {}",
+            m.proximity_pct
+        );
+    }
+
+    #[test]
+    fn test_fix_risk_proximity_respects_window() {
+        // feat at ts 1, a commit on another file at ts 2, the fix at ts 3.
+        let commits = vec![
+            make_commit("h3", "Alice", 3, "fix: repair", &["a.rs"]),
+            make_commit("h2", "Alice", 2, "feat: other", &["b.rs"]),
+            make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
+        ];
+        // The fix is 2 commits later: outside a window of 1, inside a window of 2.
+        let narrow = &compute_fix_after_touch(&commits, 1)["a.rs"];
+        assert!(
+            narrow.proximity_pct.abs() < 1e-9,
+            "proximity {}",
+            narrow.proximity_pct
+        );
+        let wide = &compute_fix_after_touch(&commits, 2)["a.rs"];
+        assert!(
+            (wide.proximity_pct - 50.0).abs() < 1e-9,
+            "proximity {}",
+            wide.proximity_pct
+        );
     }
 
     #[test]
     fn test_fix_risk_combined_both_signals() {
-        // Exercises the disjointness optimization: keyword_count + proximity_set.len().
-        //
-        // commit 0 (idx 0): feat touching a.rs → non-fix
-        // commit 1 (idx 1): fix touching a.rs  → keyword hit; also within window of idx 0
-        //                                         so idx 0 enters proximity_set
-        // commit 2 (idx 2): feat touching a.rs → non-fix (outside window trailing edge)
+        // ts 1 feat (idx 2) → a later fix follows within the window: proximity hit
+        // ts 2 fix  (idx 1) → keyword hit
+        // ts 3 feat (idx 0) → newest; no later fix
         //
         // Expected for a.rs (total=3):
-        //   keyword_count = 1  → keyword_pct  = 1/3*100 ≈ 33.33%
-        //   proximity_set = {0} (size 1) → proximity_pct = 1/3*100 ≈ 33.33%
-        //   union_count   = 2  → combined_pct = 2/3*100 ≈ 66.67%
+        //   keyword_count   = 1 → keyword_pct   = 1/3*100 ≈ 33.33%
+        //   proximity_count = 1 → proximity_pct = 1/3*100 ≈ 33.33%
+        //   union_count     = 2 → combined_pct  = 2/3*100 ≈ 66.67%
         let commits = vec![
-            make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
-            make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
             make_commit("h3", "Alice", 3, "feat: more work", &["a.rs"]),
+            make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
+            make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
         ];
         let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
-
-        assert!(!m.insufficient_data);
 
         let expected_keyword_pct = 100.0 / 3.0; // 33.33…
         let expected_proximity_pct = 100.0 / 3.0; // 33.33…

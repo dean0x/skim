@@ -5,32 +5,14 @@
 
 use std::collections::HashSet;
 
+use super::noise::{
+    COUPLING_WARNING, ENCAPSULATION_CRITICAL, ENCAPSULATION_WARNING, FIX_RISK_CRITICAL,
+    FIX_RISK_WARNING, STABILITY_CRITICAL, STABILITY_WARNING,
+};
 use super::types::{
     CompactFileEntry, CompactModuleEntry, HeatmapResult, Insight, InsightCategory, InsightsResult,
     Severity,
 };
-
-// ============================================================================
-// Threshold constants
-// ============================================================================
-
-/// Stability score below which a file is CRITICAL.
-const STABILITY_CRITICAL: u8 = 40;
-/// Stability score below which a file is a WARNING (but above critical).
-const STABILITY_WARNING: u8 = 70;
-
-/// Fix-risk combined_pct above which a file is CRITICAL.
-const FIX_RISK_CRITICAL: f64 = 50.0;
-/// Fix-risk combined_pct above which a file is a WARNING (but below critical).
-const FIX_RISK_WARNING: f64 = 30.0;
-
-/// Encapsulation_pct below which a module is CRITICAL.
-const ENCAPSULATION_CRITICAL: f64 = 40.0;
-/// Encapsulation_pct below which a module is a WARNING (but above critical).
-const ENCAPSULATION_WARNING: f64 = 60.0;
-
-/// Coupling confidence above which a coupling pair is a WARNING.
-const COUPLING_WARNING: f64 = 0.8;
 
 // ============================================================================
 // Internal helpers
@@ -340,6 +322,7 @@ mod tests {
                 keyword_pct: spec.combined_pct / 2.0,
                 proximity_pct: spec.combined_pct / 2.0,
                 combined_pct: spec.combined_pct,
+                fix_commits: 0,
                 insufficient_data: spec.insufficient_data,
             },
             blast_radius: spec.blast_radius,

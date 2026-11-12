@@ -287,6 +287,7 @@ mod tests {
                     keyword_pct: 40.0,
                     proximity_pct: 20.0,
                     combined_pct: 50.0,
+                    fix_commits: 2,
                     insufficient_data: false,
                 },
                 blast_radius: vec![CouplingEntry {
@@ -409,6 +410,7 @@ mod tests {
                     keyword_pct: 0.0,
                     proximity_pct: 0.0,
                     combined_pct: 0.0,
+                    fix_commits: 0,
                     insufficient_data: true,
                 },
                 blast_radius: vec![],
