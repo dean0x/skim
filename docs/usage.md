@@ -153,22 +153,64 @@ skim file.ts --show-stats
 
 ### skim heatmap
 
-Analyzes git commit history to surface risk hotspots: high-churn files, tightly coupled file pairs, fix-after-touch patterns, bus-factor concentration, and module boundary violations.
+Analyzes git commit history to surface risk hotspots: high-churn files, tightly coupled file pairs, fix-after-touch patterns, bus-factor concentration, and module boundary violations. The output is short and ranked, so an agent can read it before it starts work.
 
 ```bash
-skim heatmap [OPTIONS] [FILE...]
+skim heatmap [OPTIONS]              # short ranked view
+skim heatmap --detail <SECTION>     # all rows of one section
+skim heatmap --insights             # ranked CRITICAL/WARNING findings
+skim heatmap [OPTIONS] <FILE>...    # one "before you edit" card per file
 ```
 
-#### Metrics
+#### Default View
 
-| Metric | Description |
-|--------|-------------|
-| Stability Score | Composite risk score (0–100, lower = riskier). Combines churn, recency, and fix density. |
-| Churn | Number of commits touching the file within the analysis window. |
-| Blast Radius | Files that tend to change together (coupling). High coupling = high blast radius. |
-| Fix Risk | Percentage of commits that are fixes, or followed by a fix within the proximity window. |
-| Bus Factor | Single-author concentration risk. Flags files where one author holds >80% of commits. |
-| Module Health | Encapsulation score for top-level directories. Measures cross-boundary coupling. |
+The default text view is 30 lines or fewer. The first line names the repository (no absolute path), the `since..until` dates, the commit count and the window strategy, for example `Heatmap: skim-search 2026-02-24..2026-11-12, 191 commits, dual window (count)`. Up to two warning lines follow (for example, the count of commits with more than 50 files that coupling did not pair). Then three sections:
+
+| Section | Rows | Row content |
+|---------|------|-------------|
+| Hotspots | 10 | Commits in the window, then the path. Ranked by commits, then path. |
+| Coupling | 5 | Confidence, shared commits, then the two paths. Code-to-code pairs only: a pair with a doc file (`.md`, `.rst`, `.txt`, …) is not shown. |
+| Fix risk | 5 | Fix commits/commits, lift and base rate, then the path. Only files whose fix rate is above the repository base rate. |
+
+A capped section ends with one line that gives the exact hidden count and the section to open, for example `570 more (--detail coupling)`. Module health and bus factor are not in the default view; `--detail` shows them.
+
+#### Sections (`--detail`)
+
+`--detail <SECTION>` shows only that section, with all its rows (or `--top N` rows). An unknown name exits 1 and lists the valid names. `--detail` can be given once, and it does not combine with `--insights` or with file arguments.
+
+| Name | Description |
+|------|-------------|
+| `hotspots` | Files changed most often (commits in the window). |
+| `coupling` | Code-to-code file pairs that change together, with confidence and shared commits. |
+| `fix-risk` | Files whose fix rate is above the repository base rate, with fix commits/commits, lift and base rate. |
+| `modules` | Encapsulation of each module: the share of its commits that touch no other module. A module is the folder of a tracked `Cargo.toml` or `package.json`, else the top folder. |
+| `bus-factor` | Files where one author has more than 80% of the commits. |
+
+#### Noise Rules
+
+| Rule | Value |
+|------|-------|
+| Fix-risk and bus-factor support | 5 commits of the file |
+| Coupling support | 3 shared commits |
+| Module support | 5 commits of the module |
+| Fix-risk lift | The 95% lower bound (Wilson) of the file's fix rate is above the base rate (fix commits / all commits after excludes). At a base rate of 0% or 100%, one reason line replaces the rows. |
+| Bus-factor gate | 2 or more distinct authors in the window |
+| Large commits | A commit with more than 50 files adds no coupling pairs; a warning line counts these commits. |
+
+`files[]` in the JSON keeps the raw per-file values (for example `churn.commits` and `fix_risk.keyword_pct`) for files below these minimums.
+
+#### Caps and `--top`
+
+`--top N` sets the rows of each list in every view. Without it, each list has its own cap:
+
+| View | Default cap | "More" line |
+|------|-------------|-------------|
+| Default view | hotspots 10, coupling 5, fix risk 5 | `N more (--detail <section>)` |
+| `--detail <SECTION>` | all rows | — |
+| `--insights` | 20 findings | `N more (raise --top)` |
+| File cards | 5 cards; per card 3 owners, 4 partners, 3 fix commits | `N more files (raise --top)` (`1 more file` for one); one hidden-count line per card |
+
+Fix commits on a card stay at 5 or fewer at any `--top`.
 
 #### Time Windows
 
@@ -184,22 +226,59 @@ skim heatmap [OPTIONS] [FILE...]
 
 The default **dual mode** is designed for repositories of any age: it avoids under-counting on small repos (fewer than 200 commits) while still bounding analysis on large repos.
 
+#### File Cards
+
+`skim heatmap <FILE>...` prints one "before you edit" card per file argument, at most 5 (or `--top N`), then `N more files (raise --top)` (`1 more file` for one). A duplicate path gives one card. `--insights <FILE>...` prints the same bytes. A card is 12 lines or fewer at the default caps:
+
+```text
+crates/rskim/src/cmd/heatmap/view.rs: 7 commits
+  partners (confidence, shared commits):
+     69%   5  crates/rskim/tests/cli_heatmap.rs
+    100%   7  crates/rskim/src/cmd/heatmap/mod.rs
+     66%   5  crates/rskim/src/cmd/heatmap/output.rs
+  fix commits from history (newest first):
+    81a22ee 2026-11-12 "fix(heatmap): cap file_targets and count missing --diff files"
+    ca69af4 2026-11-12 "fix(heatmap): address self-review issues"
+```
+
+- **Owners** (`owners: "A" 89%, "B" 11%`) show only when the file has 2 or more distinct authors. Each name is in double quotes.
+- **Partners** are files with 3 or more shared commits and a confidence at or above `--coupling-threshold`. Test files come first.
+- **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first. In the text view, a `"` or `\` in a subject or an owner name shows as `\"` or `\\`.
+- A file with no commits in the window prints `<path>: not in history window (N commits since DATE)` (`1 commit` for one), where N and DATE describe the window.
+- Control characters, bidirectional characters and invisible format characters (for example zero-width characters and Unicode tag characters) in subjects, author names and partner paths become U+FFFD. Each of these strings is cut at 72 characters.
+- `./x`, an absolute path under the repository root, a path relative to the current folder and a path with `..` give the same card. A path outside the repository exits 1. skim does not open the file. An absolute path through a symbolic-link prefix (for example macOS `/var`) is refused.
+
+Metrics come from the full window; a card only narrows the display.
+
 #### File Targeting
 
-Positional file arguments and `--diff` scope the **output**, not the git history. Metrics are computed on the full commit history for accuracy — coupling and fix-risk scores reflect the complete picture, then the display is narrowed.
+- **`--path <DIR>`**: Scope the git log itself (commit-level filter). Composable with file arguments.
+- **`--diff <BASE>`**: The default view, scoped to the files changed vs `BASE` (three-dot diff). It warns for a changed file with no history in the window. Mutually exclusive with file arguments. Needs git 2.24 or newer.
 
-- **Positional args**: `skim heatmap src/main.rs` — show results only for that file
-- **`--path <DIR>`**: Scope the git log itself (commit-level filter). Composable with file args.
-- **`--diff <BASE>`**: Show only files changed vs `BASE` (three-dot diff). Mutually exclusive with positional file args.
+#### Default Excludes
+
+By default the analysis leaves out lock files, build and dist output, minified bundles, logs, `vendor/` and `node_modules/`, IDE metadata, coverage output, and, at any depth, `CHANGELOG.md`, `*.snap`, `snapshots/`, `*.pb.go`, `*_pb2.py` and `generated/` folders. These files are absent from every section and from `files[]`. `--no-exclude` keeps them; `--exclude <PATTERN>` adds a pattern. The patterns match paths only: a file marked "generated" only in a header line stays in.
 
 #### Insights Mode
 
-`--insights` emits only threshold-filtered CRITICAL/WARNING findings, one per line. Use when you want a quick list of hotspots without the full table.
+`--insights` emits the CRITICAL/WARNING findings, one per line, ranked by severity, then score, then support, then path. Each finding kind has the support minimum of its section (see Noise Rules), so no CRITICAL finding comes from too few commits. The header line and up to two warning lines come first, as in the default view. The view shows 20 findings, then one `N more (raise --top)` line.
 
 ```bash
-skim heatmap --insights           # Text findings
-skim heatmap --insights --json    # JSON array (agent-friendly)
+skim heatmap --insights                  # Top 20 findings
+skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 ```
+
+#### JSON (version 2)
+
+`--json` gives one compact line with `"version": 2`. This is a breaking change from version 1:
+
+- Each array of rows has the cap of its section in the view (`files[]` holds the hotspot rows), and each `files[].blast_radius` holds at most 5 partners.
+- `file_targets[]` holds at most 20 targets, and `counts.file_targets` gives their full and shown count. `warnings[]` has at most one line for each kind of warning: the `--diff` files that are not in the window give one line that counts them and names the first 3. `excluded_patterns[]` is the fixed pattern list: the default excludes and the `--exclude` values.
+- `counts.<section>.{total,shown}` gives the full and the shown count of each section (`hotspots`, `coupling`, `fix_risk`, `modules`, `bus_factor`).
+- `files[]` keeps its per-file keys; no support minimum applies to it.
+- With file arguments, `cards[]` holds the cards (`path`, `in_window`, `commits`, `counts`, `owners`, `partners`, `fix_commits`) and `counts.cards` their counts.
+- `--insights --json` gives `insights[]`, `top_files[]` and `flagged_modules[]` for the shown findings only, with `counts.insights`. Its `warnings[]` is the same list as in `--json`.
+- `repository` gives the repository name, the same name as the text header, never the absolute path. This is the same in `--insights --json` and with file arguments.
 
 #### Options
 
@@ -209,22 +288,30 @@ skim heatmap --insights --json    # JSON array (agent-friendly)
 | `--last <N>` | — | Analyze last N commits |
 | `--window <PRESET>` | — | Named window preset (see table above) |
 | `--path <DIR>` | — | Scope git log to files under this directory |
-| `--diff <BASE>` | — | Show only files changed vs BASE |
-| `--json`, `--format json` | false | Emit JSON instead of human-readable text |
-| `--top <N>` | 20 | Maximum number of files to display |
-| `--no-exclude` | false | Disable default exclusion patterns (lock files, build dirs) |
+| `--diff <BASE>` | — | Default view for the files changed vs BASE |
+| `--detail <SECTION>` | — | Show all rows of one section: `hotspots`, `coupling`, `fix-risk`, `modules` or `bus-factor` |
+| `--json`, `--format json` | false | Emit JSON version 2 instead of human-readable text |
+| `--top <N>` | per list (see Caps and `--top`) | Rows of each list in every view |
+| `--no-exclude` | false | Keep the files of the default excludes (see Default Excludes) |
 | `--exclude <PATTERN>` | — | Add extra glob pattern to exclude (repeatable) |
 | `--coupling-threshold <FLOAT>` | 0.5 | Coupling confidence threshold (0.0–1.0) |
 | `--fix-window <N>` | 5 | Proximity window for fix-after-touch detection (commit count) |
-| `--insights` | false | Show only threshold-filtered findings |
+| `--insights` | false | Show ranked findings only |
 | `--debug` | false | Enable debug output to stderr |
 | `-h`, `--help` | — | Show help message |
 
 #### Examples
 
 ```bash
-# Default: analyze last 90 days (dual mode)
+# Default: short ranked view of the dual window
 skim heatmap
+
+# All coupling pairs, or the top 20 fix-risk files
+skim heatmap --detail coupling
+skim heatmap --detail fix-risk --top 20
+
+# 3 rows per section
+skim heatmap --top 3
 
 # Analyze last 200 commits
 skim heatmap --last 200
@@ -241,20 +328,23 @@ skim heatmap --json
 # Scope analysis to src/ directory
 skim heatmap --path src/
 
-# Show only files changed vs main branch
+# Default view for the files changed vs the main branch
 skim heatmap --diff main
 
-# Show results for a specific file (full metric history, display narrowed)
+# "Before you edit" card for one file
 skim heatmap src/main.rs
 
-# Combine path-scope with file-scope
+# Combine path-scope with a card
 skim heatmap --path src/ src/main.rs
 
-# Threshold-filtered insights only
+# Top 20 ranked findings
 skim heatmap --insights
 
-# Insights as JSON for agent pipelines
-skim heatmap --insights --json
+# Top 50 findings as JSON
+skim heatmap --insights --top 50 --json
+
+# Keep lock files, changelogs, snapshots and generated code
+skim heatmap --no-exclude
 ```
 
 ## Common Usage Patterns

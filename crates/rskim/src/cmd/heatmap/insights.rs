@@ -1,246 +1,304 @@
-//! Threshold-filtered insight engine for `skim heatmap --insights`.
+//! Ranked insight engine for `skim heatmap --insights`.
 //!
-//! Pure functions, no I/O. Scans [`HeatmapResult`] against hardcoded thresholds
-//! and produces a sorted [`Vec<Insight>`] and an [`InsightsResult`] for rendering.
+//! Pure functions, no I/O. [`compute_insights`] scans a [`HeatmapResult`]
+//! against the thresholds and gates of `noise.rs` and gives every finding in
+//! one rank order. [`build_insights_result`] keeps the findings up to the cap
+//! and builds the compact file and module lists from the shown findings only.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
-use super::types::{
-    CompactFileEntry, CompactModuleEntry, HeatmapResult, Insight, InsightCategory, InsightsResult,
-    Severity,
+use super::noise::{
+    self, COUPLING_WARNING, ENCAPSULATION_CRITICAL, ENCAPSULATION_WARNING, FIX_RISK_CRITICAL,
+    FIX_RISK_WARNING, MIN_FILE_SUPPORT, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS, STABILITY_CRITICAL,
+    STABILITY_WARNING,
 };
-
-// ============================================================================
-// Threshold constants
-// ============================================================================
-
-/// Stability score below which a file is CRITICAL.
-const STABILITY_CRITICAL: u8 = 40;
-/// Stability score below which a file is a WARNING (but above critical).
-const STABILITY_WARNING: u8 = 70;
-
-/// Fix-risk combined_pct above which a file is CRITICAL.
-const FIX_RISK_CRITICAL: f64 = 50.0;
-/// Fix-risk combined_pct above which a file is a WARNING (but below critical).
-const FIX_RISK_WARNING: f64 = 30.0;
-
-/// Encapsulation_pct below which a module is CRITICAL.
-const ENCAPSULATION_CRITICAL: f64 = 40.0;
-/// Encapsulation_pct below which a module is a WARNING (but above critical).
-const ENCAPSULATION_WARNING: f64 = 60.0;
-
-/// Coupling confidence above which a coupling pair is a WARNING.
-const COUPLING_WARNING: f64 = 0.8;
+use super::types::{
+    CompactFileEntry, CompactModuleEntry, Count, FileMetrics, HeatmapResult, Insight,
+    InsightCategory, InsightCounts, InsightsResult, ModuleHealth, Severity,
+};
+use super::view::{JSON_VERSION, repo_name};
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
 
-/// Push a Critical or Warning insight based on two thresholds.
+/// The parts of a finding that do not depend on its severity.
+struct Finding<'a> {
+    category: InsightCategory,
+    file: &'a str,
+    metric_value: f64,
+    support: usize,
+    score: f64,
+}
+
+impl Finding<'_> {
+    fn insight(self, severity: Severity, message: String) -> Insight {
+        Insight {
+            severity,
+            category: self.category,
+            file: self.file.to_string(),
+            message,
+            metric_value: self.metric_value,
+            support: self.support,
+            score: self.score,
+        }
+    }
+}
+
+/// The severity of a value against two bounds: critical past the critical
+/// bound, warning past the warning bound, else no finding.
 ///
 /// For metrics where **lower** is worse (stability, encapsulation), pass
-/// `worse_than_critical = value < CRITICAL_BOUND` and
-/// `worse_than_warning  = value < WARNING_BOUND`.
-/// For metrics where **higher** is worse (fix-risk, coupling), flip the
-/// comparisons (`value > BOUND`).
-///
-/// `messages` is `(critical_msg, warning_msg)` to stay under clippy's 7-arg
-/// limit while keeping the helper free of allocations at the call site.
-fn check_threshold(
-    insights: &mut Vec<Insight>,
-    file: &str,
-    category: InsightCategory,
-    metric_value: f64,
-    worse_than_critical: bool,
-    worse_than_warning: bool,
-    messages: (String, String),
-) {
-    let (critical_message, warning_message) = messages;
-    if worse_than_critical {
-        insights.push(Insight {
-            severity: Severity::Critical,
-            category,
-            file: file.to_string(),
-            message: critical_message,
-            metric_value,
-        });
-    } else if worse_than_warning {
-        insights.push(Insight {
-            severity: Severity::Warning,
-            category,
-            file: file.to_string(),
-            message: warning_message,
-            metric_value,
-        });
+/// `value < CRITICAL_BOUND` and `value < WARNING_BOUND`. For metrics where
+/// **higher** is worse (fix risk), pass `value > BOUND`.
+fn grade(past_critical: bool, past_warning: bool) -> Option<Severity> {
+    if past_critical {
+        Some(Severity::Critical)
+    } else if past_warning {
+        Some(Severity::Warning)
+    } else {
+        None
     }
+}
+
+/// `(100 - pct) / 100`, kept in `0.0..=1.0`.
+fn inverse_share(pct: f64) -> f64 {
+    ((100.0 - pct) / 100.0).clamp(0.0, 1.0)
 }
 
 // ============================================================================
 // Public API
 // ============================================================================
 
-/// Scan all files and modules in `result`, applying hardcoded thresholds to
-/// produce a sorted list of insights.
+/// Every finding of `result`, in rank order.
 ///
-/// Sorting rules:
-/// 1. By severity ascending (Critical first — `Severity::Critical < Severity::Warning` via Ord).
-/// 2. Within same severity, by `metric_value` descending (worst first).
+/// A finding needs the support minimum of its kind: 5 commits for the file
+/// kinds (stability, fix risk, bus factor), 3 shared commits for coupling and
+/// 5 commits for a module. Fix risk also needs the lift gate and keeps its
+/// severity on `combined_pct`; bus factor needs the bus-factor gate. Coupling
+/// reads the canonical coupling graph: one finding per code-to-code pair.
+///
+/// Rank order: severity (critical first), then score desc, then support
+/// desc, then path asc. The category and the message break the last ties,
+/// so the order is total and two runs give the same findings.
 pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
+    let base_rate = noise::base_rate(result.fix_commits_total, result.window.commits_analyzed);
     let mut insights: Vec<Insight> = Vec::new();
 
-    for file in &result.files {
-        // Stability (lower score = worse)
-        let stability = file.stability_score;
-        check_threshold(
-            &mut insights,
-            &file.path,
-            InsightCategory::Stability,
-            f64::from(stability),
-            stability < STABILITY_CRITICAL,
-            stability < STABILITY_WARNING,
-            (
-                format!("critically unstable (score {}/100)", stability),
-                format!("moderate instability (score {}/100)", stability),
-            ),
-        );
-
-        // Fix risk — skip if insufficient data (higher combined_pct = worse)
-        if !file.fix_risk.insufficient_data {
-            let combined = file.fix_risk.combined_pct;
-            check_threshold(
-                &mut insights,
-                &file.path,
-                InsightCategory::FixRisk,
-                combined,
-                combined > FIX_RISK_CRITICAL,
-                combined > FIX_RISK_WARNING,
-                (
-                    format!("high fix-risk ({combined:.1}% combined)"),
-                    format!("elevated fix-risk ({combined:.1}% combined)"),
-                ),
-            );
-        }
-
-        // Bus factor (boolean risk — always Warning when flagged)
-        if file.authors.single_owner_risk {
-            let pct = file.authors.top_author_pct;
-            let count = file.authors.count;
-            insights.push(Insight {
-                severity: Severity::Warning,
-                category: InsightCategory::BusFactor,
-                file: file.path.clone(),
-                message: format!("bus-factor risk ({pct:.1}%, {count} author(s))"),
-                metric_value: pct,
-            });
-        }
-
-        // Coupling — emit one Warning per coupling partner above threshold
-        for entry in &file.blast_radius {
-            if entry.confidence > COUPLING_WARNING {
-                let conf_pct = entry.confidence * 100.0;
-                let support = entry.support;
-                insights.push(Insight {
-                    severity: Severity::Warning,
-                    category: InsightCategory::Coupling,
-                    file: file.path.clone(),
-                    message: format!(
-                        "tightly coupled with {} ({conf_pct:.1}% confidence, {support} co-changes)",
-                        entry.path
-                    ),
-                    metric_value: entry.confidence,
-                });
-            }
-        }
+    for file in result
+        .files
+        .iter()
+        .filter(|f| f.churn.commits >= MIN_FILE_SUPPORT)
+    {
+        push_file_findings(&mut insights, file, base_rate, result.window_authors);
     }
 
-    // Module encapsulation (lower pct = worse)
-    for module in &result.modules {
+    for edge in &result.coupling_graph {
+        let code_pair = !noise::is_doc_path(&edge.a) && !noise::is_doc_path(&edge.b);
+        if !code_pair || edge.support < MIN_PAIR_SUPPORT || edge.confidence <= COUPLING_WARNING {
+            continue;
+        }
+        let conf_pct = edge.confidence * 100.0;
+        let finding = Finding {
+            category: InsightCategory::Coupling,
+            file: &edge.a,
+            metric_value: edge.confidence,
+            support: edge.support,
+            score: edge.confidence,
+        };
+        insights.push(finding.insight(
+            Severity::Warning,
+            format!(
+                "tightly coupled with {} ({conf_pct:.1}% confidence, {} co-changes)",
+                edge.b, edge.support
+            ),
+        ));
+    }
+
+    for module in result
+        .modules
+        .iter()
+        .filter(|m| m.total_commits >= MODULE_MIN_COMMITS)
+    {
         let pct = module.encapsulation_pct;
-        check_threshold(
-            &mut insights,
-            &module.path,
-            InsightCategory::Encapsulation,
-            pct,
-            pct < ENCAPSULATION_CRITICAL,
-            pct < ENCAPSULATION_WARNING,
-            (
-                format!("poor encapsulation ({pct:.1}%)"),
-                format!("weak encapsulation ({pct:.1}%)"),
-            ),
-        );
+        let commits = module.total_commits;
+        let Some(severity) = grade(pct < ENCAPSULATION_CRITICAL, pct < ENCAPSULATION_WARNING)
+        else {
+            continue;
+        };
+        let level = match severity {
+            Severity::Critical => "poor",
+            Severity::Warning => "weak",
+        };
+        let finding = Finding {
+            category: InsightCategory::Encapsulation,
+            file: &module.path,
+            metric_value: pct,
+            support: commits,
+            score: inverse_share(pct),
+        };
+        insights.push(finding.insight(
+            severity,
+            format!("{level} encapsulation ({pct:.1}%, {commits} commits)"),
+        ));
     }
 
-    // Sort: Critical first (ascending severity), then by metric_value descending
-    // within same severity.
-    insights.sort_by(|a, b| {
-        a.severity.cmp(&b.severity).then_with(|| {
-            let a_sort = sort_key(a);
-            let b_sort = sort_key(b);
-            b_sort.total_cmp(&a_sort)
-        })
-    });
-
+    insights.sort_by(insight_order);
     insights
 }
 
-/// Convert an insight's metric_value to a "badness" score for descending sort.
-/// Higher badness = worse = should appear first.
-fn sort_key(insight: &Insight) -> f64 {
-    match insight.category {
-        // Lower score = worse for these → invert so larger sort key = worse
-        InsightCategory::Stability | InsightCategory::Encapsulation => 100.0 - insight.metric_value,
-        // Higher value = worse for fix-risk, bus-factor, coupling → use as-is
-        InsightCategory::FixRisk | InsightCategory::BusFactor | InsightCategory::Coupling => {
-            insight.metric_value
+/// The stability, fix-risk and bus-factor findings of one file at or above
+/// the file support minimum.
+fn push_file_findings(
+    insights: &mut Vec<Insight>,
+    file: &FileMetrics,
+    base_rate: f64,
+    window_authors: usize,
+) {
+    let support = file.churn.commits;
+    let path = file.path.as_str();
+
+    // Stability (lower score = worse)
+    let stability = file.stability_score;
+    if let Some(severity) = grade(
+        stability < STABILITY_CRITICAL,
+        stability < STABILITY_WARNING,
+    ) {
+        let level = match severity {
+            Severity::Critical => "critically unstable",
+            Severity::Warning => "moderate instability",
+        };
+        let finding = Finding {
+            category: InsightCategory::Stability,
+            file: path,
+            metric_value: f64::from(stability),
+            support,
+            score: inverse_share(f64::from(stability)),
+        };
+        insights.push(finding.insight(
+            severity,
+            format!("{level} (score {stability}/100, {support} commits)"),
+        ));
+    }
+
+    // Fix risk: the lift gate, then the severity on combined_pct
+    let fix = &file.fix_risk;
+    if noise::passes_lift(fix.fix_commits, support, base_rate) {
+        let combined = fix.combined_pct;
+        if let Some(severity) = grade(combined > FIX_RISK_CRITICAL, combined > FIX_RISK_WARNING) {
+            let level = match severity {
+                Severity::Critical => "high",
+                Severity::Warning => "elevated",
+            };
+            let finding = Finding {
+                category: InsightCategory::FixRisk,
+                file: path,
+                metric_value: combined,
+                support,
+                score: noise::wilson_lower_bound(fix.fix_commits, support),
+            };
+            insights.push(finding.insight(
+                severity,
+                format!(
+                    "{level} fix-risk ({combined:.1}% combined, {}/{support} fix commits)",
+                    fix.fix_commits
+                ),
+            ));
         }
     }
-}
 
-/// Assemble a compact [`InsightsResult`] from the full heatmap data and computed insights.
-pub(crate) fn build_insights_result(
-    result: &HeatmapResult,
-    insights: Vec<Insight>,
-) -> InsightsResult {
-    InsightsResult {
-        version: 1,
-        repository: result.repository.clone(),
-        window: result.window.clone(),
-        top_files: build_compact_files(result, &insights),
-        flagged_modules: build_flagged_modules(result),
-        insights,
+    // Bus factor (always a warning when the gate passes)
+    let pct = file.authors.top_author_pct;
+    if noise::passes_bus_gate(window_authors, support, pct) {
+        let count = file.authors.count;
+        let finding = Finding {
+            category: InsightCategory::BusFactor,
+            file: path,
+            metric_value: pct,
+            support,
+            score: (pct / 100.0).clamp(0.0, 1.0),
+        };
+        insights.push(finding.insight(
+            Severity::Warning,
+            format!("bus-factor risk ({pct:.1}% top author, {count} author(s), {support} commits)"),
+        ));
     }
 }
 
-/// Condense files to [`CompactFileEntry`], keeping only those that appear in
-/// at least one insight.  This bounds the `top_files` list to the set of
-/// flagged files rather than mapping the entire repository.
-pub(crate) fn build_compact_files(
-    result: &HeatmapResult,
-    insights: &[Insight],
-) -> Vec<CompactFileEntry> {
-    // Build a set of file paths referenced by at least one insight.
-    let flagged: HashSet<&str> = insights.iter().map(|i| i.file.as_str()).collect();
+/// The insight rank order (see [`compute_insights`]).
+fn insight_order(x: &Insight, y: &Insight) -> Ordering {
+    x.severity
+        .cmp(&y.severity)
+        .then_with(|| y.score.total_cmp(&x.score))
+        .then_with(|| y.support.cmp(&x.support))
+        .then_with(|| x.file.cmp(&y.file))
+        .then_with(|| x.category.cmp(&y.category))
+        .then_with(|| x.message.cmp(&y.message))
+}
 
-    result
-        .files
+/// The `--insights` result: the first `cap` findings of `ranked` (already in
+/// rank order), their count, the files and modules of those findings, and
+/// every warning of the run.
+pub(crate) fn build_insights_result(
+    result: &HeatmapResult,
+    mut ranked: Vec<Insight>,
+    cap: usize,
+) -> InsightsResult {
+    let total = ranked.len();
+    ranked.truncate(cap);
+    InsightsResult {
+        version: JSON_VERSION,
+        repository: repo_name(&result.repository).to_string(),
+        window: result.window.clone(),
+        counts: InsightCounts {
+            insights: Count {
+                total,
+                shown: ranked.len(),
+            },
+        },
+        top_files: build_compact_files(result, &ranked),
+        flagged_modules: build_flagged_modules(result, &ranked),
+        insights: ranked,
+        warnings: result.warnings.clone(),
+    }
+}
+
+/// The files of the shown findings, once each, in finding order.
+fn build_compact_files(result: &HeatmapResult, shown: &[Insight]) -> Vec<CompactFileEntry> {
+    let by_path: HashMap<&str, &FileMetrics> =
+        result.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    shown
         .iter()
-        .filter(|f| flagged.contains(f.path.as_str()))
+        .filter(|i| i.category != InsightCategory::Encapsulation)
+        .filter_map(|i| by_path.get(i.file.as_str()).copied())
+        .filter(|f| seen.insert(f.path.as_str()))
         .map(|f| CompactFileEntry {
             path: f.path.clone(),
             stability: f.stability_score,
             churn_commits: f.churn.commits,
             fix_risk_pct: f.fix_risk.combined_pct,
-            bus_factor_risk: f.authors.single_owner_risk,
+            bus_factor_risk: noise::passes_bus_gate(
+                result.window_authors,
+                f.churn.commits,
+                f.authors.top_author_pct,
+            ),
         })
         .collect()
 }
 
-/// Collect only modules below the encapsulation warning threshold (60%).
-pub(crate) fn build_flagged_modules(result: &HeatmapResult) -> Vec<CompactModuleEntry> {
-    result
+/// The modules of the shown encapsulation findings, in finding order.
+fn build_flagged_modules(result: &HeatmapResult, shown: &[Insight]) -> Vec<CompactModuleEntry> {
+    let by_path: HashMap<&str, &ModuleHealth> = result
         .modules
         .iter()
-        .filter(|m| m.encapsulation_pct < ENCAPSULATION_WARNING)
+        .map(|m| (m.path.as_str(), m))
+        .collect();
+    shown
+        .iter()
+        .filter(|i| i.category == InsightCategory::Encapsulation)
+        .filter_map(|i| by_path.get(i.file.as_str()).copied())
         .map(|m| CompactModuleEntry {
             path: m.path.clone(),
             encapsulation_pct: m.encapsulation_pct,
@@ -258,9 +316,10 @@ pub(crate) fn build_flagged_modules(result: &HeatmapResult) -> Vec<CompactModule
 mod tests {
     use super::*;
     use crate::cmd::heatmap::types::{
-        AuthorMetrics, ChurnMetrics, CouplingEntry, FileMetrics, FixRiskMetrics, ModuleHealth,
-        WindowInfo,
+        AuthorMetrics, ChurnMetrics, CouplingEdge, FixRiskMetrics, WindowInfo,
     };
+
+    const EPS: f64 = 1e-9;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -276,9 +335,10 @@ mod tests {
         }
     }
 
+    /// No files or modules; 10 commits, 2 of them fix commits (base rate
+    /// 20%), 2 distinct authors.
     fn make_empty_result() -> HeatmapResult {
         HeatmapResult {
-            version: 1,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "test-repo".to_string(),
             window: make_window(),
@@ -288,37 +348,35 @@ mod tests {
             excluded_patterns: vec![],
             warnings: vec![],
             file_targets: None,
+            fix_commits_total: 2,
+            window_authors: 2,
         }
     }
 
-    /// Params struct for `make_file` — collapses the former 8-positional signature into named
-    /// fields, eliminating `clippy::too_many_arguments` at the root (ADR-007) rather than
-    /// suppressing it with `#[allow]`.
+    /// Params struct for `make_file` — named fields instead of a long
+    /// positional signature.
     struct FileSpec<'a> {
         path: &'a str,
+        commits: usize,
         stability: u8,
         combined_pct: f64,
-        insufficient_data: bool,
-        single_owner_risk: bool,
+        fix_commits: usize,
         top_author_pct: f64,
         author_count: usize,
-        blast_radius: Vec<CouplingEntry>,
     }
 
-    // Defaults fall below every insight threshold so tests assert only the fields they set.
-    // The three author fields (single_owner_risk, top_author_pct, author_count) form a coherent
-    // group — override all three together when testing author-concentration insights.
+    // The defaults pass no insight threshold, so a test sets only the fields
+    // that it checks.
     impl Default for FileSpec<'_> {
         fn default() -> Self {
             Self {
                 path: "",
-                stability: 0,
+                commits: MIN_FILE_SUPPORT,
+                stability: 80,
                 combined_pct: 0.0,
-                insufficient_data: true,
-                single_owner_risk: false,
+                fix_commits: 0,
                 top_author_pct: 50.0,
                 author_count: 2,
-                blast_radius: vec![],
             }
         }
     }
@@ -327,22 +385,23 @@ mod tests {
         FileMetrics {
             path: spec.path.to_string(),
             churn: ChurnMetrics {
-                commits: 5,
+                commits: spec.commits,
                 rate: 0.1,
             },
             stability_score: spec.stability,
             authors: AuthorMetrics {
                 count: spec.author_count,
                 top_author_pct: spec.top_author_pct,
-                single_owner_risk: spec.single_owner_risk,
+                single_owner_risk: spec.top_author_pct > 80.0,
             },
             fix_risk: FixRiskMetrics {
                 keyword_pct: spec.combined_pct / 2.0,
                 proximity_pct: spec.combined_pct / 2.0,
                 combined_pct: spec.combined_pct,
-                insufficient_data: spec.insufficient_data,
+                fix_commits: spec.fix_commits,
+                insufficient_data: spec.commits < MIN_FILE_SUPPORT,
             },
-            blast_radius: spec.blast_radius,
+            blast_radius: vec![],
         }
     }
 
@@ -354,6 +413,23 @@ mod tests {
             total_commits: 10,
             cross_boundary_commits: 3,
         }
+    }
+
+    fn make_edge(a: &str, b: &str, confidence: f64, support: usize) -> CouplingEdge {
+        CouplingEdge {
+            a: a.to_string(),
+            b: b.to_string(),
+            confidence,
+            support,
+        }
+    }
+
+    /// `(category, file)` of each insight, in order.
+    fn kinds(insights: &[Insight]) -> Vec<(InsightCategory, &str)> {
+        insights
+            .iter()
+            .map(|i| (i.category, i.file.as_str()))
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -379,17 +455,14 @@ mod tests {
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
         assert_eq!(insights[0].category, InsightCategory::Stability);
-        assert!(
-            insights[0].message.contains("critically unstable"),
-            "message: {}",
-            insights[0].message
+        // The message gives the number and the support, not the path (the
+        // rendering layer adds the path).
+        assert_eq!(
+            insights[0].message,
+            "critically unstable (score 39/100, 5 commits)"
         );
-        // Message must NOT contain the file path (rendering layer adds it)
-        assert!(
-            !insights[0].message.contains("a.rs"),
-            "message should not embed file path: {}",
-            insights[0].message
-        );
+        assert_eq!(insights[0].support, 5);
+        assert!((insights[0].score - 0.61).abs() < EPS);
     }
 
     #[test]
@@ -421,7 +494,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fix risk threshold tests
+    // Fix risk tests: lift gate, then severity on combined_pct
     // -----------------------------------------------------------------------
 
     #[test]
@@ -429,16 +502,20 @@ mod tests {
         let mut result = make_empty_result();
         result.files.push(make_file(FileSpec {
             path: "b.rs",
-            stability: 80,
             combined_pct: 50.1,
-            insufficient_data: false,
+            fix_commits: 5,
             ..Default::default()
         }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
         assert_eq!(insights[0].category, InsightCategory::FixRisk);
-        assert!(insights[0].message.contains("high fix-risk"));
+        assert_eq!(
+            insights[0].message,
+            "high fix-risk (50.1% combined, 5/5 fix commits)"
+        );
+        // Score = Wilson lower bound of 5 of 5.
+        assert!((insights[0].score - noise::wilson_lower_bound(5, 5)).abs() < EPS);
     }
 
     #[test]
@@ -446,9 +523,8 @@ mod tests {
         let mut result = make_empty_result();
         result.files.push(make_file(FileSpec {
             path: "b.rs",
-            stability: 80,
             combined_pct: 35.0,
-            insufficient_data: false,
+            fix_commits: 5,
             ..Default::default()
         }));
         let insights = compute_insights(&result);
@@ -463,9 +539,8 @@ mod tests {
         let mut result = make_empty_result();
         result.files.push(make_file(FileSpec {
             path: "b.rs",
-            stability: 80,
             combined_pct: 30.0,
-            insufficient_data: false,
+            fix_commits: 5,
             ..Default::default()
         }));
         let insights = compute_insights(&result);
@@ -474,19 +549,30 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_risk_insufficient_data_skipped() {
+    fn test_fix_risk_needs_the_lift_gate() {
         let mut result = make_empty_result();
+        // 1 fix commit of 5: the Wilson lower bound (0.04) is below the 20%
+        // base rate, so a high combined_pct alone gives no finding.
         result.files.push(make_file(FileSpec {
             path: "b.rs",
-            stability: 80,
             combined_pct: 80.0,
-            ..Default::default() // insufficient_data defaults to true — skip fix-risk
+            fix_commits: 1,
+            ..Default::default()
         }));
-        let insights = compute_insights(&result);
-        assert!(
-            insights.is_empty(),
-            "insufficient_data=true should skip fix-risk insight"
-        );
+        assert!(compute_insights(&result).is_empty());
+    }
+
+    #[test]
+    fn test_fix_risk_has_no_finding_at_a_degenerate_base_rate() {
+        let mut result = make_empty_result();
+        result.fix_commits_total = 0;
+        result.files.push(make_file(FileSpec {
+            path: "b.rs",
+            combined_pct: 80.0,
+            fix_commits: 5,
+            ..Default::default()
+        }));
+        assert!(compute_insights(&result).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -498,17 +584,19 @@ mod tests {
         let mut result = make_empty_result();
         result.files.push(make_file(FileSpec {
             path: "c.rs",
-            stability: 80,
-            single_owner_risk: true,
             top_author_pct: 90.0,
-            author_count: 1,
+            author_count: 2,
             ..Default::default()
         }));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
         assert_eq!(insights[0].category, InsightCategory::BusFactor);
-        assert!(insights[0].message.contains("bus-factor risk"));
+        assert_eq!(
+            insights[0].message,
+            "bus-factor risk (90.0% top author, 2 author(s), 5 commits)"
+        );
+        assert!((insights[0].score - 0.9).abs() < EPS);
     }
 
     #[test]
@@ -516,13 +604,25 @@ mod tests {
         let mut result = make_empty_result();
         result.files.push(make_file(FileSpec {
             path: "c.rs",
-            stability: 80,
             top_author_pct: 60.0,
             author_count: 3,
             ..Default::default()
         }));
         let insights = compute_insights(&result);
-        assert!(insights.is_empty(), "no bus-factor risk when false");
+        assert!(insights.is_empty(), "no bus-factor risk at a 60% share");
+    }
+
+    #[test]
+    fn test_bus_factor_has_no_finding_in_a_one_author_window() {
+        let mut result = make_empty_result();
+        result.window_authors = 1;
+        result.files.push(make_file(FileSpec {
+            path: "c.rs",
+            top_author_pct: 100.0,
+            author_count: 1,
+            ..Default::default()
+        }));
+        assert!(compute_insights(&result).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -537,7 +637,11 @@ mod tests {
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
         assert_eq!(insights[0].category, InsightCategory::Encapsulation);
-        assert!(insights[0].message.contains("poor encapsulation"));
+        assert_eq!(
+            insights[0].message,
+            "poor encapsulation (30.0%, 10 commits)"
+        );
+        assert!((insights[0].score - 0.7).abs() < EPS);
     }
 
     #[test]
@@ -564,42 +668,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Coupling tests
+    // Coupling tests: canonical graph edges, code to code
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_coupling_warning() {
         let mut result = make_empty_result();
-        result.files.push(make_file(FileSpec {
-            path: "a.rs",
-            stability: 80,
-            blast_radius: vec![CouplingEntry {
-                path: "b.rs".to_string(),
-                confidence: 0.85,
-                support: 5,
-            }],
-            ..Default::default()
-        }));
+        result
+            .coupling_graph
+            .push(make_edge("a.rs", "b.rs", 0.85, 5));
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
         assert_eq!(insights[0].category, InsightCategory::Coupling);
-        assert!(insights[0].message.contains("tightly coupled with b.rs"));
+        assert_eq!(insights[0].file, "a.rs");
+        assert_eq!(
+            insights[0].message,
+            "tightly coupled with b.rs (85.0% confidence, 5 co-changes)"
+        );
+        assert_eq!(insights[0].support, 5);
     }
 
     #[test]
     fn test_coupling_below_threshold() {
         let mut result = make_empty_result();
-        result.files.push(make_file(FileSpec {
-            path: "a.rs",
-            stability: 80,
-            blast_radius: vec![CouplingEntry {
-                path: "b.rs".to_string(),
-                confidence: 0.80,
-                support: 5,
-            }],
-            ..Default::default()
-        }));
+        result
+            .coupling_graph
+            .push(make_edge("a.rs", "b.rs", 0.80, 5));
         let insights = compute_insights(&result);
         // confidence=0.80 is AT the threshold (not strictly above) — no insight
         assert!(
@@ -608,64 +703,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_coupling_skips_a_pair_with_a_doc_endpoint() {
+        let mut result = make_empty_result();
+        result
+            .coupling_graph
+            .push(make_edge("README.md", "src/lib.rs", 0.95, 9));
+        result
+            .coupling_graph
+            .push(make_edge("docs/guide.rst", "src/lib.rs", 0.95, 9));
+        assert!(compute_insights(&result).is_empty());
+    }
+
     // -----------------------------------------------------------------------
-    // Sorting tests
+    // Support minimums
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_sorted_critical_first() {
+    /// One file, one pair and one module that are bad on every kind, at
+    /// `file_commits`, `pair_support` and `module_commits`.
+    fn bad_on_every_kind(
+        file_commits: usize,
+        pair_support: usize,
+        module_commits: usize,
+    ) -> HeatmapResult {
         let mut result = make_empty_result();
-        // Warning first in data
+        result.window.commits_analyzed = 100;
+        result.fix_commits_total = 10;
         result.files.push(make_file(FileSpec {
-            path: "a.rs",
-            stability: 55,
-            ..Default::default()
-        })); // warning
-        result.files.push(make_file(FileSpec {
-            path: "b.rs",
-            stability: 39,
-            ..Default::default()
-        })); // critical
-        let insights = compute_insights(&result);
-        assert_eq!(insights.len(), 2);
-        assert_eq!(
-            insights[0].severity,
-            Severity::Critical,
-            "critical should be first"
+            path: "src/bad.rs",
+            commits: file_commits,
+            stability: 10,
+            combined_pct: 100.0,
+            fix_commits: file_commits,
+            top_author_pct: 100.0,
+            author_count: 1,
+        }));
+        result
+            .coupling_graph
+            .push(make_edge("src/x.rs", "src/y.rs", 1.0, pair_support));
+        let mut module = make_module("src", 0.0);
+        module.total_commits = module_commits;
+        result.modules.push(module);
+        result
+    }
+
+    #[test]
+    fn test_no_finding_is_below_its_support_minimum() {
+        let below = bad_on_every_kind(
+            MIN_FILE_SUPPORT - 1,
+            MIN_PAIR_SUPPORT - 1,
+            MODULE_MIN_COMMITS - 1,
         );
+        let insights = compute_insights(&below);
+        assert!(
+            insights.is_empty(),
+            "no finding below support, so no CRITICAL either: {:?}",
+            kinds(&insights)
+        );
+
+        let at = bad_on_every_kind(MIN_FILE_SUPPORT, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS);
+        let mut found: Vec<InsightCategory> =
+            compute_insights(&at).iter().map(|i| i.category).collect();
+        found.sort();
         assert_eq!(
-            insights[1].severity,
-            Severity::Warning,
-            "warning should be second"
+            found,
+            [
+                InsightCategory::Stability,
+                InsightCategory::FixRisk,
+                InsightCategory::BusFactor,
+                InsightCategory::Coupling,
+                InsightCategory::Encapsulation,
+            ]
         );
     }
 
     #[test]
-    fn test_sorted_by_metric_within_severity() {
+    fn test_module_finding_needs_five_commits_of_support() {
+        let module_at = |commits: usize| {
+            let mut result = make_empty_result();
+            let mut module = make_module("src", 0.0);
+            module.total_commits = commits;
+            result.modules.push(module);
+            compute_insights(&result)
+        };
+
+        assert!(module_at(4).is_empty(), "4 commits give no module finding");
+        let at_five = module_at(5);
+        assert_eq!(at_five.len(), 1);
+        assert_eq!(at_five[0].category, InsightCategory::Encapsulation);
+        assert_eq!(at_five[0].support, 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rank order
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_insights_rank_severity_then_score_then_support_then_path() {
         let mut result = make_empty_result();
-        // Two criticals: score 39 and score 20 (20 is worse)
-        result.files.push(make_file(FileSpec {
-            path: "a.rs",
-            stability: 39,
-            ..Default::default()
-        }));
+        // Critical stability, score 0.8, support 5.
         result.files.push(make_file(FileSpec {
             path: "b.rs",
             stability: 20,
             ..Default::default()
         }));
+        // Critical fix risk, score = Wilson bound of 5 of 5 (0.57).
+        result.files.push(make_file(FileSpec {
+            path: "c.rs",
+            combined_pct: 60.0,
+            fix_commits: 5,
+            ..Default::default()
+        }));
+        // Warning bus factor, score 0.9, support 5.
+        result.files.push(make_file(FileSpec {
+            path: "f.rs",
+            top_author_pct: 90.0,
+            ..Default::default()
+        }));
+        // Warning stability, score 0.45.
+        result.files.push(make_file(FileSpec {
+            path: "g.rs",
+            stability: 55,
+            ..Default::default()
+        }));
+        // Warning stability, score 0.45: the same score and support as g.rs.
+        result.files.push(make_file(FileSpec {
+            path: "e.rs",
+            stability: 55,
+            ..Default::default()
+        }));
+        // Warning coupling, score 0.9, support 3.
+        result
+            .coupling_graph
+            .push(make_edge("d.rs", "z.rs", 0.9, 3));
+        // Critical encapsulation, score 0.8, support 10.
+        let mut module = make_module("a", 20.0);
+        module.total_commits = 10;
+        result.modules.push(module);
+
         let insights = compute_insights(&result);
-        assert_eq!(insights.len(), 2);
-        // b.rs (score 20) is worse, should appear first
-        assert!(
-            insights[0].file.contains("b.rs"),
-            "b.rs (score 20) should be first, got: {}",
-            insights[0].file
-        );
-        assert!(
-            insights[1].file.contains("a.rs"),
-            "a.rs (score 39) should be second, got: {}",
-            insights[1].file
+        assert_eq!(
+            kinds(&insights),
+            [
+                (InsightCategory::Encapsulation, "a"),
+                (InsightCategory::Stability, "b.rs"),
+                (InsightCategory::FixRisk, "c.rs"),
+                (InsightCategory::BusFactor, "f.rs"),
+                (InsightCategory::Coupling, "d.rs"),
+                (InsightCategory::Stability, "e.rs"),
+                (InsightCategory::Stability, "g.rs"),
+            ]
         );
     }
 
@@ -677,42 +864,86 @@ mod tests {
             path: "a.rs",
             stability: 39,
             combined_pct: 55.0,
-            insufficient_data: false,
+            fix_commits: 5,
             ..Default::default()
         }));
         let insights = compute_insights(&result);
-        assert!(
-            insights.len() >= 2,
-            "same file can have multiple insights: stability + fix-risk"
-        );
         let categories: Vec<InsightCategory> = insights.iter().map(|i| i.category).collect();
-        assert!(categories.contains(&InsightCategory::Stability));
-        assert!(categories.contains(&InsightCategory::FixRisk));
+        assert_eq!(
+            categories,
+            [InsightCategory::Stability, InsightCategory::FixRisk]
+        );
     }
 
     // -----------------------------------------------------------------------
-    // build_compact_files — only flagged files included
+    // build_insights_result: the cap and the shown lists
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_build_compact_files_only_flagged() {
+    /// Three critical stability findings (a.rs, b.rs, c.rs in rank order)
+    /// and one warning encapsulation finding (module `m`).
+    fn four_findings() -> HeatmapResult {
         let mut result = make_empty_result();
-        // a.rs triggers a stability insight; b.rs is clean
+        for (path, stability) in [("c.rs", 30), ("a.rs", 10), ("b.rs", 20)] {
+            result.files.push(make_file(FileSpec {
+                path,
+                stability,
+                ..Default::default()
+            }));
+        }
         result.files.push(make_file(FileSpec {
-            path: "src/main.rs",
-            stability: 39,
+            path: "clean.rs",
             ..Default::default()
         }));
-        result.files.push(make_file(FileSpec {
-            path: "src/clean.rs",
-            stability: 80,
-            ..Default::default()
-        }));
-        let insights = compute_insights(&result);
-        let compact = build_compact_files(&result, &insights);
-        // Only src/main.rs has an insight; src/clean.rs must be excluded
-        assert_eq!(compact.len(), 1, "only flagged files should appear");
-        assert_eq!(compact[0].path, "src/main.rs");
+        result.modules.push(make_module("m", 50.0));
+        result
+    }
+
+    #[test]
+    fn test_build_insights_result_gives_the_repository_name_not_the_path() {
+        let mut result = four_findings();
+        result.repository = "/home/dev/work/test-repo".to_string();
+        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        assert_eq!(ir.repository, "test-repo");
+    }
+
+    #[test]
+    fn test_build_insights_result_keeps_every_run_warning() {
+        let mut result = four_findings();
+        result.warnings = vec!["first".into(), "second".into(), "third".into()];
+        let ir = build_insights_result(&result, compute_insights(&result), 1);
+        assert_eq!(ir.warnings, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn test_build_insights_result_caps_findings_and_lists_only_shown_files() {
+        let result = four_findings();
+        let ir = build_insights_result(&result, compute_insights(&result), 2);
+        assert_eq!(ir.version, 2);
+        assert_eq!(ir.counts.insights, Count { total: 4, shown: 2 });
+        assert_eq!(
+            kinds(&ir.insights),
+            [
+                (InsightCategory::Stability, "a.rs"),
+                (InsightCategory::Stability, "b.rs"),
+            ]
+        );
+        let files: Vec<&str> = ir.top_files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, ["a.rs", "b.rs"]);
+        assert!(
+            ir.flagged_modules.is_empty(),
+            "the module finding is not shown"
+        );
+    }
+
+    #[test]
+    fn test_build_insights_result_flags_the_modules_of_shown_findings() {
+        let result = four_findings();
+        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        assert_eq!(ir.counts.insights, Count { total: 4, shown: 4 });
+        let modules: Vec<&str> = ir.flagged_modules.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(modules, ["m"]);
+        let files: Vec<&str> = ir.top_files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, ["a.rs", "b.rs", "c.rs"], "clean.rs has no finding");
     }
 
     #[test]
@@ -722,75 +953,36 @@ mod tests {
             path: "src/main.rs",
             stability: 39,
             combined_pct: 25.0,
-            insufficient_data: false,
-            single_owner_risk: true,
             top_author_pct: 90.0,
-            author_count: 1,
-            blast_radius: vec![],
-        }));
-        let insights = compute_insights(&result);
-        let compact = build_compact_files(&result, &insights);
-        assert_eq!(compact.len(), 1);
-        assert_eq!(compact[0].path, "src/main.rs");
-        assert_eq!(compact[0].stability, 39);
-        assert_eq!(compact[0].churn_commits, 5);
-        assert!((compact[0].fix_risk_pct - 25.0).abs() < 1e-9);
-        assert!(compact[0].bus_factor_risk);
-    }
-
-    #[test]
-    fn test_build_compact_files_empty_insights() {
-        let mut result = make_empty_result();
-        // All clean files — no insights → top_files must be empty
-        result.files.push(make_file(FileSpec {
-            path: "src/clean.rs",
-            stability: 80,
+            author_count: 2,
             ..Default::default()
         }));
-        let insights = compute_insights(&result);
-        assert!(insights.is_empty());
-        let compact = build_compact_files(&result, &insights);
-        assert!(
-            compact.is_empty(),
-            "no insights → no top_files in compact output"
-        );
+        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        assert_eq!(ir.top_files.len(), 1, "one entry for two findings");
+        let entry = &ir.top_files[0];
+        assert_eq!(entry.path, "src/main.rs");
+        assert_eq!(entry.stability, 39);
+        assert_eq!(entry.churn_commits, 5);
+        assert!((entry.fix_risk_pct - 25.0).abs() < EPS);
+        assert!(entry.bus_factor_risk);
     }
 
-    // -----------------------------------------------------------------------
-    // build_flagged_modules
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_build_flagged_modules() {
+    fn test_build_compact_files_bus_factor_risk_needs_the_bus_gate() {
         let mut result = make_empty_result();
-        result.modules.push(make_module("src/", 50.0)); // below threshold → flagged
-        result.modules.push(make_module("tests/", 65.0)); // above threshold → not flagged
-        let flagged = build_flagged_modules(&result);
-        assert_eq!(flagged.len(), 1);
-        assert_eq!(flagged[0].path, "src/");
-    }
-
-    // -----------------------------------------------------------------------
-    // build_insights_result
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_build_insights_result_structure() {
-        let mut result = make_empty_result();
+        result.window_authors = 1;
         result.files.push(make_file(FileSpec {
-            path: "a.rs",
+            path: "src/main.rs",
             stability: 39,
+            top_author_pct: 100.0,
+            author_count: 1,
             ..Default::default()
         }));
-        result.modules.push(make_module("src/", 50.0));
-
-        let insights = compute_insights(&result);
-        let ir = build_insights_result(&result, insights);
-
-        assert_eq!(ir.version, 1);
-        assert_eq!(ir.repository, "test-repo");
-        assert!(!ir.insights.is_empty());
-        assert!(!ir.top_files.is_empty());
-        assert!(!ir.flagged_modules.is_empty());
+        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        assert_eq!(ir.top_files.len(), 1);
+        assert!(
+            !ir.top_files[0].bus_factor_risk,
+            "a one-author window has no bus-factor risk"
+        );
     }
 }
