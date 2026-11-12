@@ -2536,3 +2536,32 @@ fn the_new_hard_failures_are_ledgered_by_id_and_a_first_bless_needs_no_reason() 
         "{err}"
     );
 }
+
+#[test]
+fn ident_def_first_fails_when_the_first_definition_is_another_line_of_the_right_file() {
+    let h = Harness::new();
+    assert_exit(&h.run(), 0);
+    assert_eq!(
+        outcome(&h.report(), "fixture-L01", "ident.def_first").as_deref(),
+        Some("pass"),
+        "the definition line is the first definition site"
+    );
+
+    // The right file ranks first, but its definition site is line 4.
+    let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
+    rows[0].line = 4;
+    rows[0].content = "pub fn check_staleness() {}".to_string();
+    h.write_ident(&rows);
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-L01", "ident.def_first").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-L01", "ident.def_first");
+    assert!(
+        d.contains("src/staleness.rs:4") && d.contains("expected src/staleness.rs:2"),
+        "{d}"
+    );
+}
