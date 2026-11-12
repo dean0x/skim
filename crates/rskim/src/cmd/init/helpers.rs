@@ -585,6 +585,18 @@ mod tests {
         // call the insights JSON "agent-friendly".
         assert!(content.contains("skim heatmap --detail"));
         assert!(!content.contains("agent-friendly"));
+        // It names that --top sets the rows of every view and that the JSON
+        // is version 2, and it gives the JSON as capped.
+        assert!(
+            content
+                .contains("skim heatmap --top 3             # --top sets the rows of every view\n")
+        );
+        assert!(
+            content.contains(
+                "skim heatmap --json              # JSON version 2: compact and capped\n"
+            )
+        );
+        assert!(!content.contains("uncapped"));
     }
 
     /// documentation-14: the guidance's mode ordering is the one output claim in
