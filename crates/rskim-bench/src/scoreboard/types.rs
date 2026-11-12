@@ -224,10 +224,13 @@ pub struct Cost {
 /// A result's rank is its index in `rows` plus the invocation's `--offset`.
 /// skim's `total` is deliberately not kept: it is the page size, not a count.
 ///
-/// [`ResultPage::parse`] fills the first four fields. The other fields are
-/// the line-level and accounting answers the #540 checks read; they stay at
-/// their default (nothing observed) until an adapter fills them, and every
-/// check that reads one fails closed on an absent value.
+/// [`ResultPage::parse`] fills the first four fields, and for the lexical
+/// envelope `occurrences` and `definitions` too (the adapter for the current
+/// output). The other fields are the accounting answers the #540 checks
+/// read: the current output states none of them, so they stay at their
+/// default (nothing observed) until [`ResultPage::with_accounting`] or the
+/// runner fills them, and every check that reads one fails closed on an
+/// absent value.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResultPage {
     pub rows: Vec<ResultRow>,
@@ -298,14 +301,120 @@ impl ResultPage {
             Some(entries) => parse_each(entries, "degraded", parse_degraded)?,
         };
 
+        let (occurrences, definitions) = match arm {
+            Arm::Lexical => {
+                let roles = parse_each(results, "results", field_role)?;
+                let (occurrences, definitions) = line_answers(&rows, &roles);
+                (occurrences, Some(definitions))
+            }
+            Arm::Ast | Arm::HotCold | Arm::Risky | Arm::BlastRadius => (Vec::new(), None),
+        };
+
         Ok(ResultPage {
             rows,
             has_more,
             verify_mode,
             degraded,
+            occurrences,
+            definitions,
             ..ResultPage::default()
         })
     }
+
+    /// This page with the corpus accounting of `stats`: `searched_files` is
+    /// the index's file count and `left_out` its persisted skips by reason.
+    /// The current output states neither, so the run takes them from
+    /// `skim search --stats --json`.
+    #[must_use]
+    pub fn with_accounting(self, stats: &StatsSnapshot) -> Self {
+        ResultPage {
+            searched_files: Some(stats.file_count),
+            left_out: Some(stats.skipped_by_reason.clone()),
+            ..self
+        }
+    }
+}
+
+/// The `field` values that name a definition (`SearchField::TypeDefinition`
+/// and `FunctionSignature`).
+const DEFINITION_FIELDS: [&str; 2] = ["type_definition", "function_signature"];
+
+/// The `field` values that name no role this scoreboard uses: the other six
+/// `SearchField` names, and the co-change-only result of `--blast-radius`.
+const OTHER_FIELDS: [&str; 7] = [
+    "symbol_name",
+    "import_export",
+    "function_body",
+    "comment",
+    "string_literal",
+    "other",
+    "co_change_partner",
+];
+
+/// The role a lexical result's `field` gives its matching line: `def` for
+/// a definition field, `None` for any other known field. The binary prints
+/// the name `SearchField::name` returns
+/// (`crates/rskim-search/src/types.rs:154-165`) in
+/// `ResolvedResult::field` (`crates/rskim/src/cmd/search/types.rs:338`), and
+/// `"co_change_partner"` for a co-change-only result
+/// (`crates/rskim/src/cmd/search/query.rs:1234`).
+///
+/// # Errors
+///
+/// The row has no string `field`, or its value is none of those names: a
+/// value this scoreboard does not know is a harness error, never a missing
+/// role.
+fn field_role(row: &Value) -> anyhow::Result<Option<Role>> {
+    let obj = as_object(row, "row")?;
+    let field = opt_str(obj, "field")?.context("row has no `field`")?;
+    if DEFINITION_FIELDS.contains(&field) {
+        Ok(Some(Role::Def))
+    } else if OTHER_FIELDS.contains(&field) {
+        Ok(None)
+    } else {
+        anyhow::bail!(
+            "unknown `field` value {field:?} (known: {})",
+            DEFINITION_FIELDS
+                .iter()
+                .chain(OTHER_FIELDS.iter())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// The line-level answers of a lexical page: one occurrence for each
+/// `is_match` snippet line of a result, with the result's role, and the
+/// definitions, which are the results whose role is `def` and that state a
+/// line. The output states no definition count.
+fn line_answers(rows: &[ResultRow], roles: &[Option<Role>]) -> (Vec<Occurrence>, Definitions) {
+    let mut occurrences = Vec::new();
+    let mut sites = Vec::new();
+    for (row, &role) in rows.iter().zip(roles) {
+        occurrences.extend(
+            row.snippet
+                .iter()
+                .filter(|l| l.is_match)
+                .map(|l| Occurrence {
+                    path: row.path.clone(),
+                    line: l.line_number,
+                    role,
+                }),
+        );
+        if let (Some(Role::Def), Some(line)) = (role, row.line) {
+            sites.push(DefinitionSite {
+                path: row.path.clone(),
+                line,
+            });
+        }
+    }
+    let definitions = Definitions {
+        count: None,
+        at_least: false,
+        sites,
+    };
+    (occurrences, definitions)
 }
 
 fn parse_row(arm: Arm, value: &Value) -> anyhow::Result<ResultRow> {
@@ -925,7 +1034,7 @@ mod tests {
     fn short_query_rows_carry_a_null_line() {
         let p = page(
             Arm::Lexical,
-            r#"{"results":[{"path":"a.rs","score":0.0,"line_number":null,"snippet":null}]}"#,
+            r#"{"results":[{"path":"a.rs","score":0.0,"field":"other","line_number":null,"snippet":null}]}"#,
         )
         .unwrap();
         assert_eq!(p.rows[0].line, None);
@@ -1020,17 +1129,23 @@ mod tests {
             (Arm::Lexical, "skim search: no index found"),
             (Arm::Lexical, r#"{"total":0}"#),
             (Arm::Lexical, r#"{"results":{}}"#),
-            (Arm::Lexical, r#"{"results":[{"score":1.0}]}"#),
             (
                 Arm::Lexical,
-                r#"{"results":[{"path":"a.rs","score":"high"}]}"#,
+                r#"{"results":[{"score":1.0,"field":"other"}]}"#,
             ),
-            (Arm::Lexical, r#"{"results":[{"path":"a.rs"}]}"#),
+            (
+                Arm::Lexical,
+                r#"{"results":[{"path":"a.rs","score":"high","field":"other"}]}"#,
+            ),
+            (
+                Arm::Lexical,
+                r#"{"results":[{"path":"a.rs","field":"other"}]}"#,
+            ),
             (Arm::Lexical, r#"{"has_more":"yes","results":[]}"#),
             (Arm::Lexical, r#"{"verify_mode":3,"results":[]}"#),
             (
                 Arm::Lexical,
-                r#"{"results":[{"path":"a.rs","score":1.0,"line_number":-1}]}"#,
+                r#"{"results":[{"path":"a.rs","score":1.0,"field":"other","line_number":-1}]}"#,
             ),
             (Arm::HotCold, r#"{"results":[{"path":"a.rs","score":1.0}]}"#),
         ] {
@@ -1270,16 +1385,207 @@ mod tests {
         assert_eq!(Role::from_name(""), None);
     }
 
+    // --- the adapter for the current search output (#540) ---------------------
+
+    /// A `skim search --json` envelope as the current binary prints it (skim
+    /// 2.11.0, `--limit 10 -- check_staleness` over a three-file repository),
+    /// less the `index_stats` object. The first file defines the name, the
+    /// second calls it, and the match line is the `is_match` snippet line.
+    const CURRENT_ENVELOPE: &str = r#"{"query":"check_staleness","total":2,"results":[
+        {"path":"staleness.rs","score":3.636363557547579,"field":"function_signature",
+         "line_number":2,"line_range":{"start":2,"end":3},
+         "snippet":{"lines":[
+            {"line_number":1,"content":"// staleness checks","is_match":false},
+            {"line_number":2,"content":"pub fn check_staleness() -> bool {","is_match":true},
+            {"line_number":3,"content":"    true","is_match":false},
+            {"line_number":4,"content":"}","is_match":false}]},
+         "stale":false},
+        {"path":"other.rs","score":0.6818181670401711,"field":"function_body",
+         "line_number":2,"line_range":{"start":2,"end":3},
+         "snippet":{"lines":[
+            {"line_number":1,"content":"fn refresh() {","is_match":false},
+            {"line_number":2,"content":"    if check_staleness() {}","is_match":true},
+            {"line_number":3,"content":"}","is_match":false},
+            {"line_number":4,"content":"// check_staleness is here","is_match":false}]},
+         "stale":false}],
+        "duration_ms":2}"#;
+
+    fn occurrence(path: &str, line: u32, role: Option<Role>) -> Occurrence {
+        Occurrence {
+            path: path.to_string(),
+            line,
+            role,
+        }
+    }
+
     #[test]
-    fn a_parsed_page_has_no_line_level_answers_until_an_adapter_fills_them() {
-        let page = page(Arm::Lexical, r#"{"results": []}"#).unwrap();
-        assert!(page.occurrences.is_empty());
-        assert_eq!(page.definitions, None);
+    fn the_adapter_reads_occurrences_and_definition_sites_from_a_recorded_current_envelope() {
+        let page = page(Arm::Lexical, CURRENT_ENVELOPE).unwrap();
+        // One occurrence per result: its `is_match` line, never a context line.
+        assert_eq!(
+            page.occurrences,
+            vec![
+                occurrence("staleness.rs", 2, Some(Role::Def)),
+                occurrence("other.rs", 2, None),
+            ]
+        );
+        // The definition sites are the results whose field names a definition.
+        assert_eq!(
+            page.definitions,
+            Some(Definitions {
+                count: None,
+                at_least: false,
+                sites: vec![DefinitionSite {
+                    path: "staleness.rs".to_string(),
+                    line: 2,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn the_current_output_states_nothing_beyond_occurrences_and_definition_sites() {
+        let page = page(Arm::Lexical, CURRENT_ENVELOPE).unwrap();
+        assert_eq!(page.unlabelled_files, 0);
         assert_eq!(page.searched_files, None);
         assert_eq!(page.left_out, None);
+        assert!(page.line_counts.is_empty());
         assert_eq!(page.cost, None);
-        assert_eq!(page.unlabelled_files, 0);
         assert_eq!(page.exit_code, 0);
+    }
+
+    #[test]
+    fn every_field_value_the_current_binary_prints_maps_to_a_role() {
+        // `SearchField::name` (eight values) and the co-change stub.
+        for (field, role) in [
+            ("type_definition", Some(Role::Def)),
+            ("function_signature", Some(Role::Def)),
+            ("symbol_name", None),
+            ("import_export", None),
+            ("function_body", None),
+            ("comment", None),
+            ("string_literal", None),
+            ("other", None),
+            ("co_change_partner", None),
+        ] {
+            let json = format!(
+                r#"{{"results":[{{"path":"a.rs","score":1.0,"field":"{field}","line_number":3,
+                    "snippet":{{"lines":[{{"line_number":3,"content":"x","is_match":true}}]}}}}]}}"#
+            );
+            let p = page(Arm::Lexical, &json).unwrap();
+            assert_eq!(p.occurrences, vec![occurrence("a.rs", 3, role)], "{field}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_field_value_is_a_harness_error_naming_the_value() {
+        for field in ["text", "Function_Signature", "", "functionSignature"] {
+            let json = format!(
+                r#"{{"results":[{{"path":"a.rs","score":1.0,"field":"{field}","line_number":3}}]}}"#
+            );
+            let err = page(Arm::Lexical, &json).expect_err("an unknown field value");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("field"), "{field:?}: {msg}");
+            assert!(msg.contains(&format!("{field:?}")), "{field:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_lexical_row_without_a_string_field_is_a_harness_error() {
+        for row in [
+            r#"{"path":"a.rs","score":1.0,"line_number":3}"#,
+            r#"{"path":"a.rs","score":1.0,"field":null,"line_number":3}"#,
+            r#"{"path":"a.rs","score":1.0,"field":7,"line_number":3}"#,
+        ] {
+            let json = format!(r#"{{"results":[{row}]}}"#);
+            assert!(page(Arm::Lexical, &json).is_err(), "{row}");
+        }
+    }
+
+    #[test]
+    fn a_result_with_no_snippet_or_line_gives_no_occurrence_and_no_definition_site() {
+        // A query under three bytes: `line_number` and `snippet` are null.
+        let p = page(
+            Arm::Lexical,
+            r#"{"results":[{"path":"a.rs","score":0.0,"field":"function_signature",
+                            "line_number":null,"snippet":null}]}"#,
+        )
+        .unwrap();
+        assert!(p.occurrences.is_empty());
+        assert_eq!(p.definitions.unwrap().sites, vec![]);
+    }
+
+    #[test]
+    fn an_empty_lexical_page_reports_no_definition_sites() {
+        let p = page(Arm::Lexical, r#"{"results": []}"#).unwrap();
+        assert!(p.occurrences.is_empty());
+        let definitions = p.definitions.expect("a lexical page states definitions");
+        assert_eq!(definitions.count, None);
+        assert!(definitions.sites.is_empty());
+    }
+
+    #[test]
+    fn definition_sites_keep_the_rank_order_of_the_results() {
+        let row = |path: &str, field: &str, line: u32| {
+            format!(
+                r#"{{"path":"{path}","score":1.0,"field":"{field}","line_number":{line},
+                    "snippet":{{"lines":[{{"line_number":{line},"content":"x","is_match":true}}]}}}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"results":[{},{},{}]}}"#,
+            row("b.rs", "type_definition", 9),
+            row("c.rs", "function_body", 4),
+            row("a.rs", "function_signature", 1)
+        );
+        let sites = page(Arm::Lexical, &json)
+            .unwrap()
+            .definitions
+            .unwrap()
+            .sites;
+        let at: Vec<(&str, u32)> = sites.iter().map(|s| (s.path.as_str(), s.line)).collect();
+        assert_eq!(at, [("b.rs", 9), ("a.rs", 1)]);
+    }
+
+    #[test]
+    fn the_other_arms_state_no_line_level_answers() {
+        // Their rows carry no `field`, and they name no definition.
+        let p = page(
+            Arm::HotCold,
+            r#"{"results":[{"path":"a.rs","hotspot_score":0.9}]}"#,
+        )
+        .unwrap();
+        assert!(p.occurrences.is_empty());
+        assert_eq!(p.definitions, None);
+        let p = page(
+            Arm::Ast,
+            r#"{"results":[{"path":"a.rs","score":1.5,"line":7,"snippet":"fn big() {"}]}"#,
+        )
+        .unwrap();
+        assert!(p.occurrences.is_empty());
+        assert_eq!(p.definitions, None);
+    }
+
+    #[test]
+    fn the_corpus_accounting_comes_from_the_stats_snapshot() {
+        let stats = StatsSnapshot::parse(
+            br#"{"file_count":828,"skipped_by_reason":{"minified":1,"binary":2}}"#,
+        )
+        .unwrap();
+        let p = page(Arm::Lexical, CURRENT_ENVELOPE)
+            .unwrap()
+            .with_accounting(&stats);
+        assert_eq!(p.searched_files, Some(828));
+        assert_eq!(
+            p.left_out,
+            Some(BTreeMap::from([
+                ("binary".to_string(), 2),
+                ("minified".to_string(), 1)
+            ]))
+        );
+        // Nothing else changes.
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(p.occurrences.len(), 2);
     }
 
     // --- standalone --ast coverage ------------------------------------------------

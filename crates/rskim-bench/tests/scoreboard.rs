@@ -113,12 +113,6 @@ const PREFIX: (&str, &str, &[&str]) = ("fixture-F001", "fn", &["--hot"]);
 /// Standalone `--ast`: no query (the stub keys it on the empty string) and
 /// no oracle.
 const AST: (&str, &str, &[&str]) = ("fixture-F002", "", &["--ast", "god-function"]);
-/// The one check the stub cannot answer yet. Its pages carry no definition
-/// site, so `ident.def_first` fails closed on the `[[ident]]` entry until the
-/// stub and the page adapter state `definitions`. Every ledger the harness
-/// writes starts with this entry; remove it together with that gap.
-const STUB_GAP_LEDGER: &str = "[[xfail]]\nissue = \"#9100\"\ncheck = \"ident.def_first\"\n\
-                               ids = [\"fixture-L01\"]\nnote = \"the stub states no definition site\"\n\n";
 const PAGE_LIMIT: u32 = 2;
 const PREFIX_LIMIT: u32 = 1;
 const FULL_LIMIT: u32 = 1_000_000;
@@ -200,11 +194,32 @@ struct Row {
     content: String,
 }
 
+impl Row {
+    /// The `field` the binary prints for this line (`SearchField::name`): a
+    /// type or function declaration is a definition field, a comment is
+    /// `comment`, and any other line is `function_body`.
+    fn field(&self) -> &'static str {
+        let line = self.content.trim_start();
+        if ["struct ", "pub struct ", "enum ", "pub enum "]
+            .iter()
+            .any(|p| line.starts_with(p))
+        {
+            "type_definition"
+        } else if ["fn ", "pub fn "].iter().any(|p| line.starts_with(p)) {
+            "function_signature"
+        } else if line.starts_with("//") {
+            "comment"
+        } else {
+            "function_body"
+        }
+    }
+}
+
 fn row_json(row: &Row, score: f64) -> Value {
     json!({
         "path": row.path,
         "score": score,
-        "field": "text",
+        "field": row.field(),
         "line_number": row.line,
         "snippet": {"lines": [{"line_number": row.line, "content": row.content, "is_match": true}]},
         "stale": false,
@@ -287,8 +302,8 @@ struct Harness {
 
 impl Harness {
     /// A fixture corpus, its golden set, and a stub that answers every
-    /// golden query correctly. The ledger holds [`STUB_GAP_LEDGER`] only, and
-    /// there is no baseline.
+    /// golden query correctly. The ledger is empty, and there is no
+    /// baseline.
     fn new() -> Self {
         let source = FixtureRepo::new();
         for (path, contents) in FILES {
@@ -399,13 +414,9 @@ impl Harness {
         );
     }
 
-    /// The ledger: [`STUB_GAP_LEDGER`] plus `body`.
+    /// The ledger: `body`.
     fn write_ledger(&self, body: &str) {
-        fs::write(
-            self.data_dir.path().join("known_failures.toml"),
-            format!("{STUB_GAP_LEDGER}{body}"),
-        )
-        .unwrap();
+        fs::write(self.data_dir.path().join("known_failures.toml"), body).unwrap();
     }
 
     fn baseline_path(&self) -> PathBuf {
@@ -778,11 +789,10 @@ fn a_correct_skim_passes_run_bless_and_check() {
         outcome(&report, "fixture-X01", "lexical.recall_tracked").as_deref(),
         Some("pass")
     );
-    // A page with no definition site fails `ident.def_first` closed; the
-    // harness ledger excuses it (see `STUB_GAP_LEDGER`).
+    // The first definition site is the frozen definition line.
     assert_eq!(
         outcome(&report, "fixture-L01", "ident.def_first").as_deref(),
-        Some("xfail")
+        Some("pass")
     );
     assert_eq!(
         outcome(&report, "fixture-G001", "pagination.complete").as_deref(),
