@@ -83,7 +83,8 @@ type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync + 'stati
 /// Wrap a buffered body into the unified `ProxyBody` type.
 fn full_body(b: impl Into<Bytes>) -> ProxyBody {
     Full::from(b.into())
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        // `Full`'s error type is `Infallible`: no error value exists to box.
+        .map_err(|never| match never {})
         .boxed()
 }
 

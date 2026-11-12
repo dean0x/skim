@@ -1146,7 +1146,7 @@ mod tests {
         let user_args = vec!["--run".to_string(), "math".to_string()];
         let mut received_args: Vec<String> = Vec::new();
 
-        run_passthrough(
+        let exit_code = run_passthrough(
             &user_args,
             // identity — mimics vitest's passthrough_prepare_args
             |a| a.to_vec(),
@@ -1156,6 +1156,7 @@ mod tests {
             },
         )
         .expect("run_passthrough should not error");
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         assert!(
             !received_args.iter().any(|a| a.contains("--reporter")),
@@ -1183,7 +1184,7 @@ mod tests {
         let user_args = vec!["--project=chromium".to_string()];
         let mut received_args: Vec<String> = Vec::new();
 
-        run_passthrough(
+        let exit_code = run_passthrough(
             &user_args,
             // subcommand-only — mimics playwright's passthrough_prepare_args
             |a| {
@@ -1197,6 +1198,7 @@ mod tests {
             },
         )
         .expect("run_passthrough should not error");
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         assert_eq!(
             received_args.first().map(String::as_str),
