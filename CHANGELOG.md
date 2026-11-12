@@ -28,7 +28,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers with a `PreToolUse`-shaped response. How Claude Code reacts to that response is not
   yet measured live.
 
+- **`skim heatmap` gives a short ranked view, full sections and per-file cards** (#589).
+  The default text view is 30 lines or fewer: one header line (repository name,
+  `since..until` dates, commit count, window), the top 10 hotspots by commit count, the top 5
+  code-to-code coupling pairs and the top 5 fix-risk files above the repository base rate,
+  each row with its number and support. `--detail <section>` shows all rows of one section:
+  `hotspots`, `coupling`, `fix-risk`, `modules` or `bus-factor`. `--top N` now sets the rows
+  of every view, `--insights` and the cards too. A capped list ends with one line that gives
+  the exact hidden count. `skim heatmap <file>...` prints a "before you edit" card per file
+  (at most 5): co-change partners with 3 or more shared commits (tests first), up to 3 fix
+  commits from history (at most 5 at any `--top`), and owners when the file has 2 or more
+  authors. `--insights <file>` prints the same card. Control, bidirectional and invisible
+  format characters in card text from history show as `U+FFFD`. In the card text, subjects
+  and owner names are in double quotes, with `\"` and `\\` for a quote and a backslash.
+
 ### Changed
+
+- **The optional permission setup now allows only read-only commands.** `skim init
+  --permissions` seeds 6 tools (`df`, `diff`, `du`, `grep`, `ls`, `wc`); `rg` and `tree` are
+  no longer in the list. The next `skim init` removes the `rg` and `tree` entries that an older
+  skim seeded and prints `removed 2 entries that skim no longer seeds`. This removal needs no
+  consent and no terminal, and it runs with or without `--permissions` (also with
+  `--no-permissions`); `--dry-run` shows it and changes nothing. skim removes only the entries
+  that its own record of the earlier setup names. For Copilot CLI, the entries go from every
+  project in `permissions-config.json`. Other allow-list entries stay as they are. To keep `rg`
+  or `tree` allowed, add the entry yourself.
+
+- **BREAKING: `skim heatmap` JSON is version 2** (#589). The output is one compact line.
+  Each array of rows has the cap of its section in the view (10 hotspot rows in `files[]`
+  by default), each `files[].blast_radius` holds at most 5 partners, and
+  `counts.<section>.{total,shown}` gives the full and the shown count of each section.
+  `file_targets[]` holds at most 20 targets, with `counts.file_targets`. `warnings[]` has at
+  most one line for each kind of warning: the `--diff` files that are not in the window give
+  one line that counts them and names the first 3. `excluded_patterns[]` is the fixed
+  pattern list (the default excludes and the `--exclude` values).
+  `files[]` keeps its per-file keys. `--insights --json` gives the top 20 findings, and
+  `top_files` and `flagged_modules` hold only the shown findings. `--insights --json` has
+  the same `warnings[]` as `--json`, and the `--insights` text shows the same warning lines
+  as the default view. With file arguments,
+  `cards[]` holds the cards. Readers of version 1 must update; `--top N` or
+  `--detail <section>` gives more rows.
+- **`skim heatmap` shows fewer signals, each with enough support** (#589). Fix risk and bus
+  factor need 5 commits of a file, coupling needs 3 shared commits, and modules need 5
+  commits. A fix-risk row needs the 95% lower bound of the file's fix rate above the
+  repository base rate, and it shows the lift and the base rate. Bus factor shows only when
+  the window has 2 or more authors. The coupling section shows only code-to-code pairs.
+  Insights follow the same minimums and rank by severity, score, support, then path. Module
+  health and bus factor move to `--detail`. Modules are the folders of tracked `Cargo.toml`
+  and `package.json` files, else the top folder. `CHANGELOG.md`, `*.snap`, `snapshots/`,
+  `*.pb.go`, `*_pb2.py` and `generated/` paths at any depth are excluded by default;
+  `--no-exclude` keeps them. File arguments now print cards instead of a scoped view;
+  `--diff` still gives the scoped default view.
 
 - **Machine-contract flags on `skim git` now serve git's own bytes verbatim** (#576,
   ADR-022) — `--porcelain` (including `=v1`/`=v2`), `--null`/`-z` (matched anywhere in a
@@ -83,6 +133,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`skim heatmap` sections report the right files** (#589). Hotspots are the true top N by
+  commit count over all files. The fix-after-touch signal counts a commit that a later fix
+  follows, in the right history order. A commit with more than 50 files adds no coupling
+  pairs, and a warning line gives the count of these commits. A malformed git log record is
+  skipped and counted in a warning, and an author name with `|` keeps its timestamp and
+  subject.
+- **Heatmap flag values reach git as values only** (#589).
 - **A rewritten Claude Code Bash call keeps its other settings** (#586). Claude Code
   replaces the whole tool input with the hook's `updatedInput`, and the hook sent only
   `command`. So a rewritten call lost its `description`, `timeout`,

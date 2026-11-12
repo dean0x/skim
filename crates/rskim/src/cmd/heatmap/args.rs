@@ -2,7 +2,7 @@
 //!
 //! Provides [`parse_args`] (table-driven flag dispatch) and [`print_help`].
 
-use super::types::HeatmapArgs;
+use super::types::{DetailSection, HeatmapArgs};
 use std::time::UNIX_EPOCH;
 
 // ============================================================================
@@ -21,6 +21,7 @@ enum ValueFlagAction {
     FixWindow,
     Format,
     Diff,
+    Detail,
 }
 
 struct ValueFlagSpec {
@@ -68,6 +69,10 @@ const VALUE_FLAG_TABLE: &[ValueFlagSpec] = &[
     ValueFlagSpec {
         name: "--diff",
         action: ValueFlagAction::Diff,
+    },
+    ValueFlagSpec {
+        name: "--detail",
+        action: ValueFlagAction::Detail,
     },
 ];
 
@@ -136,7 +141,22 @@ fn apply_value_flag(
             }
         }
         ValueFlagAction::Diff => {
+            // Heatmap flag values reach git as values only: a value that
+            // starts with `-` is not a branch or commit name.
+            if val.starts_with('-') {
+                anyhow::bail!("--diff value must not start with '-': {val}");
+            }
             args.diff_base = Some(val);
+        }
+        ValueFlagAction::Detail => {
+            if args.detail.is_some() {
+                anyhow::bail!("--detail can be given only once");
+            }
+            let Some(section) = DetailSection::from_name(&val) else {
+                let names = DetailSection::ALL.map(DetailSection::name).join(", ");
+                anyhow::bail!("--detail must be one of {names}; got: {val}");
+            };
+            args.detail = Some(section);
         }
     }
     Ok(())
@@ -200,14 +220,18 @@ pub(super) fn parse_args(raw: &[String]) -> anyhow::Result<HeatmapArgs> {
     if args.diff_base.is_some() && !args.files.is_empty() {
         anyhow::bail!("cannot combine --diff with explicit file arguments");
     }
-
-    // Normalize file paths: strip leading ./
-    for f in &mut args.files {
-        if let Some(stripped) = f.strip_prefix("./") {
-            *f = stripped.to_string();
+    // `--detail` with `--diff` is allowed: the diff only scopes the files.
+    if args.detail.is_some() {
+        if args.insights {
+            anyhow::bail!("cannot combine --detail with --insights");
+        }
+        if !args.files.is_empty() {
+            anyhow::bail!("cannot combine --detail with explicit file arguments");
         }
     }
 
+    // File arguments stay as typed: `prepare_commits` normalises them
+    // against the repository root.
     Ok(args)
 }
 
@@ -280,23 +304,90 @@ pub(super) fn print_help() {
 skim heatmap — git history risk and coupling analysis
 
 USAGE:
-    skim heatmap [OPTIONS] [FILE...]
+    skim heatmap [OPTIONS]                Short ranked view (30 lines or fewer)
+    skim heatmap --detail <SECTION>       One full section
+    skim heatmap --insights               Ranked CRITICAL/WARNING findings
+    skim heatmap [OPTIONS] <FILE>...      One \"before you edit\" card per file
 
 OPTIONS:
     --since <VALUE>               Analyze commits since epoch (seconds) or duration (30d, 2w, 24h)
     --last <N>                    Analyze last N commits
     --window <PRESET>             Named window: sprint|month|quarter|half|year|all
     --path <DIR>                  Scope analysis to files under this path
-    --diff <BASE>                 Show only files changed vs BASE (three-dot diff)
-    --json, --format json         Output JSON instead of human-readable text
-    --top <N>                     Maximum files to display (default: 20)
-    --no-exclude                  Disable default exclusion patterns (lock files, build dirs, etc.)
+    --diff <BASE>                 Default view for the files changed vs BASE (three-dot diff)
+    --detail <SECTION>            One full section: hotspots|coupling|fix-risk|modules|bus-factor
+    --top <N>                     Rows of each list in every view (replaces the caps below)
+    --json, --format json         Output JSON (version 2: one compact line, capped, with counts)
+    --no-exclude                  Keep the files of the default excludes (see DEFAULT EXCLUDES)
     --exclude <PATTERN>           Add extra glob pattern to exclude (repeatable)
     --coupling-threshold <FLOAT>  Coupling confidence threshold (default: 0.5)
     --fix-window <N>              Proximity window for fix-after-touch detection (default: 5)
-    --insights                    Show only notable findings (threshold-filtered insights)
+    --insights                    Show ranked findings only
     --debug                       Enable debug output
     -h, --help                    Show this help message
+
+DEFAULT VIEW:
+    A header line (repository name, since..until dates, commits, window), then:
+    Hotspots     the 10 files with the most commits
+    Coupling     the 5 code-to-code pairs with the highest confidence
+    Fix risk     5 files whose fix rate is above the repository base rate
+    A capped section ends with one \"N more (--detail <section>)\" line.
+    Module health and bus factor show only with --detail.
+
+SECTIONS (--detail names):
+    hotspots     Files changed most often (commits)
+    coupling     Code-to-code file pairs that change together (no doc files)
+    fix-risk     Fix commits/commits, lift and base rate, for files above the base rate
+    modules      Encapsulation of each crate, package (Cargo.toml, package.json) or top folder
+    bus-factor   Files with one dominant author (more than 80% of commits)
+
+CAPS (--top N replaces each of them):
+    Default view     hotspots 10, coupling 5, fix risk 5
+    --detail X       all rows of X
+    --insights       20 findings, then one \"N more (raise --top)\" line
+    File cards       5 cards; per card 3 owners, 4 partners, 3 fix commits
+                     (fix commits stay at 5 or fewer at any --top)
+
+NOISE RULES:
+    Fix risk and bus factor need 5 commits of the file. Fix risk also needs
+    the 95% lower bound of the file's fix rate to be above the base rate.
+    Coupling needs 3 shared commits. Modules need 5 commits. Bus factor shows
+    only when the window has 2 or more authors. Commits with more than 50
+    files are not paired; a warning line gives their count. Insights follow
+    the same minimums and rank by severity, score, support, then path.
+
+FILE CARDS:
+    skim heatmap <FILE>... prints one card per file: commits, owners (only
+    with 2 or more authors), co-change partners with 3 or more shared commits
+    (tests first), and fix commits from history, newest first. A file outside
+    the window prints \"not in history window\". --insights <FILE> prints the
+    same card. ./x, an absolute path under the repository root and a path
+    relative to the current folder give the same card; a path outside the
+    repository exits 1. Metrics come from the full window; a card only
+    narrows the display.
+
+FILE TARGETING:
+    --path scopes the git log itself (commit-level filter); it composes with
+    file arguments. --diff and file arguments are mutually exclusive.
+    --detail takes no file arguments and does not combine with --insights.
+
+DEFAULT EXCLUDES (--no-exclude keeps them):
+    Lock files, build and dist folders, minified bundles, logs, vendor and
+    node_modules, coverage output, and at any depth: CHANGELOG.md, *.snap,
+    snapshots/, *.pb.go, *_pb2.py and generated/ folders. A file marked
+    \"generated\" only in a header line stays in.
+
+JSON (version 2):
+    One compact line. Each array of rows has the cap of its section, and
+    counts.<section>.{{total,shown}} gives the full and shown counts. files[]
+    holds the hotspot rows; no support minimum applies to it. With file
+    arguments, cards[] holds the cards. file_targets[] holds at most 20
+    targets, and counts.file_targets gives their full count. warnings[] has
+    at most one line for each kind of warning. excluded_patterns[] is the
+    fixed pattern list: the default excludes and the --exclude values.
+    --insights --json gives insights[],
+    top_files[] and flagged_modules[] for the shown findings only, and the
+    same warnings[] as --json.
 
 WINDOW PRESETS:
     sprint     14 days
@@ -305,40 +396,21 @@ WINDOW PRESETS:
     half       180 days
     year       365 days
     all        No time limit (analyze entire history)
-
-FILE TARGETING:
-    Positional file arguments and --diff scope the OUTPUT, not the git history.
-    Metrics are computed on full commit history for accuracy — coupling and
-    fix-risk scores reflect the complete picture, then display is narrowed.
-
-    --path scopes the git log itself (commit-level filter). File targeting and
-    --path compose: --path limits which commits are analyzed, file arguments
-    limit which results are shown.
-
-    --diff and explicit file arguments are mutually exclusive.
+    (default)  The wider of the last 90 days and the last 200 commits
 
 EXAMPLES:
-    skim heatmap                           # Analyze last 90 days
-    skim heatmap --last 200                # Analyze last 200 commits
-    skim heatmap --window sprint           # Analyze last sprint
-    skim heatmap --since 30d               # Analyze last 30 days
-    skim heatmap --json                    # JSON output
-    skim heatmap --path src/               # Scope to src/ directory
-    skim heatmap --no-exclude              # Include lock files and build artifacts
-    skim heatmap --coupling-threshold 0.3  # Lower coupling threshold
-    skim heatmap src/main.rs               # Scope output to one file
-    skim heatmap --diff main               # Show files changed vs main
-    skim heatmap --path src/ src/main.rs   # Combine path + file scoping
-    skim heatmap --insights                # One-liner findings only
-    skim heatmap --insights --json         # Insights as JSON (agent-friendly)
-    skim heatmap --insights src/main.rs    # Insights for specific file
-
-METRICS:
-    Top Churn          Files changed most frequently
-    Blast Radius       Files that tend to change together (coupling)
-    Fix Risk           Files with high fix-commit density or fix-after-touch
-    Module Health      Directory encapsulation (cross-boundary coupling)
-    Bus Factor Risk    Files with a single dominant author (>80%% of commits)
+    skim heatmap                              # Short ranked view
+    skim heatmap --detail coupling            # All coupling pairs
+    skim heatmap --detail fix-risk --top 20   # 20 fix-risk rows
+    skim heatmap --top 3                      # 3 rows per section
+    skim heatmap src/main.rs                  # Card for one file before you edit it
+    skim heatmap --diff main                  # Default view for files changed vs main
+    skim heatmap --insights                   # Top 20 ranked findings
+    skim heatmap --insights --top 50 --json   # Top 50 findings as JSON
+    skim heatmap --last 200                   # Analyze last 200 commits
+    skim heatmap --window sprint              # Analyze last sprint
+    skim heatmap --path src/                  # Scope to src/ directory
+    skim heatmap --no-exclude                 # Keep lock files, changelogs and snapshots
 "
     );
 }
@@ -491,6 +563,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_args_diff_dash_value_space_form_errors() {
+        let result = parse_args(&["--diff".to_string(), "--stat".to_string()]);
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--diff value must not start with '-'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_diff_dash_value_equals_form_errors() {
+        let result = parse_args(&["--diff=-x".to_string()]);
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--diff value must not start with '-'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_parse_args_diff_and_files_mutual_exclusion() {
         let result = parse_args(&[
             "--diff".to_string(),
@@ -503,9 +595,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_args_file_path_normalization() {
+    fn test_parse_args_keeps_file_arguments_as_typed() {
+        // The card normalises paths against the repository root later.
         let args = parse_args(&["./src/main.rs".to_string()]).unwrap();
-        assert_eq!(args.files, vec!["src/main.rs"]);
+        assert_eq!(args.files, vec!["./src/main.rs"]);
     }
 
     #[test]
@@ -575,5 +668,96 @@ mod tests {
     fn test_parse_args_insights_default_false() {
         let args = parse_args(&[]).unwrap();
         assert!(!args.insights, "insights should default to false");
+    }
+
+    // -----------------------------------------------------------------------
+    // --detail
+    // -----------------------------------------------------------------------
+
+    fn strings(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parse_error(raw: &[&str]) -> String {
+        parse_args(&strings(raw)).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn test_parse_args_detail_accepts_every_section_name() {
+        let expected = [
+            ("hotspots", DetailSection::Hotspots),
+            ("coupling", DetailSection::Coupling),
+            ("fix-risk", DetailSection::FixRisk),
+            ("modules", DetailSection::Modules),
+            ("bus-factor", DetailSection::BusFactor),
+        ];
+        for (name, section) in expected {
+            let space = parse_args(&strings(&["--detail", name])).unwrap();
+            assert_eq!(space.detail, Some(section), "--detail {name}");
+            let equals = parse_args(&strings(&[&format!("--detail={name}")])).unwrap();
+            assert_eq!(equals.detail, Some(section), "--detail={name}");
+        }
+    }
+
+    #[test]
+    fn test_parse_args_detail_absent_by_default() {
+        assert_eq!(parse_args(&[]).unwrap().detail, None);
+    }
+
+    #[test]
+    fn test_parse_args_detail_unknown_name_lists_valid_names() {
+        assert_eq!(
+            parse_error(&["--detail", "churn"]),
+            "--detail must be one of hotspots, coupling, fix-risk, modules, bus-factor; got: churn"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_repeated_errors() {
+        assert_eq!(
+            parse_error(&["--detail", "coupling", "--detail=modules"]),
+            "--detail can be given only once"
+        );
+        assert_eq!(
+            parse_error(&["--detail", "coupling", "--detail", "coupling"]),
+            "--detail can be given only once"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_with_insights_errors() {
+        assert_eq!(
+            parse_error(&["--detail", "coupling", "--insights"]),
+            "cannot combine --detail with --insights"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_with_file_arguments_errors() {
+        assert_eq!(
+            parse_error(&["src/main.rs", "--detail", "hotspots"]),
+            "cannot combine --detail with explicit file arguments"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_with_diff_is_allowed() {
+        let args = parse_args(&strings(&["--diff", "main", "--detail", "coupling"])).unwrap();
+        assert_eq!(args.detail, Some(DetailSection::Coupling));
+        assert_eq!(args.diff_base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn test_parse_args_detail_without_value_errors() {
+        assert_eq!(parse_error(&["--detail"]), "--detail requires a value");
+    }
+
+    #[test]
+    fn test_parse_args_detail_keeps_top_explicit() {
+        let implicit = parse_args(&strings(&["--detail", "modules"])).unwrap();
+        assert!(!implicit.top_explicit);
+        let explicit = parse_args(&strings(&["--detail", "modules", "--top", "4"])).unwrap();
+        assert!(explicit.top_explicit);
+        assert_eq!(explicit.top_n, 4);
     }
 }

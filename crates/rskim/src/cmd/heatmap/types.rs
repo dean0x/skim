@@ -5,7 +5,7 @@
 //! ```text
 //! CLI args  ──parse_args()──►  HeatmapArgs
 //!                                  │
-//!                      resolve_diff_files() mutates diff_base/files
+//!                 resolve_diff_files() mutates diff_base/diff_files
 //!                                  │
 //!                         resolve_config()  (consumes HeatmapArgs)
 //!                                  │
@@ -52,7 +52,7 @@ pub(crate) struct HeatmapArgs {
     pub(crate) path: Option<String>,
     /// Emit JSON output instead of text.
     pub(crate) format_json: bool,
-    /// Maximum number of files to display (default 20).
+    /// The `--top` value (20 when not given; see `top_explicit`).
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
@@ -72,16 +72,22 @@ pub(crate) struct HeatmapArgs {
     ///
     /// Consumed by `resolve_config` — copied into [`ResolvedWindow`].
     pub(crate) last_n: Option<usize>,
-    /// Explicit file targets — scope display to these paths.
+    /// Positional file arguments: one card each. `prepare_commits` replaces
+    /// them with their repo-relative paths before `resolve_config`.
     pub(crate) files: Vec<String>,
     /// Base branch/ref for `--diff` three-dot diff.
     ///
     /// Consumed by `resolve_diff_files` via `.take()`.
     pub(crate) diff_base: Option<String>,
+    /// The files that `--diff` names, repo-relative as git reports them.
+    /// Set by `resolve_diff_files`; they scope the default view.
+    pub(crate) diff_files: Vec<String>,
     /// True when `--top` was explicitly passed (vs. implied by file targeting).
     pub(crate) top_explicit: bool,
     /// Show only threshold-filtered one-liner insights.
     pub(crate) insights: bool,
+    /// The one section that `--detail` names, if given.
+    pub(crate) detail: Option<DetailSection>,
 }
 
 impl Default for HeatmapArgs {
@@ -100,9 +106,50 @@ impl Default for HeatmapArgs {
             last_n: None,
             files: Vec::new(),
             diff_base: None,
+            diff_files: Vec::new(),
             top_explicit: false,
             insights: false,
+            detail: None,
         }
+    }
+}
+
+/// A section of the heatmap view that `--detail` can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailSection {
+    Hotspots,
+    Coupling,
+    FixRisk,
+    Modules,
+    BusFactor,
+}
+
+impl DetailSection {
+    /// Every section, in display order.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Hotspots,
+        Self::Coupling,
+        Self::FixRisk,
+        Self::Modules,
+        Self::BusFactor,
+    ];
+
+    /// The name of the section on the command line.
+    #[must_use]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Hotspots => "hotspots",
+            Self::Coupling => "coupling",
+            Self::FixRisk => "fix-risk",
+            Self::Modules => "modules",
+            Self::BusFactor => "bus-factor",
+        }
+    }
+
+    /// The section whose command-line name is `name`, if one has it.
+    #[must_use]
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name() == name)
     }
 }
 
@@ -125,7 +172,9 @@ pub(crate) struct HeatmapConfig {
     pub(crate) path: Option<String>,
     /// Emit JSON output instead of text.
     pub(crate) format_json: bool,
-    /// Maximum number of files to display (default 20).
+    /// The `--top` value (20 when not given). The ranked view reads it only
+    /// when `top_explicit` is set; without `--top`, each list has its own
+    /// default cap (see `view.rs`).
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
@@ -137,12 +186,25 @@ pub(crate) struct HeatmapConfig {
     pub(crate) fix_window: usize,
     /// Enable debug output.
     pub(crate) debug: bool,
-    /// Explicit file targets — scope display to these paths.
-    pub(crate) files: Vec<String>,
+    /// The file targets of the run, by source.
+    pub(crate) targets: FileTargets,
     /// True when `--top` was explicitly passed (vs. implied by file targeting).
     pub(crate) top_explicit: bool,
     /// Show only threshold-filtered one-liner insights.
     pub(crate) insights: bool,
+    /// The one section that `--detail` names, if given.
+    pub(crate) detail: Option<DetailSection>,
+}
+
+/// The file targets of a run. The source decides the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileTargets {
+    /// No file targets: the full view.
+    All,
+    /// The files that `--diff` names: the default view, scoped to them.
+    Diff(Vec<String>),
+    /// Positional file arguments, as repo-relative paths: one card each.
+    Cards(Vec<String>),
 }
 
 /// Resolved window metadata produced by [`super::window::resolve_config`].
@@ -174,12 +236,14 @@ pub(crate) struct ResolvedWindow {
 // Heatmap output
 // ============================================================================
 
-/// Top-level output structure for `skim heatmap`.
-#[derive(Debug, Clone, Serialize)]
+/// The computed metrics of one `skim heatmap` run, before the view.
+///
+/// The outputs never serialize it directly: the ranked view (`view.rs`)
+/// and the insight engine give the text and the JSON shapes.
+#[derive(Debug, Clone)]
 pub(crate) struct HeatmapResult {
-    /// Schema version (always 1).
-    pub(crate) version: u8,
     pub(crate) generated_at: String,
+    /// The repository root as git gives it. The outputs show only its name.
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
     pub(crate) files: Vec<FileMetrics>,
@@ -187,9 +251,15 @@ pub(crate) struct HeatmapResult {
     pub(crate) coupling_graph: Vec<CouplingEdge>,
     pub(crate) excluded_patterns: Vec<String>,
     pub(crate) warnings: Vec<String>,
-    /// Files targeted by `--diff` or positional args (present only when scoped).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Files targeted by `--diff` or positional args (present only when
+    /// scoped), in the path form of the history.
     pub(crate) file_targets: Option<Vec<String>>,
+    /// Fix commits in the window after exclusion: the numerator of the
+    /// fix-risk base rate. The ranked view reads it; JSON v2 gives the rate.
+    pub(crate) fix_commits_total: usize,
+    /// Distinct author names in the window after exclusion, for the
+    /// bus-factor gate. The ranked view reads it.
+    pub(crate) window_authors: usize,
 }
 
 /// Information about the analysis window.
@@ -203,7 +273,7 @@ pub(crate) struct WindowInfo {
 }
 
 /// Risk and coupling metrics for a single file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct FileMetrics {
     pub(crate) path: String,
     pub(crate) churn: ChurnMetrics,
@@ -234,15 +304,20 @@ pub(crate) struct AuthorMetrics {
 }
 
 /// Fix-after-touch risk metrics for a file.
+///
+/// The rates are raw: they are filled for every file, also below the file
+/// support minimum.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FixRiskMetrics {
     /// Percentage of commits with fix keywords.
     pub(crate) keyword_pct: f64,
-    /// Percentage of commits followed by a fix within the window.
+    /// Percentage of commits followed by a later fix within the window.
     pub(crate) proximity_pct: f64,
     /// Union of keyword and proximity signals.
     pub(crate) combined_pct: f64,
-    /// True when <2 commits — not enough data.
+    /// Number of fix commits that touch this file.
+    pub(crate) fix_commits: usize,
+    /// True when the file has fewer commits than the file support minimum (5).
     pub(crate) insufficient_data: bool,
 }
 
@@ -252,6 +327,7 @@ impl Default for FixRiskMetrics {
             keyword_pct: 0.0,
             proximity_pct: 0.0,
             combined_pct: 0.0,
+            fix_commits: 0,
             // Default to `true` so callers that skip the lookup (no history) are
             // marked as having insufficient data rather than misleadingly showing
             // zero-risk metrics.
@@ -307,11 +383,12 @@ pub(crate) enum Severity {
 
 /// Category of a threshold-filtered finding.
 ///
-/// Using an enum (instead of `String`) gives compile-time exhaustiveness in
-/// `sort_key` and eliminates `.to_string()` allocations at each insight push.
+/// Using an enum (instead of `String`) gives compile-time exhaustiveness and
+/// eliminates `.to_string()` allocations at each insight push. Ord is derived
+/// so the insight rank order can break its last ties on the category.
 /// Serialized as kebab-case so JSON output matches the documented schema
 /// (`"fix-risk"`, `"bus-factor"`, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum InsightCategory {
     Stability,
@@ -329,17 +406,52 @@ pub(crate) struct Insight {
     pub(crate) file: String,
     pub(crate) message: String,
     pub(crate) metric_value: f64,
+    /// Commits behind the finding: commits of the file or the module, or the
+    /// shared commits of a coupled pair.
+    pub(crate) support: usize,
+    /// How bad the finding is, `0.0..=1.0`, for the rank order: stability
+    /// `(100 - score) / 100`, fix risk the Wilson lower bound of the fix
+    /// rate, bus factor the top-author share, coupling the confidence,
+    /// encapsulation `(100 - pct) / 100`.
+    pub(crate) score: f64,
 }
 
-/// Standalone insights result (separate from HeatmapResult — does NOT add fields to it).
+/// Rows that passed the gates of a list, and the rows shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct Count {
+    pub(crate) total: usize,
+    pub(crate) shown: usize,
+}
+
+impl Count {
+    /// Rows that the cap hides.
+    #[must_use]
+    pub(crate) fn hidden(self) -> usize {
+        self.total.saturating_sub(self.shown)
+    }
+}
+
+/// The [`Count`] of the insights list, for insights JSON `counts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct InsightCounts {
+    pub(crate) insights: Count,
+}
+
+/// The `--insights` result: the shown findings in rank order, their count,
+/// the files and modules of the shown findings, and the run warnings.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct InsightsResult {
     pub(crate) version: u8,
+    /// The repository name, the same as the text header (never the path).
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
+    pub(crate) counts: InsightCounts,
     pub(crate) insights: Vec<Insight>,
     pub(crate) top_files: Vec<CompactFileEntry>,
     pub(crate) flagged_modules: Vec<CompactModuleEntry>,
+    /// Every warning of the run: the same list as the default JSON
+    /// `warnings`.
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Condensed file entry for [`InsightsResult`].

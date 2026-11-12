@@ -109,15 +109,15 @@ In auto permission mode, Claude Code runs a command without the PreToolUse rewri
 - All subcommands support `--json` for machine-readable output
 
 ### Codebase Heatmap (`skim heatmap`)
-- **Churn hotspots** — files changed most frequently, ranked by commit count
-- **Blast radius** — file coupling detection: files that consistently change together
-- **Fix risk** — files with high fix-commit density or fix-after-touch patterns
-- **Bus factor** — files with a single dominant author (>80% of commits)
-- **Module health** — directory encapsulation scores (cross-boundary coupling violations)
-- Configurable time windows: `--window sprint` (14d), `--last 200`, `--since 30d`, or full history
-- File targeting with positional args and `--diff` to scope output without skewing metrics
-- `--insights` for threshold-filtered findings only (CRITICAL/WARNING severity one-liners)
-- `--json` for machine-readable output, `--path` to scope to a subdirectory
+- **Short ranked default view** (30 lines or fewer): a header line with the repository name, the `since..until` dates, the commit count and the window, then the top 10 **hotspots** by commit count, the top 5 code-to-code **coupling** pairs and the top 5 **fix-risk** files above the repository base rate, each row with its number and support. A capped section ends with one exact `N more (--detail <section>)` line
+- **`--detail <section>`** shows all rows of one section: `hotspots`, `coupling`, `fix-risk`, `modules` (crate, package or top-folder encapsulation) or `bus-factor` (one author with more than 80% of a file's commits). Module health and bus factor show only with `--detail`
+- **`--top N`** sets the rows of each list in every view: the default view, `--detail`, `--insights`, the cards and JSON
+- **`skim heatmap <file>...`** prints a "before you edit" card per file (at most 5): co-change partners with 3 or more shared commits (tests first), up to 3 fix commits from history (at most 5 at any `--top`), and owners when the file has 2 or more authors. `--insights <file>` prints the same card
+- **Noise rules:** fix risk and bus factor need 5 commits of a file, coupling needs 3 shared commits, modules need 5 commits; a fix-risk row needs the lower bound of its fix rate above the repository base rate; bus factor needs 2 or more authors in the window. Modules come from tracked `Cargo.toml` and `package.json` folders, else the top folder
+- **Default excludes:** lock files, build output, logs, vendored code, and at any depth `CHANGELOG.md`, `*.snap`, `snapshots/`, `*.pb.go`, `*_pb2.py` and `generated/` folders (`--no-exclude` keeps them; a file marked "generated" only in a header line stays in)
+- `--insights` gives the top 20 CRITICAL/WARNING findings, ranked by severity, score, support and path, then one `N more (raise --top)` line
+- `--json` gives JSON version 2: one compact line, each array of rows capped like its section, with `counts.<section>.{total,shown}`; `file_targets[]` holds at most 20 targets, `warnings[]` has at most one line for each kind of warning, and `excluded_patterns[]` is the fixed pattern list
+- Configurable time windows: `--window sprint` (14d), `--last 200`, `--since 30d`, or full history; `--path` scopes the git log to a subdirectory, and `--diff <base>` gives the default view for the changed files
 
 ### Code Search (`skim search`)
 - **n-gram index** — build an AST-aware search index with `skim search --build` (incremental SHA-256 cache, 50K file cap; use `skim search --rebuild` for a full rebuild from scratch)
@@ -651,7 +651,7 @@ cargo bench
 - MCP server mode for agent-native workflows
 
 ✅ **Analytics & Intelligence:**
-- `skim heatmap` — git history risk analysis (churn, coupling, bus factor, fix density)
+- `skim heatmap` — git history risk analysis: a short ranked view (churn, coupling, fix risk), `--detail` sections and per-file "before you edit" cards
 - `skim stats` — persistent SQLite dashboard with cost estimation
 - `skim discover` — missed optimization finder across agent sessions
 - `skim learn` — CLI error pattern detection and correction rules
