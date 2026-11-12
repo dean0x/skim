@@ -394,8 +394,9 @@ pub struct StakesEntry {
     #[serde(default)]
     pub flags: Vec<String>,
     pub expect: StakesExpect,
-    /// The expected exit code. Required when `expect = "exit"`, forbidden
-    /// otherwise.
+    /// The expected exit code: `0` (a match) or `1` (no match), the only
+    /// codes the regex oracle can judge. Required when `expect = "exit"`,
+    /// forbidden otherwise.
     #[serde(default)]
     pub exit: Option<u8>,
 }
@@ -994,7 +995,7 @@ impl Violations {
 /// `def` index in range and `split = "none"`; a `[[stakes]]` entry uses only
 /// flags of [`STAKES_FLAGS`], none of which filters files (`-g` and `-t`: the
 /// regex oracle has no file filter), compiles into a regex-oracle query, and
-/// has `exit` exactly when `expect = "exit"`;
+/// has `exit` exactly when `expect = "exit"`, and that `exit` is 0 or 1;
 /// every ledger entry names an existing id whose kind its check applies to.
 ///
 /// With the indexed universe: every `[[ident]]` `def.path` is indexed, every
@@ -1114,9 +1115,14 @@ fn check_word_line(
     Ok(())
 }
 
-/// A `[[refs]]` or `[[clash]]` query is a bare identifier: letters, digits and
-/// underscore. The whole-word rule is then the same for the oracle and for
-/// `git grep -w`, which froze the sites.
+/// A `[[refs]]` or `[[clash]]` query is a bare identifier: Unicode letters and
+/// digits (`char::is_alphanumeric`) and underscore.
+///
+/// The oracle's word class is Unicode (`[\p{Alphabetic}\p{Nd}_]`). `git grep
+/// -w`, which froze the sites, counts only ASCII letters, digits and
+/// underscore as word characters. The oracle's word set contains git's, so a
+/// line that git froze and the oracle rejects is an integrity violation
+/// (exit 2), not a silent pass.
 fn check_identifier(query: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !query.is_empty() && query.chars().all(|c| c == '_' || c.is_alphanumeric()),
@@ -1288,34 +1294,39 @@ fn check_clash(e: &ClashEntry, universe: Option<&TextUniverse>) -> anyhow::Resul
 }
 
 /// A `[[stakes]]` entry has known flags, a query the regex oracle can read,
-/// `exit` exactly when `expect = "exit"`, and — against the text universe —
-/// an exit code that agrees with the oracle's hit count: `exit = 1` needs no
-/// matching line, and `exit = 0` needs one (the exit codes of `rg`).
+/// and `exit` exactly when `expect = "exit"`. The only exit codes the regex
+/// oracle can judge are 0 (a match) and 1 (no match), the exit codes of `rg`;
+/// any other value is refused, with or without a text universe. Against the
+/// text universe, `exit = 1` needs no matching line and `exit = 0` needs one.
 fn check_stakes(e: &StakesEntry, text: Option<&TextUniverse>) -> anyhow::Result<()> {
     non_blank(&e.query)?;
     let query = e.line_query()?;
-    match (e.expect, e.exit) {
+    let expects_match = match (e.expect, e.exit) {
         (StakesExpect::Exit, None) => anyhow::bail!("expect = \"exit\" requires `exit`"),
-        (StakesExpect::Exit, Some(_)) => {}
+        (StakesExpect::Exit, Some(0)) => Some(true),
+        (StakesExpect::Exit, Some(1)) => Some(false),
+        (StakesExpect::Exit, Some(other)) => anyhow::bail!(
+            "exit = {other} cannot be judged by the regex oracle; use 0 (a match) or 1 (no match)"
+        ),
         (_, Some(_)) => anyhow::bail!("`exit` is only valid with expect = \"exit\""),
-        (_, None) => {}
-    }
-    let (Some(text), Some(exit)) = (text, e.exit) else {
+        (_, None) => None,
+    };
+    let (Some(text), Some(expects_match)) = (text, expects_match) else {
         return Ok(());
     };
     let hits = line_truth(text.files(), &query);
-    match exit {
-        1 => anyhow::ensure!(
+    if expects_match {
+        anyhow::ensure!(
+            !hits.is_empty(),
+            "exit = 0 (a match) but the oracle finds no matching line"
+        );
+    } else {
+        anyhow::ensure!(
             hits.is_empty(),
             "exit = 1 (no match) but the oracle finds {} matching line(s), e.g. {}",
             hits.len(),
             show_sites(hits.iter())
-        ),
-        0 => anyhow::ensure!(
-            !hits.is_empty(),
-            "exit = 0 (a match) but the oracle finds no matching line"
-        ),
-        _ => {}
+        );
     }
     Ok(())
 }
@@ -2130,17 +2141,56 @@ exit = 1
     }
 
     #[test]
-    fn a_zero_line_in_a_def_or_site_is_a_violation() {
-        let v = clash_violations(&refs("skim-R1", "run", ("a.rs", 0), &[("a.rs", 0, "def")]));
-        assert!(flagged(&v, "skim-R1"), "{v:?}");
+    fn a_refs_def_on_line_zero_is_a_violation() {
+        let v = clash_violations(&refs("skim-R1", "run", ("a.rs", 0), &[("a.rs", 1, "def")]));
+        assert!(
+            message_of(&v, "skim-R1").contains("def.line must be >= 1"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_refs_site_on_line_zero_is_a_violation() {
+        let v = clash_violations(&refs(
+            "skim-R1",
+            "run",
+            ("a.rs", 1),
+            &[("a.rs", 1, "def"), ("a.rs", 0, "call")],
+        ));
+        assert!(
+            message_of(&v, "skim-R1").contains("every site line must be >= 1"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_clash_def_on_line_zero_is_a_violation() {
         let v = clash_violations(&clash(
             "skim-D1",
             "run",
             &[("a.rs", 0), ("b.rs", 1)],
-            &[("a.rs", 0, "0")],
+            &[("a.rs", 2, "1")],
             "none",
         ));
-        assert!(flagged(&v, "skim-D1"), "{v:?}");
+        assert!(
+            message_of(&v, "skim-D1").contains("every def and call line must be >= 1"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_clash_call_on_line_zero_is_a_violation() {
+        let v = clash_violations(&clash(
+            "skim-D1",
+            "run",
+            &[("a.rs", 1), ("b.rs", 1)],
+            &[("a.rs", 0, "1")],
+            "none",
+        ));
+        assert!(
+            message_of(&v, "skim-D1").contains("every def and call line must be >= 1"),
+            "{v:?}"
+        );
     }
 
     // --- [[stakes]] schema rules -------------------------------------------------
@@ -2157,6 +2207,24 @@ exit = 1
             assert!(flagged(&v, "skim-S2"), "{expect}: {v:?}");
             let ok = clash_violations(&stakes("skim-S3", "q", "[]", expect, None));
             assert!(ok.is_empty(), "{expect}: {ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_stakes_exit_other_than_0_or_1_is_refused_without_a_text_universe() {
+        for exit in [2, 3, 101, 255] {
+            let v = clash_violations(&stakes("skim-S1", "q", "[]", "exit", Some(exit)));
+            let message = message_of(&v, "skim-S1");
+            assert!(
+                message.contains(&format!(
+                    "exit = {exit} cannot be judged by the regex oracle"
+                )),
+                "exit {exit}: {v:?}"
+            );
+        }
+        for exit in [0, 1] {
+            let ok = clash_violations(&stakes("skim-S2", "q", "[]", "exit", Some(exit)));
+            assert!(ok.is_empty(), "exit {exit}: {ok:?}");
         }
     }
 
@@ -2697,7 +2765,11 @@ exit = 1
                 ("src/b.rs", 1, "def"),
             ],
         ));
-        assert!(flagged(&v, "skim-R1"), "{v:?}");
+        let message = message_of(&v, "skim-R1");
+        assert!(
+            message.contains("src/a.rs:4 does not contain \"run\" as a whole word"),
+            "{v:?}"
+        );
     }
 
     #[test]
@@ -2832,8 +2904,12 @@ exit = 1
         assert!(check("run", "[]", 0).is_empty());
         let v = check("run", "[]", 1);
         assert!(message_of(&v, "skim-S1").contains("src/a.rs:1"), "{v:?}");
-        // Any other exit code is judged by the schema, not the hit count.
-        assert!(check("run", "[]", 2).is_empty());
+        // Any other exit code is one the regex oracle cannot judge: refused.
+        let v = check("run", "[]", 2);
+        assert!(
+            message_of(&v, "skim-S1").contains("cannot be judged by the regex oracle"),
+            "{v:?}"
+        );
     }
 
     #[test]
