@@ -208,7 +208,7 @@ A capped section ends with one line that gives the exact hidden count and the se
 | Default view | hotspots 10, coupling 5, fix risk 5 | `N more (--detail <section>)` |
 | `--detail <SECTION>` | all rows | — |
 | `--insights` | 20 findings | `N more (raise --top)` |
-| File cards | 5 cards; per card 3 owners, 4 partners, 3 fix commits | `N more files (raise --top)`; one hidden-count line per card |
+| File cards | 5 cards; per card 3 owners, 4 partners, 3 fix commits | `N more files (raise --top)` (`1 more file` for one); one hidden-count line per card |
 
 Fix commits on a card stay at 5 or fewer at any `--top`.
 
@@ -228,7 +228,7 @@ The default **dual mode** is designed for repositories of any age: it avoids und
 
 #### File Cards
 
-`skim heatmap <FILE>...` prints one "before you edit" card per file argument, at most 5 (or `--top N`), then `N more files (raise --top)`. A duplicate path gives one card. `--insights <FILE>...` prints the same bytes. A card is 12 lines or fewer at the default caps:
+`skim heatmap <FILE>...` prints one "before you edit" card per file argument, at most 5 (or `--top N`), then `N more files (raise --top)` (`1 more file` for one). A duplicate path gives one card. `--insights <FILE>...` prints the same bytes. A card is 12 lines or fewer at the default caps:
 
 ```text
 crates/rskim/src/cmd/heatmap/view.rs: 7 commits
@@ -244,7 +244,7 @@ crates/rskim/src/cmd/heatmap/view.rs: 7 commits
 - **Owners** (`owners: "A" 89%, "B" 11%`) show only when the file has 2 or more distinct authors. Each name is in double quotes.
 - **Partners** are files with 3 or more shared commits and a confidence at or above `--coupling-threshold`. Test files come first.
 - **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first. In the text view, a `"` or `\` in a subject or an owner name shows as `\"` or `\\`.
-- A file with no commits in the window prints `<path>: not in history window (N commits since DATE)`, where N and DATE describe the window.
+- A file with no commits in the window prints `<path>: not in history window (N commits since DATE)` (`1 commit` for one), where N and DATE describe the window.
 - Control characters, bidirectional characters and invisible format characters (for example zero-width characters and Unicode tag characters) in subjects, author names and partner paths become U+FFFD. Each of these strings is cut at 72 characters.
 - `./x`, an absolute path under the repository root, a path relative to the current folder and a path with `..` give the same card. A path outside the repository exits 1. skim does not open the file. An absolute path through a symbolic-link prefix (for example macOS `/var`) is refused.
 
