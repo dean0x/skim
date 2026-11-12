@@ -410,32 +410,83 @@ pub(crate) fn compute_fix_after_touch(
 // Metric 6: Encapsulation
 // ============================================================================
 
-/// Extract the top-level directory component from a file path.
+/// File names whose folder is a package root.
+const MANIFEST_NAMES: &[&str] = &["Cargo.toml", "package.json"];
+
+/// Package roots for module labels: the folders of tracked manifests.
 ///
-/// Returns `None` for root-level files (no directory component), e.g. `Makefile`.
-/// Returns `Some("src")` for `src/lib.rs`, `Some("tests")` for `tests/foo.rs`.
-fn extract_top_dir(path: &std::path::Path) -> Option<String> {
-    // Require at least one parent directory (not root-level files)
-    let parent = path.parent()?;
-    if parent == std::path::Path::new("") || parent == std::path::Path::new(".") {
-        return None;
+/// Only the manifest paths are used. No manifest content is read and no
+/// workspace member glob is evaluated, so invalid manifest content cannot
+/// stop a run. With no roots, every path uses the top-folder rule.
+#[derive(Debug, Default)]
+pub(crate) struct ModuleRoots {
+    /// Root folders, repo-relative, with no trailing `/`. A C-quoted
+    /// manifest path gives its folder without the outer quotes.
+    dirs: HashSet<String>,
+}
+
+impl ModuleRoots {
+    /// Collect the folder of each `Cargo.toml` or `package.json` in `paths`.
+    ///
+    /// A manifest in the repository root gives no root: that layout keeps
+    /// the top-folder rule.
+    pub(crate) fn from_tracked_files(paths: &[String]) -> Self {
+        let dirs = paths
+            .iter()
+            .filter_map(|p| {
+                let (dir, name) = without_quotes(p).0.rsplit_once('/')?;
+                (!dir.is_empty() && MANIFEST_NAMES.contains(&name)).then(|| dir.to_string())
+            })
+            .collect();
+        Self { dirs }
     }
-    // Return the first path component as the module name
-    path.components()
-        .next()
-        .and_then(|c| c.as_os_str().to_str().map(String::from))
+}
+
+/// Split one pair of outer `"` from a git C-quoted path.
+///
+/// git writes a path with unusual characters as `"..."` and escapes each such
+/// character with `\`; every `/` of the path stays in place in the quoted text.
+fn without_quotes(path: &str) -> (&str, bool) {
+    match path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+        Some(inner) => (inner, true),
+        None => (path, false),
+    }
+}
+
+/// Return the module label of a repo-relative `path`.
+///
+/// The deepest package root that holds the path wins; folders match by
+/// whole name. A path under no root uses its top folder. A file in the
+/// repository root has no module.
+pub(crate) fn module_of(path: &str, roots: &ModuleRoots) -> Option<String> {
+    let (inner, quoted) = without_quotes(path);
+    // Ancestor folders, deepest first: one per `/` of the path.
+    let dir = inner
+        .rmatch_indices('/')
+        .map(|(end, _)| &inner[..end])
+        .find(|dir| roots.dirs.contains(*dir))
+        .or_else(|| inner.split_once('/').map(|(top, _)| top))
+        .filter(|dir| !dir.is_empty())?;
+    // A `\` in the folder is an escape of git's quoting, so the label keeps
+    // the quotes. A plain folder gets the same label as its unquoted files.
+    Some(if quoted && dir.contains('\\') {
+        format!("\"{dir}\"")
+    } else {
+        dir.to_string()
+    })
 }
 
 /// Compute module encapsulation health.
 ///
-/// For each directory, counts commits that touch ONLY that directory vs.
-/// commits that also touch other directories (cross-boundary).
+/// For each module (see [`module_of`]), counts commits that touch ONLY that
+/// module vs. commits that also touch other modules (cross-boundary).
 ///
 /// Filters modules with fewer than `min_commits` total commits.
 /// Returns results sorted by encapsulation_pct ascending (worst first).
 pub(crate) fn compute_encapsulation(
     commits: &[CommitInfo],
     min_commits: usize,
+    roots: &ModuleRoots,
 ) -> Vec<ModuleHealth> {
     // module -> files seen
     let mut module_files: HashMap<String, HashSet<String>> = HashMap::new();
@@ -443,12 +494,12 @@ pub(crate) fn compute_encapsulation(
     let mut module_stats: HashMap<String, (usize, usize)> = HashMap::new();
 
     for commit in commits {
-        // Precompute top-level directory for each file once to avoid calling
-        // extract_top_dir twice per file (once for dirs, once for module_files).
+        // Map each file to its module once; both the module set of the
+        // commit and the per-module file sets use the result.
         let file_dirs: Vec<Option<String>> = commit
             .changed_files
             .iter()
-            .map(|f| extract_top_dir(&f.path))
+            .map(|f| module_of(&f.path_str(), roots))
             .collect();
 
         // Collect unique top-level directories for this commit
@@ -1046,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_encapsulation_empty() {
-        let result = compute_encapsulation(&[], 1);
+        let result = compute_encapsulation(&[], 1, &ModuleRoots::default());
         assert!(result.is_empty());
     }
 
@@ -1057,7 +1108,7 @@ mod tests {
             make_commit("h2", "Alice", 2, "m", &["src/c.rs"]),
             make_commit("h3", "Alice", 3, "m", &["src/d.rs"]),
         ];
-        let result = compute_encapsulation(&commits, 1);
+        let result = compute_encapsulation(&commits, 1, &ModuleRoots::default());
         // All commits touch only "src" module → 100% encapsulation
         let src = result.iter().find(|m| m.path == "src").unwrap();
         assert!((src.encapsulation_pct - 100.0).abs() < 1e-9);
@@ -1070,7 +1121,7 @@ mod tests {
             make_commit("h2", "Alice", 2, "m", &["src/c.rs"]),
             make_commit("h3", "Alice", 3, "m", &["src/d.rs"]),
         ];
-        let result = compute_encapsulation(&commits, 1);
+        let result = compute_encapsulation(&commits, 1, &ModuleRoots::default());
         let src = result.iter().find(|m| m.path == "src").unwrap();
         // 1 cross-boundary out of 3 → 66.7% internal → encapsulation = 66.7%
         assert!(src.encapsulation_pct < 100.0);
@@ -1080,7 +1131,7 @@ mod tests {
     #[test]
     fn test_encapsulation_min_commits_filter() {
         let commits = vec![make_commit("h1", "Alice", 1, "m", &["src/a.rs"])];
-        let result = compute_encapsulation(&commits, 3); // requires ≥3 commits
+        let result = compute_encapsulation(&commits, 3, &ModuleRoots::default()); // requires ≥3 commits
         assert!(result.is_empty());
     }
 
@@ -1094,7 +1145,7 @@ mod tests {
             make_commit("h3", "Alice", 3, "m", &["lib/d.rs"]),
             make_commit("h4", "Alice", 4, "m", &["lib/e.rs", "src/f.rs"]),
         ];
-        let result = compute_encapsulation(&commits, 1);
+        let result = compute_encapsulation(&commits, 1, &ModuleRoots::default());
         // Sorted ascending by encapsulation_pct
         for window in result.windows(2) {
             assert!(window[0].encapsulation_pct <= window[1].encapsulation_pct);
@@ -1102,24 +1153,121 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_top_dir_root_level_file() {
-        assert_eq!(extract_top_dir(std::path::Path::new("Makefile")), None);
-        assert_eq!(extract_top_dir(std::path::Path::new("README.md")), None);
+    fn test_encapsulation_counts_commit_across_two_crates_as_cross_boundary() {
+        let commits = vec![
+            make_commit("h1", "Alice", 1, "m", &["crates/a/x.rs", "crates/b/y.rs"]),
+            make_commit("h2", "Alice", 2, "m", &["crates/a/z.rs"]),
+        ];
+        let roots = roots_from(&["crates/a/Cargo.toml", "crates/b/Cargo.toml"]);
+
+        let by_crate = compute_encapsulation(&commits, 1, &roots);
+        let a = by_crate.iter().find(|m| m.path == "crates/a").unwrap();
+        assert_eq!((a.total_commits, a.cross_boundary_commits), (2, 1));
+        assert_eq!(by_crate.len(), 2, "modules: {by_crate:?}");
+
+        // The top-folder rule sees one module and no boundary.
+        let by_top = compute_encapsulation(&commits, 1, &ModuleRoots::default());
+        assert_eq!(by_top.len(), 1, "modules: {by_top:?}");
+        assert_eq!(by_top[0].path, "crates");
+        assert_eq!(by_top[0].cross_boundary_commits, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // module_of
+    // -----------------------------------------------------------------------
+
+    fn roots_from(paths: &[&str]) -> ModuleRoots {
+        let owned: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        ModuleRoots::from_tracked_files(&owned)
     }
 
     #[test]
-    fn test_extract_top_dir_nested_file() {
+    fn test_module_of_root_file_has_no_module() {
+        let roots = roots_from(&["Cargo.toml", "crates/a/Cargo.toml"]);
+        assert_eq!(module_of("Makefile", &roots), None);
+        assert_eq!(module_of("README.md", &ModuleRoots::default()), None);
+    }
+
+    #[test]
+    fn test_module_of_without_roots_uses_top_folder() {
+        let roots = ModuleRoots::default();
+        assert_eq!(module_of("src/lib.rs", &roots).as_deref(), Some("src"));
         assert_eq!(
-            extract_top_dir(std::path::Path::new("src/lib.rs")),
-            Some("src".to_string())
+            module_of("src/cmd/heatmap/mod.rs", &roots).as_deref(),
+            Some("src")
+        );
+        assert_eq!(module_of("tests/foo.rs", &roots).as_deref(), Some("tests"));
+    }
+
+    #[test]
+    fn test_module_of_maps_files_to_their_manifest_folder() {
+        let roots = roots_from(&[
+            "crates/a/Cargo.toml",
+            "crates/a/src/lib.rs",
+            "crates/b/Cargo.toml",
+            "packages/x/package.json",
+        ]);
+        assert_eq!(
+            module_of("crates/a/src/lib.rs", &roots).as_deref(),
+            Some("crates/a")
         );
         assert_eq!(
-            extract_top_dir(std::path::Path::new("src/cmd/heatmap/mod.rs")),
-            Some("src".to_string())
+            module_of("crates/b/Cargo.toml", &roots).as_deref(),
+            Some("crates/b")
         );
         assert_eq!(
-            extract_top_dir(std::path::Path::new("tests/foo.rs")),
-            Some("tests".to_string())
+            module_of("packages/x/index.js", &roots).as_deref(),
+            Some("packages/x")
+        );
+        // A path under no package root keeps the top-folder rule.
+        assert_eq!(
+            module_of("crates/README.md", &roots).as_deref(),
+            Some("crates")
+        );
+        assert_eq!(module_of("src/main.rs", &roots).as_deref(), Some("src"));
+    }
+
+    #[test]
+    fn test_module_of_root_manifest_keeps_top_folder_rule() {
+        let roots = roots_from(&["Cargo.toml", "package.json", "src/main.rs"]);
+        assert_eq!(
+            module_of("crates/a/src/lib.rs", &roots).as_deref(),
+            Some("crates")
+        );
+        assert_eq!(module_of("src/main.rs", &roots).as_deref(), Some("src"));
+    }
+
+    #[test]
+    fn test_module_of_deepest_manifest_folder_wins() {
+        let roots = roots_from(&["crates/a/Cargo.toml", "crates/a/fuzz/Cargo.toml"]);
+        assert_eq!(
+            module_of("crates/a/fuzz/src/main.rs", &roots).as_deref(),
+            Some("crates/a/fuzz")
+        );
+        assert_eq!(
+            module_of("crates/a/src/lib.rs", &roots).as_deref(),
+            Some("crates/a")
+        );
+        // Folders match by whole name: `crates/ab` is not inside `crates/a`.
+        assert_eq!(
+            module_of("crates/ab/x.rs", &roots).as_deref(),
+            Some("crates")
+        );
+    }
+
+    /// git C-quotes a path with non-ASCII characters in both `ls-files` and
+    /// `--numstat` output; a quoted crate folder still holds its own files.
+    #[test]
+    fn test_module_of_quoted_paths_match_their_quoted_manifest_folder() {
+        let roots = roots_from(&[r#""crates/na\303\257ve/Cargo.toml""#]);
+        assert_eq!(
+            module_of(r#""crates/na\303\257ve/src/lib.rs""#, &roots).as_deref(),
+            Some(r#""crates/na\303\257ve""#)
+        );
+        // A quoted file in a plain folder gets the plain folder name.
+        assert_eq!(
+            module_of(r#""src/na\303\257ve.rs""#, &roots).as_deref(),
+            Some("src")
         );
     }
 }

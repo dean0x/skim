@@ -70,10 +70,6 @@ pub(crate) trait GitDataSource {
     /// [`fetch_commits`](Self::fetch_commits): git C-quotes unusual names in
     /// both. `Ok(None)` means the list is not available; the caller uses its
     /// fallback and the run continues.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "package-level modules are the first caller")
-    )]
     fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<Option<Vec<String>>>;
 
     /// Return the path of the cwd below the repository root
@@ -251,9 +247,6 @@ impl GitDataSource for CliGitSource {
 /// debug-gated note), and the caller uses its fallback. A run cut at the
 /// runner's output cap does not report exit 0, so a partial list is never
 /// used as a full one.
-// rustc versions differ on whether this is live while its trait method has
-// no caller; remove this `allow` with the `expect` on `list_tracked_files`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn tracked_files_from(result: anyhow::Result<CommandOutput>) -> Option<Vec<String>> {
     match result {
         Ok(out) if out.exit_code == Some(0) => Some(

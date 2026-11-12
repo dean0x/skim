@@ -29,8 +29,8 @@ use excludes::{build_exclude_set, should_exclude};
 use git_source::{CliGitSource, GitDataSource};
 use insights::{build_insights_result, compute_insights};
 use metrics::{
-    CouplingResult, compute_authors, compute_churn, compute_coupling, compute_encapsulation,
-    compute_fix_after_touch, compute_stability,
+    CouplingResult, ModuleRoots, compute_authors, compute_churn, compute_coupling,
+    compute_encapsulation, compute_fix_after_touch, compute_stability, module_of,
 };
 use noise::{COUPLING_MAX_FILES, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS};
 use output::{render_insights_json, render_insights_text, render_json, render_text};
@@ -141,6 +141,8 @@ struct PreparedCommits {
     now_epoch: u64,
     repo_root: String,
     warnings: Vec<String>,
+    /// Package roots for module labels; empty means the top-folder rule.
+    module_roots: ModuleRoots,
 }
 
 /// Execute Steps 1–4 of the heatmap pipeline (git I/O + exclusions).
@@ -275,6 +277,8 @@ fn prepare_commits(
         return Ok(None);
     }
 
+    let module_roots = load_module_roots(source, &repo_root);
+
     Ok(Some(PreparedCommits {
         commits,
         config,
@@ -282,7 +286,25 @@ fn prepare_commits(
         now_epoch,
         repo_root,
         warnings,
+        module_roots,
     }))
+}
+
+/// Read the package roots from the tracked-file list of `repo_root`.
+///
+/// The list is optional input: when it is not available, modules use the
+/// top-folder rule and the run continues.
+fn load_module_roots(source: &dyn GitDataSource, repo_root: &str) -> ModuleRoots {
+    match source.list_tracked_files(repo_root) {
+        Ok(Some(paths)) => ModuleRoots::from_tracked_files(&paths),
+        Ok(None) => ModuleRoots::default(),
+        Err(e) => {
+            crate::debug_log!(
+                "[skim:heatmap] tracked-file list not available ({e}); modules use the top-folder rule"
+            );
+            ModuleRoots::default()
+        }
+    }
 }
 
 /// Orchestration with injected data source (enables testing).
@@ -306,6 +328,7 @@ fn run_with_source(
         now_epoch,
         repo_root,
         warnings,
+        module_roots,
     } = match prepare_commits(source, args)? {
         Some(p) => p,
         None => return Ok(ExitCode::FAILURE),
@@ -313,11 +336,19 @@ fn run_with_source(
 
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
-    let mut result = compute_heatmap(commits, &config, &window, now_epoch, repo_root, warnings);
+    let mut result = compute_heatmap(
+        commits,
+        &config,
+        &window,
+        now_epoch,
+        repo_root,
+        warnings,
+        &module_roots,
+    );
 
     // Apply file-targeting display filter (after full metric computation)
     if !config.files.is_empty() {
-        apply_file_scope(&mut result, &config.files);
+        apply_file_scope(&mut result, &config.files, &module_roots);
     }
 
     // Compute display top_n: when files are explicitly targeted and --top
@@ -393,8 +424,9 @@ fn record_heatmap_analytics(
 ///
 /// Filtering happens AFTER metric computation to preserve coupling accuracy.
 /// Coupling graph retains edges where at least one endpoint is targeted
-/// (blast radius view).
-fn apply_file_scope(result: &mut HeatmapResult, files: &[String]) {
+/// (blast radius view). Modules are kept when they hold a targeted file, by
+/// the same [`module_of`] mapping the module metric uses.
+fn apply_file_scope(result: &mut HeatmapResult, files: &[String], roots: &ModuleRoots) {
     use std::collections::HashSet;
 
     let target_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
@@ -419,17 +451,10 @@ fn apply_file_scope(result: &mut HeatmapResult, files: &[String]) {
         .coupling_graph
         .retain(|e| target_set.contains(e.a.as_str()) || target_set.contains(e.b.as_str()));
 
-    // Filter modules: keep only modules whose top-level directory contains a
-    // targeted file.  Modules use top-level directory names (e.g. "src",
-    // "tests") produced by `extract_top_dir`, so we extract the first path
-    // component to align with those names regardless of nesting depth.
-    let target_dirs: HashSet<&str> = files
-        .iter()
-        .filter_map(|f| f.split_once('/').map(|(top, _)| top))
-        .collect();
-    result
-        .modules
-        .retain(|m| target_dirs.contains(m.path.as_str()));
+    // Filter modules: keep only the modules that hold a targeted file.
+    let target_modules: HashSet<String> =
+        files.iter().filter_map(|f| module_of(f, roots)).collect();
+    result.modules.retain(|m| target_modules.contains(&m.path));
 
     result.file_targets = Some(files.to_vec());
 }
@@ -452,6 +477,7 @@ fn compute_heatmap(
     now_epoch: u64,
     repository: String,
     mut warnings: Vec<String>,
+    module_roots: &ModuleRoots,
 ) -> HeatmapResult {
     let t0 = Instant::now();
 
@@ -491,7 +517,7 @@ fn compute_heatmap(
                         || compute_coupling(&commits, coupling_threshold, MIN_PAIR_SUPPORT),
                     )
                 },
-                || compute_encapsulation(&commits, MODULE_MIN_COMMITS),
+                || compute_encapsulation(&commits, MODULE_MIN_COMMITS, module_roots),
             )
         },
     );
@@ -675,7 +701,11 @@ mod tests {
     #[test]
     fn test_apply_file_scope_filters_files() {
         let mut result = make_test_result();
-        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        apply_file_scope(
+            &mut result,
+            &["src/main.rs".to_string()],
+            &ModuleRoots::default(),
+        );
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, "src/main.rs");
     }
@@ -683,7 +713,11 @@ mod tests {
     #[test]
     fn test_apply_file_scope_filters_coupling() {
         let mut result = make_test_result();
-        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        apply_file_scope(
+            &mut result,
+            &["src/main.rs".to_string()],
+            &ModuleRoots::default(),
+        );
         // Edge with src/main.rs kept, edge without any target dropped
         assert_eq!(result.coupling_graph.len(), 1);
         assert_eq!(result.coupling_graph[0].a, "src/main.rs");
@@ -692,7 +726,11 @@ mod tests {
     #[test]
     fn test_apply_file_scope_filters_modules() {
         let mut result = make_test_result();
-        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        apply_file_scope(
+            &mut result,
+            &["src/main.rs".to_string()],
+            &ModuleRoots::default(),
+        );
         assert_eq!(result.modules.len(), 1);
         assert_eq!(result.modules[0].path, "src");
     }
@@ -700,7 +738,11 @@ mod tests {
     #[test]
     fn test_apply_file_scope_warns_missing() {
         let mut result = make_test_result();
-        apply_file_scope(&mut result, &["nonexistent.rs".to_string()]);
+        apply_file_scope(
+            &mut result,
+            &["nonexistent.rs".to_string()],
+            &ModuleRoots::default(),
+        );
         assert!(
             result.warnings.iter().any(|w| {
                 w.contains("nonexistent.rs") && w.contains("not found in git history")
@@ -711,7 +753,11 @@ mod tests {
     #[test]
     fn test_apply_file_scope_sets_file_targets() {
         let mut result = make_test_result();
-        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        apply_file_scope(
+            &mut result,
+            &["src/main.rs".to_string()],
+            &ModuleRoots::default(),
+        );
         assert_eq!(result.file_targets, Some(vec!["src/main.rs".to_string()]));
     }
 
@@ -747,7 +793,11 @@ mod tests {
             cross_boundary_commits: 0,
         });
 
-        apply_file_scope(&mut result, &["src/cmd/heatmap/mod.rs".to_string()]);
+        apply_file_scope(
+            &mut result,
+            &["src/cmd/heatmap/mod.rs".to_string()],
+            &ModuleRoots::default(),
+        );
 
         // The top-level "src" module must be retained; "tests" must be dropped;
         // the "src/cmd" entry (not a valid top-level module) must also be dropped.
@@ -762,14 +812,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_file_scope_keeps_module_of_manifest_folder() {
+        use types::ModuleHealth;
+        let mut result = make_test_result();
+        result.modules = ["crates/a", "crates/b", "crates"]
+            .iter()
+            .map(|p| ModuleHealth {
+                path: p.to_string(),
+                encapsulation_pct: 100.0,
+                files_count: 1,
+                total_commits: 3,
+                cross_boundary_commits: 0,
+            })
+            .collect();
+        let roots = ModuleRoots::from_tracked_files(&[
+            "crates/a/Cargo.toml".to_string(),
+            "crates/b/Cargo.toml".to_string(),
+        ]);
+
+        apply_file_scope(&mut result, &["crates/a/src/lib.rs".to_string()], &roots);
+
+        let module_paths: Vec<&str> = result.modules.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(module_paths, vec!["crates/a"]);
+    }
+
     // -----------------------------------------------------------------------
-    // prepare_commits — malformed git log records
+    // prepare_commits — malformed git log records, tracked-file list
     // -----------------------------------------------------------------------
 
-    /// Stub `GitDataSource` whose `fetch_commits` returns one commit with one
-    /// file and the configured count of malformed records.
+    /// What the stub's `list_tracked_files` gives.
+    enum TrackedStub {
+        Listed(Vec<String>),
+        Unavailable,
+        Fails,
+    }
+
+    /// Stub `GitDataSource`: `fetch_commits` returns `commits` and the
+    /// configured count of malformed records; `list_tracked_files` follows
+    /// `tracked`.
     struct StubSource {
+        commits: Vec<CommitInfo>,
         malformed: usize,
+        tracked: TrackedStub,
+    }
+
+    impl StubSource {
+        /// One commit with one file, plus `malformed` skipped records.
+        fn with_malformed(malformed: usize) -> Self {
+            Self {
+                commits: vec![stub_commit(0, &["src/main.rs"])],
+                malformed,
+                tracked: TrackedStub::Unavailable,
+            }
+        }
+    }
+
+    fn stub_commit(n: usize, files: &[&str]) -> CommitInfo {
+        CommitInfo {
+            hash: format!("{n:040x}"),
+            author: "Alice".to_string(),
+            timestamp: 1_700_000_000 + n as i64,
+            message: "feat: one".to_string(),
+            changed_files: files
+                .iter()
+                .map(|p| types::FileChangeInfo {
+                    path: std::path::PathBuf::from(p),
+                    additions: 1,
+                    deletions: 0,
+                })
+                .collect(),
+        }
     }
 
     impl GitDataSource for StubSource {
@@ -787,22 +900,16 @@ mod tests {
         }
         fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<git_source::ParsedLog> {
             Ok(git_source::ParsedLog {
-                commits: vec![CommitInfo {
-                    hash: "a".repeat(40),
-                    author: "Alice".to_string(),
-                    timestamp: 1_700_000_000,
-                    message: "feat: one".to_string(),
-                    changed_files: vec![types::FileChangeInfo {
-                        path: std::path::PathBuf::from("src/main.rs"),
-                        additions: 1,
-                        deletions: 0,
-                    }],
-                }],
+                commits: self.commits.clone(),
                 malformed: self.malformed,
             })
         }
         fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
-            Ok(None)
+            match &self.tracked {
+                TrackedStub::Listed(paths) => Ok(Some(paths.clone())),
+                TrackedStub::Unavailable => Ok(None),
+                TrackedStub::Fails => Err(anyhow::anyhow!("simulated ls-files failure")),
+            }
         }
         fn show_prefix(&self) -> anyhow::Result<String> {
             Ok(String::new())
@@ -819,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_prepare_commits_adds_one_warning_with_malformed_count() {
-        let source = StubSource { malformed: 3 };
+        let source = StubSource::with_malformed(3);
         let prepared = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()
             .expect("one good commit remains");
@@ -834,11 +941,91 @@ mod tests {
 
     #[test]
     fn test_prepare_commits_no_malformed_warning_when_count_is_zero() {
-        let source = StubSource { malformed: 0 };
+        let source = StubSource::with_malformed(0);
         let prepared = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()
             .expect("one good commit remains");
         assert!(malformed_warnings(&prepared).is_empty());
+    }
+
+    /// Three commits each in `crates/a`, `crates/b` and `packages/x`.
+    fn package_commits() -> Vec<CommitInfo> {
+        (0..3)
+            .flat_map(|i| {
+                [
+                    stub_commit(3 * i, &["crates/a/src/lib.rs"]),
+                    stub_commit(3 * i + 1, &["crates/b/src/lib.rs"]),
+                    stub_commit(3 * i + 2, &["packages/x/index.js"]),
+                ]
+            })
+            .collect()
+    }
+
+    /// Sorted module paths of a full run on `package_commits` with `tracked`.
+    fn module_paths_with(tracked: TrackedStub) -> Vec<String> {
+        let source = StubSource {
+            commits: package_commits(),
+            malformed: 0,
+            tracked,
+        };
+        let p = prepare_commits(&source, HeatmapArgs::default())
+            .unwrap()
+            .expect("the run continues");
+        let result = compute_heatmap(
+            p.commits,
+            &p.config,
+            &p.window,
+            p.now_epoch,
+            p.repo_root,
+            p.warnings,
+            &p.module_roots,
+        );
+        let mut paths: Vec<String> = result.modules.into_iter().map(|m| m.path).collect();
+        paths.sort();
+        paths
+    }
+
+    fn listed(paths: &[&str]) -> TrackedStub {
+        TrackedStub::Listed(paths.iter().map(|p| p.to_string()).collect())
+    }
+
+    #[test]
+    fn test_modules_follow_tracked_manifest_folders() {
+        let tracked = listed(&[
+            "Cargo.toml",
+            "crates/a/Cargo.toml",
+            "crates/a/src/lib.rs",
+            "crates/b/Cargo.toml",
+            "crates/b/src/lib.rs",
+            "packages/x/index.js",
+            "packages/x/package.json",
+        ]);
+        assert_eq!(
+            module_paths_with(tracked),
+            vec!["crates/a", "crates/b", "packages/x"]
+        );
+    }
+
+    #[test]
+    fn test_modules_with_only_root_manifest_use_top_folder() {
+        let tracked = listed(&["Cargo.toml", "package.json", "crates/a/src/lib.rs"]);
+        assert_eq!(module_paths_with(tracked), vec!["crates", "packages"]);
+    }
+
+    #[test]
+    fn test_modules_use_top_folder_when_tracked_list_fails() {
+        assert_eq!(
+            module_paths_with(TrackedStub::Fails),
+            vec!["crates", "packages"]
+        );
+    }
+
+    #[test]
+    fn test_modules_use_top_folder_when_tracked_list_is_unavailable() {
+        assert_eq!(
+            module_paths_with(TrackedStub::Unavailable),
+            vec!["crates", "packages"]
+        );
     }
 
     // -----------------------------------------------------------------------
