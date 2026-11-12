@@ -54,7 +54,7 @@ use crate::scoreboard::structural_metrics::{
     uncovered_patterns, unexpected_oracle_matches,
 };
 use crate::scoreboard::types::{AstPage, StatsSnapshot};
-use crate::scoreboard::universe::Universe;
+use crate::scoreboard::universe::{TextUniverse, Universe, text_universe};
 
 // ============================================================================
 // Data dir
@@ -263,7 +263,8 @@ fn run_corpus(
     progress(name, "computing the oracle universe");
     let universe = Universe::compute(&root, &runner.sandbox().git())?;
     universe.check_file_cap()?;
-    let plan = checked_plan(spec, golden, inputs, &universe)?;
+    let text = text_universe(&root, &runner.sandbox().git())?;
+    let plan = checked_plan(spec, golden, inputs, &universe, &text)?;
     let (answers, oracle_wall_ms) = structural_answers(name, &plan, &universe, oracle)?;
     require_expected_empty_oracles(&plan, &answers)?;
 
@@ -287,7 +288,14 @@ fn run_corpus(
         "the corpus changed during the run (skim must not write into the corpus root): {after}"
     );
 
-    let eval = metrics::evaluate(&universe, &stats, &plan, &observed.observations, &evidence)?;
+    let eval = metrics::evaluate(
+        &universe,
+        &text,
+        &stats,
+        &plan,
+        &observed.observations,
+        &evidence,
+    )?;
     let report = corpus_report(
         spec,
         golden,
@@ -648,6 +656,7 @@ fn checked_plan(
     golden: &LoadedGolden,
     inputs: &Inputs,
     universe: &Universe,
+    text: &TextUniverse,
 ) -> anyhow::Result<Vec<PlannedQuery>> {
     let names: Vec<&str> = inputs.all_names.iter().map(String::as_str).collect();
     let refs = inputs.ledger.refs_for_corpus(&spec.name, &names);
@@ -657,6 +666,7 @@ fn checked_plan(
             corpus: &spec.name,
             commit: &spec.commit,
             universe: Some(universe),
+            text: Some(text),
             ledger: &refs,
             catalog: &inputs.catalog,
         },
@@ -889,7 +899,7 @@ mod tests {
 
     /// An observation whose full list has `rows` rows.
     fn observed(id: &str, rows: usize) -> EntryObservation {
-        use crate::scoreboard::types::{ResultPage, ResultRow, VerifyMode};
+        use crate::scoreboard::types::{ResultPage, ResultRow};
         EntryObservation {
             id: id.to_string(),
             full: ResultPage {
@@ -901,9 +911,7 @@ mod tests {
                         snippet: Vec::new(),
                     })
                     .collect(),
-                has_more: false,
-                verify_mode: VerifyMode::Substring,
-                degraded: Vec::new(),
+                ..ResultPage::default()
             },
             sweeps: Vec::new(),
             limited: Vec::new(),

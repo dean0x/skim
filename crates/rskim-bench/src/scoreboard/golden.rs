@@ -22,9 +22,12 @@ use sha2::{Digest, Sha256};
 
 use crate::scoreboard::MAX_PAGES;
 use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
-use crate::scoreboard::oracle::{LangFilter, LexicalQuery, MatchMode, WholeWord, ground_truth};
-use crate::scoreboard::types::{Arm, CheckId, EntryKind, VerifyMode};
-use crate::scoreboard::universe::Universe;
+use crate::scoreboard::oracle::{
+    LangFilter, LexicalQuery, LineMode, LineQuery, MatchMode, WholeWord, ground_truth,
+    is_case_insensitive, line_truth,
+};
+use crate::scoreboard::types::{Arm, CheckId, EntryKind, Role, VerifyMode};
+use crate::scoreboard::universe::{TextUniverse, Universe};
 
 // ============================================================================
 // Schema
@@ -278,6 +281,20 @@ pub enum SiteRole {
     Text,
 }
 
+impl From<SiteRole> for Role {
+    fn from(role: SiteRole) -> Self {
+        match role {
+            SiteRole::Def => Role::Def,
+            SiteRole::Call => Role::Call,
+            SiteRole::Ref => Role::Ref,
+            SiteRole::Import => Role::Import,
+            SiteRole::Comment => Role::Comment,
+            SiteRole::String => Role::String,
+            SiteRole::Text => Role::Text,
+        }
+    }
+}
+
 /// One frozen site of a `[[refs]]` entry: a line that holds the query as a
 /// whole word, with its role.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -381,6 +398,75 @@ pub struct StakesEntry {
     /// otherwise.
     #[serde(default)]
     pub exit: Option<u8>,
+}
+
+impl StakesEntry {
+    /// The regex oracle's query for this entry: the lines the plain-text
+    /// search must report.
+    ///
+    /// The flags that change what matches are the match-mode and case
+    /// switches. `-E` reads the query as a regex; `-F` and the default read
+    /// it as literal text. `-i` ignores case; `-S` ignores case when the query
+    /// has no uppercase character, and `-i` wins over `-S`. `-w` keeps a match
+    /// only as a whole word. The other flags only change how a result is
+    /// shown, so the oracle ignores them.
+    ///
+    /// # Errors
+    ///
+    /// - a flag that is not in [`STAKES_FLAGS`], or one that lacks its value;
+    /// - `-g` or `-t`: they filter files, and the oracle has no file filter
+    ///   in this version;
+    /// - `-F` and `-E` together;
+    /// - the query is an empty literal, or a regex that does not compile.
+    pub fn line_query(&self) -> anyhow::Result<LineQuery> {
+        let names = stakes_flag_names(&self.flags)?;
+        let has = |flag: &str| names.contains(&flag);
+        for filter in ["-g", "-t"] {
+            anyhow::ensure!(
+                !has(filter),
+                "flag {filter:?} filters files, and the regex oracle has no file filter"
+            );
+        }
+        anyhow::ensure!(
+            !(has("-F") && has("-E")),
+            "flags \"-F\" and \"-E\" contradict each other"
+        );
+        let case_insensitive = is_case_insensitive(&self.query, has("-i"), has("-S"));
+        let word = has("-w");
+        let mode = if has("-E") {
+            LineMode::Regex {
+                case_insensitive,
+                word,
+            }
+        } else {
+            LineMode::Literal {
+                case_insensitive,
+                word,
+            }
+        };
+        LineQuery::new(&self.query, mode)
+    }
+}
+
+/// The flag names of a stakes entry, in order, with the value tokens that
+/// follow `-g`, `-t`, `-C`, `--limit`, `--offset` and `--root` removed.
+fn stakes_flag_names(flags: &[String]) -> anyhow::Result<Vec<&str>> {
+    let mut names = Vec::new();
+    let mut tokens = flags.iter();
+    while let Some(flag) = tokens.next() {
+        let takes_value = STAKES_FLAGS
+            .iter()
+            .find(|(name, _)| *name == flag)
+            .map(|(_, takes_value)| *takes_value)
+            .with_context(|| format!("flag {flag:?} is not in the closed set of stakes flags"))?;
+        if takes_value {
+            tokens
+                .next()
+                .with_context(|| format!("flag {flag:?} needs a value"))?;
+        }
+        names.push(flag.as_str());
+    }
+    Ok(names)
 }
 
 /// The closed set of flags a `[[stakes]]` entry may use: the flag set of the
@@ -839,6 +925,12 @@ pub struct IntegrityContext<'a> {
     /// pinned commit. Enables the def-line, pagination-bound and zero-hit
     /// checks; `None` runs the schema-level checks only.
     pub universe: Option<&'a Universe>,
+    /// The corpus's text universe ([`crate::scoreboard::universe::text_universe`]):
+    /// every tracked text file, with no language allow-list. Enables the
+    /// whole-word line checks of `[[ident]]`, `[[refs]]` and `[[clash]]`
+    /// (`git grep -nw` finds hits in files the allow-listed index never
+    /// reads) and the hit-count rule of `[[stakes]]`; `None` skips them.
+    pub text: Option<&'a TextUniverse>,
     /// Ledger entries for this corpus.
     pub ledger: &'a [LedgerRef<'a>],
     /// skim's pattern catalog
@@ -900,16 +992,21 @@ impl Violations {
 /// is a bare identifier; a `[[refs]]` entry has distinct sites that include its
 /// `def`; a `[[clash]]` has 2 or more distinct defs, distinct calls, every call
 /// `def` index in range and `split = "none"`; a `[[stakes]]` entry uses only
-/// flags of [`STAKES_FLAGS`] and has `exit` exactly when `expect = "exit"`;
+/// flags of [`STAKES_FLAGS`], none of which filters files (`-g` and `-t`: the
+/// regex oracle has no file filter), compiles into a regex-oracle query, and
+/// has `exit` exactly when `expect = "exit"`;
 /// every ledger entry names an existing id whose kind its check applies to.
 ///
-/// With a universe: every `[[ident]]` `def.path` is indexed and its `def.line`
-/// holds the query as a whole word; every `[[refs]]` site set equals the
-/// whole-word line set of its query, and its `def` line is one of them; every
-/// `[[clash]]` def and call line holds the query as a whole word; every
-/// concept `first` path is indexed; every lexically-computable pagination
-/// entry's ground truth fits [`pagination_bound`]; every `zero-hit` entry's
-/// ground truth is empty.
+/// With the indexed universe: every `[[ident]]` `def.path` is indexed, every
+/// concept `first` path is indexed, every lexically-computable pagination
+/// entry's ground truth fits [`pagination_bound`], and every `zero-hit`
+/// entry's ground truth is empty.
+///
+/// With the text universe: every `[[ident]]` `def.line` holds the query as a
+/// whole word; every `[[refs]]` site set equals the whole-word line set of its
+/// query, and its `def` line is one of them; every `[[clash]]` def and call
+/// line holds the query as a whole word; every `[[stakes]]` `exit = 1` has no
+/// matching line and every `exit = 0` has one.
 ///
 /// Two `[[ast]]` golden errors need the structural oracle's answers, so the
 /// pipeline checks them: an entry flagged `expect_oracle_empty` whose oracle
@@ -934,7 +1031,7 @@ pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<I
 
     check_ids(golden, ctx.corpus, &mut v);
     for e in &golden.idents {
-        v.entry_err(&e.id, check_ident(e, ctx.universe));
+        v.entry_err(&e.id, check_ident(e, ctx.universe, ctx.text));
     }
     for e in &golden.concepts {
         v.entry_err(&e.id, check_concept(e, ctx.universe));
@@ -956,13 +1053,13 @@ pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<I
         check_ast_pairs(golden, &mut v);
     }
     for e in &golden.refs {
-        v.entry_err(&e.id, check_refs(e, ctx.universe));
+        v.entry_err(&e.id, check_refs(e, ctx.text));
     }
     for e in &golden.clashes {
-        v.entry_err(&e.id, check_clash(e, ctx.universe));
+        v.entry_err(&e.id, check_clash(e, ctx.text));
     }
     for e in &golden.stakes {
-        v.entry_err(&e.id, check_stakes(e));
+        v.entry_err(&e.id, check_stakes(e, ctx.text));
     }
     check_ledger(golden, ctx.ledger, &mut v);
 
@@ -993,17 +1090,17 @@ fn non_blank(query: &str) -> anyhow::Result<()> {
 /// How many offending sites one violation message names.
 const SITES_SHOWN: usize = 5;
 
-/// The line at `path:line` in the oracle universe must hold `query` as a
+/// The line at `path:line` in the text universe must hold `query` as a
 /// whole word.
 fn check_word_line(
-    universe: &Universe,
+    universe: &TextUniverse,
     word: &WholeWord,
     path: &str,
     line: u32,
     query: &str,
 ) -> anyhow::Result<()> {
     let text = universe.text(path).with_context(|| {
-        format!("{path}:{line} is not in the oracle's indexed universe at the pinned commit")
+        format!("{path}:{line} is not in the oracle's text universe at the pinned commit")
     })?;
     let idx = usize::try_from(line.checked_sub(1).context("line must be >= 1")?)?;
     let held = text
@@ -1037,19 +1134,28 @@ fn show_sites<'a>(sites: impl Iterator<Item = &'a (String, u32)>) -> String {
         .join(", ")
 }
 
-fn check_ident(e: &IdentEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
+/// An `[[ident]]` definition must be in the indexed universe (its rank is
+/// judged against the index) and its line, read from the text universe, must
+/// hold the query as a whole word.
+fn check_ident(
+    e: &IdentEntry,
+    universe: Option<&Universe>,
+    text: Option<&TextUniverse>,
+) -> anyhow::Result<()> {
     non_blank(&e.query)?;
     anyhow::ensure!(e.def.line >= 1, "def.line must be >= 1");
-    let Some(universe) = universe else {
+    if let Some(universe) = universe {
+        anyhow::ensure!(
+            universe.contains(&e.def.path),
+            "{}:{} is not in the oracle's indexed universe at the pinned commit",
+            e.def.path,
+            e.def.line
+        );
+    }
+    let Some(text) = text else {
         return Ok(());
     };
-    check_word_line(
-        universe,
-        &WholeWord::new()?,
-        &e.def.path,
-        e.def.line,
-        &e.query,
-    )
+    check_word_line(text, &WholeWord::new()?, &e.def.path, e.def.line, &e.query)
 }
 
 fn check_concept(e: &ConceptEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
@@ -1076,7 +1182,7 @@ fn check_concept(e: &ConceptEntry, universe: Option<&Universe>) -> anyhow::Resul
     Ok(())
 }
 
-fn check_refs(e: &RefsEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
+fn check_refs(e: &RefsEntry, universe: Option<&TextUniverse>) -> anyhow::Result<()> {
     check_identifier(&e.query)?;
     anyhow::ensure!(e.def.line >= 1, "def.line must be >= 1");
     anyhow::ensure!(!e.sites.is_empty(), "entry has no sites");
@@ -1126,7 +1232,7 @@ fn check_refs(e: &RefsEntry, universe: Option<&Universe>) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn check_clash(e: &ClashEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
+fn check_clash(e: &ClashEntry, universe: Option<&TextUniverse>) -> anyhow::Result<()> {
     check_identifier(&e.query)?;
     anyhow::ensure!(
         e.defs.len() >= 2,
@@ -1181,27 +1287,37 @@ fn check_clash(e: &ClashEntry, universe: Option<&Universe>) -> anyhow::Result<()
     Ok(())
 }
 
-fn check_stakes(e: &StakesEntry) -> anyhow::Result<()> {
+/// A `[[stakes]]` entry has known flags, a query the regex oracle can read,
+/// `exit` exactly when `expect = "exit"`, and — against the text universe —
+/// an exit code that agrees with the oracle's hit count: `exit = 1` needs no
+/// matching line, and `exit = 0` needs one (the exit codes of `rg`).
+fn check_stakes(e: &StakesEntry, text: Option<&TextUniverse>) -> anyhow::Result<()> {
     non_blank(&e.query)?;
-    let mut tokens = e.flags.iter();
-    while let Some(flag) = tokens.next() {
-        let takes_value = STAKES_FLAGS
-            .iter()
-            .find(|(name, _)| *name == flag)
-            .map(|(_, takes_value)| *takes_value)
-            .with_context(|| format!("flag {flag:?} is not in the closed set of stakes flags"))?;
-        if takes_value {
-            tokens
-                .next()
-                .with_context(|| format!("flag {flag:?} needs a value"))?;
-        }
-    }
+    let query = e.line_query()?;
     match (e.expect, e.exit) {
         (StakesExpect::Exit, None) => anyhow::bail!("expect = \"exit\" requires `exit`"),
-        (StakesExpect::Exit, Some(_)) => Ok(()),
+        (StakesExpect::Exit, Some(_)) => {}
         (_, Some(_)) => anyhow::bail!("`exit` is only valid with expect = \"exit\""),
-        (_, None) => Ok(()),
+        (_, None) => {}
     }
+    let (Some(text), Some(exit)) = (text, e.exit) else {
+        return Ok(());
+    };
+    let hits = line_truth(text.files(), &query);
+    match exit {
+        1 => anyhow::ensure!(
+            hits.is_empty(),
+            "exit = 1 (no match) but the oracle finds {} matching line(s), e.g. {}",
+            hits.len(),
+            show_sites(hits.iter())
+        ),
+        0 => anyhow::ensure!(
+            !hits.is_empty(),
+            "exit = 0 (a match) but the oracle finds no matching line"
+        ),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn check_lexical(e: &LexicalEntry, universe: Option<&Universe>) -> anyhow::Result<()> {
@@ -1332,7 +1448,7 @@ fn check_ledger(golden: &GoldenFile, ledger: &[LedgerRef<'_>], v: &mut Violation
 mod tests {
     use super::*;
     use crate::scoreboard::test_support::{FixtureRepo, catalog};
-    use crate::scoreboard::universe::{GitIsolation, Universe};
+    use crate::scoreboard::universe::{GitIsolation, Universe, text_universe};
 
     const SHA: &str = "b8a0a79463382347820f1c2572bde37b68e87c76";
 
@@ -1386,6 +1502,7 @@ limits = [5, 20]
             corpus: "skim",
             commit: SHA,
             universe: None,
+            text: None,
             ledger,
             catalog: catalog(),
         }
@@ -2055,7 +2172,6 @@ exit = 1
             "[]",
             "[\"-i\"]",
             "[\"-w\", \"-F\"]",
-            "[\"-g\", \"*.rs\"]",
             "[\"-C\", \"2\", \"--limit\", \"5\"]",
             "[\"--limit\", \"-1\"]",
         ] {
@@ -2069,6 +2185,14 @@ exit = 1
             "[\"-g\"]",
             "[\"--limit\"]",
         ] {
+            let v = clash_violations(&stakes("skim-S1", "q", flags, "lines", None));
+            assert!(flagged(&v, "skim-S1"), "{flags}: {v:?}");
+        }
+    }
+
+    #[test]
+    fn a_stakes_file_filter_is_refused_because_the_oracle_cannot_judge_it() {
+        for flags in ["[\"-g\", \"*.rs\"]", "[\"-t\", \"rust\"]"] {
             let v = clash_violations(&stakes("skim-S1", "q", flags, "lines", None));
             assert!(flagged(&v, "skim-S1"), "{flags}: {v:?}");
         }
@@ -2320,7 +2444,23 @@ exit = 1
 
     // --- integrity against the corpus universe ------------------------------------
 
-    fn corpus() -> (FixtureRepo, String, Universe) {
+    /// Both universes of one fixture repository.
+    struct Universes {
+        universe: Universe,
+        text: TextUniverse,
+    }
+
+    impl Universes {
+        fn of(repo: &FixtureRepo) -> Self {
+            let git = GitIsolation::new(repo.home());
+            Universes {
+                universe: Universe::compute(repo.root(), &git).unwrap(),
+                text: text_universe(repo.root(), &git).unwrap(),
+            }
+        }
+    }
+
+    fn corpus() -> (FixtureRepo, String, Universes) {
         let repo = FixtureRepo::new();
         repo.write(
             "src/staleness.rs",
@@ -2334,16 +2474,17 @@ exit = 1
             repo.write(&format!("src/m{i}.rs"), "// shared marker\n");
         }
         let sha = repo.commit_all("init");
-        let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+        let universe = Universes::of(&repo);
         (repo, sha, universe)
     }
 
-    fn check_against(universe: &Universe, sha: &str, body: &str) -> Vec<IntegrityViolation> {
+    fn check_against(universes: &Universes, sha: &str, body: &str) -> Vec<IntegrityViolation> {
         let src = format!("corpus = \"skim\"\ncommit = \"{sha}\"\n{body}");
         let ctx = IntegrityContext {
             corpus: "skim",
             commit: sha,
-            universe: Some(universe),
+            universe: Some(&universes.universe),
+            text: Some(&universes.text),
             ledger: &[],
             catalog: catalog(),
         };
@@ -2401,7 +2542,7 @@ exit = 1
             repo.write(&format!("src/m{i:02}.rs"), "// shared marker\n");
         }
         let sha = repo.commit_all("init");
-        let u = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+        let u = Universes::of(&repo);
         let entry = |limits: &str| {
             format!(
                 "[[pagination]]\nid = \"skim-G1\"\nquery = \"shared marker\"\n\
@@ -2433,7 +2574,7 @@ exit = 1
 
     /// `run` is a whole word on a.rs lines 1, 2 and 3 and b.rs line 1; lines
     /// that hold it only inside a longer word are a.rs:4 and b.rs:2.
-    fn word_corpus() -> (FixtureRepo, String, Universe) {
+    fn word_corpus() -> (FixtureRepo, String, Universes) {
         let repo = FixtureRepo::new();
         repo.write(
             "src/a.rs",
@@ -2441,7 +2582,7 @@ exit = 1
         );
         repo.write("src/b.rs", "pub fn run(x: u32) {}\nfn rerun_it() {}\n");
         let sha = repo.commit_all("init");
-        let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+        let universe = Universes::of(&repo);
         (repo, sha, universe)
     }
 
@@ -2614,6 +2755,152 @@ exit = 1
         assert!(word_violations(&concept("[\"src/a.rs\", \"src/b.rs\"]")).is_empty());
         let v = word_violations(&concept("[\"src/a.rs\", \"src/gone.rs\"]"));
         assert!(message_of(&v, "skim-C1").contains("src/gone.rs"), "{v:?}");
+    }
+
+    // --- the text universe and the stakes exit rule -------------------------------
+
+    /// `run` is a whole word in `src/a.rs:1` (indexed) and in `LICENSE:1`,
+    /// a file the lexical index skips but the text universe reads.
+    fn licensed_corpus() -> (FixtureRepo, String, Universes) {
+        let repo = FixtureRepo::new();
+        repo.write("src/a.rs", "pub fn run() {}\n");
+        repo.write("LICENSE", "you may run it\n");
+        let sha = repo.commit_all("init");
+        let universe = Universes::of(&repo);
+        (repo, sha, universe)
+    }
+
+    #[test]
+    fn refs_sites_are_judged_against_the_text_universe_not_the_indexed_one() {
+        let (_repo, sha, u) = licensed_corpus();
+        assert_eq!(
+            (u.universe.len(), u.text.len()),
+            (1, 2),
+            "LICENSE is in the text universe only"
+        );
+        let with_license = refs(
+            "skim-R1",
+            "run",
+            ("src/a.rs", 1),
+            &[("src/a.rs", 1, "def"), ("LICENSE", 1, "text")],
+        );
+        assert!(check_against(&u, &sha, &with_license).is_empty());
+
+        let without = refs("skim-R2", "run", ("src/a.rs", 1), &[("src/a.rs", 1, "def")]);
+        let v = check_against(&u, &sha, &without);
+        assert!(
+            message_of(&v, "skim-R2").contains("LICENSE:1"),
+            "the file the index skips still owes a site: {v:?}"
+        );
+    }
+
+    #[test]
+    fn an_ident_def_must_stay_in_the_indexed_universe_even_with_a_text_universe() {
+        let (_repo, sha, u) = licensed_corpus();
+        let ident = |path: &str| {
+            format!(
+                "[[ident]]\nid = \"skim-L01\"\nquery = \"run\"\n\
+                 def = {{ path = \"{path}\", line = 1 }}\norigin = \"seed\"\n"
+            )
+        };
+        assert!(check_against(&u, &sha, &ident("src/a.rs")).is_empty());
+        let v = check_against(&u, &sha, &ident("LICENSE"));
+        assert!(
+            message_of(&v, "skim-L01").contains("indexed universe"),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn a_stakes_exit_must_agree_with_the_oracle_hit_count() {
+        let (_repo, sha, u) = word_corpus();
+        let check = |query: &str, flags: &str, exit: u8| {
+            check_against(
+                &u,
+                &sha,
+                &stakes("skim-S1", query, flags, "exit", Some(exit)),
+            )
+        };
+        // No match: exit 1 holds, exit 0 does not.
+        assert!(check("qzvx_absent", "[]", 1).is_empty());
+        let v = check("qzvx_absent", "[]", 0);
+        assert!(
+            message_of(&v, "skim-S1").contains("finds no matching line"),
+            "{v:?}"
+        );
+        // A match: exit 0 holds, exit 1 does not, and the message names a site.
+        assert!(check("run", "[]", 0).is_empty());
+        let v = check("run", "[]", 1);
+        assert!(message_of(&v, "skim-S1").contains("src/a.rs:1"), "{v:?}");
+        // Any other exit code is judged by the schema, not the hit count.
+        assert!(check("run", "[]", 2).is_empty());
+    }
+
+    #[test]
+    fn a_stakes_exit_is_not_judged_without_a_text_universe() {
+        let ctx = IntegrityContext {
+            corpus: "skim",
+            commit: "b8a0a79463382347820f1c2572bde37b68e87c76",
+            universe: None,
+            text: None,
+            ledger: &[],
+            catalog: catalog(),
+        };
+        let src = format!(
+            "corpus = \"skim\"\ncommit = \"{}\"\n{}",
+            ctx.commit,
+            stakes("skim-S1", "run", "[]", "exit", Some(1))
+        );
+        assert!(check_integrity(&golden(&src), &ctx).is_empty());
+    }
+
+    #[test]
+    fn stakes_flags_change_what_the_oracle_counts_as_a_match() {
+        let (_repo, sha, u) = word_corpus();
+        let exit_of = |query: &str, flags: &str| -> u8 {
+            // The exit that holds is the one the check lets through.
+            let holds = |exit: u8| {
+                check_against(
+                    &u,
+                    &sha,
+                    &stakes("skim-S1", query, flags, "exit", Some(exit)),
+                )
+                .is_empty()
+            };
+            match (holds(0), holds(1)) {
+                (true, false) => 0,
+                (false, true) => 1,
+                other => unreachable!("exactly one exit must hold: {other:?}"),
+            }
+        };
+        // Case: the default is exact, `-i` ignores case, `-S` ignores it only
+        // for an all-lowercase query, and `-i` wins over `-S`.
+        assert_eq!(exit_of("RUN", "[]"), 1);
+        assert_eq!(exit_of("RUN", "[\"-i\"]"), 0);
+        assert_eq!(exit_of("run", "[\"-S\"]"), 0);
+        assert_eq!(exit_of("RUN", "[\"-S\"]"), 1);
+        assert_eq!(exit_of("RUN", "[\"-i\", \"-S\"]"), 0);
+        // Whole word: `ru` is inside `run` but is no word of its own.
+        assert_eq!(exit_of("ru", "[]"), 0);
+        assert_eq!(exit_of("ru", "[\"-w\"]"), 1);
+        // Regex: `-E` reads the query as a pattern, `-F` and the default as text.
+        assert_eq!(exit_of("ru[n]", "[]"), 1);
+        assert_eq!(exit_of("ru[n]", "[\"-F\"]"), 1);
+        assert_eq!(exit_of("ru[n]", "[\"-E\"]"), 0);
+        // Display flags change nothing.
+        assert_eq!(
+            exit_of("run", "[\"-n\", \"-C\", \"2\", \"--limit\", \"3\"]"),
+            0
+        );
+    }
+
+    #[test]
+    fn contradicting_or_unreadable_stakes_queries_are_violations() {
+        let (_repo, sha, u) = word_corpus();
+        for (query, flags) in [("run", "[\"-F\", \"-E\"]"), ("ru(n", "[\"-E\"]")] {
+            let v = check_against(&u, &sha, &stakes("skim-S1", query, flags, "lines", None));
+            assert!(flagged(&v, "skim-S1"), "{query} {flags}: {v:?}");
+        }
     }
 
     // --- loading and hashing --------------------------------------------------------

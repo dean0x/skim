@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn a_ranked_entry_whose_ranking_skim_did_not_apply_is_an_error() {
-        use crate::scoreboard::types::{Degraded, VerifyMode};
+        use crate::scoreboard::types::Degraded;
 
         let golden = crate::scoreboard::golden::parse_golden(
             "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
@@ -751,10 +751,8 @@ mod tests {
             applied: Some("lexical".to_string()),
         };
         let page = |degraded: Vec<Degraded>| ResultPage {
-            rows: Vec::new(),
-            has_more: false,
-            verify_mode: VerifyMode::Substring,
             degraded,
+            ..ResultPage::default()
         };
         let observation = |q: &PlannedQuery, full, sweeps, limited| EntryObservation {
             id: q.id.clone(),

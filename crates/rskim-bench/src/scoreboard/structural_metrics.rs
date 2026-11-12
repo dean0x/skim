@@ -271,6 +271,7 @@ pub fn rows_in(page: &ResultPage, lang: OracleLang) -> ResultPage {
         has_more: page.has_more,
         verify_mode: page.verify_mode.clone(),
         degraded: page.degraded.clone(),
+        ..ResultPage::default()
     }
 }
 

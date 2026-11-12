@@ -7,7 +7,7 @@ use crate::scoreboard::golden::parse_golden;
 use crate::scoreboard::runner::{SweepPage, TextOutput};
 use crate::scoreboard::test_support::FixtureRepo;
 use crate::scoreboard::types::{Degraded, SnippetLine};
-use crate::scoreboard::universe::GitIsolation;
+use crate::scoreboard::universe::{GitIsolation, text_universe};
 
 const SHA: &str = "b8a0a79463382347820f1c2572bde37b68e87c76";
 
@@ -33,8 +33,7 @@ fn page(rows: Vec<ResultRow>, has_more: bool) -> ResultPage {
     ResultPage {
         rows,
         has_more,
-        verify_mode: VerifyMode::Substring,
-        degraded: Vec::new(),
+        ..ResultPage::default()
     }
 }
 
@@ -85,7 +84,7 @@ fn checks_of(body: &str) -> Vec<CheckId> {
 
 #[test]
 fn ident_concept_and_lexical_entries_run_the_lexical_checks_and_score_monotone() {
-    let expected = vec![
+    let shared = vec![
         CheckId::LexicalRecall,
         CheckId::LexicalPrecision,
         CheckId::LexicalSilentFn,
@@ -93,21 +92,23 @@ fn ident_concept_and_lexical_entries_run_the_lexical_checks_and_score_monotone()
         CheckId::OrderScoreMonotone,
         CheckId::ResultsUniquePaths,
     ];
+    // Each kind adds the one check its frozen answer allows.
+    let with = |extra: CheckId| [shared.clone(), vec![extra]].concat();
     assert_eq!(
         checks_of(
             "[[ident]]\nid = \"skim-L01\"\nquery = \"x_y\"\ndef = { path = \"a.rs\", line = 1 }\norigin = \"seed\"\n"
         ),
-        expected
+        with(CheckId::IdentDefFirst)
     );
     assert_eq!(
         checks_of("[[concept]]\nid = \"skim-C01\"\nquery = \"a b\"\nrelevant = 'a'\n"),
-        expected
+        shared
     );
     assert_eq!(
         checks_of(
             "[[lexical]]\nid = \"skim-X01\"\nquery = \"a b\"\nmode = \"near\"\nnear = 3\ncategory = \"near\"\n"
         ),
-        expected
+        with(CheckId::LexicalRecallTracked)
     );
 }
 
@@ -633,6 +634,8 @@ fn ident(id: &str, rank: Option<u64>, first_correct: Option<u64>) -> IdentSample
         first_correct_bytes: first_correct,
         rg_text_bytes: 300,
         rg_first_correct_bytes: Some(50),
+        rgw_text_bytes: 200,
+        rgw_first_correct_bytes: Some(30),
     }
 }
 
@@ -647,6 +650,8 @@ fn samples(idents: Vec<IdentSample>) -> CorpusSamples {
         oracle_less_rows: BTreeMap::new(),
         structural: Vec::new(),
         unscored_rows: BTreeMap::new(),
+        refs: Vec::new(),
+        costs: Vec::new(),
     }
 }
 
@@ -885,6 +890,7 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
     repo.write("src/c.rs", "// build lock\nfn y() {}\n");
     let commit = repo.commit_all("init");
     let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let golden = parse_golden(&format!(
         "corpus = \"skim\"\ncommit = \"{commit}\"\n\
          [[ident]]\nid = \"skim-L01\"\nquery = \"check_staleness\"\ndef = {{ path = \"src/b.rs\", line = 2 }}\norigin = \"seed\"\n\
@@ -931,6 +937,7 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
 
     let e = evaluate(
         &universe,
+        &text,
         &stats,
         &plan,
         &observations,
@@ -984,6 +991,7 @@ fn evaluate_records_the_full_list_size_of_entries_without_an_oracle() {
     repo.write("a.rs", "x\n");
     let commit = repo.commit_all("init");
     let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let golden = parse_golden(&format!(
         "corpus = \"skim\"\ncommit = \"{commit}\"\n\
          [[lexical]]\nid = \"skim-X01\"\nquery = \"x\"\ncategory = \"short\"\n\
@@ -1016,6 +1024,7 @@ fn evaluate_records_the_full_list_size_of_entries_without_an_oracle() {
 
     let e = evaluate(
         &universe,
+        &text,
         &stats,
         &plan,
         &observations,
@@ -1036,6 +1045,7 @@ fn evaluate_rejects_observations_that_do_not_follow_the_plan() {
     repo.write("a.rs", "x\n");
     let commit = repo.commit_all("init");
     let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let golden = parse_golden(&format!(
         "corpus = \"skim\"\ncommit = \"{commit}\"\n[[lexical]]\nid = \"skim-X01\"\nquery = \"x\"\ncategory = \"short\"\n"
     ))
@@ -1049,6 +1059,7 @@ fn evaluate_rejects_observations_that_do_not_follow_the_plan() {
     assert!(
         evaluate(
             &universe,
+            &text,
             &stats,
             &plan,
             &[],
@@ -1076,6 +1087,7 @@ fn evaluate_scores_ast_entries_against_the_structural_oracle() {
     repo.write("lib/C.java", "class C { void m() {} }\n");
     let commit = repo.commit_all("init");
     let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let golden = parse_golden(&format!(
         "corpus = \"skim\"\ncommit = \"{commit}\"\n{}{}",
         ast_entry(
@@ -1131,7 +1143,7 @@ fn evaluate_scores_ast_entries_against_the_structural_oracle() {
         })
         .collect();
 
-    let e = evaluate(&universe, &stats, &plan, &observations, &evidence).unwrap();
+    let e = evaluate(&universe, &text, &stats, &plan, &observations, &evidence).unwrap();
 
     let outcome = |id: &str, check: CheckId| {
         e.outcomes
@@ -1184,6 +1196,7 @@ fn evaluate_scores_ast_entries_against_the_structural_oracle() {
     assert!(
         evaluate(
             &universe,
+            &text,
             &stats,
             &plan,
             &observations,
@@ -1191,4 +1204,907 @@ fn evaluate_scores_ast_entries_against_the_structural_oracle() {
         )
         .is_err()
     );
+}
+
+// --- #540: the frozen-answer checks (pure) ----------------------------------------
+
+use crate::scoreboard::types::{Cost, DefinitionSite, Definitions, Occurrence, Role};
+
+fn occ(path: &str, line: u32, role: Option<Role>) -> Occurrence {
+    Occurrence {
+        path: path.to_string(),
+        line,
+        role,
+    }
+}
+
+fn with_occurrences(occurrences: Vec<Occurrence>) -> ResultPage {
+    ResultPage {
+        occurrences,
+        ..ResultPage::default()
+    }
+}
+
+fn with_definitions(count: Option<u64>, at_least: bool, sites: &[(&str, u32)]) -> ResultPage {
+    ResultPage {
+        definitions: Some(Definitions {
+            count,
+            at_least,
+            sites: sites
+                .iter()
+                .map(|(p, l)| DefinitionSite {
+                    path: p.to_string(),
+                    line: *l,
+                })
+                .collect(),
+        }),
+        ..ResultPage::default()
+    }
+}
+
+/// `launch`: defined at lib.rs:1, called at lib.rs:2 and main.rs:1, named in
+/// a comment at lib.rs:3 and in LICENSE:1.
+fn refs_entry() -> RefsEntry {
+    golden_with(
+        "[[refs]]\nid = \"skim-R01\"\nquery = \"launch\"\n\
+         def = { path = \"src/lib.rs\", line = 1 }\norigin = \"curated\"\n\
+         sites = [\n\
+           { path = \"src/lib.rs\", line = 1, role = \"def\" },\n\
+           { path = \"src/lib.rs\", line = 2, role = \"call\" },\n\
+           { path = \"src/lib.rs\", line = 3, role = \"comment\" },\n\
+           { path = \"src/main.rs\", line = 1, role = \"call\" },\n\
+           { path = \"LICENSE\", line = 1, role = \"text\" },\n\
+         ]\n",
+    )
+    .refs
+    .remove(0)
+}
+
+/// Every frozen site of [`refs_entry`], labelled as the entry freezes it.
+fn refs_occurrences() -> Vec<Occurrence> {
+    vec![
+        occ("src/lib.rs", 1, Some(Role::Def)),
+        occ("src/lib.rs", 2, Some(Role::Call)),
+        occ("src/lib.rs", 3, Some(Role::Comment)),
+        occ("src/main.rs", 1, Some(Role::Call)),
+        occ("LICENSE", 1, Some(Role::Text)),
+    ]
+}
+
+#[test]
+fn refs_recall_fails_when_one_frozen_site_is_absent_and_passes_when_all_are_present() {
+    let entry = refs_entry();
+    assert!(check_refs_recall(&with_occurrences(refs_occurrences()), &entry).is_pass());
+
+    // The role and extra occurrences do not matter to recall.
+    let mut extra = refs_occurrences();
+    extra[1].role = None;
+    extra.push(occ("src/other.rs", 9, Some(Role::Ref)));
+    assert!(check_refs_recall(&with_occurrences(extra), &entry).is_pass());
+
+    let mut absent = refs_occurrences();
+    absent.remove(3);
+    let d = detail(&check_refs_recall(&with_occurrences(absent), &entry));
+    assert!(
+        d.contains("missing 1 of 5") && d.contains("src/main.rs:1"),
+        "{d}"
+    );
+
+    // A page with no occurrence at all (the output states none) fails.
+    assert!(is_fail(&check_refs_recall(&ResultPage::default(), &entry)));
+}
+
+#[test]
+fn refs_calls_recall_fails_when_a_frozen_call_has_any_role_other_than_call_or_is_absent() {
+    let entry = refs_entry();
+    assert!(check_refs_calls_recall(&with_occurrences(refs_occurrences()), &entry).is_pass());
+
+    // Only the frozen calls need the call role; the comment may be anything.
+    let mut loose = refs_occurrences();
+    loose[2].role = None;
+    assert!(check_refs_calls_recall(&with_occurrences(loose), &entry).is_pass());
+
+    for wrong in [Some(Role::Ref), Some(Role::Def), Some(Role::Partial), None] {
+        let mut o = refs_occurrences();
+        o[1].role = wrong;
+        let d = detail(&check_refs_calls_recall(&with_occurrences(o), &entry));
+        assert!(
+            d.contains("1 of 2") && d.contains("src/lib.rs:2"),
+            "{wrong:?}: {d}"
+        );
+    }
+
+    let mut absent = refs_occurrences();
+    absent.remove(3);
+    let d = detail(&check_refs_calls_recall(&with_occurrences(absent), &entry));
+    assert!(d.contains("src/main.rs:1 (absent)"), "{d}");
+}
+
+#[test]
+fn refs_call_precision_is_the_frozen_calls_in_the_call_group_over_its_size() {
+    let entry = refs_entry();
+    // Call group {lib.rs:2, main.rs:1, lib.rs:3}: two of three are frozen calls.
+    let mut o = refs_occurrences();
+    o[2].role = Some(Role::Call);
+    let p = refs_call_precision(&with_occurrences(o), &entry).unwrap();
+    assert!((p - 2.0 / 3.0).abs() < 1e-9, "{p}");
+
+    assert_eq!(
+        refs_call_precision(&with_occurrences(refs_occurrences()), &entry),
+        Some(1.0)
+    );
+    // A page that labels no call has no precision to record.
+    let unlabelled = vec![occ("src/lib.rs", 2, None), occ("src/main.rs", 1, None)];
+    assert_eq!(
+        refs_call_precision(&with_occurrences(unlabelled), &entry),
+        None
+    );
+    assert_eq!(refs_call_precision(&ResultPage::default(), &entry), None);
+    // A call group with no frozen call scores 0.
+    assert_eq!(
+        refs_call_precision(
+            &with_occurrences(vec![occ("src/other.rs", 4, Some(Role::Call))]),
+            &entry
+        ),
+        Some(0.0)
+    );
+}
+
+/// `run` is defined at a.rs:1 and b.rs:1; its calls are a.rs:2 and c.rs:7.
+fn clash_entry() -> ClashEntry {
+    golden_with(
+        "[[clash]]\nid = \"skim-D01\"\nquery = \"run\"\nsplit = \"none\"\norigin = \"curated\"\n\
+         defs = [ { path = \"src/a.rs\", line = 1 }, { path = \"src/b.rs\", line = 1 } ]\n\
+         calls = [\n\
+           { path = \"src/a.rs\", line = 2, def = 0 },\n\
+           { path = \"src/c.rs\", line = 7, def = \"unassigned\" },\n\
+         ]\n",
+    )
+    .clashes
+    .remove(0)
+}
+
+#[test]
+fn clash_defs_complete_fails_when_one_frozen_definition_is_absent() {
+    let entry = clash_entry();
+    let both = with_definitions(Some(2), false, &[("src/a.rs", 1), ("src/b.rs", 1)]);
+    assert!(check_clash_defs_complete(&both, &entry).is_pass());
+    // The order of the sites does not matter here.
+    let reversed = with_definitions(Some(2), false, &[("src/b.rs", 1), ("src/a.rs", 1)]);
+    assert!(check_clash_defs_complete(&reversed, &entry).is_pass());
+
+    let one = with_definitions(Some(2), false, &[("src/a.rs", 1)]);
+    let d = detail(&check_clash_defs_complete(&one, &entry));
+    assert!(
+        d.contains("missing 1 of 2") && d.contains("src/b.rs:1"),
+        "{d}"
+    );
+    // The right file at another line is not the definition.
+    let drifted = with_definitions(Some(2), false, &[("src/a.rs", 1), ("src/b.rs", 4)]);
+    assert!(is_fail(&check_clash_defs_complete(&drifted, &entry)));
+    // No definitions in the output fails closed.
+    assert!(is_fail(&check_clash_defs_complete(
+        &ResultPage::default(),
+        &entry
+    )));
+}
+
+#[test]
+fn clash_def_count_accepts_an_exact_count_and_the_at_least_form_only_inside_its_bounds() {
+    let entry = clash_entry(); // frozen: 2
+    let count = |count: Option<u64>, at_least: bool, unlabelled: u64| {
+        let mut page = with_definitions(count, at_least, &[]);
+        page.unlabelled_files = unlabelled;
+        check_clash_def_count(&page, &entry)
+    };
+    assert!(count(Some(2), false, 0).is_pass());
+    assert!(is_fail(&count(Some(1), false, 0)));
+    assert!(is_fail(&count(Some(3), false, 0)));
+    // Without the budget note, unlabelled files change nothing.
+    assert!(is_fail(&count(Some(1), false, 5)));
+
+    // `at_least`: count <= frozen <= count + unlabelled_files.
+    assert!(count(Some(1), true, 1).is_pass());
+    assert!(count(Some(1), true, 37).is_pass());
+    assert!(count(Some(2), true, 0).is_pass(), "an exact count passes");
+    assert!(is_fail(&count(Some(1), true, 0)), "frozen is out of reach");
+    assert!(
+        is_fail(&count(Some(3), true, 9)),
+        "the count is above frozen"
+    );
+
+    // The output states no count, or no definitions at all.
+    let d = detail(&count(None, false, 0));
+    assert!(d.contains("no definitions.count"), "{d}");
+    assert!(is_fail(&check_clash_def_count(
+        &ResultPage::default(),
+        &entry
+    )));
+}
+
+#[test]
+fn clash_calls_recall_fails_when_a_call_of_either_definition_is_not_labelled_call() {
+    let entry = clash_entry();
+    let all = with_occurrences(vec![
+        occ("src/a.rs", 2, Some(Role::Call)),
+        occ("src/c.rs", 7, Some(Role::Call)),
+    ]);
+    assert!(check_clash_calls_recall(&all, &entry).is_pass());
+
+    let missing_second = with_occurrences(vec![occ("src/a.rs", 2, Some(Role::Call))]);
+    let d = detail(&check_clash_calls_recall(&missing_second, &entry));
+    assert!(
+        d.contains("src/c.rs:7 (absent)") && d.contains("either definition"),
+        "{d}"
+    );
+
+    let wrong_role = with_occurrences(vec![
+        occ("src/a.rs", 2, Some(Role::Ref)),
+        occ("src/c.rs", 7, Some(Role::Call)),
+    ]);
+    assert!(is_fail(&check_clash_calls_recall(&wrong_role, &entry)));
+}
+
+#[test]
+fn ident_def_first_needs_the_first_definition_site_to_be_the_frozen_line() {
+    let def = DefSite {
+        path: "src/b.rs".to_string(),
+        line: 2,
+    };
+    let first =
+        |sites: &[(&str, u32)]| check_def_first(&with_definitions(Some(1), false, sites), &def);
+    assert!(first(&[("src/b.rs", 2)]).is_pass());
+    // Only the first site counts.
+    assert!(first(&[("src/b.rs", 2), ("src/z.rs", 9)]).is_pass());
+    // The right file, another line.
+    let d = detail(&first(&[("src/b.rs", 5)]));
+    assert!(
+        d.contains("src/b.rs:5") && d.contains("expected src/b.rs:2"),
+        "{d}"
+    );
+    // The frozen line is present but not first.
+    assert!(is_fail(&first(&[("src/z.rs", 9), ("src/b.rs", 2)])));
+    assert!(is_fail(&first(&[])), "no site");
+    assert!(is_fail(&check_def_first(&ResultPage::default(), &def)));
+}
+
+#[test]
+fn concept_first_right_top5_passes_only_when_a_frozen_first_file_is_in_the_first_five() {
+    let first = vec!["src/guard.rs".to_string(), "src/fidelity.rs".to_string()];
+    let list = |paths: &[&str]| check_first_right_top5(&rows(paths), &first);
+    assert!(list(&["a", "b", "c", "d", "src/fidelity.rs"]).is_pass());
+    assert!(list(&["src/guard.rs"]).is_pass());
+    let d = detail(&list(&["a", "b", "c", "d", "e", "src/guard.rs"]));
+    assert!(d.contains("first 5"), "{d}");
+    assert!(is_fail(&list(&[])), "an empty list has no first file");
+}
+
+#[test]
+fn recall_tracked_reads_the_text_universe_ground_truth() {
+    let gt = gt(&["LICENSE", "src/lib.rs"]);
+    assert!(check_recall_tracked(&rows(&["src/lib.rs", "LICENSE"]), &gt).is_pass());
+    let d = detail(&check_recall_tracked(&rows(&["src/lib.rs"]), &gt));
+    assert!(
+        d.contains("missing 1 of 2 text-universe") && d.contains("LICENSE"),
+        "{d}"
+    );
+}
+
+/// A repository whose text universe is two text files, one binary file and
+/// one file over the size cap.
+fn accounted_corpus() -> (FixtureRepo, TextUniverse) {
+    let repo = FixtureRepo::new();
+    repo.write("a.rs", "fn a() {}\n");
+    repo.write("LICENSE", "MIT\n");
+    repo.write("logo.png", b"\x89PNG\0\0".as_slice());
+    repo.write(
+        "huge.txt",
+        vec![b'x'; usize::try_from(crate::scoreboard::universe::MAX_FILE_BYTES).unwrap() + 1],
+    );
+    repo.commit_all("init");
+    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    (repo, text)
+}
+
+fn accounted_page(searched: Option<u64>, left_out: &[(&str, u64)]) -> ResultPage {
+    ResultPage {
+        searched_files: searched,
+        left_out: Some(left_out.iter().map(|(r, n)| (r.to_string(), *n)).collect()),
+        ..ResultPage::default()
+    }
+}
+
+#[test]
+fn universe_accounted_needs_the_searched_files_and_every_left_out_count_to_match() {
+    let (_repo, text) = accounted_corpus();
+    assert_eq!((text.len(), text.left_out_count("binary")), (2, 1));
+    let exact = [("binary", 1), ("too_large", 1)];
+    assert!(check_universe_accounted(&accounted_page(Some(2), &exact), &text).is_pass());
+    // A reason with a zero count may be omitted or listed.
+    let zeros = [
+        ("binary", 1),
+        ("too_large", 1),
+        ("symlink", 0),
+        ("vanished", 0),
+    ];
+    assert!(check_universe_accounted(&accounted_page(Some(2), &zeros), &text).is_pass());
+
+    // TP-12: the searched files differ, the left-out counts agree.
+    let d = detail(&check_universe_accounted(
+        &accounted_page(Some(1), &exact),
+        &text,
+    ));
+    assert!(
+        d.contains("searched_files is 1") && d.contains("has 2"),
+        "{d}"
+    );
+    assert!(d.contains("accounted 3 files, the oracle 4"), "{d}");
+
+    // TP-13: one left-out count differs, the totals still agree.
+    let moved = [("binary", 2), ("too_large", 0)];
+    let d = detail(&check_universe_accounted(
+        &accounted_page(Some(2), &moved),
+        &text,
+    ));
+    assert!(
+        d.contains("left_out.binary is 2") && d.contains("left_out.too_large is 0"),
+        "{d}"
+    );
+    assert!(!d.contains("searched_files"), "{d}");
+
+    // A reason the oracle does not know, with a count, is a difference.
+    let unknown = [("binary", 1), ("too_large", 1), ("minified", 3)];
+    let d = detail(&check_universe_accounted(
+        &accounted_page(Some(2), &unknown),
+        &text,
+    ));
+    assert!(d.contains("left_out.minified is 3"), "{d}");
+}
+
+#[test]
+fn universe_accounted_fails_closed_when_the_output_states_no_accounting() {
+    let (_repo, text) = accounted_corpus();
+    let no_searched = accounted_page(None, &[("binary", 1), ("too_large", 1)]);
+    assert!(detail(&check_universe_accounted(&no_searched, &text)).contains("no searched_files"));
+    let no_left_out = ResultPage {
+        searched_files: Some(2),
+        ..ResultPage::default()
+    };
+    assert!(detail(&check_universe_accounted(&no_left_out, &text)).contains("no left_out"));
+}
+
+/// Four lines hold `launch` as text: lib.rs:1-2, main.rs:1, LICENSE:1.
+fn stakes_truth() -> BTreeSet<(String, u32)> {
+    [
+        ("LICENSE", 1),
+        ("src/lib.rs", 1),
+        ("src/lib.rs", 2),
+        ("src/main.rs", 1),
+    ]
+    .iter()
+    .map(|(p, l)| (p.to_string(), *l))
+    .collect()
+}
+
+fn stakes_page(lines: &[(&str, u32)], counts: &[(&str, u64)]) -> ResultPage {
+    ResultPage {
+        rows: rows(
+            &lines
+                .iter()
+                .map(|(p, _)| *p)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        ),
+        occurrences: lines.iter().map(|(p, l)| occ(p, *l, None)).collect(),
+        line_counts: counts.iter().map(|(p, n)| (p.to_string(), *n)).collect(),
+        ..ResultPage::default()
+    }
+}
+
+#[test]
+fn stakes_lines_files_and_counts_compare_the_page_with_the_regex_oracle() {
+    let truth = stakes_truth();
+    let lines = [
+        ("LICENSE", 1),
+        ("src/lib.rs", 1),
+        ("src/lib.rs", 2),
+        ("src/main.rs", 1),
+    ];
+    let counts = [("LICENSE", 1), ("src/lib.rs", 2), ("src/main.rs", 1)];
+    let exact = stakes_page(&lines, &counts);
+    assert!(check_stakes_lines(&exact, &truth).is_pass());
+    assert!(check_stakes_files(&exact, &truth).is_pass());
+    assert!(check_stakes_counts(&exact, &truth).is_pass());
+
+    // A missing line: the file is still found, the count is short.
+    let short = stakes_page(&lines[..3], &[("LICENSE", 1), ("src/lib.rs", 2)]);
+    let d = detail(&check_stakes_lines(&short, &truth));
+    assert!(
+        d.contains("1 matching line(s) missing") && d.contains("src/main.rs:1"),
+        "{d}"
+    );
+    assert!(
+        is_fail(&check_stakes_files(&short, &truth)),
+        "main.rs is gone"
+    );
+
+    // An extra line in a known file: files agree, lines and counts differ.
+    let mut more = lines.to_vec();
+    more.push(("src/lib.rs", 3));
+    let extra = stakes_page(
+        &more,
+        &[("LICENSE", 1), ("src/lib.rs", 3), ("src/main.rs", 1)],
+    );
+    assert!(
+        detail(&check_stakes_lines(&extra, &truth)).contains("src/lib.rs:3 not in the oracle")
+            || detail(&check_stakes_lines(&extra, &truth))
+                .contains("not in the oracle: src/lib.rs:3")
+    );
+    assert!(check_stakes_files(&extra, &truth).is_pass());
+    let d = detail(&check_stakes_counts(&extra, &truth));
+    assert!(d.contains("src/lib.rs has 3 line(s), the oracle 2"), "{d}");
+
+    // An extra file.
+    let stray = stakes_page(&[("src/zz.rs", 4)], &[("src/zz.rs", 1)]);
+    assert!(detail(&check_stakes_files(&stray, &truth)).contains("not in the oracle: src/zz.rs"));
+    assert!(
+        detail(&check_stakes_counts(&stray, &truth))
+            .contains("src/zz.rs has 1 line(s), the oracle 0")
+    );
+
+    // No answer at all, for a query the oracle finds hits for, fails.
+    assert!(is_fail(&check_stakes_lines(&ResultPage::default(), &truth)));
+    assert!(is_fail(&check_stakes_counts(
+        &ResultPage::default(),
+        &truth
+    )));
+    // And an empty answer for a query with no hit passes.
+    let none = BTreeSet::new();
+    assert!(check_stakes_lines(&ResultPage::default(), &none).is_pass());
+    assert!(check_stakes_files(&ResultPage::default(), &none).is_pass());
+    assert!(check_stakes_counts(&ResultPage::default(), &none).is_pass());
+}
+
+#[test]
+fn stakes_exit_fails_on_a_zero_hit_entry_whose_run_exits_zero_and_passes_when_it_exits_one() {
+    let exit = |code: i32| ResultPage {
+        exit_code: code,
+        ..ResultPage::default()
+    };
+    assert!(check_stakes_exit(&exit(1), 1).is_pass());
+    let d = detail(&check_stakes_exit(&exit(0), 1));
+    assert!(d.contains("exit code is 0, expected 1"), "{d}");
+    assert!(check_stakes_exit(&exit(0), 0).is_pass());
+    assert!(is_fail(&check_stakes_exit(&exit(2), 1)));
+    // A process killed by a signal has no code; the runner records -1.
+    assert!(is_fail(&check_stakes_exit(&exit(-1), 1)));
+}
+
+// --- #540: planning the new kinds ---------------------------------------------------
+
+const REFS_TOML: &str = "[[refs]]\nid = \"skim-R01\"\nquery = \"launch\"\n\
+     def = { path = \"a.rs\", line = 1 }\norigin = \"curated\"\n\
+     sites = [ { path = \"a.rs\", line = 1, role = \"def\" } ]\n";
+
+const CLASH_TOML: &str = "[[clash]]\nid = \"skim-D01\"\nquery = \"run\"\nsplit = \"none\"\n\
+     origin = \"curated\"\ndefs = [ { path = \"a.rs\", line = 1 }, { path = \"b.rs\", line = 1 } ]\n\
+     calls = []\n";
+
+fn stakes_toml(expect: &str, exit: Option<u8>) -> String {
+    let exit = exit.map_or(String::new(), |e| format!("exit = {e}\n"));
+    format!(
+        "[[stakes]]\nid = \"skim-S01\"\nquery = \"qzvx_absent_7713\"\nflags = []\nexpect = \"{expect}\"\n{exit}"
+    )
+}
+
+#[test]
+fn a_refs_entry_runs_the_refs_checks_and_the_unique_path_check_only() {
+    assert_eq!(
+        checks_of(REFS_TOML),
+        vec![
+            CheckId::ResultsUniquePaths,
+            CheckId::RefsRecall,
+            CheckId::RefsCallsRecall,
+            CheckId::UniverseAccounted,
+        ]
+    );
+    let g = golden_with(REFS_TOML);
+    let q = &plan(&g).unwrap()[0];
+    assert_eq!((q.kind, q.arm), (EntryKind::Refs, Arm::Lexical));
+    assert_eq!(q.query.as_deref(), Some("launch"));
+    assert!(q.refs_entry().is_some() && q.oracle.is_some());
+    assert!(!q.measures_text());
+}
+
+#[test]
+fn a_clash_entry_runs_the_clash_checks_and_the_unique_path_check_only() {
+    assert_eq!(
+        checks_of(CLASH_TOML),
+        vec![
+            CheckId::ResultsUniquePaths,
+            CheckId::ClashDefsComplete,
+            CheckId::ClashDefCount,
+            CheckId::ClashCallsRecall,
+        ]
+    );
+}
+
+#[test]
+fn a_stakes_entry_runs_the_check_its_expect_names() {
+    for (expect, exit, check) in [
+        ("lines", None, CheckId::StakesLines),
+        ("files", None, CheckId::StakesFiles),
+        ("counts", None, CheckId::StakesCounts),
+        ("exit", Some(1), CheckId::StakesExit),
+    ] {
+        assert_eq!(
+            checks_of(&stakes_toml(expect, exit)),
+            vec![CheckId::ResultsUniquePaths, check],
+            "expect = {expect}"
+        );
+    }
+}
+
+#[test]
+fn a_stakes_entry_compiles_its_flags_into_the_regex_oracle_query() {
+    let g = golden_with(
+        "[[stakes]]\nid = \"skim-S02\"\nquery = \"Launch\"\nflags = [\"-i\", \"-w\"]\nexpect = \"lines\"\n",
+    );
+    let q = &plan(&g).unwrap()[0];
+    let stakes = q.stakes_oracle().unwrap();
+    assert!(stakes.query.matches_line("fn launch() {}"), "-i");
+    assert!(!stakes.query.matches_line("fn relaunch() {}"), "-w");
+    // A flag the oracle cannot judge stops the plan instead of being ignored.
+    let filtered = golden_with(
+        "[[stakes]]\nid = \"skim-S03\"\nquery = \"x\"\nflags = [\"-t\", \"rust\"]\nexpect = \"lines\"\n",
+    );
+    assert!(plan(&filtered).is_err());
+}
+
+#[test]
+fn only_a_lexical_table_entry_gains_the_tracked_recall_check() {
+    // A paginated query has a lexical oracle but is not a `[[lexical]]` entry.
+    let paginated = checks_of(
+        "[[pagination]]\nid = \"skim-G001\"\nquery = \"build lock\"\nflags = []\nlimits = [3]\n",
+    );
+    assert!(!paginated.contains(&CheckId::LexicalRecallTracked));
+}
+
+#[test]
+fn a_concept_entry_runs_first_right_top5_only_when_it_freezes_first_files() {
+    let without = "[[concept]]\nid = \"skim-C01\"\nquery = \"a b\"\nrelevant = 'a'\n";
+    assert!(!checks_of(without).contains(&CheckId::ConceptFirstRightTop5));
+    let with = format!("{without}first = [\"src/a.rs\"]\n");
+    assert!(checks_of(&with).contains(&CheckId::ConceptFirstRightTop5));
+    let g = golden_with(&with);
+    let q = &plan(&g).unwrap()[0];
+    assert_eq!(q.first_files(), Some(["src/a.rs".to_string()].as_slice()));
+}
+
+#[test]
+fn every_check_that_runs_on_an_entry_applies_to_its_kind() {
+    let body = format!(
+        "[[ident]]\nid = \"skim-L01\"\nquery = \"x_y\"\ndef = {{ path = \"a.rs\", line = 1 }}\norigin = \"seed\"\n\
+         [[concept]]\nid = \"skim-C01\"\nquery = \"a b\"\nrelevant = 'a'\nfirst = [\"a.rs\"]\n\
+         [[lexical]]\nid = \"skim-X01\"\nquery = \"q\"\ncategory = \"short\"\n\
+         [[pagination]]\nid = \"skim-G001\"\nquery = \"x\"\nflags = []\nlimits = [3]\n\
+         [[prefix]]\nid = \"skim-F001\"\nflags = [\"--hot\"]\nlimits = [5]\n\
+         {}{REFS_TOML}{CLASH_TOML}{}",
+        ast_entry("skim-A1", "try-catch", "tsx", "hard"),
+        stakes_toml("exit", Some(1)),
+    );
+    let planned = plan(&golden_with(&body)).unwrap();
+    let kinds: BTreeSet<EntryKind> = planned.iter().map(|q| q.kind).collect();
+    assert_eq!(kinds.len(), 9, "one entry of every kind: {kinds:?}");
+    for q in &planned {
+        for check in CheckId::ALL {
+            if q.runs(*check) {
+                assert!(
+                    check.applies_to(q.kind),
+                    "{check} runs on {} ({:?})",
+                    q.id,
+                    q.kind
+                );
+            }
+        }
+        assert!(q.runs(CheckId::ResultsUniquePaths), "{}", q.id);
+    }
+}
+
+// --- #540: RATCHET and reference rows -----------------------------------------------
+
+#[test]
+fn the_new_ratchet_and_reference_rows_are_defined_with_their_direction() {
+    let direction = |name: &str| metric_def(name).expect("metric is defined").direction;
+    assert_eq!(direction("refs.call_precision"), Direction::HigherBetter);
+    for name in [
+        "cost.files_parsed_median",
+        "cost.bytes_parsed_median",
+        "cost.bytes_read_median",
+    ] {
+        assert_eq!(direction(name), Direction::LowerBetter, "{name}");
+        assert_eq!(metric_def(name).unwrap().tolerance, Tolerance::Exact);
+    }
+    for lang in ["rust", "python", "typescript", "tsx", "javascript", "go"] {
+        let name = format!("roles.precision.{lang}");
+        assert_eq!(direction(&name), Direction::HigherBetter, "{name}");
+    }
+    for name in ["bytes.rgw_text_median", "bytes.rgw_first_correct_median"] {
+        assert_eq!(direction(name), Direction::Neutral, "{name}");
+        assert_eq!(metric_def(name).unwrap().tolerance, BYTES);
+    }
+    // Moves read as the bar says.
+    assert_eq!(
+        compare_ratchet("refs.call_precision", 0.8, 0.6),
+        RatchetChange::Regressed
+    );
+    assert_eq!(
+        compare_ratchet("cost.files_parsed_median", 3.0, 2.0),
+        RatchetChange::Improved
+    );
+    assert_eq!(
+        compare_ratchet("cost.bytes_read_median", 3.0, 4.0),
+        RatchetChange::Regressed
+    );
+    assert_eq!(
+        compare_ratchet("bytes.rgw_text_median", 1000.0, 2000.0),
+        RatchetChange::Changed
+    );
+}
+
+fn cost(files_parsed: u64, bytes_parsed: u64, bytes_read: u64) -> Cost {
+    Cost {
+        files_read: 0,
+        bytes_read,
+        files_parsed,
+        bytes_parsed,
+    }
+}
+
+#[test]
+fn ratchet_values_pool_the_call_precision_the_cost_medians_and_the_rgw_columns() {
+    let mut s = samples(vec![
+        ident("a-1", Some(1), Some(40)),
+        ident("a-2", Some(2), None),
+    ]);
+    s.refs = vec![
+        RefsSample {
+            id: "r1".into(),
+            call_precision: Some(1.0),
+        },
+        RefsSample {
+            id: "r2".into(),
+            call_precision: Some(0.5),
+        },
+        RefsSample {
+            id: "r3".into(),
+            call_precision: None,
+        },
+    ];
+    s.costs = vec![cost(3, 100, 1000), cost(5, 300, 2000), cost(1, 50, 500)];
+    let r = ratchet_values(&[&s]);
+    assert_eq!(
+        r["refs.call_precision"], 0.75,
+        "the mean skips an entry with no value"
+    );
+    assert_eq!(r["cost.files_parsed_median"], 3.0);
+    assert_eq!(r["cost.bytes_parsed_median"], 100.0);
+    assert_eq!(r["cost.bytes_read_median"], 1000.0);
+    assert_eq!(r["bytes.rgw_text_median"], 200.0);
+    assert_eq!(r["bytes.rgw_first_correct_median"], 30.0);
+
+    // Two corpora pool their entries.
+    let mut t = samples(Vec::new());
+    t.refs = vec![RefsSample {
+        id: "r4".into(),
+        call_precision: Some(0.25),
+    }];
+    t.costs = vec![cost(9, 900, 9000)];
+    let pooled = ratchet_values(&[&s, &t]);
+    assert_eq!(pooled["refs.call_precision"], 0.5833);
+    assert_eq!(
+        pooled["cost.files_parsed_median"], 3.0,
+        "median of 1, 3, 5, 9"
+    );
+}
+
+#[test]
+fn a_row_with_no_value_is_absent_so_it_cannot_fail_the_gate() {
+    // The current binary states no cost and labels no call: no entry has a
+    // value for these rows.
+    let mut s = samples(vec![ident("a-1", Some(1), Some(40))]);
+    s.refs = vec![RefsSample {
+        id: "r1".into(),
+        call_precision: None,
+    }];
+    let r = ratchet_values(&[&s]);
+    for name in r.keys() {
+        assert!(
+            !name.starts_with("refs.") && !name.starts_with("cost.") && !name.starts_with("roles."),
+            "{name} has no value to record"
+        );
+    }
+    // The rows are defined all the same.
+    assert!(metric_def("roles.precision.go").is_some());
+    assert!(metric_def("cost.bytes_parsed_median").is_some());
+}
+
+// --- #540: evaluate over the new kinds ----------------------------------------------
+
+#[test]
+fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_frozen_answers() {
+    let repo = FixtureRepo::new();
+    repo.write(
+        "src/lib.rs",
+        "pub fn launch() {}\nfn start() { launch(); }\n// launch is documented\n",
+    );
+    repo.write("src/main.rs", "fn main() { launch(); }\n");
+    repo.write("LICENSE", "launch it\n");
+    repo.write("src/a.rs", "pub fn run() {}\nfn go() { run(); }\n");
+    repo.write("src/b.rs", "pub fn run(x: u32) {}\n");
+    let commit = repo.commit_all("init");
+    let git = GitIsolation::new(repo.home());
+    let universe = Universe::compute(repo.root(), &git).unwrap();
+    let text = text_universe(repo.root(), &git).unwrap();
+    assert_eq!(
+        (universe.len(), text.len()),
+        (4, 5),
+        "LICENSE is only in the text universe"
+    );
+
+    let golden = parse_golden(&format!(
+        "corpus = \"skim\"\ncommit = \"{commit}\"\n\
+         [[lexical]]\nid = \"skim-X01\"\nquery = \"launch\"\ncategory = \"substr\"\n\
+         {}{}\
+         [[stakes]]\nid = \"skim-S01\"\nquery = \"launch\"\nexpect = \"exit\"\nexit = 0\n\
+         [[stakes]]\nid = \"skim-S02\"\nquery = \"qzvx_absent_7713\"\nexpect = \"exit\"\nexit = 1\n\
+         [[stakes]]\nid = \"skim-S03\"\nquery = \"launch\"\nexpect = \"lines\"\n",
+        refs_entry_toml(),
+        clash_entry_toml()
+    ))
+    .unwrap();
+    let plan = plan(&golden).unwrap();
+    let stats = StatsSnapshot {
+        file_count: 4,
+        skipped_by_reason: BTreeMap::new(),
+        temporal_state: None,
+    };
+
+    let all_zero: BTreeMap<String, u64> = LEFT_OUT_REASONS
+        .iter()
+        .map(|r| (r.to_string(), 0))
+        .collect();
+    let refs_page = ResultPage {
+        occurrences: refs_occurrences(),
+        searched_files: Some(5),
+        left_out: Some(all_zero),
+        cost: Some(cost(2, 50, 100)),
+        ..ResultPage::default()
+    };
+    let clash_page = ResultPage {
+        occurrences: vec![
+            occ("src/a.rs", 2, Some(Role::Call)),
+            occ("src/c.rs", 7, Some(Role::Call)),
+        ],
+        ..with_definitions(Some(2), false, &[("src/a.rs", 1), ("src/b.rs", 1)])
+    };
+    let launch_lines = [
+        ("LICENSE", 1),
+        ("src/lib.rs", 1),
+        ("src/lib.rs", 2),
+        ("src/lib.rs", 3),
+        ("src/main.rs", 1),
+    ];
+    let page_for = |id: &str, tracked: bool| -> Option<ResultPage> {
+        Some(match id {
+            "skim-X01" => {
+                let mut paths = vec!["src/lib.rs", "src/main.rs"];
+                if tracked {
+                    paths.push("LICENSE");
+                }
+                page(rows(&paths), false)
+            }
+            "skim-R01" => refs_page.clone(),
+            "skim-D01" => clash_page.clone(),
+            "skim-S01" => ResultPage {
+                exit_code: 0,
+                ..ResultPage::default()
+            },
+            "skim-S02" => ResultPage {
+                exit_code: 1,
+                ..ResultPage::default()
+            },
+            "skim-S03" => stakes_page(&launch_lines, &[]),
+            _ => return None,
+        })
+    };
+    let observe = |tracked: bool| -> Vec<EntryObservation> {
+        plan.iter()
+            .map(|q| EntryObservation {
+                id: q.id.clone(),
+                full: page_for(&q.id, tracked).expect("a page is frozen for every planned entry"),
+                sweeps: Vec::new(),
+                limited: Vec::new(),
+                text: None,
+            })
+            .collect()
+    };
+    let run = |tracked: bool| {
+        evaluate(
+            &universe,
+            &text,
+            &stats,
+            &plan,
+            &observe(tracked),
+            &StructuralEvidence::default(),
+        )
+        .unwrap()
+    };
+
+    let e = run(false);
+    let outcome = |e: &CorpusEvaluation, id: &str, check: CheckId| {
+        e.outcomes
+            .iter()
+            .find(|(i, c, _)| i == id && *c == check)
+            .map(|(_, _, o)| o.clone())
+            .expect("the check ran")
+    };
+    // The indexed universe has no LICENSE, so plain recall passes while the
+    // text-universe recall sees the miss.
+    assert!(outcome(&e, "skim-X01", CheckId::LexicalRecall).is_pass());
+    let d = detail(&outcome(&e, "skim-X01", CheckId::LexicalRecallTracked));
+    assert!(d.contains("LICENSE"), "{d}");
+    assert!(outcome(&run(true), "skim-X01", CheckId::LexicalRecallTracked).is_pass());
+
+    for check in [
+        CheckId::RefsRecall,
+        CheckId::RefsCallsRecall,
+        CheckId::UniverseAccounted,
+    ] {
+        assert!(outcome(&e, "skim-R01", check).is_pass(), "{check}");
+    }
+    for check in [
+        CheckId::ClashDefsComplete,
+        CheckId::ClashDefCount,
+        CheckId::ClashCallsRecall,
+    ] {
+        assert!(outcome(&e, "skim-D01", check).is_pass(), "{check}");
+    }
+    assert!(outcome(&e, "skim-S01", CheckId::StakesExit).is_pass());
+    assert!(outcome(&e, "skim-S02", CheckId::StakesExit).is_pass());
+    assert!(outcome(&e, "skim-S03", CheckId::StakesLines).is_pass());
+    for id in ["skim-R01", "skim-D01", "skim-S01", "skim-S02", "skim-S03"] {
+        assert!(
+            outcome(&e, id, CheckId::ResultsUniquePaths).is_pass(),
+            "{id}"
+        );
+    }
+
+    // The samples the new rows read; a frozen entry is not oracle-less.
+    assert_eq!(e.samples.refs.len(), 1);
+    assert_eq!(e.samples.refs[0].call_precision, Some(1.0));
+    assert_eq!(e.samples.costs, vec![cost(2, 50, 100)]);
+    assert!(e.samples.oracle_less_rows.is_empty());
+}
+
+fn refs_entry_toml() -> &'static str {
+    "[[refs]]\nid = \"skim-R01\"\nquery = \"launch\"\n\
+     def = { path = \"src/lib.rs\", line = 1 }\norigin = \"curated\"\n\
+     sites = [\n\
+       { path = \"src/lib.rs\", line = 1, role = \"def\" },\n\
+       { path = \"src/lib.rs\", line = 2, role = \"call\" },\n\
+       { path = \"src/lib.rs\", line = 3, role = \"comment\" },\n\
+       { path = \"src/main.rs\", line = 1, role = \"call\" },\n\
+       { path = \"LICENSE\", line = 1, role = \"text\" },\n\
+     ]\n"
+}
+
+fn clash_entry_toml() -> &'static str {
+    "[[clash]]\nid = \"skim-D01\"\nquery = \"run\"\nsplit = \"none\"\norigin = \"curated\"\n\
+     defs = [ { path = \"src/a.rs\", line = 1 }, { path = \"src/b.rs\", line = 1 } ]\n\
+     calls = [\n\
+       { path = \"src/a.rs\", line = 2, def = 0 },\n\
+       { path = \"src/c.rs\", line = 7, def = \"unassigned\" },\n\
+     ]\n"
 }

@@ -57,8 +57,9 @@ impl Arm {
 
 /// skim's `verify_mode` (absent = substring), or the mode a golden entry
 /// declares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum VerifyMode {
+    #[default]
     Substring,
     Phrase,
     Near,
@@ -125,11 +126,109 @@ pub struct Degraded {
     pub applied: Option<String>,
 }
 
+/// What a matched line is. The names follow the role rules of the search
+/// engine: `def`, `call`, `ref`, `import`, `comment`, `string` and `text`
+/// are the roles a frozen site can have; `partial` (the hit is inside a longer
+/// identifier) and `unlabelled` (the engine did not parse the file) only
+/// occur in the engine's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    Def,
+    Call,
+    Ref,
+    Import,
+    Comment,
+    String,
+    Text,
+    Partial,
+    Unlabelled,
+}
+
+impl Role {
+    /// The lowercase name used in JSON and in failure details.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Def => "def",
+            Role::Call => "call",
+            Role::Ref => "ref",
+            Role::Import => "import",
+            Role::Comment => "comment",
+            Role::String => "string",
+            Role::Text => "text",
+            Role::Partial => "partial",
+            Role::Unlabelled => "unlabelled",
+        }
+    }
+
+    /// The role named `name`, or `None` for a name this scoreboard does not
+    /// know.
+    pub fn from_name(name: &str) -> Option<Role> {
+        const ALL: [Role; 9] = [
+            Role::Def,
+            Role::Call,
+            Role::Ref,
+            Role::Import,
+            Role::Comment,
+            Role::String,
+            Role::Text,
+            Role::Partial,
+            Role::Unlabelled,
+        ];
+        ALL.into_iter().find(|r| r.as_str() == name)
+    }
+}
+
+/// One matching line of a result page: `path:line`, with its role when the
+/// engine labels it (`None` = the engine gives no role).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    pub path: String,
+    /// 1-based line number.
+    pub line: u32,
+    pub role: Option<Role>,
+}
+
+/// One definition site of the queried name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionSite {
+    pub path: String,
+    /// 1-based line that holds the name.
+    pub line: u32,
+}
+
+/// The definitions of the queried name that a page reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Definitions {
+    /// How many definitions the engine counted. `None` = the output states
+    /// no count.
+    pub count: Option<u64>,
+    /// The count is a lower bound: the parse budget ran out, so some matched
+    /// files have no labels.
+    pub at_least: bool,
+    /// The definition sites, in the engine's order: the first is the one the
+    /// result anchors on.
+    pub sites: Vec<DefinitionSite>,
+}
+
+/// The work counters of one call (`cost` in the engine's envelope).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cost {
+    pub files_read: u64,
+    pub bytes_read: u64,
+    pub files_parsed: u64,
+    pub bytes_parsed: u64,
+}
+
 /// One page of results from one skim invocation.
 ///
 /// A result's rank is its index in `rows` plus the invocation's `--offset`.
 /// skim's `total` is deliberately not kept: it is the page size, not a count.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// [`ResultPage::parse`] fills the first four fields. The other fields are
+/// the line-level and accounting answers the #540 checks read; they stay at
+/// their default (nothing observed) until an adapter fills them, and every
+/// check that reads one fails closed on an absent value.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResultPage {
     pub rows: Vec<ResultRow>,
     /// `has_more` (absent = `false`).
@@ -140,6 +239,26 @@ pub struct ResultPage {
     /// `degraded[]` (absent = empty). Standalone `--ast` never carries it
     /// (#483).
     pub degraded: Vec<Degraded>,
+    /// The matching lines, one per `path:line`, with their roles.
+    pub occurrences: Vec<Occurrence>,
+    /// The definitions of the queried name; `None` = the output has none.
+    pub definitions: Option<Definitions>,
+    /// Matched files that have no labels (`parse.unlabelled_files`); `0` when
+    /// absent.
+    pub unlabelled_files: u64,
+    /// Files the search read (`searched_files`); `None` = not stated.
+    pub searched_files: Option<u64>,
+    /// Files left out of the search, by reason (`left_out`); `None` = not
+    /// stated.
+    pub left_out: Option<BTreeMap<String, u64>>,
+    /// Matching lines per file (`files[].line_count`); empty when the output
+    /// has no counts.
+    pub line_counts: BTreeMap<String, u64>,
+    /// The work counters of the call; `None` = not stated.
+    pub cost: Option<Cost>,
+    /// The process exit code. A page parsed from JSON has `0`; the runner
+    /// overwrites it with the real status.
+    pub exit_code: i32,
 }
 
 impl ResultPage {
@@ -184,6 +303,7 @@ impl ResultPage {
             has_more,
             verify_mode,
             degraded,
+            ..ResultPage::default()
         })
     }
 }
@@ -524,6 +644,42 @@ pub enum CheckId {
     /// `[[ast]]`: the call's `ast_coverage.size_excluded_files` equals the
     /// oracle's own over-cap count, and nothing is undetermined.
     StructuralCoverage,
+    /// `[[refs]]`: every frozen site is among the page's occurrences.
+    RefsRecall,
+    /// `[[refs]]`: every frozen call site is an occurrence with the role
+    /// `call`.
+    RefsCallsRecall,
+    /// `[[clash]]`: every frozen definition is among the definition sites.
+    ClashDefsComplete,
+    /// `[[clash]]`: the stated definition count equals the frozen number of
+    /// definitions (or is a valid lower bound).
+    ClashDefCount,
+    /// `[[clash]]`: every frozen call site of either definition is an
+    /// occurrence with the role `call`.
+    ClashCallsRecall,
+    /// `[[lexical]]`: every file of the text universe (no language
+    /// allow-list) that holds the query is returned.
+    LexicalRecallTracked,
+    /// `[[refs]]`: the searched files plus each left-out reason count equal
+    /// the oracle text universe's counts.
+    UniverseAccounted,
+    /// `[[ident]]`: the first definition site is the frozen definition line.
+    IdentDefFirst,
+    /// `[[concept]]` with `first`: a frozen first file is among the first
+    /// five files.
+    ConceptFirstRightTop5,
+    /// `[[stakes]]` with `expect = "lines"`: the matching lines equal the
+    /// regex oracle's.
+    StakesLines,
+    /// `[[stakes]]` with `expect = "files"`: the matching files equal the
+    /// regex oracle's.
+    StakesFiles,
+    /// `[[stakes]]` with `expect = "counts"`: the matching lines per file
+    /// equal the regex oracle's.
+    StakesCounts,
+    /// `[[stakes]]` with `expect = "exit"`: the exit code equals the frozen
+    /// one.
+    StakesExit,
 }
 
 impl CheckId {
@@ -543,6 +699,19 @@ impl CheckId {
         CheckId::StructuralRecall,
         CheckId::StructuralPrecision,
         CheckId::StructuralCoverage,
+        CheckId::RefsRecall,
+        CheckId::RefsCallsRecall,
+        CheckId::ClashDefsComplete,
+        CheckId::ClashDefCount,
+        CheckId::ClashCallsRecall,
+        CheckId::LexicalRecallTracked,
+        CheckId::UniverseAccounted,
+        CheckId::IdentDefFirst,
+        CheckId::ConceptFirstRightTop5,
+        CheckId::StakesLines,
+        CheckId::StakesFiles,
+        CheckId::StakesCounts,
+        CheckId::StakesExit,
     ];
 
     /// The dotted name used in reports and the ledger.
@@ -562,6 +731,19 @@ impl CheckId {
             CheckId::StructuralRecall => "structural.recall",
             CheckId::StructuralPrecision => "structural.precision",
             CheckId::StructuralCoverage => "structural.coverage",
+            CheckId::RefsRecall => "refs.recall",
+            CheckId::RefsCallsRecall => "refs.calls_recall",
+            CheckId::ClashDefsComplete => "clash.defs_complete",
+            CheckId::ClashDefCount => "clash.def_count",
+            CheckId::ClashCallsRecall => "clash.calls_recall",
+            CheckId::LexicalRecallTracked => "lexical.recall_tracked",
+            CheckId::UniverseAccounted => "universe.accounted",
+            CheckId::IdentDefFirst => "ident.def_first",
+            CheckId::ConceptFirstRightTop5 => "concept.first_right_top5",
+            CheckId::StakesLines => "stakes.lines",
+            CheckId::StakesFiles => "stakes.files",
+            CheckId::StakesCounts => "stakes.counts",
+            CheckId::StakesExit => "stakes.exit",
         }
     }
 
@@ -592,10 +774,25 @@ impl CheckId {
                     | EntryKind::Pagination
                     | EntryKind::Prefix
             ),
+            // Every entry kind fetches a full list of file rows, one row per
+            // path, so the check applies to the new kinds too.
             CheckId::ResultsUniquePaths => true,
             CheckId::StructuralRecall
             | CheckId::StructuralPrecision
             | CheckId::StructuralCoverage => kind == EntryKind::Ast,
+            CheckId::RefsRecall | CheckId::RefsCallsRecall | CheckId::UniverseAccounted => {
+                kind == EntryKind::Refs
+            }
+            CheckId::ClashDefsComplete | CheckId::ClashDefCount | CheckId::ClashCallsRecall => {
+                kind == EntryKind::Clash
+            }
+            CheckId::LexicalRecallTracked => kind == EntryKind::Lexical,
+            CheckId::IdentDefFirst => kind == EntryKind::Ident,
+            CheckId::ConceptFirstRightTop5 => kind == EntryKind::Concept,
+            CheckId::StakesLines
+            | CheckId::StakesFiles
+            | CheckId::StakesCounts
+            | CheckId::StakesExit => kind == EntryKind::Stakes,
         }
     }
 }
@@ -892,7 +1089,7 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", check.as_str()));
             assert_eq!(serde_json::from_str::<CheckId>(&json).unwrap(), *check);
         }
-        assert_eq!(CheckId::ALL.len(), 14);
+        assert_eq!(CheckId::ALL.len(), 27);
         for (check, name) in [
             (CheckId::StructuralRecall, "structural.recall"),
             (CheckId::StructuralPrecision, "structural.precision"),
@@ -991,6 +1188,98 @@ mod tests {
         ] {
             assert!(!check.applies_to(EntryKind::Ast), "{check}");
         }
+    }
+
+    #[test]
+    fn the_new_checks_have_the_dotted_names_of_the_plan_and_run_on_their_own_kind_only() {
+        let table: [(CheckId, &str, EntryKind); 13] = [
+            (CheckId::RefsRecall, "refs.recall", EntryKind::Refs),
+            (
+                CheckId::RefsCallsRecall,
+                "refs.calls_recall",
+                EntryKind::Refs,
+            ),
+            (
+                CheckId::ClashDefsComplete,
+                "clash.defs_complete",
+                EntryKind::Clash,
+            ),
+            (CheckId::ClashDefCount, "clash.def_count", EntryKind::Clash),
+            (
+                CheckId::ClashCallsRecall,
+                "clash.calls_recall",
+                EntryKind::Clash,
+            ),
+            (
+                CheckId::LexicalRecallTracked,
+                "lexical.recall_tracked",
+                EntryKind::Lexical,
+            ),
+            (
+                CheckId::UniverseAccounted,
+                "universe.accounted",
+                EntryKind::Refs,
+            ),
+            (CheckId::IdentDefFirst, "ident.def_first", EntryKind::Ident),
+            (
+                CheckId::ConceptFirstRightTop5,
+                "concept.first_right_top5",
+                EntryKind::Concept,
+            ),
+            (CheckId::StakesLines, "stakes.lines", EntryKind::Stakes),
+            (CheckId::StakesFiles, "stakes.files", EntryKind::Stakes),
+            (CheckId::StakesCounts, "stakes.counts", EntryKind::Stakes),
+            (CheckId::StakesExit, "stakes.exit", EntryKind::Stakes),
+        ];
+        let kinds = [
+            EntryKind::Ident,
+            EntryKind::Concept,
+            EntryKind::Lexical,
+            EntryKind::Pagination,
+            EntryKind::Prefix,
+            EntryKind::Ast,
+            EntryKind::Refs,
+            EntryKind::Clash,
+            EntryKind::Stakes,
+        ];
+        for (check, name, own) in table {
+            assert_eq!(check.as_str(), name);
+            assert_eq!(name.parse::<CheckId>().unwrap(), check);
+            for kind in kinds {
+                assert_eq!(check.applies_to(kind), kind == own, "{check} on {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn role_names_round_trip_and_an_unknown_name_is_none() {
+        for name in [
+            "def",
+            "call",
+            "ref",
+            "import",
+            "comment",
+            "string",
+            "text",
+            "partial",
+            "unlabelled",
+        ] {
+            assert_eq!(Role::from_name(name).unwrap().as_str(), name);
+        }
+        assert_eq!(Role::from_name("Call"), None);
+        assert_eq!(Role::from_name(""), None);
+    }
+
+    #[test]
+    fn a_parsed_page_has_no_line_level_answers_until_an_adapter_fills_them() {
+        let page = page(Arm::Lexical, r#"{"results": []}"#).unwrap();
+        assert!(page.occurrences.is_empty());
+        assert_eq!(page.definitions, None);
+        assert_eq!(page.searched_files, None);
+        assert_eq!(page.left_out, None);
+        assert_eq!(page.cost, None);
+        assert_eq!(page.unlabelled_files, 0);
+        assert_eq!(page.exit_code, 0);
     }
 
     // --- standalone --ast coverage ------------------------------------------------

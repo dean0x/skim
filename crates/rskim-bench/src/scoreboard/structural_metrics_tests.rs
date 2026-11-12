@@ -3,7 +3,6 @@
 use super::*;
 use crate::scoreboard::golden::parse_golden;
 use crate::scoreboard::test_support::{catalog, oracle};
-use crate::scoreboard::types::VerifyMode;
 
 const NESTED: &str = "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {\n            work(a, b);\n        }\n    }\n}\n";
 const SINGLE: &str = "fn one() {\n    for i in 0..3 {\n        work(i);\n    }\n}\n";
@@ -51,9 +50,7 @@ fn row(path: &str, line: Option<u32>) -> ResultRow {
 fn page(rows: Vec<ResultRow>) -> ResultPage {
     ResultPage {
         rows,
-        has_more: false,
-        verify_mode: VerifyMode::Substring,
-        degraded: Vec::new(),
+        ..ResultPage::default()
     }
 }
 

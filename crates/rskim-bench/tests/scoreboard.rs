@@ -30,7 +30,7 @@ use rskim_bench::scoreboard::golden::{IntegrityContext, Origin, check_integrity,
 use rskim_bench::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use rskim_bench::scoreboard::structural_metrics::called_patterns;
 use rskim_bench::scoreboard::test_support::{FixtureRepo, catalog};
-use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
+use rskim_bench::scoreboard::universe::{GitIsolation, TextUniverse, Universe, text_universe};
 use serde_json::{Value, json};
 
 // ============================================================================
@@ -113,6 +113,12 @@ const PREFIX: (&str, &str, &[&str]) = ("fixture-F001", "fn", &["--hot"]);
 /// Standalone `--ast`: no query (the stub keys it on the empty string) and
 /// no oracle.
 const AST: (&str, &str, &[&str]) = ("fixture-F002", "", &["--ast", "god-function"]);
+/// The one check the stub cannot answer yet. Its pages carry no definition
+/// site, so `ident.def_first` fails closed on the `[[ident]]` entry until the
+/// stub and the page adapter state `definitions`. Every ledger the harness
+/// writes starts with this entry; remove it together with that gap.
+const STUB_GAP_LEDGER: &str = "[[xfail]]\nissue = \"#9100\"\ncheck = \"ident.def_first\"\n\
+                               ids = [\"fixture-L01\"]\nnote = \"the stub states no definition site\"\n\n";
 const PAGE_LIMIT: u32 = 2;
 const PREFIX_LIMIT: u32 = 1;
 const FULL_LIMIT: u32 = 1_000_000;
@@ -276,11 +282,13 @@ struct Harness {
     out_dir: tempfile::TempDir,
     commit: String,
     universe: Universe,
+    text: TextUniverse,
 }
 
 impl Harness {
     /// A fixture corpus, its golden set, and a stub that answers every
-    /// golden query correctly. No ledger and no baseline.
+    /// golden query correctly. The ledger holds [`STUB_GAP_LEDGER`] only, and
+    /// there is no baseline.
     fn new() -> Self {
         let source = FixtureRepo::new();
         for (path, contents) in FILES {
@@ -297,6 +305,7 @@ impl Harness {
             root.to_str().unwrap(),
         ]);
         let universe = Universe::compute(&root, &GitIsolation::new(source.home())).unwrap();
+        let text = text_universe(&root, &GitIsolation::new(source.home())).unwrap();
 
         let h = Harness {
             _source: source,
@@ -306,6 +315,7 @@ impl Harness {
             out_dir: tempfile::tempdir().unwrap(),
             commit,
             universe,
+            text,
         };
         fs::write(
             h.data_dir.path().join("corpora.toml"),
@@ -316,6 +326,7 @@ impl Harness {
         )
         .unwrap();
         h.write_golden(DEF_LINE);
+        h.write_ledger("");
         h.install_stub();
         h.write_empty_pattern_calls();
         h.write_correct_responses();
@@ -388,8 +399,13 @@ impl Harness {
         );
     }
 
+    /// The ledger: [`STUB_GAP_LEDGER`] plus `body`.
     fn write_ledger(&self, body: &str) {
-        fs::write(self.data_dir.path().join("known_failures.toml"), body).unwrap();
+        fs::write(
+            self.data_dir.path().join("known_failures.toml"),
+            format!("{STUB_GAP_LEDGER}{body}"),
+        )
+        .unwrap();
     }
 
     fn baseline_path(&self) -> PathBuf {
@@ -757,6 +773,17 @@ fn a_correct_skim_passes_run_bless_and_check() {
             "{check}"
         );
     }
+    // The tracked-text recall agrees with the indexed one on this fixture.
+    assert_eq!(
+        outcome(&report, "fixture-X01", "lexical.recall_tracked").as_deref(),
+        Some("pass")
+    );
+    // A page with no definition site fails `ident.def_first` closed; the
+    // harness ledger excuses it (see `STUB_GAP_LEDGER`).
+    assert_eq!(
+        outcome(&report, "fixture-L01", "ident.def_first").as_deref(),
+        Some("xfail")
+    );
     assert_eq!(
         outcome(&report, "fixture-G001", "pagination.complete").as_deref(),
         Some("pass")
@@ -994,6 +1021,11 @@ ids = ["fixture-X01"]
 issue = "#9004"
 check = "lexical.silent_fn"
 ids = ["fixture-X01"]
+
+[[xfail]]
+issue = "#9004"
+check = "lexical.recall_tracked"
+ids = ["fixture-X01"]
 "##,
     );
     assert_exit(&h.check(), 1);
@@ -1007,6 +1039,10 @@ ids = ["fixture-X01"]
     );
     assert!(
         err.contains("fixture/fixture-X01 lexical.silent_fn: pass -> xfail"),
+        "{err}"
+    );
+    assert!(
+        err.contains("fixture/fixture-X01 lexical.recall_tracked: pass -> xfail"),
         "{err}"
     );
     assert!(err.contains("--accept-regression"), "{err}");
@@ -1038,9 +1074,15 @@ fn bless_refuses_a_report_with_unledgered_hard_failures() {
 fn removing_a_ledger_entry_for_a_failing_check_fails_naming_check_and_ids() {
     let h = Harness::new();
     h.drop_lexical_ground_truth_file();
+    // Dropping a ground-truth file fails both recall checks; `recall` ledgers them.
     let recall = r##"[[xfail]]
 issue = "#9001"
 check = "lexical.recall"
+ids = ["fixture-X01"]
+
+[[xfail]]
+issue = "#9001"
+check = "lexical.recall_tracked"
 ids = ["fixture-X01"]
 "##;
     let silent = r##"
@@ -1386,6 +1428,7 @@ fn golden_gen_prints_integrity_clean_ident_candidates() {
             corpus: "fixture",
             commit: &h.commit,
             universe: Some(&h.universe),
+            text: Some(&h.text),
             ledger: &[],
             catalog: catalog(),
         },
@@ -1491,6 +1534,7 @@ fn golden_gen_ast_calls_every_catalog_pattern_once_and_prints_parsable_entries()
             corpus: "fixture",
             commit: &h.commit,
             universe: Some(&h.universe),
+            text: Some(&h.text),
             ledger: &[],
             catalog: catalog(),
         },

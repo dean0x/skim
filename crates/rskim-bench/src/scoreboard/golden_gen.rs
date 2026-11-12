@@ -462,8 +462,8 @@ mod tests {
     use super::*;
     use crate::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
     use crate::scoreboard::test_support::{FixtureRepo, catalog, oracle};
-    use crate::scoreboard::types::{AstCoverage, ResultPage, VerifyMode};
-    use crate::scoreboard::universe::GitIsolation;
+    use crate::scoreboard::types::{AstCoverage, ResultPage};
+    use crate::scoreboard::universe::{GitIsolation, text_universe};
 
     fn site(name: &str, path: &str, line: u32) -> DefinitionSite {
         DefinitionSite {
@@ -742,6 +742,7 @@ mod tests {
         repo.write("src/lonely.rs", "pub fn lonely_function() {}\n");
         let sha = repo.commit_all("init");
         let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+        let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
 
         let got = generate("skim", &universe, 20).unwrap();
         let mut names: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
@@ -763,6 +764,7 @@ mod tests {
                 corpus: "skim",
                 commit: &sha,
                 universe: Some(&universe),
+                text: Some(&text),
                 ledger: &[],
                 catalog: catalog(),
             },
@@ -789,9 +791,7 @@ mod tests {
                         snippet: Vec::new(),
                     })
                     .collect(),
-                has_more: false,
-                verify_mode: VerifyMode::Substring,
-                degraded: Vec::new(),
+                ..ResultPage::default()
             },
             coverage: AstCoverage::default(),
         }
@@ -1064,6 +1064,7 @@ mod tests {
                 corpus: "skim",
                 commit: "b8a0a79463382347820f1c2572bde37b68e87c76",
                 universe: None,
+                text: None,
                 ledger: &[],
                 catalog: catalog(),
             },
