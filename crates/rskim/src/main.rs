@@ -872,6 +872,10 @@ enum LoopRefusal {
 }
 
 impl LoopRefusal {
+    /// Every refusal skim can print.  [`find_refusal_line`] reads it, so a new
+    /// variant must be listed here.
+    const ALL: [Self; 3] = [Self::SelfFirstOnPath, Self::SameToolParent, Self::TooDeep];
+
     /// What went wrong, for a process named `name`.
     fn cause(&self, name: &str) -> String {
         match self {
@@ -904,6 +908,23 @@ impl LoopRefusal {
             self.cause(program)
         )
     }
+}
+
+/// The refusal line in `stderr`, when a skim process printed one.
+///
+/// A line counts only when it equals, byte for byte, a line that [`LoopRefusal`]
+/// prints for the program it names.  A tool that exits 126 for its own reason
+/// does not match.
+pub(crate) fn find_refusal_line(stderr: &str) -> Option<&str> {
+    stderr.lines().find(|line| {
+        line.strip_prefix("error: ")
+            .and_then(|rest| rest.split_once(": "))
+            .is_some_and(|(name, _)| {
+                LoopRefusal::ALL
+                    .iter()
+                    .any(|refusal| *line == refusal.line(name) || *line == refusal.plain_line(name))
+            })
+    })
 }
 
 /// `(device, inode)` of what `path` names, following links.  `None` when `stat`
@@ -982,14 +1003,39 @@ fn next_level(
     Ok(depth)
 }
 
-/// Move to the end of `path` every folder whose `<tool>` is the running binary.
+/// What `<folder>/<tool>` is, for the demotion of folders on `PATH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolAt {
+    /// The running binary: same device and inode, which holds for a link, a hard
+    /// link, a `..` spelling and a symlinked parent alike.
+    RunningBinary,
+    /// An executable file that is not the running binary.  A spawn of `<tool>`
+    /// starts this file and reads no folder after it.
+    OtherExecutable,
+    /// No file a spawn would start, or a file that cannot be examined.
+    NotRunnable,
+}
+
+/// Classify `candidate`, the `<tool>` of one `PATH` folder.
+fn classify_tool(candidate: &std::path::Path, self_id: FileId) -> ToolAt {
+    match file_id_at(candidate) {
+        Some(id) if id == self_id => ToolAt::RunningBinary,
+        Some(_) if runner::is_executable(candidate) => ToolAt::OtherExecutable,
+        _ => ToolAt::NotRunnable,
+    }
+}
+
+/// Move to the end of `path` every folder whose `<tool>` is the running binary,
+/// up to the first folder that holds another executable `<tool>`.
 ///
-/// `Some(new_path)` only when the order changes.  A folder counts when
-/// `<folder>/<tool>` has the same device and inode as the running binary, which
-/// holds for a link, a hard link, a `..` spelling and a symlinked parent alike.
-/// Order is kept in both groups.  A folder that cannot be examined stays where
-/// it is.  Nothing is removed, so a second program in the same folder still
-/// resolves.
+/// `Some(new_path)` only when the order changes.  Order is kept in both groups.
+/// A folder that cannot be examined stays where it is.  Nothing is removed, so a
+/// second program in the same folder still resolves.
+///
+/// The scan stops at the first other executable `<tool>`: a spawn of `<tool>`
+/// reads no folder after it, so a folder after it does not change how `<tool>`
+/// resolves.  It also keeps a slow folder after the real tool (a network mount)
+/// out of every wrapper start.
 ///
 /// `tool` is `None` for a `skim`-typed start: then no lookup runs at all.
 /// `self_id` is a closure for the same reason; it runs at most once.
@@ -1000,13 +1046,33 @@ fn demote_self_dirs(
 ) -> Option<std::ffi::OsString> {
     let tool = tool?;
     let self_id = self_id()?;
+    demote_until_real_tool(path, |dir| classify_tool(&dir.join(tool), self_id))
+}
+
+/// The ordering rule of [`demote_self_dirs`], with `classify` as the one probe
+/// of a folder.  It runs once per folder, up to and including the first
+/// [`ToolAt::OtherExecutable`], and never after it.
+fn demote_until_real_tool(
+    path: &std::ffi::OsStr,
+    mut classify: impl FnMut(&std::path::Path) -> ToolAt,
+) -> Option<std::ffi::OsString> {
     let entries: Vec<std::path::PathBuf> = std::env::split_paths(path).collect();
-    // One stat per entry.
-    let (others, selves): (Vec<_>, Vec<_>) = entries
-        .iter()
-        .cloned()
-        .partition(|dir| file_id_at(&dir.join(tool)) != Some(self_id));
-    let reordered: Vec<std::path::PathBuf> = others.into_iter().chain(selves).collect();
+    let mut reordered: Vec<std::path::PathBuf> = Vec::with_capacity(entries.len());
+    let mut selves: Vec<std::path::PathBuf> = Vec::new();
+    let mut rest = entries.iter();
+    for dir in rest.by_ref() {
+        match classify(dir) {
+            ToolAt::RunningBinary => selves.push(dir.clone()),
+            ToolAt::NotRunnable => reordered.push(dir.clone()),
+            ToolAt::OtherExecutable => {
+                reordered.push(dir.clone());
+                break;
+            }
+        }
+    }
+    // Folders after the real tool were not examined and keep their place.
+    reordered.extend(rest.cloned());
+    reordered.extend(selves);
     if reordered == entries {
         return None;
     }
@@ -1028,8 +1094,8 @@ fn first_tool_is_self(path: &std::ffi::OsStr, tool: &str, self_id: FileId) -> bo
 /// differs from `path`.
 ///
 /// 1. Remove the wrappers folder, so a wrapper link there is not found again.
-/// 2. On the wrapper surface only, demote every other folder whose `<tool>` is
-///    the running binary (see [`demote_self_dirs`]).
+/// 2. On the wrapper surface only, demote every other folder ahead of the real
+///    `<tool>` whose `<tool>` is the running binary (see [`demote_self_dirs`]).
 /// 3. Refuse when the first `<tool>` on the result is still the running binary:
 ///    a spawn of the real tool would only start skim again.
 ///
@@ -1083,8 +1149,8 @@ fn set_env_before_threads(key: &str, value: &std::ffi::OsStr) {
 /// early on `PATH`.  If it stayed there, a handler that spawns `git` would find
 /// the link again and start skim again without end.  [`plan_wrapper_path`]
 /// removes the wrappers folder, and on the wrapper surface also moves to the end
-/// of `PATH` every other folder that holds a link to this binary under the
-/// tool's name.
+/// of `PATH` every other folder ahead of the real tool that holds a link to this
+/// binary under the tool's name.
 ///
 /// Reading the environment and the file system only: `PATH` is left as it is
 /// when the running binary or a folder cannot be examined.
@@ -1467,8 +1533,16 @@ fn main() -> ExitCode {
         }
     };
 
-    let exit_code = match result {
-        Ok(code) => code,
+    let exit_code = match (result, runner::chain_refusal()) {
+        // A skim process that this one started refused to start, so the chain of
+        // starts is refused.  Every later start of this process failed at once.
+        // Whatever the handler made of those failures, print the one refusal
+        // line and exit 126.
+        (_, Some(line)) => {
+            eprintln!("{line}");
+            ExitCode::from(RESTART_REFUSED_EXIT)
+        }
+        (Ok(code), None) => code,
         // A closed downstream pipe (`skim … | head -20`) is a normal
         // end-of-consumption event, not a failure.  Three sinks in
         // `cmd/execution.rs` return `StdoutStatus::PipeClosed` directly; this
@@ -1483,14 +1557,14 @@ fn main() -> ExitCode {
         // no `output::elision_marker`, no unconditional stderr line.  Raw grep
         // is silent in this exact situation, so an unconditional notice would
         // itself be a divergence from raw.
-        Err(e) if cmd::execution::is_broken_pipe_chain(&e) => {
+        (Err(e), None) if cmd::execution::is_broken_pipe_chain(&e) => {
             crate::debug_log!(
                 "[skim] downstream pipe closed; exiting {}.",
                 cmd::execution::pipe_closed_code()
             );
             cmd::execution::pipe_closed_exit()
         }
-        Err(e) => {
+        (Err(e), None) => {
             eprintln!("Error: {e:#}");
             // Map known SkimError variants to documented exit codes:
             //   exit 2 — parse error (grammar/syntax failure)
@@ -3099,6 +3173,33 @@ mod tests {
         assert!(!line.contains("named skim"), "{line:?}");
     }
 
+    #[test]
+    fn find_refusal_line_reads_every_line_skim_prints() {
+        for refusal in LoopRefusal::ALL {
+            for line in [refusal.line("git"), refusal.plain_line("skim")] {
+                let stderr = format!("noise before\n{line}\nnoise after\n");
+                assert_eq!(find_refusal_line(&stderr), Some(line.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn find_refusal_line_ignores_text_that_is_not_a_refusal_line() {
+        let refusal = LoopRefusal::TooDeep.line("git");
+        let not_refusals = [
+            "git: its own reason".to_string(),
+            "error: git: its own reason".to_string(),
+            format!("remote: {refusal}"),
+            format!("{refusal} and more"),
+            // The name inside the line is not the name after `error: `.
+            refusal.replacen("error: git:", "error: rg:", 1),
+            String::new(),
+        ];
+        for text in not_refusals {
+            assert_eq!(find_refusal_line(&text), None, "{text:?}");
+        }
+    }
+
     /// Temp tree for PATH tests: a stand-in for the running binary, plus the
     /// folders and files a test puts on a `PATH`.  Nothing here starts a process.
     #[cfg(unix)]
@@ -3211,13 +3312,115 @@ mod tests {
     #[test]
     fn demote_keeps_the_order_of_both_groups() {
         let t = PathTree::new();
-        let (s1, x, s2, y) = (t.dir("s1"), t.dir("x"), t.dir("s2"), t.dir("y"));
+        let (s1, n, s2, x, y) = (t.dir("s1"), t.dir("n"), t.dir("s2"), t.dir("x"), t.dir("y"));
         t.link(&s1, "git");
         t.link(&s2, "git");
         t.real(&x, "git");
         t.real(&y, "git");
-        let got = demote_self_dirs(&join_dirs(&[&s1, &x, &s2, &y]), Some("git"), || t.self_id());
-        assert_eq!(got, Some(join_dirs(&[&x, &y, &s1, &s2])));
+        let got = demote_self_dirs(&join_dirs(&[&s1, &n, &s2, &x, &y]), Some("git"), || {
+            t.self_id()
+        });
+        assert_eq!(
+            got,
+            Some(join_dirs(&[&n, &x, &y, &s1, &s2])),
+            "both groups keep their order; the scan ends at the first real tool, x"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demote_leaves_a_self_folder_after_the_real_tool_in_place() {
+        let t = PathTree::new();
+        let (a, c, b) = (t.dir("a"), t.dir("c"), t.dir("b"));
+        t.link(&a, "git");
+        t.real(&c, "git");
+        t.link(&b, "git");
+        let got = demote_self_dirs(&join_dirs(&[&a, &c, &b]), Some("git"), || t.self_id());
+        assert_eq!(
+            got,
+            Some(join_dirs(&[&c, &b, &a])),
+            "b is after the real tool, so it is not examined and keeps its place"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_tool_tells_the_binary_from_another_executable_and_from_nothing() {
+        let t = PathTree::new();
+        let id = t.self_id().expect("the stand-in binary has an id");
+        let (l, r, nx, d) = (t.dir("l"), t.dir("r"), t.dir("nx"), t.dir("d"));
+        t.link(&l, "git");
+        t.real(&r, "git");
+        std::fs::write(nx.join("git"), "not executable").unwrap();
+        std::fs::create_dir(d.join("git")).unwrap();
+        assert_eq!(classify_tool(&l.join("git"), id), ToolAt::RunningBinary);
+        assert_eq!(classify_tool(&r.join("git"), id), ToolAt::OtherExecutable);
+        assert_eq!(classify_tool(&nx.join("git"), id), ToolAt::NotRunnable);
+        assert_eq!(classify_tool(&d.join("git"), id), ToolAt::NotRunnable);
+        assert_eq!(
+            classify_tool(&t.root.path().join("missing").join("git"), id),
+            ToolAt::NotRunnable
+        );
+    }
+
+    /// The probe of a folder after the first real tool must never run: a folder on
+    /// a stale network mount after the real tool would block every wrapper start.
+    #[test]
+    fn demote_probes_no_folder_after_the_first_real_tool() {
+        let mut probed: Vec<String> = Vec::new();
+        let got = demote_until_real_tool(os("/a:/b:/c:/d"), |dir| {
+            probed.push(dir.display().to_string());
+            match dir.to_str() {
+                Some("/a") => ToolAt::RunningBinary,
+                Some("/b") => ToolAt::OtherExecutable,
+                other => panic!("probed a folder after the real tool: {other:?}"),
+            }
+        });
+        assert_eq!(probed, ["/a", "/b"]);
+        assert_eq!(got, Some(os("/b:/c:/d:/a").to_os_string()));
+    }
+
+    #[test]
+    fn demote_scans_past_folders_that_hold_no_runnable_tool() {
+        let mut probed = 0;
+        let got = demote_until_real_tool(os("/n:/a:/m:/r:/z"), |dir| {
+            probed += 1;
+            match dir.to_str() {
+                Some("/a") => ToolAt::RunningBinary,
+                Some("/r") => ToolAt::OtherExecutable,
+                _ => ToolAt::NotRunnable,
+            }
+        });
+        assert_eq!(probed, 4, "n, a, m and r; z comes after the real tool");
+        assert_eq!(got, Some(os("/n:/m:/r:/z:/a").to_os_string()));
+    }
+
+    #[test]
+    fn demote_without_a_real_tool_scans_every_folder_and_moves_the_binary_last() {
+        let mut probed = 0;
+        let got = demote_until_real_tool(os("/a:/n:/b"), |dir| {
+            probed += 1;
+            match dir.to_str() {
+                Some("/a" | "/b") => ToolAt::RunningBinary,
+                _ => ToolAt::NotRunnable,
+            }
+        });
+        assert_eq!(probed, 3);
+        assert_eq!(got, Some(os("/n:/a:/b").to_os_string()));
+    }
+
+    #[test]
+    fn demote_changes_nothing_when_the_real_tool_comes_first() {
+        let mut probed = 0;
+        let got = demote_until_real_tool(os("/r:/a"), |dir| {
+            probed += 1;
+            match dir.to_str() {
+                Some("/r") => ToolAt::OtherExecutable,
+                other => panic!("probed a folder after the real tool: {other:?}"),
+            }
+        });
+        assert_eq!(probed, 1);
+        assert_eq!(got, None);
     }
 
     #[cfg(unix)]

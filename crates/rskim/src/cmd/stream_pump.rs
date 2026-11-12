@@ -82,7 +82,7 @@ use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::cmd::execution::is_broken_pipe;
-use crate::runner::{ChildGuard, MAX_OUTPUT_BYTES};
+use crate::runner::{ChildGuard, MAX_OUTPUT_BYTES, ensure_chain_open, note_finished_child};
 
 /// Chunk size for the stdout pump and the stderr drain (64 KiB).
 ///
@@ -282,10 +282,15 @@ pub(crate) enum StreamOutcome {
 /// same buffered stdout handle afterwards (the trailing-newline guard).  The pump
 /// flushes per chunk, so nothing is left pending in the caller's buffer when this
 /// returns.
+///
+/// Like [`crate::runner::CommandRunner::run_with_env`], it fails at once when a
+/// skim process in the chain of starts already refused, and it fails when the
+/// child it ran is such a refusal (see [`crate::runner::chain_refusal`]).
 pub(crate) fn stream_child(
     spec: &StreamSpec<'_>,
     sink: &mut impl Write,
 ) -> io::Result<StreamOutcome> {
+    ensure_chain_open().map_err(io::Error::other)?;
     let mut cmd = Command::new(spec.program);
     cmd.args(spec.args)
         .stdout(Stdio::piped())
@@ -336,6 +341,8 @@ pub(crate) fn stream_child(
     let (stderr, stderr_discarded) = stderr_drain
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
+
+    note_finished_child(status.code(), &stderr).map_err(io::Error::other)?;
 
     Ok(StreamOutcome::Completed(StreamCompleted {
         exit_code: status.code(),

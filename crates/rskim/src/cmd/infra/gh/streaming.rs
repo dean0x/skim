@@ -443,6 +443,11 @@ pub(super) fn run_streamed_spawned(
 ) -> ExitCode {
     use std::process::{Command, Stdio};
 
+    // An earlier refusal in this process stops this start (see
+    // `runner::chain_refusal`); `main` prints the refusal line.
+    if crate::runner::ensure_chain_open().is_err() {
+        return ExitCode::from(crate::RESTART_REFUSED_EXIT);
+    }
     let child_proc = match Command::new(cmd)
         .args(args)
         .stdout(Stdio::piped())

@@ -452,6 +452,11 @@ pub(crate) fn spawn_status_to_code(status: std::io::Result<std::process::ExitSta
 /// Diagnostics live here in the caller; the pure mapping is in
 /// [`spawn_status_to_code`], which is unit-tested independently.
 pub(crate) fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
+    // The child's stderr goes to the terminal, so a refusal is not read here (see
+    // `runner::chain_refusal`).  An earlier refusal still stops this start.
+    if crate::runner::ensure_chain_open().is_err() {
+        return ExitCode::from(crate::RESTART_REFUSED_EXIT);
+    }
     let launch = match Launch::resolve(program, args) {
         Ok(launch) => launch,
         Err(gone) => return gone.report(),

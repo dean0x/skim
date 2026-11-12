@@ -15,7 +15,10 @@
 //!   exits 126 before it starts any process;
 //! - a copy of the binary is another file, so a wrapper started by a wrapper of
 //!   the same tool exits 126 as well;
-//! - a chain of more than 32 skim processes exits 126 on any surface.
+//! - a chain of more than 32 skim processes exits 126 on any surface, and every
+//!   child gets the depth of its parent plus one;
+//! - once a start comes back refused, the process starts nothing more, so the
+//!   number of starts is linear in the depth.
 //!
 //! ## Process safety
 //!
@@ -49,6 +52,9 @@ mod wrapper_path_loop {
 
     /// Exit status of a refused start.
     const REFUSED: i32 = 126;
+
+    /// Most skim processes allowed in one chain of starts.
+    const DEPTH_LIMIT: u32 = 32;
 
     /// What one child run produced.
     struct Outcome {
@@ -107,7 +113,9 @@ mod wrapper_path_loop {
         }
 
         /// The real tool: a stub `git` in `real()` that calls `zzother`, and the
-        /// `zzother` program in `links()`.  Each writes one line to the log.
+        /// `zzother` program in `links()`.  Each writes one line to the log.  The
+        /// `git` line also records the `SKIM_DEPTH` and `SKIM_WRAPPER_PARENT` that
+        /// the skim process handed to the tool.
         fn install_real_tool(&self) {
             let log = self.log();
             common::write_stub_script(
@@ -119,8 +127,24 @@ mod wrapper_path_loop {
                 &self.real(),
                 TOOL,
                 &format!(
-                    "#!/bin/sh\n{OTHER} || exit 97\nprintf '{TOOL}\\n' >> '{}'\nexit 0\n",
+                    "#!/bin/sh\n{OTHER} || exit 97\n\
+                     printf '{TOOL} depth=%s parent=%s\\n' \"$SKIM_DEPTH\" \"$SKIM_WRAPPER_PARENT\" >> '{}'\n\
+                     exit 0\n",
                     log.display()
+                ),
+            );
+        }
+
+        /// A `git` that logs one line per start and then runs `skim git` again, as
+        /// a shell shim does.  There is no real tool behind it.
+        fn install_shim_that_runs_skim_again(&self) {
+            common::write_stub_script(
+                &self.links(),
+                TOOL,
+                &format!(
+                    "#!/bin/sh\nprintf '{TOOL}\\n' >> '{}'\nexec '{}' {TOOL} \"$@\"\n",
+                    self.log().display(),
+                    common::skim_bin().display()
                 ),
             );
         }
@@ -173,18 +197,21 @@ mod wrapper_path_loop {
         }
     }
 
+    /// The program a log line names: its first word.
+    fn call_name(line: &str) -> &str {
+        line.split_whitespace().next().unwrap_or("")
+    }
+
     /// The run reached the real tool through a skim start that stood in for
     /// `TOOL`: the stub ran, and every stub run found `zzother` first.
     fn assert_reached_real_tool(outcome: &Outcome) {
-        let expected_pair = [OTHER.to_string(), TOOL.to_string()];
+        let names: Vec<&str> = outcome.calls.iter().map(|l| call_name(l)).collect();
+        let expected_pair = [OTHER, TOOL];
         assert!(
-            !outcome.calls.is_empty()
-                && outcome.calls.len() <= 4
-                && outcome.calls.len().is_multiple_of(2)
-                && outcome
-                    .calls
-                    .chunks(2)
-                    .all(|pair| pair == expected_pair.as_slice()),
+            !names.is_empty()
+                && names.len() <= 4
+                && names.len().is_multiple_of(2)
+                && names.chunks(2).all(|pair| pair == expected_pair.as_slice()),
             "`{TOOL} status` must start the real tool (at most twice, one skim level), \
              and the tool must find {OTHER} in the folder of the link; calls={:?} stderr={:?}",
             outcome.calls,
@@ -196,6 +223,44 @@ mod wrapper_path_loop {
             "the stub's exit code must propagate; stderr={:?}",
             outcome.stderr
         );
+    }
+
+    /// The value of `key=` in a stub log line.
+    fn logged_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split_whitespace()
+            .find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// Every real-tool start received `SKIM_DEPTH = depth` and a parent marker that
+    /// names the skim wrapper process, which is not the test process.
+    fn assert_tool_inherits(outcome: &Outcome, depth: u32) {
+        let runs: Vec<&String> = outcome
+            .calls
+            .iter()
+            .filter(|line| call_name(line) == TOOL)
+            .collect();
+        assert!(
+            !runs.is_empty(),
+            "the real tool must have started; calls={:?} stderr={:?}",
+            outcome.calls,
+            outcome.stderr
+        );
+        for line in runs {
+            assert_eq!(
+                logged_value(line, "depth"),
+                Some(depth.to_string().as_str()),
+                "the child of a skim process must inherit its depth plus one: {line:?}"
+            );
+            let marker = logged_value(line, "parent").unwrap_or_default();
+            let pid = marker
+                .strip_prefix(&format!("{TOOL}:"))
+                .and_then(|pid| pid.parse::<u32>().ok());
+            assert!(
+                pid.is_some_and(|pid| pid != std::process::id()),
+                "the parent marker must be `{TOOL}:<pid of the skim wrapper>`, \
+                 not the test process: {line:?}"
+            );
+        }
     }
 
     /// The run was refused with exit 126 and the one-line message, before any
@@ -269,6 +334,7 @@ mod wrapper_path_loop {
         let outcome = rig.run_status(&rig.links().join(TOOL), &path);
 
         assert_reached_real_tool(&outcome);
+        assert_tool_inherits(&outcome, 1);
     }
 
     #[test]
@@ -393,11 +459,12 @@ mod wrapper_path_loop {
         rig.link_skim(&rig.links(), TOOL);
         let path = Rig::path_of(&[rig.links(), rig.real()]);
         let mut cmd = rig.command(&rig.links().join(TOOL), &path, &["status"]);
-        cmd.env("SKIM_DEPTH", "31");
+        cmd.env("SKIM_DEPTH", (DEPTH_LIMIT - 1).to_string());
 
         let outcome = rig.outcome(&common::run_bounded(cmd));
 
         assert_reached_real_tool(&outcome);
+        assert_tool_inherits(&outcome, DEPTH_LIMIT);
     }
 
     #[test]
@@ -419,13 +486,14 @@ mod wrapper_path_loop {
 
     #[test]
     fn plain_skim_is_refused_above_the_depth_limit_and_runs_at_it() {
-        let home = tempfile::tempdir().expect("home tempdir");
+        let rig = Rig::new();
+        // An empty folder: no program of the host is reachable.
+        let path = Rig::path_of(&[rig.real()]);
+        let skim = common::skim_bin();
 
-        let refused = common::skim_sandboxed(home.path())
-            .env("SKIM_DEPTH", "32")
-            .arg("--commit")
-            .output()
-            .expect("run skim");
+        let mut cmd = rig.command(&skim, &path, &["--commit"]);
+        cmd.env("SKIM_DEPTH", DEPTH_LIMIT.to_string());
+        let refused = common::run_bounded(cmd);
         assert_eq!(refused.status.code(), Some(REFUSED));
         let stderr = String::from_utf8_lossy(&refused.stderr);
         assert!(
@@ -438,12 +506,98 @@ mod wrapper_path_loop {
             "a skim-typed start has no tool link to blame: {stderr:?}"
         );
 
-        let allowed = common::skim_sandboxed(home.path())
-            .env("SKIM_DEPTH", "31")
-            .arg("--commit")
-            .output()
-            .expect("run skim");
+        let mut cmd = rig.command(&skim, &path, &["--commit"]);
+        cmd.env("SKIM_DEPTH", (DEPTH_LIMIT - 1).to_string());
+        let allowed = common::run_bounded(cmd);
         assert_eq!(allowed.status.code(), Some(0));
+    }
+
+    // ------------------------------------------------------------------------
+    // The number of starts is bounded, not only the depth of the chain.
+    // ------------------------------------------------------------------------
+
+    /// `skim git status` starts git twice per level: once to probe, and once for
+    /// the parsed run.  A `git` that runs `skim git` again, with no real git behind
+    /// it, is stopped by the depth limit alone: the parent marker and the
+    /// self-first check do not apply to a skim-typed start.  Once a start comes
+    /// back refused, no level may start its second git, so the starts stay linear
+    /// in the depth: one per level.  Without that, every level starts git again
+    /// after its refused probe, and the count grows faster than the depth.
+    #[test]
+    fn a_shim_that_runs_skim_again_starts_a_linear_number_of_processes() {
+        let rig = Rig::new();
+        rig.install_shim_that_runs_skim_again();
+        let path = Rig::path_of(&[rig.links()]);
+
+        let outcome = rig.outcome(&common::run_bounded(rig.command(
+            &common::skim_bin(),
+            &path,
+            &[TOOL, "status"],
+        )));
+
+        assert!(
+            outcome.calls.len() <= DEPTH_LIMIT as usize + 1,
+            "the starts must be linear in the depth (one per level); starts={}",
+            outcome.calls.len()
+        );
+        assert_eq!(
+            outcome.code,
+            Some(REFUSED),
+            "the refusal must reach the command the user ran; stderr={:?}",
+            outcome.stderr
+        );
+        let lines: Vec<&str> = outcome.stderr.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the refusal line is printed once; stderr={:?}",
+            outcome.stderr
+        );
+        assert!(
+            lines[0].contains("skim started itself 32 times in a row (limit 32)"),
+            "stderr={:?}",
+            outcome.stderr
+        );
+    }
+
+    /// A tool can exit 126 for its own reason.  That is not a refused chain: the
+    /// second start still happens, and the tool's own text reaches the reader.
+    #[test]
+    fn a_tool_that_exits_126_for_its_own_reason_is_not_a_refused_chain() {
+        let rig = Rig::new();
+        common::write_stub_script(
+            &rig.real(),
+            TOOL,
+            &format!(
+                "#!/bin/sh\nprintf '{TOOL}\\n' >> '{}'\n\
+                 printf 'git: its own reason\\n' >&2\nexit {REFUSED}\n",
+                rig.log().display()
+            ),
+        );
+        let path = Rig::path_of(&[rig.real()]);
+
+        let outcome = rig.outcome(&common::run_bounded(rig.command(
+            &common::skim_bin(),
+            &path,
+            &[TOOL, "status"],
+        )));
+
+        assert_eq!(
+            outcome.calls.len(),
+            2,
+            "the probe and the parsed run both start; stderr={:?}",
+            outcome.stderr
+        );
+        assert!(
+            outcome.stderr.contains("git: its own reason"),
+            "the tool's own text must reach the reader; stderr={:?}",
+            outcome.stderr
+        );
+        assert!(
+            !outcome.stderr.contains("started itself"),
+            "stderr={:?}",
+            outcome.stderr
+        );
     }
 
     // ------------------------------------------------------------------------

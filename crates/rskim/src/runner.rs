@@ -90,6 +90,11 @@ pub(crate) enum RunnerError {
     /// A reader thread panicked instead of returning normally.
     #[error("{pipe} reader thread panicked")]
     ReaderPanicked { pipe: &'static str },
+
+    /// A skim process in the chain of starts refused to start, so this start was
+    /// not made, or its result was dropped.  See [`chain_refusal`].
+    #[error("a skim process that this one started refused to start")]
+    ChainRefused,
 }
 
 /// A stateless command runner.
@@ -174,6 +179,7 @@ impl CommandRunner {
         args: &[&str],
         env_vars: &[(&str, &str)],
     ) -> anyhow::Result<CommandOutput> {
+        ensure_chain_open()?;
         let start = Instant::now();
 
         let mut cmd = Command::new(program);
@@ -227,6 +233,8 @@ impl CommandRunner {
         let stderr = stderr_handle
             .join()
             .map_err(|_| RunnerError::ReaderPanicked { pipe: "stderr" })??;
+
+        note_finished_child(status.code(), stderr.as_bytes())?;
 
         // ADR-011 class 1 — loss-bearing, therefore unconditional and never
         // routed through `debug_log!`.  This is the only place that knows the
@@ -328,6 +336,7 @@ impl CommandRunner {
         program: &str,
         args: &[&str],
     ) -> anyhow::Result<(CommandOutput, bool)> {
+        ensure_chain_open()?;
         let start = Instant::now();
 
         let mut cmd = Command::new(program);
@@ -366,6 +375,8 @@ impl CommandRunner {
         let stderr = stderr_handle
             .join()
             .map_err(|_| RunnerError::ReaderPanicked { pipe: "stderr" })??;
+
+        note_finished_child(status.code(), stderr.as_bytes())?;
 
         let duration = start.elapsed();
 
@@ -415,6 +426,73 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         // wait() reaps the zombie; ignore result (process may already be reaped).
         let _ = self.0.wait();
+    }
+}
+
+// ============================================================================
+// Refused chain — one latch for every start in this process
+// ============================================================================
+
+/// The refusal line of the first child that told this process that the chain of
+/// skim starts is refused.  Set once, never cleared.
+static CHAIN_REFUSAL: OnceLock<String> = OnceLock::new();
+
+/// The refusal line that ended the work of this process, when a child reported
+/// one.  `main` prints it once and exits 126.
+///
+/// # Why a latch
+///
+/// The depth limit bounds the length of a chain of skim starts, not the number
+/// of starts. A handler that starts its tool again after a failed first start
+/// (`skim git status` probes, then runs) would start the tool again at every
+/// level of a chain that only the depth limit can stop. Once one start comes back
+/// refused, the chain cannot work, so every later start of this process fails at
+/// once and starts nothing. The starts are then linear in the depth.
+///
+/// Covered: the starts that capture stderr — [`CommandRunner::run_with_env`],
+/// [`CommandRunner::run_stdout_degrade`] and `stream_child` — both gate the start
+/// and read the result. The starts with inherited stdio (`run_inherited_passthrough`)
+/// and the gh streaming start only gate: their stderr goes to the terminal, and the
+/// exit code 126 alone is a real answer of many tools. They start the tool once and
+/// return, so the depth limit still bounds them to one start per level.
+///
+/// The latch is a process-wide static that a unit test must not set; the pure
+/// decision is [`refusal_line_of`].
+pub(crate) fn chain_refusal() -> Option<&'static str> {
+    CHAIN_REFUSAL.get().map(String::as_str)
+}
+
+/// The refusal line that a finished child reported, when it was a skim process
+/// that refused to start: exit 126 and a refusal line on stderr, both.  A tool
+/// that exits 126 for its own reason has no such line.
+fn refusal_line_of(exit_code: Option<i32>, stderr: &[u8]) -> Option<String> {
+    if exit_code != Some(i32::from(crate::RESTART_REFUSED_EXIT)) {
+        return None;
+    }
+    crate::find_refusal_line(&String::from_utf8_lossy(stderr)).map(str::to_owned)
+}
+
+/// Fail before a start when a skim process in the chain already refused.
+pub(crate) fn ensure_chain_open() -> Result<(), RunnerError> {
+    match CHAIN_REFUSAL.get() {
+        Some(_) => Err(RunnerError::ChainRefused),
+        None => Ok(()),
+    }
+}
+
+/// Read the result of a finished child.  When it is a refusal, set the latch and
+/// fail, so the refused result never reaches a parser or the terminal.
+pub(crate) fn note_finished_child(
+    exit_code: Option<i32>,
+    stderr: &[u8],
+) -> Result<(), RunnerError> {
+    match refusal_line_of(exit_code, stderr) {
+        Some(line) => {
+            // The first refusal stays; a second set is the same chain.
+            let _ = CHAIN_REFUSAL.set(line);
+            Err(RunnerError::ChainRefused)
+        }
+        None => Ok(()),
     }
 }
 
@@ -930,6 +1008,51 @@ mod tests {
             }
             self.remaining -= n;
             Ok(n)
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // The refused-chain decision.  The latch itself is a process-wide static, so
+    // a unit test never sets it; `cli_wrapper_path_loop.rs` runs it end to end.
+    // ------------------------------------------------------------------------
+
+    fn refusal_text() -> String {
+        crate::LoopRefusal::TooDeep.plain_line("skim")
+    }
+
+    #[test]
+    fn a_child_that_exits_126_with_the_refusal_line_is_a_refusal() {
+        let line = refusal_text();
+        let stderr = format!("a warning\n{line}\n");
+        assert_eq!(
+            refusal_line_of(Some(126), stderr.as_bytes()),
+            Some(line.clone())
+        );
+    }
+
+    #[test]
+    fn the_refusal_line_survives_bytes_that_are_not_utf8() {
+        let line = refusal_text();
+        let mut stderr = vec![0xff, 0xfe, b'\n'];
+        stderr.extend_from_slice(line.as_bytes());
+        stderr.push(b'\n');
+        assert_eq!(refusal_line_of(Some(126), &stderr), Some(line));
+    }
+
+    #[test]
+    fn a_tool_that_exits_126_for_its_own_reason_is_not_a_refusal() {
+        assert_eq!(
+            refusal_line_of(Some(126), b"bash: ./tool: Permission denied\n"),
+            None
+        );
+        assert_eq!(refusal_line_of(Some(126), b""), None);
+    }
+
+    #[test]
+    fn the_refusal_line_without_exit_126_is_not_a_refusal() {
+        let stderr = refusal_text();
+        for code in [Some(0), Some(1), Some(127), None] {
+            assert_eq!(refusal_line_of(code, stderr.as_bytes()), None, "{code:?}");
         }
     }
 
