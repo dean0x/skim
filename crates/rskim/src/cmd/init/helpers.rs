@@ -246,7 +246,10 @@ repository base rate. Each capped list ends with one exact "N more" line that
 names the flag to see more. Noise rules hide signals with low support: fix risk
 and bus factor need 5 commits of a file, coupling needs 3 shared commits, and
 modules need 5 commits. Changelogs, snapshots and generated code are excluded by
-default (`--no-exclude` keeps them).
+default (`--no-exclude` keeps them). Doc files and the top folders docs,
+.github, .devflow and tests stay out of the hotspots, modules and insights
+(`--include-docs` keeps them). A commit counts as a fix only when its subject
+says so (`fix:`, `fix(scope):`, a revert, or the keyword as the first word).
 
 **When to use heatmap:**
 - Before you edit a file — `skim heatmap <file>` shows its co-change partners
@@ -259,7 +262,7 @@ default (`--no-exclude` keeps them).
 ```
 skim heatmap                     # short ranked view of the default window
 skim heatmap <file>              # "before you edit" card for one file
-skim heatmap --detail coupling   # all rows of one section (hotspots, coupling,
+skim heatmap --detail coupling   # 25 rows of one section (hotspots, coupling,
                                  # fix-risk, modules, bus-factor)
 skim heatmap --top 3             # --top sets the rows of every view
 skim heatmap --diff main         # default view for the files changed vs main

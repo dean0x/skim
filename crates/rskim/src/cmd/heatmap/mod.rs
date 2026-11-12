@@ -29,7 +29,7 @@ use crate::analytics::{CommandType, RecordingContext};
 use args::{parse_args, print_help};
 use excludes::{build_exclude_set, should_exclude};
 use git_source::{CliGitSource, GitDataSource};
-use insights::{build_insights_result, compute_insights};
+use insights::{build_insights_result, compute_insights, keep_code_findings};
 use metrics::{
     CouplingResult, ModuleRoots, compute_authors, compute_churn, compute_coupling,
     compute_encapsulation, compute_fix_after_touch, compute_stability, module_of, without_quotes,
@@ -542,8 +542,9 @@ fn write_output(
     }
 
     if config.insights {
-        let ranked = compute_insights(result);
-        let insights_result = build_insights_result(result, ranked, spec.lists().insights);
+        let (ranked, left_out) = keep_code_findings(compute_insights(result), *spec);
+        let insights_result =
+            build_insights_result(result, ranked, spec.lists().insights, left_out);
         if config.format_json {
             writeln!(out, "{}", render_insights_json(&insights_result)?)?;
         } else {
@@ -1583,11 +1584,13 @@ mod tests {
             view::ViewSpec {
                 detail: None,
                 top: None,
+                include_docs: false,
             }
         );
         let explicit = HeatmapArgs {
             top_n: 3,
             top_explicit: true,
+            include_docs: true,
             detail: Some(types::DetailSection::Coupling),
             ..HeatmapArgs::default()
         };
@@ -1596,6 +1599,7 @@ mod tests {
             view::ViewSpec {
                 detail: Some(types::DetailSection::Coupling),
                 top: Some(3),
+                include_docs: true,
             }
         );
     }

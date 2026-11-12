@@ -243,6 +243,7 @@ fn apply_boolean_flag(args: &mut HeatmapArgs, flag: &str) -> anyhow::Result<bool
     match flag {
         "--json" => args.format_json = true,
         "--no-exclude" => args.no_exclude = true,
+        "--include-docs" => args.include_docs = true,
         "--insights" => args.insights = true,
         "--debug" => {
             args.debug = true;
@@ -319,6 +320,7 @@ OPTIONS:
     --top <N>                     Rows of each list in every view (replaces the caps below)
     --json, --format json         Output JSON (version 2: one compact line, capped, with counts)
     --no-exclude                  Keep the files of the default excludes (see DEFAULT EXCLUDES)
+    --include-docs                Keep doc files and non-code folders (see NON-CODE PATHS)
     --exclude <PATTERN>           Add extra glob pattern to exclude (repeatable)
     --coupling-threshold <FLOAT>  Coupling confidence threshold (default: 0.5)
     --fix-window <N>              Proximity window for fix-after-touch detection (default: 5)
@@ -332,7 +334,8 @@ DEFAULT VIEW:
     Coupling     the 5 code-to-code pairs with the highest confidence
     Fix risk     5 files whose fix rate is above the repository base rate
     A capped section ends with one \"N more (--detail <section>)\" line.
-    Module health and bus factor show only with --detail.
+    Module health and bus factor show only with --detail. The last line
+    points to the per-file card: skim heatmap <file>.
 
 SECTIONS (--detail names):
     hotspots     Files changed most often (commits)
@@ -343,18 +346,30 @@ SECTIONS (--detail names):
 
 CAPS (--top N replaces each of them):
     Default view     hotspots 10, coupling 5, fix risk 5
-    --detail X       all rows of X
+    --detail X       25 rows of X, then one \"N more (raise --top)\" line
     --insights       20 findings, then one \"N more (raise --top)\" line
     File cards       5 cards; per card 3 owners, 4 partners, 3 fix commits
                      (fix commits stay at 5 or fewer at any --top)
 
 NOISE RULES:
+    A fix commit is one whose subject says it fixes something: a [fix]
+    tag, a fix: or fix(scope): type (also bug, hotfix, patch, revert), or
+    one of these words first in the subject (for example Revert \"...\").
+    skim search --risky uses the same rule.
     Fix risk and bus factor need 5 commits of the file. Fix risk also needs
     the 95% lower bound of the file's fix rate to be above the base rate.
     Coupling needs 3 shared commits. Modules need 5 commits. Bus factor shows
     only when the window has 2 or more authors. Commits with more than 50
     files are not paired; a warning line gives their count. Insights follow
     the same minimums and rank by severity, score, support, then path.
+
+NON-CODE PATHS (--include-docs keeps them):
+    Doc files (*.md, *.mdx, *.markdown, *.rst, *.txt, *.adoc) and files
+    under the top folders docs, doc, .github, .devflow, tests and test stay
+    out of the hotspots and the insights; those folders stay out of the
+    modules. The \"N more\" line counts what is left out, and JSON gives
+    left_out.{{hotspots,modules}} and, for --insights, counts.left_out.
+    Coupling never pairs doc files. File cards show any path.
 
 FILE CARDS:
     skim heatmap <FILE>... prints one card per file: commits, owners (only
@@ -469,6 +484,14 @@ mod tests {
     fn test_parse_args_no_exclude() {
         let args = parse_args(&["--no-exclude".to_string()]).unwrap();
         assert!(args.no_exclude);
+    }
+
+    #[test]
+    fn test_parse_args_include_docs() {
+        assert!(!parse_args(&[]).unwrap().include_docs);
+        let args = parse_args(&["--include-docs".to_string()]).unwrap();
+        assert!(args.include_docs);
+        assert!(!args.no_exclude);
     }
 
     #[test]

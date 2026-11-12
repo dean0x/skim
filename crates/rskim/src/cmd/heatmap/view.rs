@@ -29,6 +29,8 @@ const HOTSPOTS_DEFAULT: usize = 10;
 const COUPLING_DEFAULT: usize = 5;
 /// Fix-risk rows in the default view.
 const FIX_RISK_DEFAULT: usize = 5;
+/// Rows of the section that `--detail` names, when `--top` is not given.
+const DETAIL_DEFAULT: usize = 25;
 /// Insight rows.
 const INSIGHTS_DEFAULT: usize = 20;
 /// Cards, one for each file argument.
@@ -73,14 +75,17 @@ fn default_rows(section: DetailSection) -> usize {
 // View spec
 // ============================================================================
 
-/// What a view shows: the section that `--detail` names, and the `--top`
-/// value when it was given.
+/// What a view shows: the section that `--detail` names, the `--top` value
+/// when it was given, and whether `--include-docs` keeps the non-code paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ViewSpec {
     pub(crate) detail: Option<DetailSection>,
     /// `Some` only when `--top` was given. Without it, each list has its own
     /// default cap.
     pub(crate) top: Option<usize>,
+    /// True with `--include-docs`: the hotspots, the modules and the insights
+    /// keep the paths that [`noise::is_non_code_path`] names.
+    pub(crate) include_docs: bool,
 }
 
 /// Caps of the lists outside the five sections.
@@ -110,19 +115,27 @@ impl ViewSpec {
         Self {
             detail: config.detail,
             top: config.top_explicit.then_some(config.top_n),
+            include_docs: config.include_docs,
         }
+    }
+
+    /// True when `path` stays out of the hotspots, the modules and the
+    /// insights of this view.
+    #[must_use]
+    pub(crate) fn leaves_out(self, path: &str) -> bool {
+        !self.include_docs && noise::is_non_code_path(path)
     }
 
     /// Rows of `section` in this view.
     ///
-    /// The section that `--detail` names shows all its rows, or `--top` rows.
-    /// The other sections of the default view keep their caps, so that JSON
-    /// `files[]` is never empty; a section that is not in the default view
-    /// gets no rows unless `--detail` names it.
+    /// The section that `--detail` names shows [`DETAIL_DEFAULT`] rows, or
+    /// `--top` rows. The other sections of the default view keep their caps,
+    /// so that JSON `files[]` is never empty; a section that is not in the
+    /// default view gets no rows unless `--detail` names it.
     #[must_use]
     pub(crate) fn cap(self, section: DetailSection) -> usize {
         if self.detail == Some(section) {
-            return self.top.unwrap_or(usize::MAX);
+            return self.top.unwrap_or(DETAIL_DEFAULT);
         }
         match default_rows(section) {
             0 => 0,
@@ -189,6 +202,26 @@ pub(crate) fn more_line(hidden: usize, remedy: MoreRemedy) -> Option<String> {
     })
 }
 
+/// The "more" line with the count of rows that the non-code rule left out
+/// added, or `None` when no row is hidden or left out. `noun` names the
+/// left-out rows (for example "doc and non-code files").
+#[must_use]
+pub(crate) fn more_and_left_out_line(
+    hidden: usize,
+    remedy: MoreRemedy,
+    left_out: usize,
+    noun: &str,
+) -> Option<String> {
+    let left = (left_out > 0).then(|| format!("{left_out} {noun} left out (--include-docs)"));
+    match (more_line(hidden, remedy), left) {
+        (Some(more), Some(left)) => Some(format!("{more}; {left}")),
+        (more, left) => more.or(left),
+    }
+}
+
+/// The line of the default text view that points to the per-file card.
+pub(crate) const CARD_HINT: &str = "Before you edit a file: skim heatmap <file>";
+
 /// The warnings that a text view prints in full, and the line that counts
 /// the others, or `None` when every warning fits in [`WARNING_LINES`] lines.
 #[must_use]
@@ -234,12 +267,14 @@ pub(crate) struct SectionCounts {
     pub(crate) file_targets: Option<Count>,
 }
 
-/// One section: the shown rows in order, and the count of rows that passed
-/// the gates before the cap.
+/// One section: the shown rows in order, the count of rows that passed the
+/// gates before the cap, and the count of rows that the non-code rule left
+/// out before the gates.
 #[derive(Debug)]
 pub(crate) struct Section<T> {
     pub(crate) rows: Vec<T>,
     pub(crate) total: usize,
+    pub(crate) left_out: usize,
 }
 
 impl<T> Section<T> {
@@ -248,7 +283,16 @@ impl<T> Section<T> {
         let total = rows.len();
         rows.sort_by(order);
         rows.truncate(cap);
-        Self { rows, total }
+        Self {
+            rows,
+            total,
+            left_out: 0,
+        }
+    }
+
+    /// This section with `left_out` rows left out by the non-code rule.
+    fn with_left_out(self, left_out: usize) -> Self {
+        Self { left_out, ..self }
     }
 
     #[must_use]
@@ -306,7 +350,12 @@ pub(crate) struct HeatmapView<'a> {
 pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> HeatmapView<'a> {
     let base_rate = noise::base_rate(result.fix_commits_total, result.window.commits_analyzed);
 
-    let hotspots: Vec<&FileMetrics> = result.files.iter().collect();
+    let hotspots: Vec<&FileMetrics> = result
+        .files
+        .iter()
+        .filter(|f| !spec.leaves_out(&f.path))
+        .collect();
+    let hotspots_left_out = result.files.len() - hotspots.len();
 
     let coupling: Vec<&CouplingEdge> = result
         .coupling_graph
@@ -327,7 +376,12 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
         })
         .collect();
 
-    let modules: Vec<&ModuleHealth> = result.modules.iter().collect();
+    let modules: Vec<&ModuleHealth> = result
+        .modules
+        .iter()
+        .filter(|m| !spec.leaves_out(&m.path))
+        .collect();
+    let modules_left_out = result.modules.len() - modules.len();
 
     let bus_factor: Vec<BusFactorRow<'_>> = result
         .files
@@ -350,10 +404,12 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
     HeatmapView {
         spec: *spec,
         base_rate,
-        hotspots: Section::ranked(hotspots, hotspot_order, spec.cap(DetailSection::Hotspots)),
+        hotspots: Section::ranked(hotspots, hotspot_order, spec.cap(DetailSection::Hotspots))
+            .with_left_out(hotspots_left_out),
         coupling: Section::ranked(coupling, coupling_order, spec.cap(DetailSection::Coupling)),
         fix_risk: Section::ranked(fix_risk, fix_risk_order, spec.cap(DetailSection::FixRisk)),
-        modules: Section::ranked(modules, module_order, spec.cap(DetailSection::Modules)),
+        modules: Section::ranked(modules, module_order, spec.cap(DetailSection::Modules))
+            .with_left_out(modules_left_out),
         bus_factor: Section::ranked(
             bus_factor,
             bus_factor_order,
@@ -417,10 +473,22 @@ impl<'a> HeatmapView<'a> {
         }
     }
 
-    /// The "more" line of `section`, or `None` when no row of it is hidden.
+    /// The "more" line of `section`, or `None` when no row of it is hidden
+    /// or left out. The line also counts the rows that the non-code rule
+    /// left out, and names `--include-docs`.
     #[must_use]
     pub(crate) fn more(&self, section: DetailSection) -> Option<String> {
-        more_line(self.count(section).hidden(), self.spec.remedy(section))
+        let (left_out, noun) = match section {
+            DetailSection::Hotspots => (self.hotspots.left_out, "doc and non-code files"),
+            DetailSection::Modules => (self.modules.left_out, "non-code folders"),
+            DetailSection::Coupling | DetailSection::FixRisk | DetailSection::BusFactor => (0, ""),
+        };
+        more_and_left_out_line(
+            self.count(section).hidden(),
+            self.spec.remedy(section),
+            left_out,
+            noun,
+        )
     }
 
     /// The JSON v2 shape of this view, with the cards of a run with file
@@ -456,6 +524,7 @@ impl<'a> HeatmapView<'a> {
             fix_risk: &self.fix_risk.rows,
             modules: &self.modules.rows,
             bus_factor: &self.bus_factor.rows,
+            left_out: LeftOutJson::of(self),
             excluded_patterns: &result.excluded_patterns,
             warnings: &result.warnings,
             file_targets: shown_targets,
@@ -490,6 +559,9 @@ pub(crate) struct HeatmapJson<'a> {
     fix_risk: &'a [FixRiskRow<'a>],
     modules: &'a [&'a ModuleHealth],
     bus_factor: &'a [BusFactorRow<'a>],
+    /// Rows that the non-code rule left out, when any (see `--include-docs`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left_out: Option<LeftOutJson>,
     excluded_patterns: &'a [String],
     warnings: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -497,6 +569,25 @@ pub(crate) struct HeatmapJson<'a> {
     /// One card per shown file argument, in argument order.
     #[serde(skip_serializing_if = "Option::is_none")]
     cards: Option<&'a [Card]>,
+}
+
+/// The rows that the non-code rule left out of the hotspots (`files[]`) and
+/// the modules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct LeftOutJson {
+    hotspots: usize,
+    modules: usize,
+}
+
+impl LeftOutJson {
+    /// The counts of `view`, or `None` when the rule left out no row.
+    fn of(view: &HeatmapView<'_>) -> Option<Self> {
+        let counts = Self {
+            hotspots: view.hotspots.left_out,
+            modules: view.modules.left_out,
+        };
+        (counts.hotspots + counts.modules > 0).then_some(counts)
+    }
 }
 
 /// One `files[]` entry: the keys of [`FileMetrics`], with the blast radius
@@ -541,6 +632,7 @@ mod tests {
     const DEFAULT_VIEW: ViewSpec = ViewSpec {
         detail: None,
         top: None,
+        include_docs: false,
     };
 
     // -----------------------------------------------------------------------
@@ -649,6 +741,7 @@ mod tests {
         ViewSpec {
             detail: Some(section),
             top,
+            include_docs: false,
         }
     }
 
@@ -656,6 +749,7 @@ mod tests {
         ViewSpec {
             detail: None,
             top: Some(top),
+            include_docs: false,
         }
     }
 
@@ -762,6 +856,114 @@ mod tests {
         assert_eq!(bus.count(DetailSection::BusFactor).shown, 12);
         let capped = build_view(&result, &detail_view(DetailSection::BusFactor, Some(2)));
         assert_eq!(capped.count(DetailSection::BusFactor).shown, 2);
+    }
+
+    #[test]
+    fn test_detail_section_caps_at_25_rows_and_top_raises_the_cap() {
+        let mut result = empty_result();
+        result.files = (1..=40)
+            .map(|i| file(&format!("src/f{i:02}.rs"), i))
+            .collect();
+        let detail = build_view(&result, &detail_view(DetailSection::Hotspots, None));
+        assert_eq!(detail.count(DetailSection::Hotspots).shown, 25);
+        assert_eq!(detail.count(DetailSection::Hotspots).total, 40);
+        assert_eq!(
+            detail.more(DetailSection::Hotspots).as_deref(),
+            Some("15 more (raise --top)")
+        );
+        let raised = build_view(&result, &detail_view(DetailSection::Hotspots, Some(40)));
+        assert_eq!(raised.count(DetailSection::Hotspots).shown, 40);
+        assert_eq!(raised.more(DetailSection::Hotspots), None);
+    }
+
+    #[test]
+    fn test_hotspots_leave_out_doc_and_non_code_files_and_count_them() {
+        let mut result = empty_result();
+        result.files = vec![
+            file("CLAUDE.md", 60),
+            file("README.md", 50),
+            file(".github/workflows/ci.yml", 40),
+            file("src/main.rs", 30),
+            file("crates/x/tests/cli.rs", 20),
+        ];
+        let view = build_view(&result, &DEFAULT_VIEW);
+        assert_eq!(
+            hotspot_paths(&view),
+            ["src/main.rs", "crates/x/tests/cli.rs"]
+        );
+        assert_eq!(view.hotspots.left_out, 3);
+        assert_eq!(
+            view.more(DetailSection::Hotspots).as_deref(),
+            Some("3 doc and non-code files left out (--include-docs)")
+        );
+
+        let all = ViewSpec {
+            include_docs: true,
+            ..DEFAULT_VIEW
+        };
+        let kept = build_view(&result, &all);
+        assert_eq!(hotspot_paths(&kept)[..2], ["CLAUDE.md", "README.md"]);
+        assert_eq!(kept.hotspots.left_out, 0);
+        assert_eq!(kept.more(DetailSection::Hotspots), None);
+    }
+
+    #[test]
+    fn test_more_line_joins_hidden_and_left_out_counts() {
+        let mut result = empty_result();
+        result.files = (1..=12)
+            .map(|i| file(&format!("src/f{i:02}.rs"), i))
+            .chain([file("docs/guide.md", 99)])
+            .collect();
+        let view = build_view(&result, &DEFAULT_VIEW);
+        assert_eq!(
+            view.more(DetailSection::Hotspots).as_deref(),
+            Some("2 more (--detail hotspots); 1 doc and non-code files left out (--include-docs)")
+        );
+    }
+
+    #[test]
+    fn test_modules_leave_out_non_code_folders_unless_include_docs() {
+        let mut result = empty_result();
+        result.modules = vec![
+            module("docs", 5.0, 15),
+            module(".devflow", 8.0, 36),
+            module("tests", 0.0, 9),
+            module("crates/core", 10.0, 57),
+            module("plugins", 57.0, 7),
+        ];
+        let spec = detail_view(DetailSection::Modules, None);
+        let view = build_view(&result, &spec);
+        let paths: Vec<&str> = view.modules.rows.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["crates/core", "plugins"]);
+        assert_eq!(
+            view.more(DetailSection::Modules).as_deref(),
+            Some("3 non-code folders left out (--include-docs)")
+        );
+        let all = ViewSpec {
+            include_docs: true,
+            ..spec
+        };
+        assert_eq!(build_view(&result, &all).modules.rows.len(), 5);
+    }
+
+    #[test]
+    fn test_json_left_out_counts_only_when_rows_are_left_out() {
+        let mut result = empty_result();
+        result.files = vec![file("README.md", 9), file("src/a.rs", 5)];
+        result.modules = vec![module("docs", 5.0, 15)];
+        let view = build_view(&result, &DEFAULT_VIEW);
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
+        assert_eq!(json["left_out"]["hotspots"], 1);
+        assert_eq!(json["left_out"]["modules"], 1);
+        assert_eq!(json["counts"]["hotspots"]["total"], 1);
+
+        let all = ViewSpec {
+            include_docs: true,
+            ..DEFAULT_VIEW
+        };
+        let kept = build_view(&result, &all);
+        let json = serde_json::to_value(kept.to_json(&result, None)).unwrap();
+        assert!(json.get("left_out").is_none(), "{json}");
     }
 
     #[test]
