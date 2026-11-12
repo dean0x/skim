@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers with a `PreToolUse`-shaped response. How Claude Code reacts to that response is not
   yet measured live.
 
+- **`skim FILE --symbol NAME` prints the source lines of one declaration** (#540). The flag
+  prints the raw lines of the named function, method, type, constant or field, and nothing
+  else. One stderr notice line states which lines you see and how many lines are above and
+  below. `Type::name` or `Type.name` selects a declaration inside one container. If two or
+  more declarations have the name, skim prints all of them. A header line starts each block:
+  `==> lib.rs:12-15 norm (1 of 2) <==`. `--max-lines`, `--last-lines` and `--line-numbers`
+  apply to the selected lines. Line numbers are the source line numbers. `.tsx` files use the
+  TSX grammar. Each symbol read has its own cache entry, and cache entries of other reads stay
+  valid. A symbol read adds no token-savings row. Exit codes: 1 when no declaration has the
+  name (the message lists up to 10 declaration names), 2 when the command is not a symbol read
+  (stdin, two or more files, a glob, a directory, an empty name, `--tokens`, or a `--mode`
+  other than `full`), 3 for Markdown, JSON, YAML, TOML and files with no detected language.
+  Known limits: raw source only. Functions in C and C++ files are not found, because their
+  name is inside the declarator. Attributes, doc comments and decorators above a declaration
+  are not in the printed range. The structure mode still parses `.tsx` files with the
+  TypeScript grammar (#571 stays open).
+
 ### Changed
 
 - **Machine-contract flags on `skim git` now serve git's own bytes verbatim** (#576,

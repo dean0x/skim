@@ -214,6 +214,10 @@ skim 'src/*.ts' --mode signatures --no-header
 # Extract type definitions
 skim src/types.ts --mode types
 
+# Print the raw source lines of one declaration, not the whole file
+skim src/app.ts --symbol parseConfig
+skim src/lib.rs --symbol Point::norm   # only norm inside the impl of Point
+
 # Extract markdown headers (H1-H3 for structure, H1-H6 for signatures/types)
 skim README.md --mode structure
 
@@ -258,6 +262,7 @@ skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 - `--max-lines N` - Emit at most N lines total; when content is elided, one slot goes to the elision marker. One documented exception at `N=1`: 1 content line **plus** the marker (2 lines), because spending the only slot on the marker returns a view containing no code, and dropping the marker to fit is silent loss
 - `--last-lines N` - Emit at most N lines from the tail; when content is elided, one slot goes to the elision marker. The same `N=1` exception applies — the carve-out is a property of the bound, not of the direction
 - `--tokens N` - Fit output within N tokens by escalating through modes, then line-truncating with a marker
+- `--symbol NAME` - Print the raw source lines of one named declaration of one file. `Type::name` or `Type.name` selects a declaration inside one container. If two or more declarations have the name, skim prints all of them, each after a header line. One stderr notice line states how many lines are not shown. `--max-lines`, `--last-lines` and `--line-numbers` apply to the selected lines. Exit code 1: no declaration has the name. Exit code 2: the command is not a symbol read (stdin, two or more files, a glob, a directory, an empty name, `--tokens`, or a `--mode` other than `full`). Exit code 3: Markdown, JSON, YAML, TOML, or a file with no detected language. Known limits: raw source only. Functions in C and C++ files are not found, because their name is inside the declarator. Attributes, doc comments and decorators above a declaration are not in the printed range. The structure mode still parses `.tsx` files with the TypeScript grammar. See the [usage guide](docs/usage.md#symbol-read)
 - `--passthrough` - Bypass compression and exec the real tool with raw argv (equivalent to `SKIM_PASSTHROUGH=1`). **Not universal:** `env`/`printenv` keep credential redaction regardless of passthrough state, and the multi-level dispatchers (`cargo`, `dotnet`, `go`, `swift`) still serve the compressed summary whenever stdin is not a TTY — which is every agent harness, CI job, and pipeline. Run the tool directly when you need raw bytes from a build tool
 - `--debug` - Enable raw-fallback diagnostic banners on stderr (loss-bearing elision markers are always emitted regardless)
 - `--no-cache` - Disable caching
