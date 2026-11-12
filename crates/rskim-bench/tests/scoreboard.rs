@@ -171,6 +171,7 @@ else
 fi
 if [ -f "$f" ]; then
   cat "$f"
+  if [ -f "$dir/exit_code" ]; then exit "$(cat "$dir/exit_code")"; fi
   exit 0
 fi
 printf 'stub skim: no canned response for query=%s flags=%s limit=%s offset=%s json=%s\n' "$query" "$flags" "$limit" "$offset" "$json" >&2
@@ -499,6 +500,12 @@ impl Harness {
 
     fn write_response(&self, query: &str, flags: &[&str], file: &str, body: &str) {
         fs::write(self.response_dir(query, flags).join(file), body).unwrap();
+    }
+
+    /// Make the stub exit with `code` after it prints the canned answer of
+    /// `query` (the current binary exits 0 on a query with no hit).
+    fn write_exit_code(&self, query: &str, flags: &[&str], code: i32) {
+        self.write_response(query, flags, "exit_code", &code.to_string());
     }
 
     fn write_full(&self, query: &str, flags: &[&str], rows: &[Row]) {
@@ -2188,4 +2195,344 @@ fn an_ast_entry_naming_a_pattern_the_oracle_cannot_score_is_a_harness_error() {
     let err = stderr(&run);
     assert!(err.contains("golden integrity failed"), "{err}");
     assert!(err.contains("no structural oracle query"), "{err}");
+}
+
+// ============================================================================
+// #540: the frozen-answer tables, end to end
+// ============================================================================
+
+/// A query that no file of the fixture holds.
+const ABSENT: &str = "qzvx_absent_7713";
+
+/// A `[[refs]]` entry for `check_staleness`; `sites` are `(path, line, role)`.
+/// The name is a whole word on two lines of the fixture: the definition
+/// (`src/staleness.rs:2`) and the call (`src/other.rs:2`).
+fn refs_entry(sites: &[(&str, u32, &str)]) -> String {
+    let sites: String = sites
+        .iter()
+        .map(|(path, line, role)| {
+            format!("  {{ path = \"{path}\", line = {line}, role = \"{role}\" }},\n")
+        })
+        .collect();
+    format!(
+        "\n[[refs]]\nid = \"fixture-R01\"\nquery = \"check_staleness\"\n\
+         def = {{ path = \"{DEF_PATH}\", line = {DEF_LINE} }}\norigin = \"curated\"\n\
+         sites = [\n{sites}]\n"
+    )
+}
+
+/// The refs entry that holds exactly the whole-word lines of the fixture.
+fn exact_refs_entry() -> String {
+    refs_entry(&[("src/staleness.rs", 2, "def"), ("src/other.rs", 2, "call")])
+}
+
+/// A `[[clash]]` entry for `check_staleness`; `defs` are `(path, line)`. The
+/// fixture defines the name once, so a test that needs two definitions treats
+/// the call line as the second one: the entry only has to hold whole-word lines.
+fn clash_entry(defs: &[(&str, u32)], split: &str) -> String {
+    let defs: Vec<String> = defs
+        .iter()
+        .map(|(path, line)| format!("{{ path = \"{path}\", line = {line} }}"))
+        .collect();
+    format!(
+        "\n[[clash]]\nid = \"fixture-D01\"\nquery = \"check_staleness\"\nsplit = \"{split}\"\n\
+         origin = \"curated\"\ndefs = [ {} ]\ncalls = []\n",
+        defs.join(", ")
+    )
+}
+
+const TWO_DEFS: &[(&str, u32)] = &[("src/staleness.rs", 2), ("src/other.rs", 2)];
+
+/// A `[[concept]]` entry on the fixture's `build lock` query, which freezes
+/// `first`. The query is the one of `fixture-C01`, so the stub already
+/// answers it.
+fn concept_with_first(id: &str, first: &str) -> String {
+    format!(
+        "\n[[concept]]\nid = \"{id}\"\nquery = \"build lock\"\nrelevant = '(?i)build[_\\s-]*lock'\n\
+         first = [\"{first}\"]\n"
+    )
+}
+
+/// A zero-hit `[[stakes]]` entry that expects `exit = 1`, and a match entry on
+/// the fixture's `marker` query that expects `exit = 0`.
+fn stakes_entries() -> String {
+    format!(
+        "\n[[stakes]]\nid = \"fixture-S01\"\nquery = \"{ABSENT}\"\nflags = []\nexpect = \"exit\"\nexit = 1\n\
+         \n[[stakes]]\nid = \"fixture-S02\"\nquery = \"marker\"\nflags = []\nexpect = \"exit\"\nexit = 0\n"
+    )
+}
+
+/// Every new table at once, each with the answer the fixture really has.
+fn frozen_answer_entries() -> String {
+    [
+        exact_refs_entry(),
+        clash_entry(TWO_DEFS, "none"),
+        concept_with_first("fixture-C02", "src/lock.rs"),
+        concept_with_first("fixture-C03", "src/marker.rs"),
+        stakes_entries(),
+    ]
+    .concat()
+}
+
+/// A harness that serves the new entries: zero hits for the absent query, as
+/// the current binary answers it (`total` 0, exit 0).
+fn frozen_answer_harness() -> Harness {
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, &frozen_answer_entries());
+    h.write_full(ABSENT, &[], &[]);
+    h
+}
+
+/// The failure detail the report holds for `(id, check)`.
+fn detail_of(report: &Value, id: &str, check: &str) -> String {
+    report["corpora"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["checks"].as_array().unwrap().iter())
+        .find(|c| c["id"] == id && c["check"] == check)
+        .and_then(|c| c["detail"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `check` over a golden file with `extra` appended: it must stop at
+/// integrity with exit 2 and leave no report. Gives stderr.
+fn integrity_failure_of(extra: &str) -> String {
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, extra);
+    let check = h.check();
+    assert_exit(&check, 2);
+    let err = stderr(&check);
+    assert!(err.contains("golden integrity failed"), "{err}");
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
+    err
+}
+
+#[test]
+fn a_refs_entry_whose_sites_differ_from_the_whole_word_lines_exits_2_at_integrity() {
+    // One whole-word line is not listed.
+    let err = integrity_failure_of(&refs_entry(&[("src/staleness.rs", 2, "def")]));
+    assert!(
+        err.contains("fixture-R01") && err.contains("missing") && err.contains("src/other.rs:2"),
+        "{err}"
+    );
+
+    // One listed line does not hold the word as a whole word.
+    let err = integrity_failure_of(&refs_entry(&[
+        ("src/staleness.rs", 2, "def"),
+        ("src/other.rs", 2, "call"),
+        ("src/other.rs", 1, "call"),
+    ]));
+    assert!(
+        err.contains("fixture-R01")
+            && err.contains("not a whole-word line")
+            && err.contains("src/other.rs:1"),
+        "{err}"
+    );
+
+    // The same entry with the exact set passes integrity.
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, &exact_refs_entry());
+    assert_exit(&h.run(), 0);
+}
+
+#[test]
+fn a_clash_with_one_definition_or_a_split_exits_2_at_integrity() {
+    let err = integrity_failure_of(&clash_entry(&TWO_DEFS[..1], "none"));
+    assert!(
+        err.contains("fixture-D01") && err.contains("2 or more"),
+        "{err}"
+    );
+
+    let err = integrity_failure_of(&clash_entry(TWO_DEFS, "exact"));
+    assert!(
+        err.contains("fixture-D01") && err.contains("split"),
+        "{err}"
+    );
+
+    // The two-definition entry with no split passes integrity.
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, &clash_entry(TWO_DEFS, "none"));
+    assert_exit(&h.run(), 0);
+}
+
+#[test]
+fn the_frozen_answer_entries_are_judged_against_the_output_the_current_binary_prints() {
+    let h = frozen_answer_harness();
+
+    assert_exit(&h.run(), 0);
+    let report = h.report();
+    let result = |id: &str, check: &str| outcome(&report, id, check);
+
+    // The two frozen sites are in the output, so recall holds; the call line
+    // carries no role in the current output, so the call recall fails.
+    assert_eq!(
+        result("fixture-R01", "refs.recall").as_deref(),
+        Some("pass")
+    );
+    assert_eq!(
+        result("fixture-R01", "refs.calls_recall").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-R01", "refs.calls_recall");
+    assert!(d.contains("src/other.rs:2 (role none)"), "{d}");
+    // The fixture's indexed files are its text files: the accounting agrees.
+    assert_eq!(
+        result("fixture-R01", "universe.accounted").as_deref(),
+        Some("pass")
+    );
+
+    // The output lists the definition site it knows, with no count.
+    assert_eq!(
+        result("fixture-D01", "clash.defs_complete").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-D01", "clash.defs_complete");
+    assert!(
+        d.contains("missing 1 of 2") && d.contains("src/other.rs:2"),
+        "{d}"
+    );
+    assert_eq!(
+        result("fixture-D01", "clash.def_count").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-D01", "clash.def_count");
+    assert!(d.contains("no definitions.count"), "{d}");
+
+    // `build lock` lists src/lock.rs, not src/marker.rs.
+    assert_eq!(
+        result("fixture-C02", "concept.first_right_top5").as_deref(),
+        Some("pass")
+    );
+    assert_eq!(
+        result("fixture-C03", "concept.first_right_top5").as_deref(),
+        Some("fail")
+    );
+    // The first-file check is for the concepts that freeze one.
+    assert_eq!(result("fixture-C01", "concept.first_right_top5"), None);
+
+    // The absent query exits 0, the match query exits 0.
+    assert_eq!(
+        result("fixture-S01", "stakes.exit").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-S01", "stakes.exit");
+    assert!(d.contains("exit code is 0, expected 1"), "{d}");
+    assert_eq!(
+        result("fixture-S02", "stakes.exit").as_deref(),
+        Some("pass")
+    );
+}
+
+#[test]
+fn a_zero_hit_stakes_entry_passes_once_the_run_exits_1() {
+    let h = frozen_answer_harness();
+    h.write_exit_code(ABSENT, &[], 1);
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-S01", "stakes.exit").as_deref(),
+        Some("pass")
+    );
+}
+
+#[test]
+fn a_search_that_counts_a_different_number_of_files_fails_the_universe_accounting() {
+    let h = frozen_answer_harness();
+    let files = h.universe.len();
+    // One file more than the text universe holds, with no reason for it.
+    fs::write(
+        h.stub_dir.path().join("stats.json"),
+        json!({"file_count": files + 1, "skipped_by_reason": {}, "temporal_state": "ready"})
+            .to_string(),
+    )
+    .unwrap();
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-R01", "universe.accounted").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-R01", "universe.accounted");
+    assert!(
+        d.contains(&format!("searched_files is {}", files + 1))
+            && d.contains(&format!("has {files}")),
+        "{d}"
+    );
+}
+
+/// The ledger of the failures `frozen_answer_entries` has against the
+/// fixture's current-shaped output.
+const FROZEN_ANSWER_LEDGER: &str = r##"[[xfail]]
+issue = "#553"
+check = "refs.calls_recall"
+ids = ["fixture-R01"]
+
+[[xfail]]
+issue = "#555"
+check = "clash.defs_complete"
+ids = ["fixture-D01"]
+
+[[xfail]]
+issue = "#555"
+check = "clash.def_count"
+ids = ["fixture-D01"]
+
+[[xfail]]
+issue = "#556"
+check = "concept.first_right_top5"
+ids = ["fixture-C03"]
+
+[[xfail]]
+issue = "#552"
+check = "stakes.exit"
+ids = ["fixture-S01"]
+"##;
+
+#[test]
+fn the_new_hard_failures_are_ledgered_by_id_and_a_first_bless_needs_no_reason() {
+    let h = frozen_answer_harness();
+
+    // Without a ledger the gate names the new failures.
+    let unledgered = h.check();
+    assert_exit(&unledgered, 1);
+    let err = stderr(&unledgered);
+    for check in [
+        "refs.calls_recall",
+        "clash.defs_complete",
+        "clash.def_count",
+        "concept.first_right_top5",
+        "stakes.exit",
+    ] {
+        assert!(err.contains(check), "{check}: {err}");
+    }
+
+    // Ledgered, they are `xfail`; a first bless takes them with no reason.
+    h.write_ledger(FROZEN_ANSWER_LEDGER);
+    assert_exit(&h.run(), 0);
+    assert_eq!(
+        outcome(&h.report(), "fixture-S01", "stakes.exit").as_deref(),
+        Some("xfail")
+    );
+    assert_exit(&h.bless(None), 0);
+    assert_exit(&h.check(), 0);
+    assert_eq!(h.report()["gate"]["status"], "pass");
+
+    // When the engine fixes one, the ledger entry is an XPASS until removed.
+    h.write_exit_code(ABSENT, &[], 1);
+    let fixed = h.check();
+    assert_exit(&fixed, 1);
+    let err = stderr(&fixed);
+    assert!(
+        err.contains("XPASS") && err.contains("stakes.exit"),
+        "{err}"
+    );
 }
