@@ -123,7 +123,7 @@ skim src/app.ts --symbol run -n         # lines are numbered from the first line
 - stderr: one notice line, always. It states which lines you see and how many lines are not shown:
   `[skim] --symbol "norm": lines 12-15 of 35 shown (11 above, 20 below not shown) — omit --symbol for the whole file`
 - If the search for declarations stopped at its limit (100,000 syntax nodes or a nesting depth of 500), the notice also states that more declarations with the name can exist.
-- If the name matches two or more declarations, skim prints all of them in file order. A header line starts each block: `==> lib.rs:12-15 norm (1 of 2) <==`. An empty line separates the blocks.
+- If the name matches two or more declarations, skim prints all of them in file order. A header line starts each block: `==> lib.rs:12-15 norm (1 of 2) <==`. An empty line separates the blocks. Skim prints each source line once. When a declaration lies inside an earlier one, or shares a line with it, the later header says `lines shown above` (or `lines 3-5 shown above` for a part), and the block holds only the lines not yet printed. With `-n`, a header line has no number.
 
 **How a name matches:**
 - The name must equal the declaration name. The match is exact and case-sensitive.
@@ -143,7 +143,7 @@ skim src/app.ts --symbol run -n         # lines are numbered from the first line
 | Code | Cause |
 |------|-------|
 | 0 | The name matched at least one declaration. |
-| 1 | No declaration has that name. The message lists up to 10 declaration names of the file. If the search stopped at its limit of 100,000 syntax nodes, the message names that limit and lists no names. The name can be in the part of the file that skim did not search. |
+| 1 | No declaration has that name. The message lists up to 10 declaration names of the file. If the search stopped at its limit of 100,000 syntax nodes or at its nesting depth of 500, the message names both limits and lists no names. The name can be in the part of the file that skim did not search. |
 | 2 | The command is not a symbol read: stdin, two or more files, a glob, a directory, an empty name, `--tokens`, or a `--mode` other than `full`. |
 | 3 | The file is Markdown, JSON, YAML or TOML, or skim cannot detect its language. For the last case, add `--language`. |
 

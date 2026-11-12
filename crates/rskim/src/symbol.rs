@@ -126,15 +126,19 @@ pub(crate) fn select<'a>(decls: &'a [Declaration], query: &str) -> Vec<&'a Decla
 /// The error for a query that selected nothing.
 ///
 /// When the walk stopped at a cap, a missing name may lie past it, so the
-/// message names the cap instead of listing a partial set of names as if it
-/// were the file's. Otherwise it lists at most [`MAX_NEAREST_NAMES`] names:
-/// those that contain the query (ignoring case) first, then the rest in source
-/// order. Every name is quoted, because a name comes from the file.
+/// message names both caps instead of listing a partial set of names as if it
+/// were the file's. [`DeclScan::truncated`] does not say which cap stopped the
+/// walk, so the message cannot name only one. Otherwise it lists at most
+/// [`MAX_NEAREST_NAMES`] names: those that contain the query (ignoring case)
+/// first, then the rest in source order. Every name is quoted, because a name
+/// comes from the file.
 pub(crate) fn not_found(path: &Path, query: &str, scan: &DeclScan) -> SymbolError {
     if scan.truncated {
         return SymbolError::NotFound(format!(
-            "no declaration named {query:?} in the first {} syntax nodes of {path:?} (node cap)",
-            AstWalkConfig::DEFAULT_MAX_NODES
+            "no declaration named {query:?} in {path:?}: the declaration walk stopped at its \
+             syntax-node or depth cap ({} nodes, depth {}), so the name may lie beyond it",
+            AstWalkConfig::DEFAULT_MAX_NODES,
+            AstWalkConfig::DEFAULT_MAX_DEPTH
         ));
     }
 
@@ -176,8 +180,11 @@ pub(crate) fn not_found(path: &Path, query: &str, scan: &DeclScan) -> SymbolErro
 ///
 /// One match prints its lines and nothing else. Two or more print one block
 /// each, in source order, every block led by a header and separated from the
-/// block before it by an empty line. Lines keep their own terminators, so a
-/// CRLF file stays CRLF.
+/// block before it by an empty line. A source line is printed once: a block
+/// prints only the lines no earlier block printed, and its header says when
+/// the rest are shown above. The text is therefore never larger than the file
+/// plus one header per match. Lines keep their own terminators, so a CRLF file
+/// stays CRLF.
 ///
 /// `walk_truncated` is [`DeclScan::truncated`]: when a cap stopped the walk, a
 /// later declaration with the same name may exist, and the notice says so.
@@ -203,10 +210,18 @@ pub(crate) fn render(
     let mut line_map: Vec<usize> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(count);
 
+    // First line that no block has printed yet. Matches come in source order,
+    // so every line before it that lies in a later match was printed already.
+    let mut next_unseen = 0;
+
     for (k, decl) in matches.iter().enumerate() {
         let last = decl.last_row.min(last_index);
         let first = decl.first_row.min(last);
+        if let Some(&(previous_first, _)) = ranges.last() {
+            debug_assert!(previous_first <= first, "matches must be in source order");
+        }
         ranges.push((first, last));
+        let start = first.max(next_unseen);
 
         if count > 1 {
             if k > 0 {
@@ -216,19 +231,15 @@ pub(crate) fn render(
                 text.push('\n');
                 line_map.push(0);
             }
-            text.push_str(&format!(
-                "==> {}:{}-{} {} ({} of {count}) <==\n",
-                path.display(),
-                first + 1,
-                last + 1,
-                decl.name,
-                k + 1,
-            ));
+            text.push_str(&block_header(path, decl, (k, count), (first, last), start));
             line_map.push(0);
         }
-        for (offset, line) in lines[first..=last].iter().enumerate() {
-            text.push_str(line);
-            line_map.push(first + 1 + offset);
+        if start <= last {
+            for (offset, line) in lines[start..=last].iter().enumerate() {
+                text.push_str(line);
+                line_map.push(start + 1 + offset);
+            }
+            next_unseen = last + 1;
         }
     }
 
@@ -237,6 +248,35 @@ pub(crate) fn render(
         line_map,
         notice: notice_for(query, &ranges, total, walk_truncated),
     }
+}
+
+/// The header line of one block in a multi-match read.
+///
+/// `rows` is the 0-based first and last row of the match, `start` the first row
+/// the block prints. When an earlier block printed some or all of the match,
+/// the header says so, because the block then holds fewer lines than its range.
+fn block_header(
+    path: &Path,
+    decl: &Declaration,
+    (k, count): (usize, usize),
+    (first, last): (usize, usize),
+    start: usize,
+) -> String {
+    let shown_above = if start <= first {
+        String::new()
+    } else if start > last {
+        ", lines shown above".to_string()
+    } else {
+        format!(", lines {}-{start} shown above", first + 1)
+    };
+    format!(
+        "==> {}:{}-{} {} ({} of {count}){shown_above} <==\n",
+        path.display(),
+        first + 1,
+        last + 1,
+        decl.name,
+        k + 1,
+    )
 }
 
 /// The stderr notice: which lines of the file the reader saw.
@@ -450,7 +490,7 @@ fn norm(p: &Point) -> i32 {
     }
 
     #[test]
-    fn render_counts_a_line_once_when_one_match_sits_inside_another() {
+    fn render_shows_a_line_once_when_one_match_sits_inside_another() {
         // Both functions are named `f`; the inner one lies in the outer body.
         let source = "fn f() {\n    fn f() {}\n}\nfn g() {}\n";
         let scan = scan(source, Language::Rust);
@@ -458,10 +498,143 @@ fn norm(p: &Point) -> i32 {
         assert_eq!(found.len(), 2, "precondition: both `f` are declarations");
         let rendered = render(Path::new("a.rs"), source, &found, "f", false);
 
+        let expected = "\
+==> a.rs:1-3 f (1 of 2) <==
+fn f() {
+    fn f() {}
+}
+
+==> a.rs:2-2 f (2 of 2), lines shown above <==
+";
+        assert_eq!(rendered.text, expected);
+        assert_eq!(
+            rendered.text.matches("    fn f() {}\n").count(),
+            1,
+            "line 2 must be printed once"
+        );
+        assert_eq!(
+            rendered.line_map,
+            [0, 1, 2, 3, 0, 0],
+            "headers and the separator have no source line"
+        );
+        assert_eq!(rendered.text.lines().count(), rendered.line_map.len());
         assert_eq!(
             rendered.notice,
             "[skim] --symbol \"f\": 2 declarations, 3 of 4 lines shown (1 not shown) — omit --symbol for the whole file"
         );
+    }
+
+    #[test]
+    fn render_prints_only_the_unseen_tail_of_a_partly_overlapping_match() {
+        // The second `f` starts on line 1, where the first `f` already sits,
+        // and ends on line 2.
+        let source = "fn f() {} fn f() {\n}\n";
+        let scan = scan(source, Language::Rust);
+        let found = select(&scan.decls, "f");
+        assert_eq!(found.len(), 2, "precondition: both `f` are declarations");
+        let rendered = render(Path::new("a.rs"), source, &found, "f", false);
+
+        let expected = "\
+==> a.rs:1-1 f (1 of 2) <==
+fn f() {} fn f() {
+
+==> a.rs:1-2 f (2 of 2), lines 1-1 shown above <==
+}
+";
+        assert_eq!(rendered.text, expected);
+        assert_eq!(rendered.line_map, [0, 1, 0, 0, 2]);
+        assert_eq!(
+            rendered.notice,
+            "[skim] --symbol \"f\": 2 declarations, 2 of 2 lines shown (0 not shown) — omit --symbol for the whole file"
+        );
+    }
+
+    /// Bytes one extra match may add to the text beyond the source lines: the
+    /// empty line before its header and the longest header it can have.
+    fn per_match_budget(path: &str, name: &str, count: usize, total_lines: usize) -> usize {
+        format!(
+            "\n==> {path}:{total_lines}-{total_lines} {name} ({count} of {count}), \
+             lines {total_lines}-{total_lines} shown above <==\n"
+        )
+        .len()
+    }
+
+    #[test]
+    fn render_bounds_the_text_when_many_same_name_matches_share_one_line() {
+        // A minified bundle: every match has the row range (0, 0).
+        const MATCHES: usize = 200;
+        let source = format!("{}\n", "fn f(){} ".repeat(MATCHES));
+        let scan = scan(&source, Language::Rust);
+        let found = select(&scan.decls, "f");
+        assert_eq!(found.len(), MATCHES, "precondition: every `f` is a match");
+        let rendered = render(Path::new("min.rs"), &source, &found, "f", false);
+
+        let budget = per_match_budget("min.rs", "f", MATCHES, 1);
+        assert!(
+            rendered.text.len() <= source.len() + MATCHES * budget,
+            "{} bytes for a {} byte source",
+            rendered.text.len(),
+            source.len()
+        );
+        assert_eq!(
+            rendered.text.matches(source.as_str()).count(),
+            1,
+            "the shared line must be printed once"
+        );
+        assert_eq!(rendered.text.lines().count(), rendered.line_map.len());
+        assert_eq!(
+            rendered.line_map.iter().filter(|&&n| n != 0).count(),
+            1,
+            "only the one printed source line has a number"
+        );
+    }
+
+    #[test]
+    fn render_bounds_the_text_when_same_name_functions_nest_deeply() {
+        const LEVELS: usize = 50;
+        const FILLER: usize = 400;
+        let mut source = "fn f() {\n".repeat(LEVELS);
+        for i in 0..FILLER {
+            source.push_str(&format!("// filler line {i}\n"));
+        }
+        source.push_str(&"}\n".repeat(LEVELS));
+        let total_lines = LEVELS + FILLER + LEVELS;
+
+        let scan = scan(&source, Language::Rust);
+        let found = select(&scan.decls, "f");
+        assert_eq!(found.len(), LEVELS, "precondition: every level is a match");
+        let rendered = render(Path::new("deep.rs"), &source, &found, "f", false);
+
+        let budget = per_match_budget("deep.rs", "f", LEVELS, total_lines);
+        assert!(
+            rendered.text.len() <= source.len() + LEVELS * budget,
+            "{} bytes for a {} byte source",
+            rendered.text.len(),
+            source.len()
+        );
+        assert_eq!(rendered.text.matches("// filler line 0\n").count(), 1);
+        assert_eq!(
+            rendered.text.matches("lines shown above <==").count(),
+            LEVELS - 1,
+            "every inner header says its lines are shown above"
+        );
+
+        let numbered: Vec<usize> = rendered
+            .line_map
+            .iter()
+            .copied()
+            .filter(|&n| n != 0)
+            .collect();
+        assert!(
+            numbered.windows(2).all(|pair| pair[0] < pair[1]),
+            "each source line is printed once, in order"
+        );
+        assert_eq!(
+            numbered.len(),
+            total_lines,
+            "and every line of the file is shown"
+        );
+        assert_eq!(rendered.text.lines().count(), rendered.line_map.len());
     }
 
     #[test]
@@ -549,7 +722,9 @@ fn norm(p: &Point) -> i32 {
     }
 
     #[test]
-    fn not_found_on_a_truncated_scan_names_the_node_cap() {
+    fn not_found_on_a_truncated_scan_names_both_caps() {
+        // `DeclScan` does not say which cap stopped the walk, so the message
+        // names the syntax-node cap and the depth cap alike.
         let scan = DeclScan {
             decls: Vec::new(),
             truncated: true,
@@ -559,7 +734,8 @@ fn norm(p: &Point) -> i32 {
         assert_eq!(error.exit_code(), 1);
         assert_eq!(
             message(error),
-            "no declaration named \"late\" in the first 100000 syntax nodes of \"big.rs\" (node cap)"
+            "no declaration named \"late\" in \"big.rs\": the declaration walk stopped at its \
+             syntax-node or depth cap (100000 nodes, depth 500), so the name may lie beyond it"
         );
     }
 

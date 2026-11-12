@@ -277,6 +277,95 @@ fn two_declarations_with_one_name_print_both_with_k_of_n_headers() {
 }
 
 // ============================================================================
+// A source line is printed once, so stdout stays near the file size
+// ============================================================================
+
+/// Same-name functions, the second inside the first.
+const NESTED_SRC: &str = "\
+fn f() {
+    fn f() {
+        1
+    }
+}
+fn g() {}
+";
+
+#[test]
+fn nested_same_name_declarations_print_each_line_once() {
+    let home = TempDir::new().unwrap();
+    put(home.path(), "lib.rs", NESTED_SRC);
+
+    let out = run(home.path(), &["lib.rs", "--symbol", "f"]);
+
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "==> lib.rs:1-5 f (1 of 2) <==\n{}\n==> lib.rs:2-4 f (2 of 2), lines shown above <==\n",
+            lines(NESTED_SRC, 1, 5)
+        )
+    );
+    assert_eq!(
+        out.stderr,
+        "[skim] --symbol \"f\": 2 declarations, 5 of 6 lines shown (1 not shown) \
+         — omit --symbol for the whole file\n"
+    );
+}
+
+#[test]
+fn line_numbers_skip_the_headers_of_nested_same_name_declarations() {
+    let home = TempDir::new().unwrap();
+    put(home.path(), "lib.rs", NESTED_SRC);
+
+    let out = run(home.path(), &["lib.rs", "--symbol", "f", "-n"]);
+
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stdout,
+        "==> lib.rs:1-5 f (1 of 2) <==\n\
+         1\tfn f() {\n\
+         2\t    fn f() {\n\
+         3\t        1\n\
+         4\t    }\n\
+         5\t}\n\
+         \n\
+         ==> lib.rs:2-4 f (2 of 2), lines shown above <==\n"
+    );
+}
+
+#[test]
+fn many_same_name_declarations_on_one_line_keep_stdout_near_the_file_size() {
+    // A minified bundle: every match sits on the one line.
+    const MATCHES: usize = 300;
+    let home = TempDir::new().unwrap();
+    let source = format!("{}\n", "fn f(){} ".repeat(MATCHES));
+    put(home.path(), "min.rs", &source);
+
+    let out = run(home.path(), &["min.rs", "--symbol", "f"]);
+
+    // The empty line before a header plus the longest header any match gets.
+    let per_match =
+        format!("\n==> min.rs:1-1 f ({MATCHES} of {MATCHES}), lines shown above <==\n").len();
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.len() <= source.len() + MATCHES * per_match,
+        "{} bytes of stdout for a {} byte file",
+        out.stdout.len(),
+        source.len()
+    );
+    assert_eq!(
+        out.stdout.matches(source.as_str()).count(),
+        1,
+        "the shared line must be printed once"
+    );
+    assert_eq!(
+        out.stdout.matches("lines shown above").count(),
+        MATCHES - 1,
+        "every later header says its lines are shown above"
+    );
+}
+
+// ============================================================================
 // TP-33 (AC-12): qualified names
 // ============================================================================
 
@@ -679,7 +768,7 @@ fn constants_source(count: usize) -> String {
 }
 
 #[test]
-fn no_match_in_a_file_above_the_node_cap_exits_1_and_names_the_cap() {
+fn no_match_in_a_file_above_the_node_cap_exits_1_and_names_both_caps() {
     // TP-123
     let home = TempDir::new().unwrap();
     let mut source = constants_source(20_000);
@@ -692,9 +781,32 @@ fn no_match_in_a_file_above_the_node_cap_exits_1_and_names_the_cap() {
     assert_eq!(out.stdout, "");
     assert_eq!(
         out.stderr,
-        "skim: no declaration named \"late\" in the first 100000 syntax nodes of \"big.rs\" \
-         (node cap)\n",
+        "skim: no declaration named \"late\" in \"big.rs\": the declaration walk stopped at its \
+         syntax-node or depth cap (100000 nodes, depth 500), so the name may lie beyond it\n",
         "the walk never reached `late`, so the message must not claim the name is absent"
+    );
+}
+
+#[test]
+fn no_match_in_a_file_deeper_than_the_depth_cap_does_not_blame_only_the_node_cap() {
+    // The file is tiny, so the depth cap stopped the walk and not the node cap.
+    let home = TempDir::new().unwrap();
+    let source = format!("fn deep() {{{}{}}}\n", "{".repeat(600), "}".repeat(600));
+    put(home.path(), "deep.rs", &source);
+
+    let out = run(home.path(), &["deep.rs", "--symbol", "missing"]);
+
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("syntax-node or depth cap"),
+        "the message must name the depth cap as well: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("(node cap)"),
+        "the message must not blame only the node cap: {}",
+        out.stderr
     );
 }
 
