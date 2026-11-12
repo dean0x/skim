@@ -274,7 +274,7 @@ fn run_corpus(
     require_temporal_data(&plan, &stats)?;
 
     progress(name, &format!("running {} golden entries", plan.len()));
-    let observed = observe_plan(runner, &root, &plan, &inputs.catalog)?;
+    let observed = observe_plan(runner, &root, &plan, &inputs.catalog, &stats)?;
     require_oracle_less_rows(&plan, &observed.observations)?;
     let evidence = StructuralEvidence {
         answers,
@@ -405,7 +405,10 @@ pub fn call_patterns(
 /// Run every call the plan needs. Each pattern of [`ast_calls`] is called
 /// once (`--ast <pattern>`, full list), in pattern order
 /// ([`call_patterns`]); an `[[ast]]` entry's observation is its pattern
-/// call's rows in its language ([`EntryObservation::for_ast`]).
+/// call's rows in its language ([`EntryObservation::for_ast`]). The full
+/// list of every other entry states the corpus accounting of `stats`
+/// ([`EntryObservation::with_accounting`]): the current output states
+/// `searched_files` and `left_out` nowhere else.
 ///
 /// # Errors
 ///
@@ -415,6 +418,7 @@ fn observe_plan(
     root: &Path,
     plan: &[PlannedQuery],
     catalog: &[CatalogPattern],
+    stats: &StatsSnapshot,
 ) -> anyhow::Result<PlanObservations> {
     let calls = call_patterns(runner, root, ast_calls(plan, catalog))?;
     let mut pattern_timings = BTreeMap::new();
@@ -437,7 +441,7 @@ fn observe_plan(
         let observed = runner
             .observe(root, q)
             .with_context(|| format!("entry {}", q.id))?;
-        observations.push(observed.observation);
+        observations.push(observed.observation.with_accounting(stats));
         timings.push((q.id.clone(), observed.timings));
     }
     Ok(PlanObservations {
@@ -895,6 +899,39 @@ mod tests {
             plan_of("[[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n");
         require_temporal_data(&lexical_only, &stats_with(Some("missing"))).unwrap();
         require_temporal_data(&lexical_only, &stats_with(None)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_full_list_states_the_accounting_of_the_stats_snapshot() {
+        use crate::scoreboard::test_support::script_runner;
+
+        let plan = plan_of(
+            "[[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n\
+             [[stakes]]\nid = \"skim-S01\"\nquery = \"qzvx_absent_7713\"\nexpect = \"exit\"\nexit = 1\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let runner = script_runner(dir.path(), "printf '{\"results\":[]}'\nexit 1");
+        let stats = StatsSnapshot {
+            file_count: 12,
+            skipped_by_reason: BTreeMap::from([("binary".to_string(), 3)]),
+            temporal_state: None,
+        };
+
+        let observed = observe_plan(&runner, Path::new("/c"), &plan, catalog(), &stats).unwrap();
+
+        assert_eq!(observed.observations.len(), 2);
+        for obs in &observed.observations {
+            assert_eq!(obs.full.searched_files, Some(12), "{}", obs.id);
+            assert_eq!(
+                obs.full.left_out,
+                Some(BTreeMap::from([("binary".to_string(), 3)])),
+                "{}",
+                obs.id
+            );
+            // The exit code is the process's, not the default.
+            assert_eq!(obs.full.exit_code, 1, "{}", obs.id);
+        }
     }
 
     /// An observation whose full list has `rows` rows.

@@ -16,6 +16,8 @@ use std::sync::LazyLock;
 use rskim_oracle::structural::StructuralOracle;
 
 use crate::scoreboard::catalog::{CatalogPattern, skim_catalog};
+#[cfg(unix)]
+use crate::scoreboard::runner::{SkimRunner, SkimSandbox};
 
 /// skim's pattern catalog ([`skim_catalog`]), read once per test binary.
 pub fn catalog() -> &'static [CatalogPattern] {
@@ -30,6 +32,23 @@ pub fn oracle() -> &'static StructuralOracle {
     static ORACLE: LazyLock<StructuralOracle> =
         LazyLock::new(|| StructuralOracle::new().expect("every oracle query compiles"));
     &ORACLE
+}
+
+/// A runner over a POSIX shell script `body` that stands in for the skim
+/// binary: written to `<dir>/skim`, run in a sandbox at `<dir>/home`. The
+/// script prints a canned answer and exits with the status a test needs.
+///
+/// # Panics
+///
+/// Panics when the script cannot be written.
+#[cfg(unix)]
+pub fn script_runner(dir: &Path, body: &str) -> SkimRunner {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = dir.join("skim");
+    std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    SkimRunner::new(bin, SkimSandbox::new(dir.join("home")))
 }
 
 /// A throwaway git repository plus an isolated `HOME` for every git command
