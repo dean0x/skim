@@ -249,9 +249,10 @@ repository base rate. Each capped list ends with one exact "N more" line that
 names the flag to see more. Noise rules hide signals with low support: fix risk
 and bus factor need 5 commits of a file, coupling needs 3 shared commits, and
 modules need 5 commits. Changelogs, snapshots and generated code are excluded by
-default (`--no-exclude` keeps them). Doc files and the top folders docs,
-.github, .devflow and tests stay out of the hotspots, modules and insights
-(`--include-docs` keeps them). A commit counts as a fix only when its subject
+default (`--no-exclude` keeps them). Doc files and the top folders docs, doc,
+.github, .devflow, tests and test stay out of the hotspots, modules and
+insights (`--include-docs` keeps them; `--diff` and file arguments keep every
+path). A commit counts as a fix only when its subject
 says so (`fix:`, `fix(scope):`, a revert, or the keyword as the first word).
 
 **When to use heatmap:**

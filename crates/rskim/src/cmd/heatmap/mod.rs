@@ -1604,6 +1604,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_view_spec_keeps_non_code_paths_for_a_non_code_path_scope() {
+        let keeps = |path: &str| {
+            let args = HeatmapArgs {
+                path: Some(path.to_string()),
+                ..HeatmapArgs::default()
+            };
+            let p = prepare_commits(&StubSource::with_malformed(0), args)
+                .unwrap()
+                .expect("the run continues");
+            view::ViewSpec::from_config(&p.config).include_docs
+        };
+        assert!(keeps("docs"));
+        assert!(keeps("./.github/workflows"));
+        assert!(keeps("tests/"));
+        assert!(!keeps("src"));
+        assert!(!keeps("crates/rskim/tests"));
+    }
+
     // -----------------------------------------------------------------------
     // Analytics recording
     // -----------------------------------------------------------------------

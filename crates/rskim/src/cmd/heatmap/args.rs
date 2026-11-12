@@ -369,7 +369,8 @@ NON-CODE PATHS (--include-docs keeps them):
     out of the hotspots and the insights; those folders stay out of the
     modules. The \"N more\" line counts what is left out, and JSON gives
     left_out.{{hotspots,modules}} and, for --insights, counts.left_out.
-    Coupling never pairs doc files. File cards show any path.
+    Coupling never pairs doc files. --diff, file arguments and a --path
+    that is a non-code folder keep every path.
 
 FILE CARDS:
     skim heatmap <FILE>... prints one card per file: commits, owners (only

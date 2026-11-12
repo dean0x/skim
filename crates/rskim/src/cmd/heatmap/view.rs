@@ -16,7 +16,7 @@ use super::metrics::edge_order;
 use super::noise;
 use super::types::{
     AuthorMetrics, ChurnMetrics, Count, CouplingEdge, CouplingEntry, DetailSection, FileMetrics,
-    FixRiskMetrics, HeatmapConfig, HeatmapResult, ModuleHealth, WindowInfo,
+    FileTargets, FixRiskMetrics, HeatmapConfig, HeatmapResult, ModuleHealth, WindowInfo,
 };
 
 // ============================================================================
@@ -110,12 +110,21 @@ impl ListCaps {
 
 impl ViewSpec {
     /// The spec of `config`. The `--top` value counts only when it was given.
+    ///
+    /// The non-code rule applies only to a ranking of the whole repository:
+    /// a run scoped to files that the user names (`--diff`, file arguments)
+    /// or to a `--path` that is itself a non-code folder keeps every path.
     #[must_use]
     pub(crate) fn from_config(config: &HeatmapConfig) -> Self {
+        let named_files = !matches!(config.targets, FileTargets::All);
+        let non_code_scope = config
+            .path
+            .as_deref()
+            .is_some_and(|p| noise::is_non_code_path(p.trim_start_matches("./")));
         Self {
             detail: config.detail,
             top: config.top_explicit.then_some(config.top_n),
-            include_docs: config.include_docs,
+            include_docs: config.include_docs || named_files || non_code_scope,
         }
     }
 

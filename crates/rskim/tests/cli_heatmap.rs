@@ -872,6 +872,16 @@ fn test_heatmap_files_no_top_truncation() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let targets = json["file_targets"].as_array().unwrap();
     assert_eq!(targets.len(), 3);
+    // Named files keep every path: the non-code rule does not drop the
+    // file under the top tests/ folder from files[].
+    let files: Vec<&str> = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert!(files.contains(&"tests/test_lib.rs"), "{json}");
+    assert!(json.get("left_out").is_none(), "{json}");
 }
 
 #[test]

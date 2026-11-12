@@ -1037,7 +1037,8 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
 /// AC-5 (dog-food): on this repository, `skim search --risky --json` MUST
 /// report `total_commits` and `fix_commits` for `crates/rskim/src/main.rs`
 /// that match `git rev-list --count --no-merges --full-history HEAD -- <path>`
-/// and a case-insensitive word-boundary grep of the same commits' subjects
+/// and a case-insensitive grep of the same commits' subjects (the
+/// `is_fix_commit` rule, written as one ERE)
 /// respectively (SEARCH-ADR-003, SEARCH-ADR-007).
 ///
 /// Every count is derived from git at run time; none is hardcoded, so the
@@ -1135,8 +1136,10 @@ fn test_ac5_dog_food_risky_matches_git_ground_truth() {
         let tags = r"(\[[^]]*\][[:space:]]*){0,4}";
         let tag_kw = format!(r"\[[^][:alnum:]]*{KW}[^][:alnum:]]*\]");
         let type_kw = format!(r"{KW}(\([^)]*\))?!?:");
-        let any_type = r"([A-Za-z][A-Za-z0-9_-]*(\([^)]*\))?!?:[[:space:]]*)?";
-        let word_kw = format!(r"[^[:alnum:][:space:]]*{KW}[^[:alnum:][:space:]]*([[:space:]]|$)");
+        let any_type = r"([A-Za-z][A-Za-z0-9_./-]*(\([^)]*\))?!?:[[:space:]]*)?";
+        // The first word cannot start at the `[` of a tag: a tag is a word
+        // only through `tag_kw`.
+        let word_kw = format!(r"[^[[:alnum:][:space:]]*{KW}[^[:alnum:][:space:]]*([[:space:]]|$)");
         let ere = format!(r"^[[:space:]]*{tags}({tag_kw}|{type_kw}|{any_type}{word_kw})");
         let sh_cmd = format!(
             r"git log --no-merges {walk} --format='%s' -- '{TARGET}' \

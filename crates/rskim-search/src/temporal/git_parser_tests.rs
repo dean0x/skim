@@ -675,6 +675,24 @@ fn test_is_fix_commit_matches_keyword_as_first_word_of_description() {
     assert!(is_fix_commit("fix"));
 }
 
+/// Go and Linux-kernel histories prefix the subject with a package path.
+#[test]
+fn test_is_fix_commit_matches_path_style_prefix() {
+    assert!(is_fix_commit("net/http: fix race"));
+    assert!(is_fix_commit("mm/slab: fix leak"));
+    assert!(is_fix_commit("crates/rskim: fix exit code"));
+    assert!(is_fix_commit("x/tools/gopls: revert \"faster load\""));
+    assert!(!is_fix_commit("net/http: add bug report link"));
+}
+
+/// A tag that is not a keyword is not a first word.
+#[test]
+fn test_is_fix_commit_tag_with_more_words_is_not_a_fix() {
+    assert!(!is_fix_commit("[fix it] crash on load"));
+    assert!(!is_fix_commit("[bug 4521] handle empty input"));
+    assert!(!is_fix_commit("[core][fix later] add x"));
+}
+
 #[test]
 fn test_is_fix_commit_matches_leading_tags() {
     assert!(is_fix_commit("[fix] crash on load"));

@@ -145,7 +145,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subject, so `docs: explain later-fix proximity` and `feat: add bug report template` raised
   the fix rate of their files. Now a keyword counts only as a `[fix]` tag, as the
   conventional type (`fix:`, `fix(scope):`, `fix!:`), or as the first word of the subject
-  (`Revert "..."`, `docs: fix link`). The keywords stay `fix`, `bug`, `hotfix`, `patch` and
+  (`Revert "..."`, `docs: fix link`, `net/http: fix race`). The keywords stay `fix`, `bug`, `hotfix`, `patch` and
   `revert`. An existing `skim search` index takes the new rule at its next rebuild, which the
   next commit starts.
 

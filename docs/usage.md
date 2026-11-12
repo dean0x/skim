@@ -1,6 +1,4 @@
-| `--include-docs` | false | Keep doc files and non-code folders in the hotspots, modules and insights (see Non-Code Paths) |
-| `--detail <SECTION>` | — | Show 25 rows (or `--top N`) of one section:| Fix commit | The subject says that the commit fixes something: a `[fix]` tag, a `fix:` / `fix(scope):` / `fix!:` type (also `bug`, `hotfix`, `patch`, `revert`), or one of these words first in the subject, for example `Revert "..."` or `docs: fix link`. A word inside a description does not count (`docs: explain later-fix proximity` is not a fix). `skim search --risky` uses the same rule. |
-| `--detail <SECTION>` | 25 rows | `N more (raise --top)` | Doc files and non-code folders are left out (see Non-Code Paths). |# Usage Guide
+# Usage Guide
 
 ## Command Syntax
 
@@ -170,7 +168,7 @@ The default text view is 30 lines or fewer. The first line names the repository 
 
 | Section | Rows | Row content |
 |---------|------|-------------|
-| Hotspots | 10 | Commits in the window, then the path. Ranked by commits, then path. |
+| Hotspots | 10 | Commits in the window, then the path. Ranked by commits, then path. Doc files and non-code folders are left out (see Non-Code Paths). |
 | Coupling | 5 | Confidence, shared commits, then the two paths. Code-to-code pairs only: a pair with a doc file (`.md`, `.rst`, `.txt`, …) is not shown. |
 | Fix risk | 5 | Fix commits/commits, lift and base rate, then the path. Only files whose fix rate is above the repository base rate. |
 
@@ -192,6 +190,7 @@ A capped section ends with one line that gives the exact hidden count and the se
 
 | Rule | Value |
 |------|-------|
+| Fix commit | The subject says that the commit fixes something: a `[fix]` tag, a `fix:` / `fix(scope):` / `fix!:` type (also `bug`, `hotfix`, `patch`, `revert`; a path-style type such as `net/http:` counts as a type), or one of these words first in the subject, for example `Revert "..."` or `docs: fix link`. A word inside a description does not count (`docs: explain later-fix proximity` is not a fix). `skim search --risky` uses the same rule. |
 | Fix-risk and bus-factor support | 5 commits of the file |
 | Coupling support | 3 shared commits |
 | Module support | 5 commits of the module |
@@ -203,7 +202,7 @@ A capped section ends with one line that gives the exact hidden count and the se
 
 #### Non-Code Paths
 
-Doc files (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.txt`, `*.adoc`) and the files under the top folders `docs`, `doc`, `.github`, `.devflow`, `tests` and `test` stay out of the hotspots (and so `files[]`) and the insights. Those folders stay out of the modules. A `tests` folder inside a crate or package (`crates/x/tests/`) stays in. The "more" line counts what is left out; JSON gives `left_out.{hotspots,modules}`, and `--insights --json` gives `counts.left_out`. `--include-docs` keeps them all. Coupling never pairs a doc file, and a file card shows any path.
+Doc files (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.txt`, `*.adoc`) and the files under the top folders `docs`, `doc`, `.github`, `.devflow`, `tests` and `test` stay out of the hotspots (and so `files[]`) and the insights. Those folders stay out of the modules. A `tests` folder inside a crate or package (`crates/x/tests/`) stays in. The "more" line counts what is left out; JSON gives `left_out.{hotspots,modules}`, and `--insights --json` gives `counts.left_out`. `--include-docs` keeps them all. The rule does not apply when you name the files yourself: `--diff`, file arguments, and a `--path` that is a non-code folder keep every path. Coupling never pairs a doc file.
 
 #### Caps and `--top`
 
@@ -212,7 +211,7 @@ Doc files (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.txt`, `*.adoc`) and the fi
 | View | Default cap | "More" line |
 |------|-------------|-------------|
 | Default view | hotspots 10, coupling 5, fix risk 5 | `N more (--detail <section>)` |
-| `--detail <SECTION>` | all rows | — |
+| `--detail <SECTION>` | 25 rows | `N more (raise --top)` |
 | `--insights` | 20 findings | `N more (raise --top)` |
 | File cards | 5 cards; per card 3 owners, 4 partners, 3 fix commits | `N more files (raise --top)` (`1 more file` for one); one hidden-count line per card |
 
@@ -295,10 +294,11 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 | `--window <PRESET>` | — | Named window preset (see table above) |
 | `--path <DIR>` | — | Scope git log to files under this directory |
 | `--diff <BASE>` | — | Default view for the files changed vs BASE |
-| `--detail <SECTION>` | — | Show all rows of one section: `hotspots`, `coupling`, `fix-risk`, `modules` or `bus-factor` |
+| `--detail <SECTION>` | — | Show 25 rows (or `--top N`) of one section: `hotspots`, `coupling`, `fix-risk`, `modules` or `bus-factor` |
 | `--json`, `--format json` | false | Emit JSON version 2 instead of human-readable text |
 | `--top <N>` | per list (see Caps and `--top`) | Rows of each list in every view |
 | `--no-exclude` | false | Keep the files of the default excludes (see Default Excludes) |
+| `--include-docs` | false | Keep doc files and non-code folders in the hotspots, modules and insights (see Non-Code Paths) |
 | `--exclude <PATTERN>` | — | Add extra glob pattern to exclude (repeatable) |
 | `--coupling-threshold <FLOAT>` | 0.5 | Coupling confidence threshold (0.0–1.0) |
 | `--fix-window <N>` | 5 | Proximity window for fix-after-touch detection (commit count) |

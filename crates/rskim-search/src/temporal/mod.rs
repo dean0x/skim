@@ -30,12 +30,13 @@ const FIX_KEYWORDS: [&str; 5] = ["fix", "bug", "hotfix", "patch", "revert"];
 const MAX_SUBJECT_TAGS: usize = 4;
 
 /// A conventional-commit type prefix: `type:`, `type(scope):`, `type!:` or
-/// `type(scope)!:`. Group 1 is the type.
+/// `type(scope)!:`. Group 1 is the type. A type can hold `/` and `.`, so a
+/// path-style prefix (`net/http:`, `mm/slab:`) is a type too.
 ///
 /// Compiled once and reused via `std::sync::LazyLock`.
 #[allow(clippy::expect_used)] // hardcoded pattern is always valid
 static TYPE_PREFIX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"^([A-Za-z][A-Za-z0-9_-]*)(?:\([^)]*\))?!?:").expect("valid regex")
+    Regex::new(r"^([A-Za-z][A-Za-z0-9_./-]*)(?:\([^)]*\))?!?:").expect("valid regex")
 });
 
 /// True when `word` is a fix keyword (see [`FIX_KEYWORDS`]).
