@@ -22,15 +22,19 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use rskim_bench::scoreboard::MAX_PAGES;
-use rskim_bench::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
+use rskim_bench::scoreboard::corpus::load_corpora;
+use rskim_bench::scoreboard::golden::{
+    ClashSplit, IntegrityContext, Origin, check_integrity, parse_golden,
+};
 use rskim_bench::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use rskim_bench::scoreboard::structural_metrics::called_patterns;
 use rskim_bench::scoreboard::test_support::{FixtureRepo, catalog};
 use rskim_bench::scoreboard::universe::{GitIsolation, TextUniverse, Universe, text_universe};
+use rskim_research::clone::verify_pinned_clone;
 use serde_json::{Value, json};
 
 // ============================================================================
@@ -2564,4 +2568,153 @@ fn ident_def_first_fails_when_the_first_definition_is_another_line_of_the_right_
         d.contains("src/staleness.rs:4") && d.contains("expected src/staleness.rs:2"),
         "{d}"
     );
+}
+
+// ============================================================================
+// Frozen golden data of the four corpora (#540)
+// ============================================================================
+
+/// The four corpora of `corpora.toml`.
+const CORPORA: [&str; 4] = ["skim", "ripgrep", "flask", "zod"];
+
+/// The scoreboard data dir of this crate (`corpora.toml`, `golden/`).
+fn data_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("scoreboard")
+}
+
+/// The raw text of the checked-in golden file of `corpus`.
+fn real_golden_text(corpus: &str) -> String {
+    let path = data_dir().join("golden").join(format!("{corpus}.toml"));
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[test]
+fn each_golden_file_loads_and_holds_at_least_three_refs_entries() {
+    for corpus in CORPORA {
+        let golden =
+            parse_golden(&real_golden_text(corpus)).unwrap_or_else(|e| panic!("{corpus}: {e:#}"));
+        assert_eq!(golden.corpus, corpus);
+        assert!(
+            golden.refs.len() >= 3,
+            "{corpus} holds {} [[refs]] entries, expected 3 or more",
+            golden.refs.len()
+        );
+    }
+}
+
+#[test]
+fn the_skim_golden_file_freezes_both_definitions_of_run_parsed_command() {
+    let golden = parse_golden(&real_golden_text("skim")).unwrap();
+    let clash = golden
+        .clashes
+        .iter()
+        .find(|c| c.query == "run_parsed_command")
+        .expect("no [[clash]] entry for run_parsed_command");
+
+    let mut defs: Vec<(&str, u32)> = clash
+        .defs
+        .iter()
+        .map(|d| (d.path.as_str(), d.line))
+        .collect();
+    defs.sort_unstable();
+    assert_eq!(
+        defs,
+        vec![
+            ("crates/rskim/src/cmd/build/mod.rs", 150),
+            ("crates/rskim/src/cmd/git/mod.rs", 414),
+        ]
+    );
+    assert_eq!(clash.split, ClashSplit::None);
+    assert!(!clash.calls.is_empty(), "the clash freezes no call site");
+}
+
+#[test]
+fn each_other_golden_file_holds_a_clash_entry_or_a_header_note_that_none_exists() {
+    for corpus in ["ripgrep", "flask", "zod"] {
+        let raw = real_golden_text(corpus);
+        let golden = parse_golden(&raw).unwrap_or_else(|e| panic!("{corpus}: {e:#}"));
+        assert!(
+            !golden.clashes.is_empty() || raw.contains("none found"),
+            "{corpus} has no [[clash]] entry and no \"none found\" note"
+        );
+    }
+}
+
+#[test]
+fn each_golden_file_holds_two_concept_entries_with_first_files() {
+    for corpus in CORPORA {
+        let golden = parse_golden(&real_golden_text(corpus)).unwrap();
+        let with_first = golden
+            .concepts
+            .iter()
+            .filter(|c| c.first.as_ref().is_some_and(|first| !first.is_empty()))
+            .count();
+        assert!(
+            with_first >= 2,
+            "{corpus} holds {with_first} concept entries with `first`, expected 2 or more"
+        );
+    }
+}
+
+#[test]
+fn each_golden_file_holds_a_zero_hit_and_a_match_stakes_entry() {
+    for corpus in CORPORA {
+        let golden = parse_golden(&real_golden_text(corpus)).unwrap();
+        for (exit, what) in [(1, "zero-hit"), (0, "match")] {
+            assert!(
+                golden.stakes.iter().any(|s| s.exit == Some(exit)),
+                "{corpus} holds no {what} [[stakes]] entry (exit = {exit})"
+            );
+        }
+    }
+}
+
+/// Golden integrity of the checked-in files against the pinned clones. It
+/// runs no skim: it loads each golden file and each clone, and applies the
+/// same `check_integrity` the scoreboard applies before its first query.
+///
+/// Run it after a golden edit, with the clones in `.bench-corpus/scoreboard`:
+/// `cargo nextest run -p rskim-bench --run-ignored only the_golden_files_pass_integrity`.
+#[test]
+#[ignore = "needs the pinned corpus clones under .bench-corpus/scoreboard"]
+fn the_golden_files_pass_integrity_against_the_pinned_clones() {
+    let specs = load_corpora(&data_dir().join("corpora.toml")).unwrap();
+    let clones = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.bench-corpus/scoreboard");
+    let home = tempfile::tempdir().unwrap();
+    let git = GitIsolation::new(home.path());
+
+    for spec in &specs {
+        let root = clones.join(&spec.name);
+        let state = verify_pinned_clone(&root, &spec.commit).unwrap();
+        assert!(
+            state.is_reusable(),
+            "{}: the clone is not the pinned one: {state}",
+            spec.name
+        );
+        let golden = parse_golden(&real_golden_text(&spec.name)).unwrap();
+        let universe = Universe::compute(&root, &git).unwrap();
+        let text = text_universe(&root, &git).unwrap();
+        let violations = check_integrity(
+            &golden,
+            &IntegrityContext {
+                corpus: &spec.name,
+                commit: &spec.commit,
+                universe: Some(&universe),
+                text: Some(&text),
+                ledger: &[],
+                catalog: catalog(),
+            },
+        );
+        assert!(
+            violations.is_empty(),
+            "{}: {} integrity violation(s):\n{}",
+            spec.name,
+            violations.len(),
+            violations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }
