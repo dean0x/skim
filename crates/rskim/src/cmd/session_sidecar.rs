@@ -574,7 +574,7 @@ fn cleanup_stale(sessions_dir: &Path) {
 ///
 /// Returns `None` on non-Unix platforms or if the result is ≤ 0.
 #[cfg(unix)]
-fn get_ppid() -> Option<u32> {
+pub(crate) fn get_ppid() -> Option<u32> {
     // SAFETY: getppid() is always safe to call — it has no preconditions and
     // always succeeds. The result is a valid non-negative PID on success.
     let ppid = unsafe { libc::getppid() };
@@ -582,7 +582,7 @@ fn get_ppid() -> Option<u32> {
 }
 
 #[cfg(not(unix))]
-fn get_ppid() -> Option<u32> {
+pub(crate) fn get_ppid() -> Option<u32> {
     None
 }
 

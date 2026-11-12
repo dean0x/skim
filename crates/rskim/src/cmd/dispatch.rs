@@ -9,6 +9,7 @@ use std::process::{Command, ExitCode};
 
 use super::execution::{is_broken_pipe, pipe_closed_exit};
 use super::stream_pump::{PUMP_BUF_BYTES, StreamOutcome, StreamSpec, stream_child, write_tail};
+use crate::runner::{Launch, NpxTool, VIA_NPX_FLAG};
 
 #[cfg(feature = "proxy")]
 use super::proxy;
@@ -451,14 +452,26 @@ pub(crate) fn spawn_status_to_code(status: std::io::Result<std::process::ExitSta
 /// Diagnostics live here in the caller; the pure mapping is in
 /// [`spawn_status_to_code`], which is unit-tested independently.
 pub(crate) fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
-    let result = Command::new(program).args(args).status();
+    // The child's stderr goes to the terminal, so a refusal is not read here (see
+    // `runner::chain_refusal`).  An earlier refusal still stops this start.
+    if crate::runner::ensure_chain_open().is_err() {
+        return ExitCode::from(crate::RESTART_REFUSED_EXIT);
+    }
+    let launch = match Launch::resolve(program, args) {
+        Ok(launch) => launch,
+        Err(gone) => return gone.report(),
+    };
+    let result = Command::new(&launch.spawn).args(&launch.argv).status();
     if let Err(ref e) = result {
         if e.kind() == std::io::ErrorKind::NotFound {
-            eprintln!("error: {program} not found on PATH");
+            match launch.via {
+                Some(_) => eprintln!("{}", launch.spawn_error_line()),
+                None => eprintln!("error: {program} not found on PATH"),
+            }
         } else {
             // Fail loud: report the actual spawn error rather than silently
             // returning a failure exit code (avoids PF-003).
-            eprintln!("error: failed to spawn {program}: {e}");
+            eprintln!("error: failed to spawn {}: {e}", launch.spawn);
         }
     }
     ExitCode::from(spawn_status_to_code(result))
@@ -1330,7 +1343,42 @@ pub(crate) fn dispatch_explicit(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
+    // `--via-npx` is read here and nowhere else: the wrapper surface goes
+    // through `dispatch_for_wrapper` and never sees it, so a link named after
+    // one of the tools cannot be redirected to npx by an argument.
+    if let Some((tool, rest)) = take_via_npx(subcommand, args) {
+        crate::runner::request_npx(tool);
+        return dispatch_inner(Surface::Explicit, subcommand, &rest, analytics);
+    }
     dispatch_inner(Surface::Explicit, subcommand, args, analytics)
+}
+
+/// Split the `--via-npx` flag off the arguments of an explicit `skim <tool>`.
+///
+/// The rewrite hook puts the flag right after the tool words of an `npx <tool>`
+/// rewrite (`skim prettier --write --via-npx src`). The flag is accepted at one
+/// position only: index `k`, where `args[..k]` equals one of the tool's flag
+/// tails (`npx_flag_tails`, derived from the rewrite rules) and `args[k]` is the
+/// flag. Longest tail first. Any other `--via-npx` belongs to the tool and stays
+/// in its arguments, so the vocabulary is closed and the engine and this
+/// function cannot disagree about where the flag goes.
+///
+/// Returns the tool and the arguments without the flag. Pure: it does not touch
+/// the latch, the file system or the environment.
+fn take_via_npx(subcommand: &str, args: &[String]) -> Option<(NpxTool, Vec<String>)> {
+    let tool = NpxTool::from_bin(subcommand)?;
+    let flag_at = rewrite::npx_flag_tails(tool).into_iter().find_map(|tail| {
+        let at = tail.len();
+        let head_matches = args.len() > at
+            && args[..at]
+                .iter()
+                .map(String::as_str)
+                .eq(tail.iter().copied());
+        (head_matches && args[at] == VIA_NPX_FLAG).then_some(at)
+    })?;
+    let mut rest = args.to_vec();
+    rest.remove(flag_at);
+    Some((tool, rest))
 }
 
 // ============================================================================
@@ -1351,6 +1399,110 @@ mod tests {
 
     fn sv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ========================================================================
+    // take_via_npx: the closed `--via-npx` vocabulary (skim#587)
+    // ========================================================================
+
+    fn taken(subcommand: &str, args: &[&str]) -> Option<(NpxTool, Vec<String>)> {
+        take_via_npx(subcommand, &sv(args))
+    }
+
+    /// Bare tools: the flag is the first argument and nothing else moves.
+    #[test]
+    fn test_take_via_npx_strips_the_flag_after_a_bare_tool() {
+        assert_eq!(
+            taken("tsc", &["--via-npx", "--noEmit", "-p", "."]),
+            Some((NpxTool::Tsc, sv(&["--noEmit", "-p", "."])))
+        );
+        assert_eq!(
+            taken("eslint", &["--via-npx", "--format", "json", "src"]),
+            Some((NpxTool::Eslint, sv(&["--format", "json", "src"])))
+        );
+        assert_eq!(
+            taken("oxlint", &["--via-npx"]),
+            Some((NpxTool::Oxlint, Vec::new()))
+        );
+    }
+
+    /// The flag follows ALL the rewritten tool words, so the `skim prettier
+    /// --write` and `skim biome check` prefixes keep matching permission rules.
+    #[test]
+    fn test_take_via_npx_accepts_the_flag_after_the_rewritten_tool_words() {
+        assert_eq!(
+            taken("prettier", &["--write", "--via-npx", "src"]),
+            Some((NpxTool::Prettier, sv(&["--write", "src"])))
+        );
+        assert_eq!(
+            taken("prettier", &["-w", "--via-npx", "src"]),
+            Some((NpxTool::Prettier, sv(&["-w", "src"])))
+        );
+        assert_eq!(
+            taken("prettier", &["--via-npx", "src"]),
+            Some((NpxTool::Prettier, sv(&["src"]))),
+            "`npx prettier --check src` rewrites to `skim prettier`, no tail"
+        );
+        for word in ["check", "format", "lint"] {
+            assert_eq!(
+                taken("biome", &[word, "--via-npx", "."]),
+                Some((NpxTool::Biome, sv(&[word, "."])))
+            );
+        }
+        assert_eq!(
+            taken("biome", &["--via-npx", "ci", "."]),
+            Some((NpxTool::Biome, sv(&["ci", "."]))),
+            "`npx biome ci .` rewrites to `skim biome`, no tail"
+        );
+    }
+
+    /// Any other position belongs to the tool: the closed vocabulary.
+    #[test]
+    fn test_take_via_npx_leaves_the_flag_in_any_other_position() {
+        assert_eq!(taken("eslint", &["src", "--via-npx"]), None);
+        assert_eq!(taken("eslint", &["--format", "json", "--via-npx"]), None);
+        assert_eq!(taken("tsc", &["--", "--via-npx"]), None);
+        assert_eq!(taken("prettier", &["--write", "src", "--via-npx"]), None);
+        assert_eq!(taken("prettier", &["--check", "--via-npx"]), None);
+        assert_eq!(taken("biome", &["check", "src", "--via-npx"]), None);
+        assert_eq!(
+            taken("biome", &["format", "--write", "--via-npx"]),
+            None,
+            "the tail is exactly `format`, not `format --write`"
+        );
+    }
+
+    /// Only the first flag is the skim flag; a second one reaches the tool.
+    #[test]
+    fn test_take_via_npx_removes_one_flag_only() {
+        assert_eq!(
+            taken("eslint", &["--via-npx", "--via-npx", "src"]),
+            Some((NpxTool::Eslint, sv(&["--via-npx", "src"])))
+        );
+    }
+
+    /// Only the five rule tools carry the flag; for any other subcommand the
+    /// flag is ordinary data.
+    #[test]
+    fn test_take_via_npx_ignores_every_other_subcommand() {
+        assert_eq!(taken("vitest", &["--via-npx"]), None);
+        assert_eq!(taken("jest", &["--via-npx"]), None);
+        assert_eq!(taken("git", &["--via-npx", "status"]), None);
+        assert_eq!(taken("npx", &["--via-npx"]), None);
+        assert_eq!(taken("cargo", &["--via-npx"]), None);
+        assert_eq!(taken("", &["--via-npx"]), None);
+    }
+
+    #[test]
+    fn test_take_via_npx_is_none_without_the_flag() {
+        assert_eq!(taken("tsc", &[]), None);
+        assert_eq!(taken("tsc", &["--noEmit"]), None);
+        assert_eq!(taken("prettier", &["--write", "src"]), None);
+        assert_eq!(
+            taken("eslint", &["--via-npx=1", "src"]),
+            None,
+            "only the exact flag counts"
+        );
     }
 
     /// No --session-id present → returns None (allocation-free fast-path).

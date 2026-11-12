@@ -161,6 +161,8 @@ pub const SANDBOX_REMOVED_VARS: &[&str] = &[
     "SKIM_HOOK_AUDIT",          // would append JSON lines to a hook-audit log
     "SKIM_SESSION_ID",          // analytics session attribution + sidecar keying
     "SKIM_DEBUG",               // adds raw-fallback banners that break stderr assertions
+    "SKIM_DEPTH",               // restart-chain counter; a host value moves the refusal point
+    "SKIM_WRAPPER_PARENT",      // `<tool>:<pid>` marker; a host value could refuse a start
     "SKIM_INPUT_COST_PER_MTOK", // cost estimates must use the documented default
     "SKIM_PROJECTS_DIR",        // session-provider transcript dir (Claude)
     "SKIM_CODEX_SESSIONS_DIR",  // session-provider transcript dir (Codex)
@@ -356,6 +358,103 @@ pub fn stub_path(dir: &std::path::Path) -> String {
         dir.display(),
         std::env::var("PATH").unwrap_or_default()
     )
+}
+
+// ============================================================================
+// Bounded child runs
+// ============================================================================
+
+/// Upper bound for one [`run_bounded`] child run.  A healthy run takes well
+/// under a second.
+#[cfg(unix)]
+pub const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Sleep between two `try_wait` polls.  The poll loop is bounded by
+/// [`RUN_TIMEOUT`].
+#[cfg(unix)]
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Kill every process in the group led by `pgid`.  `ESRCH` (an empty group) is
+/// the normal result after a clean exit and is ignored.
+#[cfg(unix)]
+pub fn kill_group(pgid: libc::pid_t) {
+    // SAFETY: `kill(2)` with a negative pid signals a process group.  It reads
+    // no memory of ours.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+/// Spawn `cmd`, trying again a bounded number of times on ETXTBSY.
+///
+/// A test that copies the skim binary and starts the copy at once can meet a
+/// writable descriptor that a concurrent fork still holds.  The spawn then
+/// fails with "text file busy" for a few milliseconds.  Back-off is
+/// `25 ms << attempt`, five attempts in all.
+#[cfg(unix)]
+fn spawn_retrying_text_file_busy(cmd: &mut std::process::Command) -> std::process::Child {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 0..ATTEMPTS {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt + 1 < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(25u64 << attempt));
+            }
+            Err(e) => panic!("child must be spawnable (attempt {}): {e}", attempt + 1),
+        }
+    }
+    unreachable!("the loop returns or panics on its last attempt")
+}
+
+/// Run `cmd` as the leader of its own process group, with a wall-clock bound
+/// of [`RUN_TIMEOUT`].  On expiry the whole group is killed and the test fails.
+///
+/// stdin is closed.  stdout and stderr are pipes, not files: a skim wrapper
+/// serves raw bytes to a regular file, and that path is not the one under test.
+/// The output of these children is a few bytes, so the pipes cannot fill while
+/// we poll.  Keep it that way.
+#[cfg(unix)]
+pub fn run_bounded(mut cmd: std::process::Command) -> std::process::Output {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = spawn_retrying_text_file_busy(&mut cmd);
+    let pgid = child.id() as libc::pid_t;
+    let deadline = std::time::Instant::now() + RUN_TIMEOUT;
+
+    let status = loop {
+        match child.try_wait().expect("try_wait on the child") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                kill_group(pgid);
+                let _ = child.wait();
+                panic!("child ran longer than {RUN_TIMEOUT:?}; its process group was killed");
+            }
+            None => std::thread::sleep(POLL_INTERVAL),
+        }
+    };
+
+    // Nothing may outlive the child, and no straggler may hold a pipe open.
+    kill_group(pgid);
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout).expect("read child stdout");
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr).expect("read child stderr");
+    }
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 // ============================================================================

@@ -2,6 +2,8 @@
 
 use serde::Serialize;
 
+use crate::runner::NpxTool;
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum RewriteCategory {
@@ -81,6 +83,14 @@ pub(super) struct RewriteResult {
     /// `golangci-lint`, and only the prefix tells them apart. `None` for a
     /// compound rewrite and for `head`/`tail`, which have no single owner.
     pub(super) matched_prefix: Option<&'static [&'static str]>,
+    /// The node tool this rewrite starts through `npx --no-install`, when the
+    /// matched rule is one of `rules::NPX_LOCAL_BIN_RULES`; `None` otherwise.
+    ///
+    /// Such a rewrite is correct only when the project has the tool in a
+    /// `node_modules/.bin` folder. For a compound rewrite the value comes from
+    /// the first segment alone, because only a first segment runs in the folder
+    /// the hook knows; a later `npx` segment is left as typed.
+    pub(super) npx_tool: Option<NpxTool>,
 }
 
 // ---- Compound command types (#45) ----

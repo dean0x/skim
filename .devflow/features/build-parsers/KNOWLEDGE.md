@@ -1,7 +1,7 @@
 ---
 feature: build-parsers
 name: Build Tool Output Parsers
-description: "Use when adding a new build tool parser, modifying cargo/tsc/make/gradle/maven compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, gradle, maven, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection, run_check, run_fmt, ChildGuard, indefinite, is_indefinite_command, expected_exit_codes, forward_stderr, ExitDisposition, classify_exit, run_parsed_command_with_exit, elision_marker, elision_marker_unbounded, compressed_output_hint, failure_context_body, parse_failure_details, compress-never-truncate, rewrite-hook, Fix A, Fix B, Fix C, Fix E, should_emit_compressed_hint, BENIGN_EXIT1_PROGRAMS, no_rule_silently_drops_prefix_flags, WRAPPER_REINJECTS, acknowledge, is_segment_ack, ACK_PREFIX_PATTERNS, command_needs_passthrough, rewrite_would_corrupt, SavingsDecision, savings_decision, emit_raw_passthrough, skip_net_savings_guard, build_cargo_args, cargo_expected_exit_codes, is_nextest, strip_session_id_flag, nextest, cargo-nextest, program_resolves, target_program_is_unresolvable, target_program_resolves, cached_verdict, resolves_in, PF-038."
+description: "Use when adding or changing a build parser (cargo, tsc, make, gradle, maven), the rewrite engine, or the npx project-local launcher. Keywords: three-tier, run_parsed_command, ExitDisposition, --via-npx, Launch."
 category: component-patterns
 directories: [crates/rskim/src/cmd/build/, crates/rskim/src/cmd/]
 referencedFiles:
@@ -28,12 +28,30 @@ referencedFiles:
   - crates/rskim/src/cmd/rewrite/acknowledge.rs
   - crates/rskim/src/cmd/rewrite/engine.rs
   - crates/rskim/src/cmd/rewrite/hook.rs
+  - crates/rskim/src/cmd/rewrite/types.rs
 created: 2026-05-14
-updated: 2026-09-29
-version: 19
+updated: 2026-11-12
+version: 20
 ---
 
 # Build Tool Output Parsers
+
+## Rules
+
+The Rules below cover the npx project-local launcher and the rewrite facts it changed. The older Anti-Patterns and Gotchas sections stay the reference for the rest of the area.
+
+- **KB-INV-1** `--via-npx` is skim's own flag and exists on the explicit surface only. Only `dispatch_explicit` calls `take_via_npx`. The wrapper surface never reads the flag, so a link named for a tool cannot be sent to npx by an argument. The flag has one valid place: right after one of the tool's flag tails (`rules::npx_flag_tails`). Any other `--via-npx` stays in the tool's arguments.
+- **KB-INV-2** Every place that starts a child asks `Launch::resolve` first: `obtain_output` and `stream_passthrough_raw` in `execution.rs`, `run_parsed_command` in `build/mod.rs`, and `run_inherited_passthrough` in `dispatch.rs`. A new start site must do the same. Otherwise it ignores the npx request.
+- **KB-INV-3** When the project-local bin is gone at start time, skim starts nothing: no `npx`, no bare tool. It prints an `error:` line and a `hint:` line and exits 127 (`LocalBinGone::report`).
+- **KB-INV-4** A failed npx start (non-zero exit or signal, and empty stdout) is npm's text. Both capture sites forward it raw with the same exit code, before `classify_exit` and before any parser: `obtain_output` and build `run_parsed_command`.
+- **KB-INV-5** The npx request is one process-wide `OnceLock` (`NPX_REQUEST` in `runner.rs`). Only `request_npx` sets it, only `dispatch_explicit` calls that, and only `Launch::resolve` reads it. No unit test sets the latch. Tests drive the pure `Launch::plan`.
+- **KB-INV-6** `RewriteResult.npx_tool` comes from `rules::npx_local_tool` (a rule in `NPX_LOCAL_BIN_RULES`). In a compound command only the first segment keeps it. A later `npx` segment stays as typed, because an earlier `cd` can move it out of the checked folder.
+- **KB-AP-1** Do not move a tool in `NpxTool` onto `RawFallback` (`run_tool_rerunnable`). `RawFallback::resolve` still starts the bare program and does not use `Launch`. It is safe only while these tools use `run_tool` or the build `run_parsed_command`. Today only `gh` uses the rerunnable path.
+- **KB-AP-2** Do not add an `npx <tool>` rule without a decision. Put it in `NPX_LOCAL_BIN_RULES`, or in the test-only `NPX_RULES_NOT_LOCAL_BIN` with a reason. `test_every_npx_rule_is_in_exactly_one_list` fails otherwise.
+- **KB-AP-3** Do not give the file system a tool name taken from command text. The name comes from `NpxTool::bin` only. Do not cache `local_node_bin`, and do not put its answer in the `program_resolves` cache: the answer depends on a folder and the folder can change.
+- **KB-AP-4** Do not assume `npx prettier --check` is only an acknowledged command. It is in the rule table (`NPX_LOCAL_BIN_RULES`) and in `ACK_PREFIX_PATTERNS`. The `skim rewrite` CLI checks the acknowledge list first and echoes the typed command. The PreToolUse hook does not read that list and returns `skim prettier --via-npx <rest>`.
+- **KB-AP-5** Do not expect `skim rewrite` or `discover` to probe `node_modules/.bin`. Only the PreToolUse hook does (`hook_cwd`, `local_bin_probe`, `hook_rewrite`). A failed probe, or an unknown folder, leaves only the first `npx` segment as typed. The other segments of a compound still rewrite, so a segment that masks output (`env`, `printenv`, `curl`) keeps its rewrite, also in auto mode. A command with nothing else to rewrite gets no response, and nothing goes to stderr. Do not add a match arm that drops a whole compound for a failed probe.
+- **KB-AP-6** Do not print the tool's install hint for an npx start. `Launch::install_hint` gives `None` there, and `Launch::spawn_error_line` names `npx`. A global install does not help `npx --no-install`.
 
 ## Overview
 
@@ -300,7 +318,7 @@ Tier 2 noise patterns strip `[INFO] Downloading/Downloaded from`, `[INFO] ---` s
 ## `run_parsed_command` — Shared Infrastructure (Build Family)
 
 All five build parsers call `super::run_parsed_command(...)` in `build/mod.rs` instead of spawning processes themselves. This function handles:
-1. Command spawn — blocks on a plain `wait()` with no internal timeout (see ADR-008)
+1. Command start through `Launch::resolve` (plain start, or `npx --no-install <tool>` for `--via-npx`), then a plain `wait()` with no internal timeout (skim sets no time limit on purpose). A refused start (project-local bin gone) returns exit 127; a failed npx start is forwarded raw before step 2
 2. ANSI escape code stripping from both stdout and stderr before parsing
 3. Calling the parser function pointer
 4. Emitting degradation markers to stderr (only when `--debug` / `SKIM_DEBUG=1` is active — silent by default)
@@ -325,7 +343,7 @@ pub(super) fn run_parsed_command(
 
 Two details worth noting: `rec` is a `RecordingContext` threaded from `build::run()` (which constructs it once from `AnalyticsConfig` with `CommandType::Build`); and `parser` is a plain `fn` pointer, not a closure — build parsers need no captured state. The analytics call annotates the tier via `rec.with_tier(effective_tier)`.
 
-Spawn failures (missing executable) use `anyhow::bail!` — a hard error with an install hint. This differs from the non-build path: `obtain_output` in `cmd/execution.rs` returns `Ok(None)` on spawn failure (soft fallback), which `run_parsed_command_with_mode` then converts to `Ok(ExitCode::FAILURE)`. Build commands have no stdin-passthrough path, so `ENOENT` is always fatal.
+Spawn failures (missing executable) on a plain start use `anyhow::bail!` — a hard error with an install hint. This differs from the non-build path: `obtain_output` in `cmd/execution.rs` returns `anyhow::Result<ControlFlow<ExitCode, CommandOutput>>`. `Continue(output)` carries the output to parse. `Break(code)` ends the run: the program was not found (error line, install hint, `ExitCode::FAILURE`), the project-local bin is gone (exit 127), or a failed npx start was forwarded raw. `run_parsed_command_with_mode` returns the `Break` code as it is. Build commands have no stdin-passthrough path, so `ENOENT` on a plain start is always fatal. On an npx start, build `run_parsed_command` prints `Launch::spawn_error_line` itself and returns `ExitCode::FAILURE`, with no install hint and no `bail!`.
 
 **Important**: build parsers use `run_parsed_command` (defined in `build/mod.rs`), not `run_parsed_command_with_mode` or `run_tool<T>` (both defined in `cmd/execution.rs`). The three are intentionally separate:
 - Build: no `use_stdin`, no `--json` output mode, no `SKIM_PASSTHROUGH` bypass, no compressed-output hint on failure, plain `fn()` parser pointer, bail-on-spawn, no internal timeout
@@ -367,7 +385,7 @@ ExitDisposition::UnexpectedFailure — all other non-zero, or signal kill → fo
 - Expected failure at `Full`/`Degraded` tier for `BENIGN_EXIT1_PROGRAMS` (`grep`, `rg`, `diff`) at exit 1 → silent (exit 1 = "no match"/"differs", a normal informational result; exit ≥ 2 for these tools is still a real error and shows the hint)
 - Expected failure at `Full`/`Degraded` tier for all other tools → `[skim] compressed output (exit N). SKIM_PASSTHROUGH=1 for full output.` (stderr)
 
-`BENIGN_EXIT1_PROGRAMS = &["grep", "rg", "diff"]` is a constant in `cmd/execution.rs`. The decision lives in `should_emit_compressed_hint` so it is unit-tested against the same code path (PF-007 avoidance).
+`BENIGN_EXIT1_PROGRAMS = &["grep", "rg", "diff"]` is a constant in `cmd/execution.rs`. The decision lives in `should_emit_compressed_hint` so it is unit-tested against the same code path, and call sites do not inline the decision.
 
 **Build family is exempt**: `build::run_parsed_command` does not use this matrix — it has its own exit-code logic derived from `BuildResult.success`.
 
@@ -498,7 +516,7 @@ Always use these functions — never construct elision notices inline. `elision_
 | object keys (JSON/curl)    | `"object keys"`   |
 | generic line output        | `"lines"`         |
 
-## `CommandRunner` and `ChildGuard` — Execution Layer (ADR-008)
+## `CommandRunner` and `ChildGuard` — Execution Layer
 
 `CommandRunner` (in `crates/rskim/src/runner.rs`) is a **stateless unit struct** (`#[derive(Default)]`, `new()` takes no args). It imposes no internal wall-clock timeout. `run_with_env` blocks on a plain `wait()` until the child process exits naturally.
 
@@ -508,15 +526,37 @@ Always use these functions — never construct elision notices inline. `elision_
 - Agent tool timeout
 - `Ctrl-C`
 
-The 64 MiB memory cap (`MAX_OUTPUT_BYTES`) is unchanged — ADR-008 removes the TIME bound only, not the MEMORY bound.
+The 64 MiB memory cap (`MAX_OUTPUT_BYTES`) is unchanged — the removal of the time bound covers TIME only, not the MEMORY bound.
 
 **`ChildGuard` kill-on-drop.** Every spawned child is immediately wrapped in `ChildGuard`, a RAII newtype around `std::process::Child`. Its `Drop` implementation calls `kill()` then `wait()`. On the normal execution path the child has already exited before drop fires, so `kill()` is a harmless `ESRCH` no-op. On any early-return path — the 64 MiB cap error, a pipe-capture failure, a reader-thread panic — the guard kills the still-running child before `run_with_env` returns, preventing zombie/orphan processes.
 
 `RunnerError::Timeout` and `wait_with_timeout` no longer exist. Any code referencing them will not compile.
 
+**Refused-chain latch.** `run_with_env`, `run_stdout_degrade` and `stream_child` call `ensure_chain_open` before a start and `note_finished_child` on the result. A child that exits 126 with the exact refusal line (`find_refusal_line` in `main.rs`) sets the process-wide latch `CHAIN_REFUSAL` and the start returns `RunnerError::ChainRefused`. Every later start fails at once, and `main` prints the line once and exits 126. `run_inherited_passthrough` and the gh streaming start only call `ensure_chain_open`: their stderr is not captured. A unit test never sets the latch; `refusal_line_of` is the pure decision. A new start site that captures stderr must use both calls.
+
+## Project-Local npx Launcher (`--via-npx`, `runner.rs`)
+
+The rewrite of `npx tsc`, `npx eslint`, `npx prettier`, `npx biome` and `npx oxlint` must start the project's own copy of the tool. The rewrite produces `skim <tool> <flag tail> --via-npx <rest>`, and skim then runs `npx --no-install <tool> <rest>`. The pieces:
+
+- **`NpxTool`** (`runner.rs`) is the closed set of tools. `bin()` is the only name that reaches the file system or the `npx` argument list. `NpxTool::from_bin` maps a subcommand word to a tool.
+- **`NPX_LOCAL_BIN_RULES`** (`rewrite/rules.rs`) names the `npx` rules that use the launcher, by `prefix`. `npx_local_tool(prefix)` gives the tool. `npx_flag_tails(tool)` gives every word run that can sit between `skim <tool>` and the flag (for example `--write`, `-w`, or nothing for prettier), longest first. Engine and dispatch both derive their position from these rules, so they cannot disagree. Test-only `NPX_RULES_NOT_LOCAL_BIN` lists the test-runner `npx` rules (vitest, jest, playwright, cypress) with a reason, because those start through `run_with_node_fallback`.
+- **`engine.rs`** puts `VIA_NPX_FLAG` after the rewritten tool words and before the user's arguments and any `--` separator, and sets `RewriteResult.npx_tool`. Because the flag follows the rewritten words, a permission rule on `skim prettier --write` still matches.
+- **`take_via_npx`** (`dispatch.rs`) is pure. It removes one flag at the fixed position and returns the tool and the remaining arguments. `dispatch_explicit` then calls `runner::request_npx(tool)` and dispatches the remaining arguments. Handlers never see the flag.
+- **`local_node_bin(start, tool)`** checks for an executable `node_modules/.bin/<tool>` in the canonical start folder and its parents. It stops after a folder with a `.git` entry (file or folder) and after `LOCAL_BIN_WALK_LEVELS` levels. Every stat error means "not found". It is not cached.
+- **`Launch`** is the result of `Launch::resolve(program, args)`: `spawn`, `argv`, `label`, `via`. For a plain start it is the caller's program and arguments. For an npx start it is `npx` with `--no-install <tool> <args>`. `resolve` checks the local bin again in the current folder at start time. It does this late on purpose: a path that starts no child (`skim eslint --via-npx` reading stdin) does no file system work. `Launch::plan` is the pure core and the test entry.
+- **Failure paths.** A gone bin gives `Err(LocalBinGone)`, which prints `error:` and `hint:` lines and exits 127. A missing `npx` gives `spawn_error_line` (names `npx`) and no install hint (`install_hint` is `None`). A failed npx (`npx_failed`: non-zero or signal, empty stdout) forwards both streams raw with the same exit code, before `classify_exit` at `obtain_output` and before the parser in build `run_parsed_command`. The text is npm's, so no parser can summarise it.
+
+**Hook side.** `hook.rs` builds the check once per hook call with `local_bin_probe(&json)` and passes it to `hook_rewrite`. The check uses `hook_cwd` (the `cwd` field when it is an absolute path that resolves, else the hook process folder; a relative or non-string `cwd` gives `None` and no rewrite) and `local_node_bin`, and it reads the folder only when it is asked. `hook_rewrite` filters the single-command result with it, and passes it to `compound.rs::try_rewrite_compound_with`. There, `npx_tool` is kept for the first segment only, and only when the check says yes. An `npx` segment in any later position, or a first one without its bin, stays as typed. Every other segment still rewrites, so a masking segment keeps its rewrite. When nothing else rewrites, the hook sends no response and writes nothing to stderr, so the command runs as typed. `try_rewrite_compound` (the `skim rewrite` command and `discover`) asks no question and treats the check as always yes. The source of a bare `| cat` pipe is the first segment, so it keeps the requirement.
+
+**`SKIM_PASSTHROUGH=1` and the streaming sink.** On the `run_tool` path the escape hatch streams through `stream_passthrough_raw`, which also goes through `Launch::resolve`, so an npx run still starts the project-local tool. The build `run_parsed_command` has no bypass of its own.
+
+**`RawFallback::resolve` is the one start that skips `Launch`.** It starts the bare program (`self.program`). That is safe only while the `NpxTool` tools use `run_tool` or the build `run_parsed_command`. Only `gh` uses `run_tool_rerunnable` today. Check this again before you move an npx tool onto a rerunnable path.
+
+Tests: `crates/rskim/tests/cli_npx_local_bin.rs` runs the built binary with a stub `npx` on a private `PATH` (handler argv, exit 127, raw npm failure, and the hook probe table for every `NPX_LOCAL_BIN_RULES` rule). Unit tests sit next to `take_via_npx`, `local_node_bin`, `Launch::plan`, `local_bin_probe`, `hook_rewrite` and the compound first-segment rule.
+
 ## Indefinite-Command Detection (`cmd/rewrite/indefinite.rs`)
 
-`crates/rskim/src/cmd/rewrite/indefinite.rs` (added in ADR-008 Part C) provides `is_indefinite_command(tokens: &[&str]) -> bool`. It detects daemon processes, watch modes, and live log followers so the dispatcher can pass them through with inherited stdio rather than capturing and compressing their output.
+`crates/rskim/src/cmd/rewrite/indefinite.rs` (added with the removal of the internal timeout) provides `is_indefinite_command(tokens: &[&str]) -> bool`. It detects daemon processes, watch modes, and live log followers so the dispatcher can pass them through with inherited stdio rather than capturing and compressing their output.
 
 Key design principles:
 - **Program-aware, not flag-generic.** Detection is keyed on specific program + flag combinations. Generic patterns like "any `-f` flag" would misfire on `grep -f`, `rm -f`, `git push -f`.
@@ -545,7 +585,7 @@ Categories recognized as indefinite:
 
 ## Rewrite Engine — Fix A through Fix F (PR #340)
 
-PR #340 fixed a class of silent false-negatives in the command-rewrite hook. Six fixes span both the rewrite engine (PreToolUse hook and `skim rewrite` CLI) and the shared tool handlers (both hook and PATH-wrapper surfaces). A later, independent addition — the PF-038 global PATH-resolvability bail — adds a fourth rewrite-engine-only mechanism alongside Fix A/C/E; see its own section after Fix F below.
+PR #340 fixed a class of silent false-negatives in the command-rewrite hook. Six fixes span both the rewrite engine (PreToolUse hook and `skim rewrite` CLI) and the shared tool handlers (both hook and PATH-wrapper surfaces). A later, independent addition — the global PATH-resolvability bail — adds a fourth rewrite-engine-only mechanism alongside Fix A/C/E; see its own section after Fix F below.
 
 ### Fix A — Flag-Drop Root Cause + Recurrence Guard
 
@@ -576,7 +616,7 @@ Rules that baked a required flag into `prefix` but not `rewrite_to` silently dro
 
 `grep`, `rg`, and `diff` exit 1 when they find no matches or detect a difference — a benign informational result. Previously the `[skim] compressed output (exit 1)` hint was printed, misleadingly implying an error. Exit ≥ 2 for these tools IS a real error and still shows the hint.
 
-**Implementation**: `BENIGN_EXIT1_PROGRAMS = &["grep", "rg", "diff"]` constant in `cmd/execution.rs`. `should_emit_compressed_hint(program, code, tier_name) -> bool` encapsulates the decision and is unit-tested (avoids PF-007). Called by `record_and_report`. The exit code is still propagated faithfully — only the hint is suppressed.
+**Implementation**: `BENIGN_EXIT1_PROGRAMS = &["grep", "rg", "diff"]` constant in `cmd/execution.rs`. `should_emit_compressed_hint(program, code, tier_name) -> bool` encapsulates the decision and is unit-tested (a hint rule that is only inline at call sites would go untested). Called by `record_and_report`. The exit code is still propagated faithfully — only the hint is suppressed.
 
 ### Fix C — Composed-Command Safety (interior newline detection)
 
@@ -584,7 +624,7 @@ Multi-line `git commit` messages with a heredoc were previously being merged int
 
 **Implementation**: `command_needs_passthrough(cmd: &str) -> bool` in `cmd/rewrite/compound.rs` trims trailing whitespace before delegating to `rewrite_would_corrupt`. Applied at BOTH engine entry points — the agent hook (`hook.rs`) and the `skim rewrite` CLI path. The `rewrite_would_corrupt` function retains the strict `contains('\n')` check for the CLI path; `command_needs_passthrough` is the hook-layer guard only.
 
-**F12 (2026-09-29) — the bail is no longer silent.** When `command_needs_passthrough` declines a hook-mode rewrite specifically because of an interior newline, `hook.rs::log_declined_multiline` now records a rate-limited line to `hook.log` (never stderr — hook mode's zero-stderr invariant). Before this, the bail produced 0 B stdout, 0 B stderr, exit 0, and an empty cache dir — indistinguishable from "nothing to rewrite." ADR-011 class 2 (no loss: the original command still runs unmodified). The message deliberately omits the declined command text (unbounded, may carry credentials); `SKIM_HOOK_AUDIT=1` remains the channel that records the actual command, in `hook-audit.log`. See the `hook-binary-pinning` feature knowledge for the `warn_once_daily` keying details this reuses.
+**F12 (2026-09-29) — the bail is no longer silent.** When `command_needs_passthrough` declines a hook-mode rewrite specifically because of an interior newline, `hook.rs::log_declined_multiline` now records a rate-limited line to `hook.log` (never stderr — hook mode's zero-stderr invariant). Before this, the bail produced 0 B stdout, 0 B stderr, exit 0, and an empty cache dir — indistinguishable from "nothing to rewrite." Class 2 disclosure (no loss: the original command still runs unmodified). The message deliberately omits the declined command text (unbounded, may carry credentials); `SKIM_HOOK_AUDIT=1` remains the channel that records the actual command, in `hook-audit.log`. See the `hook-binary-pinning` feature knowledge for the `warn_once_daily` keying details this reuses.
 
 ### Fix D — (Not directly in rewrite engine; covers shared handler corrections)
 
@@ -598,7 +638,7 @@ Commands appearing as the _source_ side of a pipe (`ls | head`, `git diff | head
 
 Additional lint handler fixes (gofmt, prettier, rustfmt) that affect both the hook/rewrite surface and the PATH-wrapper surface.
 
-## PF-038 — Global PATH-Resolvability Bail (`try_rewrite` Step 2b)
+## Global PATH-Resolvability Bail (`try_rewrite` Step 2b)
 
 A fourth rewrite-engine-only bail, added independently of PR #340's Fix A–F (landed 2026-09-29, `a2983e9`). `try_rewrite` in `cmd/rewrite/engine.rs` now returns `None` (no rewrite) when the program the rewritten command would spawn cannot be resolved on `PATH` — a check evaluated at the two points where `try_rewrite` has produced a rewrite (after a table rule matches, and after a `cat`/`head`/`tail` handler accepts), so it only ever probes a rule head or handler name and never the raw first token of an arbitrary command.
 
@@ -618,12 +658,12 @@ A fourth rewrite-engine-only bail, added independently of PR #340's Fix A–F (l
 
 ## Already-Compact Command Acknowledgement (`cmd/rewrite/acknowledge.rs`)
 
-`acknowledge.rs` is a new module (since the initial feature knowledge) that maintains a list of commands whose output is already near-optimal — rewriting them would add overhead without compression gains. These commands do NOT have skim handlers and do NOT appear in the rewrite rule table.
+`acknowledge.rs` maintains a list of commands whose output is already near-optimal — rewriting them would add overhead without compression gains. Most of these commands have no skim handler and no rewrite rule. The `prettier --check` and `rustfmt --check` forms are the exception: they ALSO have rewrite rules (see `WRAPPER_REINJECTS`), and `npx prettier --check` is in `NPX_LOCAL_BIN_RULES`. Which of the two lists wins depends on the caller: the `skim rewrite` CLI and `discover`/classify read the acknowledge list first, so they report the command as already compact (the CLI echoes the typed command). The PreToolUse hook calls `try_rewrite` and never reads the acknowledge list, so it rewrites `npx prettier --check src` to `skim prettier --via-npx src` when the project holds `prettier`.
 
 `ACK_PREFIX_PATTERNS: &[&[&str]]` — current entries:
 - `["git", "worktree", "list"]` — small table, no meaningful compression
 - `["prettier", "--check"]` — near-zero output on a clean codebase; skim header overhead exceeds compression gain (AD-RW-11)
-- `["npx", "prettier", "--check"]` — same rationale
+- `["npx", "prettier", "--check"]` — same rationale; also a rewrite rule in the table (`NPX_LOCAL_BIN_RULES`), used by the hook
 - `["rustfmt", "--check"]` — empty on clean, short diff headers on failure
 - `["cargo", "fmt", "--check"]` — `rustfmt --check`-equivalent wrapper; same empty-on-clean contract
 - `["cargo", "fmt", "--", "--check"]` — pass-through variant (`--` is a separator, not an operator)
@@ -632,7 +672,7 @@ A fourth rewrite-engine-only bail, added independently of PR #340's Fix A–F (l
 
 **Important**: ALL `prettier --check ...` commands are ACKed (including those with file args), because even with files, the output list is brief enough that compression overhead exceeds the gain for small to medium projects. This is a deliberate design decision (AD-RW-11).
 
-**Interaction with `WRAPPER_REINJECTS`**: the `["prettier", "--check"]`, `["rustfmt", "--check"]`, `["cargo", "fmt", "--check"]`, and `["cargo", "fmt", "--", "--check"]` entries appear in BOTH `ACK_PREFIX_PATTERNS` and `WRAPPER_REINJECTS`. The ACK list covers commands routed through the classification path (hook discover/classify); `WRAPPER_REINJECTS` covers their corresponding rewrite rules in the rule table. These two allowlists are independent.
+**Interaction with `WRAPPER_REINJECTS`**: the `["prettier", "--check"]`, `["npx", "prettier", "--check"]`, `["rustfmt", "--check"]`, `["cargo", "fmt", "--check"]`, and `["cargo", "fmt", "--", "--check"]` entries appear in BOTH `ACK_PREFIX_PATTERNS` and `WRAPPER_REINJECTS`. The ACK list covers the classification path (the `skim rewrite` CLI and discover/classify), not the hook; `WRAPPER_REINJECTS` covers their corresponding rewrite rules in the rule table. These two allowlists are independent.
 
 ## `BuildResult` — Output Type
 
@@ -702,7 +742,7 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **Referencing `obtain_output` or `render_output<T>` as being in `cmd/mod.rs`**: both functions were moved to `cmd/execution.rs` during the PR #267 refactor. `cmd/mod.rs` no longer contains these — it is a coordination/re-export point only.
 
-- **Adding `DEFAULT_CMD_TIMEOUT` or any internal timeout to `run_parsed_command`**: that constant has been deleted (ADR-008). `CommandRunner` is stateless and imposes no time bound. External timeout mechanisms are the caller's responsibility.
+- **Adding `DEFAULT_CMD_TIMEOUT` or any internal timeout to `run_parsed_command`**: that constant has been deleted on purpose. `CommandRunner` is stateless and imposes no time bound. External timeout mechanisms are the caller's responsibility.
 
 - **Using a generic watch-flag check for `is_indefinite_command`**: the function is keyed on specific program + flag pairs. Never add a generic "any command with `-f`" or "any command with `--watch`" branch — that would misfire on `grep -f`, `rm -f`, `git push -f`, etc. Add program-specific branches only.
 
@@ -720,7 +760,7 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **Rewriting commands with interior newlines**: `command_needs_passthrough` detects interior newlines and bails. Do not strip or normalize the command string before calling it — trailing newlines are benign but interior newlines indicate multi-line commands that `split_whitespace` would corrupt. Apply `command_needs_passthrough` on the raw hook-input string. Since F12, the hook-mode bail is no longer silent for this specific trigger: it logs a rate-limited signal to `hook.log` (never the declined command text) — see the Fix C section above.
 
-- **Rewriting a command whose target program cannot be resolved on `PATH`**: PF-038's Step 2b bail (`target_program_is_unresolvable` / `runner::program_resolves`) exists precisely because a rewrite that cannot spawn its target destroys the answer rather than degrading it. Do not move Step 2b back onto the raw first token (before the rule-matching loop): the probe stats whatever token it is given, so it must run only after a rule or handler has matched. Do not attempt to special-case it per rule — `RewriteRule` cannot carry a runtime probe by construction.
+- **Rewriting a command whose target program cannot be resolved on `PATH`**: the Step 2b bail (`target_program_is_unresolvable` / `runner::program_resolves`) exists precisely because a rewrite that cannot spawn its target destroys the answer rather than degrading it. Do not move Step 2b back onto the raw first token (before the rule-matching loop): the probe stats whatever token it is given, so it must run only after a rule or handler has matched. Do not attempt to special-case it per rule — `RewriteRule` cannot carry a runtime probe by construction.
 
 - **Adding new already-compact commands to the rewrite rule table instead of `ACK_PREFIX_PATTERNS`**: commands with near-zero output (e.g. format-check commands on a clean codebase) belong in `acknowledge.rs`. If the skim header overhead exceeds the compression gain, the command should be ACKed, not wrapped.
 
@@ -733,6 +773,8 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 - **Injecting `--session-id` into the rewritten command**: `inject_session_id_into_parts` has been removed. Session attribution flows via the sidecar file (`write_session_id` at hook time). Adding `--session-id` back to the rewritten command causes "unrecognised option" failures in underlying tools.
 
 - **Skipping `skip_net_savings_guard` when constructing `ParsedCommandConfig` or `ToolRunConfig` for JSON-output paths**: JSON responses must never be rewritten to non-JSON. Set `skip_net_savings_guard: true` for any path that uses `OutputFormat::Json`; otherwise the guard may emit raw text instead of the JSON the caller expects.
+
+- **Deferring an inconsistency you noticed in a sibling build parser while you add a new one**: fix it in the same change. A parser added beside an unfixed sibling copies the flaw.
 
 ## Gotchas
 
@@ -752,7 +794,7 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **Signal-killed process (exit code `None`) in empty-output path is failure**: The empty-output early return uses `output.exit_code == Some(0)` for success, not `!= Some(1)`. A signal-killed process has `exit_code: None` — that must map to `success = false`.
 
-- **No internal timeout; long builds block until completion**: `run_parsed_command` blocks until the child process exits naturally. There is no wall-clock cap inside skim (ADR-008). A `cargo test --all-features` on a large workspace will hold the call for as long as it takes. `ChildGuard` ensures the child is reaped on early return, but it does not impose a time limit.
+- **No internal timeout; long builds block until completion**: `run_parsed_command` blocks until the child process exits naturally. There is no wall-clock cap inside skim, by decision. A `cargo test --all-features` on a large workspace will hold the call for as long as it takes. `ChildGuard` ensures the child is reaped on early return, but it does not impose a time limit.
 
 - **Gradle success requires both zero exit code AND absence of `BUILD FAILED` text**: a process can exit 0 while gradle still emits `BUILD FAILED` in certain edge cases. Both conditions are checked in Tier 1.
 
@@ -786,7 +828,7 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **`is_segment_ack` uses prefix matching, not exact matching**: `["prettier", "--check"]` ACKs ALL `prettier --check ...` invocations, including those with file arguments. The decision to ACK the entire prefix family is deliberate (AD-RW-11) — compression overhead exceeds the gain for these tools regardless of file arguments.
 
-- **The two interception surfaces (hook/rewrite vs. PATH wrappers) do NOT both benefit from Fix A/C/E — and PF-038 is a fourth rewrite-engine-only mechanism, not a third**: Fix A (flag preservation), Fix C (interior newline detection), and PF-038 (global PATH-resolvability bail, `try_rewrite` Step 2b) are all rewrite-engine properties — they apply to the PreToolUse hook, `compound.rs`'s segment splitting, and the `skim rewrite` CLI, all of which call `try_rewrite`. None of the three apply to PATH wrappers, where `try_rewrite` is never called, flags arrive as ordinary argv, and an unresolvable program simply fails later at the real spawn. Fix B (hint suppression) and Fix F (handler corrections) affect the shared per-tool handlers, so they benefit both surfaces. Tests that drive the `--hook`/rewrite path do not exercise the wrapper path and vice versa.
+- **The two interception surfaces (hook/rewrite vs. PATH wrappers) do NOT both benefit from Fix A/C/E — and the PATH-resolvability bail is a fourth rewrite-engine-only mechanism, not a third**: Fix A (flag preservation), Fix C (interior newline detection), and the global PATH-resolvability bail (`try_rewrite` Step 2b) are all rewrite-engine properties — they apply to the PreToolUse hook, `compound.rs`'s segment splitting, and the `skim rewrite` CLI, all of which call `try_rewrite`. None of the three apply to PATH wrappers, where `try_rewrite` is never called, flags arrive as ordinary argv, and an unresolvable program simply fails later at the real spawn. Fix B (hint suppression) and Fix F (handler corrections) affect the shared per-tool handlers, so they benefit both surfaces. Tests that drive the `--hook`/rewrite path do not exercise the wrapper path and vice versa.
 
 - **The net-savings guard baselines against `raw_output`, not `stdout`**: for test runners in `run_test_runner`, `raw_output` is the combined stdout+stderr after ANSI stripping. For build parsers in `run_parsed_command`, `raw_cow` is the same combined stream. Both match what the user would see if skim were bypassed entirely.
 
@@ -794,9 +836,12 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - **`strip_session_id_flag` is a defense-in-depth guard, not a primary filter**: the hook (`hook.rs`) no longer injects `--session-id`. `strip_session_id_flag` only fires for OLD hook binaries talking to a NEW skim binary. The fast-path (`!args.iter().any(|a| a.contains("--session-id"))`) ensures it is allocation-free on every normal call.
 
+- **KB-INV-4 / KB-INV-3: `npx_failed` looks at stdout only, and the probe runs twice**: a tool that fails with diagnostics on stdout (for example `tsc`) is not an npx failure, so its output still reaches the parser. `npx_failed` is true only when stdout is empty and the exit is non-zero or a signal. The project-local bin is also checked twice: once by the PreToolUse hook and again by `Launch::resolve` at start time, because the folder can change between the two.
+- **KB-AP-5: a failed npx probe is invisible by design**: the hook writes no stderr and no permission decision when `local_bin_probe` says no for an `npx` segment, and the segment stays as typed. When that segment is the only one to rewrite, the hook writes no stdout either. Nothing marks the missing rewrite except the audit log (`SKIM_HOOK_AUDIT=1`). Check `node_modules/.bin/<tool>` in the hook folder (and parents to the repository root) first when a rewrite is missing.
+
 ## Key Files
 
-- `crates/rskim/src/cmd/build/mod.rs` — dispatcher (`run`), shared `run_parsed_command`, `print_help`; now includes net-savings guard call with `savings_decision(raw_cow, result.content())`
+- `crates/rskim/src/cmd/build/mod.rs` — dispatcher (`run`), shared `run_parsed_command`, `print_help`; now includes net-savings guard call with `savings_decision(raw_cow, result.content())`; `run_parsed_command` starts through `Launch::resolve` and forwards a failed npx start raw before the parser
 - `crates/rskim/src/cmd/build/cargo.rs` — cargo build/check/clippy: `run`/`run_check`/`run_clippy` all delegate to `run_with_json_format` (NDJSON Tier 1, regex Tier 2); `run_fmt` uses a separate two-tier `parse_fmt` (empty → Full, non-empty → Passthrough)
 - `crates/rskim/src/cmd/build/tsc.rs` — TypeScript compiler: regex-on-stderr Tier 1, combined Tier 2, empty-output success (checked after both tiers)
 - `crates/rskim/src/cmd/build/make.rs` — GNU make: GCC diagnostics Tier 1, noise-strip Tier 2, eight `LazyLock<Regex>` patterns plus one literal `starts_with` check
@@ -805,18 +850,18 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 - `crates/rskim/src/output/mod.rs` — `ParseResult<T>` enum definition and helpers; `elision_marker`, `elision_marker_unbounded`, `compressed_output_hint` (#317 loud elision + hint helpers)
 - `crates/rskim/src/output/canonical.rs` — `BuildResult` (pre-rendered output); `TestResult` (with `context: Option<String>` safety net and `with_context` constructor, #317)
 - `crates/rskim/src/cmd/mod.rs` — coordination point: declares all submodules, re-exports public API; inline helpers: `user_has_flag`, `inject_flag_before_separator`, `extract_show_stats`, `extract_json_flag`, `extract_output_format`, `should_read_stdin` (stdin-eligible when empty args OR `args == ["run"]`), passthrough checks, resolvers
-- `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, `run_inherited_passthrough()`, per-tool dispatcher helpers, `strip_session_id_flag` (#350 defense-in-depth for stray `--session-id`), `run_cargo_tests` (shared tail for test/nextest arms with explicit `is_nextest` threading)
-- `crates/rskim/src/cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, `skip_net_savings_guard`), `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit` (#317), `ExitDisposition`, `classify_exit`, `BENIGN_EXIT1_PROGRAMS`, `should_emit_compressed_hint`, `SavingsDecision` (#350), `savings_decision` (#350), `emit_raw_passthrough` (#350), `longest_nonwhitespace_run` (#350), `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`
+- `crates/rskim/src/cmd/dispatch.rs` — `dispatch()`, `run_raw_passthrough()`, `run_inherited_passthrough()`, per-tool dispatcher helpers, `strip_session_id_flag` (#350 defense-in-depth for stray `--session-id`), `run_cargo_tests` (shared tail for test/nextest arms with explicit `is_nextest` threading); `dispatch_explicit` and `take_via_npx` (the only reader of `--via-npx`); `run_inherited_passthrough` starts through `Launch`
+- `crates/rskim/src/cmd/execution.rs` — `OutputFormat`, `RunContext`, `ParsedCommandConfig<'_>` (with `expected_exit_codes`, `forward_stderr`, `skip_net_savings_guard`), `ToolRunConfig<'_>`, `run_tool<T>`, `run_parsed_command_with_mode`, `run_parsed_command_with_exit` (#317), `ExitDisposition`, `classify_exit`, `BENIGN_EXIT1_PROGRAMS`, `should_emit_compressed_hint`, `SavingsDecision` (#350), `savings_decision` (#350), `emit_raw_passthrough` (#350), `longest_nonwhitespace_run` (#350), `format_analytics_label`, `combine_output`, `obtain_output`, `render_output<T>`, `record_and_report`, `passthrough_raw`; `obtain_output` returns `ControlFlow<ExitCode, CommandOutput>`; `RawFallback::resolve` (bare program, no `Launch`); `stream_passthrough_raw`
 - `crates/rskim/src/cmd/security.rs` — `sanitize_for_display`, `scrub_db_args`, `scrub_infra_args`
 - `crates/rskim/src/cmd/registry.rs` — `KNOWN_SUBCOMMANDS` (sorted, binary-searchable via `binary_search`), `is_known_subcommand`, `is_meta_subcommand`, `wrapper_targets`
 - `crates/rskim/src/cmd/test_utils.rs` — standalone test helper module (compiled under `#[cfg(test)]` gate): `make_output`, `make_output_full`, `make_output_stderr`, `load_fixture` (with `Component::Normal` traversal guard); import as `crate::cmd::test_utils`; renamed from `test_support` in PR #126
-- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless unit struct, `#[derive(Default)]`), `CommandOutput`, `ChildGuard` (kill-on-drop RAII), `is_spawn_error`, `MAX_OUTPUT_BYTES` (64 MiB); no timeout, no `RunnerError::Timeout`; `program_resolves` (PF-038 PATH-resolvability probe), `cached_verdict`/`PROGRAM_RESOLVES_CACHE` (process-lifetime memoisation), `resolves_in` (testable core)
+- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless unit struct, `#[derive(Default)]`), `CommandOutput`, `ChildGuard` (kill-on-drop RAII), `is_spawn_error`, `MAX_OUTPUT_BYTES` (64 MiB); no timeout, no `RunnerError::Timeout`; `program_resolves` (PATH-resolvability probe), `cached_verdict`/`PROGRAM_RESOLVES_CACHE` (process-lifetime memoisation), `resolves_in` (testable core); npx launcher: `NpxTool`, `VIA_NPX_FLAG`, `local_node_bin`, `Launch` (`resolve`/`plan`/`spawn_error_line`/`install_hint`/`npx_failed`), `LocalBinGone`, the one `NPX_REQUEST` latch and `request_npx`
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command(tokens: &[&str]) -> bool`; program-aware daemon/streaming detection with env-var prefix stripping; consumed by the rewrite hook path and by `dispatch()`'s `run_inherited_passthrough` gate
-- `crates/rskim/src/cmd/rewrite/rules.rs` — declarative rewrite rules; `all_rules()` iterator; structural guard `no_rule_silently_drops_prefix_flags` with `WRAPPER_REINJECTS` allowlist (#340, Fix A); `check_rule_for_flag_drop` helper; `cargo nextest run` rewrite preserves `"run"` token (#367)
-- `crates/rskim/src/cmd/rewrite/compound.rs` — `command_needs_passthrough` (hook-layer guard); `rewrite_would_corrupt` (strict check); `split_compound`, `try_rewrite_compound`, `has_pipe_operator` (global pipe passthrough — Fix E)
+- `crates/rskim/src/cmd/rewrite/rules.rs` — declarative rewrite rules; `all_rules()` iterator; structural guard `no_rule_silently_drops_prefix_flags` with `WRAPPER_REINJECTS` allowlist (#340, Fix A); `check_rule_for_flag_drop` helper; `cargo nextest run` rewrite preserves `"run"` token (#367); `NPX_LOCAL_BIN_RULES`, `npx_local_tool`, `npx_flag_tails`, test-only `NPX_RULES_NOT_LOCAL_BIN`
+- `crates/rskim/src/cmd/rewrite/compound.rs` — `command_needs_passthrough` (hook-layer guard); `rewrite_would_corrupt` (strict check); `split_compound`, `try_rewrite_compound`, `has_pipe_operator` (global pipe passthrough — Fix E); `try_rewrite_compound` keeps `npx_tool` from the first segment only
 - `crates/rskim/src/cmd/rewrite/acknowledge.rs` — `ACK_PREFIX_PATTERNS` (already-compact command list, AD-RW-11); `is_segment_ack(tokens: &[&str]) -> bool` (prefix match)
-- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite` (Step 2b: `target_program_is_unresolvable` / `target_program_resolves` — PF-038 global PATH-resolvability bail, `#[cfg(test)]`-overridable via `RESOLVER_OVERRIDE`), `try_custom_handlers`, `strip_env_vars`, `strip_cargo_toolchain`, `split_at_separator`
-- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode`, `parse_agent_flag`, `audit_hook`; `inject_session_id_into_parts` removed (#350); session attribution via `write_session_id` sidecar only
+- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite` (Step 2b: `target_program_is_unresolvable` / `target_program_resolves` — global PATH-resolvability bail, `#[cfg(test)]`-overridable via `RESOLVER_OVERRIDE`), `try_custom_handlers`, `strip_env_vars`, `strip_cargo_toolchain`, `split_at_separator`; `npx_tool` on the rewrite result and `--via-npx` insertion for the `NPX_LOCAL_BIN_RULES` rules
+- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode`, `parse_agent_flag`, `audit_hook`; `inject_session_id_into_parts` removed (#350); session attribution via `write_session_id` sidecar only; `hook_cwd`, `local_bin_probe` and `hook_rewrite` (the npx probe, applied to the rewrite before the auto-mode withhold arm in the response `match`)
 - `crates/rskim/src/cmd/test/cargo.rs` — `run(args, is_nextest, show_stats, rec)` for `skim cargo test` and `skim cargo nextest run`; `build_cargo_args(args, is_nextest)` and `cargo_expected_exit_codes(is_nextest)` as pure extracted helpers (#367); `parse_failure_details` state machine for stable-toolchain `---- name stdout/stderr ----` blocks (#317)
 - `crates/rskim/src/cmd/test/shared.rs` — `run_test_runner`, `scrape_failures`, `failure_context_body`, `emit_failure_context` (#317), `try_read_stdin`, `TestKind`, `ExitSource`, `ArgPreparation`, `TestRunnerConfig`; net-savings guard applied in `run_test_runner` (#350); passthrough arm now uses `resolve_exit_code(0, exit_source)` not hardcoded FAILURE (#350 Cluster D)
 - `crates/rskim/tests/fixtures/cmd/build/` — fixture files: `cargo_build_fail.json`, `cargo_build_ok.json`, `clippy_fail.json`, `clippy_warnings.json`, `make_errors.txt`, `make_nothing.txt`, `make_recursive.txt`, `make_success.txt`, `make_warnings_only.txt`, `tsc_errors.txt`
@@ -826,9 +871,8 @@ Do not redeclare local versions — use the canonical source to prevent drift.
 
 - `crates/rskim/src/output/mod.rs` — owns `ParseResult<T>`, the type returned by all three-tier parsers across the whole codebase (lint, test, infra, build); `emit_markers` debug gate; `elision_marker`/`elision_marker_unbounded` (#317)
 - `crates/rskim/src/output/canonical.rs` — owns `BuildResult`, `TestResult` (with `context` safety net), `GitResult`, `LintResult`, `ShowCommitResult`
-- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless, ADR-008), `CommandOutput`, `ChildGuard` (kill-on-drop), `is_spawn_error`; no internal timeout, no `RunnerError::Timeout`; `program_resolves` (PF-038) — consumed by the rewrite engine's Step 2b bail, not by any build-parser handler directly
+- `crates/rskim/src/runner.rs` — `CommandRunner` (stateless, no time limit), `CommandOutput`, `ChildGuard` (kill-on-drop), `is_spawn_error`; no internal timeout, no `RunnerError::Timeout`; `program_resolves` — consumed by the rewrite engine's Step 2b bail, not by any build-parser handler directly
 - `crates/rskim/src/cmd/rewrite/indefinite.rs` — `is_indefinite_command`; guards daemon/streaming commands from being captured; consumed by `dispatch()` and the rewrite hook path
 - `crates/rskim/src/cmd/lint/` — sibling module using the same three-tier pattern with `LintResult` instead of `BuildResult`; lint parsers use `run_tool<T>` (via `run_parsed_command_with_mode` in `execution.rs`) rather than `run_parsed_command`
 - `crates/rskim/src/cmd/test/` — sibling module using the same three-tier pattern with `TestResult`; cargo.rs uses `run_parsed_command_with_exit` directly; nextest uses `is_nextest=true` explicitly threaded from `dispatch_cargo`
-- ADR-008: Remove internal subprocess timeout/duration caps; bound child-process lifetime with `ChildGuard` kill-on-drop instead of an arbitrary timeout
-- ADR-001: Fix all noticed issues immediately regardless of scope — applies when adding a new build parser: fix any spotted inconsistencies in other parsers in the same PR rather than deferring
+- `.devflow/features/hook-binary-pinning/KNOWLEDGE.md` — the hook and wrapper surfaces: `--via-npx` is explicit-surface only, the PreToolUse probe, the wrapper-surface `PATH` order and the `SKIM_DEPTH` start-count limit (exit 126), and the `| cat` pipeline exception

@@ -31,17 +31,8 @@ mod common;
 #[cfg(unix)]
 mod wrapper_flag_zone {
     use crate::common;
-    use std::os::unix::process::CommandExt as _;
     use std::path::PathBuf;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    /// Upper bound for one child run.  A healthy run takes well under a second.
-    const RUN_TIMEOUT: Duration = Duration::from_secs(20);
-
-    /// Sleep between two `try_wait` polls.  The poll loop is bounded by
-    /// [`RUN_TIMEOUT`].
-    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    use std::process::Command;
 
     /// Marker line the stub writes after the arguments of one call.
     const CALL_END: &str = "call-end";
@@ -154,72 +145,12 @@ mod wrapper_flag_zone {
 
         /// Run the link with `args` and collect what happened.
         fn run(&self, args: &[&str]) -> Outcome {
-            let output = run_bounded(self.command(args));
+            let output = common::run_bounded(self.command(args));
             Outcome {
                 code: output.status.code(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                 stub_calls: self.parse_stub_calls(),
             }
-        }
-    }
-
-    /// Kill every process in the group led by `pgid`.  `ESRCH` (an empty group)
-    /// is the normal result after a clean exit and is ignored.
-    fn kill_group(pgid: libc::pid_t) {
-        // SAFETY: `kill(2)` with a negative pid signals a process group.  It
-        // reads no memory of ours.
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-    }
-
-    /// Run `cmd` as the leader of its own process group, with a wall-clock
-    /// bound.  On expiry the whole group is killed and the test fails.
-    ///
-    /// stdout and stderr are pipes, not files: the wrapper serves raw bytes to a
-    /// regular file, and that path is not the one under test.  The output of
-    /// these children is a few bytes, so the pipes cannot fill while we poll.
-    fn run_bounded(mut cmd: Command) -> std::process::Output {
-        use std::io::Read as _;
-
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = cmd.spawn().expect("wrapper link must be spawnable");
-        let pgid = child.id() as libc::pid_t;
-        let deadline = Instant::now() + RUN_TIMEOUT;
-
-        let status = loop {
-            match child.try_wait().expect("try_wait on the wrapper child") {
-                Some(status) => break status,
-                None if Instant::now() >= deadline => {
-                    kill_group(pgid);
-                    let _ = child.wait();
-                    panic!(
-                        "wrapper child ran longer than {RUN_TIMEOUT:?}; \
-                         its process group was killed"
-                    );
-                }
-                None => std::thread::sleep(POLL_INTERVAL),
-            }
-        };
-
-        // Nothing may outlive the child, and no straggler may hold a pipe open.
-        kill_group(pgid);
-
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            pipe.read_to_end(&mut stdout).expect("read child stdout");
-        }
-        if let Some(mut pipe) = child.stderr.take() {
-            pipe.read_to_end(&mut stderr).expect("read child stderr");
-        }
-        std::process::Output {
-            status,
-            stdout,
-            stderr,
         }
     }
 
