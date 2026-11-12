@@ -76,14 +76,14 @@ fn header_line(label: &str, result: &HeatmapResult) -> String {
     let scope = result
         .file_targets
         .as_ref()
-        .map(|targets| format!(", scoped to {} files", targets.len()))
+        .map(|targets| format!(", scoped to {}", items(targets.len(), "file", "files")))
         .unwrap_or_default();
     format!(
-        "{label}: {} {}..{}, {} commits, {} window{strategy}{scope}",
+        "{label}: {} {}..{}, {}, {} window{strategy}{scope}",
         repo_name(&result.repository),
         window.since,
         window.until,
-        window.commits_analyzed,
+        items(window.commits_analyzed, "commit", "commits"),
         window.mode
     )
 }
@@ -230,7 +230,8 @@ pub(crate) fn render_cards_text(
 }
 
 /// One card. The commit subjects are in quotes under a "from history"
-/// heading: they are text from the repository, not instructions.
+/// heading: they are text from the repository, not instructions. The owner
+/// names are in quotes too, so a name with `, ` stays one entry.
 fn push_card(out: &mut String, card: &Card, window: &WindowInfo, caps: ListCaps) {
     if !card.in_window {
         push_line(
@@ -247,7 +248,7 @@ fn push_card(out: &mut String, card: &Card, window: &WindowInfo, caps: ListCaps)
         let owners: Vec<String> = card
             .owners
             .iter()
-            .map(|o| format!("{} {:.0}%", o.name, o.share_pct))
+            .map(|o| format!("{} {:.0}%", quoted(&o.name), o.share_pct))
             .collect();
         push_line(out, &format!("  owners: {}", owners.join(", ")));
     }
@@ -271,11 +272,30 @@ fn push_card(out: &mut String, card: &Card, window: &WindowInfo, caps: ListCaps)
         push_line(out, "    (none)");
     }
     for f in &card.fix_commits {
-        push_line(out, &format!("    {} {} \"{}\"", f.sha, f.date, f.subject));
+        push_line(
+            out,
+            &format!("    {} {} {}", f.sha, f.date, quoted(&f.subject)),
+        );
     }
     if let Some(line) = card_more_line(card.counts, caps) {
         push_line(out, &format!("  {line}"));
     }
+}
+
+/// `text` in double quotes, with each `\` and `"` in it escaped as `\\` and
+/// `\"`, so only the closing quote ends the quoted text. The text view
+/// only: JSON has its own escapes.
+fn quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if matches!(c, '\\' | '"') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// The line with the hidden counts of a card, or `None` when the caps hide
@@ -308,7 +328,17 @@ fn card_more_line(counts: CardCounts, caps: ListCaps) -> Option<String> {
 
 /// `"N more <noun>"`, with the singular noun for 1.
 fn more_items(n: usize, one: &str, many: &str) -> String {
-    format!("{n} more {}", if n == 1 { one } else { many })
+    format!("{n} more {}", noun(n, one, many))
+}
+
+/// `"N <noun>"`, with the singular noun for 1.
+fn items(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", noun(n, one, many))
+}
+
+/// `one` for 1, else `many`.
+fn noun<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
 }
 
 // ============================================================================
@@ -363,6 +393,7 @@ pub(crate) fn render_insights_json(insights_result: &InsightsResult) -> anyhow::
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::cmd::heatmap::card::{FixCommit, Owner};
     use crate::cmd::heatmap::types::{
         AuthorMetrics, ChurnMetrics, CompactFileEntry, CompactModuleEntry, Count, CouplingEdge,
         CouplingEntry, FileMetrics, FixRiskMetrics, Insight, InsightCategory, InsightCounts,
@@ -461,7 +492,7 @@ mod tests {
         }
     }
 
-    /// A path of exactly 100 chars that ends in `{tag}{i:03}.rs`.
+    /// A path of exactly 99 chars that ends in `{tag}{i:03}.rs`.
     fn long_path(tag: char, i: usize) -> String {
         let tail = format!("{tag}{i:03}.rs");
         format!("{}{tail}", "d/".repeat((100 - tail.len()) / 2))
@@ -490,7 +521,7 @@ mod tests {
         let mut result = make_result();
         result.window.commits_analyzed = 1000;
         result.fix_commits_total = 100;
-        // 100 files with 100-char paths; the first 20 have only fix commits,
+        // 100 files with 99-char paths; the first 20 have only fix commits,
         // far above the 10% base rate.
         result.files = (0..100)
             .map(|i| {
@@ -539,6 +570,22 @@ mod tests {
             text.lines().next(),
             Some(
                 "Heatmap: test-repo 2024-10-01..2025-01-01, 10 commits, sprint window, scoped to 2 files"
+            )
+        );
+    }
+
+    #[test]
+    fn test_text_header_uses_the_singular_noun_for_one_commit_and_one_file() {
+        let mut result = make_result();
+        result.window.commits_analyzed = 1;
+        result.fix_commits_total = 0;
+        result.window.effective_strategy = None;
+        result.file_targets = Some(vec!["src/main.rs".to_string()]);
+        let text = text_of(&result, DEFAULT_VIEW);
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                "Heatmap: test-repo 2024-10-01..2025-01-01, 1 commit, dual window, scoped to 1 file"
             )
         );
     }
@@ -699,6 +746,96 @@ mod tests {
         assert_eq!(file["fix_risk"]["keyword_pct"], 40.0);
         assert_eq!(file["fix_risk"]["insufficient_data"], false);
         assert_eq!(file["blast_radius"][0]["path"], "src/lib.rs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Card text
+    // -----------------------------------------------------------------------
+
+    /// A card of `src/a.rs` with the owners `first` (57%) and `second` (43%)
+    /// and one fix commit with `subject`. Every list shows in full.
+    fn card_with(first: &str, second: &str, subject: &str) -> Card {
+        let full = |n| Count { total: n, shown: n };
+        let owner = |name: &str, commits, share_pct| Owner {
+            name: name.to_string(),
+            commits,
+            share_pct,
+        };
+        Card {
+            path: "src/a.rs".to_string(),
+            in_window: true,
+            commits: 7,
+            counts: CardCounts {
+                owners: full(2),
+                partners: full(0),
+                fix_commits: full(1),
+            },
+            owners: vec![owner(first, 4, 57.1), owner(second, 3, 42.9)],
+            partners: vec![],
+            fix_commits: vec![FixCommit {
+                sha: "abc1234".to_string(),
+                date: "2026-11-01".to_string(),
+                subject: subject.to_string(),
+            }],
+        }
+    }
+
+    fn card_text(card: &Card) -> String {
+        let mut out = String::new();
+        push_card(&mut out, card, &make_result().window, DEFAULT_VIEW.lists());
+        out
+    }
+
+    #[test]
+    fn test_card_text_gives_each_owner_name_in_quotes() {
+        let text = card_text(&card_with("Test User", "Ada", "fix: a"));
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "src/a.rs: 7 commits",
+                r#"  owners: "Test User" 57%, "Ada" 43%"#,
+                "  partners (confidence, shared commits):",
+                "    (none)",
+                "  fix commits from history (newest first):",
+                r#"    abc1234 2026-11-01 "fix: a""#,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_card_owner_name_with_a_comma_stays_one_entry() {
+        let card = card_with("Ada, Bob 50%", r#"Eve "E" \ x"#, "fix: a");
+        assert_eq!(
+            card_text(&card).lines().nth(1),
+            Some(r#"  owners: "Ada, Bob 50%" 57%, "Eve \"E\" \\ x" 43%"#)
+        );
+    }
+
+    #[test]
+    fn test_card_subject_keeps_its_quotes_balanced() {
+        let card = card_with("Test User", "Ada", r#"fix: say "done" \ ok"#);
+        assert_eq!(
+            card_text(&card).lines().nth(5),
+            Some(r#"    abc1234 2026-11-01 "fix: say \"done\" \\ ok""#)
+        );
+    }
+
+    #[test]
+    fn test_card_more_line_joins_the_top_part_and_the_git_log_part() {
+        let counts = CardCounts {
+            owners: Count { total: 2, shown: 2 },
+            partners: Count { total: 6, shown: 5 },
+            fix_commits: Count { total: 7, shown: 5 },
+        };
+        let caps = ViewSpec {
+            detail: None,
+            top: Some(5),
+        }
+        .lists();
+        assert_eq!(
+            card_more_line(counts, caps).as_deref(),
+            Some("1 more partner (raise --top), 2 more fix commits (git log)")
+        );
     }
 
     // -----------------------------------------------------------------------

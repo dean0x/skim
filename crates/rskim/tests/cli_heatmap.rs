@@ -727,7 +727,7 @@ fn test_heatmap_explicit_files_text_header() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let header = stdout.lines().next().unwrap_or_default();
     assert!(
-        header.starts_with("Heatmap: ") && header.ends_with(", scoped to 1 files"),
+        header.starts_with("Heatmap: ") && header.ends_with(", scoped to 1 file"),
         "header missing scope: {stdout}"
     );
 }
@@ -932,7 +932,7 @@ fn test_heatmap_diff_flag() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let header = stdout.lines().next().unwrap_or_default();
     assert!(
-        header.starts_with("Heatmap: ") && header.ends_with(", scoped to 1 files"),
+        header.starts_with("Heatmap: ") && header.ends_with(", scoped to 1 file"),
         "should show scoped header: {stdout}"
     );
 }
@@ -1144,7 +1144,7 @@ fn test_insights_empty_repo() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "{stdout}");
     assert!(lines[0].starts_with("Insights: "), "{stdout}");
-    assert!(lines[0].contains(", 1 commits, "), "{stdout}");
+    assert!(lines[0].contains(", 1 commit, "), "{stdout}");
     assert_eq!(lines[1], "  (no notable findings)");
 }
 
@@ -2316,9 +2316,10 @@ fn expected_fix_lines(dir: &Path, path: &str) -> Vec<String> {
         .filter_map(|line| {
             let mut fields = line.split('\0');
             let (hash, date, subject) = (fields.next()?, fields.next()?, fields.next()?);
+            let escaped = subject.replace('\\', "\\\\").replace('"', "\\\"");
             subject
                 .starts_with("fix")
-                .then(|| format!("    {} {date} \"{subject}\"", &hash[..7]))
+                .then(|| format!("    {} {date} \"{escaped}\"", &hash[..7]))
         })
         .collect()
 }
@@ -2362,7 +2363,7 @@ fn test_heatmap_card_lists_a_test_partner_first_and_three_fix_commits_from_histo
     // one of git itself.
     let mut expected = owned_strings(&[
         "src/core.rs: 9 commits",
-        "  owners: Test User 89%, Ada|Lovelace 11%",
+        r#"  owners: "Test User" 89%, "Ada|Lovelace" 11%"#,
         "  partners (confidence, shared commits):",
         "     58%   6  tests/core_test.rs",
         "     83%   8  src/util.rs",
@@ -2402,7 +2403,7 @@ fn test_heatmap_card_owners_line_needs_two_authors() {
         .into_iter()
         .filter(|l| l.starts_with("  owners: "))
         .collect();
-    assert_eq!(owners, ["  owners: Test User 89%, Ada|Lovelace 11%"]);
+    assert_eq!(owners, [r#"  owners: "Test User" 89%, "Ada|Lovelace" 11%"#]);
 }
 
 #[test]
@@ -2544,7 +2545,7 @@ fn test_heatmap_card_is_the_same_with_insights_and_top_keeps_five_fix_commits() 
     let text = heatmap_stdout(dir.path(), &["--top", "1", CARD_FILE]);
     let mut expected = owned_strings(&[
         "src/core.rs: 9 commits",
-        "  owners: Test User 89%",
+        r#"  owners: "Test User" 89%"#,
         "  partners (confidence, shared commits):",
         "     58%   6  tests/core_test.rs",
         "  fix commits from history (newest first):",
@@ -2787,7 +2788,7 @@ fn test_heatmap_card_replaces_control_and_bidi_characters() {
     assert_eq!(
         card[1..],
         [
-            "  owners: Test User 67%, Eve\u{FFFD}x 33%".to_string(),
+            "  owners: \"Test User\" 67%, \"Eve\u{FFFD}x\" 33%".to_string(),
             "  partners (confidence, shared commits):".to_string(),
             "    100%   3  src/b\u{FFFD}c.rs".to_string(),
             "  fix commits from history (newest first):".to_string(),

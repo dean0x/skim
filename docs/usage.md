@@ -243,9 +243,9 @@ crates/rskim/src/cmd/heatmap/noise.rs: 4 commits
   1 more partner (raise --top)
 ```
 
-- **Owners** (`owners: A 89%, B 11%`) show only when the file has 2 or more distinct authors.
+- **Owners** (`owners: "A" 89%, "B" 11%`) show only when the file has 2 or more distinct authors. Each name is in double quotes.
 - **Partners** are files with 3 or more shared commits and a confidence at or above `--coupling-threshold`. Test files come first.
-- **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first.
+- **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first. In the text view, a `"` or `\` in a subject or an owner name shows as `\"` or `\\`.
 - A file with no commits in the window prints `<path>: not in history window (N commits since DATE)`, where N and DATE describe the window.
 - Control and bidirectional characters in subjects, author names and partner paths become U+FFFD. Each of these strings is cut at 72 characters.
 - `./x`, an absolute path under the repository root, a path relative to the current folder and a path with `..` give the same card. A path outside the repository exits 1. skim does not open the file. An absolute path through a symbolic-link prefix (for example macOS `/var`) is refused.
