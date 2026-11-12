@@ -460,12 +460,7 @@ mod tests {
             checks,
             ratchet: BTreeMap::from([("ident.mrr".to_string(), mrr)]),
             structural: StructuralReport::default(),
-            info: CorpusInfo {
-                oracle_skipped_by_reason: BTreeMap::new(),
-                unindexed_hits: BTreeMap::new(),
-                idents: Vec::new(),
-                concepts: Vec::new(),
-            },
+            info: CorpusInfo::default(),
         }
     }
 

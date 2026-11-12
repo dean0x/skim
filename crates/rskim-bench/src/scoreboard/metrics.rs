@@ -16,7 +16,9 @@
 //!   indexed universe, and the text universe of every tracked text file
 //!   (for `lexical.recall_tracked`, the frozen line sets and the
 //!   `stakes.*` checks). [`ratchet_values`] turns samples (one corpus, or
-//!   every corpus for the aggregate) into RATCHET values.
+//!   every corpus for the aggregate) into RATCHET values, and
+//!   [`reference_values`] into the INFO reference rows (the `rg -nw`
+//!   columns), which no baseline holds and no gate reads.
 //! - [`RATCHET_METRICS`] defines each RATCHET metric's good direction and
 //!   tolerance; [`compare_ratchet`] applies them for the gate and `bless`.
 //!   Each entry with no oracle also ratchets its full-list row count
@@ -1278,7 +1280,8 @@ pub struct ConceptSample {
 }
 
 /// Per-query measurements of one `[[refs]]` entry.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefsSample {
     pub id: String,
     /// Of the occurrences the page labels `call`, the fraction that are
@@ -1484,11 +1487,6 @@ pub const RATCHET_METRICS: &[MetricDef] = &[
         "bytes.rg_first_correct_median",
     ),
     reference("bytes.rg_first_correct_median", BYTES),
-    // The `rg -nw` simulation (#540): the same byte columns for the word
-    // search an agent types for a bare identifier. Neutral reference values,
-    // like the `bytes.rg_*` rows: no bar, and a move needs a bless.
-    reference("bytes.rgw_text_median", BYTES),
-    reference("bytes.rgw_first_correct_median", BYTES),
     def(
         "bytes.first_correct_misses",
         Direction::LowerBetter,
@@ -1959,11 +1957,6 @@ fn put_ident_values(out: &mut BTreeMap<String, f64>, idents: &[&IdentSample]) {
         .filter_map(|i| i.rg_first_correct_bytes)
         .collect();
     put(out, "bytes.rg_first_correct_median", percentile(&rg, 0.5));
-    let rgw: Vec<u64> = idents
-        .iter()
-        .filter_map(|i| i.rgw_first_correct_bytes)
-        .collect();
-    put(out, "bytes.rgw_first_correct_median", percentile(&rgw, 0.5));
 }
 
 /// `concept.*` values: mean precision at 5 / 10, skim and both baselines.
@@ -2013,12 +2006,36 @@ fn put_text_byte_values(
     put(out, "bytes.text_p90", percentile(&text_bytes, 0.9));
     put(out, "bytes.rg_text_median", percentile(&rg_bytes, 0.5));
     put(out, "bytes.rg_text_p90", percentile(&rg_bytes, 0.9));
-    let rgw_bytes: Vec<u64> = idents
-        .iter()
+}
+
+/// The INFO reference rows (#540): the byte columns of the `rg -nw`
+/// simulation, the search an agent types for a bare identifier. They are not
+/// RATCHET metrics: the report records them under `info`, outside the
+/// baseline, so no move of theirs ever gates. A row with no value is absent.
+///
+/// - `bytes.rgw_text_median`: output bytes over every ranking entry (idents
+///   and concepts);
+/// - `bytes.rgw_first_correct_median`: output bytes through the definition
+///   line, over the idents whose definition `rg -nw` shows.
+///
+/// Pooled over `samples` the way [`ratchet_values`] pools them, rounded to 4
+/// decimal places.
+pub fn reference_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
+    let idents = || samples.iter().flat_map(|s| s.idents.iter());
+    let concepts = || samples.iter().flat_map(|s| s.concepts.iter());
+    let text: Vec<u64> = idents()
         .map(|i| i.rgw_text_bytes)
-        .chain(concepts.iter().map(|c| c.rgw_text_bytes))
+        .chain(concepts().map(|c| c.rgw_text_bytes))
         .collect();
-    put(out, "bytes.rgw_text_median", percentile(&rgw_bytes, 0.5));
+    let first_correct: Vec<u64> = idents().filter_map(|i| i.rgw_first_correct_bytes).collect();
+    let mut out = BTreeMap::new();
+    put(&mut out, "bytes.rgw_text_median", percentile(&text, 0.5));
+    put(
+        &mut out,
+        "bytes.rgw_first_correct_median",
+        percentile(&first_correct, 0.5),
+    );
+    out
 }
 
 // ============================================================================

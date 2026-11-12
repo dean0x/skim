@@ -1830,9 +1830,9 @@ fn the_new_ratchet_and_reference_rows_are_defined_with_their_direction() {
         let name = format!("roles.precision.{lang}");
         assert_eq!(direction(&name), Direction::HigherBetter, "{name}");
     }
+    // The `rg -nw` columns are INFO reference rows: not RATCHET metrics.
     for name in ["bytes.rgw_text_median", "bytes.rgw_first_correct_median"] {
-        assert_eq!(direction(name), Direction::Neutral, "{name}");
-        assert_eq!(metric_def(name).unwrap().tolerance, BYTES);
+        assert!(metric_def(name).is_none(), "{name} must not ratchet");
     }
     // Moves read as the bar says.
     assert_eq!(
@@ -1847,10 +1847,6 @@ fn the_new_ratchet_and_reference_rows_are_defined_with_their_direction() {
         compare_ratchet("cost.bytes_read_median", 3.0, 4.0),
         RatchetChange::Regressed
     );
-    assert_eq!(
-        compare_ratchet("bytes.rgw_text_median", 1000.0, 2000.0),
-        RatchetChange::Changed
-    );
 }
 
 fn cost(files_parsed: u64, bytes_parsed: u64, bytes_read: u64) -> Cost {
@@ -1863,7 +1859,7 @@ fn cost(files_parsed: u64, bytes_parsed: u64, bytes_read: u64) -> Cost {
 }
 
 #[test]
-fn ratchet_values_pool_the_call_precision_the_cost_medians_and_the_rgw_columns() {
+fn ratchet_values_pool_the_call_precision_and_the_cost_medians() {
     let mut s = samples(vec![
         ident("a-1", Some(1), Some(40)),
         ident("a-2", Some(2), None),
@@ -1891,8 +1887,12 @@ fn ratchet_values_pool_the_call_precision_the_cost_medians_and_the_rgw_columns()
     assert_eq!(r["cost.files_parsed_median"], 3.0);
     assert_eq!(r["cost.bytes_parsed_median"], 100.0);
     assert_eq!(r["cost.bytes_read_median"], 1000.0);
-    assert_eq!(r["bytes.rgw_text_median"], 200.0);
-    assert_eq!(r["bytes.rgw_first_correct_median"], 30.0);
+    // The `rg -nw` columns are INFO: they never reach the RATCHET values.
+    assert!(
+        r.keys().all(|name| !name.contains("rgw")),
+        "{:?}",
+        r.keys().collect::<Vec<_>>()
+    );
 
     // Two corpora pool their entries.
     let mut t = samples(Vec::new());
@@ -1907,6 +1907,71 @@ fn ratchet_values_pool_the_call_precision_the_cost_medians_and_the_rgw_columns()
         pooled["cost.files_parsed_median"], 3.0,
         "median of 1, 3, 5, 9"
     );
+}
+
+fn concept_sample(id: &str) -> ConceptSample {
+    ConceptSample {
+        id: id.to_string(),
+        p5: 0.5,
+        p10: 0.5,
+        p5_baseline_alpha: 0.2,
+        p10_baseline_alpha: 0.2,
+        p5_baseline_count: 0.4,
+        p10_baseline_count: 0.4,
+        text_bytes: 100,
+        rg_text_bytes: 300,
+        rgw_text_bytes: 200,
+    }
+}
+
+#[test]
+fn reference_values_pool_the_rg_word_columns_over_idents_and_concepts() {
+    let mut s = samples(vec![
+        ident("a-1", Some(1), Some(40)),
+        IdentSample {
+            rgw_text_bytes: 400,
+            rgw_first_correct_bytes: None,
+            ..ident("a-2", Some(2), None)
+        },
+    ]);
+    s.concepts = vec![ConceptSample {
+        rgw_text_bytes: 600,
+        ..concept_sample("a-c1")
+    }];
+    let r = reference_values(&[&s]);
+    // The text median is over both kinds of entry (200, 400, 600); the
+    // first-correct median is over the idents that state one.
+    assert_eq!(r["bytes.rgw_text_median"], 400.0);
+    assert_eq!(r["bytes.rgw_first_correct_median"], 30.0);
+    assert_eq!(r.len(), 2);
+
+    // Two corpora pool their entries.
+    let t = samples(vec![IdentSample {
+        rgw_first_correct_bytes: Some(90),
+        ..ident("b-1", Some(1), Some(10))
+    }]);
+    let pooled = reference_values(&[&s, &t]);
+    assert_eq!(
+        pooled["bytes.rgw_first_correct_median"], 30.0,
+        "lower middle of 30, 90"
+    );
+    assert_eq!(
+        pooled["bytes.rgw_text_median"], 200.0,
+        "lower middle of 200, 200, 400, 600"
+    );
+}
+
+#[test]
+fn a_reference_row_with_no_value_is_absent() {
+    assert!(reference_values(&[&samples(Vec::new())]).is_empty());
+    // Idents that never state a first-correct byte count give no median.
+    let miss = IdentSample {
+        rgw_first_correct_bytes: None,
+        ..ident("a-1", None, None)
+    };
+    let r = reference_values(&[&samples(vec![miss])]);
+    assert!(!r.contains_key("bytes.rgw_first_correct_median"));
+    assert!(r.contains_key("bytes.rgw_text_median"));
 }
 
 #[test]

@@ -832,6 +832,45 @@ fn a_correct_skim_passes_run_bless_and_check() {
 }
 
 #[test]
+fn the_rg_word_rows_are_info_and_rows_the_output_cannot_state_are_absent() {
+    let h = Harness::new();
+    assert_exit(&h.run(), 0);
+    let report = h.report();
+    let corpus = &report["corpora"][0];
+
+    // The `rg -nw` byte columns are in the INFO section of the report.
+    let reference = corpus["info"]["reference"].as_object().unwrap();
+    for name in ["bytes.rgw_text_median", "bytes.rgw_first_correct_median"] {
+        assert!(
+            reference[name].as_f64().is_some_and(|v| v > 0.0),
+            "{name}: {reference:?}"
+        );
+    }
+
+    // The stub, like the current binary, states no cost, labels no call and
+    // names no role the role oracle could judge: those rows have no value,
+    // and the `rg -nw` rows are not RATCHET values.
+    for ratchet in [&corpus["ratchet"], &report["aggregate"]["ratchet"]] {
+        let names: Vec<&String> = ratchet.as_object().unwrap().keys().collect();
+        for prefix in ["cost.", "roles.", "refs.", "bytes.rgw"] {
+            assert!(
+                names.iter().all(|n| !n.starts_with(prefix)),
+                "{prefix}: {names:?}"
+            );
+        }
+    }
+
+    // None of it reaches the baseline, and the gate stays green.
+    assert_exit(&h.bless(None), 0);
+    let baseline = fs::read_to_string(h.baseline_path()).unwrap();
+    for name in ["rgw", "cost.", "roles.", "refs."] {
+        assert!(!baseline.contains(name), "{name} is in the baseline");
+    }
+    assert_exit(&h.check(), 0);
+    assert_eq!(h.report()["gate"]["status"], "pass");
+}
+
+#[test]
 fn a_dropped_ground_truth_file_is_a_silent_false_negative_failure() {
     let h = Harness::new();
     h.bless_current();

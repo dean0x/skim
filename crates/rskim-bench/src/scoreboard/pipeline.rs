@@ -744,6 +744,8 @@ fn corpus_report(
             unindexed_hits: eval.unindexed_hits.clone(),
             idents: eval.samples.idents.clone(),
             concepts: eval.samples.concepts.clone(),
+            refs: eval.samples.refs.clone(),
+            reference: metrics::reference_values(&[&eval.samples]),
         },
     })
 }
