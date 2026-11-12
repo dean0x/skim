@@ -809,12 +809,12 @@ fn assert_diff_dash_value_refused(diff_args: &[&str]) {
 
 #[test]
 fn test_heatmap_diff_dash_value_space_form_refused() {
-    assert_diff_dash_value_refused(&["--diff", "--output=heatmap-out.txt"]);
+    assert_diff_dash_value_refused(&["--diff", "-x"]);
 }
 
 #[test]
 fn test_heatmap_diff_dash_value_equals_form_refused() {
-    assert_diff_dash_value_refused(&["--diff=--output=heatmap-out.txt"]);
+    assert_diff_dash_value_refused(&["--diff=-x"]);
 }
 
 #[test]

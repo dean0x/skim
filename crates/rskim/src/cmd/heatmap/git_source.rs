@@ -858,6 +858,28 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--"), "args: {args:?}");
     }
 
+    /// Each flag value reaches git as one argument: the `--diff` value after
+    /// `--end-of-options`, the window start as one `--since=<n>` token, and
+    /// the `--path` value after `--`.
+    #[test]
+    fn test_flag_values_reach_git_as_one_argument_each() {
+        for base in ["-x", "--x", "-x=y", "x y"] {
+            let rev = format!("{base}...HEAD");
+            assert_eq!(
+                build_diff_args(base),
+                vec!["diff", "--name-only", "--end-of-options", rev.as_str()],
+                "--diff {base:?}"
+            );
+        }
+        let log = build_git_log_args(Some(42), Some("-x"));
+        assert_eq!(
+            log.iter().filter(|a| a.contains("42")).collect::<Vec<_>>(),
+            vec!["--since=42"],
+            "args: {log:?}"
+        );
+        assert_eq!(log[log.len() - 2..], ["--", "-x"], "args: {log:?}");
+    }
+
     // -----------------------------------------------------------------------
     // git log run outcome
     // -----------------------------------------------------------------------
