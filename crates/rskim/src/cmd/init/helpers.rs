@@ -240,19 +240,31 @@ tightly coupled file pairs, fix-after-touch patterns, module boundary violations
 and bus-factor concentration. Run it when you need to understand where risk lives
 in a codebase before starting work.
 
+The default view is short (30 lines or fewer): the top 10 hotspots by commits,
+the top 5 code-to-code coupling pairs and the top 5 fix-risk files above the
+repository base rate. Each capped list ends with one exact "N more" line that
+names the flag to see more. Noise rules hide signals with low support: fix risk
+and bus factor need 5 commits of a file, coupling needs 3 shared commits, and
+modules need 5 commits. Changelogs, snapshots and generated code are excluded by
+default (`--no-exclude` keeps them).
+
 **When to use heatmap:**
+- Before you edit a file — `skim heatmap <file>` shows its co-change partners
+  (tests first), recent fix commits and owners
 - Before a refactoring task — identify which files are risky to change
 - When triaging bugs — find files with high fix density
 - Exploring an unfamiliar codebase — understand coupling and ownership patterns
 - Before code review — check if the changed files are high-risk hotspots
 
 ```
-skim heatmap                     # default: last 90 days, text output
-skim heatmap --json              # structured JSON for programmatic use
-skim heatmap --path src/lib/     # scope to a subdirectory
-skim heatmap --window sprint     # last 14 days only
-skim heatmap --insights          # threshold-filtered findings only
-skim heatmap --insights --json   # insights as JSON (agent-friendly)
+skim heatmap                     # short ranked view of the default window
+skim heatmap <file>              # "before you edit" card for one file
+skim heatmap --detail coupling   # all rows of one section (hotspots, coupling,
+                                 # fix-risk, modules, bus-factor)
+skim heatmap --top 3             # --top sets the rows of every view
+skim heatmap --diff main         # default view for the files changed vs main
+skim heatmap --insights          # top 20 ranked findings
+skim heatmap --json              # JSON version 2: compact and capped
 ```
 <!-- skim-end -->"#,
         version = version
@@ -586,6 +598,22 @@ mod tests {
         assert!(content.contains("Heatmap"));
         assert!(content.contains("skim heatmap"));
         assert!(content.contains("risk"));
+        // The heatmap reference names the short view's flags and does not
+        // call the insights JSON "agent-friendly".
+        assert!(content.contains("skim heatmap --detail"));
+        assert!(!content.contains("agent-friendly"));
+        // It names that --top sets the rows of every view and that the JSON
+        // is version 2, and it gives the JSON as capped.
+        assert!(
+            content
+                .contains("skim heatmap --top 3             # --top sets the rows of every view\n")
+        );
+        assert!(
+            content.contains(
+                "skim heatmap --json              # JSON version 2: compact and capped\n"
+            )
+        );
+        assert!(!content.contains("uncapped"));
     }
 
     /// documentation-14: the guidance's mode ordering is the one output claim in
