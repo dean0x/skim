@@ -177,9 +177,13 @@ pub(crate) fn is_test_path(path: &str) -> bool {
 
 /// True when `path` is a doc file: its extension is `md`, `mdx`, `markdown`,
 /// `rst`, `txt` or `adoc`, in any letter case.
+///
+/// git writes a path with unusual characters in quotes (`"docs/caf\303\251.md"`).
+/// Such a path ends in `"`, so the extension is read before that quote. git
+/// quotes every path that holds a `"`, so an unquoted path never ends in one.
 #[must_use]
 pub(crate) fn is_doc_path(path: &str) -> bool {
-    Path::new(path)
+    Path::new(path.strip_suffix('"').unwrap_or(path))
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| DOC_EXTENSIONS.iter().any(|d| ext.eq_ignore_ascii_case(d)))
@@ -352,5 +356,13 @@ mod tests {
         for p in code {
             assert!(!is_doc_path(p), "{p} must not be a doc path");
         }
+    }
+
+    #[test]
+    fn test_is_doc_path_reads_a_git_quoted_path() {
+        assert!(is_doc_path(r#""docs/caf\303\251.md""#));
+        assert!(is_doc_path(r#""docs/a\tb.RST""#));
+        assert!(!is_doc_path(r#""src/caf\303\251.rs""#));
+        assert!(!is_doc_path(r#""docs/caf\303\251.md/x.rs""#));
     }
 }

@@ -782,6 +782,8 @@ mod tests {
             edge("README.md", "src/a.rs", 0.95, 9),
             edge("src/a.rs", "src/b.rs", 0.7, 4),
             edge("docs/guide.rst", "docs/intro.MD", 0.9, 5),
+            // git quotes a non-ASCII name; the file is still a doc file.
+            edge(r#""docs/caf\303\251.md""#, "src/a.rs", 0.9, 6),
         ];
         let view = build_view(&result, &DEFAULT_VIEW);
         let pairs: Vec<(&str, &str)> = view

@@ -408,51 +408,56 @@ fn run_with_source(
     // Step 10: Render
     let elapsed = start_time.elapsed();
     let mut stdout = io::stdout().lock();
+    let label = write_output(&mut stdout, &result, &config, &spec, cards.as_ref())?;
 
-    // Cards early-return: `--insights` gives the same output, text or JSON.
-    if let Some(cards) = &cards {
-        let view = view::build_view(&result, &spec);
+    // Step 11: Fire-and-forget analytics
+    record_heatmap_analytics(analytics, label, elapsed);
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write the output of one run to `out` and return its analytics label.
+///
+/// A run with file arguments writes its cards, and `--insights` gives the
+/// same cards, text or JSON. Else `--insights` writes the ranked findings of
+/// the full result, capped at 20 or `--top`. Else the ranked view writes the
+/// default view or the `--detail` section.
+fn write_output(
+    out: &mut impl Write,
+    result: &HeatmapResult,
+    config: &HeatmapConfig,
+    spec: &view::ViewSpec,
+    cards: Option<&view::Section<card::Card>>,
+) -> anyhow::Result<&'static str> {
+    if let Some(cards) = cards {
         if config.format_json {
-            let json = render_json(&result, &view, Some(cards))?;
-            writeln!(stdout, "{json}")?;
+            let view = view::build_view(result, spec);
+            writeln!(out, "{}", render_json(result, &view, Some(cards))?)?;
         } else {
-            let text = render_cards_text(&result, cards, spec.lists());
-            write!(stdout, "{text}")?;
+            write!(out, "{}", render_cards_text(result, cards, spec.lists()))?;
         }
-        record_heatmap_analytics(analytics, "skim heatmap", elapsed);
-        return Ok(ExitCode::SUCCESS);
+        return Ok("skim heatmap");
     }
 
-    // Insights early-return: the findings come from the full result, ranked,
-    // then capped at 20 or `--top`.
     if config.insights {
-        let ranked = compute_insights(&result);
-        let insights_result = build_insights_result(&result, ranked, spec.lists().insights);
+        let ranked = compute_insights(result);
+        let insights_result = build_insights_result(result, ranked, spec.lists().insights);
         if config.format_json {
-            let json = render_insights_json(&insights_result)?;
-            writeln!(stdout, "{json}")?;
+            writeln!(out, "{}", render_insights_json(&insights_result)?)?;
         } else {
-            let text = render_insights_text(&result, &insights_result);
-            write!(stdout, "{text}")?;
+            write!(out, "{}", render_insights_text(result, &insights_result))?;
         }
-        record_heatmap_analytics(analytics, "skim heatmap --insights", elapsed);
-        return Ok(ExitCode::SUCCESS);
+        return Ok("skim heatmap --insights");
     }
 
     // The view sorts, gates and caps every section for both outputs.
-    let view = view::build_view(&result, &spec);
+    let view = view::build_view(result, spec);
     if config.format_json {
-        let json = render_json(&result, &view, None)?;
-        writeln!(stdout, "{json}")?;
+        writeln!(out, "{}", render_json(result, &view, None)?)?;
     } else {
-        let text = render_text(&result, &view);
-        write!(stdout, "{text}")?;
+        write!(out, "{}", render_text(result, &view))?;
     }
-
-    // Step 11: Fire-and-forget analytics
-    record_heatmap_analytics(analytics, "skim heatmap", elapsed);
-
-    Ok(ExitCode::SUCCESS)
+    Ok("skim heatmap")
 }
 
 /// Fire-and-forget analytics recording for heatmap commands.
