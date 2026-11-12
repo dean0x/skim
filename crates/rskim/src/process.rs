@@ -472,12 +472,11 @@ fn try_cached_result(
 /// Performs a pre-read metadata check to bail early before allocating memory,
 /// which prevents a transient peak of `num_cpus × file_size` when this function
 /// is called in parallel (e.g., via `into_par_iter` in the analytics recorder).
-/// The post-read length check is retained for TOCTOU safety (the file may grow
-/// between the stat and the read).
+/// The read itself is bounded by [`read_capped`], because the metadata size is
+/// only a hint: a FIFO or a device (a symlink to `/dev/zero`, say) reports no
+/// size, and a regular file may grow between the stat and the read.
 fn read_and_validate(path: &Path) -> anyhow::Result<String> {
     // Pre-read size guard: bail before allocating if the file is already over the limit.
-    // This is a best-effort check; a file that is exactly at the limit may pass here
-    // but fail the post-read check below if it grows between the stat and the read.
     if let Ok(meta) = fs::metadata(path)
         && meta.len() as usize > MAX_INPUT_SIZE
     {
@@ -488,16 +487,32 @@ fn read_and_validate(path: &Path) -> anyhow::Result<String> {
             MAX_INPUT_SIZE / 1024 / 1024
         );
     }
-    let contents = fs::read_to_string(path)?;
-    if contents.len() > MAX_INPUT_SIZE {
+    read_capped(fs::File::open(path)?, MAX_INPUT_SIZE)
+}
+
+/// Read UTF-8 text from `reader` and fail when it holds more than `limit` bytes.
+///
+/// Reads at most `limit + 1` bytes, so the memory use is bounded for a source
+/// that never ends. The bytes are checked against the limit before they are
+/// decoded, so a read cut inside a multi-byte character still reports the size.
+fn read_capped(reader: impl Read, limit: usize) -> anyhow::Result<String> {
+    let mut bytes = Vec::new();
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
         anyhow::bail!(
             "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
-            contents.len(),
-            MAX_INPUT_SIZE,
-            MAX_INPUT_SIZE / 1024 / 1024
+            bytes.len(),
+            limit,
+            limit / 1024 / 1024
         );
     }
-    Ok(contents)
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+        .into()
+    })
 }
 
 /// Transform file contents, trying auto-detection first and falling back to
@@ -1554,6 +1569,108 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A source that never ends. It fails once it is read past `trip_at`
+    /// bytes, so a reader with no bound ends in an error and not in an
+    /// exhausted memory.
+    struct EndlessSource {
+        served: usize,
+        trip_at: usize,
+    }
+
+    impl Read for EndlessSource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.served >= self.trip_at {
+                return Err(io::Error::other("read past the bound"));
+            }
+            let len = buf.len().min(self.trip_at - self.served);
+            buf[..len].fill(b'x');
+            self.served += len;
+            Ok(len)
+        }
+    }
+
+    #[test]
+    fn read_capped_stops_reading_a_source_that_never_ends() {
+        let source = EndlessSource {
+            served: 0,
+            trip_at: 64 * 1024,
+        };
+
+        let error = read_capped(source, 1024).unwrap_err().to_string();
+
+        assert!(
+            error.starts_with("File too large: 1025 bytes exceeds maximum of 1024 bytes"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    fn read_capped_accepts_text_of_exactly_the_limit_and_refuses_one_byte_more() {
+        assert_eq!(read_capped(&b"abcd"[..], 4).unwrap(), "abcd");
+        assert!(read_capped(&b"abcde"[..], 4).is_err());
+    }
+
+    #[test]
+    fn read_capped_reports_the_size_when_the_cut_falls_inside_a_character() {
+        // 'é' is two bytes. A cap of 4 bytes reads 5, and the fifth byte is
+        // the first half of the third character.
+        let text = "ééééé";
+
+        let error = read_capped(text.as_bytes(), 4).unwrap_err().to_string();
+
+        assert!(error.starts_with("File too large:"), "error: {error}");
+    }
+
+    #[test]
+    fn read_capped_still_refuses_text_that_is_not_utf8() {
+        let error = read_capped(&[0xff_u8, 0xfe][..], 16)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "stream did not contain valid UTF-8");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_and_validate_bounds_the_read_of_a_file_that_reports_no_size() {
+        // /dev/zero reports a size of 0 and never ends. The read stops at the
+        // input cap and fails with the size error.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("zero.rs");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+
+        let error = read_and_validate(&link).unwrap_err().to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "File too large: {} bytes exceeds maximum of {MAX_INPUT_SIZE} bytes (50MB)",
+                MAX_INPUT_SIZE + 1
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_and_validate_reads_a_named_pipe_within_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe.rs");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo must succeed");
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || fs::write(fifo, "fn a() {}\n").unwrap())
+        };
+
+        let contents = read_and_validate(&fifo).unwrap();
+
+        writer.join().unwrap();
+        assert_eq!(contents, "fn a() {}\n");
+    }
+
     // ========================================================================
     // parse_tier_from tests (B4-B5)
     // ========================================================================
@@ -2226,9 +2343,10 @@ function Footer() {
         );
     }
 
-    /// A warm read prints the same stdout AND the same notice as the cold read
-    /// that wrote it; another name never reads that entry; and a read that
-    /// failed leaves nothing in the cache.
+    /// A warm read is served from the entry the cold read wrote: it prints the
+    /// stored stdout and the stored notice, not a fresh read of the source;
+    /// another name never reads that entry; and a read that failed leaves
+    /// nothing in the cache.
     #[test]
     #[serial_test::serial]
     fn symbol_read_warm_hit_repeats_stdout_and_notice_and_failures_write_nothing() {
@@ -2249,6 +2367,19 @@ function Footer() {
         let after_failures = cache_files();
         let cold = process_symbol_file(&path, "long_one", opts);
         let after_cold = cache_files();
+        // Change the stored stdout between the reads: a warm read that equals
+        // its cold read would also be a miss, so only the change shows a hit.
+        let stored_output = "stored output of long_one\n";
+        let entry_path = fs::read_dir(cache_dir.path())
+            .unwrap()
+            .next()
+            .expect("the cold read wrote one entry")
+            .unwrap()
+            .path();
+        let mut entry: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&entry_path).unwrap()).unwrap();
+        entry["content"] = serde_json::Value::from(stored_output);
+        fs::write(&entry_path, entry.to_string()).unwrap();
         let warm = process_symbol_file(&path, "long_one", opts);
         let other = process_symbol_file(&path, "last", opts);
         unsafe { std::env::remove_var("SKIM_CACHE_DIR") };
@@ -2257,7 +2388,11 @@ function Footer() {
         assert_eq!(after_failures, 0, "a failed read must not write an entry");
         let (cold, warm, other) = (cold.unwrap(), warm.unwrap(), other.unwrap());
         assert_eq!(after_cold, 1, "the cold read writes one entry");
-        assert_eq!(warm.output, cold.output);
+        assert_ne!(
+            cold.output, stored_output,
+            "the stored text must differ from a fresh read"
+        );
+        assert_eq!(warm.output, stored_output);
         assert_eq!(warm.notice, cold.notice);
         assert_eq!(other.output, "fn last() {}\n");
         assert_ne!(other.output, warm.output);

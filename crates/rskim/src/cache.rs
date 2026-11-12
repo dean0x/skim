@@ -25,7 +25,9 @@
 //! The key's fan-out has grown, so orphans accrue faster than they used to:
 //! `line_numbers` and then `notice_bytes` joined the key, and `notice_bytes`
 //! alone takes three distinct values for one file (hook origin, direct, batch)
-//! — up to three orphans per edit rather than one. The
+//! — up to three orphans per edit rather than one. The `--symbol` name joined
+//! the key as well, so every distinct symbol name read from a file adds one
+//! more orphan per edit, on top of those combinations. The
 //! `CACHE_SCHEMA_VERSION` 2 → 3 bump orphaned every warm entry once.
 //!
 //! Adding a bound is a new cache-lifecycle policy (eviction order, budget,

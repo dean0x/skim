@@ -596,6 +596,31 @@ fn cache_entries(home: &TempDir) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Change the stored entry whose `content` is the stdout of `cold`.
+///
+/// A warm read that equals its cold read proves nothing: a cache miss prints
+/// the same bytes. After `edit` changes the stored entry, a warm read shows
+/// whether it was served from that entry or ran cold again.
+fn edit_entry_of(home: &TempDir, cold: &Streams, edit: impl FnOnce(&mut serde_json::Value)) {
+    let load = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let entry_path = cache_entries(home)
+        .into_iter()
+        .find(|path| load(path)["content"] == cold.stdout.as_str())
+        .expect("the cold read wrote an entry that holds its stdout");
+    let mut entry = load(&entry_path);
+    edit(&mut entry);
+    fs::write(&entry_path, entry.to_string()).unwrap();
+}
+
+/// Replace the stored lines of the entry that holds the stdout of `cold`.
+fn replace_stored_lines(home: &TempDir, cold: &Streams, stored: &str) {
+    edit_entry_of(home, cold, |entry| {
+        entry["content"] = serde_json::Value::from(stored);
+    });
+}
+
 #[test]
 fn a_full_read_and_two_symbol_reads_of_one_file_keep_three_different_cached_outputs() {
     // TP-41
@@ -618,11 +643,24 @@ fn a_full_read_and_two_symbol_reads_of_one_file_keep_three_different_cached_outp
         "a full read, --symbol a and --symbol b each own one entry"
     );
 
-    // Warm, in the opposite order: each read is served what its own cold read
-    // printed, on both streams.
-    assert_eq!(read_ok(&home, &only_b), cold_b);
-    assert_eq!(read_ok(&home, &only_a), cold_a);
-    assert_eq!(read_ok(&home, &full), cold_full);
+    // Give each entry its own stored text. A warm read prints the text of the
+    // entry of its own key, and the notice that the entry kept: a read that
+    // ran cold would print the source lines instead.
+    replace_stored_lines(&home, &cold_full, "stored: whole file\n");
+    replace_stored_lines(&home, &cold_a, "stored: a\n");
+    replace_stored_lines(&home, &cold_b, "stored: b\n");
+
+    // Warm, in the opposite order of the cold reads.
+    let warm_b = read_ok(&home, &only_b);
+    let warm_a = read_ok(&home, &only_a);
+    let warm_full = read_ok(&home, &full);
+
+    assert_eq!(warm_b.stdout, "stored: b\n");
+    assert_eq!(warm_b.stderr, cold_b.stderr);
+    assert_eq!(warm_a.stdout, "stored: a\n");
+    assert_eq!(warm_a.stderr, cold_a.stderr);
+    assert_eq!(warm_full.stdout, "stored: whole file\n");
+    assert_eq!(warm_full.stderr, cold_full.stderr);
     assert_eq!(cache_entries(&home).len(), 3, "a warm read adds no entry");
 }
 
@@ -635,18 +673,7 @@ fn a_warm_symbol_read_is_served_from_the_entry_of_its_own_name() {
 
     // Replace the stored lines of the entry of `a` with a marker text. A warm
     // read of `a` must print it, and a warm read of `b` must not.
-    let entry_of_a = cache_entries(&home)
-        .into_iter()
-        .find(|path| {
-            let entry: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-            entry["content"] == cold_a.stdout.as_str()
-        })
-        .expect("the cold read of a wrote an entry that holds its lines");
-    let mut entry: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&entry_of_a).unwrap()).unwrap();
-    entry["content"] = serde_json::Value::from("stored lines of a\n");
-    fs::write(&entry_of_a, entry.to_string()).unwrap();
+    replace_stored_lines(&home, &cold_a, "stored lines of a\n");
 
     let warm_a = read_ok(&home, &["two.rs", "--symbol", "a"]);
     let warm_b = read_ok(&home, &["two.rs", "--symbol", "b"]);
@@ -660,13 +687,41 @@ fn a_warm_symbol_read_is_served_from_the_entry_of_its_own_name() {
 }
 
 #[test]
+fn a_stored_symbol_entry_without_a_notice_is_not_served() {
+    // TP-41 (the notice is unconditional, so an entry that lost it is a miss)
+    let home = symbol_home("two.rs", TWO_FUNCTIONS);
+    let cold = read_ok(&home, &["two.rs", "--symbol", "a"]);
+    assert!(
+        !cold.stderr.is_empty(),
+        "a symbol read prints a notice, or this test proves nothing"
+    );
+
+    // Drop the notice from the entry and change its lines, so a read that
+    // served the entry anyway would show it on stdout and print no notice.
+    edit_entry_of(&home, &cold, |entry| {
+        entry
+            .as_object_mut()
+            .expect("an entry is a JSON object")
+            .remove("notice")
+            .expect("the cold read stored its notice");
+        entry["content"] = serde_json::Value::from("stored lines of a\n");
+    });
+
+    let warm = read_ok(&home, &["two.rs", "--symbol", "a"]);
+
+    assert_eq!(
+        warm, cold,
+        "the read runs cold: the source lines and the notice are printed again"
+    );
+}
+
+#[test]
 fn a_warm_read_of_several_declarations_prints_the_same_headers_and_notice() {
     // TP-41 (the notice of a multi-match read is cached with its entry)
     let source = "fn dup() -> u32 {\n    1\n}\n\nfn dup(x: u32) -> u32 {\n    x\n}\n";
     let home = symbol_home("dup.rs", source);
 
     let cold = read_ok(&home, &["dup.rs", "--symbol", "dup"]);
-    let warm = read_ok(&home, &["dup.rs", "--symbol", "dup"]);
 
     assert!(
         cold.stdout.starts_with("==> dup.rs:1-3 dup (1 of 2) <==\n"),
@@ -678,7 +733,17 @@ fn a_warm_read_of_several_declarations_prints_the_same_headers_and_notice() {
         "[skim] --symbol \"dup\": 2 declarations, 6 of 7 lines shown (1 not shown) \
          — omit --symbol for the whole file\n"
     );
-    assert_eq!(warm, cold);
+
+    // Change one stored body line. Only a read served from the entry prints it,
+    // and it keeps the stored headers and the stored notice.
+    let stored = cold.stdout.replacen("    1\n", "    stored\n", 1);
+    assert_ne!(stored, cold.stdout, "the edit must change the stored lines");
+    replace_stored_lines(&home, &cold, &stored);
+
+    let warm = read_ok(&home, &["dup.rs", "--symbol", "dup"]);
+
+    assert_eq!(warm.stdout, stored);
+    assert_eq!(warm.stderr, cold.stderr);
 }
 
 #[test]

@@ -160,6 +160,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A file that reports no size has a bounded read.** A named pipe or a device file, for
+  example a symlink to `/dev/zero`, reports a size of 0. The size check passed it and the
+  read had no limit. Now the read stops at the 50MB input cap and fails with the same
+  `File too large` error. A named pipe below the cap reads as before.
+
 - **A commit counts as a fix only when its subject says so** (#597). `skim heatmap` fix risk
   and `skim search --risky` counted a commit as a fix when a fix keyword was anywhere in its
   subject, so `docs: explain later-fix proximity` and `feat: add bug report template` raised
