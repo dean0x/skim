@@ -2014,6 +2014,14 @@ mod tests {
                 "rewrite_to must name the tool the prefix names: {:?}",
                 rule.prefix
             );
+            // The engine puts `--via-npx` only on a strict prefix match. A
+            // global-flag match would keep the requirement and drop the flag,
+            // so the handler would start the bare tool.
+            assert!(
+                rule.global_value_flags.is_empty(),
+                "a local-bin npx rule must have no global value flags: {:?}",
+                rule.prefix
+            );
             let tool = NpxTool::from_bin(rule.prefix[1])
                 .unwrap_or_else(|| panic!("no NpxTool for {:?}", rule.prefix));
             assert_eq!(npx_local_tool(rule.prefix), Some(tool));

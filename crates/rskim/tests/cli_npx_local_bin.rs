@@ -551,12 +551,15 @@ mod via_npx {
 
             let outcome = rig.run(&case.args());
 
-            assert_ne!(outcome.code, Some(0), "{:?}", case.words);
-            assert!(
-                outcome.stderr.contains("'npx' not found"),
-                "{:?}: stderr={:?}",
-                case.words,
-                outcome.stderr
+            assert_eq!(outcome.code, Some(1), "{:?}", case.words);
+            assert_eq!(
+                outcome.stderr,
+                format!(
+                    "error: 'npx' not found; it must be on PATH to run the project's '{}'\n",
+                    case.tool
+                ),
+                "{:?}: one error line, with one prefix, on every handler path",
+                case.words
             );
             assert!(
                 !outcome.stderr.contains("npm install -g")

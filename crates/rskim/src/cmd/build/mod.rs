@@ -330,7 +330,13 @@ pub(super) fn run_parsed_command(
                         "{program}: command not found\n\
                          Hint: {hint}"
                     ),
-                    None => anyhow::bail!("{}", launch.spawn_error_line()),
+                    // The line carries its own `error:` prefix. Print it here,
+                    // as the lint path does, so that `main` does not add a
+                    // second `Error:` in front of it.
+                    None => {
+                        eprintln!("{}", launch.spawn_error_line());
+                        return Ok(ExitCode::FAILURE);
+                    }
                 }
             }
             return Err(e);

@@ -872,19 +872,36 @@ enum LoopRefusal {
 }
 
 impl LoopRefusal {
-    /// The one stderr line for this refusal.  It names the tool, and says how
-    /// to cure the cause.
-    fn line(&self, tool: &str) -> String {
-        let cause = match self {
-            Self::SelfFirstOnPath => format!("the first {tool} on PATH is skim itself"),
-            Self::SameToolParent => format!("a skim named {tool} started it"),
+    /// What went wrong, for a process named `name`.
+    fn cause(&self, name: &str) -> String {
+        match self {
+            Self::SelfFirstOnPath => format!("the first {name} on PATH is skim itself"),
+            Self::SameToolParent => format!("a skim named {name} started it"),
             Self::TooDeep => format!(
                 "skim started itself {SKIM_DEPTH_LIMIT} times in a row (limit {SKIM_DEPTH_LIMIT})"
             ),
-        };
+        }
+    }
+
+    /// The one stderr line for a refused wrapper start.  It names the tool, and
+    /// says how to cure the cause.
+    fn line(&self, tool: &str) -> String {
         format!(
-            "error: {tool}: {cause}; a link or copy of skim named {tool} is on PATH outside \
-             the skim wrappers folder — remove it or run the real {tool} by its full path"
+            "error: {tool}: {}; a link or copy of skim named {tool} is on PATH outside \
+             the skim wrappers folder — remove it or run the real {tool} by its full path",
+            self.cause(tool)
+        )
+    }
+
+    /// The one stderr line for a refused `skim`-typed start, named `program`.
+    ///
+    /// Only the depth limit refuses such a start.  No link named for a tool is
+    /// known then, so the cure names the program that starts skim again.
+    fn plain_line(&self, program: &str) -> String {
+        format!(
+            "error: {program}: {}; a program that skim starts runs skim again — remove \
+             that program or run the real tool by its full path",
+            self.cause(program)
         )
     }
 }
@@ -1246,10 +1263,16 @@ fn main() -> ExitCode {
     // tool.  A start that would only start itself again stops here with exit
     // 126, before it starts any other process.
     if let Err(refusal) = strip_skim_wrappers_from_path().and_then(|()| enter_skim_level()) {
-        let named = wrapper_tool_from_argv0()
-            .or_else(|| extract_argv0_stem(&std::env::args().next()?))
-            .unwrap_or_else(|| "skim".to_string());
-        eprintln!("{}", refusal.line(&named));
+        let line = match wrapper_tool_from_argv0() {
+            Some(tool) => refusal.line(&tool),
+            None => refusal.plain_line(
+                &std::env::args()
+                    .next()
+                    .and_then(|argv0| extract_argv0_stem(&argv0))
+                    .unwrap_or_else(|| "skim".to_string()),
+            ),
+        };
+        eprintln!("{line}");
         return ExitCode::from(RESTART_REFUSED_EXIT);
     }
 
@@ -3060,6 +3083,20 @@ mod tests {
              of skim named git is on PATH outside the skim wrappers folder — remove it or \
              run the real git by its full path"
         );
+    }
+
+    /// A `skim`-typed start has no tool name, so its line must not blame a
+    /// "link of skim named skim".
+    #[test]
+    fn plain_refusal_line_names_the_program_and_not_a_tool_link() {
+        let line = LoopRefusal::TooDeep.plain_line("skim");
+        assert_eq!(
+            line,
+            "error: skim: skim started itself 32 times in a row (limit 32); a program that \
+             skim starts runs skim again — remove that program or run the real tool by its \
+             full path"
+        );
+        assert!(!line.contains("named skim"), "{line:?}");
     }
 
     /// Temp tree for PATH tests: a stand-in for the running binary, plus the

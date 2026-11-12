@@ -432,6 +432,11 @@ mod wrapper_path_loop {
             stderr.starts_with("error: skim: skim started itself 32 times in a row (limit 32)"),
             "stderr={stderr:?}"
         );
+        assert_eq!(stderr.lines().count(), 1, "one line: {stderr:?}");
+        assert!(
+            stderr.contains("a program that skim starts runs skim again"),
+            "a skim-typed start has no tool link to blame: {stderr:?}"
+        );
 
         let allowed = common::skim_sandboxed(home.path())
             .env("SKIM_DEPTH", "31")
