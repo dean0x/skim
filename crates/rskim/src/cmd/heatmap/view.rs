@@ -203,15 +203,16 @@ pub(crate) fn more_line(hidden: usize, remedy: MoreRemedy) -> Option<String> {
 }
 
 /// The "more" line with the count of rows that the non-code rule left out
-/// added, or `None` when no row is hidden or left out. `noun` names the
-/// left-out rows (for example "doc and non-code files").
+/// added, or `None` when no row is hidden or left out. `nouns` name one and
+/// several left-out rows (for example "non-code file", "non-code files").
 #[must_use]
 pub(crate) fn more_and_left_out_line(
     hidden: usize,
     remedy: MoreRemedy,
     left_out: usize,
-    noun: &str,
+    nouns: (&str, &str),
 ) -> Option<String> {
+    let noun = if left_out == 1 { nouns.0 } else { nouns.1 };
     let left = (left_out > 0).then(|| format!("{left_out} {noun} left out (--include-docs)"));
     match (more_line(hidden, remedy), left) {
         (Some(more), Some(left)) => Some(format!("{more}; {left}")),
@@ -478,16 +479,23 @@ impl<'a> HeatmapView<'a> {
     /// left out, and names `--include-docs`.
     #[must_use]
     pub(crate) fn more(&self, section: DetailSection) -> Option<String> {
-        let (left_out, noun) = match section {
-            DetailSection::Hotspots => (self.hotspots.left_out, "doc and non-code files"),
-            DetailSection::Modules => (self.modules.left_out, "non-code folders"),
-            DetailSection::Coupling | DetailSection::FixRisk | DetailSection::BusFactor => (0, ""),
+        let (left_out, nouns) = match section {
+            DetailSection::Hotspots => {
+                (self.hotspots.left_out, ("non-code file", "non-code files"))
+            }
+            DetailSection::Modules => (
+                self.modules.left_out,
+                ("non-code folder", "non-code folders"),
+            ),
+            DetailSection::Coupling | DetailSection::FixRisk | DetailSection::BusFactor => {
+                (0, ("", ""))
+            }
         };
         more_and_left_out_line(
             self.count(section).hidden(),
             self.spec.remedy(section),
             left_out,
-            noun,
+            nouns,
         )
     }
 
@@ -894,7 +902,7 @@ mod tests {
         assert_eq!(view.hotspots.left_out, 3);
         assert_eq!(
             view.more(DetailSection::Hotspots).as_deref(),
-            Some("3 doc and non-code files left out (--include-docs)")
+            Some("3 non-code files left out (--include-docs)")
         );
 
         let all = ViewSpec {
@@ -917,7 +925,7 @@ mod tests {
         let view = build_view(&result, &DEFAULT_VIEW);
         assert_eq!(
             view.more(DetailSection::Hotspots).as_deref(),
-            Some("2 more (--detail hotspots); 1 doc and non-code files left out (--include-docs)")
+            Some("2 more (--detail hotspots); 1 non-code file left out (--include-docs)")
         );
     }
 

@@ -375,7 +375,7 @@ pub(crate) fn render_insights_text(result: &HeatmapResult, insights: &InsightsRe
         insights.counts.insights.hidden(),
         MoreRemedy::Top,
         insights.counts.left_out,
-        "doc and non-code findings",
+        ("non-code finding", "non-code findings"),
     ) {
         push_line(&mut out, &format!("  {more}"));
     }
@@ -997,13 +997,13 @@ mod tests {
         let text = render_insights_text(&result, &insights);
         assert_eq!(
             text.lines().last(),
-            Some("  2 more (raise --top); 7 doc and non-code findings left out (--include-docs)")
+            Some("  2 more (raise --top); 7 non-code findings left out (--include-docs)")
         );
         insights.counts.insights.total = 1;
         let text = render_insights_text(&result, &insights);
         assert_eq!(
             text.lines().last(),
-            Some("  7 doc and non-code findings left out (--include-docs)")
+            Some("  7 non-code findings left out (--include-docs)")
         );
     }
 

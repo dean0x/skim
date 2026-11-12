@@ -1,4 +1,6 @@
-# Usage Guide
+| `--include-docs` | false | Keep doc files and non-code folders in the hotspots, modules and insights (see Non-Code Paths) |
+| `--detail <SECTION>` | — | Show 25 rows (or `--top N`) of one section:| Fix commit | The subject says that the commit fixes something: a `[fix]` tag, a `fix:` / `fix(scope):` / `fix!:` type (also `bug`, `hotfix`, `patch`, `revert`), or one of these words first in the subject, for example `Revert "..."` or `docs: fix link`. A word inside a description does not count (`docs: explain later-fix proximity` is not a fix). `skim search --risky` uses the same rule. |
+| `--detail <SECTION>` | 25 rows | `N more (raise --top)` | Doc files and non-code folders are left out (see Non-Code Paths). |# Usage Guide
 
 ## Command Syntax
 
@@ -157,7 +159,7 @@ Analyzes git commit history to surface risk hotspots: high-churn files, tightly 
 
 ```bash
 skim heatmap [OPTIONS]              # short ranked view
-skim heatmap --detail <SECTION>     # all rows of one section
+skim heatmap --detail <SECTION>     # 25 rows of one section
 skim heatmap --insights             # ranked CRITICAL/WARNING findings
 skim heatmap [OPTIONS] <FILE>...    # one "before you edit" card per file
 ```
@@ -172,11 +174,11 @@ The default text view is 30 lines or fewer. The first line names the repository 
 | Coupling | 5 | Confidence, shared commits, then the two paths. Code-to-code pairs only: a pair with a doc file (`.md`, `.rst`, `.txt`, …) is not shown. |
 | Fix risk | 5 | Fix commits/commits, lift and base rate, then the path. Only files whose fix rate is above the repository base rate. |
 
-A capped section ends with one line that gives the exact hidden count and the section to open, for example `570 more (--detail coupling)`. Module health and bus factor are not in the default view; `--detail` shows them.
+A capped section ends with one line that gives the exact hidden count and the section to open, for example `570 more (--detail coupling)`. When the non-code rule leaves out rows, the same line counts them, for example `1711 more (--detail hotspots); 130 non-code files left out (--include-docs)`. Module health and bus factor are not in the default view; `--detail` shows them. The last line points to the per-file card: `Before you edit a file: skim heatmap <file>`.
 
 #### Sections (`--detail`)
 
-`--detail <SECTION>` shows only that section, with all its rows (or `--top N` rows). An unknown name exits 1 and lists the valid names. `--detail` can be given once, and it does not combine with `--insights` or with file arguments.
+`--detail <SECTION>` shows only that section, with 25 rows (or `--top N` rows), then one `N more (raise --top)` line. An unknown name exits 1 and lists the valid names. `--detail` can be given once, and it does not combine with `--insights` or with file arguments.
 
 | Name | Description |
 |------|-------------|
@@ -198,6 +200,10 @@ A capped section ends with one line that gives the exact hidden count and the se
 | Large commits | A commit with more than 50 files adds no coupling pairs; a warning line counts these commits. |
 
 `files[]` in the JSON keeps the raw per-file values (for example `churn.commits` and `fix_risk.keyword_pct`) for files below these minimums.
+
+#### Non-Code Paths
+
+Doc files (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.txt`, `*.adoc`) and the files under the top folders `docs`, `doc`, `.github`, `.devflow`, `tests` and `test` stay out of the hotspots (and so `files[]`) and the insights. Those folders stay out of the modules. A `tests` folder inside a crate or package (`crates/x/tests/`) stays in. The "more" line counts what is left out; JSON gives `left_out.{hotspots,modules}`, and `--insights --json` gives `counts.left_out`. `--include-docs` keeps them all. Coupling never pairs a doc file, and a file card shows any path.
 
 #### Caps and `--top`
 
