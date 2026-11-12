@@ -658,6 +658,73 @@ fn test_is_fix_commit_word_boundary() {
 }
 
 #[test]
+fn test_is_fix_commit_matches_conventional_scope_and_breaking_prefix() {
+    assert!(is_fix_commit("fix(init): finish the setup"));
+    assert!(is_fix_commit("fix!: drop the old flag"));
+    assert!(is_fix_commit("fix(cli)!: rename --foo"));
+    assert!(is_fix_commit("revert(search): undo the cap"));
+    assert!(is_fix_commit("fix:no space after the colon"));
+}
+
+#[test]
+fn test_is_fix_commit_matches_keyword_as_first_word_of_description() {
+    assert!(is_fix_commit("docs: fix the broken link"));
+    assert!(is_fix_commit("chore(ci): fix flaky job"));
+    assert!(is_fix_commit("  Fix trailing whitespace"));
+    assert!(is_fix_commit("Fix: typo"));
+    assert!(is_fix_commit("fix"));
+}
+
+/// Go and Linux-kernel histories prefix the subject with a package path.
+#[test]
+fn test_is_fix_commit_matches_path_style_prefix() {
+    assert!(is_fix_commit("net/http: fix race"));
+    assert!(is_fix_commit("mm/slab: fix leak"));
+    assert!(is_fix_commit("crates/rskim: fix exit code"));
+    assert!(is_fix_commit("x/tools/gopls: revert \"faster load\""));
+    assert!(!is_fix_commit("net/http: add bug report link"));
+}
+
+/// A tag that is not a keyword is not a first word.
+#[test]
+fn test_is_fix_commit_tag_with_more_words_is_not_a_fix() {
+    assert!(!is_fix_commit("[fix it] crash on load"));
+    assert!(!is_fix_commit("[bug 4521] handle empty input"));
+    assert!(!is_fix_commit("[core][fix later] add x"));
+}
+
+#[test]
+fn test_is_fix_commit_matches_leading_tags() {
+    assert!(is_fix_commit("[fix] crash on load"));
+    assert!(is_fix_commit("[core] fix crash on load"));
+    assert!(is_fix_commit("[core][parser] Revert \"faster scan\""));
+    assert!(is_fix_commit("[core] fix(parser): crash on load"));
+}
+
+/// Issue #597: a keyword inside a description is not a fix.
+#[test]
+fn test_is_fix_commit_keyword_inside_description_is_not_a_fix() {
+    assert!(!is_fix_commit("docs: explain later-fix proximity"));
+    assert!(!is_fix_commit("feat: add bug report template"));
+    assert!(!is_fix_commit("feat(heatmap): count fix commits per file"));
+    assert!(!is_fix_commit("refactor: move the patch parser"));
+    assert!(!is_fix_commit("Update README after the hotfix"));
+    assert!(!is_fix_commit("chore: prepare revert tooling"));
+    assert!(!is_fix_commit("test: cover the fix-risk lift"));
+    assert!(!is_fix_commit("feat: fix-up mode for rebase"));
+    assert!(!is_fix_commit("[core] add bug tracker link"));
+}
+
+#[test]
+fn test_is_fix_commit_empty_and_odd_subjects() {
+    assert!(!is_fix_commit(""));
+    assert!(!is_fix_commit("   "));
+    assert!(!is_fix_commit("[unclosed tag fix"));
+    assert!(!is_fix_commit("[]"));
+    assert!(!is_fix_commit("feat:"));
+}
+
+#[test]
 fn test_is_fix_commit_no_match() {
     assert!(!is_fix_commit("add new feature"));
     assert!(!is_fix_commit("refactor: improve readability"));
@@ -731,7 +798,7 @@ fn test_commit_info_serialization_roundtrip() {
 ///   feature: B1 (b.txt, "fix: bug one")    → B2 (b.txt, "fix: bug two")
 ///   HEAD:    M (merge(#1): feature → main, 2 parents)
 ///
-/// The merge commit's subject never matches FIX_REGEX. All four non-merge
+/// The merge commit's subject is not a fix subject. All four non-merge
 /// commits have deterministic dates so concurrent test runs are stable (PF-012).
 fn init_merge_fixture() -> Option<TempDir> {
     let dir = init_git_repo()?;

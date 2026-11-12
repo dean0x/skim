@@ -343,6 +343,7 @@ pub(crate) fn build_cards(
     Section {
         rows,
         total: targets.len(),
+        left_out: 0,
     }
 }
 
@@ -491,6 +492,7 @@ mod tests {
         ViewSpec {
             detail: None,
             top: None,
+            include_docs: false,
         }
         .lists()
     }

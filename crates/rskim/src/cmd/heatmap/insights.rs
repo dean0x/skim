@@ -17,7 +17,7 @@ use super::types::{
     CompactFileEntry, CompactModuleEntry, Count, FileMetrics, HeatmapResult, Insight,
     InsightCategory, InsightCounts, InsightsResult, ModuleHealth, Severity,
 };
-use super::view::{JSON_VERSION, repo_name};
+use super::view::{JSON_VERSION, ViewSpec, repo_name};
 
 // ============================================================================
 // Internal helpers
@@ -237,13 +237,29 @@ fn insight_order(x: &Insight, y: &Insight) -> Ordering {
         .then_with(|| x.message.cmp(&y.message))
 }
 
+/// The findings of `ranked` that `spec` keeps, in the same order, and the
+/// count of findings left out because their file or module is not product
+/// code (see [`ViewSpec::leaves_out`]).
+#[must_use]
+pub(crate) fn keep_code_findings(ranked: Vec<Insight>, spec: ViewSpec) -> (Vec<Insight>, usize) {
+    let all = ranked.len();
+    let kept: Vec<Insight> = ranked
+        .into_iter()
+        .filter(|i| !spec.leaves_out(&i.file))
+        .collect();
+    let left_out = all - kept.len();
+    (kept, left_out)
+}
+
 /// The `--insights` result: the first `cap` findings of `ranked` (already in
-/// rank order), their count, the files and modules of those findings, and
-/// every warning of the run.
+/// rank order), their count, the count of findings that the non-code rule
+/// left out, the files and modules of the shown findings, and every warning
+/// of the run.
 pub(crate) fn build_insights_result(
     result: &HeatmapResult,
     mut ranked: Vec<Insight>,
     cap: usize,
+    left_out: usize,
 ) -> InsightsResult {
     let total = ranked.len();
     ranked.truncate(cap);
@@ -256,6 +272,7 @@ pub(crate) fn build_insights_result(
                 total,
                 shown: ranked.len(),
             },
+            left_out,
         },
         top_files: build_compact_files(result, &ranked),
         flagged_modules: build_flagged_modules(result, &ranked),
@@ -899,10 +916,50 @@ mod tests {
     }
 
     #[test]
+    fn test_keep_code_findings_leaves_out_doc_files_and_non_code_folders() {
+        let mut result = make_empty_result();
+        result.files = ["CLAUDE.md", "src/a.rs", ".github/ci.yml"]
+            .into_iter()
+            .map(|path| {
+                make_file(FileSpec {
+                    path,
+                    stability: 20,
+                    ..FileSpec::default()
+                })
+            })
+            .collect();
+        result.modules = vec![make_module("docs", 5.0), make_module("crates/core", 5.0)];
+        let spec = ViewSpec {
+            detail: None,
+            top: None,
+            include_docs: false,
+        };
+        let (kept, left_out) = keep_code_findings(compute_insights(&result), spec);
+        let mut files: Vec<&str> = kept.iter().map(|i| i.file.as_str()).collect();
+        files.sort_unstable();
+        assert_eq!(files, ["crates/core", "src/a.rs"]);
+        assert_eq!(left_out, 3);
+
+        let all = ViewSpec {
+            include_docs: true,
+            ..spec
+        };
+        let (kept, left_out) = keep_code_findings(compute_insights(&result), all);
+        assert_eq!((kept.len(), left_out), (5, 0));
+
+        let ir = build_insights_result(&result, vec![], 20, 3);
+        let json = serde_json::to_value(&ir).unwrap();
+        assert_eq!(json["counts"]["left_out"], 3);
+        let none = build_insights_result(&result, vec![], 20, 0);
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json["counts"].get("left_out").is_none(), "{json}");
+    }
+
+    #[test]
     fn test_build_insights_result_gives_the_repository_name_not_the_path() {
         let mut result = four_findings();
         result.repository = "/home/dev/work/test-repo".to_string();
-        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        let ir = build_insights_result(&result, compute_insights(&result), 20, 0);
         assert_eq!(ir.repository, "test-repo");
     }
 
@@ -910,14 +967,14 @@ mod tests {
     fn test_build_insights_result_keeps_every_run_warning() {
         let mut result = four_findings();
         result.warnings = vec!["first".into(), "second".into(), "third".into()];
-        let ir = build_insights_result(&result, compute_insights(&result), 1);
+        let ir = build_insights_result(&result, compute_insights(&result), 1, 0);
         assert_eq!(ir.warnings, ["first", "second", "third"]);
     }
 
     #[test]
     fn test_build_insights_result_caps_findings_and_lists_only_shown_files() {
         let result = four_findings();
-        let ir = build_insights_result(&result, compute_insights(&result), 2);
+        let ir = build_insights_result(&result, compute_insights(&result), 2, 0);
         assert_eq!(ir.version, 2);
         assert_eq!(ir.counts.insights, Count { total: 4, shown: 2 });
         assert_eq!(
@@ -938,7 +995,7 @@ mod tests {
     #[test]
     fn test_build_insights_result_flags_the_modules_of_shown_findings() {
         let result = four_findings();
-        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        let ir = build_insights_result(&result, compute_insights(&result), 20, 0);
         assert_eq!(ir.counts.insights, Count { total: 4, shown: 4 });
         let modules: Vec<&str> = ir.flagged_modules.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(modules, ["m"]);
@@ -957,7 +1014,7 @@ mod tests {
             author_count: 2,
             ..Default::default()
         }));
-        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        let ir = build_insights_result(&result, compute_insights(&result), 20, 0);
         assert_eq!(ir.top_files.len(), 1, "one entry for two findings");
         let entry = &ir.top_files[0];
         assert_eq!(entry.path, "src/main.rs");
@@ -978,7 +1035,7 @@ mod tests {
             author_count: 1,
             ..Default::default()
         }));
-        let ir = build_insights_result(&result, compute_insights(&result), 20);
+        let ir = build_insights_result(&result, compute_insights(&result), 20, 0);
         assert_eq!(ir.top_files.len(), 1);
         assert!(
             !ir.top_files[0].bus_factor_risk,

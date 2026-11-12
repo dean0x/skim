@@ -132,6 +132,7 @@ pub(super) fn resolve_config(
         format_json: args.format_json,
         top_n: args.top_n,
         no_exclude: args.no_exclude,
+        include_docs: args.include_docs,
         extra_excludes: args.extra_excludes,
         coupling_threshold: args.coupling_threshold,
         fix_window: args.fix_window,

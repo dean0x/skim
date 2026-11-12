@@ -13,7 +13,8 @@ use super::card::{Card, CardCounts};
 use super::noise;
 use super::types::{DetailSection, HeatmapResult, InsightsResult, Severity, WindowInfo};
 use super::view::{
-    HeatmapView, ListCaps, MoreRemedy, Section, more_line, repo_name, text_warnings,
+    CARD_HINT, HeatmapView, ListCaps, MoreRemedy, Section, more_and_left_out_line, repo_name,
+    text_warnings,
 };
 
 // ============================================================================
@@ -35,6 +36,7 @@ pub(crate) fn render_json(
 // ============================================================================
 
 /// Render the default text view, or the one section that `--detail` names.
+/// The default view ends with one line that points to the per-file card.
 pub(crate) fn render_text(result: &HeatmapResult, view: &HeatmapView<'_>) -> String {
     let mut out = String::new();
     push_line(&mut out, &header_line("Heatmap", result));
@@ -43,6 +45,9 @@ pub(crate) fn render_text(result: &HeatmapResult, view: &HeatmapView<'_>) -> Str
         if view.spec.shows(section) {
             push_section(&mut out, view, section);
         }
+    }
+    if view.spec.detail.is_none() {
+        push_line(&mut out, CARD_HINT);
     }
     out
 }
@@ -366,7 +371,12 @@ pub(crate) fn render_insights_text(result: &HeatmapResult, insights: &InsightsRe
             ),
         );
     }
-    if let Some(more) = more_line(insights.counts.insights.hidden(), MoreRemedy::Top) {
+    if let Some(more) = more_and_left_out_line(
+        insights.counts.insights.hidden(),
+        MoreRemedy::Top,
+        insights.counts.left_out,
+        ("non-code finding", "non-code findings"),
+    ) {
         push_line(&mut out, &format!("  {more}"));
     }
     out
@@ -404,6 +414,7 @@ mod tests {
     const DEFAULT_VIEW: ViewSpec = ViewSpec {
         detail: None,
         top: None,
+        include_docs: false,
     };
 
     fn make_result() -> HeatmapResult {
@@ -538,8 +549,9 @@ mod tests {
         let text = text_of(&result, DEFAULT_VIEW);
         let lines: Vec<&str> = text.lines().collect();
         // header 1, warnings 2, then heading + rows + more line per section:
-        // hotspots 1 + 10 + 1, coupling 1 + 5 + 1, fix risk 1 + 5 + 1.
-        assert_eq!(lines.len(), 29, "{text}");
+        // hotspots 1 + 10 + 1, coupling 1 + 5 + 1, fix risk 1 + 5 + 1, then
+        // the card hint line.
+        assert_eq!(lines.len(), 30, "{text}");
         assert!(lines.len() <= 30);
         assert!(lines.iter().all(|l| !l.is_empty()), "no blank line: {text}");
         assert_eq!(lines[2], "3 more warnings (--json)");
@@ -615,8 +627,10 @@ mod tests {
                 "Hotspots (commits):",
                 "Coupling (confidence, shared commits):",
                 "Fix risk (fix commits/commits, lift, base rate):",
+                CARD_HINT,
             ]
         );
+        assert_eq!(text.lines().last(), Some(CARD_HINT));
         assert!(text.is_ascii(), "{text}");
     }
 
@@ -690,6 +704,7 @@ mod tests {
         let spec = ViewSpec {
             detail: Some(DetailSection::Modules),
             top: None,
+            include_docs: false,
         };
         let text = text_of(&result, spec);
         let lines: Vec<&str> = text.lines().collect();
@@ -707,6 +722,7 @@ mod tests {
         let spec = ViewSpec {
             detail: Some(DetailSection::Hotspots),
             top: Some(1),
+            include_docs: false,
         };
         let text = text_of(&result, spec);
         assert_eq!(
@@ -871,6 +887,7 @@ mod tests {
         let cards = Section {
             rows: vec![card_with("Test User", "Ada", "fix: a")],
             total: 3,
+            left_out: 0,
         };
         let text = render_cards_text(&make_result(), &cards, DEFAULT_VIEW.lists());
         assert_eq!(text.lines().last(), Some("2 more files (raise --top)"));
@@ -886,6 +903,7 @@ mod tests {
         let caps = ViewSpec {
             detail: None,
             top: Some(5),
+            include_docs: false,
         }
         .lists();
         assert_eq!(
@@ -920,6 +938,7 @@ mod tests {
                     total,
                     shown: insights.len(),
                 },
+                left_out: 0,
             },
             insights,
             top_files: vec![CompactFileEntry {
@@ -963,6 +982,40 @@ mod tests {
                 "  3 more (raise --top)",
             ]
         );
+    }
+
+    #[test]
+    fn test_insights_text_more_line_counts_left_out_findings() {
+        let result = make_result();
+        let shown = vec![make_insight(
+            Severity::Critical,
+            "a.rs",
+            "critically unstable (score 22/100, 9 commits)",
+        )];
+        let mut insights = insights_of(shown, 3);
+        insights.counts.left_out = 7;
+        let text = render_insights_text(&result, &insights);
+        assert_eq!(
+            text.lines().last(),
+            Some("  2 more (raise --top); 7 non-code findings left out (--include-docs)")
+        );
+        insights.counts.insights.total = 1;
+        let text = render_insights_text(&result, &insights);
+        assert_eq!(
+            text.lines().last(),
+            Some("  7 non-code findings left out (--include-docs)")
+        );
+    }
+
+    #[test]
+    fn test_text_detail_view_has_no_card_hint() {
+        let result = make_result();
+        let spec = ViewSpec {
+            detail: Some(DetailSection::Hotspots),
+            ..DEFAULT_VIEW
+        };
+        let text = text_of(&result, spec);
+        assert!(!text.contains(CARD_HINT), "{text}");
     }
 
     #[test]

@@ -4466,7 +4466,7 @@ fn test_zero_row_notice_shallow_wins_over_zero_commits() {
 ///
 /// This is the classifier-parity proof that #407 exists to establish.  Before
 /// #407, `parse_history` returned only first-parent commits and their messages
-/// were merge subjects (`merge(#NNN): …`) which never matched `FIX_REGEX`.
+/// were merge subjects (`merge(#NNN): …`) which `is_fix_commit` never called fixes.
 /// After #407, branch commits with real fix subjects (`fix: …`, `bug: …`) flow
 /// into `sync_history_to_db` / `aggregate_file_stats`, and `fix_commits` in
 /// the DB must reflect the exact same classification that `is_fix_commit` gives
@@ -4523,12 +4523,12 @@ fn test_risk_rows_match_is_fix_commit_over_same_history() {
         .count() as u32;
     assert_eq!(
         expected_fix, 2,
-        "T-407-16 fixture sanity: 'fix: bug one' and 'fix: bug two' must match FIX_REGEX"
+        "T-407-16 fixture sanity: 'fix: bug one' and 'fix: bug two' must pass is_fix_commit"
     );
     assert_eq!(
         expected_total - expected_fix,
         1,
-        "T-407-16 fixture sanity: 'feat: new feature' must NOT match FIX_REGEX"
+        "T-407-16 fixture sanity: 'feat: new feature' must NOT pass is_fix_commit"
     );
 
     let src = FixedSource {
