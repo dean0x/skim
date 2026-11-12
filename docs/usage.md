@@ -174,7 +174,7 @@ The default text view is 30 lines or fewer. The first line names the repository 
 | Coupling | 5 | Confidence, shared commits, then the two paths. Code-to-code pairs only: a pair with a doc file (`.md`, `.rst`, `.txt`, …) is not shown. |
 | Fix risk | 5 | Fix commits/commits, lift and base rate, then the path. Only files whose fix rate is above the repository base rate. |
 
-A capped section ends with one line that gives the exact hidden count and the section to open, for example `570 more (--detail coupling)`. When the non-code rule leaves out rows, the same line counts them, for example `1711 more (--detail hotspots); 130 non-code files left out (--include-docs)`. Module health and bus factor are not in the default view; `--detail` shows them. The last line points to the per-file card: `Before you edit a file: skim heatmap <file>`.
+A capped section ends with one line that gives the exact hidden count and the section to open, for example `570 more (--detail coupling)`. When the non-code rule leaves out rows, the same line counts them, for example `864 more (--detail hotspots); 847 non-code files left out (--include-docs)`. Module health and bus factor are not in the default view; `--detail` shows them. The last line points to the per-file card: `Before you edit a file: skim heatmap <file>`.
 
 #### Sections (`--detail`)
 
