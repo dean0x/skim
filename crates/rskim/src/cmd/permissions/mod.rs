@@ -14,19 +14,22 @@
 //! ## Seed derivation
 //!
 //! The seeded tool list is the intersection of `READ_ONLY_SUBCOMMANDS` and
-//! `wrapper_targets()` — always exactly 7 tools:
-//! `df`, `diff`, `du`, `grep`, `ls`, `tree`, `wc`.
+//! `wrapper_targets()` — always exactly 6 tools:
+//! `df`, `diff`, `du`, `grep`, `ls`, `wc`.
 //!
 //! A `Bash(skim <tool>:*)` prefix entry does NOT bound the wrapped tool's
 //! arguments, so only arg-safe read-only tools may ever be seeded. A tool with
-//! an option that starts another program (`rg --pre`) is not arg-safe.
+//! an option that writes a file or starts a program that the caller names is
+//! not arg-safe (see the `READ_ONLY_SUBCOMMANDS` invariants).
 //!
 //! ## Retired seed entries
 //!
 //! When a tool leaves the seed list, the user-owned writers (Claude, Copilot)
 //! remove its entry on the next seed run, but only when a seed-tier sidecar
-//! recorded it ([`retired_seed_entries`]). The skim-owned writers (Gemini,
-//! Codex) regenerate their whole file, so they need no extra step.
+//! recorded it ([`retired_seed_entries`]). Copilot removes it from every
+//! project in its file, because one sidecar serves all projects. The
+//! skim-owned writers (Gemini, Codex) regenerate their whole file, so they
+//! need no extra step.
 //!
 //! ## Registry invariant
 //!
@@ -237,7 +240,7 @@ pub(super) fn hash_if_bounded(path: &std::path::Path) -> anyhow::Result<Option<S
 /// Compute the agent-native seed entries for a permissions protocol.
 ///
 /// The seed tool list is `READ_ONLY_SUBCOMMANDS ∩ wrapper_targets()`, which
-/// is always exactly the 7 tools declared in `READ_ONLY_SUBCOMMANDS` (registry
+/// is always exactly the 6 tools declared in `READ_ONLY_SUBCOMMANDS` (registry
 /// tests enforce that it is a strict subset of `wrapper_targets()`).
 ///
 /// Each tool is mapped through `protocol.render_entry(tool)` to produce the
@@ -276,6 +279,33 @@ pub(super) fn retired_seed_entries(config_dir: &Path, entries: &[String]) -> Vec
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Write the seed-tier sidecar for `entries`, with the hash of `config_path`
+/// as it is on disk now. Used by the user-owned writers (Claude, Copilot)
+/// after a config write, and also when only the sidecar's record of a retired
+/// entry is stale (the entry is already gone from the config).
+pub(super) fn write_seed_sidecar(
+    config_dir: &Path,
+    config_path: &Path,
+    entries: &[String],
+) -> anyhow::Result<()> {
+    // skim wrote or size-checked the file just before this call; oversized here is unexpected.
+    let config_hash = hash_if_bounded(config_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} unexpectedly exceeds the size limit — \
+             this is an internal error; please file a bug report",
+            config_path.display()
+        )
+    })?;
+    let recorded = sidecar::PermissionSidecar {
+        version: 1,
+        tier: "seed".to_string(),
+        entries: entries.to_vec(),
+        source_mirrors: std::collections::HashMap::new(),
+        config_hash,
+    };
+    sidecar::write_sidecar(&config_dir.join(sidecar::SIDECAR_FILENAME), &recorded)
 }
 
 /// Remove every string in `targets` from `allow`; return the removed strings
@@ -360,14 +390,14 @@ mod tests {
         );
     }
 
-    // ---- literal-7 seed pin (Claude) ----
+    // ---- literal-6 seed pin (Claude) ----
 
-    /// Claude seeded entries must equal exactly the 7 `Bash(skim <tool>:*)` strings.
+    /// Claude seeded entries must equal exactly the 6 `Bash(skim <tool>:*)` strings.
     ///
     /// This test pins the entry set. Any future addition requires a deliberate
     /// edit to READ_ONLY_SUBCOMMANDS AND this assertion — drift is never silent.
     #[test]
-    fn test_claude_seeded_entries_exact_7() {
+    fn test_claude_seeded_entries_exact_6() {
         let protocol = permissions_protocol_for_agent(AgentKind::ClaudeCode).unwrap();
         let entries = seeded_entries(protocol.as_ref());
         assert_eq!(
@@ -378,18 +408,17 @@ mod tests {
                 "Bash(skim du:*)",
                 "Bash(skim grep:*)",
                 "Bash(skim ls:*)",
-                "Bash(skim tree:*)",
                 "Bash(skim wc:*)",
             ],
-            "Claude seeded entries must be exactly the 7 Bash(skim <tool>:*) strings (sorted)"
+            "Claude seeded entries must be exactly the 6 Bash(skim <tool>:*) strings (sorted)"
         );
     }
 
-    /// No agent's seed list may name `rg`: its `--pre`, `--hostname-bin` and
-    /// `-z` options start another program, and every seeded rule is a prefix
-    /// rule that does not bound the arguments.
+    /// No agent's seed list may name `rg` or `tree`: each has an option that
+    /// is not read-only, and every seeded rule is a prefix rule that does not
+    /// bound the arguments.
     #[test]
-    fn test_no_agent_seeds_rg() {
+    fn test_no_agent_seeds_rg_or_tree() {
         for &agent in &[
             AgentKind::ClaudeCode,
             AgentKind::GeminiCli,
@@ -397,13 +426,15 @@ mod tests {
             AgentKind::CopilotCli,
         ] {
             let p = permissions_protocol_for_agent(agent).unwrap();
-            let rg_entry = p.render_entry("rg");
             let entries = seeded_entries(p.as_ref());
-            assert!(
-                !entries.contains(&rg_entry),
-                "{agent:?} must not seed '{rg_entry}', got {entries:?}"
-            );
-            assert_eq!(entries.len(), 7, "{agent:?} must seed exactly 7 entries");
+            for tool in ["rg", "tree"] {
+                let entry = p.render_entry(tool);
+                assert!(
+                    !entries.contains(&entry),
+                    "{agent:?} must not seed '{entry}', got {entries:?}"
+                );
+            }
+            assert_eq!(entries.len(), 6, "{agent:?} must seed exactly 6 entries");
         }
     }
 

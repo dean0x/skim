@@ -457,13 +457,13 @@ mod tests {
         assert!(!sidecar.config_hash.is_empty());
     }
 
-    /// An install that an older skim seeded with `rg` is stale for the
-    /// current list, and a re-seed regenerates the rules file without it.
+    /// An install that an older skim seeded with `rg` and `tree` is stale for the
+    /// current list, and a re-seed regenerates the rules file without them.
     #[test]
     fn test_reseed_drops_rule_retired_from_seed_list() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = protocol();
-        let old = vec!["df".to_string(), "rg".to_string()];
+        let old = vec!["df".to_string(), "rg".to_string(), "tree".to_string()];
         p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
 
         let entries = seeded_entries(p.as_ref());
@@ -476,13 +476,13 @@ mod tests {
         match outcome {
             SeedOutcome::Added {
                 entries_removed, ..
-            } => assert_eq!(entries_removed, vec!["rg".to_string()]),
+            } => assert_eq!(entries_removed, vec!["rg", "tree"]),
             SeedOutcome::AlreadyCurrent => panic!("re-seed must rewrite the rules file"),
         }
         let contents = std::fs::read_to_string(dir.path().join("rules/skim.rules")).unwrap();
         assert!(
-            !contents.contains("\"skim rg\""),
-            "rules file must not allow 'skim rg', got:\n{contents}"
+            !contents.contains("\"skim rg\"") && !contents.contains("\"skim tree\""),
+            "rules file must not allow 'skim rg' or 'skim tree', got:\n{contents}"
         );
     }
 

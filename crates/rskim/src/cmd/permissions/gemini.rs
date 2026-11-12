@@ -412,6 +412,34 @@ mod tests {
         assert!(!sidecar.config_hash.is_empty());
     }
 
+    /// An install that an older skim seeded with `rg` and `tree` is stale for
+    /// the current list, and a re-seed regenerates the policy without them.
+    #[test]
+    fn test_reseed_drops_entries_retired_from_seed_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let old: Vec<String> = ["skim df", "skim rg", "skim tree"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
+
+        let entries = seeded_entries(p.as_ref());
+        assert!(!p.is_current(dir.path(), &entries));
+
+        match p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap() {
+            SeedOutcome::Added {
+                entries_removed, ..
+            } => assert_eq!(entries_removed, vec!["skim rg", "skim tree"]),
+            SeedOutcome::AlreadyCurrent => panic!("re-seed must rewrite the policy file"),
+        }
+        let contents = std::fs::read_to_string(dir.path().join(p.config_filename())).unwrap();
+        assert!(
+            !contents.contains("skim rg") && !contents.contains("skim tree"),
+            "policy must not allow 'skim rg' or 'skim tree', got:\n{contents}"
+        );
+    }
+
     #[test]
     fn test_seed_idempotent_returns_already_current() {
         let dir = tempfile::TempDir::new().unwrap();

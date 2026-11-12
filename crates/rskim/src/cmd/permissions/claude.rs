@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use super::{hash_if_bounded, remove_entries, retired_seed_entries};
+use super::{hash_if_bounded, remove_entries, retired_seed_entries, write_seed_sidecar};
 use crate::cmd::init::{
     MAX_SETTINGS_SIZE, atomic_write_settings, backup_settings_file, load_or_create_settings,
 };
@@ -104,6 +104,11 @@ impl PermissionsProtocol for ClaudePermissions {
         }
 
         if entries_added.is_empty() && entries_removed.is_empty() {
+            // The config needs no change. Drop a stale record of a retired
+            // entry, so that a later entry the user adds is not removed.
+            if !retired.is_empty() {
+                write_seed_sidecar(config_dir, &config_path, entries)?;
+            }
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
@@ -119,24 +124,7 @@ impl PermissionsProtocol for ClaudePermissions {
 
         // Atomic write.
         atomic_write_settings(&settings, &config_path)?;
-
-        // Compute hash and write sidecar.
-        // The file was just written by skim after a size-guarded load; oversized here is unexpected.
-        let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "settings.json unexpectedly exceeds size limit after write — \
-                 this is an internal error; please file a bug report"
-            )
-        })?;
-        let sidecar = PermissionSidecar {
-            version: 1,
-            tier: "seed".to_string(),
-            entries: entries.to_vec(),
-            source_mirrors: std::collections::HashMap::new(),
-            config_hash,
-        };
-        let sidecar_path = config_dir.join(SIDECAR_FILENAME);
-        write_sidecar(&sidecar_path, &sidecar)?;
+        write_seed_sidecar(config_dir, &config_path, entries)?;
 
         Ok(SeedOutcome::Added {
             entries_added,
@@ -797,6 +785,43 @@ mod tests {
         assert!(
             p.is_current(dir.path(), &entries),
             "config must be current after the re-seed"
+        );
+    }
+
+    /// When the retired entry is already gone from the config, a re-seed
+    /// still rewrites the sidecar. An entry that the user adds back later is
+    /// then the user's own, and the next seed run keeps it.
+    #[test]
+    fn test_seed_drops_stale_record_of_retired_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_prior_seed(
+            dir.path(),
+            &["Bash(skim df:*)"],
+            &["Bash(skim df:*)", "Bash(skim rg:*)"],
+        );
+        let p = protocol();
+        let entries = vec!["Bash(skim df:*)".to_string()];
+
+        let outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        assert!(matches!(outcome, SeedOutcome::AlreadyCurrent));
+        let sidecar = load_sidecar(&dir.path().join("skim-permissions.json")).unwrap();
+        assert_eq!(sidecar.entries, entries, "stale record must be dropped");
+
+        // The user adds the entry back by hand.
+        let settings = serde_json::json!({
+            "permissions": { "allow": ["Bash(skim df:*)", "Bash(skim rg:*)"] }
+        });
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        assert_eq!(
+            allow_entries(dir.path()),
+            vec!["Bash(skim df:*)", "Bash(skim rg:*)"],
+            "an entry the user added after the re-seed must stay"
         );
     }
 

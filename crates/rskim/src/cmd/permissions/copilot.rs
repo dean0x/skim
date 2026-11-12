@@ -19,7 +19,7 @@
 //! ## Entry format
 //!
 //! Entries use Claude Code's `Bash(<cmd>:*)` allow syntax (Copilot CLI uses
-//! the same JSON permission schema). The entry set is the same 7-tool seed
+//! the same JSON permission schema). The entry set is the same 6-tool seed
 //! as the Claude Code writer.
 //!
 //! ## Schema note
@@ -37,11 +37,9 @@
 
 use std::path::Path;
 
-use super::{hash_if_bounded, remove_entries, retired_seed_entries};
+use super::{remove_entries, retired_seed_entries, write_seed_sidecar};
 use crate::cmd::init::{MAX_SETTINGS_SIZE, atomic_write_settings, load_or_create_settings};
-use crate::cmd::permissions::sidecar::{
-    PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
-};
+use crate::cmd::permissions::sidecar::{SIDECAR_FILENAME, load_sidecar};
 use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
 
 /// Config filename (relative to copilot_home).
@@ -109,6 +107,20 @@ impl PermissionsProtocol for CopilotPermissions {
         // Read before the sidecar is rewritten below.
         let retired = retired_seed_entries(config_dir, entries);
 
+        // One sidecar serves every project in this file, and it is rewritten
+        // below without the retired entries, so remove them from every
+        // project now; no later run would know they were skim's.
+        let mut entries_removed: Vec<String> = Vec::new();
+        for allow in map
+            .values_mut()
+            .filter_map(|project| project.get_mut("allow"))
+            .filter_map(serde_json::Value::as_array_mut)
+        {
+            entries_removed.extend(remove_entries(allow, &retired));
+        }
+        entries_removed.sort();
+        entries_removed.dedup();
+
         // Ensure the project key and allow array exist.
         let project_obj = map
             .entry(project_key.clone())
@@ -116,8 +128,6 @@ impl PermissionsProtocol for CopilotPermissions {
 
         // Navigate to or create the allow array.
         let allow_array = ensure_allow_array(project_obj, &config_path)?;
-
-        let entries_removed = remove_entries(allow_array, &retired);
 
         let existing: std::collections::HashSet<String> = allow_array
             .iter()
@@ -133,6 +143,11 @@ impl PermissionsProtocol for CopilotPermissions {
         }
 
         if entries_added.is_empty() && entries_removed.is_empty() {
+            // The config needs no change. Drop a stale record of a retired
+            // entry, so that a later entry the user adds is not removed.
+            if !retired.is_empty() {
+                write_seed_sidecar(config_dir, &config_path, entries)?;
+            }
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
@@ -141,25 +156,9 @@ impl PermissionsProtocol for CopilotPermissions {
         let full_json = serde_json::Value::Object(map);
         atomic_write_settings(&full_json, &config_path)?;
 
-        // Write sidecar.
-        // The file was just written by skim after a size-guarded load; oversized here is unexpected.
-        let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "permissions-config.json unexpectedly exceeds size limit after write — \
-                 this is an internal error; please file a bug report"
-            )
-        })?;
-        let sidecar = PermissionSidecar {
-            version: 1,
-            // tier is hardcoded to "seed": Mirror requests produce the same seed-set for
-            // this agent.
-            tier: "seed".to_string(),
-            entries: entries.to_vec(),
-            source_mirrors: std::collections::HashMap::new(),
-            config_hash,
-        };
-        let sidecar_path = config_dir.join(SIDECAR_FILENAME);
-        write_sidecar(&sidecar_path, &sidecar)?;
+        // The sidecar tier is always "seed": Mirror requests produce the same
+        // seed-set for this agent.
+        write_seed_sidecar(config_dir, &config_path, entries)?;
 
         Ok(SeedOutcome::Added {
             entries_added,
@@ -261,10 +260,18 @@ impl PermissionsProtocol for CopilotPermissions {
         let existing: std::collections::HashSet<&str> =
             allow.iter().filter_map(|v| v.as_str()).collect();
 
-        entries.iter().all(|e| existing.contains(e.as_str()))
-            && !retired_seed_entries(config_dir, entries)
-                .iter()
-                .any(|r| existing.contains(r.as_str()))
+        // A retired entry in any project makes the file stale (seed removes
+        // it from every project).
+        let retired = retired_seed_entries(config_dir, entries);
+        let retired_present = map
+            .values()
+            .filter_map(|project| project.get("allow"))
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .any(|s| retired.iter().any(|r| r == s));
+
+        entries.iter().all(|e| existing.contains(e.as_str())) && !retired_present
     }
 }
 
@@ -343,6 +350,8 @@ fn ensure_allow_array<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::permissions::hash_if_bounded;
+    use crate::cmd::permissions::sidecar::{PermissionSidecar, write_sidecar};
     use crate::cmd::permissions::{permissions_protocol_for_agent, seeded_entries};
     use crate::cmd::session::AgentKind;
 
@@ -363,10 +372,10 @@ mod tests {
     // ---- seeded_entries ----
 
     #[test]
-    fn test_copilot_seeded_entries_exact_7() {
+    fn test_copilot_seeded_entries_exact_6() {
         let p = protocol();
         let entries = seeded_entries(p.as_ref());
-        assert_eq!(entries.len(), 7, "Copilot must seed exactly 7 entries");
+        assert_eq!(entries.len(), 6, "Copilot must seed exactly 6 entries");
         assert!(entries.contains(&"Bash(skim ls:*)".to_string()));
         assert!(entries.contains(&"Bash(skim grep:*)".to_string()));
     }
@@ -475,8 +484,9 @@ mod tests {
         );
     }
 
-    /// A re-seed removes, from the current project, an entry that an earlier
-    /// seed run recorded but that the current seed list no longer contains.
+    /// A re-seed removes an entry that an earlier seed run recorded but that
+    /// the current seed list no longer contains, from every project in the
+    /// file: one sidecar serves all projects.
     #[test]
     fn test_seed_removes_entry_retired_from_seed_list() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -485,9 +495,11 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let other_key = "/elsewhere/other-project";
         let config_path = dir.path().join("permissions-config.json");
         let config = serde_json::json!({
-            project_key.clone(): { "allow": ["Bash(skim df:*)", "Bash(skim rg:*)", "UserEntry"] }
+            project_key.clone(): { "allow": ["Bash(skim df:*)", "Bash(skim rg:*)", "UserEntry"] },
+            other_key: { "allow": ["Bash(skim rg:*)", "OtherEntry"] }
         });
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
         let sidecar = PermissionSidecar {
@@ -520,10 +532,49 @@ mod tests {
             vec!["Bash(skim df:*)", "UserEntry"],
             "the retired entry must be removed and every other entry kept"
         );
+        let other: Vec<&str> = map[other_key]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            other,
+            vec!["OtherEntry"],
+            "the retired entry must also be removed from the other project"
+        );
         assert!(
             p.is_current(dir.path(), &entries),
             "config must be current after the re-seed"
         );
+    }
+
+    /// A retired entry that remains only in another project still makes the
+    /// file stale, so the next `skim init` offers the re-seed.
+    #[test]
+    fn test_is_current_false_for_retired_entry_in_other_project() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let project_key = find_git_root_from_cwd()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let config_path = dir.path().join("permissions-config.json");
+        let config = serde_json::json!({
+            project_key: { "allow": ["Bash(skim df:*)"] },
+            "/elsewhere/other-project": { "allow": ["Bash(skim rg:*)"] }
+        });
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        let sidecar = PermissionSidecar {
+            version: 1,
+            tier: "seed".to_string(),
+            entries: vec!["Bash(skim df:*)".to_string(), "Bash(skim rg:*)".to_string()],
+            source_mirrors: std::collections::HashMap::new(),
+            config_hash: hash_if_bounded(&config_path).unwrap().unwrap(),
+        };
+        write_sidecar(&dir.path().join(SIDECAR_FILENAME), &sidecar).unwrap();
+
+        assert!(!p.is_current(dir.path(), &["Bash(skim df:*)".to_string()]));
     }
 
     // ---- remove_seeded: happy path ----
