@@ -8,7 +8,9 @@
 //! of structural priority 4 or 5 (functions and type definitions) or priority 2
 //! (containers) that has a `name` field. A language whose declaring nodes carry
 //! no `name` field (for example the C family, whose function names sit under a
-//! `declarator` field) yields no declaration for those nodes.
+//! `declarator` field) yields no declaration for those nodes. A variable
+//! declared in a function body (TypeScript, JavaScript, Go) is a local and
+//! yields no declaration.
 //!
 //! The walk uses [`AstWalkIter`] with the default caps. [`DeclScan::truncated`]
 //! tells the caller that a cap cut the walk, so a missing name may be missing
@@ -37,6 +39,11 @@ const LEAF_KINDS: &[&str] = &[
     "const_spec",
     "var_spec",
 ];
+
+/// Kinds that declare a variable. Inside a function body they declare a
+/// local, which is not a declaration: TS and JS `const`/`let`/`var`, and Go
+/// `var` and `const`.
+const VARIABLE_KINDS: &[&str] = &["variable_declarator", "var_spec", "const_spec"];
 
 /// One declared name and where it sits in the source.
 ///
@@ -151,7 +158,7 @@ fn declaration_at(node: Node<'_>, source: &str, lang: Language) -> Option<Declar
     let container = match placement(node, source, lang) {
         Placement::Member(container) => container,
         // A variable inside a function body is a local, not a declaration.
-        Placement::Nested if kind == "variable_declarator" => return None,
+        Placement::Nested if VARIABLE_KINDS.contains(&kind) => return None,
         Placement::Nested => None,
     };
 
@@ -245,11 +252,6 @@ enum Role {
 }
 
 fn placement(node: Node<'_>, source: &str, lang: Language) -> Placement {
-    // Go declares the container of a method on the method itself: its
-    // receiver type. Go has no other container.
-    if lang == Language::Go {
-        return Placement::Member(go_receiver_type(node, source));
-    }
     let max_hops = AstWalkConfig::DEFAULT_MAX_DEPTH as usize;
     for ancestor in std::iter::successors(node.parent(), |n| n.parent()).take(max_hops) {
         match ancestor_role(lang, ancestor.kind()) {
@@ -257,6 +259,11 @@ fn placement(node: Node<'_>, source: &str, lang: Language) -> Placement {
             Role::Scope => return Placement::Nested,
             Role::Transparent => {}
         }
+    }
+    // Go declares the container of a method on the method itself: its
+    // receiver type. Go has no container node.
+    if lang == Language::Go {
+        return Placement::Member(go_receiver_type(node, source));
     }
     Placement::Member(None)
 }
@@ -287,6 +294,7 @@ fn ancestor_role(lang: Language, kind: &str) -> Role {
             kind == "statement_block",
         ),
         Language::Python => (kind == "class_definition", kind == "function_definition"),
+        Language::Go => (false, kind == "block"),
         _ => {
             let priority = node_kind_priority(kind);
             (matches!(priority, 2 | 5), priority == 4)

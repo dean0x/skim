@@ -1371,25 +1371,10 @@ pub(crate) fn process_symbol_file(
         symbol: Some(name),
     };
 
-    // An entry without its notice is not served: the notice is unconditional.
     if options.use_cache
-        && let Some(hit) = cache::read_cache(&key)
-        && let Some(notice) = hit.notice
+        && let Some(read) = cached_symbol_read(&key, path, options.show_stats)?
     {
-        let (original_tokens, transformed_tokens) =
-            match (hit.original_tokens, hit.transformed_tokens) {
-                (Some(original), Some(transformed)) => (Some(original), Some(transformed)),
-                _ if options.show_stats => {
-                    tokens::count_token_pair(&read_and_validate(path)?, &hit.content)
-                }
-                _ => (None, None),
-            };
-        return Ok(SymbolRead {
-            output: hit.content,
-            notice,
-            original_tokens,
-            transformed_tokens,
-        });
+        return Ok(read);
     }
 
     let contents = read_and_validate(path)?;
@@ -1409,24 +1394,8 @@ pub(crate) fn process_symbol_file(
         return Err(symbol::not_found(path, name, &scan).into());
     }
 
-    let selected = symbol::render(path, &contents, &matches, name);
-    let (output, bounded_map) =
-        if options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some() {
-            enforce_line_bounds(
-                &selected.text,
-                Some(language),
-                &options.trunc,
-                &selected.text,
-            )
-        } else {
-            (selected.text, None)
-        };
-    let output = if options.line_numbers {
-        let map = compose_line_maps(&selected.line_map, bounded_map);
-        crate::format::format_with_line_numbers(&output, &map)
-    } else {
-        output
-    };
+    let selected = symbol::render(path, &contents, &matches, name, scan.truncated);
+    let output = bound_and_number(&selected, language, options);
 
     let (original_tokens, transformed_tokens) = if options.show_stats {
         tokens::count_token_pair(&contents, &output)
@@ -1454,6 +1423,56 @@ pub(crate) fn process_symbol_file(
         original_tokens,
         transformed_tokens,
     })
+}
+
+/// The stored result of an earlier `--symbol` read with the same key, if any.
+///
+/// An entry without its notice is not served: the notice is unconditional.
+fn cached_symbol_read(
+    key: &cache::CacheKeyParams<'_>,
+    path: &Path,
+    show_stats: bool,
+) -> anyhow::Result<Option<SymbolRead>> {
+    let Some(hit) = cache::read_cache(key) else {
+        return Ok(None);
+    };
+    let Some(notice) = hit.notice else {
+        return Ok(None);
+    };
+    let (original_tokens, transformed_tokens) = match (hit.original_tokens, hit.transformed_tokens)
+    {
+        (Some(original), Some(transformed)) => (Some(original), Some(transformed)),
+        _ if show_stats => tokens::count_token_pair(&read_and_validate(path)?, &hit.content),
+        _ => (None, None),
+    };
+    Ok(Some(SymbolRead {
+        output: hit.content,
+        notice,
+        original_tokens,
+        transformed_tokens,
+    }))
+}
+
+/// Apply `--max-lines` / `--last-lines`, then `--line-numbers`, to the
+/// selected text. The bounds count the selected lines, and the numbers are
+/// the source line numbers of those lines.
+fn bound_and_number(
+    selected: &symbol::Rendered,
+    language: Language,
+    options: ProcessOptions,
+) -> String {
+    let (output, bounded_map) = enforce_line_bounds(
+        &selected.text,
+        Some(language),
+        &options.trunc,
+        &selected.text,
+    );
+    if options.line_numbers {
+        let map = compose_line_maps(&selected.line_map, bounded_map);
+        crate::format::format_with_line_numbers(&output, &map)
+    } else {
+        output
+    }
 }
 
 /// Source line numbers for text that a line bound cut after a selection.

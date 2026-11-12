@@ -376,6 +376,38 @@ var counter int
 }
 
 #[test]
+fn go_local_variables_and_constants_are_not_declarations() {
+    // The same rule as TypeScript: a variable in a function body is a local.
+    // A type declared in a function body stays a declaration, as in Rust.
+    let src = r#"package main
+
+var top int
+
+func Run() {
+	var local int
+	const inner = 2
+	type hidden struct{}
+	handler := func() {
+		var deeper int
+		_ = deeper
+	}
+	_, _ = local, handler
+}
+"#;
+    let scan = scan(Language::Go, "go", src);
+
+    assert_eq!(
+        names_and_kinds(&scan),
+        vec![
+            ("top", "var_spec"),
+            ("Run", "function_declaration"),
+            ("hidden", "type_spec"),
+        ]
+    );
+    assert_eq!(find(&scan, "hidden").container, None);
+}
+
+#[test]
 fn java_declarations_follow_the_generic_rule() {
     let src = r#"public class Greeter {
     public String greet() {

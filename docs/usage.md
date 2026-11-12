@@ -122,6 +122,7 @@ skim src/app.ts --symbol run -n         # lines are numbered from the first line
 - stdout: the raw source lines of the declaration, from its first line to its last line. Skim does not change them.
 - stderr: one notice line, always. It states which lines you see and how many lines are not shown:
   `[skim] --symbol "norm": lines 12-15 of 35 shown (11 above, 20 below not shown) — omit --symbol for the whole file`
+- If the search for declarations stopped at its limit (100,000 syntax nodes or a nesting depth of 500), the notice also states that more declarations with the name can exist.
 - If the name matches two or more declarations, skim prints all of them in file order. A header line starts each block: `==> lib.rs:12-15 norm (1 of 2) <==`. An empty line separates the blocks.
 
 **How a name matches:**

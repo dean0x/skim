@@ -464,6 +464,18 @@ fn a_glob_exits_2_even_when_it_matches_one_file() {
 }
 
 #[test]
+fn an_existing_file_whose_name_holds_glob_characters_is_read_as_that_file() {
+    // TP-36 (a route file such as `[id].tsx` is one file path, not a glob)
+    let home = TempDir::new().unwrap();
+    put(home.path(), "[id].tsx", TSX_SRC);
+
+    let out = run(home.path(), &["[id].tsx", "--symbol", "Footer"]);
+
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(out.stdout, lines(TSX_SRC, 3, 5));
+}
+
+#[test]
 fn a_directory_exits_2() {
     // TP-36
     let home = rust_home();
@@ -687,13 +699,25 @@ fn no_match_in_a_file_above_the_node_cap_exits_1_and_names_the_cap() {
 }
 
 #[test]
-fn a_match_before_the_node_cap_is_still_found_in_a_big_file() {
-    // TP-123 (the cap fails only a read that found nothing)
+fn a_match_before_the_node_cap_is_found_and_the_notice_names_the_cap() {
+    // TP-123 (the cap fails only a read that found nothing). A second `dup`
+    // lies past the cap, so the reader sees one of two declarations; the
+    // notice must say that more may exist.
     let home = TempDir::new().unwrap();
-    put(home.path(), "big.rs", &constants_source(20_000));
+    let source = format!(
+        "fn dup() {{}}\n{}fn dup() {{ 1 }}\n",
+        constants_source(20_000)
+    );
+    put(home.path(), "big.rs", &source);
 
-    let out = run(home.path(), &["big.rs", "--symbol", "C7"]);
+    let out = run(home.path(), &["big.rs", "--symbol", "dup"]);
 
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
-    assert_eq!(out.stdout, "const C7: u32 = 7;\n");
+    assert_eq!(out.stdout, "fn dup() {}\n");
+    assert_eq!(
+        out.stderr,
+        "[skim] --symbol \"dup\": lines 1-1 of 20002 shown (0 above, 20001 below not shown); \
+         the declaration walk stopped at its syntax-node or depth cap, so more declarations \
+         with this name may exist — omit --symbol for the whole file\n"
+    );
 }

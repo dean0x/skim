@@ -178,7 +178,16 @@ pub(crate) fn not_found(path: &Path, query: &str, scan: &DeclScan) -> SymbolErro
 /// each, in source order, every block led by a header and separated from the
 /// block before it by an empty line. Lines keep their own terminators, so a
 /// CRLF file stays CRLF.
-pub(crate) fn render(path: &Path, source: &str, matches: &[&Declaration], query: &str) -> Rendered {
+///
+/// `walk_truncated` is [`DeclScan::truncated`]: when a cap stopped the walk, a
+/// later declaration with the same name may exist, and the notice says so.
+pub(crate) fn render(
+    path: &Path,
+    source: &str,
+    matches: &[&Declaration],
+    query: &str,
+    walk_truncated: bool,
+) -> Rendered {
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     let total = lines.len();
     let count = matches.len();
@@ -226,18 +235,30 @@ pub(crate) fn render(path: &Path, source: &str, matches: &[&Declaration], query:
     Rendered {
         text,
         line_map,
-        notice: notice_for(query, &ranges, total),
+        notice: notice_for(query, &ranges, total, walk_truncated),
     }
 }
 
 /// The stderr notice: which lines of the file the reader saw.
-fn notice_for(query: &str, ranges: &[(usize, usize)], total: usize) -> String {
+fn notice_for(
+    query: &str,
+    ranges: &[(usize, usize)],
+    total: usize,
+    walk_truncated: bool,
+) -> String {
     const REMEDY: &str = "omit --symbol for the whole file";
+    // The reader may see fewer declarations than the file has, so the notice
+    // must say so (the read is loss-bearing either way).
+    let cap = if walk_truncated {
+        "; the declaration walk stopped at its syntax-node or depth cap, so more declarations with this name may exist"
+    } else {
+        ""
+    };
     if let [(first, last)] = ranges {
         let above = *first;
         let below = total - 1 - *last;
         return format!(
-            "[skim] --symbol {query:?}: lines {}-{} of {total} shown ({above} above, {below} below not shown) — {REMEDY}",
+            "[skim] --symbol {query:?}: lines {}-{} of {total} shown ({above} above, {below} below not shown){cap} — {REMEDY}",
             first + 1,
             last + 1
         );
@@ -255,7 +276,7 @@ fn notice_for(query: &str, ranges: &[(usize, usize)], total: usize) -> String {
         }
     }
     format!(
-        "[skim] --symbol {query:?}: {} declarations, {shown} of {total} lines shown ({} not shown) — {REMEDY}",
+        "[skim] --symbol {query:?}: {} declarations, {shown} of {total} lines shown ({} not shown){cap} — {REMEDY}",
         ranges.len(),
         total - shown
     )
@@ -359,7 +380,7 @@ fn norm(p: &Point) -> i32 {
     fn render_one_match_is_the_declaration_lines_and_nothing_else() {
         let scan = scan(RUST, Language::Rust);
         let found = select(&scan.decls, "norm");
-        let rendered = render(Path::new("lib.rs"), RUST, &found, "norm");
+        let rendered = render(Path::new("lib.rs"), RUST, &found, "norm", false);
 
         assert_eq!(rendered.text, "fn norm(p: &Point) -> i32 {\n    p.x\n}\n");
         assert_eq!(rendered.line_map, [17, 18, 19]);
@@ -373,7 +394,7 @@ fn norm(p: &Point) -> i32 {
     fn render_notice_counts_lines_above_and_below() {
         let scan = scan(RUST, Language::Rust);
         let found = select(&scan.decls, "Point::new");
-        let rendered = render(Path::new("lib.rs"), RUST, &found, "Point::new");
+        let rendered = render(Path::new("lib.rs"), RUST, &found, "Point::new", false);
 
         assert_eq!(
             rendered.notice,
@@ -385,7 +406,7 @@ fn norm(p: &Point) -> i32 {
     fn render_two_matches_lead_each_block_with_a_header() {
         let scan = scan(RUST, Language::Rust);
         let found = select(&scan.decls, "new");
-        let rendered = render(Path::new("src/lib.rs"), RUST, &found, "new");
+        let rendered = render(Path::new("src/lib.rs"), RUST, &found, "new", false);
 
         let expected = "\
 ==> src/lib.rs:6-8 new (1 of 2) <==
@@ -412,7 +433,7 @@ fn norm(p: &Point) -> i32 {
         let source = "fn a() {\r\n    1\r\n}\r\nfn b() {}\r\n";
         let scan = scan(source, Language::Rust);
         let found = select(&scan.decls, "a");
-        let rendered = render(Path::new("a.rs"), source, &found, "a");
+        let rendered = render(Path::new("a.rs"), source, &found, "a", false);
 
         assert_eq!(rendered.text, "fn a() {\r\n    1\r\n}\r\n");
     }
@@ -422,7 +443,7 @@ fn norm(p: &Point) -> i32 {
         let source = "fn a() {}\nfn b() {}";
         let scan = scan(source, Language::Rust);
         let found = select(&scan.decls, "b");
-        let rendered = render(Path::new("a.rs"), source, &found, "b");
+        let rendered = render(Path::new("a.rs"), source, &found, "b", false);
 
         assert_eq!(rendered.text, "fn b() {}");
         assert_eq!(rendered.line_map, [2]);
@@ -435,11 +456,34 @@ fn norm(p: &Point) -> i32 {
         let scan = scan(source, Language::Rust);
         let found = select(&scan.decls, "f");
         assert_eq!(found.len(), 2, "precondition: both `f` are declarations");
-        let rendered = render(Path::new("a.rs"), source, &found, "f");
+        let rendered = render(Path::new("a.rs"), source, &found, "f", false);
 
         assert_eq!(
             rendered.notice,
             "[skim] --symbol \"f\": 2 declarations, 3 of 4 lines shown (1 not shown) — omit --symbol for the whole file"
+        );
+    }
+
+    #[test]
+    fn render_notice_on_a_truncated_walk_says_more_matches_may_exist() {
+        let scan = scan(RUST, Language::Rust);
+        let one = select(&scan.decls, "norm");
+        let two = select(&scan.decls, "new");
+
+        let one = render(Path::new("lib.rs"), RUST, &one, "norm", true);
+        let two = render(Path::new("lib.rs"), RUST, &two, "new", true);
+
+        assert_eq!(
+            one.notice,
+            "[skim] --symbol \"norm\": lines 17-19 of 19 shown (16 above, 0 below not shown); \
+             the declaration walk stopped at its syntax-node or depth cap, so more declarations \
+             with this name may exist — omit --symbol for the whole file"
+        );
+        assert!(
+            two.notice
+                .contains("(13 not shown); the declaration walk stopped at its syntax-node"),
+            "{}",
+            two.notice
         );
     }
 

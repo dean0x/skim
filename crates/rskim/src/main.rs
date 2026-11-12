@@ -1875,9 +1875,11 @@ fn process_single_arg(
 /// `skim FILE --symbol NAME`: print one declaration of one file.
 ///
 /// A directory or a glob cannot be the one file a symbol read needs, so both
-/// are usage errors (exit 2). Stdin and several files are refused earlier, in
-/// [`validate_symbol_args`]. The read records no analytics row: the row would
-/// count the selection as a token saving.
+/// are usage errors (exit 2). A path that names an existing file is that file
+/// even when its name holds a glob character, as `pages/[id].tsx` does. Stdin
+/// and several files are refused earlier, in [`validate_symbol_args`]. The
+/// read records no analytics row: the row would count the selection as a
+/// token saving.
 fn run_symbol_read(
     file: &str,
     name: &str,
@@ -1887,7 +1889,7 @@ fn run_symbol_read(
     let path = PathBuf::from(file);
     let not_a_file = if path.is_dir() {
         Some("a directory")
-    } else if multi::has_glob_pattern(file) {
+    } else if !path.is_file() && multi::has_glob_pattern(file) {
         Some("a glob")
     } else {
         None
