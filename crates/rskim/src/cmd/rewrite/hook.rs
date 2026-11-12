@@ -404,6 +404,43 @@ fn withholds_rewrite(input: &serde_json::Value, result: &RewriteResult) -> bool 
     is_auto_permission_mode(input) && !result.masks_output
 }
 
+/// The folder the hook judges a project-local tool in.
+///
+/// The `cwd` field of the hook input when it is an absolute path that resolves;
+/// the working folder of the hook process when the field is absent. A `cwd` that
+/// is relative, not a string, or not a folder that resolves gives `None`: the
+/// hook then cannot say where the command will run, and the caller must not
+/// rewrite. A relative `cwd` is never read against the hook process, which runs
+/// in a folder the agent does not choose.
+fn hook_cwd(input: &serde_json::Value) -> Option<std::path::PathBuf> {
+    match input.get("cwd") {
+        None => std::env::current_dir().ok(),
+        Some(serde_json::Value::String(cwd)) => {
+            let cwd = std::path::Path::new(cwd);
+            if cwd.is_absolute() {
+                cwd.canonicalize().ok()
+            } else {
+                None
+            }
+        }
+        Some(_) => None,
+    }
+}
+
+/// Whether the project holds the tool a rewrite starts through `npx`.
+///
+/// A rewrite with no such tool (`RewriteResult::npx_tool` is `None`) has nothing
+/// to check. For an `npx <tool>` rewrite the tool must be an executable in
+/// `node_modules/.bin` of the hook folder or a parent up to the repository root
+/// (`runner::local_node_bin`); without it the handler would refuse to start, so
+/// the hook leaves the typed command alone. The tool name comes from the rule,
+/// never from command text.
+fn npx_requirement_met(input: &serde_json::Value, result: &RewriteResult) -> bool {
+    result.npx_tool.is_none_or(|tool| {
+        hook_cwd(input).is_some_and(|cwd| crate::runner::local_node_bin(&cwd, tool))
+    })
+}
+
 /// Why [`command_gates`] declined a command.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Decline {
@@ -528,8 +565,11 @@ fn log_provenance_findings(agent_kind: AgentKind) {
 /// 5. Run command through rewrite logic
 /// 6. In auto permission mode, a rewrite that needs no masking is withheld: exit
 ///    0, empty stdout (see [`withholds_rewrite`])
-/// 7. On match: emit hook response JSON, exit 0
-/// 8. On no match: exit 0, empty stdout (passthrough)
+/// 7. A rewrite that starts a project-local node tool through `npx` is sent only
+///    when the project holds the tool; else exit 0, empty stdout (see
+///    [`npx_requirement_met`])
+/// 8. On match: emit hook response JSON, exit 0
+/// 9. On no match: exit 0, empty stdout (passthrough)
 ///
 /// Drift is detected and logged to hook.log on every PreToolUse invocation. For
 /// diagnosis run `skim doctor`.
@@ -687,6 +727,14 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         Some(result) if withholds_rewrite(&json, &result) => {
             // Auto permission mode, and no masking tool on the path: send no
             // response, so there is no stdout, no stderr and no permission decision.
+            audit_hook(&command, false, "");
+        }
+        Some(result) if !npx_requirement_met(&json, &result) => {
+            // The first segment is an `npx <tool>` rule and the project holds no
+            // such tool (or the hook cannot tell where the command runs): send no
+            // response, so the command runs as typed. This drops the whole
+            // compound rewrite, also the segments that need no folder, which is
+            // the safe side. Nothing goes to stderr.
             audit_hook(&command, false, "");
         }
         Some(result) => {
@@ -1064,6 +1112,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // hook_cwd and npx_requirement_met
+    // ========================================================================
+
+    /// A project folder: a `.git` marker, and when `tool` is given an
+    /// executable of that name in `node_modules/.bin`.
+    #[cfg(unix)]
+    fn project_with(tool: Option<&str>) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(".git")).expect("git marker");
+        if let Some(tool) = tool {
+            let bin_dir = dir.path().join("node_modules").join(".bin");
+            std::fs::create_dir_all(&bin_dir).expect("create .bin");
+            let bin = bin_dir.join(tool);
+            std::fs::write(&bin, b"#!/bin/sh\n").expect("write bin");
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                .expect("make executable");
+        }
+        dir
+    }
+
+    #[test]
+    fn test_hook_cwd_absent_is_the_process_folder() {
+        assert_eq!(
+            hook_cwd(&serde_json::json!({})),
+            std::env::current_dir().ok()
+        );
+    }
+
+    #[test]
+    fn test_hook_cwd_absolute_folder_is_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let input = serde_json::json!({ "cwd": dir.path().to_str().expect("UTF-8") });
+        assert_eq!(hook_cwd(&input), dir.path().canonicalize().ok());
+    }
+
+    #[test]
+    fn test_hook_cwd_rejects_what_it_cannot_trust() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent");
+        for cwd in [
+            serde_json::json!("relative/folder"),
+            serde_json::json!("."),
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!(["/"]),
+            serde_json::json!({ "path": "/" }),
+            serde_json::json!(missing.to_str().expect("UTF-8")),
+        ] {
+            assert_eq!(hook_cwd(&serde_json::json!({ "cwd": cwd })), None, "{cwd}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_npx_requirement_met_follows_the_local_bin() {
+        let npx = rewrite_of("npx tsc --noEmit");
+        assert!(npx.npx_tool.is_some(), "an npx rule must name its tool");
+
+        let with_bin = project_with(Some("tsc"));
+        let without_bin = project_with(None);
+        let other_tool = project_with(Some("eslint"));
+        let cwd = |dir: &tempfile::TempDir| serde_json::json!({ "cwd": dir.path().to_str().expect("UTF-8") });
+
+        assert!(npx_requirement_met(&cwd(&with_bin), &npx));
+        assert!(!npx_requirement_met(&cwd(&without_bin), &npx));
+        assert!(
+            !npx_requirement_met(&cwd(&other_tool), &npx),
+            "another tool's bin does not count"
+        );
+    }
+
+    #[test]
+    fn test_npx_requirement_met_is_false_when_the_folder_is_unknown() {
+        let npx = rewrite_of("npx tsc --noEmit");
+        for cwd in [
+            serde_json::json!("relative"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            assert!(
+                !npx_requirement_met(&serde_json::json!({ "cwd": cwd }), &npx),
+                "{cwd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_npx_requirement_met_is_true_for_a_rewrite_with_no_npx_tool() {
+        let plain = rewrite_of("cargo test");
+        assert!(plain.npx_tool.is_none());
+        // The folder is never read for such a rewrite, so a bad one changes nothing.
+        assert!(npx_requirement_met(
+            &serde_json::json!({ "cwd": 1 }),
+            &plain
+        ));
+        assert!(npx_requirement_met(&serde_json::json!({}), &plain));
     }
 
     // ========================================================================

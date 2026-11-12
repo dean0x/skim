@@ -4,6 +4,7 @@ use super::handlers::{try_rewrite_cat, try_rewrite_head, try_rewrite_tail};
 use super::rules;
 use super::types::RewriteResult;
 use crate::output::REWRITE_ORIGIN_ENV;
+use crate::runner::VIA_NPX_FLAG;
 
 /// Return true if any token in `middle` matches a skip-flag prefix.
 ///
@@ -212,11 +213,19 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
         // For global-flag matches, preserve the original token order so that
         // global flags remain in the output (e.g. `kubectl -n ns get pods`
         // → `skim kubectl -n ns get pods`).
+        let npx_tool = rules::npx_local_tool(rule.prefix);
         let output: Vec<String> = if strict_match {
+            // An `npx <tool>` rule that starts the project's own copy puts
+            // `--via-npx` after every word it rewrites to, so a permission rule
+            // on `skim prettier --write` or `skim biome check` keeps matching,
+            // and before the user's arguments. Dispatch accepts the flag at
+            // exactly this position (`rules::npx_flag_tails`). No npx rule has
+            // global value flags, so the other branch never carries the flag.
             env_vars
                 .iter()
                 .chain(rule.rewrite_to.iter())
                 .map(|s| s.to_string())
+                .chain(npx_tool.map(|_| VIA_NPX_FLAG.to_string()))
                 .chain(
                     middle
                         .iter()
@@ -245,7 +254,7 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
             category: rule.category,
             masks_output: rewrites_to_masking_tool(rule.rewrite_to),
             matched_prefix: Some(rule.prefix),
-            npx_tool: rules::npx_local_tool(rule.prefix),
+            npx_tool,
         });
     }
 
@@ -1294,55 +1303,61 @@ mod tests {
     // ------------------------------------------------------------------------
 
     /// Each `npx <tool>` rule that starts the project's own bin names its tool
-    /// in the result, and the engine text for it does not change.
+    /// in the result, and its text carries `--via-npx` after every word the
+    /// rule rewrites to (so a permission rule on `skim prettier --write` or
+    /// `skim biome check` keeps matching) and before the user's arguments.
     #[test]
     fn test_npx_local_bin_rules_name_their_tool() {
         for (tokens, tool, text) in [
             (
                 vec!["npx", "tsc", "--noEmit"],
                 NpxTool::Tsc,
-                "skim tsc --noEmit",
+                "skim tsc --via-npx --noEmit",
             ),
             (
                 vec!["npx", "eslint", "src/"],
                 NpxTool::Eslint,
-                "skim eslint src/",
+                "skim eslint --via-npx src/",
             ),
             (
                 vec!["npx", "prettier", "--write", "src/"],
                 NpxTool::Prettier,
-                "skim prettier --write src/",
+                "skim prettier --write --via-npx src/",
             ),
             (
                 vec!["npx", "prettier", "-w", "src/"],
                 NpxTool::Prettier,
-                "skim prettier -w src/",
+                "skim prettier -w --via-npx src/",
             ),
             (
                 vec!["npx", "prettier", "--check", "src/"],
                 NpxTool::Prettier,
-                "skim prettier src/",
+                "skim prettier --via-npx src/",
             ),
             (
                 vec!["npx", "biome", "check", "."],
                 NpxTool::Biome,
-                "skim biome check .",
+                "skim biome check --via-npx .",
             ),
             (
                 vec!["npx", "biome", "format", "."],
                 NpxTool::Biome,
-                "skim biome format .",
+                "skim biome format --via-npx .",
             ),
             (
                 vec!["npx", "biome", "lint", "."],
                 NpxTool::Biome,
-                "skim biome lint .",
+                "skim biome lint --via-npx .",
             ),
-            (vec!["npx", "biome", "ci"], NpxTool::Biome, "skim biome ci"),
+            (
+                vec!["npx", "biome", "ci"],
+                NpxTool::Biome,
+                "skim biome --via-npx ci",
+            ),
             (
                 vec!["npx", "oxlint", "src/"],
                 NpxTool::Oxlint,
-                "skim oxlint src/",
+                "skim oxlint --via-npx src/",
             ),
         ] {
             let result = try_rewrite(&tokens)
@@ -1353,8 +1368,8 @@ mod tests {
     }
 
     /// A rewrite that does not start a project-local bin through npx carries no
-    /// requirement: bare tool names, the test-family `npx` rules (they have
-    /// their own npx fallback) and the file handlers.
+    /// requirement and no flag: bare tool names, the test-family `npx` rules
+    /// (they have their own npx fallback) and the file handlers.
     #[test]
     fn test_other_rewrites_carry_no_npx_tool() {
         for tokens in [
@@ -1369,15 +1384,44 @@ mod tests {
         ] {
             let result = try_rewrite(&tokens).unwrap_or_else(|| panic!("{tokens:?} must rewrite"));
             assert_eq!(result.npx_tool, None, "{tokens:?}");
+            assert!(
+                !result.tokens.iter().any(|t| t == VIA_NPX_FLAG),
+                "{tokens:?} must not carry the npx flag: {:?}",
+                result.tokens
+            );
         }
     }
 
     /// The requirement survives an env-var prefix, because the rule match runs
-    /// after the env strip.
+    /// after the env strip, and the flag sits after the `skim` words, not
+    /// before the env words.
     #[test]
     fn test_npx_tool_survives_an_env_prefix() {
         let result = try_rewrite(&["CI=1", "npx", "eslint", "."]).expect("must rewrite");
         assert_eq!(result.npx_tool, Some(NpxTool::Eslint));
+        assert_eq!(result.tokens.join(" "), "CI=1 skim eslint --via-npx .");
+
+        let result =
+            try_rewrite(&["CI=1", "npx", "prettier", "--write", "."]).expect("must rewrite");
+        assert_eq!(
+            result.tokens.join(" "),
+            "CI=1 skim prettier --write --via-npx ."
+        );
+    }
+
+    /// The flag goes before the user's arguments and before a `--` separator,
+    /// so the tool's own `--` zone stays intact.
+    #[test]
+    fn test_npx_flag_precedes_user_arguments_and_the_separator() {
+        let result = try_rewrite(&["npx", "tsc", "--", "--noEmit"]).expect("must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim tsc --via-npx -- --noEmit");
+    }
+
+    /// With no arguments at all the flag is the last word.
+    #[test]
+    fn test_npx_flag_with_no_arguments_is_last() {
+        let result = try_rewrite(&["npx", "tsc"]).expect("must rewrite");
+        assert_eq!(result.tokens.join(" "), "skim tsc --via-npx");
     }
 
     /// Every rule head is a bare name or a cwd-relative `./name`.

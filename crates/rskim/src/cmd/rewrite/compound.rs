@@ -1998,7 +1998,10 @@ mod tests {
     fn test_compound_rewrites_only_the_first_npx_segment() {
         let result = compound_rewrite_of("npx tsc && npx eslint .")
             .expect("the first segment is an npx rule and must rewrite");
-        assert_eq!(result.tokens.join(" "), "skim tsc && npx eslint .");
+        assert_eq!(
+            result.tokens.join(" "),
+            "skim tsc --via-npx && npx eslint ."
+        );
         assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
     }
 
@@ -2008,7 +2011,10 @@ mod tests {
     fn test_compound_first_npx_segment_keeps_later_non_npx_rewrites() {
         let result = compound_rewrite_of("npx eslint . ; cargo test")
             .expect("both segments rewrite: the npx one is first");
-        assert_eq!(result.tokens.join(" "), "skim eslint . ; skim cargo test");
+        assert_eq!(
+            result.tokens.join(" "),
+            "skim eslint --via-npx . ; skim cargo test"
+        );
         assert_eq!(result.npx_tool, Some(NpxTool::Eslint));
     }
 
@@ -2038,7 +2044,7 @@ mod tests {
     fn test_compound_npx_source_of_a_cat_pipe_keeps_the_requirement() {
         let result = compound_rewrite_of("npx tsc --noEmit | cat")
             .expect("the source of a bare `| cat` pipeline must rewrite");
-        assert_eq!(result.tokens.join(" "), "skim tsc --noEmit | cat");
+        assert_eq!(result.tokens.join(" "), "skim tsc --via-npx --noEmit | cat");
         assert_eq!(result.npx_tool, Some(NpxTool::Tsc));
     }
 
