@@ -755,7 +755,7 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
 
     with_isolated_cache(|_cache| {
         // Build the index (SKIM_CACHE_DIR overrides to isolated tempdir).
-        super::super::run(
+        let exit_code = super::super::run(
             &[
                 "--build".to_string(),
                 "--root".to_string(),
@@ -764,6 +764,7 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
             &TEST_ANALYTICS,
         )
         .expect("--build must succeed; fix the build pipeline if it fails here");
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         // "xyzzy_impossible_token" won't match any file lexically →
         // lexical layer is empty → early-return empty intersection.
@@ -1327,7 +1328,7 @@ fn text_ast_combined_self_heals_missing_ast_index() {
 
     with_isolated_cache(|cache| {
         // Build a full index (lexical + AST) via run(--build) with the isolated cache.
-        super::super::run(
+        let exit_code = super::super::run(
             &[
                 "--build".to_string(),
                 "--root".to_string(),
@@ -1336,6 +1337,7 @@ fn text_ast_combined_self_heals_missing_ast_index() {
             &TEST_ANALYTICS,
         )
         .expect("--build must succeed for self-heal test to be meaningful");
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         // The isolated cache dir has the form: <isolated_base>/search/<hash>/.
         // Locate the search subdirectory to find and delete ast_index.skidx.
@@ -1403,7 +1405,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 
     with_isolated_cache(|cache| {
         // Build a full index via run(--build) with the isolated cache.
-        super::super::run(
+        let exit_code = super::super::run(
             &[
                 "--build".to_string(),
                 "--root".to_string(),
@@ -1412,6 +1414,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
             &TEST_ANALYTICS,
         )
         .expect("--build must succeed for version-stub self-heal test to be meaningful");
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         // Locate the hash-keyed search directory inside the isolated cache.
         let search_dir = cache.join("search");
@@ -2861,7 +2864,7 @@ fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
 
     // Test exact:false pattern (rust-nested-loop is a proxy pattern).
     let mut nested_out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "rust-nested-loop",
         super::super::types::Page::first(20),
         false,
@@ -2874,6 +2877,7 @@ fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
         &mut nested_out,
     )
     .unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
     let nested_text = String::from_utf8(nested_out).unwrap();
     assert!(
         nested_text.contains("loops.rs"),
@@ -2888,7 +2892,7 @@ fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
 
     // Test exact:true pattern (rust-unsafe-block: bigram unsafe_block → block).
     let mut unsafe_out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "rust-unsafe-block",
         super::super::types::Page::first(20),
         false,
@@ -2901,6 +2905,7 @@ fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
         &mut unsafe_out,
     )
     .unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
     let unsafe_text = String::from_utf8(unsafe_out).unwrap();
     // src/unsafe.rs has `unsafe { *ptr = val; }` → exact:true bigram (unsafe_block, block).
     assert!(
@@ -2999,7 +3004,7 @@ fn run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397() {
     // A degraded row (no line) looks like "  src/loops.rs  [score]  pattern".
     // We verify the row contains the colon-number suffix (AD-397-4).
     let mut out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "rust-nested-loop",
         super::super::types::Page::first(20),
         false,
@@ -3012,6 +3017,7 @@ fn run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397() {
         &mut out,
     )
     .unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let text = String::from_utf8(out).unwrap();
 
@@ -3112,7 +3118,7 @@ fn run_ast_standalone_single_ngram_identity_ac9_374() {
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     let mut out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "rust-unsafe-block",
         super::super::types::Page::first(20),
         false,
@@ -3125,6 +3131,7 @@ fn run_ast_standalone_single_ngram_identity_ac9_374() {
         &mut out,
     )
     .unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let text = String::from_utf8(out).unwrap();
 
@@ -3172,7 +3179,7 @@ fn run_ast_standalone_no_format_change_ac10_374() {
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     let mut out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "rust-nested-loop",
         super::super::types::Page::first(20),
         false,
@@ -3185,6 +3192,7 @@ fn run_ast_standalone_no_format_change_ac10_374() {
         &mut out,
     )
     .unwrap();
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     // Record AST format version after the gate query.
     let version_after = rskim_search::AstIndexReader::index_version(cache.path())
@@ -4115,7 +4123,7 @@ fn run_ast_standalone_matches_compound_for_all_five_synthetic_patterns_ac2_394()
     for (pattern, exhibiting_file, term) in cases {
         // Standalone.
         let mut standalone_out: Vec<u8> = Vec::new();
-        super::run_ast_standalone(
+        let exit_code = super::run_ast_standalone(
             pattern,
             super::super::types::Page::first(20),
             false,
@@ -4128,6 +4136,7 @@ fn run_ast_standalone_matches_compound_for_all_five_synthetic_patterns_ac2_394()
             &mut standalone_out,
         )
         .unwrap();
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
         let standalone_text = String::from_utf8(standalone_out).unwrap();
         assert!(
             standalone_text.contains(exhibiting_file),
@@ -4408,7 +4417,7 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
 
     for (pattern, exhibiting_file, negative_twin, expected_line) in cases {
         let mut out: Vec<u8> = Vec::new();
-        super::run_ast_standalone(
+        let exit_code = super::run_ast_standalone(
             pattern,
             super::super::types::Page::first(20),
             true, // json
@@ -4421,6 +4430,7 @@ fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
             &mut out,
         )
         .unwrap();
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
         let json_text = String::from_utf8(out).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_text)
@@ -4602,7 +4612,7 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
     // Query the SAME synthetic pattern twice — no staleness rebuild should fire.
     for _ in 0..2 {
         let mut out: Vec<u8> = Vec::new();
-        super::run_ast_standalone(
+        let exit_code = super::run_ast_standalone(
             "god-function",
             super::super::types::Page::first(20),
             false,
@@ -4615,6 +4625,7 @@ fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
             &mut out,
         )
         .unwrap();
+        assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
     }
 
     // Assert the index file was NOT rewritten (mtime unchanged = no rebuild).
@@ -4775,7 +4786,7 @@ fn ast_verify_budget_exhaustion_drops_candidates_ad405_11() {
     // Baseline: real manifest (tiny files) — limit=1 should yield 1 result.
     // This confirms the pattern actually matches at least one file.
     let mut baseline_out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "empty-function",
         super::super::types::Page::first(1),
         true, // JSON so result count is parseable
@@ -4788,6 +4799,7 @@ fn ast_verify_budget_exhaustion_drops_candidates_ad405_11() {
         &mut baseline_out,
     )
     .expect("baseline run must succeed");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
     let baseline: serde_json::Value =
         serde_json::from_str(&String::from_utf8(baseline_out).unwrap()).unwrap();
     let baseline_count = baseline["results"].as_array().unwrap().len();
@@ -4809,7 +4821,7 @@ fn ast_verify_budget_exhaustion_drops_candidates_ad405_11() {
     );
 
     let mut budget_out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "empty-function",
         super::super::types::Page::first(1),
         true, // JSON
@@ -4822,6 +4834,7 @@ fn ast_verify_budget_exhaustion_drops_candidates_ad405_11() {
         &mut budget_out,
     )
     .expect("budget-exhaustion run must return Ok (budget drop is not an error — AC-F8)");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let budget_result: serde_json::Value =
         serde_json::from_str(&String::from_utf8(budget_out).unwrap()).unwrap();
@@ -4894,7 +4907,7 @@ fn ast_verify_missing_size_charges_1mib_fallback_ad405_11() {
     // Note: limit=10 is insufficient (10 * 102,400 = 1,024,000 < 1,048,576 → still dropped).
     // limit=11 is the minimum that allows one size-unknown candidate through.
     let mut wide_out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "empty-function",
         super::super::types::Page::first(11), // wide: budget = 11 * 102,400 > 1 MiB
         true,
@@ -4907,6 +4920,7 @@ fn ast_verify_missing_size_charges_1mib_fallback_ad405_11() {
         &mut wide_out,
     )
     .expect("wide-budget run must succeed");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
     let wide: serde_json::Value =
         serde_json::from_str(&String::from_utf8(wide_out).unwrap()).unwrap();
     let wide_count = wide["results"].as_array().unwrap().len();
@@ -4919,7 +4933,7 @@ fn ast_verify_missing_size_charges_1mib_fallback_ad405_11() {
     // Narrow-budget run: limit=1 → window=1 → budget = 100 KiB.
     // size-unknown fallback = 1 MiB (after the fix) → 1 MiB > 100 KiB → DROPPED.
     let mut narrow_out: Vec<u8> = Vec::new();
-    super::run_ast_standalone(
+    let exit_code = super::run_ast_standalone(
         "empty-function",
         super::super::types::Page::first(1), // narrow: budget = 100 KiB
         true,
@@ -4932,6 +4946,7 @@ fn ast_verify_missing_size_charges_1mib_fallback_ad405_11() {
         &mut narrow_out,
     )
     .expect("narrow-budget run must return Ok (budget drop is not an error)");
+    assert_eq!(exit_code, std::process::ExitCode::SUCCESS);
 
     let narrow: serde_json::Value =
         serde_json::from_str(&String::from_utf8(narrow_out).unwrap()).unwrap();

@@ -42,11 +42,13 @@
 
 use std::path::Path;
 
-use super::hash_if_bounded;
+use super::{hash_if_bounded, retired_seed_entries};
 use crate::cmd::permissions::sidecar::{
     PermissionSidecar, SIDECAR_FILENAME, load_sidecar, write_sidecar,
 };
-use crate::cmd::permissions::{PermissionsProtocol, PermissionsTier, RemoveOutcome, SeedOutcome};
+use crate::cmd::permissions::{
+    PermissionsProtocol, PermissionsTier, PruneMode, RemoveOutcome, SeedOutcome,
+};
 
 /// Config path (relative to config_dir) for the Codex rules file.
 const CONFIG_FILENAME: &str = "rules/skim.rules";
@@ -108,38 +110,7 @@ impl PermissionsProtocol for CodexPermissions {
             return Ok(SeedOutcome::AlreadyCurrent);
         }
 
-        // Generate the rules file content.
-        let content = generate_rules(entries);
-
-        // Ensure parent directory exists.
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Atomic write (tmp + rename).
-        let tmp_path = config_path.with_extension("rules.tmp");
-        std::fs::write(&tmp_path, &content)?;
-        std::fs::rename(&tmp_path, &config_path)?;
-
-        // Compute hash and write sidecar.
-        // The file was just written by skim; exceeding the size bound here is unexpected.
-        let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "generated Codex rules file unexpectedly exceeds size limit — \
-                 this is an internal error; please file a bug report"
-            )
-        })?;
-        let sidecar = PermissionSidecar {
-            version: 1,
-            // tier is hardcoded to "seed": Blanket is refused above; Mirror falls back to
-            // the same seed-set.
-            tier: "seed".to_string(),
-            entries: entries.to_vec(),
-            source_mirrors: std::collections::HashMap::new(),
-            config_hash,
-        };
-        let sidecar_path = config_dir.join(SIDECAR_FILENAME);
-        write_sidecar(&sidecar_path, &sidecar)?;
+        write_rules(config_dir, entries)?;
 
         Ok(SeedOutcome::Added {
             entries_added: entries.to_vec(),
@@ -190,16 +161,41 @@ impl PermissionsProtocol for CodexPermissions {
         })
     }
 
+    /// Regenerates the rules file from the recorded entries that skim still
+    /// seeds, but only when the file is still exactly what skim wrote (its
+    /// hash matches the sidecar). A file changed by hand could lack a
+    /// recorded rule, and a regenerated file would add that rule back, so
+    /// such a file is left as it is and nothing is removed.
+    fn prune_retired(
+        &self,
+        config_dir: &Path,
+        current: &[String],
+        mode: PruneMode,
+    ) -> anyhow::Result<Vec<String>> {
+        let record = retired_seed_entries(config_dir, current);
+        if record.retired.is_empty() {
+            return Ok(Vec::new());
+        }
+        let config_path = config_dir.join(CONFIG_FILENAME);
+        // Ok(None) means oversized: treat it as changed by hand.
+        let unchanged = config_path.exists()
+            && matches!(hash_if_bounded(&config_path), Ok(Some(h)) if h == record.config_hash);
+        if !unchanged {
+            return Ok(Vec::new());
+        }
+        if mode == PruneMode::Apply {
+            write_rules(config_dir, &record.kept)?;
+        }
+        Ok(record.retired)
+    }
+
     fn is_current(&self, config_dir: &Path, entries: &[String]) -> bool {
-        let sidecar_path = config_dir.join(SIDECAR_FILENAME);
         let config_path = config_dir.join(CONFIG_FILENAME);
 
-        let sidecar = match load_sidecar(&sidecar_path) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-
-        if sidecar.entries != entries {
+        // Recorded entries that a prune removes do not count: the prune runs
+        // first and regenerates the file from the rest.
+        let record = retired_seed_entries(config_dir, entries);
+        if record.kept != entries {
             return false;
         }
 
@@ -209,7 +205,7 @@ impl PermissionsProtocol for CodexPermissions {
 
         // Ok(None) means oversized → treat as not current (return false).
         hash_if_bounded(&config_path)
-            .map(|opt| opt.map(|h| h == sidecar.config_hash).unwrap_or(false))
+            .map(|opt| opt.map(|h| h == record.config_hash).unwrap_or(false))
             .unwrap_or(false)
     }
 }
@@ -236,6 +232,48 @@ fn validate_codex_entry(entry: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Validate `entries`, write the rules file for them atomically, and write
+/// the seed-tier sidecar that records them with the new file's hash.
+fn write_rules(config_dir: &Path, entries: &[String]) -> anyhow::Result<()> {
+    // Validate all entries before any write.
+    for entry in entries {
+        validate_codex_entry(entry)?;
+    }
+    let config_path = config_dir.join(CONFIG_FILENAME);
+
+    // Generate the rules file content.
+    let content = generate_rules(entries);
+
+    // Ensure parent directory exists.
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Atomic write (tmp + rename).
+    let tmp_path = config_path.with_extension("rules.tmp");
+    std::fs::write(&tmp_path, &content)?;
+    std::fs::rename(&tmp_path, &config_path)?;
+
+    // Compute hash and write sidecar.
+    // The file was just written by skim; exceeding the size bound here is unexpected.
+    let config_hash = hash_if_bounded(&config_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "generated Codex rules file unexpectedly exceeds size limit — \
+             this is an internal error; please file a bug report"
+        )
+    })?;
+    let sidecar = PermissionSidecar {
+        version: 1,
+        // tier is hardcoded to "seed": Blanket is refused in seed; Mirror falls back to
+        // the same seed-set.
+        tier: "seed".to_string(),
+        entries: entries.to_vec(),
+        source_mirrors: std::collections::HashMap::new(),
+        config_hash,
+    };
+    write_sidecar(&config_dir.join(SIDECAR_FILENAME), &sidecar)
 }
 
 /// Generate Starlark-flavored rules file content from raw tool name entries.
@@ -450,6 +488,116 @@ mod tests {
         let sidecar = load_sidecar(&sidecar_path).unwrap();
         assert_eq!(sidecar.entries, entries);
         assert!(!sidecar.config_hash.is_empty());
+    }
+
+    /// An install that an older skim seeded with `rg` and `tree` is stale for the
+    /// current list, and a re-seed regenerates the rules file without them.
+    #[test]
+    fn test_reseed_drops_rule_retired_from_seed_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let old = vec!["df".to_string(), "rg".to_string(), "tree".to_string()];
+        p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
+
+        let entries = seeded_entries(p.as_ref());
+        assert!(
+            !p.is_current(dir.path(), &entries),
+            "an install that recorded 'rg' must be stale for the current list"
+        );
+
+        let outcome = p.seed(dir.path(), PermissionsTier::Seed, &entries).unwrap();
+        assert!(
+            matches!(outcome, SeedOutcome::Added { .. }),
+            "re-seed must rewrite the rules file"
+        );
+        let contents = std::fs::read_to_string(dir.path().join("rules/skim.rules")).unwrap();
+        assert!(
+            !contents.contains("\"skim rg\"") && !contents.contains("\"skim tree\""),
+            "rules file must not allow 'skim rg' or 'skim tree', got:\n{contents}"
+        );
+    }
+
+    /// The rules file is judged as if the prune had run: a rule that a prune
+    /// removes does not make it stale. A dry-run only plans the prune and the
+    /// real run applies it first, so both runs give the same result.
+    #[test]
+    fn test_is_current_judges_rules_as_if_pruned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let entries = seeded_entries(p.as_ref());
+        let mut older = entries.clone();
+        older.push("rg".to_string());
+        p.seed(dir.path(), PermissionsTier::Seed, &older).unwrap();
+
+        assert!(p.is_current(dir.path(), &entries));
+    }
+
+    /// A prune regenerates the rules file from the recorded entries that
+    /// skim still seeds, and adds none of the current list that was not
+    /// recorded. The plan names the same entries without writing.
+    #[test]
+    fn test_prune_regenerates_rules_without_retired_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let old = vec!["df".to_string(), "rg".to_string(), "tree".to_string()];
+        p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
+        let config_path = dir.path().join("rules/skim.rules");
+        let entries = seeded_entries(p.as_ref());
+
+        let before = std::fs::read(&config_path).unwrap();
+        let planned = p
+            .prune_retired(dir.path(), &entries, PruneMode::Plan)
+            .unwrap();
+        assert_eq!(planned, vec!["rg", "tree"]);
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            before,
+            "a plan must not write"
+        );
+
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+        assert_eq!(removed, planned, "the plan must name what is removed");
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("\"skim df\""), "a kept rule must stay");
+        assert!(
+            !contents.contains("\"skim rg\"")
+                && !contents.contains("\"skim tree\"")
+                && !contents.contains("\"skim wc\""),
+            "rules file must hold only the kept rules, got:\n{contents}"
+        );
+        let sidecar = load_sidecar(&dir.path().join(SIDECAR_FILENAME)).unwrap();
+        assert_eq!(sidecar.tier, "seed");
+        assert_eq!(sidecar.entries, vec!["df"]);
+        assert!(
+            p.is_current(dir.path(), &sidecar.entries),
+            "the sidecar hash must match the regenerated file"
+        );
+    }
+
+    /// A rules file changed by hand is not regenerated: it could lack a
+    /// recorded rule, and a regenerated file would add that rule back.
+    #[test]
+    fn test_prune_leaves_hand_edited_rules_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = protocol();
+        let old = vec!["df".to_string(), "rg".to_string()];
+        p.seed(dir.path(), PermissionsTier::Seed, &old).unwrap();
+        let config_path = dir.path().join("rules/skim.rules");
+        std::fs::write(&config_path, "# edited by hand\n").unwrap();
+
+        let entries = seeded_entries(p.as_ref());
+        let removed = p
+            .prune_retired(dir.path(), &entries, PruneMode::Apply)
+            .unwrap();
+
+        assert!(removed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "# edited by hand\n"
+        );
     }
 
     #[test]

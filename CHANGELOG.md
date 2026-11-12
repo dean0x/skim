@@ -61,6 +61,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The optional permission setup now allows only read-only commands.** `skim init
+  --permissions` seeds 6 tools (`df`, `diff`, `du`, `grep`, `ls`, `wc`); `rg` and `tree` are
+  no longer in the list. The next `skim init` removes the `rg` and `tree` entries that an older
+  skim seeded and prints `removed 2 entries that skim no longer seeds`. This removal needs no
+  consent and no terminal, and it runs with or without `--permissions` (also with
+  `--no-permissions`); `--dry-run` shows it and changes nothing. skim removes only the entries
+  that its own record of the earlier setup names. For Copilot CLI, the entries go from every
+  project in `permissions-config.json`. Other allow-list entries stay as they are. To keep `rg`
+  or `tree` allowed, add the entry yourself.
+
 - **BREAKING: `skim heatmap` JSON is version 2** (#589). The output is one compact line.
   Each array of rows has the cap of its section in the view (10 hotspot rows in `files[]`
   by default), each `files[].blast_radius` holds at most 5 partners, and
