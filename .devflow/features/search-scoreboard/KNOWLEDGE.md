@@ -52,8 +52,8 @@ couple across the two crates, which invariant is enforced where, and the traps f
   different universe and bypassed the verify gate, anchors and pagination; this measures what the shipped CLI returns.
 - **What "passing" means.** Every HARD outcome is PASS or ledgered XFAIL and nothing differs from the blessed
   `baseline.json` (RATCHET values, HARD states, pins, golden digests, corpus set). It does **not** mean skim beats the
-  baselines ("beats baseline" is INFO; the baseline has skim *losing* aggregate `bytes.text_median` 2177 vs simulated
-  rg 1573 and `concept.p5` 0.8538 vs occurrence-count 0.9).
+  baselines ("beats baseline" is INFO; the baseline has skim *losing* aggregate `bytes.text_median` 2348 vs simulated
+  rg 1439 and `concept.p5` 0.8294 vs occurrence-count 0.8706).
 - **Ratchets, not targets** (applies SEARCH-ADR-003): RATCHET values compare with blessed *measured* values, never
   the "bar" column. Golden data is declared before anyone looks at skim's output and never regenerated in CI.
 - **Green is not merge authorization** (SEARCH-ADR-005), except its 2026-09-26 amendment: #540 phase PRs merge once
