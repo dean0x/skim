@@ -1229,26 +1229,153 @@ mod tests {
         let big = vec![b'x'; usize::try_from(MAX_FILE_BYTES).unwrap() + 1];
         repo.write("huge.txt", big);
         repo.write("gone.txt", "will vanish\n");
-        repo.write("real.rs", "fn real() {}\n");
-        std::os::unix::fs::symlink("real.rs", repo.root().join("link.rs")).unwrap();
         repo.commit_all("init");
         std::fs::remove_file(repo.root().join("gone.txt")).unwrap();
 
         let t = text(&repo);
-        assert!(t.contains("ok.txt") && t.contains("real.rs"));
-        assert_eq!(t.len(), 2);
+        assert_eq!(t.files().map(|(p, _)| p).collect::<Vec<_>>(), ["ok.txt"]);
         for (reason, n) in [
             ("binary", 1),
             ("not_utf8", 1),
             ("too_large", 1),
             ("vanished", 1),
-            ("symlink", 1),
+            ("symlink", 0),
             ("unreadable", 0),
             ("outside_root", 0),
         ] {
             assert_eq!(t.left_out_count(reason), n, "{reason}");
         }
         assert_eq!(t.left_out_count("no_such_reason"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tracked_symlink_is_counted_symlink_and_never_read() {
+        let repo = FixtureRepo::new();
+        repo.write("real.rs", "fn real() {}\n");
+        std::os::unix::fs::symlink("real.rs", repo.root().join("link.rs")).unwrap();
+        repo.commit_all("init");
+
+        let t = text(&repo);
+        assert_eq!(t.files().map(|(p, _)| p).collect::<Vec<_>>(), ["real.rs"]);
+        assert_eq!(t.left_out_count("symlink"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untracked_walked_symlink_is_counted_symlink_and_never_read() {
+        let repo = FixtureRepo::new();
+        repo.write("real.rs", "fn real() {}\n");
+        repo.commit_all("init");
+        // Untracked, so git lists it as a plain walked entry (not a mode 120000
+        // index entry); it points inside the root, so a read would admit it.
+        std::os::unix::fs::symlink("real.rs", repo.root().join("link.rs")).unwrap();
+        assert!(
+            repo.git(&["ls-files", "--others", "--exclude-standard"])
+                .contains("link.rs"),
+            "fixture: the walk lists the untracked symlink"
+        );
+
+        let t = text(&repo);
+        assert!(t.contains("real.rs"));
+        assert!(!t.contains("link.rs"));
+        assert_eq!(t.left_out_count("symlink"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tracked_file_replaced_by_a_fifo_is_unreadable_and_never_opened() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let repo = FixtureRepo::new();
+        repo.write("pipe.txt", "was a file\n");
+        repo.write("kept.txt", "kept\n");
+        repo.commit_all("init");
+        let fifo = repo.root().join("pipe.txt");
+        std::fs::remove_file(&fifo).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "fixture: mkfifo");
+
+        // Opening a FIFO that has no writer blocks forever, so a guard that
+        // regressed would hang this test instead of failing it: build the
+        // universe on a thread and bound the wait.
+        let (root, home) = (repo.root().to_path_buf(), repo.home().to_path_buf());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(text_universe(&root, &GitIsolation::new(home)));
+        });
+        let t = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the build must finish: a non-regular file is left out without being opened")
+            .unwrap();
+
+        assert_eq!(t.files().map(|(p, _)| p).collect::<Vec<_>>(), ["kept.txt"]);
+        assert_eq!(t.left_out_count("unreadable"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tracked_file_that_cannot_be_opened_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repo = FixtureRepo::new();
+        repo.write("locked.txt", "locked\n");
+        repo.write("kept.txt", "kept\n");
+        repo.commit_all("init");
+        let locked = repo.root().join("locked.txt");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&locked).is_ok() {
+            // A superuser opens any file: the open-error arm cannot be reached.
+            eprintln!("skipped: this user can open a mode 000 file");
+            return;
+        }
+
+        let t = text(&repo);
+        assert_eq!(t.files().map(|(p, _)| p).collect::<Vec<_>>(), ["kept.txt"]);
+        assert_eq!(t.left_out_count("unreadable"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tracked_file_reached_through_a_symlinked_parent_is_outside_root_and_never_read() {
+        let repo = FixtureRepo::new();
+        repo.write("dir/f.txt", "inside\n");
+        repo.write("kept.txt", "kept\n");
+        repo.commit_all("init");
+        // `dir/f.txt` stays tracked and is a regular file as far as an lstat of
+        // the path can tell, but its real path leaves the root.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("f.txt"), "outside secret\n").unwrap();
+        std::fs::remove_dir_all(repo.root().join("dir")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.root().join("dir")).unwrap();
+
+        let t = text(&repo);
+        assert!(t.contains("kept.txt"));
+        assert!(!t.contains("dir/f.txt"));
+        assert_eq!(t.left_out_count("outside_root"), 1);
+        assert!(t.files().all(|(_, body)| !body.contains("outside secret")));
+    }
+
+    // APFS refuses a file name that is not UTF-8, so only Linux runs this test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_non_utf8_paths_with_one_lossy_form_are_an_error() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let repo = FixtureRepo::new();
+        // 0xFF and 0xFE are both invalid UTF-8: each decodes to U+FFFD, so both
+        // names become the key "a\u{FFFD}.txt".
+        for (name, body) in [(&b"a\xff.txt"[..], "one\n"), (&b"a\xfe.txt"[..], "two\n")] {
+            std::fs::write(repo.root().join(std::ffi::OsStr::from_bytes(name)), body).unwrap();
+        }
+        repo.commit_all("init");
+
+        let err = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap_err();
+        assert!(format!("{err:#}").contains("decode to"), "{err:#}");
     }
 
     #[test]
