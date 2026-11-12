@@ -1121,16 +1121,26 @@ fn test_ac5_dog_food_risky_matches_git_ground_truth() {
             .expect("rev-list count must be a number")
     };
 
-    // fix_commits: non-merge subjects matching the same case-insensitive
-    // word-boundary pattern as is_fix_commit (temporal/mod.rs FIX_REGEX),
-    // over the same walk as the matching total.
+    // fix_commits: non-merge subjects that the rule of is_fix_commit
+    // (temporal/mod.rs) calls a fix, written again here as one ERE, over the
+    // same walk as the matching total. A subject is a fix when, after at
+    // most 4 leading `[tag]` groups, a tag is a keyword, the conventional
+    // type is a keyword, or the first word is a keyword (punctuation at its
+    // ends removed).
     //
     // `grep -c` prints the count and exits 0 (matches) or 1 (no matches).
     // parse() handles both — unwrap_or(0) is the zero-match safety net.
     let git_fix_count = |walk: &str| -> u64 {
+        const KW: &str = "(fix|bug|hotfix|patch|revert)";
+        let tags = r"(\[[^]]*\][[:space:]]*){0,4}";
+        let tag_kw = format!(r"\[[^][:alnum:]]*{KW}[^][:alnum:]]*\]");
+        let type_kw = format!(r"{KW}(\([^)]*\))?!?:");
+        let any_type = r"([A-Za-z][A-Za-z0-9_-]*(\([^)]*\))?!?:[[:space:]]*)?";
+        let word_kw = format!(r"[^[:alnum:][:space:]]*{KW}[^[:alnum:][:space:]]*([[:space:]]|$)");
+        let ere = format!(r"^[[:space:]]*{tags}({tag_kw}|{type_kw}|{any_type}{word_kw})");
         let sh_cmd = format!(
             r"git log --no-merges {walk} --format='%s' -- '{TARGET}' \
-              | grep -ciE '\b(fix|bug|hotfix|patch|revert)\b'"
+              | grep -ciE '{ere}'"
         );
         let out = StdCommand::new("sh")
             .arg("-c")
