@@ -933,20 +933,128 @@ mod via_npx {
         );
     }
 
-    /// AC-5: a failed probe drops the whole compound rewrite, also the segments
-    /// that need no folder. The command runs as typed.
+    /// AC-5: a failed probe leaves only the `npx` segment as typed. The segments
+    /// that need no folder still rewrite.
     #[test]
-    fn test_hook_failed_probe_drops_the_whole_compound() {
+    fn test_hook_failed_probe_leaves_only_the_npx_segment_as_typed() {
         let rig = Rig::new();
         rig.install_npx();
         rig.install_path_copy("cargo");
 
-        assert_eq!(rig.hook_line("npx tsc && cargo test", &rig.project()), None);
+        assert_eq!(
+            rig.hook_line("npx tsc && cargo test", &rig.project())
+                .as_deref(),
+            Some("npx tsc && skim cargo test")
+        );
+    }
+
+    /// AC-5: a command that is only an `npx` rule, with no local bin, gets no
+    /// response. The command runs as typed.
+    #[test]
+    fn test_hook_failed_probe_gives_no_response_for_a_lone_npx_command() {
+        let rig = Rig::new();
+        rig.install_npx();
+
+        assert_eq!(rig.hook_line("npx tsc --noEmit", &rig.project()), None);
+    }
+
+    /// The `cwd` values that leave the hook unable to say where the command
+    /// runs, and one folder that holds no tool.
+    fn unusable_hook_folders(rig: &Rig) -> Vec<(&'static str, Value)> {
+        let missing = rig.home.path().join("absent");
+        vec![
+            ("folder without the bin", json!(bare_repo(rig, "empty"))),
+            ("relative name", json!("project")),
+            ("relative dot", json!(".")),
+            ("number", json!(42)),
+            ("null", json!(null)),
+            ("missing folder", json!(missing)),
+        ]
+    }
+
+    /// A segment that routes through a masking tool keeps its rewrite when the
+    /// `npx` segment before it has none: the first segment stays as typed, the
+    /// masking segment still goes through skim. Checked in the default and the
+    /// auto permission mode, for each way the project can lack the tool.
+    #[test]
+    fn test_hook_failed_probe_keeps_the_masking_segment_of_a_compound() {
+        let rig = Rig::new();
+        rig.install_npx();
+        for tool in ["env", "printenv", "curl"] {
+            rig.install_path_copy(tool);
+        }
+
+        for (typed, expected) in [
+            ("npx tsc && env", "npx tsc && skim env"),
+            ("npx eslint . ; printenv", "npx eslint . ; skim printenv"),
+            (
+                "npx tsc && curl -v https://example.com",
+                "npx tsc && skim curl -v https://example.com",
+            ),
+        ] {
+            for (what, cwd) in unusable_hook_folders(&rig) {
+                for mode in [None, Some("auto")] {
+                    let mut payload = pre_payload(typed, Some(cwd.clone()));
+                    if let Some(mode) = mode {
+                        payload["permission_mode"] = json!(mode);
+                    }
+                    assert_eq!(
+                        rig.run_hook(rig.home.path(), &payload)
+                            .rewritten()
+                            .as_deref(),
+                        Some(expected),
+                        "{typed} ({what}, mode {mode:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// With the local bin in place the first segment rewrites too, and the
+    /// masking segment keeps its rewrite as before.
+    #[test]
+    fn test_hook_masking_segment_after_an_npx_segment_with_the_local_bin() {
+        let rig = rig_with_every_local_tool();
+        rig.install_path_copy("env");
+
+        for mode in [None, Some("auto")] {
+            let mut payload = pre_payload(
+                "npx tsc && env",
+                Some(json!(rig.project().to_str().expect("UTF-8 path"))),
+            );
+            if let Some(mode) = mode {
+                payload["permission_mode"] = json!(mode);
+            }
+            assert_eq!(
+                rig.run_hook(&rig.project(), &payload)
+                    .rewritten()
+                    .as_deref(),
+                Some("skim tsc --via-npx && skim env"),
+                "mode {mode:?}"
+            );
+        }
+    }
+
+    /// In the auto permission mode a compound with no masking segment is still
+    /// withheld when the `npx` segment has no local bin.
+    #[test]
+    fn test_hook_auto_mode_withholds_a_non_masking_compound_without_a_local_bin() {
+        let rig = Rig::new();
+        rig.install_npx();
+        rig.install_path_copy("cargo");
+
+        let mut payload = pre_payload(
+            "npx tsc && cargo test",
+            Some(json!(rig.project().to_str().expect("UTF-8 path"))),
+        );
+        payload["permission_mode"] = json!("auto");
+
+        assert_eq!(rig.run_hook(&rig.project(), &payload).rewritten(), None);
     }
 
     /// TP-9: what the probe must not change. A bare tool name, the test-family
-    /// `npx` rules, a typed `skim` command and the auto-mode withhold behave as
-    /// before, with or without a local bin.
+    /// `npx` rule and a typed `skim` command behave as before when the project
+    /// holds no local bin.
     #[test]
     fn test_hook_rewrites_that_need_no_local_bin_are_unchanged() {
         let rig = Rig::new();
