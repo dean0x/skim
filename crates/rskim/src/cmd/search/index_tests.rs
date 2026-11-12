@@ -3956,7 +3956,7 @@ fn test_ac11_stats_json_back_compat_keys() {
 /// in `test_ac4_bundle_skipped_and_named_in_sample` and `test_ac5_*`. This test
 /// verifies the production wiring in `run_build` — the `eprintln!` call, the
 /// empty-guard, and the cap=10 argument — by capturing stderr from the binary
-/// (subprocess-level, CARGO_BIN_EXE_skim).  A regression that drops the
+/// (subprocess-level, via `skim_bin_path`).  A regression that drops the
 /// `eprintln!` or inverts the empty-guard would not be caught by the component
 /// tests; this test catches it.
 #[test]

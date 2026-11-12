@@ -3675,8 +3675,8 @@ mod tests {
         // A 4× step (not the 2× doubling of the other guards). The doubling form
         // allowed only 1.4× runner noise (2.8 / 2.0) and failed on a CI runner at
         // 2.93× with no walker change. The threshold 8.0 = 4^1.5 keeps the same
-        // exponent-space midpoint, and allows 2× noise. N=2000 is the largest
-        // size under MAX_AST_NODES: N=4000 returns Err(ComplexityLimit).
+        // exponent-space midpoint, and allows 2× noise. The step cannot start at
+        // N=1000: N=4000 is over MAX_AST_NODES and returns Err(ComplexityLimit).
         let (t1_min, t1_median) = time_pseudo(&python_return_type_source(500), Language::Python);
         let (t2_min, _) = time_pseudo(&python_return_type_source(2000), Language::Python);
 

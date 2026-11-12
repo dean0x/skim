@@ -2287,29 +2287,33 @@ mod tests {
     /// in-source unit tests walk up from `current_exe()` to the first ancestor
     /// that holds `skim`. The walk covers both cargo layouts for the test binary:
     /// `target/<profile>/deps/skim-<hash>` and, from cargo 1.100,
-    /// `target/<profile>/build/rskim/<hash>/out/skim-<hash>`.
+    /// `target/<profile>/build/rskim/<hash>/out/skim-<hash>`. It stops at the
+    /// cargo target dir (the folder with `CACHEDIR.TAG`), so a `skim` file
+    /// outside the build output is never used.
     ///
-    /// PRECONDITION: the `skim` binary is built (`cargo test -p rskim --bins`,
-    /// `--all-targets`, or `cargo build -p rskim` before nextest). A stale binary
-    /// at that path exercises old code; the callers' output assertions catch that.
+    /// PRECONDITION: the `skim` binary is built from the current tree
+    /// (`cargo test -p rskim --bins`, `--all-targets`, or `cargo build -p rskim`
+    /// before nextest). A stale binary runs old code and can give a false pass.
     pub(super) fn skim_bin_path() -> String {
         if let Ok(bin) = std::env::var("CARGO_BIN_EXE_skim") {
             return bin;
         }
         let exe = std::env::current_exe().expect("test binary path must resolve");
         let name = format!("skim{}", std::env::consts::EXE_SUFFIX);
-        exe.ancestors()
-            .skip(1)
-            .map(|dir| dir.join(&name))
-            .find(|candidate| candidate.is_file())
-            .unwrap_or_else(|| {
-                panic!(
-                    "no built `{name}` above {}; run `cargo build -p rskim` first",
-                    exe.display()
-                )
-            })
-            .to_string_lossy()
-            .into_owned()
+        for dir in exe.ancestors().skip(1) {
+            let candidate = dir.join(&name);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+            if dir.join("CACHEDIR.TAG").is_file() {
+                break;
+            }
+        }
+        panic!(
+            "no built `{name}` between {} and the cargo target dir; \
+             run `cargo build -p rskim` first",
+            exe.display()
+        )
     }
 
     // ========================================================================

@@ -33,6 +33,10 @@
 //! both sides, whereas an empirically fitted constant (the historical 2.5)
 //! drifts as hardware changes.  Measured ratios for correct implementations
 //! sit in the 1.8×–2.1× range; 2.8 leaves ~35% headroom.
+//!
+//! A guard that needs more noise headroom grows N 4× instead, against
+//! 4^1.5 = 8.0: the same exponent midpoint, with 2× noise headroom instead
+//! of 1.4×. The Python return-type guard in `pseudo.rs` uses this form.
 
 /// Run `f` exactly 5 times and return `(min, median)`.
 ///
