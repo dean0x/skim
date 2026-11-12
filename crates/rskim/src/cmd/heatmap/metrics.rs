@@ -1255,7 +1255,7 @@ mod tests {
         );
     }
 
-    /// git C-quotes a path with non-ASCII characters in both `ls-files` and
+    /// git C-quotes a path with non-ASCII characters in both `ls-tree` and
     /// `--numstat` output; a quoted crate folder still holds its own files.
     #[test]
     fn test_module_of_quoted_paths_match_their_quoted_manifest_folder() {

@@ -3,7 +3,7 @@
 //! Uses `CommandRunner` to execute git commands and parses their output into
 //! `CommitInfo` values via a simple state machine.
 
-use crate::runner::{CommandOutput, CommandRunner, is_spawn_error};
+use crate::runner::{CommandOutput, CommandRunner, MAX_OUTPUT_BYTES, is_spawn_error};
 
 use super::types::{CommitInfo, FileChangeInfo, HeatmapConfig};
 
@@ -13,6 +13,9 @@ use super::types::{CommitInfo, FileChangeInfo, HeatmapConfig};
 /// The hash and the timestamp come first, so no content of an author name or
 /// a subject (a `|`, for example) can move them.
 const LOG_FORMAT: &str = "--format=COMMIT:%H%x00%ad%x00%aN%x00%s";
+
+/// The start of each record header line in [`LOG_FORMAT`] output.
+const RECORD_PREFIX: &str = "COMMIT:";
 
 /// Map a `CommandRunner` error to a friendly "git not installed" message when appropriate.
 fn git_not_found(e: anyhow::Error) -> anyhow::Error {
@@ -39,9 +42,13 @@ fn git_not_found(e: anyhow::Error) -> anyhow::Error {
 /// single `&dyn GitDataSource` instead of splitting into a concrete `&CliGitSource`
 /// for infrastructure and a trait object for data fetch.
 ///
-/// No method takes a path from the user. A future method that does must put
-/// the path after `--` and run git with `GIT_LITERAL_PATHSPECS=1`
-/// (`CommandRunner::run_with_env`).
+/// One method takes a path from the user: [`fetch_commits`](Self::fetch_commits)
+/// gives the `--path` value to git. That value goes after `--`, and git runs
+/// with `--literal-pathspecs` (the same as `GIT_LITERAL_PATHSPECS=1`), so git
+/// reads it as a literal path: a folder matches the files below it, and no
+/// glob or pathspec magic applies. A new method that takes a path from the
+/// user must do the same. (`CliGitSource::fetch_diff_files` takes a revision,
+/// not a path: see `build_diff_args`.)
 ///
 /// Long-term, this trait will be replaced by `rskim_search::TemporalSource` +
 /// `GixSource` once the heatmap pipeline migrates from CLI git to the gix library.
@@ -61,10 +68,18 @@ pub(crate) trait GitDataSource {
     fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>>;
 
     /// Fetch commits according to `config`, with the count of skipped records.
+    ///
+    /// When the git output stops at the runner's output limit, the last
+    /// record is dropped and [`ParsedLog::cut_oldest`] is set. Any other
+    /// failed `git log` is an error with git's message, but a branch with no
+    /// commits gives an empty history.
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<ParsedLog>;
 
-    /// List the paths in the index of the repository at `repo_root`, relative
-    /// to that root.
+    /// List the paths in the HEAD tree of the repository at `repo_root`,
+    /// relative to that root.
+    ///
+    /// The list comes from the committed tree, not from the index. A branch
+    /// with no commits gives `Ok(None)`.
     ///
     /// The paths use the same encoding as the `--numstat` paths of
     /// [`fetch_commits`](Self::fetch_commits): git C-quotes unusual names in
@@ -87,8 +102,16 @@ pub(crate) struct CliGitSource {
 }
 
 /// Build the `git log` arg list for a window start and an optional `--path`.
+///
+/// `--literal-pathspecs` goes before the subcommand, so git reads the path
+/// after `--` as a literal path: a folder still matches the files below it,
+/// but a glob or a pathspec magic prefix matches only that literal name. It is
+/// the same as `GIT_LITERAL_PATHSPECS=1`; it is an argument here because the
+/// run reads stdout through `CommandRunner::run_stdout_degrade`, which takes
+/// no environment.
 fn build_git_log_args(since: Option<u64>, path: Option<&str>) -> Vec<String> {
     let mut args = vec![
+        "--literal-pathspecs".to_string(),
         "log".to_string(),
         LOG_FORMAT.to_string(),
         "--numstat".to_string(),
@@ -155,6 +178,19 @@ impl CliGitSource {
             .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
             .collect())
     }
+
+    /// `true` when HEAD names no commit: the branch has no commits yet.
+    ///
+    /// `git rev-parse --verify --quiet` exits 1 for a name that does not
+    /// resolve. Any other result, a spawn error included, gives `false`, so
+    /// a failed `git log` is then reported, not hidden as an empty history.
+    fn head_is_unborn(&self) -> bool {
+        matches!(
+            self.runner
+                .run("git", &["rev-parse", "--verify", "--quiet", "HEAD"]),
+            Ok(out) if out.exit_code == Some(1)
+        )
+    }
 }
 
 impl GitDataSource for CliGitSource {
@@ -219,15 +255,18 @@ impl GitDataSource for CliGitSource {
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<ParsedLog> {
         let owned_args = build_git_log_args(config.since, config.path.as_deref());
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        let output = self.runner.run("git", &args).map_err(git_not_found)?;
-        Ok(parse_git_log_output(&output.stdout))
+        let (output, cut) = self
+            .runner
+            .run_stdout_degrade("git", &args)
+            .map_err(git_not_found)?;
+        parsed_log_from(&output, cut, || self.head_is_unborn())
     }
 
     fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
         // No `-z`: the plain output C-quotes unusual paths exactly as
         // `--numstat` does, so both lists use one path encoding for any
         // `core.quotePath` setting.
-        let result = self.runner.run("git", &["-C", repo_root, "ls-files"]);
+        let result = self.runner.run("git", &tracked_files_args(repo_root));
         Ok(tracked_files_from(result))
     }
 
@@ -240,7 +279,85 @@ impl GitDataSource for CliGitSource {
     }
 }
 
-/// Map a `git ls-files` run to its path list.
+/// The arg list that lists the paths of the HEAD tree of `repo_root`.
+///
+/// The paths come from the committed tree, so git does not read the index
+/// and no index setting of the repository applies. A branch with no commits
+/// makes git fail, and the caller then uses its fallback. `--full-tree` lists
+/// the whole tree for any cwd.
+fn tracked_files_args(repo_root: &str) -> [&str; 7] {
+    [
+        "-C",
+        repo_root,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "--full-tree",
+        "HEAD",
+    ]
+}
+
+/// Map a `git log` run to its records.
+///
+/// `cut` is the runner's flag for stdout that stopped at its output limit.
+/// Then the last record can be cut anywhere, so it is dropped, and
+/// [`ParsedLog::cut_oldest`] gets the oldest author timestamp that is kept.
+/// A cut before the end of the first record is an error, because no full
+/// record is left.
+///
+/// With no cut, exit 0 parses all of stdout. Any other exit status is an
+/// error with git's stderr, but when `head_unborn` reports a branch with no
+/// commits the result is an empty history. `head_unborn` runs only then.
+fn parsed_log_from(
+    out: &CommandOutput,
+    cut: bool,
+    head_unborn: impl FnOnce() -> bool,
+) -> anyhow::Result<ParsedLog> {
+    if cut {
+        let mut parsed = parse_git_log_output(without_last_record(&out.stdout));
+        let oldest = parsed.commits.iter().map(|c| c.timestamp).min();
+        let Some(oldest) = oldest else {
+            anyhow::bail!(
+                "git log output stopped at the {} MiB output limit before the end of the first commit record",
+                MAX_OUTPUT_BYTES / (1024 * 1024)
+            );
+        };
+        parsed.cut_oldest = Some(oldest);
+        return Ok(parsed);
+    }
+    if out.exit_code == Some(0) {
+        return Ok(parse_git_log_output(&out.stdout));
+    }
+    if head_unborn() {
+        return Ok(ParsedLog::default());
+    }
+    let status = match out.exit_code {
+        Some(code) => format!("exit status {code}"),
+        None => "a signal".to_string(),
+    };
+    let stderr = out.stderr.trim();
+    if stderr.is_empty() {
+        anyhow::bail!("git log ended with {status}");
+    }
+    anyhow::bail!("git log ended with {status}: {stderr}")
+}
+
+/// The text before the last line that starts a record, so that a record
+/// the output limit may have cut is not parsed. With one record or none,
+/// nothing is left.
+fn without_last_record(raw: &str) -> &str {
+    let mut last_start = 0;
+    let mut offset = 0;
+    for line in raw.split_inclusive('\n') {
+        if line.starts_with(RECORD_PREFIX) {
+            last_start = offset;
+        }
+        offset += line.len();
+    }
+    &raw[..last_start]
+}
+
+/// Map a `git ls-tree` run to its path list.
 ///
 /// A spawn error or any exit status other than 0 gives `None` (with one
 /// debug-gated note), and the caller uses its fallback. A run cut at the
@@ -257,14 +374,14 @@ fn tracked_files_from(result: anyhow::Result<CommandOutput>) -> Option<Vec<Strin
         ),
         Ok(out) => {
             crate::debug_log!(
-                "[skim:heatmap] git ls-files exit status {:?}; modules use the top-folder rule",
+                "[skim:heatmap] git ls-tree exit status {:?}; modules use the top-folder rule",
                 out.exit_code
             );
             None
         }
         Err(e) => {
             crate::debug_log!(
-                "[skim:heatmap] git ls-files did not run ({e}); modules use the top-folder rule"
+                "[skim:heatmap] git ls-tree did not run ({e}); modules use the top-folder rule"
             );
             None
         }
@@ -296,6 +413,10 @@ pub(crate) struct ParsedLog {
     /// Count of `COMMIT:` records skipped for a missing field, a bad hash or a
     /// bad timestamp. Their numstat lines are skipped with them.
     pub(crate) malformed: usize,
+    /// `Some(ts)` when the git output stopped at the runner's output limit:
+    /// the last record was dropped, and `ts` is the author timestamp of the
+    /// oldest commit kept. `None` for a full output.
+    pub(crate) cut_oldest: Option<i64>,
 }
 
 /// Parse the output of `git log` with [`LOG_FORMAT`] and `--numstat`.
@@ -309,7 +430,7 @@ pub(crate) fn parse_git_log_output(raw: &str) -> ParsedLog {
     let mut current: Option<CommitInfo> = None;
 
     for line in raw.lines() {
-        if let Some(rest) = line.strip_prefix("COMMIT:") {
+        if let Some(rest) = line.strip_prefix(RECORD_PREFIX) {
             // Flush the previous commit
             if let Some(c) = current.take() {
                 commits.push(c);
@@ -336,7 +457,11 @@ pub(crate) fn parse_git_log_output(raw: &str) -> ParsedLog {
         commits.push(c);
     }
 
-    ParsedLog { commits, malformed }
+    ParsedLog {
+        commits,
+        malformed,
+        cut_oldest: None,
+    }
 }
 
 /// Parse the part of a record header after `COMMIT:`.
@@ -692,6 +817,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "--literal-pathspecs",
                 "log",
                 "--format=COMMIT:%H%x00%ad%x00%aN%x00%s",
                 "--numstat",
@@ -702,6 +828,20 @@ mod tests {
                 "--",
                 "src/",
             ]
+        );
+    }
+
+    /// The `--path` value is the last argument, after `--`, and the literal
+    /// path flag goes before the subcommand, where git reads it.
+    #[test]
+    fn test_git_log_args_read_the_path_value_as_a_literal_path() {
+        let args = build_git_log_args(None, Some("*"));
+        assert_eq!(args[..2], ["--literal-pathspecs", "log"], "args: {args:?}");
+        assert_eq!(args[args.len() - 2..], ["--", "*"], "args: {args:?}");
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == "--").count(),
+            1,
+            "args: {args:?}"
         );
     }
 
@@ -719,8 +859,119 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // git log run outcome
+    // -----------------------------------------------------------------------
+
+    /// Two full records, newest first: `HASH_A` at 2000 with `a.rs`, then
+    /// `HASH_B` at 1000 with `b.rs`.
+    fn two_records() -> String {
+        format!(
+            "{}1\t0\ta.rs\n\n{}1\t0\tb.rs\n\n",
+            header(HASH_A, "2000", "Alice", "second"),
+            header(HASH_B, "1000", "Bob", "first"),
+        )
+    }
+
+    /// Assert the two records of `two_records`, each with only its own file.
+    fn assert_two_records(parsed: &ParsedLog) {
+        assert_eq!(parsed.commits.len(), 2);
+        assert_eq!(parsed.commits[0].hash, HASH_A);
+        assert_eq!(paths(&parsed.commits[0]), vec![Path::new("a.rs")]);
+        assert_eq!(parsed.commits[1].hash, HASH_B);
+        assert_eq!(paths(&parsed.commits[1]), vec![Path::new("b.rs")]);
+        assert_eq!(parsed.malformed, 0);
+    }
+
+    fn head_check_not_expected() -> bool {
+        panic!("the HEAD check must run only after a failed git log")
+    }
+
+    #[test]
+    fn test_log_exit_zero_keeps_every_record() {
+        let out = output(&two_records(), Some(0));
+        let parsed = parsed_log_from(&out, false, head_check_not_expected).unwrap();
+        assert_two_records(&parsed);
+        assert_eq!(parsed.cut_oldest, None);
+    }
+
+    #[test]
+    fn test_log_cut_at_output_limit_drops_the_last_record() {
+        // The cut is in the middle of a numstat path of the third record.
+        let raw = format!(
+            "{}1\t0\tsrc/foo.rs\n2\t0\tsrc/fo",
+            two_records() + &header(&"c".repeat(40), "500", "Cy", "third")
+        );
+        for exit_code in [None, Some(141), Some(0)] {
+            let out = output(&raw, exit_code);
+            let parsed = parsed_log_from(&out, true, head_check_not_expected).unwrap();
+            assert_two_records(&parsed);
+            assert_eq!(parsed.cut_oldest, Some(1000), "exit {exit_code:?}");
+        }
+    }
+
+    #[test]
+    fn test_log_cut_in_a_record_header_counts_no_malformed_record() {
+        let raw = two_records() + "COMMIT:cccccccc";
+        let parsed = parsed_log_from(&output(&raw, None), true, head_check_not_expected).unwrap();
+        assert_two_records(&parsed);
+        assert_eq!(parsed.cut_oldest, Some(1000));
+    }
+
+    #[test]
+    fn test_log_cut_before_the_end_of_the_first_record_is_error() {
+        let raw = header(HASH_A, "2000", "Alice", "only") + "1\t0\tsrc/fo";
+        let msg = parsed_log_from(&output(&raw, None), true, head_check_not_expected)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("64 MiB output limit"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_log_nonzero_exit_is_error_with_git_stderr() {
+        let out = output(&two_records(), Some(128));
+        let msg = parsed_log_from(&out, false, || false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(msg, "git log ended with exit status 128: fatal: test");
+    }
+
+    #[test]
+    fn test_log_signal_exit_without_cut_is_error() {
+        let out = output(&two_records(), None);
+        let msg = parsed_log_from(&out, false, || false)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(msg, "git log ended with a signal: fatal: test");
+    }
+
+    #[test]
+    fn test_log_failure_on_a_branch_with_no_commits_is_empty_history() {
+        let out = output("", Some(128));
+        let parsed = parsed_log_from(&out, false, || true).unwrap();
+        assert!(parsed.commits.is_empty());
+        assert_eq!(parsed.malformed, 0);
+        assert_eq!(parsed.cut_oldest, None);
+    }
+
+    // -----------------------------------------------------------------------
     // Tracked files and show-prefix
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tracked_files_args_read_the_head_tree() {
+        assert_eq!(
+            tracked_files_args("/repo").as_slice(),
+            [
+                "-C",
+                "/repo",
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "--full-tree",
+                "HEAD"
+            ]
+        );
+    }
 
     #[test]
     fn test_tracked_files_nonzero_exit_gives_none() {
@@ -784,6 +1035,80 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Write each of `files` (relative to `root`) and stage it.
+    fn add_files(root: &Path, files: &[&str]) {
+        for rel in files {
+            let file = root.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x\n").unwrap();
+            git_in(root, &["add", rel]);
+        }
+    }
+
+    /// Run the heatmap `git log` in `root` with an optional `--path` value.
+    fn log_in(root: &Path, path: Option<&str>) -> ParsedLog {
+        let mut log_args = vec!["-C".to_string(), root.to_str().unwrap().to_string()];
+        log_args.extend(build_git_log_args(None, path));
+        let log_args: Vec<&str> = log_args.iter().map(String::as_str).collect();
+        let log = CommandRunner::new().run("git", &log_args).unwrap();
+        assert_eq!(log.exit_code, Some(0), "git log: {}", log.stderr);
+        parse_git_log_output(&log.stdout)
+    }
+
+    /// A folder value matches the files below it; a glob or a pathspec
+    /// magic value matches only a path with that literal name.
+    #[test]
+    fn test_git_log_path_matches_a_folder_and_not_a_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q"]);
+        add_files(root, &["src/sub/a.rs"]);
+        git_in(root, &["commit", "-q", "-m", "one"]);
+        add_files(root, &["top.rs"]);
+        git_in(root, &["commit", "-q", "-m", "two"]);
+
+        for (path, want) in [
+            ("src", 1),
+            ("src/", 1),
+            ("src/sub", 1),
+            ("*.rs", 0),
+            (":/", 0),
+            (":(exclude)src", 0),
+        ] {
+            let parsed = log_in(root, Some(path));
+            assert_eq!(parsed.commits.len(), want, "--path {path:?}");
+        }
+    }
+
+    #[test]
+    fn test_tracked_files_come_from_the_head_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q"]);
+        add_files(root, &["a.rs"]);
+        git_in(root, &["commit", "-q", "-m", "one"]);
+        // Staged only: not in the HEAD tree.
+        add_files(root, &["b.rs"]);
+
+        let tracked = CliGitSource::new()
+            .list_tracked_files(root.to_str().unwrap())
+            .unwrap();
+        assert_eq!(tracked, Some(vec!["a.rs".to_string()]));
+    }
+
+    #[test]
+    fn test_tracked_files_on_a_branch_with_no_commits_give_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q"]);
+        add_files(root, &["a.rs"]);
+
+        let tracked = CliGitSource::new()
+            .list_tracked_files(root.to_str().unwrap())
+            .unwrap();
+        assert_eq!(tracked, None);
+    }
+
     /// The tracked-file list and the numstat paths must use one encoding, or a
     /// non-ASCII crate folder never matches its own files.
     #[test]
@@ -794,25 +1119,18 @@ mod tests {
         // The default, set here so that a global setting cannot hide a
         // difference between the two encodings.
         git_in(root, &["config", "core.quotePath", "true"]);
-        for rel in ["crates/naïve/Cargo.toml", "crates/naïve/src/lib.rs"] {
-            let file = root.join(rel);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(&file, "x\n").unwrap();
-        }
-        git_in(root, &["add", "."]);
+        add_files(
+            root,
+            &["crates/naïve/Cargo.toml", "crates/naïve/src/lib.rs"],
+        );
         git_in(root, &["commit", "-q", "-m", "init"]);
-        let root_str = root.to_str().unwrap();
 
         let mut tracked = CliGitSource::new()
-            .list_tracked_files(root_str)
+            .list_tracked_files(root.to_str().unwrap())
             .unwrap()
-            .expect("ls-files ran in a git repo");
+            .expect("the tracked-file list ran in a git repo");
 
-        let mut log_args = vec!["-C".to_string(), root_str.to_string()];
-        log_args.extend(build_git_log_args(None, None));
-        let log_args: Vec<&str> = log_args.iter().map(String::as_str).collect();
-        let log = CommandRunner::new().run("git", &log_args).unwrap();
-        let parsed = parse_git_log_output(&log.stdout);
+        let parsed = log_in(root, None);
         assert_eq!(parsed.commits.len(), 1);
         let mut numstat: Vec<String> = parsed.commits[0]
             .changed_files

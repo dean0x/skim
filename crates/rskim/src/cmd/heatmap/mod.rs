@@ -260,6 +260,14 @@ fn prepare_commits(
             parsed.malformed
         ));
     }
+    if let Some(oldest) = parsed.cut_oldest {
+        // Author timestamps are ASCII digits only, so they are never negative.
+        warnings.push(format!(
+            "git log output stopped at the {} MiB output limit; the oldest commit counted is from {}, and older history is not counted. Use --path, --since or --last for a full count.",
+            crate::runner::MAX_OUTPUT_BYTES / (1024 * 1024),
+            format_epoch(u64::try_from(oldest).unwrap_or(0)),
+        ));
+    }
     let raw_commits = parsed.commits;
 
     if debug {
@@ -988,12 +996,13 @@ mod tests {
         Fails,
     }
 
-    /// Stub `GitDataSource`: `fetch_commits` returns `commits` and the
-    /// configured count of malformed records; `list_tracked_files` follows
-    /// `tracked`.
+    /// Stub `GitDataSource`: `fetch_commits` returns `commits`, the
+    /// configured count of malformed records and `cut_oldest`;
+    /// `list_tracked_files` follows `tracked`.
     struct StubSource {
         commits: Vec<CommitInfo>,
         malformed: usize,
+        cut_oldest: Option<i64>,
         tracked: TrackedStub,
     }
 
@@ -1003,6 +1012,7 @@ mod tests {
             Self {
                 commits: vec![stub_commit(0, &["src/main.rs"])],
                 malformed,
+                cut_oldest: None,
                 tracked: TrackedStub::Unavailable,
             }
         }
@@ -1042,6 +1052,7 @@ mod tests {
             Ok(git_source::ParsedLog {
                 commits: self.commits.clone(),
                 malformed: self.malformed,
+                cut_oldest: self.cut_oldest,
             })
         }
         fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
@@ -1088,6 +1099,40 @@ mod tests {
         assert!(malformed_warnings(&prepared).is_empty());
     }
 
+    fn cut_warnings(prepared: &PreparedCommits) -> Vec<&String> {
+        prepared
+            .warnings
+            .iter()
+            .filter(|w| w.contains("output limit"))
+            .collect()
+    }
+
+    #[test]
+    fn test_prepare_commits_adds_one_warning_when_git_log_output_stopped_early() {
+        let source = StubSource {
+            cut_oldest: Some(1_700_000_000),
+            ..StubSource::with_malformed(0)
+        };
+        let prepared = prepare_commits(&source, HeatmapArgs::default())
+            .unwrap()
+            .expect("one good commit remains");
+        assert_eq!(
+            cut_warnings(&prepared),
+            vec![
+                "git log output stopped at the 64 MiB output limit; the oldest commit counted is from 2023-11-14, and older history is not counted. Use --path, --since or --last for a full count."
+            ]
+        );
+        assert_eq!(prepared.commits.len(), 1);
+    }
+
+    #[test]
+    fn test_prepare_commits_no_output_limit_warning_for_full_output() {
+        let prepared = prepare_commits(&StubSource::with_malformed(0), HeatmapArgs::default())
+            .unwrap()
+            .expect("one good commit remains");
+        assert!(cut_warnings(&prepared).is_empty());
+    }
+
     /// `MODULE_MIN_COMMITS` commits each in `crates/a`, `crates/b` and
     /// `packages/x`, so every module reaches the module support minimum.
     fn package_commits() -> Vec<CommitInfo> {
@@ -1107,6 +1152,7 @@ mod tests {
         let source = StubSource {
             commits: package_commits(),
             malformed: 0,
+            cut_oldest: None,
             tracked,
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
@@ -1186,6 +1232,7 @@ mod tests {
         let source = StubSource {
             commits,
             malformed: 0,
+            cut_oldest: None,
             tracked: TrackedStub::Unavailable,
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
