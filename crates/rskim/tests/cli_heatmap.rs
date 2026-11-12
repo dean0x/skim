@@ -1467,3 +1467,26 @@ fn test_heatmap_file_scope_keeps_the_package_module() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     assert_eq!(module_commits(&json), vec![("crates/a".to_string(), 4)]);
 }
+
+// ============================================================================
+// --detail
+// ============================================================================
+
+#[test]
+fn test_heatmap_detail_unknown_name_lists_valid_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = common::skim()
+        .args(["heatmap", "--detail", "churn"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "no stdout on a bad --detail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "--detail must be one of hotspots, coupling, fix-risk, modules, bus-factor; got: churn"
+        ),
+        "stderr: {stderr}"
+    );
+}
