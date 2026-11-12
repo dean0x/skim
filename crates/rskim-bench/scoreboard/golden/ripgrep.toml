@@ -472,3 +472,117 @@ id = "ripgrep-ast-unhandled-result-rust"
 pattern = "unhandled-result"
 lang = "rust"
 precision = "ratchet"
+
+# --- frozen answers (#540): refs, clash, plain-word first files, stakes -----------
+#
+# Every site below comes from `git grep -nw <name>` at 4519153e and a hand read of
+# each hit line, with no skim output. The roles are def, call, ref, import,
+# comment, string and text. A [[refs]] entry lists every whole-word line of its
+# name, so its sites add up to the grep count.
+#
+# [[clash]] names have 2 or more definitions. Calls are not split by definition
+# (split = "none"), so every call is "unassigned".
+
+[[refs]]
+id = "ripgrep-R01"
+query = "has_exceeded_match_limit"
+def = { path = "crates/searcher/src/searcher/core.rs", line = 710 }
+sites = [
+    { path = "crates/searcher/src/searcher/core.rs", line = 128, role = "call" },
+    { path = "crates/searcher/src/searcher/core.rs", line = 145, role = "call" },
+    { path = "crates/searcher/src/searcher/core.rs", line = 284, role = "call" },
+    { path = "crates/searcher/src/searcher/core.rs", line = 340, role = "call" },
+    { path = "crates/searcher/src/searcher/core.rs", line = 422, role = "call" },
+    { path = "crates/searcher/src/searcher/core.rs", line = 468, role = "call" },
+    { path = "crates/searcher/src/searcher/core.rs", line = 485, role = "call" },
+    { path = "crates/searcher/src/searcher/core.rs", line = 710, role = "def" },
+]
+origin = "curated"
+
+[[refs]]
+id = "ripgrep-R02"
+query = "find_iter_at_in_context"
+def = { path = "crates/printer/src/util.rs", line = 473 }
+sites = [
+    { path = "crates/printer/src/json.rs", line = 16, role = "import" },
+    { path = "crates/printer/src/json.rs", line = 661, role = "call" },
+    { path = "crates/printer/src/standard.rs", line = 26, role = "import" },
+    { path = "crates/printer/src/standard.rs", line = 716, role = "call" },
+    { path = "crates/printer/src/summary.rs", line = 20, role = "import" },
+    { path = "crates/printer/src/summary.rs", line = 649, role = "call" },
+    { path = "crates/printer/src/summary.rs", line = 659, role = "comment" },
+    { path = "crates/printer/src/util.rs", line = 59, role = "comment" },
+    { path = "crates/printer/src/util.rs", line = 473, role = "def" },
+    { path = "crates/printer/src/util.rs", line = 556, role = "comment" },
+]
+origin = "curated"
+
+[[refs]]
+id = "ripgrep-R03"
+query = "cmd_exists"
+def = { path = "tests/util.rs", line = 47 }
+sites = [
+    { path = "tests/misc.rs", line = 2, role = "import" },
+    { path = "tests/misc.rs", line = 848, role = "call" },
+    { path = "tests/misc.rs", line = 863, role = "call" },
+    { path = "tests/misc.rs", line = 881, role = "call" },
+    { path = "tests/misc.rs", line = 896, role = "call" },
+    { path = "tests/misc.rs", line = 911, role = "call" },
+    { path = "tests/misc.rs", line = 926, role = "call" },
+    { path = "tests/misc.rs", line = 941, role = "call" },
+    { path = "tests/misc.rs", line = 956, role = "call" },
+    { path = "tests/misc.rs", line = 971, role = "call" },
+    { path = "tests/misc.rs", line = 986, role = "call" },
+    { path = "tests/misc.rs", line = 1001, role = "call" },
+    { path = "tests/util.rs", line = 47, role = "def" },
+]
+origin = "curated"
+
+[[clash]]
+id = "ripgrep-D01"
+query = "trim_ascii_prefix"
+defs = [
+    { path = "crates/printer/src/standard.rs", line = 1582 },
+    { path = "crates/printer/src/util.rs", line = 452 },
+]
+calls = [
+    { path = "crates/printer/src/standard.rs", line = 1053, def = "unassigned" },
+    { path = "crates/printer/src/standard.rs", line = 1075, def = "unassigned" },
+    { path = "crates/printer/src/standard.rs", line = 1137, def = "unassigned" },
+    { path = "crates/printer/src/standard.rs", line = 1198, def = "unassigned" },
+    { path = "crates/printer/src/standard.rs", line = 1231, def = "unassigned" },
+    { path = "crates/printer/src/standard.rs", line = 1587, def = "unassigned" },
+]
+split = "none"
+origin = "curated"
+
+# Plain-word queries with the file that holds the answer. The relevance regex was
+# written from the source before any skim run.
+[[concept]]
+id = "ripgrep-C08"
+query = "decompression reader"
+relevant = '(?i)decompress'
+first = ["crates/cli/src/decompress.rs"]
+
+[[concept]]
+id = "ripgrep-C09"
+query = "color specification"
+relevant = '(?i)color[_\s-]*specs?'
+first = ["crates/printer/src/color.rs"]
+
+# --- stakes: exit codes of a plain-text search (no flag) ----------------------------
+# A literal that no tracked file holds exits 1; a literal that a tracked file holds
+# exits 0 (the exit codes of rg).
+[[stakes]]
+id = "ripgrep-Q01"
+query = "qzvx_absent_7713"
+flags = []
+expect = "exit"
+exit = 1
+
+[[stakes]]
+id = "ripgrep-Q02"
+query = "wsl_prefix"
+flags = []
+expect = "exit"
+exit = 0
