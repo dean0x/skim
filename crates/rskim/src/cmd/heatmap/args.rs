@@ -2,7 +2,7 @@
 //!
 //! Provides [`parse_args`] (table-driven flag dispatch) and [`print_help`].
 
-use super::types::HeatmapArgs;
+use super::types::{DetailSection, HeatmapArgs};
 use std::time::UNIX_EPOCH;
 
 // ============================================================================
@@ -21,6 +21,7 @@ enum ValueFlagAction {
     FixWindow,
     Format,
     Diff,
+    Detail,
 }
 
 struct ValueFlagSpec {
@@ -68,6 +69,10 @@ const VALUE_FLAG_TABLE: &[ValueFlagSpec] = &[
     ValueFlagSpec {
         name: "--diff",
         action: ValueFlagAction::Diff,
+    },
+    ValueFlagSpec {
+        name: "--detail",
+        action: ValueFlagAction::Detail,
     },
 ];
 
@@ -143,6 +148,16 @@ fn apply_value_flag(
             }
             args.diff_base = Some(val);
         }
+        ValueFlagAction::Detail => {
+            if args.detail.is_some() {
+                anyhow::bail!("--detail can be given only once");
+            }
+            let Some(section) = DetailSection::from_name(&val) else {
+                let names = DetailSection::ALL.map(DetailSection::name).join(", ");
+                anyhow::bail!("--detail must be one of {names}; got: {val}");
+            };
+            args.detail = Some(section);
+        }
     }
     Ok(())
 }
@@ -204,6 +219,15 @@ pub(super) fn parse_args(raw: &[String]) -> anyhow::Result<HeatmapArgs> {
     // Post-parse validation
     if args.diff_base.is_some() && !args.files.is_empty() {
         anyhow::bail!("cannot combine --diff with explicit file arguments");
+    }
+    // `--detail` with `--diff` is allowed: the diff only scopes the files.
+    if args.detail.is_some() {
+        if args.insights {
+            anyhow::bail!("cannot combine --detail with --insights");
+        }
+        if !args.files.is_empty() {
+            anyhow::bail!("cannot combine --detail with explicit file arguments");
+        }
     }
 
     // Normalize file paths: strip leading ./
@@ -600,5 +624,96 @@ mod tests {
     fn test_parse_args_insights_default_false() {
         let args = parse_args(&[]).unwrap();
         assert!(!args.insights, "insights should default to false");
+    }
+
+    // -----------------------------------------------------------------------
+    // --detail
+    // -----------------------------------------------------------------------
+
+    fn strings(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parse_error(raw: &[&str]) -> String {
+        parse_args(&strings(raw)).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn test_parse_args_detail_accepts_every_section_name() {
+        let expected = [
+            ("hotspots", DetailSection::Hotspots),
+            ("coupling", DetailSection::Coupling),
+            ("fix-risk", DetailSection::FixRisk),
+            ("modules", DetailSection::Modules),
+            ("bus-factor", DetailSection::BusFactor),
+        ];
+        for (name, section) in expected {
+            let space = parse_args(&strings(&["--detail", name])).unwrap();
+            assert_eq!(space.detail, Some(section), "--detail {name}");
+            let equals = parse_args(&strings(&[&format!("--detail={name}")])).unwrap();
+            assert_eq!(equals.detail, Some(section), "--detail={name}");
+        }
+    }
+
+    #[test]
+    fn test_parse_args_detail_absent_by_default() {
+        assert_eq!(parse_args(&[]).unwrap().detail, None);
+    }
+
+    #[test]
+    fn test_parse_args_detail_unknown_name_lists_valid_names() {
+        assert_eq!(
+            parse_error(&["--detail", "churn"]),
+            "--detail must be one of hotspots, coupling, fix-risk, modules, bus-factor; got: churn"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_repeated_errors() {
+        assert_eq!(
+            parse_error(&["--detail", "coupling", "--detail=modules"]),
+            "--detail can be given only once"
+        );
+        assert_eq!(
+            parse_error(&["--detail", "coupling", "--detail", "coupling"]),
+            "--detail can be given only once"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_with_insights_errors() {
+        assert_eq!(
+            parse_error(&["--detail", "coupling", "--insights"]),
+            "cannot combine --detail with --insights"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_with_file_arguments_errors() {
+        assert_eq!(
+            parse_error(&["src/main.rs", "--detail", "hotspots"]),
+            "cannot combine --detail with explicit file arguments"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_detail_with_diff_is_allowed() {
+        let args = parse_args(&strings(&["--diff", "main", "--detail", "coupling"])).unwrap();
+        assert_eq!(args.detail, Some(DetailSection::Coupling));
+        assert_eq!(args.diff_base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn test_parse_args_detail_without_value_errors() {
+        assert_eq!(parse_error(&["--detail"]), "--detail requires a value");
+    }
+
+    #[test]
+    fn test_parse_args_detail_keeps_top_explicit() {
+        let implicit = parse_args(&strings(&["--detail", "modules"])).unwrap();
+        assert!(!implicit.top_explicit);
+        let explicit = parse_args(&strings(&["--detail", "modules", "--top", "4"])).unwrap();
+        assert!(explicit.top_explicit);
+        assert_eq!(explicit.top_n, 4);
     }
 }

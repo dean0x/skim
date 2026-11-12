@@ -270,6 +270,8 @@ mod tests {
             excluded_patterns: vec![],
             warnings: vec![],
             file_targets: None,
+            fix_commits_total: 0,
+            window_authors: 0,
         }
     }
 

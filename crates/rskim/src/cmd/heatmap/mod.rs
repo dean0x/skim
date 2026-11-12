@@ -16,6 +16,7 @@ mod metrics;
 mod noise;
 mod output;
 mod types;
+mod view;
 mod window;
 
 use std::io::{self, Write};
@@ -544,10 +545,23 @@ fn compute_heatmap(
         );
     }
 
-    // Step 6: Assemble FileMetrics
+    // Window totals for the view gates: the fix-risk base rate and the
+    // bus-factor author minimum.
+    let fix_commits_total = commits
+        .iter()
+        .filter(|c| rskim_search::is_fix_commit(&c.message))
+        .count();
+    let window_authors = commits
+        .iter()
+        .map(|c| c.author.as_str())
+        .collect::<std::collections::HashSet<&str>>()
+        .len();
+
+    // Step 6: Assemble FileMetrics. The ranked view sorts every section, so
+    // the files stay in no particular order here.
     // `churn_map` already contains every path seen across all commits; no need
     // to rebuild a separate HashSet from the commit list.
-    let mut file_metrics: Vec<FileMetrics> = churn_map
+    let file_metrics: Vec<FileMetrics> = churn_map
         .into_iter()
         .map(|(path, churn)| {
             let stability_score = stability_map.get(&path).copied().unwrap_or(100);
@@ -565,9 +579,6 @@ fn compute_heatmap(
             }
         })
         .collect();
-
-    // Sort by stability_score ascending (riskiest first)
-    file_metrics.sort_by_key(|f| f.stability_score);
 
     // Step 7: Build window info
     let window_info = build_window_info(window, config.since, commits.len(), now_epoch);
@@ -595,6 +606,8 @@ fn compute_heatmap(
         excluded_patterns,
         warnings,
         file_targets: None,
+        fix_commits_total,
+        window_authors,
     }
 }
 
@@ -695,6 +708,8 @@ mod tests {
             excluded_patterns: vec![],
             warnings: vec![],
             file_targets: None,
+            fix_commits_total: 2,
+            window_authors: 1,
         }
     }
 
@@ -1025,6 +1040,92 @@ mod tests {
         assert_eq!(
             module_paths_with(TrackedStub::Unavailable),
             vec!["crates", "packages"]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Window totals and the view spec
+    // -----------------------------------------------------------------------
+
+    fn authored_commit(n: usize, author: &str, message: &str) -> CommitInfo {
+        CommitInfo {
+            author: author.to_string(),
+            message: message.to_string(),
+            ..stub_commit(n, &["src/main.rs"])
+        }
+    }
+
+    /// A full run on `commits` with default args, up to the result.
+    fn result_of(commits: Vec<CommitInfo>) -> HeatmapResult {
+        let source = StubSource {
+            commits,
+            malformed: 0,
+            tracked: TrackedStub::Unavailable,
+        };
+        let p = prepare_commits(&source, HeatmapArgs::default())
+            .unwrap()
+            .expect("the run continues");
+        compute_heatmap(
+            p.commits,
+            &p.config,
+            &p.window,
+            p.now_epoch,
+            p.repo_root,
+            p.warnings,
+            &p.module_roots,
+        )
+    }
+
+    #[test]
+    fn test_compute_heatmap_counts_window_fix_commits_and_authors() {
+        let result = result_of(vec![
+            authored_commit(0, "Alice", "fix: crash on start"),
+            authored_commit(1, "Bob", "feat: add flag"),
+            authored_commit(2, "Alice", "Fix the parser"),
+            authored_commit(3, "Carol", "docs: prefix"),
+            authored_commit(4, "Alice", "feat: more"),
+        ]);
+        assert_eq!(result.fix_commits_total, 2);
+        assert_eq!(result.window_authors, 3);
+    }
+
+    #[test]
+    fn test_compute_heatmap_one_author_window_counts_one_author() {
+        let result = result_of(vec![
+            authored_commit(0, "Alice", "feat: a"),
+            authored_commit(1, "Alice", "feat: b"),
+        ]);
+        assert_eq!(result.window_authors, 1);
+        assert_eq!(result.fix_commits_total, 0);
+    }
+
+    #[test]
+    fn test_view_spec_reads_top_only_when_it_was_given() {
+        let spec_of = |args: HeatmapArgs| {
+            let p = prepare_commits(&StubSource::with_malformed(0), args)
+                .unwrap()
+                .expect("the run continues");
+            view::ViewSpec::from_config(&p.config)
+        };
+        assert_eq!(
+            spec_of(HeatmapArgs::default()),
+            view::ViewSpec {
+                detail: None,
+                top: None,
+            }
+        );
+        let explicit = HeatmapArgs {
+            top_n: 3,
+            top_explicit: true,
+            detail: Some(types::DetailSection::Coupling),
+            ..HeatmapArgs::default()
+        };
+        assert_eq!(
+            spec_of(explicit),
+            view::ViewSpec {
+                detail: Some(types::DetailSection::Coupling),
+                top: Some(3),
+            }
         );
     }
 

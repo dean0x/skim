@@ -312,6 +312,8 @@ mod tests {
             excluded_patterns: vec!["Cargo.lock".to_string()],
             warnings: vec![],
             file_targets: None,
+            fix_commits_total: 3,
+            window_authors: 2,
         }
     }
 

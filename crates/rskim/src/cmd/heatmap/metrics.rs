@@ -71,7 +71,7 @@ fn entry_order(x: &CouplingEntry, y: &CouplingEntry) -> Ordering {
 }
 
 /// Edge order: confidence desc, then support desc, then `a` asc, then `b` asc.
-fn edge_order(x: &CouplingEdge, y: &CouplingEdge) -> Ordering {
+pub(crate) fn edge_order(x: &CouplingEdge, y: &CouplingEdge) -> Ordering {
     y.confidence
         .total_cmp(&x.confidence)
         .then_with(|| y.support.cmp(&x.support))

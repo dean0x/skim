@@ -52,7 +52,7 @@ pub(crate) struct HeatmapArgs {
     pub(crate) path: Option<String>,
     /// Emit JSON output instead of text.
     pub(crate) format_json: bool,
-    /// Maximum number of files to display (default 20).
+    /// The `--top` value (20 when not given; see `top_explicit`).
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
@@ -82,6 +82,8 @@ pub(crate) struct HeatmapArgs {
     pub(crate) top_explicit: bool,
     /// Show only threshold-filtered one-liner insights.
     pub(crate) insights: bool,
+    /// The one section that `--detail` names, if given.
+    pub(crate) detail: Option<DetailSection>,
 }
 
 impl Default for HeatmapArgs {
@@ -102,7 +104,47 @@ impl Default for HeatmapArgs {
             diff_base: None,
             top_explicit: false,
             insights: false,
+            detail: None,
         }
+    }
+}
+
+/// A section of the heatmap view that `--detail` can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailSection {
+    Hotspots,
+    Coupling,
+    FixRisk,
+    Modules,
+    BusFactor,
+}
+
+impl DetailSection {
+    /// Every section, in display order.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Hotspots,
+        Self::Coupling,
+        Self::FixRisk,
+        Self::Modules,
+        Self::BusFactor,
+    ];
+
+    /// The name of the section on the command line.
+    #[must_use]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Hotspots => "hotspots",
+            Self::Coupling => "coupling",
+            Self::FixRisk => "fix-risk",
+            Self::Modules => "modules",
+            Self::BusFactor => "bus-factor",
+        }
+    }
+
+    /// The section whose command-line name is `name`, if one has it.
+    #[must_use]
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name() == name)
     }
 }
 
@@ -125,7 +167,9 @@ pub(crate) struct HeatmapConfig {
     pub(crate) path: Option<String>,
     /// Emit JSON output instead of text.
     pub(crate) format_json: bool,
-    /// Maximum number of files to display (default 20).
+    /// The `--top` value (20 when not given). The ranked view reads it only
+    /// when `top_explicit` is set; without `--top`, each list has its own
+    /// default cap (see `view.rs`).
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
@@ -143,6 +187,8 @@ pub(crate) struct HeatmapConfig {
     pub(crate) top_explicit: bool,
     /// Show only threshold-filtered one-liner insights.
     pub(crate) insights: bool,
+    /// The one section that `--detail` names, if given.
+    pub(crate) detail: Option<DetailSection>,
 }
 
 /// Resolved window metadata produced by [`super::window::resolve_config`].
@@ -190,6 +236,14 @@ pub(crate) struct HeatmapResult {
     /// Files targeted by `--diff` or positional args (present only when scoped).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) file_targets: Option<Vec<String>>,
+    /// Fix commits in the window after exclusion: the numerator of the
+    /// fix-risk base rate. The ranked view reads it; JSON v2 gives the rate.
+    #[serde(skip)]
+    pub(crate) fix_commits_total: usize,
+    /// Distinct author names in the window after exclusion, for the
+    /// bus-factor gate. The ranked view reads it.
+    #[serde(skip)]
+    pub(crate) window_authors: usize,
 }
 
 /// Information about the analysis window.

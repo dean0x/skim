@@ -95,10 +95,6 @@ pub(crate) fn wilson_lower_bound(successes: usize, trials: usize) -> f64 {
 
 /// Fix commits divided by all commits in the window after exclusion, in
 /// `0.0..=1.0`. An empty window gives 0.0.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ranked view is the first caller")
-)]
 #[must_use]
 pub(crate) fn base_rate(fix_commits: usize, commits: usize) -> f64 {
     debug_assert!(
@@ -122,10 +118,6 @@ pub(crate) fn base_rate_is_degenerate(base_rate: f64) -> bool {
 /// The fix-risk gate. True only when the file has [`MIN_FILE_SUPPORT`] or
 /// more commits, the base rate is not degenerate, and the Wilson lower bound
 /// of the fix rate of the file is above the base rate.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ranked view is the first caller")
-)]
 #[must_use]
 pub(crate) fn passes_lift(fix_commits: usize, support: usize, base_rate: f64) -> bool {
     support >= MIN_FILE_SUPPORT
@@ -135,10 +127,6 @@ pub(crate) fn passes_lift(fix_commits: usize, support: usize, base_rate: f64) ->
 
 /// The fix rate of the file divided by the base rate. Zero support or a base
 /// rate that is not above zero gives 0.0.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ranked view is the first caller")
-)]
 #[must_use]
 pub(crate) fn lift(fix_commits: usize, support: usize, base_rate: f64) -> f64 {
     if support == 0 || base_rate <= 0.0 || base_rate.is_nan() {
@@ -155,10 +143,6 @@ pub(crate) fn lift(fix_commits: usize, support: usize, base_rate: f64) -> f64 {
 /// or more distinct authors, the file has [`MIN_FILE_SUPPORT`] or more
 /// commits, and the top author holds more than [`BUS_FACTOR_TOP_SHARE_PCT`]
 /// percent of them.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ranked view is the first caller")
-)]
 #[must_use]
 pub(crate) fn passes_bus_gate(
     window_authors: usize,
@@ -179,7 +163,7 @@ pub(crate) fn passes_bus_gate(
 /// `*.spec.*` or `test_*.py`. Paths are repo-relative with `/` separators.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the ranked view is the first caller")
+    expect(dead_code, reason = "the card partner order is the first caller")
 )]
 #[must_use]
 pub(crate) fn is_test_path(path: &str) -> bool {
@@ -194,10 +178,6 @@ pub(crate) fn is_test_path(path: &str) -> bool {
 
 /// True when `path` is a doc file: its extension is `md`, `mdx`, `markdown`,
 /// `rst`, `txt` or `adoc`, in any letter case.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the ranked view is the first caller")
-)]
 #[must_use]
 pub(crate) fn is_doc_path(path: &str) -> bool {
     Path::new(path)

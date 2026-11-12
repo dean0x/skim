@@ -129,6 +129,7 @@ pub(super) fn resolve_config(
         files: args.files,
         top_explicit: args.top_explicit,
         insights: args.insights,
+        detail: args.detail,
     };
 
     Ok((config, window))
@@ -222,6 +223,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::super::git_source::ParsedLog;
+    use super::super::types::DetailSection;
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -525,6 +527,7 @@ mod tests {
         args.debug = true;
         args.top_explicit = true;
         args.insights = true;
+        args.detail = Some(DetailSection::FixRisk);
         args.path = Some("src/".to_string());
         args.extra_excludes = vec!["*.generated.ts".to_string()];
         args.files = vec!["src/main.rs".to_string()];
@@ -540,6 +543,7 @@ mod tests {
         assert!(config.debug);
         assert!(config.top_explicit);
         assert!(config.insights);
+        assert_eq!(config.detail, Some(DetailSection::FixRisk));
         assert_eq!(config.path.as_deref(), Some("src/"));
         assert_eq!(config.extra_excludes, vec!["*.generated.ts"]);
         assert_eq!(config.files, vec!["src/main.rs"]);
