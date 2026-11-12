@@ -151,10 +151,11 @@ fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<Str
     }
 }
 
-/// A path from git output as the relative path to test on disk, or `None`
-/// when its quoted form does not decode. git writes a name with unusual
-/// bytes in double quotes, with C escapes and 3-digit octal escapes (the
-/// form of `card::git_quoted`); a test on the quoted text would name no file.
+/// A path from git output as the relative path that it names, for a test
+/// on disk or against the exclude patterns, or `None` when its quoted form
+/// does not decode. git writes a name with unusual bytes in double quotes,
+/// with C escapes and 3-digit octal escapes (the form of
+/// `card::git_quoted`); a test on the quoted text would name no file.
 fn disk_path(path: &str) -> Option<std::path::PathBuf> {
     let (inner, quoted) = without_quotes(path);
     if !quoted {

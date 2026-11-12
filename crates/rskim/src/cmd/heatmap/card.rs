@@ -244,19 +244,37 @@ pub(crate) fn history_paths(targets: &[String], files: &[FileMetrics]) -> Vec<St
 // ============================================================================
 
 /// True for a char that can change how a terminal shows the text around
-/// it: every control char (C0, DEL and C1) and the Unicode bidi and line
-/// separator controls.
+/// it, or that shows nothing: every control char (C0, DEL and C1), the
+/// Unicode bidi and line separator controls, each Unicode format char
+/// (category Cf) that has no glyph of its own, and the whole tag block.
 fn is_unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
+            // Bidi controls and line separators.
             '\u{061C}'
                 | '\u{200E}'
                 | '\u{200F}'
                 | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
+                | '\u{2066}'..='\u{206F}'
                 | '\u{2028}'
                 | '\u{2029}'
+                // Invisible format chars: soft hyphen, zero-width chars,
+                // word joiner and invisible operators, byte order mark,
+                // annotation marks, and the joiners and controls of some
+                // scripts and of music notation.
+                | '\u{00AD}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200D}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                // Tag chars: they show nothing, but each one maps to an
+                // ASCII char.
+                | '\u{E0000}'..='\u{E007F}'
         )
 }
 
@@ -622,6 +640,62 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_replaces_invisible_format_chars_with_exact_bytes() {
+        let input = "a\u{200B}b\u{200C}c\u{200D}d\u{2060}e\u{FEFF}f\u{AD}g";
+        let expected = "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{FFFD}f\u{FFFD}g";
+        assert_eq!(
+            sanitize(input, CARD_TEXT_MAX_CHARS).as_bytes(),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_replaces_each_tag_char_with_exact_bytes() {
+        // Tag chars that spell "hi", between a language tag and a cancel tag.
+        let input = "ok\u{E0001}\u{E0068}\u{E0069}\u{E007F}.";
+        let expected = "ok\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}.";
+        assert_eq!(
+            sanitize(input, CARD_TEXT_MAX_CHARS).as_bytes(),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_sanitize_replaces_the_first_and_last_char_of_each_format_range() {
+        let listed = [
+            '\u{ad}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200d}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{206a}',
+            '\u{206f}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{13430}',
+            '\u{1343f}',
+            '\u{1bca0}',
+            '\u{1bca3}',
+            '\u{1d173}',
+            '\u{1d17a}',
+            '\u{e0000}',
+            '\u{e007f}',
+        ];
+        for c in listed {
+            assert_eq!(
+                sanitize(&format!("x{c}y"), 72),
+                "x\u{FFFD}y",
+                "U+{:04X}",
+                c as u32
+            );
+        }
+        // Visible neighbours of those ranges stay as they are.
+        assert_eq!(sanitize("¬®‐\u{FFFC}", 72), "¬®‐\u{FFFC}");
+    }
+
+    #[test]
     fn test_sanitize_cuts_a_multibyte_subject_by_char() {
         let subject = "é".repeat(100);
         let cut = sanitize(&subject, CARD_TEXT_MAX_CHARS);
@@ -721,6 +795,24 @@ mod tests {
             ]
         );
         assert_eq!(card.counts.partners, Count { total: 5, shown: 4 });
+    }
+
+    /// git writes a non-ASCII name in quotes, so the first folder of the
+    /// raw text is `"tests`. The partner is still a test file.
+    #[test]
+    fn test_card_ranks_a_git_quoted_test_partner_first() {
+        let quoted_test = r#""tests/caf\303\251.rs""#;
+        let mut core = metrics("src/core.rs", 6);
+        core.blast_radius = vec![partner("src/a.rs", 0.9, 4), partner(quoted_test, 0.5, 3)];
+        let result = result_with(vec![core]);
+        let cards = build_cards(&[], &result, &["src/core.rs".to_string()], default_caps());
+
+        let order: Vec<(&str, bool)> = cards.rows[0]
+            .partners
+            .iter()
+            .map(|p| (p.path.as_str(), p.test))
+            .collect();
+        assert_eq!(order, [(quoted_test, true), ("src/a.rs", false)]);
     }
 
     #[test]

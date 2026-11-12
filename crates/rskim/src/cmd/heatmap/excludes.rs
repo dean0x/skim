@@ -2,6 +2,8 @@
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
+use super::metrics::without_quotes;
+
 // ============================================================================
 // Default exclusion patterns
 // ============================================================================
@@ -92,8 +94,21 @@ pub(crate) fn build_exclude_set(no_exclude: bool, extra: &[String]) -> GlobSet {
 }
 
 /// Return `true` when `path` matches any pattern in `set`.
+///
+/// `path` is in the form of git's numstat output. git writes a path with
+/// unusual bytes in double quotes, with C and octal escapes; the outer
+/// quotes would hide each extension and file name, and the escapes each
+/// non-ASCII name, from the patterns. So a quoted path is tested as the
+/// path that it names, or without its quotes when it does not decode.
 pub(crate) fn should_exclude(path: &str, set: &GlobSet) -> bool {
-    set.is_match(path)
+    let (inner, quoted) = without_quotes(path);
+    if !quoted {
+        return set.is_match(path);
+    }
+    match super::disk_path(path) {
+        Some(named) => set.is_match(named),
+        None => set.is_match(inner),
+    }
 }
 
 /// Return `true` when a numstat line represents a binary file.
@@ -206,6 +221,44 @@ mod tests {
         let set = build_exclude_set(false, &extra);
         assert!(should_exclude("foo.generated.ts", &set));
         assert!(!should_exclude("foo.ts", &set));
+    }
+
+    /// Paths that git writes in quotes, with octal escapes, for a non-ASCII
+    /// name: one or more for each name, extension and folder pattern of the
+    /// list, nested and at the root.
+    const QUOTED_EXCLUDED: &[&str] = &[
+        r#""pkg/caf\303\251/CHANGELOG.md""#,
+        r#""src/caf\303\251.snap""#,
+        r#""caf\303\251/snapshots/case.txt""#,
+        r#""snapshots/caf\303\251.txt""#,
+        r#""api/caf\303\251.pb.go""#,
+        r#""py/caf\303\251_pb2.py""#,
+        r#""src/caf\303\251/generated/types.rs""#,
+        r#""generated/caf\303\251.rs""#,
+        r#""caf\303\251.lock""#,
+        r#""web/caf\303\251.min.js""#,
+        r#""dist/caf\303\251.js""#,
+    ];
+
+    #[test]
+    fn test_default_excludes_match_paths_that_git_quotes() {
+        let set = build_exclude_set(false, &[]);
+        let kept: Vec<&str> = QUOTED_EXCLUDED
+            .iter()
+            .copied()
+            .filter(|p| !should_exclude(p, &set))
+            .collect();
+        assert!(kept.is_empty(), "not excluded: {kept:?}");
+        assert!(!should_exclude(r#""src/caf\303\251.rs""#, &set));
+    }
+
+    #[test]
+    fn test_extra_excludes_match_paths_that_git_quotes() {
+        let extra = vec!["*.generated.ts".to_string(), "pkg/café/**".to_string()];
+        let set = build_exclude_set(false, &extra);
+        assert!(should_exclude(r#""src/caf\303\251.generated.ts""#, &set));
+        assert!(should_exclude(r#""pkg/caf\303\251/main.rs""#, &set));
+        assert!(!should_exclude(r#""src/caf\303\251.ts""#, &set));
     }
 
     #[test]
