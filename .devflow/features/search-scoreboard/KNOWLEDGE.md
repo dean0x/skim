@@ -11,6 +11,7 @@ referencedFiles:
   - crates/rskim-bench/src/scoreboard/gate.rs
   - crates/rskim-bench/src/scoreboard/baseline.rs
   - crates/rskim-bench/src/scoreboard/golden.rs
+  - crates/rskim-bench/src/scoreboard/universe.rs
   - crates/rskim-bench/src/scoreboard/golden_gen.rs
   - crates/rskim-bench/src/scoreboard/catalog.rs
   - crates/rskim-bench/src/scoreboard/structural_metrics.rs
@@ -20,7 +21,7 @@ referencedFiles:
   - crates/rskim-research/src/clone.rs
   - .github/workflows/ci.yml
 created: 2026-09-25
-updated: 2026-09-28
+updated: 2026-11-12
 ---
 
 # Search scoreboard (quality gate) incl. the structural oracle
@@ -64,9 +65,9 @@ couple across the two crates, which invariant is enforced where, and the traps f
 
 | Class | Scope | Tolerance | Where defined |
 |---|---|---|---|
-| HARD | golden entry × check (`CheckId::ALL`, 14 checks) | 0; only a ledger entry excuses a failure | `types.rs` `CheckId`, `metrics.rs` `PlannedQuery::runs` |
+| HARD | golden entry × check (`CheckId::ALL`, 27 checks) | 0; only a ledger entry excuses a failure | `types.rs` `CheckId`, `metrics.rs` `PlannedQuery::runs` |
 | RATCHET | per corpus + aggregate | exact after `round4`; `bytes.text_*` / `bytes.*first_correct_median` / `bytes.rg_*` ±3% **relative to the baseline value** | `metrics.rs` `RATCHET_METRICS`, `ORACLE_LESS_ROWS_DEF`, `STRUCTURAL_FAMILIES`, `compare_ratchet` |
-| INFO | latency, `unindexed_hits`, per-reason skip breakdown, beats-baseline | never gated | `report.rs` |
+| INFO | latency, `unindexed_hits`, per-reason skip breakdown, beats-baseline, `bytes.rgw_text_median` and `bytes.rgw_first_correct_median` (`info.reference` of each corpus) | never gated, not in `baseline.json` | `report.rs`, `metrics.rs` `reference_values` |
 
 Which HARD checks run on an entry is decided in one place, `PlannedQuery::runs`:
 
@@ -77,6 +78,40 @@ Which HARD checks run on an entry is decided in one place, `PlannedQuery::runs`:
 - `pagination.*` only on `[[pagination]]`, `order.prefix_consistent` only on `[[prefix]]` entries.
 - `order.score_monotone` is skipped on `[[ast]]` entries (standalone `--ast` is path-ordered, #547) and when a
   temporal sort or `--blast-radius` overrides the rank. `results.unique_paths` runs on every entry, within each list.
+- The frozen-answer checks run on their own entry kind only (next section). No `lexical.*` or ordering check runs on
+  `[[refs]]`, `[[clash]]` or `[[stakes]]` entries.
+
+### Frozen answers (#540): `[[refs]]`, `[[clash]]`, `[[stakes]]`, concept `first`, the text universe
+
+Answers frozen before the plain-word engine exists. Every frozen set comes from `git grep -nw` at the pin plus a hand
+read of each line, never from skim's output; golden integrity (exit 2) checks the sets against the oracle, so a
+missing or an extra site cannot move the target. Each corpus holds 3+ `[[refs]]` (ids `<corpus>-R<nn>`), 1
+`[[clash]]` (`-D<nn>`; skim's is `run_parsed_command`, two definitions), 2 concept entries with `first`, and 2
+`[[stakes]]` (`-Q01` zero-hit, `exit = 1`; `-Q02` a match, `exit = 0`).
+
+| Table / field | Checks | Class |
+|---|---|---|
+| `[[refs]]` (`def`, `sites` with roles) | `refs.recall` (every site is an occurrence), `refs.calls_recall` (every frozen `call` is labelled `call`), `universe.accounted` (`searched_files` + `left_out` reasons equal the oracle's text universe) | HARD |
+| `[[refs]]` | `refs.call_precision` (share of the `call` group that is frozen calls; no value when nothing is labelled `call`) | RATCHET |
+| `[[clash]]` (`defs`, `calls`, `split = "none"`) | `clash.defs_complete`, `clash.def_count` (`at_least` passes only as a valid lower bound), `clash.calls_recall` (calls are not split by definition) | HARD |
+| `[[lexical]]` | `lexical.recall_tracked` (recall over the text universe, no language allow-list) | HARD |
+| `[[ident]]` | `ident.def_first` (`definitions.sites[0]` is the frozen `def` path and line) | HARD |
+| `[[concept]]` `first` (optional) | `concept.first_right_top5` (a frozen first file is among the first 5 files) | HARD |
+| `[[stakes]]` | `stakes.lines`, `stakes.files`, `stakes.counts` (against the regex oracle), `stakes.exit` (the frozen exit code) | HARD |
+| role oracle, cost counters | `roles.precision.<lang>`, `cost.files_parsed_median`, `cost.bytes_parsed_median`, `cost.bytes_read_median` | RATCHET (no value until the output states the data; an absent row fails nothing) |
+| `rg -nw` simulation | `bytes.rgw_text_median`, `bytes.rgw_first_correct_median` | INFO |
+
+- **Text universe** (`universe.rs` `text_universe`, one function): every tracked text file, no language allow-list and
+  no minified gate, plus untracked not-ignored files with no hidden path component. Hidden and secret-bearing tracked
+  files are in it, as `git grep` lists them. A file leaves it only for a counted `left_out` reason (`binary`,
+  `not_utf8`, `too_large`, `unreadable`, `vanished`, `outside_root`, `symlink`).
+- **Adapter** (`types.rs` `line_answers`, `field_role`): one occurrence per `is_match` snippet line; `function_signature`
+  and `type_definition` give role `def`, every other `field` gives none, and an unknown or missing `field` is exit 2.
+  `definitions.count` is absent, so `clash.def_count` fails closed. `CURRENT_ENVELOPE` in `types.rs` tests is the
+  recorded shape.
+- **Integrity** (`golden.rs` `check_refs`, `check_clash`, `check_stakes`): `sites` equal the whole-word line set at the
+  pin; a clash has 2+ `defs` and `split = "none"`; a stakes exit agrees with the oracle's hit count.
+- `SEARCH_PATHS` does not change for these tables: `rskim-bench` and `rskim-oracle` are already in it.
 
 Pagination and prefix checks compare skim with **its own full list** (`--limit 1_000_000`), so oracle-less entries
 can be pagination entries. `lexical.silent_fn` fails only when a ground-truth file is missing **and** `degraded[]`
@@ -98,6 +133,12 @@ is empty; a disclosed miss counts against recall only.
 | #546 | `structural.precision` on `skim-ast-try-catch-finally-javascript` (a false-positive guard) | two independent edges declared, the verify gate accepts either (`patterns.rs`, `compound/reparse.rs`) | one `try_statement` must carry both clauses; XPASS: remove the ledger entry, **keep** the golden guard, bless (no reason) |
 | #571 | `structural.recall` on `zod-ast-try-catch-tsx`, `zod-ast-unhandled-result-tsx` | `.tsx` → `Language::TypeScript` → `LANGUAGE_TYPESCRIPT` (`rskim-core/src/types.rs`); JSX makes `_og.tsx` an ERROR root | skim parses `.tsx` with `LANGUAGE_TSX`; both XPASS; other `*-tsx` ratchets may move (a drop needs a reason) |
 | #572 | `structural.precision` on `ripgrep-ast-empty-function-rust` | `is_counted_child` drops `self` (in `PUNCTUATION_KIND_IDS`), so `{ self }` counts as empty (`ast_index/structural.rs`) | count the tail expression as a body element, as the oracle does; promote |
+| #552 | `stakes.exit` on the four `<corpus>-Q01` | a search with no match exits 0, the frozen entry expects 1 | exit 1 on no match; promote |
+| #553 | `refs.recall`, `refs.calls_recall` on the `-R` ids; `clash.calls_recall` on the `-D` ids | the page does not show every match line and states no `call` role | every match shown with a role; promote |
+| #554 | `lexical.recall_tracked` on the lexical ids; `universe.accounted` on the `-R` ids | files outside the language list are not searched, and `searched_files` / `left_out` differ from the text universe | search the text universe; promote |
+| #555 | `ident.def_first` on the ident ids; `clash.defs_complete` and `clash.def_count` on the `-D` ids | the anchor is not the definition: `definitions.sites` is empty or its first site is another line, and no `definitions.count` | state the definition sites and count; promote |
+
+`concept.first_right_top5` (#556) passed on all eight new concept ids, so it has no ledger entry.
 
 "Promote" is lifecycle 1 below: remove the ids, then bless `xfail -> pass` (no reason needed).
 
@@ -158,7 +199,10 @@ The baseline stores only `pass` / `xfail` per `(id, check)`; any change, `new ->
 2. **A real bug you will not fix here.** File the ticket, add an `[[xfail]]` with the exact ids, re-bless with
    `--accept-regression "<reason>"` (`pass -> xfail` is a downgrade).
 3. **You added a HARD check or golden entries.** `new -> pass` / `new -> xfail` plus a digest change: bless, no
-   reason. New `[[ast]]` entries also shrink the `structural.unscored_rows.<pattern>` they now score (neutral).
+   reason. New `[[ast]]` entries also shrink the `structural.unscored_rows.<pattern>` they now score (neutral). New
+   `[[concept]]` and `[[ident]]` entries change the pooled `concept.*`, `ident.*` and `bytes.text_*` values (and the
+   baseline columns beside them): a pooled value that moves in its bad direction needs `--accept-regression`, even
+   when only the entry set changed. Read each move before you write the reason.
 4. **You removed a golden entry** (e.g. an `[[ast]]` entry a pin bump made vacuous). Its checks go `-> not run`, a
    downgrade: remove its ledger ids too, bless with `--accept-regression`.
 5. **You bumped a corpus pin.** Update `corpora.toml` and the golden `commit` together, re-verify every `def.line`
@@ -476,7 +520,8 @@ run never leaves an older passing report for `bless --from`.
 - `crates/rskim-bench/src/scoreboard/metrics.rs`: `plan` / `runs`, HARD checks, `RATCHET_METRICS`, `STRUCTURAL_FAMILIES`, `compare_ratchet`.
 - `crates/rskim-bench/src/scoreboard/gate.rs` / `baseline.rs`: ledger, `classify`, `evaluate`; `baseline.json` and `bless`.
 - `crates/rskim-bench/src/scoreboard/golden.rs` / `golden_gen.rs`: schema (`AstEntry`), integrity, `golden_digest`; proposals, `comment_safe`.
-- `crates/rskim-bench/src/scoreboard/oracle.rs` / `universe.rs`: lexical oracle and `LANGS`; the oracle universe.
+- `crates/rskim-bench/src/scoreboard/oracle.rs` / `universe.rs`: lexical oracle and `LANGS`; the oracle universe and `text_universe`.
+- `crates/rskim-bench/src/scoreboard/types.rs`: `CheckId`, `Role`, and the adapter for the current search JSON (`field_role`, `line_answers`).
 - `crates/rskim-bench/src/scoreboard/catalog.rs` (+ `catalog_tests.rs`): the one catalog read; per-query fixtures.
 - `crates/rskim-bench/src/scoreboard/structural_metrics.rs`: `OracleAnswers`, row splitting, structural checks, vacuity.
 - `crates/rskim-oracle/src/structural.rs` (+ `structural_tests.rs`): registry, `EXT_CLASSES`, cap, scratch, intent walk, fingerprint.

@@ -25,9 +25,9 @@ It is the **required merge gate for search PRs** (owner decision 2026-09-25, SEA
 
 | Class | Checks | Rule |
 |---|---|---|
-| **HARD** (per query) | `lexical.recall`, `lexical.precision` (skim's full list = oracle ground truth on the indexed universe) · `lexical.silent_fn` (a ground-truth file is missing and `degraded[]` is empty) · `lexical.verify_mode` · `pagination.complete` / `.disjoint` / `.ordered` / `.has_more_honest` · `order.prefix_consistent` · `order.score_monotone` · `results.unique_paths` (no path twice in one list: the full list, a `--limit` list, or one page) · `structural.recall`, `structural.precision`, `structural.coverage` on `[[ast]]` entries ([Structural oracle](#structural-oracle)) | Tolerance 0. A failure passes only if it is ledgered (XFAIL). |
-| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `oracle_less.full_rows.<id>`, the full-list row count of each entry with no oracle (`--ast`, `--blast-radius`, a standalone `--hot` / `--cold` / `--risky` run); a shrink is a regression · the structural families `structural.precision.<id>`, `structural.line_on_match.<id>`, `structural.intent_recall.<id>` / `structural.intent_precision.<id>` and `structural.unscored_rows.<pattern>` (neutral: see [Checks](#checks)) | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
-| **INFO** (never gated) | Latency: p50/p95 of the golden entries' own skim calls, plus the `--ast` pattern calls and the structural oracle pass, each timed apart · `unindexed_hits` · the oracle's per-reason skip breakdown · the "beats baseline" column | none |
+| **HARD** (per query) | `lexical.recall`, `lexical.precision` (skim's full list = oracle ground truth on the indexed universe) · `lexical.silent_fn` (a ground-truth file is missing and `degraded[]` is empty) · `lexical.verify_mode` · `pagination.complete` / `.disjoint` / `.ordered` / `.has_more_honest` · `order.prefix_consistent` · `order.score_monotone` · `results.unique_paths` (no path twice in one list: the full list, a `--limit` list, or one page) · `structural.recall`, `structural.precision`, `structural.coverage` on `[[ast]]` entries ([Structural oracle](#structural-oracle)) · the frozen-answer checks `refs.recall`, `refs.calls_recall`, `clash.defs_complete`, `clash.def_count`, `clash.calls_recall`, `lexical.recall_tracked`, `universe.accounted`, `ident.def_first`, `concept.first_right_top5`, `stakes.lines`, `stakes.files`, `stakes.counts`, `stakes.exit` ([Frozen answers](#frozen-answers-refs-clash-stakes-and-the-text-universe)) | Tolerance 0. A failure passes only if it is ledgered (XFAIL). |
+| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `oracle_less.full_rows.<id>`, the full-list row count of each entry with no oracle (`--ast`, `--blast-radius`, a standalone `--hot` / `--cold` / `--risky` run); a shrink is a regression · the structural families `structural.precision.<id>`, `structural.line_on_match.<id>`, `structural.intent_recall.<id>` / `structural.intent_precision.<id>` and `structural.unscored_rows.<pattern>` (neutral: see [Checks](#checks)) · `refs.call_precision`, `roles.precision.<lang>` (`rust`, `python`, `typescript`, `tsx`, `javascript`, `go`) and the three cost counters `cost.files_parsed_median`, `cost.bytes_parsed_median`, `cost.bytes_read_median` (a row the search output cannot state has no value: it is absent, fails nothing and is not blessed) | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
+| **INFO** (never gated) | Latency: p50/p95 of the golden entries' own skim calls, plus the `--ast` pattern calls and the structural oracle pass, each timed apart · `unindexed_hits` · the oracle's per-reason skip breakdown · the "beats baseline" column · the `rg -nw` reference rows `bytes.rgw_text_median` and `bytes.rgw_first_correct_median`, in `info.reference` of each corpus in `report.json`: they are never gated and not in `baseline.json` | none |
 
 A changed golden file (the structural-oracle fingerprint is folded into its hash), corpus pin, or HARD outcome (for
 example `xfail -> pass`) also means "bless required". A HARD downgrade (`pass -> xfail`, or a blessed check, entry or
@@ -154,7 +154,9 @@ an `id` that is unique and prefixed with `<corpus>-`. The existing id scheme:
 - `C..` concepts;
 - `S..` / `X..` / `K..` / `Z..` lexical cases, plus the seed's two-digit `G01` / `G02` `--lang` cases;
 - `P..` phrase / near;
-- `G0xx` pagination, `F0xx` prefix.
+- `G0xx` pagination, `F0xx` prefix;
+- `R..` frozen sites of one name (`[[refs]]`), `D..` a name with two or more definitions (`[[clash]]`), `Q..` stakes
+  (`[[stakes]]`). The tables are described under [Frozen answers](#frozen-answers-refs-clash-stakes-and-the-text-universe).
 
 ```toml
 [[ident]]      # definition ranking: def.line must contain `query` at the pinned commit
@@ -164,7 +166,7 @@ def = { path = "crates/rskim/src/cmd/search/temporal.rs", line = 462 }
 origin = "curated"            # seed | generated | curated
 
 [[concept]]    # ranking: relevance is a regex over file text, written from the corpus source
-id = "skim-C08"
+id = "skim-C20"
 query = "hook watchdog"
 relevant = '(?i)hook[_\s-]*watchdog'
 
@@ -196,6 +198,10 @@ Golden integrity runs before any query, and a violation is exit 2, never a gate 
 - each `def.line` contains the query at the pinned commit;
 - regexes compile, and `near` is present exactly when the mode needs it;
 - ids are unique, `zero-hit` entries have no ground truth, and pagination fits its bound;
+- the frozen-answer tables hold their rules ([Frozen answers](#frozen-answers-refs-clash-stakes-and-the-text-universe)):
+  a `[[refs]]` site set that differs from the whole-word line set at the pin, a `[[clash]]` with fewer than 2
+  definitions, a `first` path outside the universe and a `[[stakes]]` exit code that disagrees with the oracle's hit
+  count are all errors;
 - every ledger entry refers to a real entry and check.
 
 For identifiers, `scoreboard golden-gen --corpus <name>` proposes candidates: definitions with exactly one site in
@@ -203,6 +209,62 @@ the corpus, a name of at least 6 bytes, and 2–60 ground-truth files, ordered b
 the proposal, then paste it.
 
 Adding any entry changes the golden hash, so the next `check` says "bless required". Bless from that run.
+
+## Frozen answers: refs, clash, stakes and the text universe
+
+Three golden tables and one concept field freeze the answers a plain-word search must give (#540), before the engine
+that gives them exists. Each frozen set comes from `git grep -nw` at the pin plus a hand read of every line, never from
+skim's output. Each corpus holds 3 or more `[[refs]]` entries, 1 `[[clash]]` entry (a name with two definitions at the
+pin), 2 or more concept entries with `first`, and 2 `[[stakes]]` entries (one zero-hit, one match).
+
+| Table | Holds | Integrity (exit 2 when broken) |
+|---|---|---|
+| `[[refs]]` | `id`, `query` (a bare identifier), `def {path, line}`, `sites [{path, line, role}]`, `origin`. Every line that holds the name as a whole word, with its role: `def`, `call`, `ref`, `import`, `comment`, `string` or `text`. | The `sites` equal the whole-word line set of the query over the text universe at the pin, and `def` is one of them. |
+| `[[clash]]` | `id`, `query`, `defs [{path, line}]` (2 or more), `calls [{path, line, def}]`, `split`, `origin`. A name with two or more definitions. `def` of a call is an index into `defs` or `"unassigned"`. | At least 2 `defs`; each call index is in range; every def and call line holds the name as a whole word; `split = "none"` (the value `"exact"` is refused until calls are split by definition). |
+| `[[stakes]]` | `id`, `query`, `flags` (rg-style, from a closed list), `expect` (`lines`, `files`, `counts` or `exit`) and `exit` for `expect = "exit"`. A plain-text query judged against the regex oracle. | `exit` is present exactly when `expect = "exit"`; `exit = 1` needs no matching line in the text universe and `exit = 0` needs one. |
+| `[[concept]]` `first` | An optional list of paths: the files that hold the answer to a plain-word question. A concept entry without `first` still loads. | Each path is a file of the indexed universe at the pin. |
+
+PR 1 freezes only the `[[stakes]]` entries that need no new flag: the no-match exit code. The `lines`, `files` and
+`counts` kinds are checked on fixtures, and get golden entries when the flags exist.
+
+| Check | Class | Runs on | Passes iff / measures |
+|---|---|---|---|
+| `refs.recall` | HARD | `[[refs]]` | every frozen site is among the occurrences of the full list |
+| `refs.calls_recall` | HARD | `[[refs]]` | every frozen `call` site is an occurrence labelled `call` |
+| `clash.defs_complete` | HARD | `[[clash]]` | every frozen definition is among `definitions.sites` |
+| `clash.def_count` | HARD | `[[clash]]` | `definitions.count` equals the number of frozen definitions; an `at_least` count passes only as a valid lower bound (not above the frozen number, and within the files the parse budget left unlabelled) |
+| `clash.calls_recall` | HARD | `[[clash]]` | every frozen call site of either definition is an occurrence labelled `call` (calls are not split by definition) |
+| `lexical.recall_tracked` | HARD | `[[lexical]]` | every file of the text universe that holds the query is returned (no language allow-list) |
+| `universe.accounted` | HARD | `[[refs]]` | `searched_files` plus each `left_out` reason count equal the oracle's counts for the text universe, reason by reason |
+| `ident.def_first` | HARD | `[[ident]]` | `definitions.sites[0]` has the path and the line of the frozen `def` |
+| `concept.first_right_top5` | HARD | `[[concept]]` with `first` | a frozen `first` file is among the first 5 files |
+| `stakes.lines` | HARD | `[[stakes]]` with `expect = "lines"` | the matching lines equal the regex oracle's |
+| `stakes.files` | HARD | `[[stakes]]` with `expect = "files"` | the matching files equal the regex oracle's |
+| `stakes.counts` | HARD | `[[stakes]]` with `expect = "counts"` | the matching lines per file equal the regex oracle's |
+| `stakes.exit` | HARD | `[[stakes]]` with `expect = "exit"` | the exit code equals the frozen one (`1` for no match, `0` for a match) |
+| `refs.call_precision` | RATCHET | `[[refs]]` | of the occurrences labelled `call`, the share that are frozen calls (4 dp); no value when the output labels no `call` |
+| `roles.precision.<lang>` | RATCHET | role oracle (`rskim-oracle`) | precision of the role labels per language; no value while the output labels no role the oracle can judge |
+| `cost.files_parsed_median`, `cost.bytes_parsed_median`, `cost.bytes_read_median` | RATCHET | every call that states its cost | the median of each work counter (lower is better); no value while the output states no cost |
+| `bytes.rgw_text_median`, `bytes.rgw_first_correct_median` | INFO | `[[ident]]`, `[[concept]]` | output bytes of the `rg -nw` simulation (the search an agent types for a bare identifier): in total, and through the definition line. Recorded in `info.reference` of `report.json`, never gated |
+
+`results.unique_paths` also runs on these tables. A RATCHET row with no value is absent from the report values: it
+fails nothing, and `bless` does not record it.
+
+**The text universe.** One function, `text_universe` (`src/scoreboard/universe.rs`), gives the universe that
+`lexical.recall_tracked`, `universe.accounted` and the whole-word checks of golden integrity read. It is every tracked
+text file of the work tree, with no language allow-list and no minified gate. Hidden and secret-bearing tracked files
+are in it: a plain-text search lists them, as `git grep` does. A file leaves the universe only for a counted reason
+(`left_out`: `binary`, `not_utf8`, `too_large`, `unreadable`, `vanished`, `outside_root`, `symlink`). The older
+indexed universe (`universe.delta`, the `lexical.recall` family) is unchanged.
+
+**What the search output must state.** The adapter reads the current `skim search --json` output. A lexical row gives
+one occurrence for each `is_match` snippet line. Its `field` gives the role: `function_signature` and `type_definition`
+give `def`, and every other field gives no role. `definitions.sites` are the `def` rows that state a line number, in
+rank order, and `definitions.count` is absent. An unknown or missing `field` is a harness error (exit 2). So the
+`call` and `ref` roles, the definition count and the stakes exit codes are checks the current binary cannot meet yet.
+
+**Ledger.** These checks start as `[[xfail]]` entries against the current binary, each tied to an open ticket. When a
+check passes, its entry XPASSes: remove the id, then bless (see [The ledger](#the-ledger-known_failurestoml)).
 
 ## Structural oracle
 
@@ -431,7 +493,8 @@ Two jobs in `.github/workflows/ci.yml` run the gate: `changes` (**Detect Search 
   - `.github/workflows/ci.yml`.
 
   Adding a `crate::` import to `cmd/search/` from another `rskim` file means adding that file here and to
-  `SEARCH_PATHS` in the `changes` job.
+  `SEARCH_PATHS` in the `changes` job. The frozen-answer tables and checks live in `crates/rskim-bench/` and
+  `crates/rskim-oracle/`, which are already listed, so `SEARCH_PATHS` does not change for them.
 
   A PR outside these paths skips the job, and GitHub reports a skipped job as passing.
 - **Binary.** Build Check uploads its release `skim` as the `skim-release` artifact (kept 1 day). The scoreboard
