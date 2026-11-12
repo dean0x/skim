@@ -2582,6 +2582,26 @@ fn test_heatmap_four_path_forms_give_byte_identical_cards() {
 }
 
 #[test]
+fn test_heatmap_two_forms_of_one_file_give_one_card() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_card_repo(dir.path());
+
+    let json = heatmap_json_with(dir.path(), &[CARD_FILE, "./src/core.rs", "src/util.rs"]);
+
+    assert_eq!(
+        json["counts"]["cards"],
+        serde_json::json!({"total": 2, "shown": 2})
+    );
+    let paths: Vec<&str> = json["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, [CARD_FILE, "src/util.rs"]);
+}
+
+#[test]
 fn test_heatmap_card_path_outside_the_root_exits_1_with_no_card() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_card_repo(dir.path());
@@ -2602,6 +2622,7 @@ fn test_heatmap_card_path_outside_the_root_exits_1_with_no_card() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn test_heatmap_card_of_a_fifo_path_returns_without_blocking() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2612,30 +2633,18 @@ fn test_heatmap_card_of_a_fifo_path_returns_without_blocking() {
         .expect("mkfifo");
     assert!(made.success());
 
-    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_skim"))
-        .args(["heatmap", "pipe"])
+    // The environment of `common::skim()`. `run_bounded` kills the run and
+    // fails the test at its time bound: a run that opens the FIFO would block.
+    let mut cmd = StdCommand::new(common::skim_bin());
+    cmd.args(["heatmap", "pipe"])
         .env("SKIM_DISABLE_ANALYTICS", "1")
-        .current_dir(dir.path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn skim");
-    // At most 300 polls of 100 ms: a run that opens the FIFO would block.
-    let mut status = None;
-    for _ in 0..300 {
-        status = child.try_wait().expect("try_wait");
-        if status.is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let Some(status) = status else {
-        child.kill().ok();
-        panic!("skim heatmap blocked on a FIFO path argument");
-    };
-    assert!(status.success());
-    let mut stdout = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_REWRITTEN_FROM")
+        .current_dir(dir.path());
+    let output = common::run_bounded(cmd);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
     let card = card_lines(&stdout, "pipe");
     assert_eq!(card.len(), 1, "{stdout}");
     assert!(

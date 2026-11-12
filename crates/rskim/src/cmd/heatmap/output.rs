@@ -237,13 +237,22 @@ fn push_card(out: &mut String, card: &Card, window: &WindowInfo, caps: ListCaps)
         push_line(
             out,
             &format!(
-                "{}: not in history window ({} commits since {})",
-                card.path, window.commits_analyzed, window.since
+                "{}: not in history window ({} since {})",
+                card.path,
+                items(window.commits_analyzed, "commit", "commits"),
+                window.since
             ),
         );
         return;
     }
-    push_line(out, &format!("{}: {} commits", card.path, card.commits));
+    push_line(
+        out,
+        &format!(
+            "{}: {}",
+            card.path,
+            items(card.commits, "commit", "commits")
+        ),
+    );
     if !card.owners.is_empty() {
         let owners: Vec<String> = card
             .owners
@@ -818,6 +827,41 @@ mod tests {
             card_text(&card).lines().nth(5),
             Some(r#"    abc1234 2026-11-01 "fix: say \"done\" \\ ok""#)
         );
+    }
+
+    #[test]
+    fn test_card_title_uses_the_singular_noun_for_one_commit() {
+        let card = Card {
+            commits: 1,
+            ..card_with("Test User", "Ada", "fix: a")
+        };
+        assert_eq!(card_text(&card).lines().next(), Some("src/a.rs: 1 commit"));
+    }
+
+    #[test]
+    fn test_card_outside_the_window_uses_the_singular_noun_for_one_commit() {
+        let card = Card {
+            in_window: false,
+            ..card_with("Test User", "Ada", "fix: a")
+        };
+        let mut window = make_result().window;
+        window.commits_analyzed = 1;
+        let mut out = String::new();
+        push_card(&mut out, &card, &window, DEFAULT_VIEW.lists());
+        assert_eq!(
+            out,
+            "src/a.rs: not in history window (1 commit since 2024-10-01)\n"
+        );
+    }
+
+    #[test]
+    fn test_cards_text_more_line_uses_the_plural_for_two_hidden_files() {
+        let cards = Section {
+            rows: vec![card_with("Test User", "Ada", "fix: a")],
+            total: 3,
+        };
+        let text = render_cards_text(&make_result(), &cards, DEFAULT_VIEW.lists());
+        assert_eq!(text.lines().last(), Some("2 more files (raise --top)"));
     }
 
     #[test]
