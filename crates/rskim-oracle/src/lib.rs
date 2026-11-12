@@ -12,7 +12,11 @@
 //!   nested-loop intent oracles, and the oracle's own AST language table and
 //!   size cap.
 //!
+//! - [`roles`] — the role oracle for names (#540): where a name is defined,
+//!   called and imported, from role queries written from the grammars.
+//!
 //! skim's pattern catalog is not an input: the scoreboard reads it in
 //! `rskim-bench` and crosses it with this crate's registry by pattern name.
 
+pub mod roles;
 pub mod structural;
