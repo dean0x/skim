@@ -20,8 +20,8 @@
 //!   holds and no gate reads.
 //! - [`RATCHET_METRICS`] defines each RATCHET metric's good direction and
 //!   tolerance; [`compare_ratchet`] applies them for the gate and `bless`. A
-//!   row whose entries state no value (for example `roles.precision.*`, which
-//!   no code reads the role oracle for yet) is absent from the values, and an
+//!   row whose entries state no value (for example `roles.precision.go` when no
+//!   page labels a Go file) is absent from the values, and an
 //!   absent row never fails the gate.
 //!
 //! No function here imports skim's own search code: every expectation comes
@@ -32,6 +32,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use regex::Regex;
+use rskim_oracle::roles::role_sites;
+use rskim_oracle::structural::{LangClass, OracleLang, classify};
 use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::MAX_PAGES;
@@ -589,6 +591,79 @@ pub fn refs_call_precision(page: &ResultPage, entry: &RefsEntry) -> Option<f64> 
         return None;
     }
     Some(group.intersection(&frozen).count() as f64 / group.len() as f64)
+}
+
+/// How many role labels one language has, and how many of them the role
+/// oracle confirms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoleTally {
+    /// The `def`, `call` and `import` labels the page puts on files of the
+    /// language.
+    pub labelled: u64,
+    /// The labels whose line the role oracle lists for the same role.
+    pub confirmed: u64,
+}
+
+impl RoleTally {
+    fn add(&mut self, other: RoleTally) {
+        self.labelled += other.labelled;
+        self.confirmed += other.confirmed;
+    }
+}
+
+/// The `roles.precision.<lang>` input of one page: for each oracle language,
+/// the `def`, `call` and `import` labels of `page.occurrences` and how many of
+/// them the role oracle (`rskim_oracle::roles::role_sites`) confirms.
+///
+/// `name` is the bare identifier the page was searched for. A label is
+/// confirmed when the oracle lists the occurrence's line under the same role
+/// for `name` in that file. `source_of` gives the text of a file of the oracle
+/// universe. A labelled file that is not there has no oracle reading, so its
+/// labels count as not confirmed. Other roles (`ref`, `comment`, `string`,
+/// `text`, `partial`) and files of a language without a role oracle are not
+/// counted. A line counts once per role.
+///
+/// # Errors
+///
+/// The role oracle fails on a file (harness error, never a silent miss).
+pub fn page_role_tallies<'a>(
+    page: &ResultPage,
+    name: &str,
+    source_of: impl Fn(&str) -> Option<&'a str>,
+) -> anyhow::Result<BTreeMap<OracleLang, RoleTally>> {
+    let mut labels: BTreeMap<&str, BTreeSet<(u32, Role)>> = BTreeMap::new();
+    for o in &page.occurrences {
+        if let Some(role @ (Role::Def | Role::Call | Role::Import)) = o.role {
+            labels
+                .entry(o.path.as_str())
+                .or_default()
+                .insert((o.line, role));
+        }
+    }
+    let mut tallies: BTreeMap<OracleLang, RoleTally> = BTreeMap::new();
+    for (path, lines) in labels {
+        let LangClass::Oracle(lang) = classify(path) else {
+            continue;
+        };
+        let sites = match source_of(path) {
+            Some(source) => Some(
+                role_sites(lang, source, name)
+                    .with_context(|| format!("role oracle on {path} for {name:?}"))?,
+            ),
+            None => None,
+        };
+        let tally = tallies.entry(lang).or_default();
+        for (line, role) in lines {
+            tally.labelled += 1;
+            let confirmed = sites.as_ref().is_some_and(|s| match role {
+                Role::Def => s.defs.contains(&line),
+                Role::Call => s.calls.contains(&line),
+                _ => s.imports.contains(&line),
+            });
+            tally.confirmed += u64::from(confirmed);
+        }
+    }
+    Ok(tallies)
 }
 
 /// `clash.defs_complete`: every frozen definition is among the definition
@@ -1200,6 +1275,9 @@ pub struct CorpusSamples {
     pub concepts: Vec<ConceptSample>,
     /// Per-`[[refs]]`-entry measurements, in plan order.
     pub refs: Vec<RefsSample>,
+    /// Per language, the role labels of the `[[refs]]` and `[[clash]]` pages and
+    /// the ones the role oracle confirms ([`page_role_tallies`]).
+    pub roles: BTreeMap<OracleLang, RoleTally>,
     /// The work counters of every call that states them, in plan order.
     pub costs: Vec<Cost>,
 }
@@ -1406,8 +1484,9 @@ pub const RATCHET_METRICS: &[MetricDef] = &[
         Tolerance::Exact,
         "ratchet (exact counter)",
     ),
-    // No code in this version reads the role oracle, so these rows have no
-    // value yet: the search output labels no role the oracle could judge.
+    // Precision of the `def`, `call` and `import` labels of the `[[refs]]` and
+    // `[[clash]]` pages, judged by the role oracle (`page_role_tallies`). A
+    // language with no label in any corpus has no value.
     def(
         "roles.precision.rust",
         Direction::HigherBetter,
@@ -1583,6 +1662,7 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
     }
     put_text_byte_values(&mut out, &idents, &concepts);
     put_refs_values(&mut out, samples);
+    put_role_values(&mut out, samples);
     put_cost_values(&mut out, samples);
     out
 }
@@ -1600,6 +1680,23 @@ fn put_refs_values(out: &mut BTreeMap<String, f64>, samples: &[&CorpusSamples]) 
                 .filter_map(|r| r.call_precision),
         ),
     );
+}
+
+/// `roles.precision.<lang>`: the labels the role oracle confirms over the labels
+/// the pages put on files of the language, pooled over every corpus. A language
+/// with no label has no value.
+fn put_role_values(out: &mut BTreeMap<String, f64>, samples: &[&CorpusSamples]) {
+    for lang in OracleLang::ALL {
+        let mut pooled = RoleTally::default();
+        for tally in samples.iter().filter_map(|s| s.roles.get(&lang)) {
+            pooled.add(*tally);
+        }
+        put(
+            out,
+            &format!("roles.precision.{lang}"),
+            (pooled.labelled > 0).then(|| pooled.confirmed as f64 / pooled.labelled as f64),
+        );
+    }
 }
 
 /// `cost.*_median`: the median of each work counter over every call that
@@ -1837,6 +1934,7 @@ pub fn evaluate(
     let mut concepts = Vec::new();
     let mut refs = Vec::new();
     let mut costs = Vec::new();
+    let mut roles: BTreeMap<OracleLang, RoleTally> = BTreeMap::new();
 
     for (q, obs) in paired(plan, observations)? {
         let oracle = eval_oracle(q, text);
@@ -1863,6 +1961,17 @@ pub fn evaluate(
             }
             Target::None => {}
         }
+        let role_name = q
+            .refs_entry()
+            .map(|e| e.query.as_str())
+            .or_else(|| q.clash_entry().map(|e| e.query.as_str()));
+        if let Some(name) = role_name {
+            for (lang, tally) in page_role_tallies(&obs.full, name, |p| text.text(p))
+                .with_context(|| format!("{}: roles.precision", q.id))?
+            {
+                roles.entry(lang).or_default().add(tally);
+            }
+        }
         if let Some(entry) = q.refs_entry() {
             refs.push(RefsSample {
                 id: q.id.clone(),
@@ -1885,6 +1994,7 @@ pub fn evaluate(
             idents,
             concepts,
             refs,
+            roles,
             costs,
         },
         searched_files: searched,

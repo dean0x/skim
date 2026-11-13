@@ -536,6 +536,7 @@ fn samples(idents: Vec<IdentSample>) -> CorpusSamples {
         idents,
         concepts: Vec::new(),
         refs: Vec::new(),
+        roles: BTreeMap::new(),
         costs: Vec::new(),
     }
 }
@@ -1790,6 +1791,18 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
     assert_eq!(e.samples.refs.len(), 1);
     assert_eq!(e.samples.refs[0].call_precision, Some(1.0));
     assert_eq!(e.samples.costs, vec![cost(2, 50, 100)]);
+    // The role labels of the refs page (3, all confirmed) and of the clash page
+    // (1, confirmed) both reach the Rust tally.
+    assert_eq!(
+        e.samples.roles,
+        BTreeMap::from([(
+            OracleLang::Rust,
+            RoleTally {
+                labelled: 4,
+                confirmed: 4
+            }
+        )])
+    );
 }
 
 fn refs_entry_toml() -> &'static str {
@@ -1891,5 +1904,108 @@ fn evaluate_judges_each_stakes_expectation_with_its_own_comparison() {
         assert_eq!(passed("skim-S01", CheckId::StakesLines), lines, "{name}");
         assert_eq!(passed("skim-S02", CheckId::StakesFiles), files, "{name}");
         assert_eq!(passed("skim-S03", CheckId::StakesCounts), counts, "{name}");
+    }
+}
+
+// --- roles.precision ----------------------------------------------------------------
+
+fn tally(labelled: u64, confirmed: u64) -> RoleTally {
+    RoleTally {
+        labelled,
+        confirmed,
+    }
+}
+
+/// `launch` is defined at line 1 of `src/lib.rs` and called at line 2.
+const RUST_LAUNCH: &str = "fn launch() {}\nfn start() { launch(); }\n// launch\n";
+/// `launch` is imported at line 1 of `app.py` and called at line 2.
+const PYTHON_LAUNCH: &str = "from m import launch\nlaunch()\n";
+
+fn launch_source(path: &str) -> Option<&'static str> {
+    match path {
+        "src/lib.rs" => Some(RUST_LAUNCH),
+        "app.py" => Some(PYTHON_LAUNCH),
+        _ => None,
+    }
+}
+
+#[test]
+fn page_role_tallies_confirm_a_label_only_when_the_oracle_lists_that_line_for_that_role() {
+    let page = with_occurrences(vec![
+        occ("src/lib.rs", 1, Some(Role::Def)),  // confirmed
+        occ("src/lib.rs", 2, Some(Role::Call)), // confirmed
+        occ("src/lib.rs", 2, Some(Role::Def)),  // a call line labelled def
+        occ("src/lib.rs", 1, Some(Role::Call)), // a def line labelled call
+        occ("src/lib.rs", 3, Some(Role::Call)), // a comment labelled call
+        occ("app.py", 1, Some(Role::Import)),   // confirmed
+        occ("app.py", 2, Some(Role::Call)),     // confirmed
+        occ("app.py", 2, Some(Role::Import)),   // a call line labelled import
+    ]);
+    let t = page_role_tallies(&page, "launch", launch_source).unwrap();
+    assert_eq!(t[&OracleLang::Rust], tally(5, 2));
+    assert_eq!(t[&OracleLang::Python], tally(3, 2));
+    assert_eq!(t.len(), 2);
+}
+
+#[test]
+fn page_role_tallies_skip_other_roles_other_languages_and_count_a_line_once_per_role() {
+    let page = with_occurrences(vec![
+        occ("src/lib.rs", 1, Some(Role::Def)),
+        occ("src/lib.rs", 1, Some(Role::Def)),
+        occ("src/lib.rs", 2, Some(Role::Ref)),
+        occ("src/lib.rs", 3, Some(Role::Comment)),
+        occ("src/lib.rs", 3, Some(Role::Partial)),
+        occ("src/lib.rs", 3, None),
+        occ("README.md", 1, Some(Role::Def)),
+        occ("notes.txt", 1, Some(Role::Call)),
+    ]);
+    let t = page_role_tallies(&page, "launch", launch_source).unwrap();
+    assert_eq!(t, BTreeMap::from([(OracleLang::Rust, tally(1, 1))]));
+    assert!(
+        page_role_tallies(&ResultPage::default(), "launch", launch_source)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn page_role_tallies_count_a_label_on_a_file_outside_the_universe_as_not_confirmed() {
+    let page = with_occurrences(vec![
+        occ("src/gone.rs", 1, Some(Role::Def)),
+        occ("src/lib.rs", 1, Some(Role::Def)),
+    ]);
+    let t = page_role_tallies(&page, "launch", launch_source).unwrap();
+    assert_eq!(t[&OracleLang::Rust], tally(2, 1));
+}
+
+#[test]
+fn page_role_tallies_fail_when_the_role_oracle_fails() {
+    let page = with_occurrences(vec![occ("src/lib.rs", 1, Some(Role::Def))]);
+    let err = page_role_tallies(&page, "", launch_source).unwrap_err();
+    assert!(format!("{err:#}").contains("non-empty name"), "{err:#}");
+}
+
+#[test]
+fn roles_precision_pools_labels_over_corpora_and_leaves_a_language_with_no_label_out() {
+    let mut a = samples(Vec::new());
+    a.roles = BTreeMap::from([
+        (OracleLang::Rust, tally(1, 1)),
+        (OracleLang::Python, tally(2, 0)),
+    ]);
+    let mut b = samples(Vec::new());
+    b.roles = BTreeMap::from([(OracleLang::Rust, tally(3, 1))]);
+
+    let one = ratchet_values(&[&a]);
+    assert_eq!(one["roles.precision.rust"], 1.0);
+    assert_eq!(one["roles.precision.python"], 0.0);
+
+    // Pooled labels, not the mean of the two corpus ratios (that would be 0.6667).
+    let pooled = ratchet_values(&[&a, &b]);
+    assert_eq!(pooled["roles.precision.rust"], 0.5);
+    for lang in ["typescript", "tsx", "javascript", "go"] {
+        assert!(
+            !pooled.contains_key(&format!("roles.precision.{lang}")),
+            "{lang} has no label, so it has no value"
+        );
     }
 }
