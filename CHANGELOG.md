@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and kept it fresh with git hooks. The new design builds nothing, caches nothing and
   installs no hook. The output, the flags and the exit codes change, so scripts that
   call `skim search` must change.
-  - **Views.** A bare identifier (`skim search launchWorker`) prints the definition first,
+  - **Views.** A bare identifier (`skim search parseConfig`) prints the definition first,
     with its line range. Each call follows, with the function that holds it. Imports,
     strings, comments, text and partial matches are counted by role. A quoted argument
     with several words (`skim search "temporal staleness check"`) lists the files that

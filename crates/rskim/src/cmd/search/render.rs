@@ -388,9 +388,6 @@ fn unlabelled_reason(reason: Unlabelled, limits: &Limits) -> String {
             "above the per-file parse cap of {}",
             bytes_label(limits.per_file_parse_cap)
         ),
-        Unlabelled::ParseTimeout => {
-            format!("parse time bound of {} ms", limits.parse_time.as_millis())
-        }
         Unlabelled::ParseFailed => "the parser failed".to_owned(),
         Unlabelled::Changed => "changed during the search".to_owned(),
         Unlabelled::WalkCap => "declaration walk cap".to_owned(),

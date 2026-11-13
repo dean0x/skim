@@ -685,6 +685,63 @@ fn two_runs_of_one_query_give_equal_cost_counters() {
     assert!(first["cost"]["bytes_read"].as_u64().unwrap() > 0);
 }
 
+/// A repository of TypeScript files where `ZodType` has each role, in files
+/// large enough that a parse takes measurable time.
+fn zod_type_repo() -> SearchRepo {
+    let repo = SearchRepo::new();
+    let filler: String = (0..1_500)
+        .map(|j| format!("export function f{j}(a: number): number {{ return a + {j}; }}\n"))
+        .collect();
+    for i in 0..24 {
+        let hits = match i % 4 {
+            0 => "export function ZodType(x: number): number {\n  return x;\n}\n".to_owned(),
+            1 => "export function run(): number {\n  return ZodType(1);\n}\n".repeat(1 + i % 3),
+            2 => "import { ZodType } from \"./z0\";\nlet t: ZodType;\n".to_owned(),
+            _ => "// ZodType note\nconst s = \"ZodType\";\n".repeat(1 + i % 5),
+        };
+        repo.write(&format!("src/z{i}.ts"), format!("{hits}{filler}"));
+    }
+    repo.track_all();
+    repo
+}
+
+/// The labels, and so the order, depend only on the files: the same query
+/// under parallel load gives one output.
+#[test]
+fn one_query_run_many_times_under_parallel_load_gives_one_order() {
+    const RUNS: usize = 16;
+    const ROUNDS: usize = 2;
+    let repo = zod_type_repo();
+    let args = ["ZodType", "--all"];
+    let reference = repo.search(&args);
+    assert_eq!(reference.code, 0, "{}", reference.stderr);
+    // Every file is labelled: 6 definitions, and the 18 other files listed.
+    assert!(
+        reference.stdout.contains("note: 6 definitions of ZodType"),
+        "{}",
+        reference.stdout
+    );
+    assert_eq!(
+        listed_paths(&reference.stdout).len(),
+        18,
+        "{}",
+        reference.stdout
+    );
+    for _ in 0..ROUNDS {
+        let runs: Vec<Run> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..RUNS)
+                .map(|_| scope.spawn(|| repo.search(&args)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for run in runs {
+            assert_eq!(run.code, reference.code);
+            assert_eq!(run.stdout, reference.stdout);
+            assert_eq!(run.stderr, reference.stderr);
+        }
+    }
+}
+
 // ============================================================================
 // Definitions
 // ============================================================================

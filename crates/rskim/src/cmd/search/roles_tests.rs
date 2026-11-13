@@ -15,7 +15,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 use rskim_core::Language;
 use rskim_oracle::roles::{RoleSites, role_sites};
@@ -24,9 +23,6 @@ use rskim_oracle::structural::OracleLang;
 use super::{
     Labelling, Labels, Role, Unlabelled, declaration_keywords, has_declaration_keyword, is_partial,
 };
-
-/// A parse time bound that no fixture reaches.
-const PARSE_TIME: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Fixtures
@@ -270,7 +266,7 @@ fn line_of(source: &str, byte: usize) -> u32 {
 }
 
 fn labels_of(fixture: &Fixture) -> Labels {
-    Labels::new(fixture.source, fixture.lang, fixture.ext, PARSE_TIME)
+    Labels::new(fixture.source, fixture.lang, fixture.ext)
         .unwrap_or_else(|e| panic!("{}: {e:?}", fixture.label))
 }
 
@@ -432,7 +428,7 @@ fn comment_and_string_occurrences_get_the_text_roles_and_are_never_oracle_sites(
 /// The role of the first whole-word occurrence of `needle` at or after the
 /// first occurrence of `after` (or of the start).
 fn role_of(lang: Language, ext: &str, source: &str, after: &str, needle: &str) -> Role {
-    let labels = Labels::new(source, lang, ext, PARSE_TIME).unwrap();
+    let labels = Labels::new(source, lang, ext).unwrap();
     let from = source.find(after).unwrap();
     let start = occurrences(source, needle)
         .into_iter()
@@ -677,7 +673,7 @@ fn an_import_needs_an_import_node_above_the_identifier() {
 #[test]
 fn a_declared_name_is_a_def_only_when_the_match_is_the_whole_name() {
     let rust = "fn launch_worker() {}\n";
-    let labels = Labels::new(rust, Language::Rust, "rs", PARSE_TIME).unwrap();
+    let labels = Labels::new(rust, Language::Rust, "rs").unwrap();
     assert_eq!(labels.role(&(3..16)), Role::Def);
     assert_eq!(
         labels.role(&(3..9)),
@@ -691,11 +687,11 @@ fn a_declared_name_is_a_def_only_when_the_match_is_the_whole_name() {
 #[test]
 fn markdown_and_data_formats_give_text_outside_comments_and_strings() {
     let md = "# launch\n\nlaunch the worker <!-- launch -->\n";
-    let labels = Labels::new(md, Language::Markdown, "md", PARSE_TIME).unwrap();
+    let labels = Labels::new(md, Language::Markdown, "md").unwrap();
     assert_eq!(labels.role(&(2..8)), Role::Text);
 
     let json = "{\"launch\": \"launch now\"}\n";
-    let labels = Labels::new(json, Language::Json, "json", PARSE_TIME).unwrap();
+    let labels = Labels::new(json, Language::Json, "json").unwrap();
     assert_eq!(labels.role(&(2..8)), Role::Text, "a key is text");
     assert_eq!(labels.role(&(12..18)), Role::StringLit);
 
@@ -706,7 +702,7 @@ fn markdown_and_data_formats_give_text_outside_comments_and_strings() {
 fn markdown_prose_and_code_blocks_are_text_not_comments() {
     let md =
         "# launch\n\nlaunch the worker\n\n- launch item\n\n> launch quote\n\n```\nlaunch();\n```\n";
-    let labels = Labels::new(md, Language::Markdown, "md", PARSE_TIME).unwrap();
+    let labels = Labels::new(md, Language::Markdown, "md").unwrap();
     for (at, what) in [
         (md.find("launch the").unwrap(), "a paragraph"),
         (md.find("launch item").unwrap(), "a list item"),
@@ -715,14 +711,6 @@ fn markdown_prose_and_code_blocks_are_text_not_comments() {
     ] {
         assert_eq!(labels.role(&(at..at + 6)), Role::Text, "{what} is text");
     }
-}
-#[test]
-fn a_parse_past_the_time_bound_gives_no_labels() {
-    let source: String = (0..20_000)
-        .map(|i| format!("fn f{i}() {{ let x = {i}; }}\n"))
-        .collect();
-    let result = Labels::new(&source, Language::Rust, "rs", Duration::ZERO);
-    assert!(matches!(result, Err(Unlabelled::ParseTimeout)));
 }
 
 // ============================================================================
@@ -743,8 +731,7 @@ fn classify(
 #[test]
 fn a_line_takes_the_best_role_among_its_matches() {
     let source = "// run\nfn run() { run(); }\n";
-    let labelling =
-        Labelling::Labelled(Labels::new(source, Language::Rust, "rs", PARSE_TIME).unwrap());
+    let labelling = Labelling::Labelled(Labels::new(source, Language::Rust, "rs").unwrap());
     // The line `fn run() { run(); }` starts at byte 7: the def, then the call.
     let line = "fn run() { run(); }";
     let hit = labelling
@@ -779,7 +766,7 @@ fn a_line_with_a_whole_hit_and_a_partial_hit_is_not_partial() {
 #[test]
 fn the_holder_is_the_enclosing_declaration_or_none_at_the_top_level() {
     let source = "const TOP: u32 = helper();\nfn outer() {\n    helper();\n}\nfn helper() {}\n";
-    let labels = Labels::new(source, Language::Rust, "rs", PARSE_TIME).unwrap();
+    let labels = Labels::new(source, Language::Rust, "rs").unwrap();
     let in_outer = source.find("    helper").unwrap() + 4;
     let holder = labels.holder(in_outer).unwrap();
     assert_eq!(holder.name, "outer");
@@ -825,8 +812,7 @@ fn role_tiers_are_in_the_documented_order() {
 #[test]
 fn a_partial_hit_in_a_parsed_file_has_no_holder() {
     let source = "fn outer() {\n    launchWorkerPool();\n}\n";
-    let labelling =
-        Labelling::Labelled(Labels::new(source, Language::Rust, "rs", PARSE_TIME).unwrap());
+    let labelling = Labelling::Labelled(Labels::new(source, Language::Rust, "rs").unwrap());
     let line = "    launchWorkerPool();";
 
     let hit = labelling

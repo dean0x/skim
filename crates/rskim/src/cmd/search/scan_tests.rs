@@ -5,7 +5,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -434,38 +433,13 @@ fn a_file_over_the_per_file_parse_cap_is_unlabelled_with_its_lines_counted() {
 }
 
 #[test]
-fn a_parse_past_the_time_bound_leaves_the_file_unlabelled() {
-    let tree = Tree::new();
-    let source: String = (0..5_000)
-        .map(|i| format!("fn needle{i}() {{ let x = {i}; }}\n"))
-        .collect();
-    tree.write("slow.rs", &source);
-    let limits = Limits {
-        parse_time: Duration::ZERO,
-        ..Limits::default()
-    };
-
-    let out = scan(&tree, &pattern("needle", false), limits, 0);
-
-    let f = file(&out, "slow.rs");
-    assert_eq!(f.unlabelled, Some(Unlabelled::ParseTimeout));
-    assert_eq!(f.roles.get(Role::Unlabelled), f.lines);
-    assert_eq!(out.cost.files_parsed, 1, "the parse was started");
-}
-
-#[test]
 fn a_matched_file_above_the_walk_node_cap_is_unlabelled_with_walk_cap() {
     let tree = Tree::new();
     // Three syntax nodes per statement: more than the 100,000 node cap.
     let source = format!("needle;\n{}", "x;\n".repeat(60_000));
     tree.write("wide.js", &source);
-    // A slow runner must not reach the parse time bound first.
-    let limits = Limits {
-        parse_time: Duration::from_secs(60),
-        ..Limits::default()
-    };
 
-    let out = scan(&tree, &pattern("needle", true), limits, 0);
+    let out = scan(&tree, &pattern("needle", true), Limits::default(), 0);
 
     let f = file(&out, "wide.js");
     assert_eq!(f.unlabelled, Some(Unlabelled::WalkCap));

@@ -153,14 +153,15 @@ One rayon pool of at most `MAX_SCAN_THREADS` = 8 threads. Two phases run one aft
   query), notes whether a matching line holds a declaration keyword before the match, takes the file prior and a digest of
   the content. It keeps no line text, so memory is O(files).
 - **Phase B (`label`)** visits the matched files in parse order. It re-reads each file and compares the digest (a file
-  that changed is counted under `changed` and not listed), labels the file with one bounded parse, decides the role of
+  that changed is counted under `changed` and not listed), labels the file with one parse, decides the role of
   every matching line and stores line records up to a fixed cap. Role counts are exact for every matching line, stored
   or not.
 
 `Limits` (all named constants): `MAX_STORED_LINES` = 10,000; `MAX_CONTEXT_LINES` = 100,000; `PARSE_BUDGET_FILES` = 500;
-`PARSE_BUDGET_BYTES` = 32 MiB; `PER_FILE_PARSE_CAP` = 1 MiB; `PARSE_TIME_BOUND` = 100 ms; `MAX_DEF_SITES_PER_FILE` = 100;
+`PARSE_BUDGET_BYTES` = 32 MiB; `PER_FILE_PARSE_CAP` = 1 MiB; `MAX_DEF_SITES_PER_FILE` = 100;
 `MAX_DEF_SITES` = 10,000; `LINE_WIDTH_CAP` = 300. A file the budget leaves unparsed keeps its lines under `unlabelled`
-with a reason (`Unlabelled`: `budget`, `parse_cap`, `parse_timeout`, `parse_failed`, `changed`, `walk_cap`).
+with a reason (`Unlabelled`: `budget`, `parse_cap`, `parse_failed`, `changed`, `walk_cap`). No bound reads the clock:
+the labels, and so the order, depend only on the files, so a page or a repeat call under load gives the same answer.
 
 ## Roles (`roles.rs`)
 

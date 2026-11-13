@@ -31,7 +31,6 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use rayon::prelude::*;
 use rskim_core::Language;
@@ -65,9 +64,6 @@ pub(super) const PARSE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// A file above this size is not parsed.
 pub(super) const PER_FILE_PARSE_CAP: usize = 1024 * 1024;
 
-/// The time one parse may take.
-pub(super) const PARSE_TIME_BOUND: Duration = Duration::from_millis(100);
-
 /// Most definition sites kept per file.
 pub(super) const MAX_DEF_SITES_PER_FILE: usize = 100;
 
@@ -84,7 +80,6 @@ pub(super) struct Limits {
     pub(super) parse_files: usize,
     pub(super) parse_bytes: usize,
     pub(super) per_file_parse_cap: usize,
-    pub(super) parse_time: Duration,
 }
 
 impl Default for Limits {
@@ -96,7 +91,6 @@ impl Default for Limits {
             parse_files: PARSE_BUDGET_FILES,
             parse_bytes: PARSE_BUDGET_BYTES,
             per_file_parse_cap: PER_FILE_PARSE_CAP,
-            parse_time: PARSE_TIME_BOUND,
         }
     }
 }
@@ -755,7 +749,7 @@ fn phase_b_file(job: &Job, counted: &Counted<'_>) -> Labelled {
         (Plan::Text, _) | (Plan::Parse, None) => (Labelling::Labelled(Labels::text()), None),
         (Plan::Skip(reason), _) => (Labelling::Unlabelled(reason), None),
         (Plan::Parse, Some(lang)) => {
-            let labelling = match Labels::new(&text, lang, &ext, config.limits.parse_time) {
+            let labelling = match Labels::new(&text, lang, &ext) {
                 Ok(labels) => Labelling::Labelled(labels),
                 Err(reason) => Labelling::Unlabelled(reason),
             };

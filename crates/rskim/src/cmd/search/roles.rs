@@ -27,7 +27,6 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::time::Duration;
 
 use rskim_core::{Declaration, Language, Parser, declarations, enclosing_declaration};
 use tree_sitter::{Node, Tree};
@@ -144,8 +143,6 @@ pub(super) enum Unlabelled {
     Budget,
     /// The file is above the per-file parse cap.
     ParseCap,
-    /// The parse passed its time bound.
-    ParseTimeout,
     /// The parser failed.
     ParseFailed,
     /// The file changed between the match read and the label read.
@@ -161,7 +158,6 @@ impl Unlabelled {
         match self {
             Unlabelled::Budget => "budget",
             Unlabelled::ParseCap => "parse_cap",
-            Unlabelled::ParseTimeout => "parse_timeout",
             Unlabelled::ParseFailed => "parse_failed",
             Unlabelled::Changed => "changed",
             Unlabelled::WalkCap => "walk_cap",
@@ -229,19 +225,18 @@ impl Labels {
 
     /// Parse and classify `source`.
     ///
-    /// `ext` selects the grammar variant (`tsx`). `time` bounds the parse.
+    /// `ext` selects the grammar variant (`tsx`).
+    ///
+    /// The parse has no time bound, so the labels depend only on `source`.
+    /// The caller bounds the work by size: the per-file parse cap and the
+    /// parse budget of the query, and the walk caps below.
     ///
     /// # Errors
     ///
-    /// The [`Unlabelled`] reason: the parse passed `time`, the parser failed,
-    /// or the declaration walk was cut by a node or depth cap (a name past the
-    /// cap would be missing, so the file gets no labels at all).
-    pub(super) fn new(
-        source: &str,
-        lang: Language,
-        ext: &str,
-        time: Duration,
-    ) -> Result<Self, Unlabelled> {
+    /// The [`Unlabelled`] reason: the parser failed, or the declaration walk
+    /// was cut by a node or depth cap (a name past the cap would be missing,
+    /// so the file gets no labels at all).
+    pub(super) fn new(source: &str, lang: Language, ext: &str) -> Result<Self, Unlabelled> {
         if let Some(fields) = classify_data_format(source, lang) {
             return Ok(Labels {
                 parts: Parts::Fields(fields),
@@ -249,11 +244,7 @@ impl Labels {
         }
         let mut parser =
             Parser::new_for_extension(lang, ext).map_err(|_| Unlabelled::ParseFailed)?;
-        let tree = match parser.parse_bounded(source, time) {
-            Ok(Some(tree)) => tree,
-            Ok(None) => return Err(Unlabelled::ParseTimeout),
-            Err(_) => return Err(Unlabelled::ParseFailed),
-        };
+        let tree = parser.parse(source).map_err(|_| Unlabelled::ParseFailed)?;
         if lang == Language::Markdown {
             // The classifier marks Markdown prose as `Comment` to rank it. A
             // Markdown file has no comments, so its prose is `text`.
