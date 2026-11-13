@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "rskim"
-version = "2.11.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-compress"
-version = "2.11.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2613,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-contract"
-version = "2.11.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -2626,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-core"
-version = "2.11.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "insta",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-llm"
-version = "2.11.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-proxy"
-version = "2.11.0"
+version = "3.0.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-tokens"
-version = "2.11.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "criterion",

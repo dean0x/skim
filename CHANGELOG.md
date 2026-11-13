@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### BREAKING (3.0.0)
+## [3.0.0] - 2026-11-13
+
+### BREAKING
 
 - **`skim search` reads the files at each query. The index is gone.** (#540) The old
   design built an index (`index.skidx`, `index.skpost`, an AST index and `temporal.db`)
@@ -70,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     flag (for example `skim search --rebuild`), that step does not exist in 3.0.0.
 
 ### Added
+
+- **Five internal crates are now on crates.io.** `rskim-contract`, `rskim-llm`,
+  `rskim-tokens`, `rskim-compress` and `rskim-proxy` publish with `rskim` at the same
+  version, so `cargo install rskim` works. (#604)
 
 - **After-run output compression in Claude Code auto mode.** `skim init` now also installs a
   `PostToolUse` hook entry (matcher `Bash`). In auto permission mode the hook replaces the
