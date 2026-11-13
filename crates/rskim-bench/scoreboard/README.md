@@ -43,8 +43,8 @@ Manual adversarial dog-food (SEARCH-ADR-007) is still required for these:
 
 - The text layout of the labelled view and the word view (`def` lines, section headers, the `other:` line, notices).
   The checks read the JSON envelope, the `-l` and `-c` output and the exit code.
-- Role precision outside the frozen names. `refs.call_precision` covers the names in `[[refs]]` entries only.
-  `roles.precision.<lang>` has no value, because no check reads the role oracle yet.
+- Role precision outside the frozen names. `refs.call_precision` covers the names in `[[refs]]` entries only, and
+  `roles.precision.<lang>` covers the names of `[[refs]]` and `[[clash]]` entries only.
 - Calls split by definition. A name with several definitions gets a note, and the calls are not split (`split = "none"`).
 - Latency. It is INFO, because shared CI runners are noisy. The cost counters (`cost.*`) are the RATCHET.
 - A corpus outside the four, and a file count above the largest corpus.
@@ -240,7 +240,7 @@ a bare multi-word query as a list of words, which the line oracle cannot judge.
 | `stakes.counts` | HARD | `[[stakes]]` with `expect = "counts"` | the matching lines per file equal the regex oracle's |
 | `stakes.exit` | HARD | `[[stakes]]` with `expect = "exit"` | the exit code equals the frozen one (`0` for a match, `1` for no match, `2` for a rejected query) |
 | `refs.call_precision` | RATCHET | `[[refs]]` | of the occurrences labelled `call`, the share that are frozen calls (4 dp); no value when the output labels no `call` |
-| `roles.precision.<lang>` | RATCHET | role oracle (`rskim-oracle`) | precision of the role labels per language; no value yet, because no check reads the role oracle |
+| `roles.precision.<lang>` | RATCHET | role oracle (`rskim-oracle`) | of the `def`, `call` and `import` labels that the full lists of the `[[refs]]` and `[[clash]]` queries put on files of the language, the share whose line the role oracle lists for the same role and name (4 dp, pooled over the corpora). A label on a file outside the oracle universe counts as not confirmed. A language with no label has no value: at this commit `tsx`, `javascript` and `go` have none, because the four corpora give no labelled site in them |
 | `cost.files_parsed_median`, `cost.bytes_parsed_median`, `cost.bytes_read_median` | RATCHET | every call that states its cost | the median of each work counter (lower is better); no value while the output states no cost |
 | `bytes.rgw_text_median`, `bytes.rgw_first_correct_median` | INFO | `[[ident]]`, `[[concept]]` | output bytes of the `rg -nw` simulation (the search an agent types for a bare identifier): in total, and through the definition line. Recorded in `info.reference` of `report.json`, never gated |
 

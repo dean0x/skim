@@ -38,7 +38,7 @@ dog-food campaign as the standing gate. Manual dog-food remains only where the s
 - the text layout of the labelled view, the word view and the notices (the checks read the JSON envelope, the `-l` and
   `-c` output and the exit code);
 - role precision outside the frozen names (`refs.call_precision` covers the `[[refs]]` names only; `roles.precision.*`
-  has no value because no check reads the role oracle yet);
+  covers the `[[refs]]` and `[[clash]]` names only);
 - calls split by definition (a name with several definitions gets a note; `split = "none"`);
 - latency (INFO), a corpus outside the four, and any new query flag until it has golden entries.
 
@@ -267,8 +267,10 @@ callee position (`call`) and below an import node (`import`), for Rust, Python, 
 `queries/roles/<role>.<lang>.scm`, and line 2 of each (`; Grammar: <crate> <version>`) must equal the version the
 workspace `Cargo.lock` resolves. `.tsx` is parsed with the TSX grammar.
 
-- **Consumer.** `golden-gen` only (`golden_gen.rs` `definition_sites`). No check scores skim with it yet, so
-  `roles.precision.<lang>` has no value.
+- **Consumers.** `golden-gen` (`golden_gen.rs` `definition_sites`) and the `roles.precision.<lang>` rows
+  (`metrics.rs` `page_role_tallies`). For each `[[refs]]` and `[[clash]]` query, a `def`, `call` or `import` label of the
+  full list is confirmed when `role_sites` lists the same line under the same role for that name. Labels are pooled per
+  language over the corpora. A language with no label has no value (at this commit `tsx`, `javascript` and `go`).
 - **`structural.rs`** supplies the language table (`OracleLang`, `classify`, `EXT_CLASSES`) and `OracleScratch` (one
   parser and one `QueryCursor` per rayon worker, reused file to file; the cursor holds at most `ORACLE_MATCH_LIMIT` =
   4096 in-progress matches, set once when the scratch is made, because lowering it on a used cursor would not bind).
