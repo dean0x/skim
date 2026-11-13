@@ -564,6 +564,7 @@
         "ident.mrr.baseline_alpha": 0.4497,
         "ident.mrr.baseline_count": 0.4986,
         "refs.call_precision": 1.0,
+        "roles.precision.python": 1.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -1113,6 +1114,7 @@
         "ident.mrr.baseline_alpha": 0.4762,
         "ident.mrr.baseline_count": 0.6801,
         "refs.call_precision": 1.0,
+        "roles.precision.rust": 0.7027,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -1745,6 +1747,7 @@
         "ident.mrr.baseline_alpha": 0.4029,
         "ident.mrr.baseline_count": 0.7472,
         "refs.call_precision": 1.0,
+        "roles.precision.rust": 0.9683,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -2303,6 +2306,7 @@
         "ident.mrr.baseline_alpha": 0.3313,
         "ident.mrr.baseline_count": 0.735,
         "refs.call_precision": 1.0,
+        "roles.precision.typescript": 1.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -2335,6 +2339,9 @@
     "ident.mrr.baseline_alpha": 0.4136,
     "ident.mrr.baseline_count": 0.6673,
     "refs.call_precision": 1.0,
+    "roles.precision.python": 1.0,
+    "roles.precision.rust": 0.87,
+    "roles.precision.typescript": 1.0,
     "universe.delta": 0.0,
     "universe.skipped_by_reason_mismatch": 0.0
   },
