@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     command line (`rskim-research` is a library only). The search scoreboard is the new
     merge gate for search changes. It checks the frozen answers for names and their roles
     in place of the old structural and temporal checks.
+  - **Older entries in this section.** The entries below that describe the `skim search`
+    index, the AST arm, the temporal layer or their flags record the 2.x work before
+    3.0.0. They do not describe 3.0.0. Where such an entry names a step with a removed
+    flag (for example `skim search --rebuild`), that step does not exist in 3.0.0.
 
 ### Added
 
