@@ -61,6 +61,9 @@ pub(crate) struct LegacyCleanup {
     /// a real folder, a child that is not a project folder, and a project folder
     /// that still holds something.
     pub kept: u64,
+    /// `<cache>/search` holds more than [`MAX_SEARCH_ENTRIES`] entries. The
+    /// entries past the bound were not inspected; a next run cleans them.
+    pub more: bool,
 }
 
 /// What `<cache>/search` is.
@@ -75,6 +78,9 @@ enum SearchDir {
 struct SearchScan {
     project_folders: Vec<PathBuf>,
     others: u64,
+    /// More entries follow the first [`MAX_SEARCH_ENTRIES`]; they were not
+    /// inspected.
+    more: bool,
 }
 
 fn classify_search_dir(base: &Path) -> io::Result<SearchDir> {
@@ -98,8 +104,13 @@ fn scan_search_dir(search: &Path) -> io::Result<SearchScan> {
     let mut scan = SearchScan {
         project_folders: Vec::new(),
         others: 0,
+        more: false,
     };
-    for entry in fs::read_dir(search)?.take(MAX_SEARCH_ENTRIES) {
+    for (seen, entry) in fs::read_dir(search)?.enumerate() {
+        if seen == MAX_SEARCH_ENTRIES {
+            scan.more = true;
+            break;
+        }
         let entry = entry?;
         // `file_type` does not follow a link, so a link to a folder is not a folder here.
         let is_real_folder = entry.file_type().is_ok_and(|kind| kind.is_dir());
@@ -145,6 +156,7 @@ pub(crate) fn remove_legacy_index_data(base: &Path) -> io::Result<LegacyCleanup>
     };
     let scan = scan_search_dir(&search)?;
     cleanup.kept += scan.others;
+    cleanup.more = scan.more;
     for folder in &scan.project_folders {
         let mut removed_here = 0_u64;
         for (path, bytes) in artifacts_in(folder) {
@@ -210,6 +222,13 @@ pub(crate) fn clear_legacy_index_data(base: &Path) {
                 eprintln!(
                     "Note: {} entries under {:?} are not old index files and were left in place",
                     cleanup.kept,
+                    base.join("search")
+                );
+            }
+            if cleanup.more {
+                eprintln!(
+                    "Note: {:?} holds more than {MAX_SEARCH_ENTRIES} entries; \
+                     run skim --clear-cache again to clean the rest",
                     base.join("search")
                 );
             }

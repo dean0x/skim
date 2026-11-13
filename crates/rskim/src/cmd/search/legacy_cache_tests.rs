@@ -77,6 +77,7 @@ fn test_cleanup_removes_the_twelve_names_and_the_empty_folders() {
             files: 12,
             bytes: total,
             kept: 0,
+            more: false,
         }
     );
     assert!(
@@ -287,6 +288,22 @@ fn test_cleanup_removes_an_empty_project_folder_but_not_a_sibling_with_files() {
     assert!(busy.join("notes.txt").exists());
     assert_eq!(cleanup.kept, 1);
     assert_eq!(cleanup.files, 0);
+    assert!(!cleanup.more);
+}
+
+#[test]
+fn test_cleanup_says_when_entries_past_the_bound_were_not_inspected() {
+    let base = tempdir().unwrap();
+    let search = base.path().join("search");
+    fs::create_dir_all(&search).unwrap();
+    for n in 0..=super::MAX_SEARCH_ENTRIES {
+        fs::write(search.join(format!("other{n}")), b"").unwrap();
+    }
+
+    let cleanup = remove_legacy_index_data(base.path()).unwrap();
+
+    assert!(cleanup.more, "one entry is past the bound");
+    assert_eq!(cleanup.kept, super::MAX_SEARCH_ENTRIES as u64);
 }
 
 // ============================================================================
