@@ -1,6 +1,6 @@
 [package]
 name = "rskim-compress"
-version = "2.11.0"
+version = "3.0.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -10,8 +10,8 @@ repository = "https://github.com/dean0x/skim"
 # scripts/release-prep.sh bumps this version with the others.
 
 [dependencies]
-rskim-contract = { version = "2.11.0", path = "../rskim-contract" }
-rskim-llm = { version = "2.11.0", path = "../rskim-llm" }
+rskim-contract = { version = "3.0.0", path = "../rskim-contract" }
+rskim-llm = { version = "3.0.0", path = "../rskim-llm" }
 regex = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }

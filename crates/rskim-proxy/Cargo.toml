@@ -1,6 +1,6 @@
 [package]
 name = "rskim-proxy"
-version = "2.11.0"
+version = "3.0.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -50,11 +50,11 @@ webpki-roots = { workspace = true }
 # Safety substrate — seam composes #301's Outcome / guarded_transform.
 # AD-PXY-05: reuse Outcome (fail-open success variant) to avoid duplicating the
 # never-inflate + sink rule. harness feature gated to dev-deps only.
-rskim-contract = { version = "2.11.0", path = "../rskim-contract" }
+rskim-contract = { version = "3.0.0", path = "../rskim-contract" }
 
 # Optional typed-view helper for the seam context (lazy parse, see §3.1).
 # Forwarding MUST NOT be coupled to parse success — rskim-llm is optional.
-rskim-llm = { version = "2.11.0", path = "../rskim-llm", optional = true }
+rskim-llm = { version = "3.0.0", path = "../rskim-llm", optional = true }
 
 # Serialization — same workspace features (preserve_order + raw_value) required
 # for byte-faithful round-trips matching the rest of the workspace.

@@ -1,6 +1,6 @@
 [package]
 name = "rskim-tokens"
-version = "2.11.0"
+version = "3.0.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -34,7 +34,7 @@ net-anthropic = ["dep:ureq", "dep:serde_json"]
 criterion = { workspace = true }
 proptest = { workspace = true }
 static_assertions = { workspace = true }
-rskim-core = { version = "2.11.0", path = "../rskim-core" }
+rskim-core = { version = "3.0.0", path = "../rskim-core" }
 
 [lints.clippy]
 unwrap_used = "deny"
