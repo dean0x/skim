@@ -2003,8 +2003,12 @@ pub fn evaluate(
 }
 
 /// The engine's file accounting (`searched_files` and `left_out`), from the
-/// first observation that states both. Every call of a corpus searches the
-/// same files, so one observation speaks for the corpus.
+/// first observation that states both. A call with `-g` or `-t` (a lexical
+/// entry with `lang`, or a stakes entry with a filter) searches fewer files
+/// than the corpus holds, so only a call with no filter speaks for the whole
+/// corpus. The first observation is such a call only because the plan lists
+/// the `[[ident]]` entries first and they carry no flags: a golden file with
+/// no ident entry would take its accounting from a call of another kind.
 ///
 /// # Errors
 ///
