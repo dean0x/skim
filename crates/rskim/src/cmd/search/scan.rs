@@ -15,17 +15,24 @@
 //! and compares the digest (a file that changed is counted and not listed), then
 //! labels the file with one bounded parse, decides the role of every matching
 //! line, and stores line records up to a fixed cap. Role counts are exact for
-//! every matching line, stored or not.
+//! every matching line, stored or not. With `-C`, it then keeps the context
+//! lines of the stored records.
 //!
 //! # Bounds
 //!
 //! Every bound is a named constant of [`Limits`]: stored lines, context lines,
-//! the parse budget (files and bytes), the per-file parse cap, the parse time,
-//! the line width, the pool size. A file the budget leaves unparsed keeps its
-//! lines under `unlabelled`; nothing is dropped. The record and the context
-//! quota of each file are assigned from the exact line counts of phase A, in
-//! parse order, before phase B starts, so the result does not depend on thread
-//! scheduling.
+//! definition lines (per file and over all files), the parse budget (files and
+//! bytes), the per-file parse cap, the line width, the pool size. A file the
+//! budget leaves unparsed keeps its lines under `unlabelled`; nothing is
+//! dropped.
+//!
+//! The record quota of each file is assigned from the exact line counts of
+//! phase A, in parse order, before phase B starts. The context budget is spent
+//! in parse order too, on the lines that each file needs once it has its
+//! records. The result does not depend on thread scheduling.
+//!
+//! Each cap that cuts lines is recorded where it cuts, in [`CapsHit`]. The
+//! output names the caps from that record and does not infer them from sums.
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
@@ -64,7 +71,8 @@ pub(super) const PARSE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// A file above this size is not parsed.
 pub(super) const PER_FILE_PARSE_CAP: usize = 1024 * 1024;
 
-/// Most definition sites kept per file.
+/// Most definition lines kept per file. The definitions past it are counted in
+/// the role counts and not listed.
 pub(super) const MAX_DEF_SITES_PER_FILE: usize = 100;
 
 /// Most definition lines kept over all files, in parse order. The definitions
@@ -76,6 +84,7 @@ pub(super) const MAX_DEF_SITES: usize = 10_000;
 pub(super) struct Limits {
     pub(super) max_stored_lines: usize,
     pub(super) max_def_sites: usize,
+    pub(super) max_def_sites_per_file: usize,
     pub(super) max_context_lines: usize,
     pub(super) parse_files: usize,
     pub(super) parse_bytes: usize,
@@ -87,6 +96,7 @@ impl Default for Limits {
         Limits {
             max_stored_lines: MAX_STORED_LINES,
             max_def_sites: MAX_DEF_SITES,
+            max_def_sites_per_file: MAX_DEF_SITES_PER_FILE,
             max_context_lines: MAX_CONTEXT_LINES,
             parse_files: PARSE_BUDGET_FILES,
             parse_bytes: PARSE_BUDGET_BYTES,
@@ -194,7 +204,7 @@ pub(super) struct FileScan {
     /// Exact role counts over all matching lines. Empty after a counts-only
     /// scan.
     pub(super) roles: RoleCounts,
-    /// Definition lines, up to [`MAX_DEF_SITES_PER_FILE`].
+    /// Definition lines, up to [`Limits::max_def_sites_per_file`].
     pub(super) defs: Vec<Record>,
     /// Other stored lines, in line order.
     pub(super) records: Vec<Record>,
@@ -244,6 +254,28 @@ pub(super) struct ParseStats {
     pub(super) by_reason: BTreeMap<Unlabelled, u64>,
 }
 
+/// The caps that cut lines from a result. The scan sets each flag where the cut
+/// happens, so the output does not need to guess the cause from the totals.
+/// Context lines have no flag: [`ScanOutput::context_hidden`] counts the lines
+/// the context cap cut.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CapsHit {
+    /// The stored-line quota left a matching line without a record.
+    pub(super) stored_lines: bool,
+    /// The per-file cap dropped a definition line.
+    pub(super) file_defs: bool,
+    /// The cap over all files dropped a definition line.
+    pub(super) all_defs: bool,
+}
+
+impl CapsHit {
+    fn merge(&mut self, other: CapsHit) {
+        self.stored_lines |= other.stored_lines;
+        self.file_defs |= other.file_defs;
+        self.all_defs |= other.all_defs;
+    }
+}
+
 /// The result of a scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ScanOutput {
@@ -254,6 +286,8 @@ pub(super) struct ScanOutput {
     pub(super) left_out: LeftOutCounts,
     pub(super) cost: Cost,
     pub(super) parse: ParseStats,
+    /// The caps that cut lines. None after a counts-only scan.
+    pub(super) caps: CapsHit,
     /// Context lines that were wanted and not kept because of the cap.
     pub(super) context_hidden: u64,
 }
@@ -532,11 +566,11 @@ struct Job {
     matched: usize,
     plan: Plan,
     record_quota: usize,
-    context_quota: usize,
 }
 
-/// The matched files in parse order, with the plan, the record quota and the
-/// context quota of each.
+/// The matched files in parse order, with the plan and the record quota of
+/// each. The quota counts every matching line of a file, definitions included:
+/// phase A cannot tell them apart, and the definitions have caps of their own.
 fn plan_jobs(counted: &Counted<'_>) -> (Vec<Job>, bool) {
     let limits = &counted.config.limits;
     let matched = &counted.matched;
@@ -578,7 +612,7 @@ fn plan_jobs(counted: &Counted<'_>) -> (Vec<Job>, bool) {
 
     let mut jobs = Vec::with_capacity(order.len());
     let (mut parsed_files, mut parsed_bytes) = (0usize, 0usize);
-    let (mut stored_left, mut context_left) = (limits.max_stored_lines, limits.max_context_lines);
+    let mut stored_left = limits.max_stored_lines;
     let mut budget_hit = false;
     for index in order {
         let m = &matched[index];
@@ -605,15 +639,10 @@ fn plan_jobs(counted: &Counted<'_>) -> (Vec<Job>, bool) {
         };
         let record_quota = wanted.min(stored_left);
         stored_left -= record_quota;
-        let context_quota = record_quota
-            .saturating_mul(counted.config.context.saturating_mul(2))
-            .min(context_left);
-        context_left -= context_quota;
         jobs.push(Job {
             matched: index,
             plan,
             record_quota,
-            context_quota,
         });
     }
     (jobs, budget_hit)
@@ -650,18 +679,45 @@ impl Counted<'_> {
                 ..Cost::default()
             },
             parse: ParseStats::default(),
+            caps: CapsHit::default(),
             context_hidden: 0,
         }
+    }
+
+    /// Run phase B over `jobs`: the results are in parse order.
+    ///
+    /// Without `-C` every file runs at once. With `-C` the files run in waves
+    /// of at most [`MAX_SCAN_THREADS`], and after each wave the context budget
+    /// is spent on the files of the wave in parse order. The budget goes to the
+    /// lines each file needs, which are known only once it has its records, so
+    /// a file that needs few lines leaves the rest to the files after it. A
+    /// wave holds the text of its files, so that memory is at most
+    /// [`MAX_SCAN_THREADS`] files.
+    fn run_jobs(&self, jobs: &[Job]) -> Vec<Labelled> {
+        let context = self.config.context;
+        let wave = if context == 0 {
+            jobs.len().max(1)
+        } else {
+            MAX_SCAN_THREADS
+        };
+        let mut context_left = self.config.limits.max_context_lines;
+        let mut results = Vec::with_capacity(jobs.len());
+        for jobs in jobs.chunks(wave) {
+            let mut labelled: Vec<Labelled> = self
+                .pool
+                .install(|| jobs.par_iter().map(|job| phase_b_file(job, self)).collect());
+            for result in &mut labelled {
+                result.keep_context(context, &mut context_left);
+            }
+            results.append(&mut labelled);
+        }
+        results
     }
 
     /// Run phase B: label the matched files and keep the line records.
     pub(super) fn label(self) -> ScanOutput {
         let (jobs, budget_hit) = plan_jobs(&self);
-        let results: Vec<Labelled> = self.pool.install(|| {
-            jobs.par_iter()
-                .map(|job| phase_b_file(job, &self))
-                .collect()
-        });
+        let results = self.run_jobs(&jobs);
 
         let mut parse = ParseStats {
             budget_hit,
@@ -673,12 +729,17 @@ impl Counted<'_> {
             ..Cost::default()
         };
         let mut context_hidden = 0u64;
+        let mut caps = CapsHit::default();
         let mut defs_kept = 0usize;
         let mut files = Vec::with_capacity(results.len());
         for mut result in results {
             // The results are in parse order, so the cap is the same on every run.
             let room = self.config.limits.max_def_sites.saturating_sub(defs_kept);
-            result.file.defs.truncate(room);
+            if result.file.defs.len() > room {
+                caps.all_defs = true;
+                result.file.defs.truncate(room);
+            }
+            caps.merge(result.caps);
             defs_kept += result.file.defs.len();
             if let Some(bytes) = result.parsed_bytes {
                 cost.files_parsed += 1;
@@ -698,6 +759,7 @@ impl Counted<'_> {
             left_out: self.left_out,
             cost,
             parse,
+            caps,
             context_hidden,
         }
     }
@@ -725,7 +787,24 @@ fn file_scan(
 struct Labelled {
     file: FileScan,
     parsed_bytes: Option<usize>,
+    /// The caps that cut lines of this file.
+    caps: CapsHit,
+    /// The text of the file, held until its context lines are chosen. `None`
+    /// without `-C`, with no stored record, or for a file that changed.
+    text: Option<String>,
     context_hidden: u64,
+}
+
+impl Labelled {
+    /// Keep the context lines of the stored records, up to `left` lines, and
+    /// take what was kept off `left`. The text is released.
+    fn keep_context(&mut self, context: usize, left: &mut usize) {
+        let Some(text) = self.text.take() else {
+            return;
+        };
+        self.context_hidden = collect_context(&text, context, *left, &mut self.file);
+        *left = left.saturating_sub(self.file.context.len());
+    }
 }
 
 fn phase_b_file(job: &Job, counted: &Counted<'_>) -> Labelled {
@@ -766,19 +845,18 @@ fn phase_b_file(job: &Job, counted: &Counted<'_>) -> Labelled {
         QueryPlan::Pattern(_) => Select::First,
         QueryPlan::Words(_) => Select::BestWords,
     };
-    collect_lines(
-        &text,
-        &labelling,
-        config.query,
-        select,
-        job.record_quota,
-        &mut file,
-    );
-    let context_hidden = collect_context(&text, config.context, job.context_quota, &mut file);
+    let quota = LineQuota {
+        records: job.record_quota,
+        defs: config.limits.max_def_sites_per_file,
+    };
+    let caps = collect_lines(&text, &labelling, config.query, select, quota, &mut file);
+    let text = (config.context > 0 && !file.records.is_empty()).then_some(text);
     Labelled {
         file,
         parsed_bytes,
-        context_hidden,
+        caps,
+        text,
+        context_hidden: 0,
     }
 }
 
@@ -792,20 +870,34 @@ fn changed(candidate: &Candidate, m: &Matched) -> Labelled {
     Labelled {
         file: file_scan(candidate, m, Some(Unlabelled::Changed), roles),
         parsed_bytes: None,
+        caps: CapsHit::default(),
+        text: None,
         context_hidden: 0,
     }
 }
 
+/// How many lines of one file phase B keeps.
+#[derive(Debug, Clone, Copy)]
+struct LineQuota {
+    /// Line records of the roles other than `def`.
+    records: usize,
+    /// Definition lines.
+    defs: usize,
+}
+
 /// Decide the role of every matching line of `text`, count the roles, and keep
-/// up to `quota` line records (definitions are kept apart).
+/// the line records up to `quota` (definitions are kept apart). Returns the
+/// caps that cut a line of this file.
 fn collect_lines(
     text: &str,
     labelling: &Labelling,
     query: &ScanQuery,
     select: Select,
-    quota: usize,
+    quota: LineQuota,
     file: &mut FileScan,
-) {
+) -> CapsHit {
+    let mut caps = CapsHit::default();
+    let mut other_lines = 0usize;
     for (number, start, line) in numbered_lines(text) {
         let (hit, distinct) = match &query.plan {
             QueryPlan::Pattern(matcher) => (
@@ -830,14 +922,17 @@ fn collect_lines(
         };
         file.roles.add(hit.role);
         let is_def = hit.role == Role::Def;
+        other_lines += usize::from(!is_def);
         let room = if is_def {
-            file.defs.len() < MAX_DEF_SITES_PER_FILE
+            let room = file.defs.len() < quota.defs;
+            caps.file_defs |= !room;
+            room
         } else {
             match select {
-                Select::First => file.records.len() < quota,
+                Select::First => file.records.len() < quota.records,
                 Select::BestWords => {
-                    quota > 0
-                        && (file.records.len() < quota
+                    quota.records > 0
+                        && (file.records.len() < quota.records
                             || file.records.iter().any(|r| r.distinct_words < distinct))
                 }
             }
@@ -859,7 +954,7 @@ fn collect_lines(
         if is_def {
             file.defs.push(record);
         } else if select == Select::BestWords {
-            keep_best_words(&mut file.records, record, quota);
+            keep_best_words(&mut file.records, record, quota.records);
         } else {
             file.records.push(record);
         }
@@ -867,6 +962,15 @@ fn collect_lines(
     if select == Select::BestWords {
         file.records.sort_by_key(|r| r.line);
     }
+    // The file wanted a record for each line of a role other than `def`, or
+    // for the best few of them in the word view. It has fewer only when the
+    // quota was smaller than that.
+    let wanted = match select {
+        Select::First => other_lines,
+        Select::BestWords => other_lines.min(WORD_VIEW_BEST_LINES),
+    };
+    caps.stored_lines = file.records.len() < wanted;
+    caps
 }
 
 /// Keep `record` among the best `quota` records of the word view: most distinct

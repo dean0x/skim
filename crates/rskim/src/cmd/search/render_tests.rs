@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use super::*;
 use crate::cmd::search::rank::FilePrior;
 use crate::cmd::search::roles::{Holder, RoleCounts};
-use crate::cmd::search::scan::{ContextLine, Cost, ParseStats};
+use crate::cmd::search::scan::{CapsHit, ContextLine, Cost, ParseStats};
 use crate::cmd::search::universe::LeftOutCounts;
 
 // ============================================================================
@@ -72,6 +72,7 @@ fn scan_of(mut files: Vec<FileScan>) -> ScanOutput {
         left_out: LeftOutCounts::default(),
         cost: Cost::default(),
         parse: ParseStats::default(),
+        caps: CapsHit::default(),
         context_hidden: 0,
     }
 }
@@ -659,7 +660,8 @@ fn lines_the_stored_line_cap_left_out_get_a_note_and_a_marker() {
     a.lines = 5;
     a.roles.add(Role::Call);
     a.roles.add(Role::Call);
-    let scan = scan_of(vec![a]);
+    let mut scan = scan_of(vec![a]);
+    scan.caps.stored_lines = true;
     let mut layout = Layout::default();
     layout.limits.max_stored_lines = 3;
 
@@ -689,7 +691,8 @@ fn definitions_the_definition_cap_left_out_get_a_note_naming_the_cap_and_a_marke
     for _ in 0..3 {
         a.roles.add(Role::Def);
     }
-    let scan = scan_of(vec![a]);
+    let mut scan = scan_of(vec![a]);
+    scan.caps.all_defs = true;
     let mut layout = Layout::default();
     layout.limits.max_def_sites = 1;
 
@@ -707,6 +710,116 @@ fn definitions_the_definition_cap_left_out_get_a_note_naming_the_cap_and_a_marke
         ["[skim] lines elided beyond 1 of 4 — use -c or -l for every file, or narrow the pattern"]
     );
 }
+#[test]
+fn definitions_the_per_file_cap_left_out_get_a_note_naming_the_cap_and_a_marker_that_reads_the_file()
+ {
+    let mut a = file(
+        "a.rs",
+        FilePrior::Source,
+        vec![record(1, Role::Def, Some("needle"), "fn needle() {}")],
+    );
+    a.lines = 4;
+    for _ in 0..3 {
+        a.roles.add(Role::Def);
+    }
+    let mut scan = scan_of(vec![a]);
+    scan.caps.file_defs = true;
+    let mut layout = Layout::default();
+    layout.limits.max_def_sites_per_file = 1;
+
+    let rendered = render_with(&pattern("needle"), &scan, layout, Format::Text);
+
+    assert!(
+        rendered.stdout.contains(
+            "note: 3 lines in 1 file are counted, not listed (per-file definition cap 1)\n"
+        ),
+        "{}",
+        rendered.stdout
+    );
+    assert_eq!(
+        rendered.stderr,
+        ["[skim] lines elided beyond 1 of 4 — \
+             read the file with skim FILE --mode=signatures, or narrow the pattern"]
+    );
+}
+
+#[test]
+fn every_cap_that_cut_lines_is_named_and_the_marker_joins_their_remedies() {
+    let mut a = call_file("a.rs", FilePrior::Source, &[1]);
+    a.lines = 5;
+    for _ in 0..4 {
+        a.roles.add(Role::Call);
+    }
+    let mut scan = scan_of(vec![a]);
+    scan.caps = CapsHit {
+        stored_lines: true,
+        file_defs: true,
+        all_defs: true,
+    };
+    let mut layout = Layout::default();
+    layout.limits.max_stored_lines = 1;
+    layout.limits.max_def_sites_per_file = 2;
+    layout.limits.max_def_sites = 3;
+
+    let rendered = render_with(&pattern("call"), &scan, layout, Format::Text);
+
+    assert!(
+        rendered
+            .stdout
+            .contains("(stored-line cap 1, per-file definition cap 2, definition cap 3)\n"),
+        "{}",
+        rendered.stdout
+    );
+    assert_eq!(
+        rendered.stderr,
+        [
+            "[skim] lines elided beyond 1 of 5 — use -c or -l for every file, \
+             read the file with skim FILE --mode=signatures, or narrow the pattern"
+        ]
+    );
+}
+
+#[test]
+fn the_cap_note_comes_from_the_scan_record_and_not_from_the_totals() {
+    // The stored records sum to the cap, but the scan recorded no cut: the
+    // lines left out have another cause.
+    let mut a = call_file("a.rs", FilePrior::Source, &[1, 2, 3]);
+    a.lines = 5;
+    a.roles.add(Role::Call);
+    a.roles.add(Role::Call);
+    let scan = scan_of(vec![a]);
+    let mut layout = Layout::default();
+    layout.limits.max_stored_lines = 3;
+
+    let rendered = render_with(&pattern("call"), &scan, layout, Format::Text);
+
+    assert!(
+        rendered
+            .stdout
+            .contains("note: 2 lines in 1 file are counted, not listed\n"),
+        "{}",
+        rendered.stdout
+    );
+    assert!(rendered.stderr.is_empty(), "{:?}", rendered.stderr);
+}
+
+#[test]
+fn json_names_the_caps_that_cut_lines_in_its_notices() {
+    let mut a = call_file("a.rs", FilePrior::Source, &[1]);
+    a.lines = 3;
+    a.roles.add(Role::Call);
+    a.roles.add(Role::Call);
+    let mut scan = scan_of(vec![a]);
+    scan.caps.file_defs = true;
+
+    let value = json_of(&pattern("call"), &scan, Layout::default());
+
+    assert_eq!(
+        value["notices"],
+        json!(["2 lines in 1 file are counted, not listed (per-file definition cap 100)"])
+    );
+}
+
 #[test]
 fn a_cap_that_cut_nothing_prints_no_note() {
     let a = call_file("a.rs", FilePrior::Source, &[1, 2, 3]);

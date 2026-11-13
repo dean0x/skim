@@ -10,6 +10,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::cmd::search::matcher::{CaseMode, MatcherSpec, PatternKind};
+use crate::cmd::search::render::{Format, Layout, MatchMode, QueryInfo, Rendered, Report, render};
 use crate::cmd::search::universe::list_universe;
 
 // ============================================================================
@@ -84,6 +85,30 @@ fn file<'a>(out: &'a ScanOutput, rel: &str) -> &'a FileScan {
         .iter()
         .find(|f| f.path == Path::new(rel))
         .unwrap_or_else(|| panic!("no matched file {rel}: {:?}", out.files))
+}
+
+/// The text view of a finished scan of the literal `needle`, as the user sees it.
+fn rendered(out: &ScanOutput, needle: &str, limits: Limits, context: usize) -> Rendered {
+    let query = QueryInfo {
+        text: needle.to_owned(),
+        words: Vec::new(),
+        mode: MatchMode::Literal,
+        ignore_case: false,
+    };
+    let layout = Layout {
+        context,
+        limits,
+        ..Layout::default()
+    };
+    render(
+        &Report {
+            query: &query,
+            scan: out,
+            layout,
+            duration_ms: 0,
+        },
+        Format::Text,
+    )
 }
 
 // ============================================================================
@@ -494,6 +519,235 @@ fn the_parse_byte_budget_skips_a_file_it_cannot_fit_and_keeps_a_smaller_one() {
     );
     assert_eq!(file(&out, "src/small.rs").unlabelled, None);
     assert!(out.parse.budget_hit);
+}
+
+// ============================================================================
+// Caps reach the output: the scan names the cap that cut lines
+// ============================================================================
+
+#[test]
+fn a_definition_in_the_first_file_does_not_hide_the_stored_line_cap_from_the_output() {
+    let tree = Tree::new();
+    // First in parse order (a declaration keyword before the match). Six
+    // matching lines: one definition and five calls. All six hold quota.
+    tree.write(
+        "src/a.rs",
+        "fn foo() {}\nfn run() {\n    foo();\n    foo();\n    foo();\n    foo();\n    foo();\n}\n",
+    );
+    tree.write(
+        "src/b.rs",
+        "fn other() {\n    foo();\n    foo();\n    foo();\n    foo();\n}\n",
+    );
+    let limits = Limits {
+        max_stored_lines: 6,
+        ..Limits::default()
+    };
+
+    let out = scan(&tree, &pattern("foo", true), limits, 0);
+
+    assert_eq!(file(&out, "src/a.rs").defs.len(), 1);
+    assert_eq!(file(&out, "src/a.rs").records.len(), 5);
+    assert!(file(&out, "src/b.rs").records.is_empty());
+    let shown = rendered(&out, "foo", limits, 0);
+    assert!(
+        shown
+            .stdout
+            .contains("note: 4 lines in 1 file are counted, not listed (stored-line cap 6)\n"),
+        "{}",
+        shown.stdout
+    );
+    assert_eq!(
+        shown.stderr,
+        ["[skim] lines elided beyond 6 of 10 — use -c or -l for every file, or narrow the pattern"]
+    );
+}
+
+#[test]
+fn a_definition_that_holds_a_quota_slot_does_not_make_the_stored_line_cap_a_cut() {
+    let tree = Tree::new();
+    // Two lines match: a definition and a call. The quota is 1, the call is
+    // stored and the definition is kept apart: no line is cut.
+    tree.write("src/a.rs", "fn foo() {}\nfn run() {\n    foo();\n}\n");
+    let limits = Limits {
+        max_stored_lines: 1,
+        ..Limits::default()
+    };
+
+    let out = scan(&tree, &pattern("foo", true), limits, 0);
+
+    assert_eq!(out.caps, CapsHit::default());
+    let shown = rendered(&out, "foo", limits, 0);
+    assert!(
+        !shown.stdout.contains("counted, not listed"),
+        "{}",
+        shown.stdout
+    );
+    assert!(shown.stderr.is_empty(), "{:?}", shown.stderr);
+}
+
+#[test]
+fn the_per_file_definition_cap_is_named_in_the_note_and_the_marker() {
+    let tree = Tree::new();
+    let body = format!(
+        "{}fn run() {{\n    foo();\n}}\n",
+        "fn foo() {}\n".repeat(150)
+    );
+    tree.write("src/a.rs", body);
+
+    let out = scan(&tree, &pattern("foo", true), Limits::default(), 0);
+
+    let f = file(&out, "src/a.rs");
+    assert_eq!(f.defs.len(), 100, "the per-file cap keeps 100 definitions");
+    assert_eq!(f.roles.get(Role::Def), 150, "roles count every definition");
+    let shown = rendered(&out, "foo", Limits::default(), 0);
+    assert!(
+        shown.stdout.contains(
+            "note: 50 lines in 1 file are counted, not listed (per-file definition cap 100)\n"
+        ),
+        "{}",
+        shown.stdout
+    );
+    assert_eq!(
+        shown.stderr,
+        ["[skim] lines elided beyond 101 of 151 — \
+             read the file with skim FILE --mode=signatures, or narrow the pattern"]
+    );
+}
+
+#[test]
+fn the_per_file_definition_cap_comes_from_the_limits() {
+    let tree = Tree::new();
+    tree.write("src/a.rs", "fn foo() {}\nfn foo() {}\nfn foo() {}\n");
+    tree.write("src/b.rs", "fn foo() {}\n");
+    let limits = Limits {
+        max_def_sites_per_file: 2,
+        ..Limits::default()
+    };
+
+    let out = scan(&tree, &pattern("foo", true), limits, 0);
+
+    assert_eq!(file(&out, "src/a.rs").defs.len(), 2);
+    assert_eq!(file(&out, "src/b.rs").defs.len(), 1);
+    assert_eq!(
+        out.caps,
+        CapsHit {
+            file_defs: true,
+            ..CapsHit::default()
+        }
+    );
+}
+
+#[test]
+fn the_whole_result_definition_cap_is_recorded_where_it_cuts() {
+    let tree = Tree::new();
+    tree.write("src/a.rs", "fn foo() {}\nfn foo() {}\n");
+    tree.write("src/b.rs", "fn foo() {}\n");
+    let limits = Limits {
+        max_def_sites: 2,
+        ..Limits::default()
+    };
+
+    let out = scan(&tree, &pattern("foo", true), limits, 0);
+
+    assert_eq!(
+        out.caps,
+        CapsHit {
+            all_defs: true,
+            ..CapsHit::default()
+        }
+    );
+    let shown = rendered(&out, "foo", limits, 0);
+    assert!(
+        shown
+            .stdout
+            .contains("note: 1 line in 1 file is counted, not listed (definition cap 2)\n"),
+        "{}",
+        shown.stdout
+    );
+}
+
+#[test]
+fn definitions_exactly_at_the_whole_result_cap_record_no_cut() {
+    let tree = Tree::new();
+    tree.write("src/a.rs", "fn foo() {}\nfn foo() {}\n");
+    let limits = Limits {
+        max_def_sites: 2,
+        ..Limits::default()
+    };
+
+    let out = scan(&tree, &pattern("foo", true), limits, 0);
+
+    assert_eq!(out.caps, CapsHit::default());
+}
+
+#[test]
+fn a_dense_file_does_not_take_the_context_budget_of_the_next_file() {
+    let tree = Tree::new();
+    // 40 records in a row: only the one line after them can be context.
+    tree.write("a.txt", format!("{}pad\n", "foo\n".repeat(40)));
+    // Three records ten lines apart: 12 context lines with -C 2.
+    let gap = "pad\n".repeat(10);
+    tree.write("b.txt", format!("{gap}foo\n{gap}foo\n{gap}foo\n{gap}"));
+    let limits = Limits {
+        max_context_lines: 20,
+        ..Limits::default()
+    };
+
+    let out = scan(&tree, &pattern("foo", false), limits, 2);
+
+    assert_eq!(file(&out, "a.txt").context.len(), 1);
+    assert_eq!(file(&out, "b.txt").context.len(), 12);
+    assert_eq!(out.context_hidden, 0);
+    let shown = rendered(&out, "foo", limits, 2);
+    assert!(
+        !shown.stdout.contains("context cap"),
+        "no note: {}",
+        shown.stdout
+    );
+    assert!(shown.stderr.is_empty(), "{:?}", shown.stderr);
+}
+
+#[test]
+fn the_context_budget_is_spent_in_parse_order_on_the_lines_each_file_needs() {
+    let tree = Tree::new();
+    // Parse order: the file with more matching lines first. Needs: 12 and 8.
+    let gap = "pad\n".repeat(10);
+    tree.write("a.txt", format!("{gap}foo\n{gap}foo\n{gap}foo\n{gap}"));
+    tree.write("b.txt", format!("{gap}foo\n{gap}foo\n{gap}"));
+    let limits = Limits {
+        max_context_lines: 15,
+        ..Limits::default()
+    };
+
+    let out = scan(&tree, &pattern("foo", false), limits, 2);
+
+    assert_eq!(file(&out, "a.txt").context.len(), 12);
+    assert_eq!(file(&out, "b.txt").context.len(), 3);
+    assert_eq!(out.context_hidden, 8 - 3);
+}
+
+#[test]
+fn the_context_budget_gives_equal_results_over_many_files_and_runs() {
+    let tree = Tree::new();
+    for i in 0..30 {
+        tree.write(
+            &format!("src/f{i:02}.txt"),
+            format!("pad\nfoo\npad\npad\nfoo\npad\n{i}\n"),
+        );
+    }
+    let limits = Limits {
+        max_context_lines: 50,
+        ..Limits::default()
+    };
+
+    let first = scan(&tree, &pattern("foo", false), limits, 1);
+    let second = scan(&tree, &pattern("foo", false), limits, 1);
+
+    assert_eq!(first, second);
+    let kept: usize = first.files.iter().map(|f| f.context.len()).sum();
+    assert_eq!(kept, 50);
+    // Each file needs lines 1, 3, 4 and 6 as context.
+    assert_eq!(first.context_hidden, 30 * 4 - 50);
 }
 
 // ============================================================================

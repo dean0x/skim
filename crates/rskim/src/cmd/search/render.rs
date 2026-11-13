@@ -27,8 +27,10 @@
 //! # Bounds
 //!
 //! A bound that hides lines prints a note with exact counts: the stored-line
-//! cap, the context cap, the files the parse budget left unlabelled, and the
-//! files a `--limit` page leaves out.
+//! cap, the definition caps, the context cap, the files the parse budget left
+//! unlabelled, and the files a `--limit` page leaves out. The scan records
+//! which cap cut lines ([`CapsHit`]); the notes name the caps from that record
+//! and never infer a cause from the totals.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -41,7 +43,7 @@ use super::rank::{
     WordInput, files_with_all_words, rank_labelled, rank_words,
 };
 use super::roles::{Role, Unlabelled};
-use super::scan::{FileScan, Limits, Record, ScanOutput};
+use super::scan::{CapsHit, FileScan, Limits, Record, ScanOutput};
 use super::universe::LeftOut;
 use crate::output::elision_marker_with_remedy;
 
@@ -49,8 +51,17 @@ use crate::output::elision_marker_with_remedy;
 /// or `-C` is given.
 pub(super) const COMPACT_GROUP_LINES: usize = 30;
 
-/// The remedy of the stderr marker for lines the stored-line cap left out.
-const CAP_REMEDY: &str = "use -c or -l for every file, or narrow the pattern";
+/// The remedy clause of the stderr marker for lines the stored-line cap or the
+/// definition cap over all files left out: `-c` and `-l` still reach every file.
+const FILES_REMEDY: &str = "use -c or -l for every file";
+
+/// The remedy clause of the stderr marker for definitions the per-file cap left
+/// out: `-c` and `-l` list no line, and a narrower pattern keeps the same
+/// definitions of the same file, so the way to see them is to read the file.
+const FILE_DEFS_REMEDY: &str = "read the file with skim FILE --mode=signatures";
+
+/// The last remedy clause of every cap marker.
+const NARROW_REMEDY: &str = "or narrow the pattern";
 
 /// The remedy of the stderr marker for context lines the context cap left out.
 const CONTEXT_REMEDY: &str = "use a smaller -C, or narrow the pattern";
@@ -464,24 +475,39 @@ fn labelled_shortfall(files: &[FileScan], roles: &[Role]) -> Shortfall {
     shortfall
 }
 
-/// The caps of the stored lines that the scan reached: the stored-line cap and
-/// the definition cap, each as the name and the value the notes show.
-fn caps_reached(scan: &ScanOutput, limits: &Limits) -> Vec<(&'static str, usize)> {
-    let records: usize = scan.files.iter().map(|f| f.records.len()).sum();
-    let defs: usize = scan.files.iter().map(|f| f.defs.len()).sum();
+/// The caps that cut stored lines, from the record the scan made where each
+/// cut happened: each as the name and the value the notes show.
+fn caps_reached(caps: &CapsHit, limits: &Limits) -> Vec<(&'static str, usize)> {
     let mut reached = Vec::new();
-    if records >= limits.max_stored_lines {
+    if caps.stored_lines {
         reached.push(("stored-line cap", limits.max_stored_lines));
     }
-    if defs >= limits.max_def_sites {
+    if caps.file_defs {
+        reached.push(("per-file definition cap", limits.max_def_sites_per_file));
+    }
+    if caps.all_defs {
         reached.push(("definition cap", limits.max_def_sites));
     }
     reached
 }
 
+/// The remedy of the stderr marker for the stored lines the caps left out: one
+/// clause for each way out that the reached caps leave open.
+fn cap_remedy(caps: &CapsHit) -> String {
+    let mut clauses = Vec::new();
+    if caps.stored_lines || caps.all_defs {
+        clauses.push(FILES_REMEDY);
+    }
+    if caps.file_defs {
+        clauses.push(FILE_DEFS_REMEDY);
+    }
+    clauses.push(NARROW_REMEDY);
+    clauses.join(", ")
+}
+
 /// The notes of a result, without the `note: ` prefix: the files the parse
-/// budget left unlabelled, the lines the stored-line cap left out, and the
-/// context lines the context cap left out.
+/// budget left unlabelled, the lines the stored-line cap and the definition
+/// caps left out, and the context lines the context cap left out.
 fn notices(report: &Report<'_>, shortfall: Shortfall) -> Vec<String> {
     let scan = report.scan;
     let limits = &report.layout.limits;
@@ -512,7 +538,7 @@ fn notices(report: &Report<'_>, shortfall: Shortfall) -> Vec<String> {
 
     if shortfall.lines > 0 {
         let verb = if shortfall.lines == 1 { "is" } else { "are" };
-        let caps = caps_reached(scan, limits);
+        let caps = caps_reached(&scan.caps, limits);
         let cause = if caps.is_empty() {
             String::new()
         } else {
@@ -538,15 +564,21 @@ fn notices(report: &Report<'_>, shortfall: Shortfall) -> Vec<String> {
     notes
 }
 
-/// The stderr marker for the lines the stored-line cap left out, if it left
-/// any out.
+/// The stderr marker for the lines the stored-line cap and the definition caps
+/// left out, if they left any out.
 fn cap_marker(report: &Report<'_>, shortfall: Shortfall) -> Option<String> {
-    if shortfall.lines == 0 || caps_reached(report.scan, &report.layout.limits).is_empty() {
+    let caps = &report.scan.caps;
+    if shortfall.lines == 0 || caps_reached(caps, &report.layout.limits).is_empty() {
         return None;
     }
     let wanted = usize::try_from(shortfall.wanted).unwrap_or(usize::MAX);
     let left = usize::try_from(shortfall.lines).unwrap_or(usize::MAX);
-    elision_marker_with_remedy(wanted.saturating_sub(left), wanted, "lines", CAP_REMEDY)
+    elision_marker_with_remedy(
+        wanted.saturating_sub(left),
+        wanted,
+        "lines",
+        &cap_remedy(caps),
+    )
 }
 
 /// The stderr marker for the context lines the context cap left out, if it

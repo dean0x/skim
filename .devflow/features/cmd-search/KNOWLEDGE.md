@@ -50,8 +50,11 @@ version: 9
   `skim --clear-cache`. A query never calls `hooks` or `legacy_cache`. `skim doctor` reports both and exits the same.
 - **KB-AP-1** Do not add a flag that starts a program or reads a file the query did not list. The closed flag set and the
   `Containment` open are the trust boundary.
-- **KB-AP-2** Do not decide a bound's behaviour in the output code. Phase A of `scan` assigns the stored-line and context
-  quota from the exact counts, in parse order, so the result does not depend on thread scheduling.
+- **KB-AP-2** Do not decide a bound's behaviour in the output code, and do not infer the cause of a cut from sums. Phase A
+  of `scan` assigns the stored-line quota from the exact counts, in parse order. Phase B spends the context budget in
+  parse order, on the lines each file needs. Each cap that cuts lines is recorded where it cuts (`CapsHit` in
+  `ScanOutput`; `context_hidden` for the context cap), so the result does not depend on thread scheduling and the output
+  only reads the record.
 - **KB-AP-3** Do not treat a name that is missing from the declaration scan as absent when `DeclScan.truncated` is true.
   The file gets the `walk_cap` reason under `unlabelled`.
 - **KB-AP-4** Use only two stderr forms: `skim search: <message>` (always on) and `skim search [debug]: <message>` (only
@@ -155,13 +158,23 @@ One rayon pool of at most `MAX_SCAN_THREADS` = 8 threads. Two phases run one aft
 - **Phase B (`label`)** visits the matched files in parse order. It re-reads each file and compares the digest (a file
   that changed is counted under `changed` and not listed), labels the file with one parse, decides the role of
   every matching line and stores line records up to a fixed cap. Role counts are exact for every matching line, stored
-  or not.
+  or not. With `-C` it then keeps the context lines of the stored records: the files run in waves of at most
+  `MAX_SCAN_THREADS`, and after each wave the context budget goes to the files of the wave in parse order, on the lines
+  each file needs. A wave holds the text of its files, so that memory is at most `MAX_SCAN_THREADS` files.
 
 `Limits` (all named constants): `MAX_STORED_LINES` = 10,000; `MAX_CONTEXT_LINES` = 100,000; `PARSE_BUDGET_FILES` = 500;
-`PARSE_BUDGET_BYTES` = 32 MiB; `PER_FILE_PARSE_CAP` = 1 MiB; `MAX_DEF_SITES_PER_FILE` = 100;
-`MAX_DEF_SITES` = 10,000; `LINE_WIDTH_CAP` = 300. A file the budget leaves unparsed keeps its lines under `unlabelled`
-with a reason (`Unlabelled`: `budget`, `parse_cap`, `parse_failed`, `changed`, `walk_cap`). No bound reads the clock:
-the labels, and so the order, depend only on the files, so a page or a repeat call under load gives the same answer.
+`PARSE_BUDGET_BYTES` = 32 MiB; `PER_FILE_PARSE_CAP` = 1 MiB; `MAX_DEF_SITES_PER_FILE` = 100 (the
+`Limits::max_def_sites_per_file` field); `MAX_DEF_SITES` = 10,000; `LINE_WIDTH_CAP` = 300. A file the budget leaves
+unparsed keeps its lines under `unlabelled` with a reason (`Unlabelled`: `budget`, `parse_cap`, `parse_failed`,
+`changed`, `walk_cap`). No bound reads the clock: the labels, and so the order, depend only on the files, so a page or
+a repeat call under load gives the same answer.
+
+The stored-line quota of a file counts every matching line, definitions included, because phase A cannot tell them
+apart; the definitions have their own two caps. `ScanOutput.caps` (`CapsHit`) says which of three caps cut a line: the
+stored-line cap, the per-file definition cap and the definition cap over all files. The note names them
+(`stored-line cap`, `per-file definition cap`, `definition cap`) and the stderr marker joins the remedy of each cap that
+fired. The per-file cap has its own remedy, `read the file with skim FILE --mode=signatures`, because `-c`, `-l` and a
+narrower pattern do not show the cut definitions of one file.
 
 ## Roles (`roles.rs`)
 
