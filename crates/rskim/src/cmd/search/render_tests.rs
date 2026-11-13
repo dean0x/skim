@@ -959,6 +959,108 @@ fn control_characters_in_a_line_print_as_visible_escapes() {
     );
 }
 
+/// The embeddings, the overrides and the isolates: the nine format characters
+/// that reorder the text around them on a terminal.
+const BIDI_CONTROLS: [char; 9] = [
+    '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}',
+    '\u{2069}',
+];
+
+#[test]
+fn each_bidi_control_in_a_line_prints_as_a_visible_escape() {
+    for c in BIDI_CONTROLS {
+        assert_eq!(
+            escape_text(&format!("a{c}b")),
+            format!("a\\u{{{:x}}}b", c as u32),
+            "U+{:04X}",
+            c as u32
+        );
+    }
+}
+
+#[test]
+fn each_bidi_control_in_a_path_prints_with_octal_escapes() {
+    for c in BIDI_CONTROLS {
+        let mut buf = [0u8; 4];
+        let octal: String = c
+            .encode_utf8(&mut buf)
+            .bytes()
+            .map(|b| format!("\\{b:03o}"))
+            .collect();
+        assert_eq!(
+            quote_path(Path::new(&format!("a{c}b.rs"))),
+            format!("\"a{octal}b.rs\""),
+            "U+{:04X}",
+            c as u32
+        );
+    }
+}
+
+#[test]
+fn right_to_left_letters_print_as_they_are() {
+    assert_eq!(escape_text("שלום مرحبا"), "שלום مرحبا");
+    assert_eq!(quote_path(Path::new("דוגמה/مثال.rs")), "דוגמה/مثال.rs");
+}
+
+#[test]
+fn the_characters_next_to_the_bidi_controls_print_as_they_are() {
+    // The line and paragraph separators, the no-break narrow space, the first
+    // unassigned code point before the isolates and the first one after them.
+    for c in ['\u{2029}', '\u{2028}', '\u{202f}', '\u{2065}', '\u{206a}'] {
+        let line = format!("a{c}b");
+        assert_eq!(escape_text(&line), line, "U+{:04X}", c as u32);
+        assert_eq!(
+            quote_path(Path::new(&format!("a{c}b.rs"))),
+            format!("a{c}b.rs"),
+            "U+{:04X}",
+            c as u32
+        );
+    }
+}
+
+#[test]
+fn a_path_that_starts_with_a_quote_prints_quoted() {
+    assert_eq!(quote_path(Path::new("\"x.rs")), "\"\\\"x.rs\"");
+    // A quote anywhere else cannot start a quoted form, so the name stays as is.
+    assert_eq!(quote_path(Path::new("a\"b.rs")), "a\"b.rs");
+}
+
+#[test]
+fn a_path_that_looks_quoted_differs_from_the_quoted_form_of_another_path() {
+    // The first name is `"a\nb"` with a backslash and an `n`; the second name
+    // holds a real newline, so it prints as `"a\nb"` too when it is quoted.
+    let looks_quoted = Path::new("\"a\\nb\"");
+    let holds_newline = Path::new("a\nb");
+
+    assert_eq!(quote_path(holds_newline), "\"a\\nb\"");
+    assert_ne!(quote_path(looks_quoted), quote_path(holds_newline));
+}
+
+#[test]
+fn no_two_paths_print_the_same_name() {
+    // Every name of up to four characters over an alphabet that holds each
+    // special character of the quoting: the quote, the backslash, a letter that
+    // follows a backslash in an escape, a newline and a bidi control.
+    const ALPHABET: [char; 6] = ['"', '\\', 'n', '\n', 'a', '\u{202e}'];
+    let mut names = vec![String::new()];
+    let mut frontier = names.clone();
+    for _ in 0..4 {
+        frontier = frontier
+            .iter()
+            .flat_map(|name| ALPHABET.iter().map(move |c| format!("{name}{c}")))
+            .collect();
+        names.extend(frontier.iter().cloned());
+    }
+
+    let mut printed: BTreeMap<String, &str> = BTreeMap::new();
+    for name in &names {
+        let shown = quote_path(Path::new(name));
+        if let Some(other) = printed.insert(shown.clone(), name) {
+            panic!("{other:?} and {name:?} both print as {shown}");
+        }
+    }
+}
+
 #[test]
 fn no_control_byte_of_a_path_or_a_line_reaches_the_text_output() {
     let scan = scan_of(vec![file(
@@ -989,6 +1091,40 @@ fn no_control_byte_of_a_path_or_a_line_reaches_the_text_output() {
     let output = text(&pattern("run"), &scan);
     assert!(output.contains("fn f\\x1B[31m() {"), "{output}");
     assert!(output.contains("[g\\x07] run\\x1B[2J()"), "{output}");
+}
+
+#[test]
+fn no_bidi_control_of_a_path_or_a_line_reaches_the_text_output() {
+    let bidi: String = BIDI_CONTROLS.iter().collect();
+    let scan = scan_of(vec![file(
+        format!("dir/{bidi}a.rs"),
+        FilePrior::Source,
+        vec![
+            definition(1, 1, 2, &format!("f{bidi}"), &format!("fn f{bidi}() {{")),
+            record(
+                5,
+                Role::Call,
+                Some(&format!("g{bidi}")),
+                &format!("run{bidi}()"),
+            ),
+        ],
+    )]);
+    let layout = Layout {
+        context: 0,
+        ..Layout::default()
+    };
+
+    for format in [Format::Text, Format::FilesWithMatches, Format::Counts] {
+        let rendered = render_with(&pattern("run"), &scan, layout, format);
+        let all = format!("{}{}", rendered.stdout, rendered.stderr.join("\n"));
+        assert!(
+            !all.chars().any(|c| BIDI_CONTROLS.contains(&c)),
+            "{format:?}: {all:?}"
+        );
+    }
+    let output = text(&pattern("run"), &scan);
+    assert!(output.contains("fn f\\u{202a}"), "{output}");
+    assert!(output.contains("run\\u{202a}"), "{output}");
 }
 
 // ============================================================================

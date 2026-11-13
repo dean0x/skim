@@ -15,14 +15,18 @@
 //!
 //! # Escapes
 //!
-//! Text output never prints a control byte from a file name or a line. A path
-//! with a control character is C-quoted (`"a\nb"`; a C1 control prints as the
-//! octal escapes of its UTF-8 bytes, `"\302\233"`); a path that is not UTF-8 is
-//! quoted with octal escapes for every byte above `0x7F`, as git does with
-//! `core.quotePath`. In line text, C0 controls except TAB and DEL print as
-//! `\xHH`, and C1 controls print as `\u{HH}`, so a hit cannot move the cursor
-//! or rewrite the screen. The JSON output keeps the serde escapes and marks a
-//! path that is not UTF-8 with `"path_lossy": true`.
+//! Text output never prints a control byte or a bidirectional format control
+//! (U+202A to U+202E, U+2066 to U+2069) from a file name or a line. A path with
+//! one of them is C-quoted (`"a\nb"`; a C1 control or a format control prints as
+//! the octal escapes of its UTF-8 bytes, `"\302\233"`); so is a path that
+//! starts with a quote, because it would otherwise look like the quoted form of
+//! another path; a path that is not UTF-8 is quoted with octal escapes for
+//! every byte above `0x7F`, as git does with `core.quotePath`. In line text,
+//! C0 controls except TAB and DEL print as `\xHH`, and C1 controls and format
+//! controls print as `\u{HH}`, so a hit cannot move the cursor, rewrite the
+//! screen or reorder the text around it. Letters of a right-to-left script
+//! print as they are. The JSON output keeps the serde escapes and marks a path
+//! that is not UTF-8 with `"path_lossy": true`.
 //!
 //! # Bounds
 //!
@@ -258,12 +262,36 @@ fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
     }
 }
 
+/// A bidirectional format control: an embedding, an override or an isolate
+/// (U+202A to U+202E, U+2066 to U+2069). It is not a control character, so
+/// `char::is_control` misses it, yet it reorders the text around it on a
+/// terminal and makes a name or a line read as another one. Letters of a
+/// right-to-left script are not format controls and print as they are.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// A character that text output never prints raw: a control character or a
+/// bidirectional format control.
+fn is_hidden(c: char) -> bool {
+    c.is_control() || is_bidi_control(c)
+}
+
 /// The path as text output prints it: as is, or C-quoted when it holds a
-/// control character or is not UTF-8.
+/// control character or a bidirectional format control, starts with a quote,
+/// or is not UTF-8.
+///
+/// A reader must not take one name for the quoted form of another. The quoted
+/// form of every path starts with `"`, so a name that prints as is can equal a
+/// quoted form only when it starts with `"` too, and such a name is quoted.
+/// The quoting also has an inverse: it escapes the backslash and the quote, so
+/// each other backslash in the output starts an escape (`\n`, `\t`, `\r` or
+/// `\ooo`) that stands for one byte, and reading the output back gives the
+/// original bytes. Two different paths therefore never print as one name.
 pub(super) fn quote_path(path: &Path) -> String {
     let bytes = path_bytes(path);
     match std::str::from_utf8(&bytes) {
-        Ok(text) if !text.chars().any(char::is_control) => text.to_owned(),
+        Ok(text) if !text.starts_with('"') && !text.chars().any(is_hidden) => text.to_owned(),
         Ok(text) => {
             let mut out = String::with_capacity(text.len() + 2);
             out.push('"');
@@ -274,8 +302,9 @@ pub(super) fn quote_path(path: &Path) -> String {
                     '\r' => out.push_str("\\r"),
                     '"' => out.push_str("\\\""),
                     '\\' => out.push_str("\\\\"),
-                    // A C0 or a C1 control: the octal escape of each UTF-8 byte.
-                    c if c.is_control() => {
+                    // A C0 control, a C1 control or a bidirectional format
+                    // control: the octal escape of each UTF-8 byte.
+                    c if is_hidden(c) => {
                         let mut buf = [0u8; 4];
                         for b in c.encode_utf8(&mut buf).bytes() {
                             out.push_str(&format!("\\{b:03o}"));
@@ -307,11 +336,15 @@ pub(super) fn quote_path(path: &Path) -> String {
     }
 }
 
-/// `text` with every control character made visible: C0 controls except TAB,
-/// and DEL, as `\xHH`; C1 controls as `\u{HH}`.
+/// `text` with every control character and bidirectional format control made
+/// visible: C0 controls except TAB, and DEL, as `\xHH`; C1 controls and
+/// bidirectional format controls as `\u{HH}`.
 pub(super) fn escape_text(text: &str) -> Cow<'_, str> {
-    let hidden =
-        |c: char| (c.is_ascii_control() && c != '\t') || ('\u{80}'..='\u{9f}').contains(&c);
+    let hidden = |c: char| {
+        (c.is_ascii_control() && c != '\t')
+            || ('\u{80}'..='\u{9f}').contains(&c)
+            || is_bidi_control(c)
+    };
     if !text.chars().any(hidden) {
         return Cow::Borrowed(text);
     }
@@ -319,7 +352,7 @@ pub(super) fn escape_text(text: &str) -> Cow<'_, str> {
     for c in text.chars() {
         if c.is_ascii_control() && c != '\t' {
             out.push_str(&format!("\\x{:02X}", c as u32));
-        } else if ('\u{80}'..='\u{9f}').contains(&c) {
+        } else if ('\u{80}'..='\u{9f}').contains(&c) || is_bidi_control(c) {
             out.push_str(&format!("\\u{{{:x}}}", c as u32));
         } else {
             out.push(c);

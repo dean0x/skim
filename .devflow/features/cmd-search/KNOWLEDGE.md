@@ -42,8 +42,10 @@ version: 9
 - **KB-INV-6** A tracked path and the work tree are untrusted. `Containment` canonicalizes each parent folder, requires it
   to stay inside the canonical root, and opens the file by that parent plus the file name with no link followed and no
   block on a FIFO. The opened handle is checked before a byte is read.
-- **KB-INV-7** Text output never prints a control byte from a file name or a line (`render::quote_path`, `escape_text`).
-  JSON keeps the serde escapes and marks a path that is not UTF-8 with `"path_lossy": true`.
+- **KB-INV-7** Text output never prints a control byte or a bidi format control (U+202A to U+202E, U+2066 to U+2069) from
+  a file name or a line (`render::quote_path`, `escape_text`). A file name that starts with a quote is C-quoted too, so no
+  name looks like the quoted form of another. Letters of a right-to-left script print as they are. JSON keeps the serde
+  escapes and marks a path that is not UTF-8 with `"path_lossy": true`.
 - **KB-INV-8** The hidden-file and secret-file rule lives in one function (`sensitive_admission`) and one constant
   (`SENSITIVE_PATH_POLICY`) in `universe.rs`. Today every tracked file is listed.
 - **KB-INV-9** The old hook block and the old index data are removed only by `skim init`, `skim init --uninstall` and
