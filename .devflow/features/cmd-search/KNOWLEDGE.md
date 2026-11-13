@@ -30,7 +30,8 @@ version: 9
 - **KB-INV-1** A query reads the files and builds nothing. It writes no file, keeps no cache and records no analytics
   row. It starts no other program: the git index is read in process.
 - **KB-INV-2** The flag set is closed. `parse_flags` accepts only the flags in the help text. An unknown flag, a removed
-  flag, a second pattern or a flag that cannot combine with another exits 2 and prints nothing on stdout.
+  flag, a second pattern or a flag that cannot combine with another exits 2. A removed flag prints nothing on stdout, with or without `--json`. Any other usage error prints
+  nothing on stdout, except with `--json`, where it prints one `{"error":"…"}` object.
 - **KB-INV-3** Every file the query does not read is counted under one `LeftOut` reason and shown in the last line and
   in the JSON `left_out` object. No file leaves the universe silently.
 - **KB-INV-4** Every bound is a named constant. A bound that hides lines prints a note with exact counts and the remedy.
@@ -220,7 +221,8 @@ holds a `--root` folder.
   valid `<id>`, then each empty project folder, then `<cache>/search` when empty. No step follows a link; one pass
   inspects at most `MAX_SEARCH_ENTRIES` = 4096 entries, and when more follow (`LegacyCleanup.more`) the clear prints a
   note to run it again. Callers: `cmd/mod.rs` (`skim --clear-cache`) and
-  `cmd/doctor/mod.rs` (`legacy_index_report`, an advisory line with the size).
+  `cmd/doctor/mod.rs` (`legacy_index_report`, an advisory line with the size; it has the same bound, and when
+  `LegacyReport.more` is set the line says "at least" for the folders and the size).
 
 ## Gotchas
 
