@@ -420,7 +420,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
-- **`skim search` temporal layer now walks the full commit DAG** (#407) — the
+- **`skim search` temporal layer now walks the full commit DAG** (#407) — replaced
+  before release: 3.0.0 removes the temporal layer, its flags and `--rebuild` (see
+  "BREAKING (3.0.0)" above). The text below records the 2.x branch only.  The
   commit population for `--hot`, `--cold`, `--risky`, and `--blast-radius` changes
   from first-parent-only traversal to a full DAG walk that skips merge commits, matching
   `git log --no-merges` and skim heatmap's population.  The measured effect on this
@@ -432,14 +434,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slow rebuild per project root while the `TEMPORAL_DATA_VERSION` self-heal (1 → 2)
   replaces the stored data.  Subsequent queries are fast until HEAD advances; the first
   query after each new commit re-walks history.  (If a previous history walk failed for
-  the current HEAD, the retry backoff defers the heal until HEAD advances or you run an
-  explicit `skim search --rebuild`.)
+  the current HEAD, the retry backoff deferred the heal until HEAD advanced or an
+  explicit `skim search --rebuild` ran; 3.0.0 removes that flag.)
 
   **Adopted-root caveat:** a `--root` whose `temporal.db` records a different
   `git_toplevel` (e.g. the enclosing repository changed) is **refused** rather than
-  silently re-anchored — skim exits 0 with a typed notice.  The remedy is an explicit
-  `skim search --rebuild --root <path>` which re-anchors and writes the new toplevel
-  (PF-017 by design).
+  silently re-anchored — skim exits 0 with a typed notice.  The remedy was an explicit
+  `skim search --rebuild --root <path>`, which re-anchored and wrote the new toplevel
+  (PF-017 by design); 3.0.0 removes that flag.
 
   **`--blast-radius` consequence:** because Jaccard numerators and `file_counts`
   denominators now reflect the full commit population, co-change peer **sets and ordering**
