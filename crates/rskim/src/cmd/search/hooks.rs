@@ -20,7 +20,12 @@
 //! that is a link, is not UTF-8 text or is larger than [`MAX_HOOK_BYTES`] is
 //! not skim's and stays as it is. The rewrite keeps the file permissions, so a
 //! hook that was not executable does not start to run.
+//!
+//! The three hooks are independent. A hook that cannot be read or rewritten (for
+//! example one that another user owns, with mode 600) is reported as a
+//! [`HookFailure`] and the other hooks are still handled.
 
+use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
@@ -52,8 +57,9 @@ const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-checkout"];
 /// Outcome of [`remove_search_hooks`].
 ///
 /// The shared-scope notice (AC34(b)) is emitted by the operation itself;
-/// callers receive `dir` for their own path-disclosure messages and `changed`
-/// for suppression of empty-operation output.
+/// callers receive `dir` for their own path-disclosure messages, `changed`
+/// for suppression of empty-operation output and `failures` for the hooks that
+/// were left as they were.
 #[derive(Debug)]
 pub(crate) struct HooksOutcome {
     /// The resolved hooks directory, in canonical form when it exists.
@@ -61,6 +67,78 @@ pub(crate) struct HooksOutcome {
     /// `true` when at least one old block was found and removed. `false` means
     /// no hook held a block.
     pub changed: bool,
+    /// The hooks that could not be read or rewritten, at most one for each name
+    /// in [`HOOK_NAMES`]. A hook in this list is unchanged.
+    pub failures: Vec<HookFailure>,
+}
+
+/// What [`find_search_hooks`] found in the hooks directory.
+///
+/// It exists only when there is something to report: a block, a hook that could
+/// not be read, or both.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HooksFinding {
+    /// The resolved hooks directory, in canonical form when it exists.
+    pub dir: PathBuf,
+    /// `true` when a readable hook holds a complete old block.
+    pub block_found: bool,
+    /// The hooks that could not be read. Whether they hold a block is unknown.
+    pub unreadable: Vec<HookFailure>,
+}
+
+/// What skim did to a hook when it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookStep {
+    /// Look at the file (`symlink_metadata`).
+    Inspect,
+    /// Read the text of the file.
+    Read,
+    /// Write the file again without the block.
+    Rewrite,
+}
+
+impl HookStep {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Inspect => "inspect",
+            Self::Read => "read",
+            Self::Rewrite => "rewrite",
+        }
+    }
+}
+
+/// A hook that skim could not read or rewrite.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HookFailure {
+    /// The hook file.
+    pub path: PathBuf,
+    /// What skim was doing.
+    pub step: HookStep,
+    /// Why the system call failed.
+    pub kind: std::io::ErrorKind,
+}
+
+impl HookFailure {
+    fn new(path: &Path, step: HookStep, error: &std::io::Error) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            step,
+            kind: error.kind(),
+        }
+    }
+}
+
+impl fmt::Display for HookFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `{:?}` quotes ESC/CR/LF that a repository-controlled path can hold.
+        write!(
+            f,
+            "could not {} hook {:?} ({})",
+            self.step.verb(),
+            self.path,
+            self.kind
+        )
+    }
 }
 
 // ============================================================================
@@ -234,10 +312,13 @@ fn is_shared_hooks_dir(project_root: &Path) -> bool {
 /// least one block was removed, this function emits [`SHARED_HOOKS_SCOPE_MSG`]
 /// to stderr, so every caller inherits the notice.
 ///
+/// A hook that cannot be read or rewritten does not stop the others: it is listed
+/// in [`HooksOutcome::failures`] and stays as it is.
+///
 /// # Errors
 ///
-/// Returns `Err` when a hook cannot be read or rewritten, or when `project_root`
-/// is a subdirectory of a git repository and holds no hooks of its own.
+/// Returns `Err` when `project_root` is a subdirectory of a git repository and
+/// holds no hooks of its own.
 pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOutcome> {
     let hooks_dir = match resolve_hooks_dir(project_root) {
         Ok(d) => d,
@@ -250,35 +331,34 @@ pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOu
             );
         }
     };
-    let mut any_removed = false;
-    for name in HOOK_NAMES {
-        any_removed |= remove_from_hook(&hooks_dir.join(name))?;
-    }
-    if any_removed && is_shared_hooks_dir(project_root) {
+    let removal = remove_from_dir(&hooks_dir, &read_hook);
+    if removal.changed && is_shared_hooks_dir(project_root) {
         eprintln!("{SHARED_HOOKS_SCOPE_MSG}");
     }
     Ok(HooksOutcome {
         dir: canonical_if_exists(hooks_dir),
-        changed: any_removed,
+        changed: removal.changed,
+        failures: removal.failures,
     })
 }
 
-/// The hooks directory of `project_root` when a hook there holds a complete old
-/// block, `None` otherwise. It writes nothing.
+/// What the hooks of `project_root` hold: the hooks directory and what is wrong
+/// in it, or `None` when no hook there holds a complete old block and every hook
+/// could be read. It writes nothing.
 ///
 /// Uses the same directory, the same hook list and the same block rule as
 /// [`remove_search_hooks`], so a block found here is a block that removal takes
-/// out. A `project_root` that is a subdirectory of a git repository holds no
-/// hooks, so it gives `None`.
-pub(crate) fn find_search_hooks(project_root: &Path) -> Option<PathBuf> {
+/// out. A hook that cannot be read is listed in [`HooksFinding::unreadable`]: it
+/// is unknown, not clean. A `project_root` that is a subdirectory of a git
+/// repository holds no hooks, so it gives `None`.
+pub(crate) fn find_search_hooks(project_root: &Path) -> Option<HooksFinding> {
     let hooks_dir = resolve_hooks_dir(project_root).ok()?;
-    let found = HOOK_NAMES.iter().any(|name| {
-        matches!(
-            read_hook(&hooks_dir.join(name)),
-            Ok(Some(hook)) if strip_block(&hook.text) != hook.text
-        )
-    });
-    found.then(|| canonical_if_exists(hooks_dir))
+    let scan = scan_dir(&hooks_dir, &read_hook);
+    (scan.block_found || !scan.unreadable.is_empty()).then(|| HooksFinding {
+        dir: canonical_if_exists(hooks_dir),
+        block_found: scan.block_found,
+        unreadable: scan.unreadable,
+    })
 }
 
 // ============================================================================
@@ -291,15 +371,61 @@ struct Hook {
     permissions: std::fs::Permissions,
 }
 
+/// How a hook file is read. The tests replace it with a reader that fails.
+type ReadHook<'a> = &'a dyn Fn(&Path) -> Result<Option<Hook>, HookFailure>;
+
+/// What one pass of [`remove_from_dir`] did.
+struct Removal {
+    changed: bool,
+    failures: Vec<HookFailure>,
+}
+
+/// What one pass of [`scan_dir`] saw.
+struct Scan {
+    block_found: bool,
+    unreadable: Vec<HookFailure>,
+}
+
+/// Remove the old block from each hook of `hooks_dir`. A hook that fails is
+/// listed and the next hook is still handled.
+fn remove_from_dir(hooks_dir: &Path, read: ReadHook<'_>) -> Removal {
+    let mut removal = Removal {
+        changed: false,
+        failures: Vec::new(),
+    };
+    for name in HOOK_NAMES {
+        match remove_from_hook(&hooks_dir.join(name), read) {
+            Ok(removed) => removal.changed |= removed,
+            Err(failure) => removal.failures.push(failure),
+        }
+    }
+    removal
+}
+
+/// Look for the old block in each hook of `hooks_dir`, and write nothing. A hook
+/// that cannot be read is listed and the next hook is still read.
+fn scan_dir(hooks_dir: &Path, read: ReadHook<'_>) -> Scan {
+    let mut scan = Scan {
+        block_found: false,
+        unreadable: Vec::new(),
+    };
+    for name in HOOK_NAMES {
+        match read(&hooks_dir.join(name)) {
+            Ok(Some(hook)) => scan.block_found |= strip_block(&hook.text) != hook.text,
+            Ok(None) => {}
+            Err(failure) => scan.unreadable.push(failure),
+        }
+    }
+    scan
+}
+
 /// Read a hook file, or `Ok(None)` when it is absent or is not skim's to rewrite.
 ///
 /// Skim only rewrites a regular file of at most [`MAX_HOOK_BYTES`] that is UTF-8
 /// text. A link is not followed: the rewrite replaces the file at `path`, and
 /// that would turn the link into a copy. The read is bounded by the cap, not by
 /// the size the file had when it was inspected.
-fn read_hook(path: &Path) -> anyhow::Result<Option<Hook>> {
-    use anyhow::Context as _;
-
+fn read_hook(path: &Path) -> Result<Option<Hook>, HookFailure> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         // A `.git` that is a file (a gitdir that failed the write-path gate) makes
@@ -312,7 +438,7 @@ fn read_hook(path: &Path) -> anyhow::Result<Option<Hook>> {
         {
             return Ok(None);
         }
-        Err(e) => return Err(e).with_context(|| format!("could not inspect hook {path:?}")),
+        Err(e) => return Err(HookFailure::new(path, HookStep::Inspect, &e)),
     };
     if !meta.is_file() {
         return Ok(None);
@@ -320,7 +446,7 @@ fn read_hook(path: &Path) -> anyhow::Result<Option<Hook>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .and_then(|file| file.take(MAX_HOOK_BYTES + 1).read_to_end(&mut bytes))
-        .with_context(|| format!("could not read hook {path:?}"))?;
+        .map_err(|e| HookFailure::new(path, HookStep::Read, &e))?;
     if bytes.len() as u64 > MAX_HOOK_BYTES {
         return Ok(None);
     }
@@ -333,15 +459,16 @@ fn read_hook(path: &Path) -> anyhow::Result<Option<Hook>> {
 /// Strip the old block from one hook file.
 ///
 /// Returns `true` if a block was removed, `false` if the hook was left as it is.
-fn remove_from_hook(hook_path: &Path) -> anyhow::Result<bool> {
-    let Some(hook) = read_hook(hook_path)? else {
+fn remove_from_hook(hook_path: &Path, read: ReadHook<'_>) -> Result<bool, HookFailure> {
+    let Some(hook) = read(hook_path)? else {
         return Ok(false);
     };
     let stripped = strip_block(&hook.text);
     if stripped == hook.text {
         return Ok(false);
     }
-    write_hook_atomic(hook_path, &stripped, hook.permissions)?;
+    write_hook_atomic(hook_path, &stripped, hook.permissions)
+        .map_err(|e| HookFailure::new(hook_path, HookStep::Rewrite, &e))?;
     Ok(true)
 }
 
@@ -392,23 +519,29 @@ fn canonical_if_exists(dir: PathBuf) -> PathBuf {
 ///
 /// The file gets `permissions`, the ones the hook had. A hook that was not
 /// executable stays one that git does not run.
+///
+/// The data reaches the disk before the rename, so a power loss cannot leave the
+/// user's own hook lines as an empty file.
 fn write_hook_atomic(
     hook_path: &Path,
     content: &str,
     permissions: std::fs::Permissions,
-) -> anyhow::Result<()> {
-    let parent = hook_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("hook path has no parent directory"))?;
+) -> std::io::Result<()> {
+    let parent = hook_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hook path has no parent directory",
+        )
+    })?;
 
     let mut tmp = NamedTempFile::new_in(parent)?;
 
     use std::io::Write as _;
     tmp.write_all(content.as_bytes())?;
     std::fs::set_permissions(tmp.path(), permissions)?;
+    tmp.as_file().sync_all()?;
 
-    tmp.persist(hook_path)
-        .map_err(|e| anyhow::anyhow!("failed to persist hook file: {}", e))?;
+    tmp.persist(hook_path).map_err(|e| e.error)?;
 
     Ok(())
 }

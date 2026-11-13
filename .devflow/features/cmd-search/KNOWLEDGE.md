@@ -245,9 +245,17 @@ plain repositories resolve the way git does). `resolve_repo_toplevel` is the sof
 - **`hooks.rs`**: `find_search_hooks` and `remove_search_hooks` handle the block between `# skim-search-start` and
   `# skim-search-end` in `post-commit`, `post-merge` and `post-checkout` (`HOOK_NAMES`). Removal deletes the lines from
   the start marker to the end marker and no other byte. A marker counts only as a whole line. A hook that is a link, is
-  not UTF-8 or is larger than `MAX_HOOK_BYTES` (1 MiB) is not skim's and stays. The rewrite keeps the file permissions.
-  Callers: `cmd/init/install.rs` (`skim init` and `skim init --uninstall`, with a dry run). `skim doctor` prints an
-  advisory line through `cmd::init::old_search_hooks_dir` and never changes its exit code for it.
+  not UTF-8 or is larger than `MAX_HOOK_BYTES` (1 MiB) is not skim's and stays. The rewrite keeps the file permissions
+  and flushes the new file (`sync_all`) before the rename. The three hooks are independent: a hook that cannot be
+  inspected, read or rewritten is a `HookFailure` (path, step, error kind) and the other hooks are still handled.
+  `remove_search_hooks` lists the failures in `HooksOutcome::failures` (it returns `Err` only for the subdirectory
+  refusal). `find_search_hooks` gives a `HooksFinding` (`block_found` and `unreadable`): an unreadable hook is
+  unknown, never clean. Tests replace the reader (`ReadHook`) because a test may run as root.
+  Callers: `cmd/init/install.rs` (`skim init` and `skim init --uninstall`, with a dry run; one note for each failed
+  hook). `skim doctor` prints advisory lines through `cmd::init::old_search_hooks_finding` (the block line, and one
+  line for each unreadable hook) and never changes its exit code for them. The block line names `skim init` first
+  and says that it needs an installed agent: with none, `run_install_auto_detect` returns before the cleanup in
+  `run_install_single`. `skim init --uninstall` is named only as the way to remove skim completely.
 - **`legacy_cache.rs`**: `LEGACY_ARTIFACTS` names the 15 files skim 2.x wrote in `<cache>/search/<id>/` (`<id>` is 16
   lowercase hex digits). That includes the `-wal`, `-shm` and `-journal` files of `temporal.db`. The temp files of the
   old atomic writer (`.tmp` and 6 ASCII letters or digits, `is_temp_artifact_name`) go too. `clear_legacy_index_data`

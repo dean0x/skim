@@ -76,7 +76,7 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
         drift = true;
     }
     // Advisory only: old search git hooks never set the drift verdict.
-    if let Some(note) = old_search_hooks_note(crate::cmd::init::old_search_hooks_dir().as_deref()) {
+    for note in old_search_hooks_notes(crate::cmd::init::old_search_hooks_finding().as_ref()) {
         println!("{note}");
     }
     println!();
@@ -656,19 +656,42 @@ fn print_hook_section(
     Ok(verdict)
 }
 
-/// The advisory line for old search git hooks, or `None` when there are none.
+/// The advisory lines for old search git hooks. The list is empty when no hook
+/// holds the block and every hook could be read.
 ///
 /// Skim 2.x wrote a block into `post-commit`, `post-merge` and `post-checkout`.
-/// The block now runs a command that exits 2. A note only: it sets neither the
-/// drift verdict nor the exit code. `dir` is the hooks folder where the block
-/// still sits, for the repository around the current folder.
-fn old_search_hooks_note(dir: Option<&std::path::Path>) -> Option<String> {
-    // `{:?}` quotes control bytes that a repository-controlled path can hold.
-    dir.map(|dir| {
-        format!(
-            "  ⚠  Old search git hooks: found in {dir:?} — run skim init --uninstall or skim init"
-        )
-    })
+/// The block now runs a command that exits 2. Notes only: they set neither the
+/// drift verdict nor the exit code. `finding` is what the hooks of the repository
+/// around the current folder hold.
+///
+/// The remedy is `skim init`, which removes the block while it installs for an
+/// agent. With no agent installed it stops before it touches a hook, so the line
+/// says so. `skim init --uninstall` also removes the block, but it takes skim out
+/// of every agent, so the line names it only as the way to remove skim completely.
+///
+/// A hook that cannot be read gets its own line: whether it holds the block is
+/// unknown, so doctor does not report it as clean.
+fn old_search_hooks_notes(
+    finding: Option<&crate::cmd::search::hooks::HooksFinding>,
+) -> Vec<String> {
+    let Some(finding) = finding else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    if finding.block_found {
+        // `{:?}` quotes control bytes that a repository-controlled path can hold.
+        notes.push(format!(
+            "  ⚠  Old search git hooks: found in {:?} — run skim init (it needs an installed agent; \
+             with none it changes nothing). To remove skim completely, run skim init --uninstall",
+            finding.dir
+        ));
+    }
+    notes.extend(
+        finding.unreadable.iter().map(|failure| {
+            format!("  ⚠  Old search git hooks: {failure} — check the hook by hand")
+        }),
+    );
+    notes
 }
 
 /// Advisory lines about `PostToolUse` hooks of other tools, for one agent.
@@ -1790,30 +1813,114 @@ mod tests {
 
     // ---- old search notes ----
 
-    #[test]
-    fn test_old_search_hooks_note_is_absent_without_a_block() {
-        assert_eq!(old_search_hooks_note(None), None);
+    fn hooks_finding(
+        dir: &str,
+        block_found: bool,
+        unreadable: Vec<crate::cmd::search::hooks::HookFailure>,
+    ) -> crate::cmd::search::hooks::HooksFinding {
+        crate::cmd::search::hooks::HooksFinding {
+            dir: std::path::PathBuf::from(dir),
+            block_found,
+            unreadable,
+        }
+    }
+
+    fn unreadable_hook(path: &str) -> crate::cmd::search::hooks::HookFailure {
+        crate::cmd::search::hooks::HookFailure {
+            path: std::path::PathBuf::from(path),
+            step: crate::cmd::search::hooks::HookStep::Read,
+            kind: std::io::ErrorKind::PermissionDenied,
+        }
     }
 
     #[test]
-    fn test_old_search_hooks_note_names_the_folder_and_the_remedy() {
-        let note = old_search_hooks_note(Some(std::path::Path::new("/r/.git/hooks"))).unwrap();
+    fn test_old_search_hooks_notes_are_absent_without_a_finding() {
+        assert!(old_search_hooks_notes(None).is_empty());
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_name_the_folder_and_put_skim_init_first() {
+        let finding = hooks_finding("/r/.git/hooks", true, Vec::new());
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        let [note] = notes.as_slice() else {
+            panic!("a block must give one line: {notes:?}");
+        };
         assert!(
             note.contains("Old search git hooks: found in \"/r/.git/hooks\""),
             "{note}"
         );
+        let first_init = note.find("skim init").expect("the line names skim init");
+        let uninstall = note
+            .find("skim init --uninstall")
+            .expect("the line names the way to remove skim completely");
+        assert_ne!(
+            first_init, uninstall,
+            "skim init must come before skim init --uninstall: {note}"
+        );
         assert!(
-            note.contains("skim init --uninstall or skim init"),
+            note.contains("To remove skim completely, run skim init --uninstall"),
             "{note}"
         );
     }
 
     #[test]
-    fn test_old_search_hooks_note_quotes_control_bytes_in_the_path() {
-        let note =
-            old_search_hooks_note(Some(std::path::Path::new("/r\u{1b}[31m\n/hooks"))).unwrap();
+    fn test_old_search_hooks_notes_say_what_init_does_with_no_agent() {
+        let finding = hooks_finding("/r/.git/hooks", true, Vec::new());
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        assert!(
+            notes[0].contains("it needs an installed agent; with none it changes nothing"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_quote_control_bytes_in_the_path() {
+        let finding = hooks_finding("/r\u{1b}[31m\n/hooks", true, Vec::new());
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        let note = notes.join("\n");
         assert!(!note.contains('\u{1b}'), "{note:?}");
         assert_eq!(note.lines().count(), 1, "{note:?}");
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_report_an_unreadable_hook_as_unknown() {
+        let finding = hooks_finding(
+            "/r/.git/hooks",
+            false,
+            vec![unreadable_hook("/r/.git/hooks/post-commit")],
+        );
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        assert_eq!(
+            notes,
+            vec![
+                "  ⚠  Old search git hooks: could not read hook \"/r/.git/hooks/post-commit\" \
+                 (permission denied) — check the hook by hand"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_keep_the_block_line_beside_an_unreadable_hook() {
+        let finding = hooks_finding(
+            "/r/.git/hooks",
+            true,
+            vec![unreadable_hook("/r/.git/hooks/post-merge")],
+        );
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("found in"), "{notes:?}");
+        assert!(notes[1].contains("post-merge"), "{notes:?}");
     }
 
     #[test]

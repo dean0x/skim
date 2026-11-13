@@ -7,7 +7,10 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
-use super::{find_search_hooks, remove_search_hooks};
+use super::{
+    HookFailure, HookStep, HooksFinding, find_search_hooks, remove_from_dir, remove_search_hooks,
+    scan_dir,
+};
 
 // ============================================================================
 // Helpers
@@ -313,7 +316,11 @@ fn test_find_reports_the_directory_while_a_block_is_present() {
     .unwrap();
     assert_eq!(
         find_search_hooks(dir.path()),
-        Some(hooks_dir(dir.path()).canonicalize().unwrap())
+        Some(HooksFinding {
+            dir: hooks_dir(dir.path()).canonicalize().unwrap(),
+            block_found: true,
+            unreadable: Vec::new(),
+        })
     );
 
     remove_search_hooks(dir.path()).unwrap();
@@ -321,6 +328,129 @@ fn test_find_reports_the_directory_while_a_block_is_present() {
         find_search_hooks(dir.path()),
         None,
         "after removal no block is found"
+    );
+}
+
+// ============================================================================
+// A hook that cannot be read does not stop the others
+// ============================================================================
+
+/// A reader that fails for the hook named `broken` and reads every other hook as
+/// `read_hook` does. A process may run as root, and root reads a file of mode 000,
+/// so a stand-in failure is the only one that every environment can raise.
+fn reader_failing_on(
+    broken: &'static str,
+) -> impl Fn(&Path) -> Result<Option<super::Hook>, HookFailure> {
+    move |path: &Path| {
+        if path.file_name().is_some_and(|name| name == broken) {
+            Err(HookFailure {
+                path: path.to_path_buf(),
+                step: HookStep::Read,
+                kind: std::io::ErrorKind::PermissionDenied,
+            })
+        } else {
+            super::read_hook(path)
+        }
+    }
+}
+
+/// The first hook cannot be read. The two after it are still cleaned, and the
+/// failed one is listed and left as it was.
+#[test]
+fn test_remove_cleans_the_other_hooks_when_the_first_cannot_be_read() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    plant_fresh_hooks(&hooks_dir(dir.path()));
+
+    let removal = remove_from_dir(&hooks_dir(dir.path()), &reader_failing_on("post-commit"));
+
+    assert!(removal.changed, "the two readable hooks lost their block");
+    assert_eq!(removal.failures.len(), 1, "{:?}", removal.failures);
+    assert_eq!(
+        removal.failures[0].path,
+        hooks_dir(dir.path()).join("post-commit")
+    );
+    assert_eq!(
+        fs::read_to_string(hooks_dir(dir.path()).join("post-commit")).unwrap(),
+        with_old_block("#!/bin/sh"),
+        "the unreadable hook stays as it was"
+    );
+    for name in ["post-merge", "post-checkout"] {
+        assert_eq!(
+            fs::read_to_string(hooks_dir(dir.path()).join(name)).unwrap(),
+            "#!/bin/sh\n",
+            "{name}: a hook after the failed one must still be cleaned"
+        );
+    }
+}
+
+/// A block removed from an earlier hook is still reported when a later hook
+/// cannot be read.
+#[test]
+fn test_remove_keeps_the_changed_flag_when_a_later_hook_cannot_be_read() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    plant_fresh_hooks(&hooks_dir(dir.path()));
+
+    let removal = remove_from_dir(&hooks_dir(dir.path()), &reader_failing_on("post-checkout"));
+
+    assert!(removal.changed);
+    assert_eq!(removal.failures.len(), 1, "{:?}", removal.failures);
+}
+
+/// Doctor must not read an unreadable hook as clean, and must still see the
+/// block of the hooks after it.
+#[test]
+fn test_scan_reports_an_unreadable_hook_and_still_finds_the_block_after_it() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    plant_fresh_hooks(&hooks_dir(dir.path()));
+
+    let scan = scan_dir(&hooks_dir(dir.path()), &reader_failing_on("post-commit"));
+
+    assert!(
+        scan.block_found,
+        "post-merge and post-checkout hold a block"
+    );
+    assert_eq!(scan.unreadable.len(), 1, "{:?}", scan.unreadable);
+    assert_eq!(
+        scan.unreadable[0].path,
+        hooks_dir(dir.path()).join("post-commit")
+    );
+}
+
+/// With no readable block anywhere, an unreadable hook alone is still a finding.
+#[test]
+fn test_scan_reports_an_unreadable_hook_when_no_block_is_found() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    fs::write(hooks_dir(dir.path()).join("post-merge"), "#!/bin/sh\n").unwrap();
+
+    let scan = scan_dir(&hooks_dir(dir.path()), &reader_failing_on("post-commit"));
+
+    assert!(!scan.block_found);
+    assert_eq!(scan.unreadable.len(), 1, "{:?}", scan.unreadable);
+}
+
+/// A failure names the hook, the step and the cause, and quotes the control
+/// bytes that a repository-controlled path can hold.
+#[test]
+fn test_hook_failure_quotes_control_bytes_in_the_path() {
+    let failure = HookFailure {
+        path: Path::new("/r\u{1b}[31m\n/.git/hooks/post-commit").to_path_buf(),
+        step: HookStep::Rewrite,
+        kind: std::io::ErrorKind::PermissionDenied,
+    };
+
+    let text = failure.to_string();
+
+    assert_eq!(
+        text,
+        "could not rewrite hook \"/r\\u{1b}[31m\\n/.git/hooks/post-commit\" (permission denied)"
+    );
+    assert!(
+        !text.bytes().any(|b| b < 0x20 && b != 0x09),
+        "no raw control byte: {text:?}"
     );
 }
 
@@ -716,15 +846,12 @@ fn test_remove_hooks_submodule_no_shared_disclosure() {
         .current_dir(&super_root)
         .output()
         .expect("git submodule add (spawn)");
-    if !out.status.success() {
-        // git submodule may be unavailable in CI — skip gracefully.
-        eprintln!(
-            "test_remove_hooks_submodule: git submodule add failed ({}); skipping.\nstderr: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return;
-    }
+    assert!(
+        out.status.success(),
+        "git submodule add failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let sub_root = super_root.join("sub");
     assert!(
@@ -769,40 +896,37 @@ fn test_remove_hooks_submodule_no_shared_disclosure() {
 }
 
 // ============================================================================
-// Control characters in a gitdir pointer are not forwarded raw
+// Control characters in a repository path are not forwarded raw
 // ============================================================================
 
-/// A `gitdir:` pointer containing ASCII control characters (`\r`, `\n`, ESC) must
-/// not appear raw in any error message from `remove_search_hooks`.
+/// The refusal for a subdirectory names the folder and the enclosing repository.
+/// When the repository folder holds an ESC byte, the error must carry it quoted:
+/// a raw ESC would reach the terminal of the user.
 ///
-/// Discriminating: the emitted error message contains no byte in `0x01..=0x1F`
-/// other than `\t` (0x09) when a crafted `.git` file contains a control character
-/// in its `gitdir:` line.
+/// The test builds the one case that makes `remove_search_hooks` return this
+/// error: a folder with no `.git` entry inside a repository whose folder name
+/// holds ESC and a CSI sequence.
 #[test]
-fn test_hooks_refusal_quotes_control_chars_in_gitdir() {
+fn test_hooks_refusal_quotes_control_chars_in_the_repository_path() {
     let dir = tempdir().unwrap();
-    let project = dir.path().join("project");
-    fs::create_dir_all(&project).unwrap();
+    let repo = dir.path().join("repo\x1b[31mred");
+    fs::create_dir_all(&repo).unwrap();
+    create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    let subdir = repo.join("src");
+    fs::create_dir_all(&subdir).unwrap();
 
-    // Craft a .git FILE whose gitdir: line contains a CR+LF and an ESC byte.
-    let evil_target = dir.path().join("evil\x1b[31mred\x1b[0m");
-    let gitdir_line = format!("gitdir: {}\r\n", evil_target.display());
-    fs::write(project.join(".git"), gitdir_line.as_bytes()).unwrap();
+    let message = remove_search_hooks(&subdir).unwrap_err().to_string();
 
-    // remove_search_hooks may return Ok or Err; what matters is that no error
-    // message contains a raw control byte (excluding tab).
-    let remove_err = remove_search_hooks(&project)
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-
-    for (i, byte) in remove_err.bytes().enumerate() {
-        if byte < 0x20 && byte != 0x09 {
-            panic!(
-                "remove error message must not contain raw control byte 0x{byte:02X} \
-                 at position {i}; message: {:?}",
-                &remove_err[..remove_err.len().min(200)]
-            );
-        }
-    }
+    assert!(
+        message.contains("is a subdirectory of the git repository"),
+        "the removal path must return the subdirectory refusal; got: {message:?}"
+    );
+    assert!(
+        !message.bytes().any(|b| b < 0x20 && b != 0x09),
+        "the error must not contain a raw control byte; got: {message:?}"
+    );
+    assert!(
+        message.contains("repo\\u{1b}[31mred"),
+        "the ESC byte must appear quoted as \\u{{1b}}; got: {message:?}"
+    );
 }

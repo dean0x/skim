@@ -1102,7 +1102,7 @@ fn test_doctor_reports_old_search_data_as_advisory_with_no_exit_change() {
         "the old hook block must be reported:\n{found_stdout}"
     );
     assert!(
-        found_stdout.contains("run skim init --uninstall or skim init"),
+        found_stdout.contains("run skim init (it needs an installed agent"),
         "the note must name the remedy:\n{found_stdout}"
     );
     assert!(
@@ -1133,6 +1133,49 @@ fn test_doctor_reports_old_search_data_as_advisory_with_no_exit_change() {
     assert_eq!(
         std::fs::metadata(shard.join("index.skpost")).unwrap().len(),
         2_000_000
+    );
+}
+
+/// The doctor line for old search hooks names `skim init` first. It names
+/// `skim init --uninstall` only as the way to remove skim completely, because that
+/// command takes skim out of every agent. It also says that `skim init` changes
+/// nothing when no agent is installed.
+#[test]
+fn test_doctor_old_search_hooks_line_names_skim_init_before_uninstall() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("repo");
+    let hooks = project.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("post-merge"), OLD_SEARCH_BLOCK).unwrap();
+
+    let output = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(&project)
+        .env("PATH", common::hermetic_path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("Old search git hooks"))
+        .unwrap_or_else(|| panic!("the old hook block must be reported:\n{stdout}"));
+    let first_init = line.find("skim init").expect("the line names skim init");
+    let uninstall = line
+        .find("skim init --uninstall")
+        .expect("the line names the way to remove skim completely");
+    assert_ne!(
+        first_init, uninstall,
+        "skim init must come before skim init --uninstall:\n{line}"
+    );
+    assert!(
+        line.contains("it needs an installed agent; with none it changes nothing"),
+        "the line must say what skim init does with no agent:\n{line}"
+    );
+    assert!(
+        line.contains("To remove skim completely, run skim init --uninstall"),
+        "the line must name --uninstall as the way to remove skim:\n{line}"
     );
 }
 

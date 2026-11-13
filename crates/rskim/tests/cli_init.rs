@@ -985,6 +985,31 @@ fn test_init_dry_run_reports_the_old_search_block_and_writes_nothing() {
     );
 }
 
+/// With no supported agent installed, `skim init` stops before it touches a hook.
+/// The `skim doctor` line for old search hooks says so, and this test keeps that
+/// line true: the hooks stay and the exit code is not 0.
+#[test]
+fn test_init_with_no_agent_leaves_the_old_search_hooks_alone() {
+    // `bare()` has no `.claude/`, so detection finds no agent.
+    let sandbox = Sandbox::bare();
+    let (project, hooks) = repo_with_old_search_hooks(&sandbox);
+    let before = snapshot_files(&hooks);
+
+    sandbox
+        .init()
+        .args(["--yes"])
+        .current_dir(&project)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No supported agents found"));
+
+    assert_eq!(
+        snapshot_files(&hooks),
+        before,
+        "skim init with no agent must not change a hook file"
+    );
+}
+
 /// `skim init --uninstall` removes the block also when no agent hook is
 /// installed: the block belongs to the repository, not to an agent.
 #[test]
