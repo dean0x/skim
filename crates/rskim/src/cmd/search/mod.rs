@@ -14,11 +14,21 @@
 //! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
 
 mod build_lock;
+// The classifier serves only the role agreement test until the scan engine
+// reads it; the engine commit lifts the `cfg(test)` gate.
+#[cfg(test)]
+mod classifier;
+#[cfg(test)]
+mod field;
+#[cfg(test)]
+mod fields;
 mod gitdir;
 pub(crate) mod hooks;
 mod index;
 mod manifest;
 mod query;
+#[cfg(test)]
+mod roles_tests;
 mod snippet;
 mod staleness;
 mod types;

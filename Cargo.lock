@@ -2566,6 +2566,7 @@ dependencies = [
  "rskim-compress",
  "rskim-contract",
  "rskim-core",
+ "rskim-oracle",
  "rskim-proxy",
  "rskim-search",
  "rskim-tokens",

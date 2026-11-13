@@ -1,0 +1,540 @@
+//! AST-aware field classifier that maps source byte ranges to [`SearchField`] variants.
+//!
+//! # Algorithm
+//!
+//! 1. The caller parses `source` once with [`rskim_core::Parser`] and passes the
+//!    tree to [`classify_tree`].
+//! 2. Walk the tree in pre-order, collecting non-`Other` `(Range, SearchField)` tuples.
+//!    Memory: O(AST nodes), not O(source bytes).
+//! 3. Process ranges in reverse (innermost/children first) using interval subtraction
+//!    against an "uncovered" set so that the deepest node wins each byte.
+//! 4. Fill uncovered gaps with `SearchField::Other`, then merge adjacent same-field
+//!    ranges.
+//!
+//! The classifier never parses and never fails. The caller bounds the source
+//! size before it parses.
+//!
+//! # Format-specific dispatchers
+//!
+//! Markdown and the data formats have their own classifiers:
+//!
+//! - Markdown: [`classify_tree`] routes a Markdown tree to a tree-sitter
+//!   classifier with custom heading-level logic.
+//! - JSON/YAML/TOML: lightweight std-only scanners. These formats have no
+//!   tree-sitter grammar, so they have no tree: [`classify_data_format`] takes
+//!   the source alone.
+//!
+//! Every other tree-sitter language takes the generic path in [`classify_tree`].
+//!
+//! # Invariants
+//!
+//! The returned `Vec` satisfies:
+//! - Sorted ascending by `range.start`.
+//! - Non-overlapping (no two ranges share a byte).
+//! - Contiguous (covers every byte from 0 to `source.len()`).
+//! - `sum(range.end - range.start) == source.len()`.
+//! - For empty source, an empty `Vec` is returned.
+
+use std::ops::Range;
+
+use rskim_core::Language;
+use tree_sitter::Tree;
+
+use super::field::SearchField;
+
+/// Returns `true` if `kind` is an identifier-family node type that receives
+/// context-aware field classification (AD-411-1).
+#[inline]
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "variable_name"
+            | "attribute_name"
+    )
+}
+
+/// Returns `true` if `kind` is a value/const/binding/field/variant declaration
+/// whose `name`-field child is a definition name that should receive a
+/// definition-tier field (AD-411-1, OD4).
+///
+/// These kinds are NOT in the priority 3,4,5 set but their name-child identifiers
+/// are definitions, not call sites.  Also includes C/C++ declarator helper nodes
+/// so their identifier children receive the SymbolName degradation (not FunctionBody)
+/// when the grammar does not use `"name"` as the field name.
+///
+/// See also [`is_container_decl_kind`] for the class/module container complement.
+#[inline]
+fn is_value_decl_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        // Rust
+        "const_item"
+            | "static_item"
+            | "let_declaration"
+            // TypeScript / JavaScript
+            | "lexical_declaration"
+            | "variable_declarator"
+            | "variable_declaration"
+            | "public_field_definition"
+            // Java / C# / Swift / Kotlin
+            | "field_declaration"
+            | "local_variable_declaration"
+            | "constant_declaration"
+            | "property_declaration"
+            // C / C++ declaration helpers (name is nested under declarator, not name:)
+            | "function_declarator"
+            | "declarator"
+            | "init_declarator"
+            | "pointer_declarator"
+            | "parameter_declaration"
+            // Go
+            | "var_declaration"
+            | "const_declaration"
+            | "short_var_declaration"
+            | "var_spec"
+            | "const_spec"
+            // Enum variants (Rust enum_variant, Java/Kotlin enum_entry)
+            | "enum_variant"
+            | "enum_entry"
+            // SQL: create_query holds the table/view/index name via name: identifier;
+            // column_definition holds the column name similarly.
+            // object_reference wraps the table name in CREATE TABLE via name: identifier
+            // (tree-sitter-sequel: create_table → object_reference → name: identifier).
+            // Adding it here ensures table names are never mis-classified as FunctionBody;
+            // they degrade to FunctionSignature (definition tier) even in reference
+            // contexts where the grandparent is not a CREATE statement.
+            | "create_query"
+            | "column_definition"
+            | "object_reference"
+    )
+}
+
+/// Returns `true` if `kind` is a class/module/impl container node (priority 2 in
+/// `rskim_core::node_kind_info`) whose `name:` field child is the container's own
+/// definition name and should rank at the [`SearchField::TypeDefinition`] tier rather
+/// than the call-site tier.
+///
+/// # Semantic rationale
+///
+/// `rskim_core::node_kind_priority` assigns class/module/namespace containers priority 2
+/// because the *truncation* algorithm (which shares the same table) must rank a class
+/// *body* lower than a function body — priority there governs body retention ordering,
+/// not the semantic tier of the class's *name*.  Consequently the `>= 3` threshold in
+/// [`map_identifier_to_field`] excludes these containers from the declaration check, and
+/// without this function the class *name* identifier falls through to
+/// [`SearchField::FunctionBody`] (call-site tier) — a cross-language inconsistency.
+///
+/// This function corrects that by marking all priority-2 container kinds as declaration
+/// contexts.  When their `name:` child is an [`is_identifier_kind`] identifier,
+/// `map_identifier_to_field` returns [`SearchField::TypeDefinition`] — the same tier
+/// used for Rust `struct_item` (priority 5) and Python `class_definition` (priority 5),
+/// giving class-based OO languages consistent definition-name ranking.
+///
+/// # Coverage of kinds whose identifier types are not yet in `is_identifier_kind`
+///
+/// Ruby `class` / `module` (name: `constant`), Kotlin `class_declaration`
+/// (name: `simple_identifier`), and C++ `namespace_definition`
+/// (name: `namespace_identifier`) use identifier types absent from
+/// [`is_identifier_kind`], so their name children are not routed to
+/// [`map_identifier_to_field`] today.  They are included here for
+/// forward-compatibility: when their identifier types are added to
+/// [`is_identifier_kind`] they will automatically inherit the correct tier.
+///
+/// # Effect of `impl_item` on ranking
+///
+/// Including `impl_item` in this function is **not** inert.  Its priority is 2
+/// in `rskim_core::node_kind_priority`, so without this function `parent_is_decl`
+/// would be `false` for `impl` blocks and their type/trait identifier children
+/// (`type_identifier` in `impl Foo` / `impl Trait for Foo`) would classify as
+/// [`SearchField::FunctionBody`].  With `impl_item` here, `parent_is_decl` is
+/// `true`; since the grammar field for those identifiers is `type:` / `trait:`
+/// (never `name:`), they route through the `field_name != Some("name")` branch
+/// and return [`SearchField::SymbolName`] — an intentional elevation above the
+/// call-site tier.  `impl` blocks bind behaviour to a named type or trait;
+/// ranking their identifiers at `SymbolName` improves search relevance for
+/// type/trait names without misclassifying them as full type definitions.
+///
+/// Go's `struct_type` and `interface_type` truly are inert: the type name lives
+/// in the enclosing `type_spec`, not as a direct identifier child of those nodes.
+///
+/// # Maintenance — keep in sync with priority-2 container kinds
+///
+/// This list intentionally duplicates the priority-2 container kinds from
+/// `rskim_core::node_kind_priority`.  The `>= 3` check in [`map_identifier_to_field`]
+/// cannot include priority-2 kinds (priority 2 governs body-retention ordering in
+/// the truncation algorithm, not semantic tier), so this function bridges the gap.
+/// When a new grammar assigns priority 2 to a container kind, add it here as well
+/// so its definition name receives the correct [`SearchField::TypeDefinition`] tier.
+#[inline]
+fn is_container_decl_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        // TS / JS / Java / C# / Kotlin — class definitions (name: identifier or type_identifier)
+        "class_declaration"
+            // C++ — class/struct definitions (name: type_identifier)
+            | "class_specifier"
+            // Ruby — class (name: constant, not yet in is_identifier_kind; harmless today)
+            | "class"
+            // Ruby / TS / JS — module (name: constant or identifier)
+            | "module"
+            | "module_declaration"
+            // Rust — impl blocks (field `type:`/`trait:`, not `name:`): identifier
+            // children return SymbolName via field_name != Some("name") — intentional
+            // elevation of impl type/trait references above call-site tier.
+            | "impl_item"
+            // C++ / C# — namespaces (name: namespace_identifier — not in is_identifier_kind)
+            | "namespace_definition"
+            | "namespace_declaration"
+            // Go — interface_type / struct_type: type name lives in the enclosing
+            // type_spec, not as a direct identifier child — truly inert.
+            | "interface_type"
+            | "struct_type"
+    )
+}
+
+/// Map an identifier node to a [`SearchField`] using parent context.
+///
+/// # AD-411-1
+///
+/// Declaration-name rule: an identifier-family node is a "declaration name"
+/// iff `cursor.field_name()` returns `Some("name")` AND its direct parent is a
+/// declaration kind (priority 3/4/5, a value/const/binding/field/variant kind,
+/// OR a class/module container kind — see [`is_container_decl_kind`]).
+///
+/// - `field_name == Some("name")` + parent priority 4 (fn) → [`SearchField::FunctionSignature`]
+/// - `field_name == Some("name")` + parent priority 5 (type) → [`SearchField::TypeDefinition`]
+/// - `field_name == Some("name")` + parent priority 3 (import) → [`SearchField::ImportExport`]
+/// - `field_name == Some("name")` + parent is container-decl kind → [`SearchField::TypeDefinition`]
+///   (class / module / namespace names rank at the type-definition tier — cross-language
+///   consistency fix for TS/JS/Java/C++/C# `class Foo {}` names; AD-411-1 container rule)
+/// - `field_name == Some("name")` + parent is value-decl kind → [`SearchField::FunctionSignature`]
+///   (const/value/binding definition names map to FunctionSignature, so a
+///   const definition is a definition-tier field and `SymbolName` stays the
+///   degradation tier for grammars without a `name:` field)
+/// - `field_name != Some("name")` + parent is ANY declaration kind →
+///   [`SearchField::SymbolName`] (degradation: grammar uses a different field
+///   name; never ranks below today's unconditional SymbolName — OD4 guarantee)
+/// - otherwise (non-declaration parent) → [`SearchField::FunctionBody`]
+///   (call sites, references, and type-reference identifiers)
+fn map_identifier_to_field(
+    field_name: Option<&'static str>,
+    parent_kind: Option<&'static str>,
+) -> SearchField {
+    let parent = match parent_kind {
+        Some(k) => k,
+        None => return SearchField::FunctionBody,
+    };
+
+    let parent_priority = rskim_core::node_kind_priority(parent);
+    let parent_is_decl =
+        parent_priority >= 3 || is_value_decl_kind(parent) || is_container_decl_kind(parent);
+
+    if !parent_is_decl {
+        // Not in any declaration context → call site / reference / type reference.
+        return SearchField::FunctionBody;
+    }
+
+    if field_name != Some("name") {
+        // In a declaration but field_name is not "name": the grammar uses a
+        // different field for its declaration name child (e.g. C's `declarator:`
+        // or Kotlin's `simple_identifier`).  Degrade to SymbolName — guaranteed
+        // not worse than the old unconditional SymbolName path (OD4).
+        return SearchField::SymbolName;
+    }
+
+    // Container kinds (priority 2) define named types / modules.  Their `name:`
+    // identifier child is a type-definition name, not a call site.
+    // AD-411-1 container rule: map to TypeDefinition for cross-language consistency
+    // with Rust struct_item (priority 5) and Python class_definition (priority 5).
+    if is_container_decl_kind(parent) {
+        return SearchField::TypeDefinition;
+    }
+
+    // We are the "name:" field child of a priority-3/4/5 declaration — inherit field.
+    match parent_priority {
+        5 => SearchField::TypeDefinition,
+        4 => SearchField::FunctionSignature,
+        3 => SearchField::ImportExport,
+        _ => {
+            // Parent is a value/const/binding/field/variant declaration (priority < 3,
+            // caught by is_value_decl_kind above).
+            // Map to FunctionSignature: mapping const/value names to it keeps
+            // SymbolName as the degradation tier for grammars without a "name:"
+            // field, rather than the primary const-definition tier. The name is
+            // semantically loose but tier-correct: these are definitions.
+            SearchField::FunctionSignature
+        }
+    }
+}
+
+/// Map a non-identifier AST node to a [`SearchField`].
+///
+/// Handles comments, string literals, body blocks, and priority-based
+/// classification.  Identifier-family nodes are dispatched separately by
+/// [`map_identifier_to_field`] which has access to cursor context (AD-411-1).
+///
+/// # Coupling
+///
+/// The specific node kinds matched here (comments, strings, body blocks) are
+/// kept in sync with `rskim_core::transform::utils::node_kind_info` and
+/// `rskim_core::transform::utils::find_body_child`.  Any new node kind
+/// categories added to those functions may need a corresponding case here.
+fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
+    // First check for specific comment/string kinds regardless of priority.
+    match kind {
+        "comment" | "line_comment" | "block_comment" | "doc_comment" => {
+            return SearchField::Comment;
+        }
+        "string_literal"
+        | "string"
+        | "interpreted_string_literal"
+        | "raw_string_literal"
+        | "string_content"
+        | "raw_str_literal"
+        | "template_string"
+        | "template_literal"
+        | "quoted_string" => {
+            return SearchField::StringLiteral;
+        }
+        // Body/block nodes → FunctionBody.
+        //
+        // Without this arm, block nodes return Other from the priority match
+        // below (priority 1) and are skipped by the innermost-wins rule
+        // (Other is the default fill — we only overwrite non-Other). The parent
+        // function node has already stamped those bytes as FunctionSignature,
+        // so they remain FunctionSignature even though they are body bytes.
+        // That would label every body byte as part of the signature.
+        //
+        // Kinds here mirror rskim_core::transform::utils::find_body_child (the
+        // union of all body kinds across supported languages).
+        "block"              // Rust, Python, Go, Java, C#, Kotlin
+        | "statement_block" // TypeScript, JavaScript
+        | "compound_statement" // C, C++
+        | "constructor_body"   // Java
+        | "body_statement"     // Ruby
+        | "function_body" => {
+            // Kotlin, Swift
+            return SearchField::FunctionBody;
+        }
+        _ => {}
+    }
+
+    match priority {
+        5 => SearchField::TypeDefinition,
+        4 => SearchField::FunctionSignature,
+        3 => SearchField::ImportExport,
+        _ => SearchField::Other,
+    }
+}
+
+/// Classify the bytes of the data formats (JSON, YAML, TOML), which have no
+/// tree-sitter grammar and so no tree.
+///
+/// Returns `None` for every other language: those take [`classify_tree`].
+/// Otherwise returns a sorted, non-overlapping, contiguous list of
+/// `(Range<usize>, SearchField)` tuples covering every byte from `0` to
+/// `source.len()`, or an empty vector for empty source.
+pub(super) fn classify_data_format(
+    source: &str,
+    lang: Language,
+) -> Option<Vec<(Range<usize>, SearchField)>> {
+    match lang {
+        Language::Json => Some(super::fields::serde_fields::classify_json(source)),
+        Language::Yaml => Some(super::fields::serde_fields::classify_yaml(source)),
+        Language::Toml => Some(super::fields::serde_fields::classify_toml(source)),
+        _ => None,
+    }
+}
+
+/// Classify all bytes in `source` according to their AST-derived field.
+///
+/// `tree` must be the parse of `source` for `lang` (the TSX grammar for a
+/// `.tsx` file). Returns a sorted, non-overlapping, contiguous list of
+/// `(Range<usize>, SearchField)` tuples covering every byte from `0` to
+/// `source.len()`, or an empty vector for empty source.
+pub(super) fn classify_tree(
+    tree: &Tree,
+    source: &str,
+    lang: Language,
+) -> Vec<(Range<usize>, SearchField)> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let len = source.len();
+
+    // Markdown needs custom heading-level logic.
+    if lang == Language::Markdown {
+        return super::fields::markdown::classify_markdown(tree, source);
+    }
+
+    // Generic tree-sitter path for all other languages.
+    let root = tree.root_node();
+
+    // Collect non-Other AST node ranges in pre-order (parents before children).
+    // Memory: O(AST_nodes) instead of the previous O(source_bytes) per-byte array.
+    let mut node_ranges: Vec<(Range<usize>, SearchField)> = Vec::new();
+
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        let byte_range = node.byte_range();
+
+        // Clamp range to source bounds (safety against malformed AST).
+        let start = byte_range.start.min(len);
+        let end = byte_range.end.min(len);
+
+        if start < end {
+            let kind = node.kind();
+
+            // AD-411-1: identifier-family nodes receive context-aware field
+            // classification — their field depends on whether they are the
+            // declaration name child of a declaring parent node.
+            let field = if is_identifier_kind(kind) {
+                // cursor.field_name() returns the field name of the current node
+                // within its parent (e.g. Some("name") for `name:` fields).
+                // node.parent().map(|p| p.kind()) is always &'static str in
+                // tree-sitter 0.25 (grammar node kinds are interned statics).
+                let field_name = cursor.field_name();
+                let parent_kind = node.parent().map(|p| p.kind());
+                map_identifier_to_field(field_name, parent_kind)
+            } else {
+                let priority = rskim_core::node_kind_priority(kind);
+                map_priority_to_field(kind, priority)
+            };
+
+            if field != SearchField::Other {
+                node_ranges.push((start..end, field));
+            }
+        }
+
+        // Advance cursor in pre-order.
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return build_field_ranges(node_ranges, len);
+            }
+        }
+    }
+}
+
+/// Build the final contiguous range list from pre-order node ranges.
+///
+/// Implements "innermost wins": processes ranges in reverse (children first)
+/// so deeper nodes claim bytes before their parents. Uncovered bytes become
+/// [`SearchField::Other`]. Adjacent same-field ranges are merged.
+///
+/// # Preconditions
+///
+/// - `node_ranges` must be in **pre-order** (parents before children). The
+///   reverse-iteration loop relies on children appearing after their parents.
+/// - Ranges may overlap; the algorithm resolves overlaps via interval subtraction
+///   so the deepest (innermost) node wins each byte.
+/// - `source_len` must equal the byte length of the source that was parsed.
+///
+/// # Output guarantees
+///
+/// The returned `Vec` is:
+/// - Sorted ascending by `range.start`.
+/// - Non-overlapping (no two ranges share a byte).
+/// - Contiguous (covers every byte `0..source_len`).
+/// - `sum(range.end - range.start) == source_len`.
+/// - For empty input (`node_ranges.is_empty()`), returns a single `Other`
+///   range covering `0..source_len`.
+pub(super) fn build_field_ranges(
+    node_ranges: Vec<(Range<usize>, SearchField)>,
+    source_len: usize,
+) -> Vec<(Range<usize>, SearchField)> {
+    if node_ranges.is_empty() {
+        return vec![(0..source_len, SearchField::Other)];
+    }
+
+    // Track which byte intervals are still unclaimed. Starts as the full source.
+    // Double-buffer to reuse allocations across iterations.
+    let mut uncovered: Vec<Range<usize>> = vec![];
+    uncovered.push(0..source_len);
+    let mut next_uncovered: Vec<Range<usize>> = Vec::new();
+    let mut result: Vec<(Range<usize>, SearchField)> = Vec::with_capacity(node_ranges.len() * 2);
+
+    // Reverse: children (later in pre-order) claim bytes before parents.
+    for (range, field) in node_ranges.into_iter().rev() {
+        next_uncovered.clear();
+
+        for unc in &uncovered {
+            if unc.end <= range.start || unc.start >= range.end {
+                // No overlap — interval stays uncovered.
+                next_uncovered.push(unc.clone());
+            } else {
+                // Overlap — split around the claimed region.
+                if unc.start < range.start {
+                    next_uncovered.push(unc.start..range.start);
+                }
+                result.push((unc.start.max(range.start)..unc.end.min(range.end), field));
+                if unc.end > range.end {
+                    next_uncovered.push(range.end..unc.end);
+                }
+            }
+        }
+
+        std::mem::swap(&mut uncovered, &mut next_uncovered);
+    }
+
+    // Remaining uncovered bytes → Other.
+    for gap in uncovered {
+        result.push((gap, SearchField::Other));
+    }
+
+    result.sort_unstable_by_key(|(r, _)| r.start);
+    merge_adjacent(&mut result);
+    result
+}
+
+/// Merge adjacent ranges that share the same field into a single range.
+pub(super) fn merge_adjacent(ranges: &mut Vec<(Range<usize>, SearchField)>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        if ranges[read].1 == ranges[write].1 && ranges[read].0.start == ranges[write].0.end {
+            ranges[write].0.end = ranges[read].0.end;
+        } else {
+            write += 1;
+            ranges[write] = ranges[read].clone();
+        }
+    }
+    ranges.truncate(write + 1);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+/// Parse `source` as `lang` and classify it, for any language: the data
+/// formats take [`classify_data_format`], every other language is parsed and
+/// takes [`classify_tree`].
+#[cfg(test)]
+pub(super) fn classify_source(
+    source: &str,
+    lang: Language,
+) -> rskim_core::Result<Vec<(Range<usize>, SearchField)>> {
+    if let Some(ranges) = classify_data_format(source, lang) {
+        return Ok(ranges);
+    }
+    let mut parser = rskim_core::Parser::new(lang)?;
+    let tree = parser.parse(source)?;
+    Ok(classify_tree(&tree, source, lang))
+}
+
+#[cfg(test)]
+#[path = "classifier_tests.rs"]
+mod tests;

@@ -75,3 +75,6 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 filetime = { workspace = true }
 rskim-contract = { path = "../rskim-contract" }
+# The role oracle of the scoreboard: the agreement test of the search roles
+# (cmd/search/roles_tests.rs) reads it. The oracle depends on no rskim crate.
+rskim-oracle = { path = "../rskim-oracle" }
