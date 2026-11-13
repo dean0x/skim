@@ -214,7 +214,7 @@ fn build_query(flags: &QueryFlags) -> Result<(ScanQuery, QueryInfo), UsageError>
                 ignore_case: matcher.is_case_insensitive(),
             };
             let query = ScanQuery {
-                plan: QueryPlan::Pattern(matcher),
+                plan: QueryPlan::Pattern(Box::new(matcher)),
                 identifier: *identifier,
             };
             Ok((query, info))

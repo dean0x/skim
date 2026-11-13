@@ -48,7 +48,7 @@ fn matcher(pattern: &str) -> Matcher {
 
 fn pattern(p: &str, identifier: bool) -> ScanQuery {
     ScanQuery {
-        plan: QueryPlan::Pattern(matcher(p)),
+        plan: QueryPlan::Pattern(Box::new(matcher(p))),
         identifier,
     }
 }
@@ -459,8 +459,13 @@ fn a_matched_file_above_the_walk_node_cap_is_unlabelled_with_walk_cap() {
     // Three syntax nodes per statement: more than the 100,000 node cap.
     let source = format!("needle;\n{}", "x;\n".repeat(60_000));
     tree.write("wide.js", &source);
+    // A slow runner must not reach the parse time bound first.
+    let limits = Limits {
+        parse_time: Duration::from_secs(60),
+        ..Limits::default()
+    };
 
-    let out = scan(&tree, &pattern("needle", true), Limits::default(), 0);
+    let out = scan(&tree, &pattern("needle", true), limits, 0);
 
     let f = file(&out, "wide.js");
     assert_eq!(f.unlabelled, Some(Unlabelled::WalkCap));

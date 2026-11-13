@@ -113,8 +113,9 @@ pub(super) fn pool_threads(available: usize) -> usize {
 
 /// What the scan looks for.
 pub(super) enum QueryPlan {
-    /// One pattern: the labelled view.
-    Pattern(Matcher),
+    /// One pattern: the labelled view. The matcher is boxed, because it is
+    /// much larger than the word list.
+    Pattern(Box<Matcher>),
     /// Several plain words: the word view. A line matches when it holds any
     /// word.
     Words(Vec<Matcher>),
