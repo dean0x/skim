@@ -327,26 +327,42 @@ jobs:
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
 
-          # Publish rskim-core first (rskim depends on it)
-          CORE_PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/rskim-core/${VERSION}" \
-            -H "User-Agent: skim-release-workflow" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('version') else 'no')" 2>/dev/null || echo "no")
-          if [ "$CORE_PUBLISHED" = "yes" ]; then
-            echo "rskim-core ${VERSION} already published on crates.io — skipping"
-          else
-            cargo publish -p rskim-core --allow-dirty
-          fi
+          # Dependency order: each crate publishes after every crate it
+          # depends on (normal and versioned dev-dependencies).
+          #   rskim-core      — none
+          #   rskim-contract  — none
+          #   rskim-llm       — none
+          #   rskim-tokens    — rskim-core (dev)
+          #   rskim-compress  — rskim-contract, rskim-llm
+          #   rskim-proxy     — rskim-contract, rskim-llm (optional)
+          #   rskim           — rskim-core, rskim-compress, rskim-tokens,
+          #                     rskim-contract + rskim-proxy (feature `proxy`)
+          # scripts/release-prep.sh bumps the same set; keep the two lists in sync.
+          CRATES="rskim-core rskim-contract rskim-llm rskim-tokens rskim-compress rskim-proxy rskim"
 
-          # Wait for crates.io to index the new version before publishing rskim
-          sleep 30
+          # Check every crate before the first publish, so a version drift
+          # stops the job with nothing published.
+          for crate in $CRATES; do
+            CRATE_VERSION=$(grep '^version = ' "crates/${crate}/Cargo.toml" | head -1 | sed 's/version = "\(.*\)"/\1/')
+            if [ "$CRATE_VERSION" != "$VERSION" ]; then
+              echo "❌ ERROR: crates/${crate}/Cargo.toml is at '${CRATE_VERSION}', tag is v${VERSION}"
+              echo "Run ./scripts/release-prep.sh ${VERSION} to bump every published crate."
+              exit 1
+            fi
+          done
+          echo "✅ All published crates at ${VERSION}"
 
-          # Publish rskim
-          RSKIM_PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/rskim/${VERSION}" \
-            -H "User-Agent: skim-release-workflow" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('version') else 'no')" 2>/dev/null || echo "no")
-          if [ "$RSKIM_PUBLISHED" = "yes" ]; then
-            echo "rskim ${VERSION} already published on crates.io — skipping"
-          else
-            cargo publish -p rskim --allow-dirty
-          fi
+          # `cargo publish` waits until crates.io has indexed the new version,
+          # so the next crate in the list can resolve it.
+          for crate in $CRATES; do
+            PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/${crate}/${VERSION}" \
+              -H "User-Agent: skim-release-workflow" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('version') else 'no')" 2>/dev/null || echo "no")
+            if [ "$PUBLISHED" = "yes" ]; then
+              echo "${crate} ${VERSION} already published on crates.io — skipping"
+            else
+              cargo publish -p "${crate}" --allow-dirty
+            fi
+          done
 
   publish-npm:
     name: Publish npm packages

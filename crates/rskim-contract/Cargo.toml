@@ -1,14 +1,14 @@
 [package]
 name = "rskim-contract"
-version = "0.1.0"
+version = "2.11.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "Safety invariant contract and fail-open guardrail module for skim Layer 3"
 repository = "https://github.com/dean0x/skim"
-# publish = false matching rskim-tokens precedent.
 # Layer-3 crate: no l3- infix per Decision 2 / #309 naming convention.
-publish = false
+# Published to crates.io in lockstep with `rskim`, which depends on it.
+# scripts/release-prep.sh bumps this version with the others.
 
 [dependencies]
 serde = { workspace = true }
