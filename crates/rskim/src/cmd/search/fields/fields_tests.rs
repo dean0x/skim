@@ -222,6 +222,38 @@ fn f_json_09_depth_beyond_max_json_depth_cap() {
     );
 }
 
+/// F-JSON-10: every string of an array inside an object is a value, not a key.
+///
+/// A comma inside an array must not put the enclosing object back to "expect a
+/// key": that gave the second and later strings of an array the key field.
+#[test]
+fn f_json_10_every_string_of_an_array_in_an_object_is_a_string_literal() {
+    let source = r#"{"files": ["a", "b", "c"], "next": "d"}"#;
+    let ranges = classify_json(source);
+    assert_contiguous(&ranges, source.len());
+
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""a""#, r#""b""#, r#""c""#, r#""d""#],
+        "ranges: {ranges:?}"
+    );
+}
+
+/// F-JSON-11: arrays nested in arrays and objects in arrays keep their own
+/// key and value positions.
+#[test]
+fn f_json_11_nested_arrays_and_objects_in_arrays_keep_key_and_value_positions() {
+    let source = r#"{"a": [["x", "y"], {"k": "v", "l": ["w", "z"]}], "b": "u"}"#;
+    let ranges = classify_json(source);
+    assert_contiguous(&ranges, source.len());
+
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""x""#, r#""y""#, r#""v""#, r#""w""#, r#""z""#, r#""u""#],
+        "keys must not be string literals; ranges: {ranges:?}"
+    );
+}
+
 // ============================================================================
 // YAML tests
 // ============================================================================
@@ -543,6 +575,47 @@ fn f_toml_11_escaped_eq_in_quoted_key() {
     assert!(
         sym_texts.iter().any(|t| t.contains("path=here")),
         "quoted key with '=' inside must be a single SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
+    );
+}
+
+/// F-TOML-12: a backslash before a line end stays inside its line.
+///
+/// A basic string whose last byte before the line end is a backslash must not
+/// carry the scan past the line end: that put the inline-comment scan out of
+/// range and stopped the whole scan. Each input here is a file that holds the
+/// bad line.
+#[test]
+fn f_toml_12_backslash_before_a_line_end_does_not_leave_the_line() {
+    for source in [
+        "a = \"x\\\n\"\n",
+        "a = \"\\\n",
+        "a = \"x\\\nb = 1\n",
+        "a = \"x\\\r\n",
+        "a = \"x\\",
+    ] {
+        let ranges = classify_toml(source);
+        assert_contiguous(&ranges, source.len());
+        assert_field_lengths_sum(&ranges, source.len());
+    }
+}
+
+/// F-TOML-13: the line after a line that ends in a backslash is classified on
+/// its own: its string is a string, its comment is a comment.
+#[test]
+fn f_toml_13_the_line_after_a_backslash_line_end_is_classified_on_its_own() {
+    let source = "a = \"x\\\nb = \"y\" # note\n";
+    let ranges = classify_toml(source);
+    assert_contiguous(&ranges, source.len());
+
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"x\\", "\"y\""],
+        "ranges: {ranges:?}"
+    );
+    assert_eq!(
+        field_text(source, &ranges, SearchField::Comment),
+        vec!["# note"],
+        "ranges: {ranges:?}"
     );
 }
 

@@ -37,6 +37,14 @@ use super::fill_gaps_and_merge;
 // JSON scanner
 // ============================================================================
 
+/// One open JSON container on the scanner stack.
+enum JsonFrame {
+    /// An open `{`. `expect_key` is true when the next string is a key.
+    Object { expect_key: bool },
+    /// An open `[`. Every string in it is a value.
+    Array,
+}
+
 /// Classify byte ranges in a JSON source string.
 ///
 /// Field mapping:
@@ -56,21 +64,26 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
 
     let mut ranges: Vec<(Range<usize>, SearchField)> = Vec::new();
 
-    // Maximum nesting depth tracked on `in_key_stack`. Beyond this depth we
-    // still parse correctly (brace_depth keeps counting) but stop pushing new
+    // Maximum nesting depth tracked on `frames`. Beyond this depth we still
+    // parse correctly (`open_depth` keeps counting) but stop pushing new
     // entries to avoid unbounded heap growth on pathologically deep input.
     const MAX_JSON_DEPTH: usize = 1024;
 
     // Stack-based depth tracking:
     // - brace_depth: count of currently open `{` objects
     // - bracket_depth: count of currently open `[` arrays
-    // - in_key: true when we expect to read a key (vs. a value) at current depth
+    // - open_depth: count of currently open `{` and `[` together
+    // - frames: one entry per open container (up to MAX_JSON_DEPTH), innermost
+    //   last. An object frame says whether we expect to read a key (vs. a
+    //   value) at its position:
     //   * starts true at object open `{`
     //   * flips to false after reading the key's `:` separator
-    //   * flips back to true after `,` or `{`
+    //   * flips back to true after `,`
+    //   An array frame has no key position, so `,` and `:` leave it alone.
     let mut brace_depth: usize = 0;
     let mut bracket_depth: usize = 0;
-    let mut in_key_stack: Vec<bool> = Vec::new(); // one entry per `{` opened (up to MAX_JSON_DEPTH)
+    let mut open_depth: usize = 0;
+    let mut frames: Vec<JsonFrame> = Vec::new();
     let mut i = 0;
 
     while i < len {
@@ -78,42 +91,54 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
         match b {
             b'{' => {
                 brace_depth += 1;
+                open_depth += 1;
                 // Start of an object: next token expected is a key (or `}`).
                 // Only track state up to MAX_JSON_DEPTH to bound heap usage.
-                if brace_depth <= MAX_JSON_DEPTH {
-                    in_key_stack.push(true);
+                if open_depth <= MAX_JSON_DEPTH {
+                    frames.push(JsonFrame::Object { expect_key: true });
                 }
                 i += 1;
             }
             b'}' => {
-                // Only pop if we pushed: opening braces beyond MAX_JSON_DEPTH
-                // do not push, so closing ones must not pop. Check before
-                // saturating_sub so the comparison uses the pre-decrement depth.
-                if brace_depth <= MAX_JSON_DEPTH {
-                    in_key_stack.pop();
+                // Only pop if we pushed: containers opened beyond
+                // MAX_JSON_DEPTH do not push, so closing ones must not pop.
+                // Check before saturating_sub so the comparison uses the
+                // pre-decrement depth.
+                if open_depth <= MAX_JSON_DEPTH {
+                    frames.pop();
                 }
+                open_depth = open_depth.saturating_sub(1);
                 brace_depth = brace_depth.saturating_sub(1);
                 i += 1;
             }
             b'[' => {
                 bracket_depth += 1;
+                open_depth += 1;
+                if open_depth <= MAX_JSON_DEPTH {
+                    frames.push(JsonFrame::Array);
+                }
                 i += 1;
             }
             b']' => {
+                if open_depth <= MAX_JSON_DEPTH {
+                    frames.pop();
+                }
+                open_depth = open_depth.saturating_sub(1);
                 bracket_depth = bracket_depth.saturating_sub(1);
                 i += 1;
             }
             b':' => {
                 // Separator between key and value: flip to "expecting value".
-                if let Some(top) = in_key_stack.last_mut() {
-                    *top = false;
+                if let Some(JsonFrame::Object { expect_key }) = frames.last_mut() {
+                    *expect_key = false;
                 }
                 i += 1;
             }
             b',' => {
-                // After a value: flip back to "expecting key" if we're in an object.
-                if let Some(top) = in_key_stack.last_mut() {
-                    *top = true;
+                // After a value: flip back to "expecting key" if the
+                // innermost container is an object.
+                if let Some(JsonFrame::Object { expect_key }) = frames.last_mut() {
+                    *expect_key = true;
                 }
                 i += 1;
             }
@@ -122,12 +147,11 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 let str_start = i;
                 let str_end = scan_json_string(bytes, i);
 
-                let in_key = in_key_stack.last().copied().unwrap_or(false);
-                let in_object = !in_key_stack.is_empty();
+                let is_key = matches!(frames.last(), Some(JsonFrame::Object { expect_key: true }));
                 // bracket_depth > 0 means we're inside an array.
                 let inside_array_at_root = bracket_depth > 0 && brace_depth <= bracket_depth;
 
-                if in_object && in_key {
+                if is_key {
                     // Key string: determine whether this should be TypeDefinition or SymbolName.
                     // TypeDefinition: depth-0 key (brace_depth == 1) AND value is object/array.
                     let field = if brace_depth == 1 && !inside_array_at_root {
@@ -561,7 +585,7 @@ fn classify_toml_value(
                 *i = end;
             } else {
                 // Single-line basic string.
-                let end = scan_single_quote_toml(bytes, val_start, b'"', len);
+                let end = scan_single_quote_toml(bytes, val_start, b'"', eol);
                 ranges.push((val_start..end, SearchField::StringLiteral));
                 // Look for inline comment.
                 classify_toml_inline_comment(bytes, end, eol, ranges);
@@ -576,7 +600,7 @@ fn classify_toml_value(
                 *i = end;
             } else {
                 // Single-line literal string.
-                let end = scan_single_quote_toml(bytes, val_start, b'\'', len);
+                let end = scan_single_quote_toml(bytes, val_start, b'\'', eol);
                 ranges.push((val_start..end, SearchField::StringLiteral));
                 classify_toml_inline_comment(bytes, end, eol, ranges);
             }
@@ -600,8 +624,11 @@ fn classify_toml_inline_comment(
     eol: usize,
     ranges: &mut Vec<(Range<usize>, SearchField)>,
 ) {
-    // Look for ` #` pattern (space + hash) between `from` and `eol`.
-    let region = &bytes[from..eol];
+    // Look for ` #` pattern (space + hash) between `from` and `eol`. A range
+    // that does not lie in the source holds no comment.
+    let Some(region) = bytes.get(from..eol) else {
+        return;
+    };
     for (j, &b) in region.iter().enumerate() {
         if b == b'#' {
             let hash_abs = from + j;
@@ -654,11 +681,16 @@ fn find_toml_eq_sign(content: &[u8]) -> Option<usize> {
 
 /// Scan a single-line TOML string (basic `"..."` or literal `'...'`).
 ///
-/// Returns the byte offset after the closing delimiter.
-fn scan_single_quote_toml(bytes: &[u8], start: usize, delim: u8, len: usize) -> usize {
-    debug_assert!(start < len && bytes[start] == delim);
+/// `eol` is the byte offset of the line end (the `\n`, or the source length on
+/// the last line). The scan never goes past it: a backslash before the line
+/// end escapes nothing, because a basic string has no line continuation.
+///
+/// Returns the byte offset after the closing delimiter, or `eol` when the
+/// string is unterminated.
+fn scan_single_quote_toml(bytes: &[u8], start: usize, delim: u8, eol: usize) -> usize {
+    debug_assert!(start < eol && eol <= bytes.len() && bytes[start] == delim);
     let mut i = start + 1;
-    while i < len {
+    while i < eol {
         let b = bytes[i];
         if b == delim {
             return i + 1;
@@ -668,13 +700,9 @@ fn scan_single_quote_toml(bytes: &[u8], start: usize, delim: u8, len: usize) -> 
             i += 2;
             continue;
         }
-        if b == b'\n' {
-            // Unterminated single-line string.
-            return i;
-        }
         i += 1;
     }
-    len
+    eol
 }
 
 /// Scan a multi-line TOML triple-quoted string to its closing `"""` or `'''`.

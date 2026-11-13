@@ -282,6 +282,26 @@ fn a_lockfile_a_text_file_and_an_extensionless_script_are_searched() {
 }
 
 #[test]
+fn a_toml_file_with_a_backslash_before_a_line_end_does_not_stop_the_query() {
+    let repo = SearchRepo::new();
+    repo.write("conf/path.toml", "needle = \"C:\\\n\"\n");
+    repo.write("src/lib.rs", "pub fn needle() {}\n");
+    repo.track_all();
+
+    let run = repo.search(&["needle", "--all"]);
+
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert_eq!(run.stderr, "");
+    assert_eq!(
+        run.stdout,
+        "def src/lib.rs:1-1: pub fn needle() {}\n\
+         text: 1 line in 1 file\n\
+         conf/path.toml:1: needle = \"C:\\\n\
+         total: 2 lines in 2 files, all listed or counted; 2 files searched, 0 left out\n"
+    );
+}
+
+#[test]
 fn a_tracked_env_file_is_listed_and_a_glob_leaves_it_out() {
     let repo = launch_repo();
     let listed = repo.search(&["-l", "launch_worker"]);
