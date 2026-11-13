@@ -145,14 +145,17 @@ if [ ${#TRACKED_MANIFESTS[@]} -eq 0 ]; then
   exit 1
 fi
 
-BAD_PINS=$(grep -nE '^rskim-[a-z-]+ = \{.*version *=' "${TRACKED_MANIFESTS[@]}" \
+# Candidates: an inline pin in any spelling (indented, dotted key, `version`
+# after `path`), a renamed dependency (`package = "rskim-..."`), or a table
+# form (`[dependencies.rskim-...]`, also quoted target tables). Every
+# candidate that is not the one canonical form at the current version fails.
+BAD_PINS=$(grep -nE "(^[[:space:]]*rskim-[a-z-]+[[:space:]]*[.=].*version)|(package[[:space:]]*=[[:space:]]*\"rskim-)|(^[[:space:]]*\[.*dependencies\.[\"']?rskim-)" \
+  "${TRACKED_MANIFESTS[@]}" \
   | grep -vE ":[0-9]+:rskim-[a-z-]+ = \{ *version = \"${OLD_RE}\"" || true)
-TABLE_FORMS=$(grep -nE '^\[[a-z.-]*dependencies\.rskim-' "${TRACKED_MANIFESTS[@]}" || true)
 
-if [ -n "$BAD_PINS" ] || [ -n "$TABLE_FORMS" ]; then
+if [ -n "$BAD_PINS" ]; then
   echo -e "${RED}✗${RESET} Internal dependency pins that the bump can not update:"
-  [ -n "$BAD_PINS" ] && echo "$BAD_PINS"
-  [ -n "$TABLE_FORMS" ] && echo "$TABLE_FORMS"
+  echo "$BAD_PINS"
   echo "  Write each as: rskim-<name> = { version = \"${OLD_VERSION}\", path = \"...\" }"
   exit 1
 fi
@@ -187,8 +190,9 @@ fi
 echo -e "${GREEN}✓${RESET} cargo clippy"
 
 echo "Running cargo test --all-features (this may take a while)..."
-TEST_OUTPUT=$(cargo test --all-features 2>&1)
-TEST_EXIT=$?
+# `|| TEST_EXIT=$?` keeps `set -e` from ending the script before the tail prints.
+TEST_EXIT=0
+TEST_OUTPUT=$(cargo test --all-features 2>&1) || TEST_EXIT=$?
 
 if [ $TEST_EXIT -ne 0 ]; then
   echo "$TEST_OUTPUT" | tail -20
@@ -234,6 +238,19 @@ if [ -n "$LEFT_OVER" ]; then
   exit 1
 fi
 echo -e "${GREEN}✓${RESET} no $OLD_VERSION left in the version lines"
+
+NEW_RE="${NEW_VERSION//./\\.}"
+for manifest in "${PUBLISHED_MANIFESTS[@]}"; do
+  if ! grep -q "^version = \"${NEW_RE}\"$" "$manifest"; then
+    echo -e "${RED}✗${RESET} $manifest — package version is not $NEW_VERSION after the bump"
+    exit 1
+  fi
+done
+if [ "$(grep -c "\*\*Current\*\*: v${NEW_RE} — Stable" "$README" || true)" != "1" ]; then
+  echo -e "${RED}✗${RESET} README.md — status line is not v$NEW_VERSION after the bump"
+  exit 1
+fi
+echo -e "${GREEN}✓${RESET} ${#PUBLISHED_MANIFESTS[@]} published crates and README.md at $NEW_VERSION"
 
 echo ""
 echo "── Updating Cargo.lock ──"
