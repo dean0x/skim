@@ -54,7 +54,9 @@ version: 9
 - **KB-AP-3** Do not treat a name that is missing from the declaration scan as absent when `DeclScan.truncated` is true.
   The file gets the `walk_cap` reason under `unlabelled`.
 - **KB-AP-4** Use only two stderr forms: `skim search: <message>` (always on) and `skim search [debug]: <message>` (only
-  with `SKIM_DEBUG=1`, through `crate::debug_log!`). Add no sub-qualifier.
+  with `SKIM_DEBUG=1`, through `crate::debug_log!`). Add no sub-qualifier. The one exception is the shared elision
+  marker (`[skim] lines elided beyond N of M — ...`) that `output::elision_marker_with_remedy` gives a bound that hides
+  lines.
 
 ## Overview
 
