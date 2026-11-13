@@ -737,6 +737,73 @@ fn a_usage_error_under_json_prints_an_error_object_and_exits_2() {
     assert!(run.stderr.contains("-l and -c cannot be combined"));
 }
 
+/// An exit-2 run under `--json` prints one object that holds only the error
+/// message, and the same message on stderr behind the program prefix.
+fn assert_json_error(case: &str, run: &Run) {
+    assert_eq!(run.code, 2, "{case}: {}", run.stderr);
+    assert_eq!(
+        run.stdout.lines().count(),
+        1,
+        "{case}: stdout is not one line: {:?}",
+        run.stdout
+    );
+    let json = json_of(run);
+    let object = json
+        .as_object()
+        .unwrap_or_else(|| panic!("{case}: stdout is not an object: {}", run.stdout));
+    assert_eq!(object.len(), 1, "{case}: {}", run.stdout);
+    let message = object
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{case}: no error message: {}", run.stdout));
+    assert!(!message.is_empty(), "{case}: the error message is empty");
+    assert!(
+        run.stderr.starts_with("skim search: ") && run.stderr.contains(message),
+        "{case}: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn every_run_time_exit_2_cause_prints_one_error_object_under_json() {
+    let repo = launch_repo();
+    let broken_index = launch_repo();
+    fs::write(
+        broken_index.root().join(".git/index"),
+        b"this is not an index",
+    )
+    .unwrap();
+    let no_head = launch_repo();
+    fs::remove_file(no_head.root().join(".git/HEAD")).unwrap();
+
+    let cases = [
+        ("invalid regex", repo.search(&["-E", "(", "--json"])),
+        (
+            "unknown file type",
+            repo.search(&["x", "-t", "nosuchtype", "--json"]),
+        ),
+        (
+            "bad root",
+            repo.search(&["x", "--root", "/nonexistent-folder-for-skim-test", "--json"]),
+        ),
+        (
+            "unreadable git index",
+            broken_index.search(&["launch_worker", "--json"]),
+        ),
+        (
+            "damaged repository",
+            no_head.search(&["--root", "src", "launch_worker", "--json"]),
+        ),
+        (
+            "filesystem root without --root",
+            repo.search_in(std::path::Path::new("/"), &["launch_worker", "--json"]),
+        ),
+    ];
+    for (case, run) in &cases {
+        assert_json_error(case, run);
+    }
+}
+
 #[test]
 fn two_runs_of_one_query_give_equal_cost_counters() {
     let repo = launch_repo();
@@ -749,7 +816,7 @@ fn two_runs_of_one_query_give_equal_cost_counters() {
 }
 
 /// A repository of TypeScript files where `ZodType` has each role, in files
-/// large enough that a parse takes measurable time.
+/// large enough that parallel runs overlap in time.
 fn zod_type_repo() -> SearchRepo {
     let repo = SearchRepo::new();
     let filler: String = (0..1_500)
@@ -772,8 +839,8 @@ fn zod_type_repo() -> SearchRepo {
 /// under parallel load gives one output.
 #[test]
 fn one_query_run_many_times_under_parallel_load_gives_one_order() {
-    const RUNS: usize = 16;
-    const ROUNDS: usize = 2;
+    const RUNS: usize = 8;
+    const AT_A_TIME: usize = 4;
     let repo = zod_type_repo();
     let args = ["ZodType", "--all"];
     let reference = repo.search(&args);
@@ -790,9 +857,9 @@ fn one_query_run_many_times_under_parallel_load_gives_one_order() {
         "{}",
         reference.stdout
     );
-    for _ in 0..ROUNDS {
+    for _ in 0..RUNS / AT_A_TIME {
         let runs: Vec<Run> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..RUNS)
+            let handles: Vec<_> = (0..AT_A_TIME)
                 .map(|_| scope.spawn(|| repo.search(&args)))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()

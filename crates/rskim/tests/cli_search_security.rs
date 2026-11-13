@@ -8,6 +8,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -406,31 +407,9 @@ fn a_git_ceiling_stops_the_root_walk_and_a_folder_outside_a_repository_is_search
 // Analytics
 // ============================================================================
 
-#[test]
-fn a_query_with_a_token_shaped_pattern_writes_no_analytics_row_that_holds_it() {
-    let repo = SearchRepo::new();
-    repo.write("a.rs", "pub fn needle() {}\n");
-    repo.track_all();
-    let db = repo.home().join("analytics.db");
-    let pattern = format!("{}{}", "ghp_", "A".repeat(36));
-
-    // A read of a file records a row: the database exists and is readable.
-    let mut read = repo.skim();
-    read.env_remove("SKIM_DISABLE_ANALYTICS")
-        .env("SKIM_ANALYTICS_DB", &db)
-        .arg("a.rs");
-    assert_eq!(finish(&mut read).code, 0);
-
-    let mut query = repo.skim();
-    query
-        .env_remove("SKIM_DISABLE_ANALYTICS")
-        .env("SKIM_ANALYTICS_DB", &db)
-        .args(["search", &pattern]);
-    assert_eq!(finish(&mut query).code, 1);
-    // Let any background writer finish.
-    std::thread::sleep(Duration::from_millis(500));
-
-    let conn = rusqlite::Connection::open(&db).expect("the analytics database exists");
+/// The row count of every table in the analytics database, by table name.
+fn analytics_row_counts(db: &Path) -> BTreeMap<String, usize> {
+    let conn = rusqlite::Connection::open(db).expect("the analytics database exists");
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
         .unwrap()
@@ -438,24 +417,74 @@ fn a_query_with_a_token_shaped_pattern_writes_no_analytics_row_that_holds_it() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    let mut rows_seen = 0usize;
-    for table in &tables {
+    tables
+        .into_iter()
+        .map(|table| {
+            let count: usize = conn
+                .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (table, count)
+        })
+        .collect()
+}
+
+/// Every table of the analytics database holds no text value that contains `needle`.
+fn assert_analytics_holds_no_text(db: &Path, needle: &str) {
+    let conn = rusqlite::Connection::open(db).expect("the analytics database exists");
+    for table in analytics_row_counts(db).keys() {
         let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
         let columns = stmt.column_count();
         let mut rows = stmt.query([]).unwrap();
         while let Some(row) = rows.next().unwrap() {
-            rows_seen += 1;
             for column in 0..columns {
                 if let Ok(text) = row.get::<_, String>(column) {
                     assert!(
-                        !text.contains(&pattern),
+                        !text.contains(needle),
                         "table {table} holds the pattern: {text}"
                     );
                 }
             }
         }
     }
-    assert!(rows_seen > 0, "the read of a file left a row to inspect");
+}
+
+#[test]
+fn a_query_records_no_analytics_row_and_none_holds_a_token_shaped_pattern() {
+    let repo = SearchRepo::new();
+    repo.write("a.rs", "pub fn needle() {}\n");
+    repo.track_all();
+    let db = repo.home().join("analytics.db");
+    let pattern = format!("{}{}", "ghp_", "A".repeat(36));
+
+    // A read of a file records a row: the database exists and is readable.
+    // The process joins its background writers before it exits, so the row is
+    // there when the run ends.
+    let mut read = repo.skim();
+    read.env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("SKIM_ANALYTICS_DB", &db)
+        .arg("a.rs");
+    assert_eq!(finish(&mut read).code, 0);
+    let before = analytics_row_counts(&db);
+    assert!(
+        before.values().sum::<usize>() > 0,
+        "the read of a file left a row to count: {before:?}"
+    );
+
+    let mut query = repo.skim();
+    query
+        .env_remove("SKIM_DISABLE_ANALYTICS")
+        .env("SKIM_ANALYTICS_DB", &db)
+        .args(["search", &pattern]);
+    assert_eq!(finish(&mut query).code, 1);
+
+    assert_eq!(
+        analytics_row_counts(&db),
+        before,
+        "a query changed the rows of the analytics database"
+    );
+    assert_analytics_holds_no_text(&db, &pattern);
 }
 
 // ============================================================================
@@ -499,13 +528,15 @@ fn a_tracked_path_replaced_by_a_fifo_is_unreadable_and_the_query_ends() {
         std::thread::sleep(Duration::from_millis(20));
     };
     let output = child.wait_with_output().unwrap();
-    assert!(
-        matches!(status.code(), Some(0 | 1)),
-        "exit {:?}: {}",
+    // ok.txt matches, so the query ends with a match.
+    assert_eq!(
         status.code(),
+        Some(0),
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["total_lines"], 1);
     assert_eq!(json["left_out"]["unreadable"], 1);
     assert_eq!(json["searched_files"], 1);
 }
