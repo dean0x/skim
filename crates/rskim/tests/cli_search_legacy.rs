@@ -199,3 +199,91 @@ fn removed_flag_name_after_double_dash_is_a_query() {
         .stdout(predicate::str::contains("src/a.rs:1:"))
         .stderr(predicate::str::contains("was removed").not());
 }
+
+/// Every file below `dir` with its bytes, keyed by the path relative to `dir`.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(base).unwrap().display().to_string(),
+                    fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Run `git` in `dir`, isolated from the host configuration, and assert success.
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A query never deletes or rewrites old data: a repository with the old search
+/// hooks and a cache folder with old index files are byte for byte the same
+/// after the query. Removal belongs to `skim init` and `skim --clear-cache`.
+#[test]
+fn query_leaves_old_hooks_and_old_index_data_unchanged() {
+    let proj = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(proj.path().join("src")).unwrap();
+    fs::write(proj.path().join("src/a.rs"), "pub fn needle() {}\n").unwrap();
+    git(proj.path(), &["init", "-q"]);
+    git(proj.path(), &["add", "src/a.rs"]);
+
+    let hooks = proj.path().join(".git").join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    for name in ["post-commit", "post-merge", "post-checkout"] {
+        fs::write(
+            hooks.join(name),
+            "#!/bin/sh\necho mine\n# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end\n",
+        )
+        .unwrap();
+    }
+    let shard = cache.path().join("search").join("0123456789abcdef");
+    fs::create_dir_all(&shard).unwrap();
+    for name in [
+        "index.skidx",
+        "index.skpost",
+        "temporal.db",
+        ".skim-build.lock",
+    ] {
+        fs::write(shard.join(name), name.as_bytes()).unwrap();
+    }
+    let hooks_before = snapshot(&hooks);
+    let cache_before = snapshot(cache.path());
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["search", "needle", "--root"])
+        .arg(proj.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("src/a.rs"));
+
+    assert_eq!(snapshot(&hooks), hooks_before, "a query rewrote a hook");
+    assert_eq!(
+        snapshot(cache.path()),
+        cache_before,
+        "a query changed the cache folder"
+    );
+}

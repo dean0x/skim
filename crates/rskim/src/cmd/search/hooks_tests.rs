@@ -1,31 +1,57 @@
-//! Tests for the git hooks module (hooks.rs).
+//! Tests for the old-hook removal (hooks.rs).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
+use std::path::Path;
 
 use tempfile::tempdir;
 
-use super::{has_search_hooks, install_search_hooks, remove_search_hooks};
+use super::{find_search_hooks, remove_search_hooks};
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/// Create a fake git repo with a hooks dir in `dir`.
-fn create_git_repo(dir: &std::path::Path) {
-    let hooks_dir = dir.join(".git").join("hooks");
-    fs::create_dir_all(&hooks_dir).unwrap();
+/// The block that skim 2.x wrote into the three search hooks.
+const HOOK_BLOCK: &str =
+    "# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end";
+
+const HOOK_NAMES: [&str; 3] = ["post-commit", "post-merge", "post-checkout"];
+
+/// The text of a hook as skim 2.x left it: `existing` first, a newline if it had
+/// none, then the block and a newline.
+fn with_old_block(existing: &str) -> String {
+    let mut text = existing.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(HOOK_BLOCK);
+    text.push('\n');
+    text
 }
 
-/// Read content of a hook file.
-fn read_hook(dir: &std::path::Path, name: &str) -> String {
-    fs::read_to_string(dir.join(".git").join("hooks").join(name)).unwrap()
+/// Write the hooks skim 2.x created in a repository that had none: a shebang
+/// line and the block.
+fn plant_fresh_hooks(hooks_dir: &Path) {
+    fs::create_dir_all(hooks_dir).unwrap();
+    for name in HOOK_NAMES {
+        fs::write(hooks_dir.join(name), with_old_block("#!/bin/sh")).unwrap();
+    }
+}
+
+/// Create a fake git repo with a hooks dir in `dir`.
+fn create_git_repo(dir: &Path) {
+    fs::create_dir_all(dir.join(".git").join("hooks")).unwrap();
+}
+
+fn hooks_dir(dir: &Path) -> std::path::PathBuf {
+    dir.join(".git").join("hooks")
 }
 
 /// Run `git` in `dir`, isolated from the ambient git configuration, and
 /// assert that it succeeds.
-fn git(dir: &std::path::Path, args: &[&str]) {
+fn git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -43,7 +69,7 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 /// Create a real git repository in `dir` with one commit per entry of
 /// `commit_files`: the message, then the `(path, content)` files to add.
 #[allow(clippy::type_complexity)]
-fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) {
+fn create_real_git_repo(dir: &Path, commit_files: &[(&str, &[(&str, &str)])]) {
     git(dir, &["init"]);
     git(dir, &["config", "user.email", "test@example.com"]);
     git(dir, &["config", "user.name", "Test"]);
@@ -62,7 +88,7 @@ fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &
 
 /// Add a linked worktree at `worktree` on a new branch `branch` of the
 /// repository at `primary`.
-fn create_real_git_worktree(primary: &std::path::Path, worktree: &std::path::Path, branch: &str) {
+fn create_real_git_worktree(primary: &Path, worktree: &Path, branch: &str) {
     git(primary, &["branch", branch]);
     git(
         primary,
@@ -70,97 +96,21 @@ fn create_real_git_worktree(primary: &std::path::Path, worktree: &std::path::Pat
     );
 }
 
-// ============================================================================
-// install_search_hooks
-// ============================================================================
-
-#[test]
-fn test_install_creates_hooks_with_markers() {
-    let dir = tempdir().unwrap();
-    create_git_repo(dir.path());
-
-    install_search_hooks(dir.path()).unwrap();
-
-    for hook in &["post-commit", "post-merge", "post-checkout"] {
-        let content = read_hook(dir.path(), hook);
-        assert!(
-            content.contains("# skim-search-start"),
-            "{hook} should contain start marker"
-        );
-        assert!(
-            content.contains("# skim-search-end"),
-            "{hook} should contain end marker"
-        );
-        assert!(
-            content.contains("skim search --update"),
-            "{hook} should call skim search --update"
-        );
-    }
-}
-
-#[test]
-fn test_install_creates_shebang_when_hook_missing() {
-    let dir = tempdir().unwrap();
-    create_git_repo(dir.path());
-
-    install_search_hooks(dir.path()).unwrap();
-
-    let content = read_hook(dir.path(), "post-commit");
-    assert!(
-        content.starts_with("#!/bin/sh"),
-        "new hook should start with #!/bin/sh"
-    );
-}
-
-#[test]
-fn test_install_is_idempotent() {
-    let dir = tempdir().unwrap();
-    create_git_repo(dir.path());
-
-    install_search_hooks(dir.path()).unwrap();
-    install_search_hooks(dir.path()).unwrap(); // Second call must be a no-op
-
-    let content = read_hook(dir.path(), "post-commit");
-    // Should not have duplicate markers
-    let start_count = content.matches("# skim-search-start").count();
-    assert_eq!(start_count, 1, "install twice should not duplicate markers");
-}
-
-#[test]
-fn test_install_preserves_existing_content() {
-    let dir = tempdir().unwrap();
-    create_git_repo(dir.path());
-
-    let hook_path = dir.path().join(".git").join("hooks").join("post-commit");
-    fs::write(&hook_path, "#!/bin/sh\necho 'existing hook'\n").unwrap();
-
-    install_search_hooks(dir.path()).unwrap();
-
-    let content = read_hook(dir.path(), "post-commit");
-    assert!(
-        content.contains("existing hook"),
-        "existing content must be preserved"
-    );
-    assert!(
-        content.contains("# skim-search-start"),
-        "skim block must be appended"
-    );
-}
-
-#[test]
-fn test_install_creates_hooks_dir_if_missing() {
-    let dir = tempdir().unwrap();
-    // Create .git but NOT hooks/
-    fs::create_dir_all(dir.path().join(".git")).unwrap();
-
-    install_search_hooks(dir.path()).unwrap();
-
-    let hooks_dir = dir.path().join(".git").join("hooks");
-    assert!(hooks_dir.exists(), "hooks dir should be created");
-    assert!(
-        hooks_dir.join("post-commit").exists(),
-        "post-commit hook should exist"
-    );
+/// The hooks directory git itself names for `worktree`, made absolute.
+fn git_hooks_dir(worktree: &Path) -> std::path::PathBuf {
+    let out = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(worktree)
+        .output()
+        .expect("git rev-parse --git-path hooks");
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p = std::path::PathBuf::from(&rel);
+    let p = if p.is_absolute() { p } else { worktree.join(p) };
+    // The directory may not exist yet; canonicalize the existing parent instead.
+    let parent = p.parent().unwrap().canonicalize().unwrap();
+    parent.join(p.file_name().unwrap())
 }
 
 // ============================================================================
@@ -168,82 +118,210 @@ fn test_install_creates_hooks_dir_if_missing() {
 // ============================================================================
 
 #[test]
-fn test_remove_strips_skim_block() {
+fn test_remove_strips_the_block_from_every_hook() {
     let dir = tempdir().unwrap();
     create_git_repo(dir.path());
-    install_search_hooks(dir.path()).unwrap();
+    plant_fresh_hooks(&hooks_dir(dir.path()));
 
-    remove_search_hooks(dir.path()).unwrap();
+    let outcome = remove_search_hooks(dir.path()).unwrap();
 
-    for hook in &["post-commit", "post-merge", "post-checkout"] {
-        let path = dir.path().join(".git").join("hooks").join(hook);
-        if path.exists() {
-            let content = fs::read_to_string(&path).unwrap();
-            assert!(
-                !content.contains("# skim-search-start"),
-                "{hook}: start marker should be removed"
-            );
-            assert!(
-                !content.contains("# skim-search-end"),
-                "{hook}: end marker should be removed"
-            );
-        }
+    assert!(outcome.changed, "a block was removed, so changed is true");
+    for name in HOOK_NAMES {
+        assert_eq!(
+            fs::read_to_string(hooks_dir(dir.path()).join(name)).unwrap(),
+            "#!/bin/sh\n",
+            "{name}: only the shebang line must remain"
+        );
     }
 }
 
+/// Foreign bytes survive removal exactly: blank lines before and after the
+/// block, tabs, carriage returns, and a line with no final newline.
+///
+/// Discriminating: a remover that trims the blank lines in front of the block
+/// (or that cuts at a marker found inside a line) changes these bytes.
 #[test]
-fn test_remove_preserves_non_skim_content() {
+fn test_remove_keeps_every_foreign_byte() {
     let dir = tempdir().unwrap();
     create_git_repo(dir.path());
+    let before = "#!/bin/sh\n\n# my hook\nif [ -x ./go ]; then\n\t./go \"$@\"\nfi\r\n\n\n";
+    let after = "\nexport KEEP=1\r\n\n\ttrailing line without newline";
+    let hook = hooks_dir(dir.path()).join("post-commit");
+    fs::write(&hook, format!("{before}{HOOK_BLOCK}\n{after}")).unwrap();
 
-    let hook_path = dir.path().join(".git").join("hooks").join("post-commit");
-    fs::write(&hook_path, "#!/bin/sh\necho 'my hook'\n").unwrap();
+    let outcome = remove_search_hooks(dir.path()).unwrap();
 
-    install_search_hooks(dir.path()).unwrap();
-    remove_search_hooks(dir.path()).unwrap();
-
-    let content = fs::read_to_string(&hook_path).unwrap();
-    assert!(
-        content.contains("my hook"),
-        "non-skim content should be preserved after removal"
+    assert!(outcome.changed);
+    assert_eq!(
+        fs::read_to_string(&hook).unwrap(),
+        format!("{before}{after}"),
+        "removal must delete the block lines and no other byte"
     );
+}
+
+/// A foreign script that prints or greps the marker text has the marker inside a
+/// longer line. That is not a block, so the hook stays byte for byte.
+#[test]
+fn test_remove_leaves_marker_text_inside_a_longer_line() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    let text = "#!/bin/sh\necho \"# skim-search-start\"\ngrep -q '# skim-search-end' notes\n";
+    let hook = hooks_dir(dir.path()).join("post-merge");
+    fs::write(&hook, text).unwrap();
+
+    let outcome = remove_search_hooks(dir.path()).unwrap();
+
+    assert!(!outcome.changed);
+    assert_eq!(fs::read_to_string(&hook).unwrap(), text);
+    assert_eq!(
+        find_search_hooks(dir.path()),
+        None,
+        "doctor must not report text that removal would keep"
+    );
+}
+
+/// A start marker with no end marker is not a block that skim wrote.
+#[test]
+fn test_remove_leaves_a_start_marker_without_an_end_marker() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    let text = "#!/bin/sh\n# skim-search-start\necho mine\n";
+    let hook = hooks_dir(dir.path()).join("post-checkout");
+    fs::write(&hook, text).unwrap();
+
+    let outcome = remove_search_hooks(dir.path()).unwrap();
+
+    assert!(!outcome.changed);
+    assert_eq!(fs::read_to_string(&hook).unwrap(), text);
+    assert_eq!(find_search_hooks(dir.path()), None);
 }
 
 #[test]
 fn test_remove_is_safe_when_no_hooks_exist() {
     let dir = tempdir().unwrap();
     create_git_repo(dir.path());
-    // No hooks installed — remove should succeed without error.
+    let outcome = remove_search_hooks(dir.path()).unwrap();
+    assert!(!outcome.changed);
+}
+
+/// A hook that was not executable must not become executable: git would start to
+/// run a script that its owner had switched off.
+#[cfg(unix)]
+#[test]
+fn test_remove_keeps_the_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    for (name, mode) in [("post-commit", 0o644), ("post-merge", 0o700)] {
+        let hook = hooks_dir(dir.path()).join(name);
+        fs::write(&hook, with_old_block("#!/bin/sh\necho mine")).unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     remove_search_hooks(dir.path()).unwrap();
+
+    for (name, mode) in [("post-commit", 0o644), ("post-merge", 0o700)] {
+        let found = fs::metadata(hooks_dir(dir.path()).join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(found, mode, "{name}: removal must keep the file mode");
+    }
+}
+
+/// A hook that is a link belongs to whoever made the link. The rewrite replaces
+/// the file at the hook path, so it would turn the link into a copy.
+#[cfg(unix)]
+#[test]
+fn test_remove_leaves_a_symlinked_hook_alone() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    let shared = dir.path().join("shared-hook.sh");
+    let text = with_old_block("#!/bin/sh\necho shared");
+    fs::write(&shared, &text).unwrap();
+    let hook = hooks_dir(dir.path()).join("post-commit");
+    std::os::unix::fs::symlink(&shared, &hook).unwrap();
+
+    let outcome = remove_search_hooks(dir.path()).unwrap();
+
+    assert!(!outcome.changed);
+    assert!(
+        fs::symlink_metadata(&hook)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link must still be a link"
+    );
+    assert_eq!(fs::read_to_string(&shared).unwrap(), text);
+    assert_eq!(find_search_hooks(dir.path()), None);
+}
+
+/// A file above the read cap is not a hook skim wrote, and removal does not read
+/// it whole.
+#[test]
+fn test_remove_leaves_an_oversized_hook_alone() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    let mut text = with_old_block("#!/bin/sh");
+    text.push_str(&"# padding line\n".repeat(80_000));
+    assert!(text.len() as u64 > super::MAX_HOOK_BYTES);
+    let hook = hooks_dir(dir.path()).join("post-commit");
+    fs::write(&hook, &text).unwrap();
+
+    let outcome = remove_search_hooks(dir.path()).unwrap();
+
+    assert!(!outcome.changed);
+    assert_eq!(fs::read_to_string(&hook).unwrap(), text);
+}
+
+/// A hook that is not UTF-8 text (a compiled program) is left as it is, and the
+/// other hooks are still cleaned.
+#[test]
+fn test_remove_leaves_a_binary_hook_alone_and_cleans_the_others() {
+    let dir = tempdir().unwrap();
+    create_git_repo(dir.path());
+    let mut binary = b"\xff\xfe\x00 not text\n".to_vec();
+    binary.extend_from_slice(HOOK_BLOCK.as_bytes());
+    let hook = hooks_dir(dir.path()).join("post-commit");
+    fs::write(&hook, &binary).unwrap();
+    let other = hooks_dir(dir.path()).join("post-merge");
+    fs::write(&other, with_old_block("#!/bin/sh")).unwrap();
+
+    let outcome = remove_search_hooks(dir.path()).unwrap();
+
+    assert!(outcome.changed);
+    assert_eq!(fs::read(&hook).unwrap(), binary);
+    assert_eq!(fs::read_to_string(&other).unwrap(), "#!/bin/sh\n");
 }
 
 // ============================================================================
-// has_search_hooks
+// find_search_hooks
 // ============================================================================
 
 #[test]
-fn test_has_hooks_returns_false_before_install() {
+fn test_find_reports_the_directory_while_a_block_is_present() {
     let dir = tempdir().unwrap();
     create_git_repo(dir.path());
-    assert!(!has_search_hooks(dir.path()));
-}
+    assert_eq!(find_search_hooks(dir.path()), None, "no hooks yet");
 
-#[test]
-fn test_has_hooks_returns_true_after_install() {
-    let dir = tempdir().unwrap();
-    create_git_repo(dir.path());
-    install_search_hooks(dir.path()).unwrap();
-    assert!(has_search_hooks(dir.path()));
-}
+    fs::write(
+        hooks_dir(dir.path()).join("post-merge"),
+        with_old_block("#!/bin/sh\necho mine"),
+    )
+    .unwrap();
+    assert_eq!(
+        find_search_hooks(dir.path()),
+        Some(hooks_dir(dir.path()).canonicalize().unwrap())
+    );
 
-#[test]
-fn test_has_hooks_returns_false_after_remove() {
-    let dir = tempdir().unwrap();
-    create_git_repo(dir.path());
-    install_search_hooks(dir.path()).unwrap();
     remove_search_hooks(dir.path()).unwrap();
-    // After removal, no hooks should be detected.
-    assert!(!has_search_hooks(dir.path()));
+    assert_eq!(
+        find_search_hooks(dir.path()),
+        None,
+        "after removal no block is found"
+    );
 }
 
 // ============================================================================
@@ -251,20 +329,13 @@ fn test_has_hooks_returns_false_after_remove() {
 // ============================================================================
 
 /// AC31(b)/(c) — in a linked worktree, `resolve_hooks_dir` returns the SHARED
-/// `<commondir>/hooks` directory (git's own answer), and install/remove/has all
-/// agree on it.  Nothing is written under the per-worktree gitdir.
+/// `<commondir>/hooks` directory (git's own answer), and remove and find agree on
+/// it. Nothing is written under the per-worktree gitdir.
 ///
 /// Ground truth is taken from git itself (`git -C <wt> rev-parse --git-path hooks`),
 /// not assumed, so a routing change that stops matching git fails this test.
-///
-/// Discriminating: pre-#413 the three call sites hand-built
-/// `<root>/.git/hooks`, and `<root>/.git` is a FILE in a linked worktree, so
-/// `install_search_hooks` died with `Not a directory (os error 20)` and
-/// `remove_search_hooks` silently no-opped while reporting success.
 #[test]
 fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
-    use std::process::Command;
-
     let dir = tempdir().unwrap();
     let primary = dir.path().join("primary");
     let worktree = dir.path().join("wt1");
@@ -272,27 +343,11 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
 
     create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
     create_real_git_worktree(&primary, &worktree, "b1");
-
-    // Ground truth: git's own hooks path for this worktree, absolutised.
-    let out = Command::new("git")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .args(["rev-parse", "--git-path", "hooks"])
-        .current_dir(&worktree)
-        .output()
-        .expect("git rev-parse --git-path hooks");
-    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let gt_hooks = {
-        let p = std::path::PathBuf::from(&rel);
-        let p = if p.is_absolute() { p } else { worktree.join(p) };
-        // The directory may not exist yet; canonicalize the existing parent instead.
-        let parent = p.parent().unwrap().canonicalize().unwrap();
-        parent.join(p.file_name().unwrap())
-    };
+    let gt_hooks = git_hooks_dir(&worktree);
 
     let resolved = super::resolve_hooks_dir(&worktree)
         .expect("linked worktree has a .git FILE — resolve_hooks_dir must return Ok");
-    // `.git` is a FILE in a linked worktree — the pre-#413 path is not a directory.
+    // `.git` is a FILE in a linked worktree — a hand-built `<root>/.git/hooks` is not a directory.
     assert!(
         worktree.join(".git").is_file(),
         "precondition: a linked worktree's .git must be a file"
@@ -304,43 +359,40 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
          resolved={resolved:?}, git={gt_hooks:?}"
     );
 
-    // Install must succeed (pre-fix: ENOTDIR) and write into the SHARED dir.
-    install_search_hooks(&worktree).unwrap();
-    for name in ["post-commit", "post-merge", "post-checkout"] {
-        let body = fs::read_to_string(gt_hooks.join(name)).unwrap_or_else(|e| {
-            panic!("AC31(b): {name} must exist in the shared hooks dir {gt_hooks:?}: {e}")
-        });
+    // Old hooks live in the SHARED directory.
+    plant_fresh_hooks(&gt_hooks);
+
+    // AC34(a): the block is visible from a DIFFERENT worktree of the same clone.
+    assert!(
+        find_search_hooks(&primary).is_some(),
+        "AC34(a): a block in the shared hooks dir must be visible from the primary"
+    );
+
+    // Remove reports truthfully and works from any worktree (AC31(a)/AC34(c)).
+    assert!(
+        remove_search_hooks(&worktree).unwrap().changed,
+        "AC31(a): remove must report changed=true when a block was actually removed"
+    );
+    assert!(
+        !remove_search_hooks(&primary).unwrap().changed,
+        "AC31(a): a second remove must report changed=false so no false success line is printed"
+    );
+    for name in HOOK_NAMES {
         assert_eq!(
-            body.matches("# skim-search-start").count(),
-            1,
-            "AC31(b): exactly one marker block must be present in {name}"
+            fs::read_to_string(gt_hooks.join(name)).unwrap(),
+            "#!/bin/sh\n",
+            "{name}: the shared hook must lose its block"
         );
     }
+    assert_eq!(find_search_hooks(&worktree), None);
 
-    // AC31(c): nothing written per-worktree.
+    // AC31(c): nothing was created per-worktree.
     // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
     let wt_gitdir = super::super::gitdir::resolve_git_dir(&worktree).unwrap();
     assert!(
         !wt_gitdir.join("hooks").exists(),
         "AC31(c): no per-worktree hooks directory may be created ({wt_gitdir:?})"
     );
-
-    // The install is observable from a DIFFERENT worktree of the same clone (AC34(a)).
-    assert!(
-        has_search_hooks(&primary),
-        "AC34(a): a hook installed from a linked worktree must be visible from the primary"
-    );
-
-    // Remove reports truthfully and is reversible from the primary (AC31(a)/AC34(c)).
-    assert!(
-        remove_search_hooks(&primary).unwrap().changed,
-        "AC31(a): remove must report changed=true when a marker block was actually removed"
-    );
-    assert!(
-        !remove_search_hooks(&primary).unwrap().changed,
-        "AC31(a): a second remove must report changed=false so no false success line is printed"
-    );
-    assert!(!has_search_hooks(&worktree));
 }
 
 /// Security (AD-413-3 extension): a crafted `gitdir:` pointer that resolves to a
@@ -348,11 +400,10 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
 /// `refs/` absent) must NOT be used as a write destination.  `resolve_hooks_dir`
 /// must fall back to the safe local `<root>/.git/hooks` instead.
 ///
-/// This tests the write-path sanity gate added in the fix for the hooks.rs security
-/// finding (hooks.rs `looks_like_git_dir`).  The attacker scenario:
+/// The attacker scenario:
 /// - A tarball is extracted and contains a `.git` FILE (git itself won't check
 ///   one out, but archive tools will) pointing at an arbitrary target directory.
-/// - skim must not create executables in that arbitrary directory.
+/// - skim must not rewrite files in that arbitrary directory.
 #[test]
 fn test_resolve_hooks_dir_rejects_crafted_gitdir_with_no_git_structure() {
     let dir = tempdir().unwrap();
@@ -382,17 +433,46 @@ fn test_resolve_hooks_dir_rejects_crafted_gitdir_with_no_git_structure() {
     );
 }
 
+/// The remover never rewrites a file below a `gitdir:` pointer that fails the
+/// write-path gate, even when that file holds the old block.
+///
+/// Discriminating: without the gate the remover would resolve to
+/// `<target>/hooks` and strip the block from the file planted there.
+#[test]
+fn test_remove_never_rewrites_through_a_gitdir_that_fails_the_gate() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let target = dir.path().join("attacker_target");
+    fs::create_dir_all(target.join("hooks")).unwrap();
+    fs::write(target.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let victim = target.join("hooks").join("post-commit");
+    let text = with_old_block("#!/bin/sh\necho not-ours");
+    fs::write(&victim, &text).unwrap();
+    fs::write(
+        project.join(".git"),
+        format!("gitdir: {}\n", target.display()),
+    )
+    .unwrap();
+
+    let outcome = remove_search_hooks(&project).unwrap();
+
+    assert!(!outcome.changed);
+    assert_eq!(
+        fs::read_to_string(&victim).unwrap(),
+        text,
+        "a file below a gitdir that fails the gate must stay byte for byte"
+    );
+    assert_eq!(find_search_hooks(&project), None);
+}
+
 // ============================================================================
 // #413 / AC34(b) — SHARED_HOOKS_SCOPE_MSG constant content guard
 // ============================================================================
 
-/// AC34(b) constant guard — the disclosure message printed by both
-/// `install_search_hooks` and `remove_search_hooks` when the resolved hooks
-/// directory is the shared `<commondir>/hooks` must contain both key phrases.
-///
-/// This test anchors the string content of `SHARED_HOOKS_SCOPE_MSG` so that
-/// the two `eprintln!` call sites in `hooks.rs` cannot drift away from the
-/// phrases that AC34(b) requires ("every worktree" and "clone").
+/// AC34(b) constant guard — the disclosure message printed by
+/// `remove_search_hooks` when the resolved hooks directory is the shared
+/// `<commondir>/hooks` must contain both key phrases.
 ///
 /// Combined with `test_ac34_multi_worktree_blast_radius` below, which asserts
 /// that `is_shared_hooks_dir` returns `true` for a real linked-worktree root,
@@ -418,33 +498,23 @@ fn test_shared_hooks_scope_msg_contains_required_phrases() {
 }
 
 // ============================================================================
-// #413 / AC34(b)/(c)/(d) — multi-worktree blast radius is real, bounded,
-// idempotent across worktrees, and the disclosure predicate fires correctly
+// #413 / AC34(b)/(c) — multi-worktree blast radius is real, bounded, and the
+// disclosure predicate fires correctly
 // ============================================================================
 
-/// AC34(b)/(c)/(d) — S37 scenario in unit-test form.
+/// AC34(b)/(c) — S37 scenario in unit-test form.
 ///
-/// Fixture: primary + wt1 + wt2, with a foreign `post-commit` body and a
-/// `pre-push` file planted in `<commondir>/hooks` **before** any skim command.
+/// Fixture: primary + wt1 + wt2, with a foreign `post-commit` body (carrying the
+/// old block) and a `pre-push` file planted in `<commondir>/hooks`.
 ///
 /// **(b)** `is_shared_hooks_dir` returns `true` for both linked-worktree roots,
 /// proving the predicate that gates `eprintln!({SHARED_HOOKS_SCOPE_MSG})` in
-/// both `install_search_hooks` and `remove_search_hooks`.  Together with
-/// `test_shared_hooks_scope_msg_contains_required_phrases`, this establishes
-/// that the disclosure string has the required content AND the predicate fires.
+/// `remove_search_hooks`.
 ///
-/// **(c)** After install the planted foreign `post-commit` body is byte-identical
-/// to its pre-install content (the skim block was appended, not prepended over
-/// it).  The planted `pre-push` file is untouched.  After remove the foreign
-/// body is byte-identical to its original form and `pre-push` remains untouched.
-///
-/// **(d)** Installing a second time from `wt2` and a third time from `primary`
-/// each return `changed=false` (the idempotency no-op) and each leave the
-/// `# skim-search-start` marker count at exactly 1 per hook file.
+/// **(c)** After a remove from a different worktree the foreign `post-commit` body
+/// is byte-identical to its original form and `pre-push` is untouched.
 #[test]
 fn test_ac34_multi_worktree_blast_radius() {
-    use std::process::Command;
-
     let dir = tempdir().unwrap();
     let primary = dir.path().join("primary");
     let wt1 = dir.path().join("wt1");
@@ -454,153 +524,41 @@ fn test_ac34_multi_worktree_blast_radius() {
     create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
     create_real_git_worktree(&primary, &wt1, "b1");
     create_real_git_worktree(&primary, &wt2, "b2");
-
-    // Ground-truth shared hooks directory for wt1 (same for wt2 and primary).
-    let out = Command::new("git")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .args(["rev-parse", "--git-path", "hooks"])
-        .current_dir(&wt1)
-        .output()
-        .expect("git rev-parse --git-path hooks");
-    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let gt_hooks = {
-        let p = std::path::PathBuf::from(&rel);
-        let p = if p.is_absolute() { p } else { wt1.join(p) };
-        let parent = p.parent().unwrap().canonicalize().unwrap();
-        parent.join(p.file_name().unwrap())
-    };
+    let gt_hooks = git_hooks_dir(&wt1);
 
     // Precondition: both wt1 and wt2 have a .git FILE (linked worktree).
-    assert!(
-        wt1.join(".git").is_file(),
-        "precondition: wt1/.git must be a file (linked worktree)"
-    );
-    assert!(
-        wt2.join(".git").is_file(),
-        "precondition: wt2/.git must be a file (linked worktree)"
-    );
+    assert!(wt1.join(".git").is_file(), "wt1/.git must be a file");
+    assert!(wt2.join(".git").is_file(), "wt2/.git must be a file");
 
-    // Plant a foreign post-commit body BEFORE any skim command (AC34(c)).
+    // Plant a foreign post-commit body that carries the old block, and a foreign
+    // pre-push file that skim must never touch.
     let foreign_pc_body = "#!/bin/sh\necho FOREIGN_POST_COMMIT\n";
     let pc_path = gt_hooks.join("post-commit");
     fs::create_dir_all(&gt_hooks).unwrap();
-    fs::write(&pc_path, foreign_pc_body).unwrap();
-
-    // Plant a foreign pre-push file that skim must never touch (AC34(c)).
+    fs::write(&pc_path, with_old_block(foreign_pc_body)).unwrap();
     let foreign_pp_body = "#!/bin/sh\necho FOREIGN_PRE_PUSH\n";
     let pp_path = gt_hooks.join("pre-push");
     fs::write(&pp_path, foreign_pp_body).unwrap();
 
-    // ── AC34(b): is_shared_hooks_dir fires for every linked-worktree root ──
-    // Both linked-worktree roots must return true so the eprintln! path is taken.
+    // AC34(b): is_shared_hooks_dir fires for every linked-worktree root.
     assert!(
-        super::is_shared_hooks_dir(&wt1, &gt_hooks),
+        super::is_shared_hooks_dir(&wt1),
         "AC34(b): is_shared_hooks_dir must be true for wt1 (linked worktree)"
     );
     assert!(
-        super::is_shared_hooks_dir(&wt2, &gt_hooks),
+        super::is_shared_hooks_dir(&wt2),
         "AC34(b): is_shared_hooks_dir must be true for wt2 (linked worktree)"
     );
 
-    // ── First install (from wt1) ──────────────────────────────────────────────
-    let out1 = install_search_hooks(&wt1).unwrap();
-    assert!(
-        out1.changed,
-        "first install from wt1 must report changed=true"
-    );
+    // Remove from wt2 — a DIFFERENT worktree from the one that is checked out first.
+    let outcome = remove_search_hooks(&wt2).unwrap();
+    assert!(outcome.changed, "the block was present in the shared hooks");
 
-    // Foreign post-commit body must be preserved — skim block appended, not overwriting.
-    let pc_after_install1 = fs::read_to_string(&pc_path).unwrap();
-    assert!(
-        pc_after_install1.starts_with(foreign_pc_body),
-        "AC34(c): foreign post-commit body must be byte-identical (as prefix) after 1st install; \
-         got: {pc_after_install1:?}"
-    );
-    assert!(
-        pc_after_install1.contains("# skim-search-start"),
-        "AC34(c): skim block must be appended after the foreign body"
-    );
-
-    // pre-push must be completely untouched.
     assert_eq!(
-        fs::read_to_string(&pp_path).unwrap(),
-        foreign_pp_body,
-        "AC34(c): pre-push file must be byte-identical after 1st install"
-    );
-
-    // Exactly one marker block per hook file installed.
-    for name in ["post-commit", "post-merge", "post-checkout"] {
-        let content =
-            fs::read_to_string(gt_hooks.join(name)).expect("hook file must exist after install");
-        assert_eq!(
-            content.matches("# skim-search-start").count(),
-            1,
-            "AC34(d): exactly one marker block in {name} after 1st install"
-        );
-    }
-
-    // ── Second install (from wt2 — DIFFERENT worktree) ───────────────────────
-    let out2 = install_search_hooks(&wt2).unwrap();
-    assert!(
-        !out2.changed,
-        "AC34(d): 2nd install from wt2 must report changed=false (idempotent)"
-    );
-    for name in ["post-commit", "post-merge", "post-checkout"] {
-        let count = fs::read_to_string(gt_hooks.join(name))
-            .unwrap()
-            .matches("# skim-search-start")
-            .count();
-        assert_eq!(
-            count, 1,
-            "AC34(d): marker count must still be 1 in {name} after 2nd install from wt2"
-        );
-    }
-
-    // ── Third install (from primary) ──────────────────────────────────────────
-    let out3 = install_search_hooks(&primary).unwrap();
-    assert!(
-        !out3.changed,
-        "AC34(d): 3rd install from primary must report changed=false (idempotent)"
-    );
-    for name in ["post-commit", "post-merge", "post-checkout"] {
-        let count = fs::read_to_string(gt_hooks.join(name))
-            .unwrap()
-            .matches("# skim-search-start")
-            .count();
-        assert_eq!(
-            count, 1,
-            "AC34(d): marker count must still be 1 in {name} after 3rd install from primary"
-        );
-    }
-
-    // ── Remove (from wt2 — DIFFERENT worktree from installer) ────────────────
-    let rm_out = remove_search_hooks(&wt2).unwrap();
-    assert!(
-        rm_out.changed,
-        "AC34(c): remove from wt2 must report changed=true (markers were present)"
-    );
-
-    // Marker blocks gone from all three hook names.
-    for name in ["post-commit", "post-merge", "post-checkout"] {
-        let path = gt_hooks.join(name);
-        if path.exists() {
-            let content = fs::read_to_string(&path).unwrap();
-            assert!(
-                !content.contains("# skim-search-start"),
-                "AC34(c): skim-search-start must be removed from {name} after remove"
-            );
-        }
-    }
-
-    // Foreign post-commit body must be byte-identical after remove (AC34(c)).
-    let pc_after_remove = fs::read_to_string(&pc_path).unwrap();
-    assert_eq!(
-        pc_after_remove, foreign_pc_body,
+        fs::read_to_string(&pc_path).unwrap(),
+        foreign_pc_body,
         "AC34(c): foreign post-commit body must be byte-identical after remove"
     );
-
-    // pre-push must still be completely untouched (AC34(c)).
     assert_eq!(
         fs::read_to_string(&pp_path).unwrap(),
         foreign_pp_body,
@@ -609,7 +567,7 @@ fn test_ac34_multi_worktree_blast_radius() {
 }
 
 /// AC31(e) / AC5b monotonicity — a plain repo and a non-repo directory keep the
-/// pre-#413 `<root>/.git/hooks` path, byte for byte.
+/// `<root>/.git/hooks` path, byte for byte.
 #[test]
 fn test_resolve_hooks_dir_unchanged_for_plain_repo_and_non_repo() {
     let dir = tempdir().unwrap();
@@ -628,9 +586,9 @@ fn test_resolve_hooks_dir_unchanged_for_plain_repo_and_non_repo() {
         "AC31(e): a plain repo must resolve to <root>/.git/hooks exactly as before"
     );
 
-    // Non-repo directory (the shape every pre-existing hooks_tests case uses).
-    // This directory has no .git and no enclosing git repository (it is inside
-    // a system temp dir), so resolve_hooks_dir still returns Some(<root>/.git/hooks).
+    // Non-repo directory (the shape the simple cases above use). This directory
+    // has no .git and no enclosing git repository (it is inside a system temp
+    // dir), so resolve_hooks_dir still returns Ok(<root>/.git/hooks).
     let non_repo = dir.path().join("non_repo");
     fs::create_dir_all(&non_repo).unwrap();
     assert_eq!(
@@ -641,24 +599,13 @@ fn test_resolve_hooks_dir_unchanged_for_plain_repo_and_non_repo() {
 }
 
 // ============================================================================
-// Subdirectory-root refusal (review finding — AD-413-15 extension)
+// Subdirectory-root refusal
 // ============================================================================
 
-/// A subdirectory of a git repo must not receive a fabricated `.git` entry.
-///
-/// Pre-fix: `resolve_hooks_dir` fell through to `<root>/.git/hooks` for any
-/// root with no `.git`, and `install_search_hooks` then called `create_dir_all`
-/// on that path, creating a real `.git` **directory** at the subdirectory level.
-/// This permanently disabled `resolve_repo_toplevel` (AC17: it refuses to walk
-/// past an existing `.git` entry) and made the temporal layer silently dead
-/// (PF-017).
-///
-/// Post-fix:
-/// - `resolve_hooks_dir` returns `None` for a subdirectory root.
-/// - `install_search_hooks` returns `Err` naming the enclosing repository.
-/// - No `.git` entry is created.
+/// A subdirectory of a git repo holds no hooks of its own: removal refuses, names
+/// the enclosing repository, and creates no `.git` entry.
 #[test]
-fn test_install_hooks_refuses_subdirectory_root() {
+fn test_remove_hooks_refuses_subdirectory_root() {
     let dir = tempdir().unwrap();
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
@@ -668,51 +615,31 @@ fn test_install_hooks_refuses_subdirectory_root() {
     let subdir = repo.join("src");
     fs::create_dir_all(&subdir).unwrap();
 
-    // resolve_hooks_dir must return Err for a subdirectory of a git repo (F9/AD-413-18).
     assert!(
         super::resolve_hooks_dir(&subdir).is_err(),
-        "a subdirectory of a git repo must yield Err from resolve_hooks_dir; \
-         pre-fix: returned <subdir>/.git/hooks and let create_dir_all fabricate \
-         a fake .git directory"
+        "a subdirectory of a git repo must yield Err from resolve_hooks_dir"
     );
 
-    // install_search_hooks must refuse with an Err naming the enclosing repo.
-    let err = install_search_hooks(&subdir).unwrap_err();
+    let err = remove_search_hooks(&subdir).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("subdirectory") || msg.contains("inside"),
         "error must describe the subdirectory constraint; got: {msg}"
     );
-
-    // Most critical invariant: no .git entry must exist at the subdirectory level.
     assert!(
         !subdir.join(".git").exists(),
-        "install must not create a .git entry in a subdirectory root; \
-         this breaks ancestor adoption (resolve_repo_toplevel AC17) and \
-         makes the temporal layer silently dead (PF-017)"
+        "removal must not create a .git entry in a subdirectory root"
     );
-
-    // remove_search_hooks is symmetric: also refuses on subdirectory roots.
-    let remove_err = remove_search_hooks(&subdir).unwrap_err();
-    let remove_msg = remove_err.to_string();
-    assert!(
-        remove_msg.contains("subdirectory") || remove_msg.contains("inside"),
-        "remove_search_hooks must also refuse a subdirectory root; got: {remove_msg}"
-    );
-
-    // has_search_hooks returns false rather than panicking on a subdirectory root.
-    assert!(
-        !has_search_hooks(&subdir),
-        "has_search_hooks must return false for a subdirectory root"
+    assert_eq!(
+        find_search_hooks(&subdir),
+        None,
+        "find returns None rather than panicking on a subdirectory root"
     );
 }
 
-/// Missing test 6 / P2-3 / AD-413-18: `resolve_hooks_dir` on a subdirectory must
-/// return `Err(ancestor)` where `ancestor` is the canonical path of the enclosing
-/// repository, not merely `Err(_)`.
-///
-/// Discriminating: the `Err` payload equals the canonical enclosing repo path so
-/// callers can embed it in a human-readable hint ("re-run with `--root <payload>`").
+/// `resolve_hooks_dir` on a subdirectory must return `Err(ancestor)` where
+/// `ancestor` is the canonical path of the enclosing repository, not merely
+/// `Err(_)`; the removal error names that repository.
 #[test]
 fn test_resolve_hooks_dir_subdirectory_err_payload_is_ancestor_canonical() {
     let dir = tempdir().unwrap();
@@ -724,50 +651,39 @@ fn test_resolve_hooks_dir_subdirectory_err_payload_is_ancestor_canonical() {
     let subdir = repo.join("lib");
     fs::create_dir_all(&subdir).unwrap();
 
-    // The Err payload must be the canonical ancestor path (P2-3 / AD-413-18).
     let result = super::resolve_hooks_dir(&subdir);
     assert_eq!(
         result,
         Err(repo_canonical.clone()),
-        "resolve_hooks_dir must return Err(enclosing_repo_canonical) for a subdirectory; \
-         callers embed this path in the '--root <path>' hint (P2-3)"
+        "resolve_hooks_dir must return Err(enclosing_repo_canonical) for a subdirectory"
     );
 
-    // The install error message must name the canonical repo path so the user can
-    // copy-paste the `--root` flag without quoting surprises (P3-4).
-    let err = install_search_hooks(&subdir).unwrap_err();
+    let err = remove_search_hooks(&subdir).unwrap_err();
     let msg = err.to_string();
     let repo_display = repo_canonical.display().to_string();
     assert!(
         msg.contains(&repo_display),
-        "install error must contain the canonical repo path '{repo_display}'; got: {msg}"
+        "remove error must contain the canonical repo path '{repo_display}'; got: {msg}"
     );
 }
 
-/// Submodule case — AC34(b) correctness (Findings 3+4 of the #413 review):
+/// Submodule case — AC34(b) correctness:
 ///
 /// A git submodule's `.git` is a file whose `gitdir:` pointer resolves to
 /// `<superproject>/.git/modules/<name>`.  That gitdir is a self-contained private
 /// ref store with no `commondir` file, so the hooks directory is NOT shared across
 /// worktrees.
 ///
-/// (a) `install_search_hooks` must return `shared: false` — the "shared by every
-///     worktree of this clone" disclosure must NOT fire for a submodule root.
-///     The pre-fix path-inequality gate (`hooks_dir != root/.git/hooks`) fired
-///     for submodules because their resolved dir differs from the hand-built path.
+/// (a) `is_shared_hooks_dir` must be false — the "shared by every worktree of
+///     this clone" disclosure must NOT fire for a submodule root.
 ///
-/// (b) The hooks are installed into the submodule's private gitdir, not the
+/// (b) The block is removed from the submodule's private gitdir, not from the
 ///     superproject's hooks directory.
-///
-/// (b2) After `canonicalize()` (the display-site normalization), the path contains
-///      no `..` components.  The raw pointer written by git is relative
-///      (`gitdir: ../.git/modules/sub`), so `resolve_git_dir` returns a joined,
-///      non-normalized path without the display-site fix.
 ///
 /// Uses a real `git submodule add` fixture — a fake `.git` file would not exercise
 /// the relative-pointer code path in `resolve_git_dir`.
 #[test]
-fn test_install_hooks_submodule_no_shared_disclosure_and_normalized_path() {
+fn test_remove_hooks_submodule_no_shared_disclosure() {
     use std::process::Command;
 
     let dir = tempdir().unwrap();
@@ -782,9 +698,8 @@ fn test_install_hooks_submodule_no_shared_disclosure_and_normalized_path() {
     fs::create_dir_all(&super_root).unwrap();
     create_real_git_repo(&super_root, &[("init", &[("README.md", "readme\n")])]);
 
-    // Add sub_origin as a submodule named "sub" inside the superproject.
     // `protocol.file.allow=always` is required when adding a local-path submodule
-    // from within git 2.38+ (file protocol is restricted by default since CVE-2022-39253).
+    // from within git 2.38+ (file protocol is restricted by default).
     let out = Command::new("git")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -804,7 +719,7 @@ fn test_install_hooks_submodule_no_shared_disclosure_and_normalized_path() {
     if !out.status.success() {
         // git submodule may be unavailable in CI — skip gracefully.
         eprintln!(
-            "test_install_hooks_submodule: git submodule add failed ({}); skipping.\nstderr: {}",
+            "test_remove_hooks_submodule: git submodule add failed ({}); skipping.\nstderr: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
@@ -812,68 +727,53 @@ fn test_install_hooks_submodule_no_shared_disclosure_and_normalized_path() {
     }
 
     let sub_root = super_root.join("sub");
-
-    // Precondition: the submodule checkout must have a `.git` FILE (not a directory).
     assert!(
         sub_root.join(".git").is_file(),
         "submodule .git must be a file, not a directory (precondition)"
     );
 
-    // (a) install_search_hooks must return shared: false — submodule gitdir has no
-    // commondir, so the hooks dir is private, not clone-wide-shared.
-    let outcome = install_search_hooks(&sub_root)
-        .expect("install_search_hooks must succeed on a submodule root");
-    assert!(
-        !outcome.shared,
-        "submodule hooks dir is private (no commondir); \
-         outcome.shared must be false, not 'shared by every worktree'"
-    );
+    // The old block sits in the submodule's private hooks directory, and the
+    // superproject has one of its own that removal must not touch.
+    let sub_hooks = super::resolve_hooks_dir(&sub_root).unwrap();
+    plant_fresh_hooks(&sub_hooks);
+    let super_hooks = hooks_dir(&super_root);
+    plant_fresh_hooks(&super_hooks);
 
-    // (b) Hooks must be installed in the submodule's private gitdir, not the
-    // superproject's hooks directory.
-    let super_hooks = super_root.join(".git").join("hooks");
+    let outcome = remove_search_hooks(&sub_root)
+        .expect("remove_search_hooks must succeed on a submodule root");
+
+    assert!(outcome.changed, "the submodule hooks held the block");
     assert!(
-        !outcome.dir.starts_with(&super_hooks),
-        "submodule hooks must NOT be in the superproject hooks dir ({super_hooks:?}); \
-         got: {:?}",
+        !super::is_shared_hooks_dir(&sub_root),
+        "submodule hooks dir is private (no commondir); \
+         the 'shared by every worktree' notice must not fire"
+    );
+    assert_eq!(outcome.dir, sub_hooks.canonicalize().unwrap());
+    assert!(
+        !outcome.dir.to_string_lossy().contains(".."),
+        "the reported directory must be normalized; got {:?}",
         outcome.dir
     );
-    for name in ["post-commit", "post-merge", "post-checkout"] {
-        assert!(
-            outcome.dir.join(name).exists(),
-            "hook {name} must be installed in the submodule gitdir {:?}",
-            outcome.dir
+    for name in HOOK_NAMES {
+        assert_eq!(
+            fs::read_to_string(sub_hooks.join(name)).unwrap(),
+            "#!/bin/sh\n",
+            "{name}: the submodule hook must lose its block"
+        );
+        assert_eq!(
+            fs::read_to_string(super_hooks.join(name)).unwrap(),
+            with_old_block("#!/bin/sh"),
+            "{name}: the superproject hook must stay as it is"
         );
     }
-
-    // (b2) The canonicalized display path must not contain `..`.
-    // `resolve_git_dir` joins the relative pointer as-is (e.g.
-    // `sub_root.join("../.git/modules/sub")`).  The display-site
-    // `canonicalize()` normalizes this before printing.
-    let display_dir = outcome
-        .dir
-        .canonicalize()
-        .expect("submodule hooks dir must exist after install (for canonicalize)");
-    let display_str = display_dir.to_string_lossy();
-    assert!(
-        !display_str.contains(".."),
-        "canonicalized display path must not contain '..'; got: {display_str}"
-    );
 }
 
 // ============================================================================
-// Missing test 7 / F8 — control characters in gitdir pointer are not forwarded raw
+// Control characters in a gitdir pointer are not forwarded raw
 // ============================================================================
 
-/// Missing test 7 / F8 / AD-413-3 extension: a `gitdir:` pointer containing
-/// ASCII control characters (`\r`, `\n`, ESC, NUL) must not appear raw in any
-/// error or warning message emitted by `install_search_hooks` or
-/// `remove_search_hooks`.
-///
-/// The F8 fix uses `.display()` (not `{:?}`) for the `--root` hint and wraps the
-/// subdirectory path in `{:?}` for the body — neither form should emit raw ESC/CR
-/// bytes into the user's terminal (where they would be interpreted as ANSI escapes
-/// or CR-rewrite).
+/// A `gitdir:` pointer containing ASCII control characters (`\r`, `\n`, ESC) must
+/// not appear raw in any error message from `remove_search_hooks`.
 ///
 /// Discriminating: the emitted error message contains no byte in `0x01..=0x1F`
 /// other than `\t` (0x09) when a crafted `.git` file contains a control character
@@ -885,32 +785,24 @@ fn test_hooks_refusal_quotes_control_chars_in_gitdir() {
     fs::create_dir_all(&project).unwrap();
 
     // Craft a .git FILE whose gitdir: line contains a CR+LF and an ESC byte.
-    // These are the most dangerous control characters for terminal output.
     let evil_target = dir.path().join("evil\x1b[31mred\x1b[0m");
     let gitdir_line = format!("gitdir: {}\r\n", evil_target.display());
     fs::write(project.join(".git"), gitdir_line.as_bytes()).unwrap();
 
-    // install_search_hooks and remove_search_hooks may return Ok or Err; what
-    // matters is that no error message contains a raw control byte (excluding tab).
-    let install_err = install_search_hooks(&project)
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+    // remove_search_hooks may return Ok or Err; what matters is that no error
+    // message contains a raw control byte (excluding tab).
     let remove_err = remove_search_hooks(&project)
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
 
-    for (label, msg) in [("install", &install_err), ("remove", &remove_err)] {
-        for (i, byte) in msg.bytes().enumerate() {
-            // Allow tab (0x09). Reject all other ASCII control characters.
-            if byte < 0x20 && byte != 0x09 {
-                panic!(
-                    "{label} error message must not contain raw control byte 0x{byte:02X} \
-                     at position {i}; message: {:?}",
-                    &msg[..msg.len().min(200)]
-                );
-            }
+    for (i, byte) in remove_err.bytes().enumerate() {
+        if byte < 0x20 && byte != 0x09 {
+            panic!(
+                "remove error message must not contain raw control byte 0x{byte:02X} \
+                 at position {i}; message: {:?}",
+                &remove_err[..remove_err.len().min(200)]
+            );
         }
     }
 }

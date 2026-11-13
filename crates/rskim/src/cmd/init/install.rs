@@ -595,6 +595,10 @@ fn run_install_single(
         println!();
     }
 
+    // Before the fast path, so that an install that is already current still
+    // loses the search git hooks that skim 2.x wrote.
+    remove_legacy_search_hooks(flags.dry_run);
+
     // Before the fast path, so that a current install still loses the entries
     // that skim no longer seeds.
     let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run);
@@ -823,76 +827,44 @@ fn execute_install(
         inject_guidance(agent_from_state(state)?, global, env)?;
     }
 
-    // Search hooks + background index — non-fatal, delegated to helper.
-    install_search_integration();
-
     Ok(())
 }
 
-/// Install search git hooks and spawn a background index build.
+/// Remove the search git hooks that skim 2.x installed in the repository around
+/// the current folder.
 ///
-/// Non-fatal: all failures are printed as notices but do not abort the caller.
-/// `find_git_root_from_cwd` already verifies `.git` exists, so no inner `.git`
-/// check is needed — the outer `if let Some(...)` is the only guard required.
-fn install_search_integration() {
+/// Called by `skim init` and `skim init --uninstall`. Nothing is installed and no
+/// program is started. Only the old block goes; every other line of each hook
+/// stays (see `cmd::search::hooks`). With `dry_run`, it names the directory and
+/// writes nothing. Non-fatal: a failure is a note and does not stop the caller.
+/// Outside a git repository it does nothing.
+pub(super) fn remove_legacy_search_hooks(dry_run: bool) {
     let Some(project_root) = find_git_root_from_cwd() else {
         return;
     };
-
-    match crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
-        Err(e) => eprintln!("  Note: could not install search hooks: {e}"),
-        Ok(outcome) => {
-            println!("  {} Search hooks installed", check_mark(true));
-            // AC34(b): when `resolve_hooks_dir` routes to `<commondir>/hooks`
-            // (a linked worktree), print the resolved path in the skim init stdout
-            // stream.  `install_search_hooks` already emits SHARED_HOOKS_SCOPE_MSG
-            // to stderr for all callers; this line adds the absolute path disclosure
-            // in the `skim init` output itself.
-            //
-            // Gate on `outcome.shared` (the `is_shared_hooks_dir` predicate carried
-            // in the result), NOT on path inequality.  Path inequality fired for git
-            // submodules too — their gitdir is `<super>/.git/modules/<name>`, which
-            // differs from `<root>/.git/hooks` even though no clone-wide sharing
-            // is occurring (the submodule gitdir has no `commondir` file).
-            //
-            // Normalize the path before printing: `resolve_git_dir` returns the
-            // joined raw pointer for `.git`-file repos, which for a submodule contains
-            // `..` components (e.g. `/repo/sub/../.git/modules/sub/hooks`).  Canonical
-            // form is cleaner to read.  Fall back to the raw path if the directory
-            // has not been created yet (should not happen — create_dir_all ran above).
-            if outcome.shared {
-                let display_dir = outcome
-                    .dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| outcome.dir.clone());
-                // F8: use {:?} to quote ESC/CR/LF from repository-controlled
-                // gitdir pointers (AD-413-3 / ADR-008).
-                println!(
-                    "    note: hooks installed in {:?} (shared by every worktree of this clone)",
-                    display_dir
-                );
-            }
+    if dry_run {
+        if let Some(dir) = crate::cmd::search::hooks::find_search_hooks(&project_root) {
+            println!("  [dry-run] Would remove old search git hooks from {dir:?}");
         }
+        return;
     }
+    match crate::cmd::search::hooks::remove_search_hooks(&project_root) {
+        // `{:?}` quotes ESC/CR/LF that a repository-controlled path can hold.
+        Ok(outcome) if outcome.changed => println!(
+            "  {} Old search git hooks removed from {:?}",
+            check_mark(true),
+            outcome.dir
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("  Note: could not remove old search git hooks: {e}"),
+    }
+}
 
-    // Spawn a background build — fire-and-forget, non-blocking, non-fatal.
-    //
-    // The `Child` handle is intentionally dropped without calling `wait()`.
-    // On Unix the child process is reparented to init (PID 1) when this
-    // process exits and will be reaped there.  The `skim init` command exits
-    // immediately after this block, so the window for a zombie entry in the
-    // process table is negligible.  The build lock in `build_index` prevents
-    // concurrent writes when multiple callers overlap.
-    if let Ok(exe) = std::env::current_exe()
-        && let Ok(child) = std::process::Command::new(&exe)
-            .args(["search", "--build"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-    {
-        eprintln!("  Search index build started (PID {})", child.id());
-        drop(child); // Detach: do not wait for the background process.
-    }
+/// The hooks folder of the repository around the current folder, when a hook there
+/// still holds the old search block. `skim doctor` reports it. Writes nothing.
+pub(crate) fn old_search_hooks_dir() -> Option<std::path::PathBuf> {
+    let project_root = find_git_root_from_cwd()?;
+    crate::cmd::search::hooks::find_search_hooks(&project_root)
 }
 
 /// Install or prompt for shell wrapper installation in `~/.skim/bin/`.
@@ -986,7 +958,7 @@ fn print_wrapper_install_result(result: &super::wrappers::InstallResult, dry_run
 /// The root lookup of `skim search` performs a similar walk but falls back to
 /// `cwd` when no `.git` is found and canonicalises the start path first.  This
 /// function has different semantics: callers here need `None` to mean "not a
-/// git repo" so they can skip hook installation entirely.  The two lookups are
+/// git repo" so they can skip the old-hook cleanup entirely.  The two lookups are
 /// kept separate to preserve the distinct caller contracts.
 fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;

@@ -17,6 +17,10 @@
 //! - `render` — the text, JSON, `-l` and `-c` output
 //! - `gitdir` — project-root discovery and git directory lookup
 //! - `hooks` — the removal of the search git hooks that older versions wrote
+//! - `legacy_cache` — the removal of the index data that older versions cached
+//!
+//! A query never calls `hooks` or `legacy_cache`. `skim init`, `skim init --uninstall`
+//! and `skim --clear-cache` remove old data, and `skim doctor` reports it.
 
 mod args;
 mod classifier;
@@ -25,6 +29,7 @@ mod fields;
 mod filter;
 mod gitdir;
 pub(crate) mod hooks;
+pub(crate) mod legacy_cache;
 mod matcher;
 mod rank;
 mod render;

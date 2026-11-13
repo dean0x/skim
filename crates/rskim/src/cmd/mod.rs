@@ -164,6 +164,14 @@ pub(crate) fn resolve_cache_dir() -> Option<std::path::PathBuf> {
     hook_log::CacheEnv::from_process().resolve_cache_dir()
 }
 
+/// Remove the search index data that older versions of skim left in the cache
+/// folder, and print what was removed. Called by `skim --clear-cache` only.
+pub(crate) fn clear_legacy_search_data() {
+    if let Some(base) = resolve_cache_dir() {
+        search::legacy_cache::clear_legacy_index_data(&base);
+    }
+}
+
 /// Cached PATH-wrappers directory — computed once on first access via [`LazyLock`].
 ///
 /// Resolution order (first non-empty value wins):

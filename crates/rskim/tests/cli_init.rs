@@ -8,12 +8,12 @@
 //! no `--agent` removes wrapper symlinks from `~/.skim/bin` and guidance files
 //! from `~/.gemini` and `~/.copilot` for every configured agent (PF-017).
 //!
-//! A successful `skim init` also ends by walking ancestors of the process
-//! working directory for a project root and installing git hooks into it, so an
-//! invocation left at the cwd cargo supplies writes `post-commit`, `post-merge`
-//! and `post-checkout` into the skim clone this test binary was built from. That
-//! axis belongs to no environment variable and is closed in the sandbox builder
-//! itself.
+//! `skim init` and `skim init --uninstall` also walk ancestors of the process
+//! working directory for a project root and take the old search block out of
+//! that repository's `post-commit`, `post-merge` and `post-checkout` hooks, so an
+//! invocation left at the cwd cargo supplies rewrites hooks of the skim clone
+//! this test binary was built from. That axis belongs to no environment variable
+//! and is closed in the sandbox builder itself.
 //!
 //! Every invocation in this file is therefore built by [`Sandbox`], which owns a
 //! `TempDir` and routes through `common::skim_sandboxed`. The convention is not
@@ -118,8 +118,8 @@ impl Sandbox {
     /// [`test_every_invocation_in_this_file_is_sandboxed`] can see and pin, so
     /// the axis cannot regress in this file on its own. It is worth restating
     /// because an unpinned cwd is not a read of the developer's home directory
-    /// but a write to their repository — `skim init` ends by walking ancestors
-    /// of the cwd for a project root and installing git hooks into it.
+    /// but a write to their repository — `skim init` walks ancestors of the cwd
+    /// for a project root and rewrites the git hooks in it.
     fn skim(&self) -> Command {
         let mut cmd = common::skim_sandboxed(self.home());
         cmd.current_dir(self.home());
@@ -826,6 +826,231 @@ fn test_init_uninstall_when_not_installed() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Nothing to uninstall"));
+}
+
+// ============================================================================
+// Old search git hooks (skim 2.x)
+// ============================================================================
+//
+// Skim 2.x wrote a marker block into `post-commit`, `post-merge` and
+// `post-checkout`. `skim init` and `skim init --uninstall` take it out again and
+// leave every other byte of the hook. The repository is a fake one inside the
+// sandbox home: an empty `.git/hooks` directory is enough for the project-root
+// walk, and nothing outside the sandbox is reachable.
+
+/// The block that skim 2.x wrote into the search hooks, with its final newline.
+const OLD_SEARCH_BLOCK: &str =
+    "# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end\n";
+
+/// The lines of a foreign `post-commit` hook: blank lines, a tab and a comment.
+const FOREIGN_POST_COMMIT: &str = "#!/bin/sh\n\n# my own hook\n\tnotify-send \"committed\"\n\n";
+
+/// A repository in the sandbox whose search hooks are as skim 2.x left them:
+/// `post-commit` holds foreign lines and the block, `post-merge` a shebang and the
+/// block, `pre-push` is foreign, and `post-checkout` does not exist.
+///
+/// Returns the repository folder and its hooks folder.
+fn repo_with_old_search_hooks(sandbox: &Sandbox) -> (std::path::PathBuf, std::path::PathBuf) {
+    let project = sandbox.project_dir("repo");
+    let hooks = project.join(".git").join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(
+        hooks.join("post-commit"),
+        format!("{FOREIGN_POST_COMMIT}{OLD_SEARCH_BLOCK}"),
+    )
+    .unwrap();
+    fs::write(
+        hooks.join("post-merge"),
+        format!("#!/bin/sh\n{OLD_SEARCH_BLOCK}"),
+    )
+    .unwrap();
+    fs::write(hooks.join("pre-push"), "#!/bin/sh\necho foreign\n").unwrap();
+    (project, hooks)
+}
+
+/// The sorted names and contents of every file in `dir`, for a before/after check.
+fn snapshot_files(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read(&path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// `skim init` leaves only the foreign lines of a hook, byte for byte.
+#[test]
+fn test_init_removes_the_old_search_block_and_keeps_foreign_lines() {
+    let sandbox = Sandbox::new();
+    let (project, hooks) = repo_with_old_search_hooks(&sandbox);
+
+    sandbox
+        .init()
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Old search git hooks removed"));
+
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-commit")).unwrap(),
+        FOREIGN_POST_COMMIT,
+        "only the foreign lines may remain"
+    );
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-merge")).unwrap(),
+        "#!/bin/sh\n"
+    );
+    assert_eq!(
+        fs::read_to_string(hooks.join("pre-push")).unwrap(),
+        "#!/bin/sh\necho foreign\n",
+        "a hook without the block is not touched"
+    );
+    assert!(
+        !hooks.join("post-checkout").exists(),
+        "init must not create a hook that was not there"
+    );
+}
+
+/// An install that is already current takes the fast path and writes nothing
+/// else, but the old hooks still go.
+#[test]
+fn test_init_removes_the_old_search_block_when_the_install_is_current() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .init()
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success();
+    let (project, hooks) = repo_with_old_search_hooks(&sandbox);
+
+    sandbox
+        .init()
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Already up to date"))
+        .stdout(predicate::str::contains("Old search git hooks removed"));
+
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-commit")).unwrap(),
+        FOREIGN_POST_COMMIT
+    );
+}
+
+/// `skim init --dry-run` names the folder and changes no hook file.
+#[test]
+fn test_init_dry_run_reports_the_old_search_block_and_writes_nothing() {
+    let sandbox = Sandbox::new();
+    let (project, hooks) = repo_with_old_search_hooks(&sandbox);
+    let before = snapshot_files(&hooks);
+
+    sandbox
+        .init()
+        .args(["--yes", "--dry-run", "--agent", "claude-code"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[dry-run] Would remove old search git hooks",
+        ));
+
+    assert_eq!(
+        snapshot_files(&hooks),
+        before,
+        "dry-run changed a hook file"
+    );
+}
+
+/// `skim init --uninstall` removes the block also when no agent hook is
+/// installed: the block belongs to the repository, not to an agent.
+#[test]
+fn test_uninstall_removes_the_old_search_block_without_an_agent_hook() {
+    let sandbox = Sandbox::new();
+    let (project, hooks) = repo_with_old_search_hooks(&sandbox);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Old search git hooks removed"));
+
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-commit")).unwrap(),
+        FOREIGN_POST_COMMIT
+    );
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-merge")).unwrap(),
+        "#!/bin/sh\n"
+    );
+}
+
+/// `skim init --uninstall --dry-run` changes no hook file.
+#[test]
+fn test_uninstall_dry_run_changes_no_hook_file() {
+    let sandbox = Sandbox::new();
+    let (project, hooks) = repo_with_old_search_hooks(&sandbox);
+    let before = snapshot_files(&hooks);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--dry-run", "--yes"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[dry-run] Would remove old search git hooks",
+        ));
+
+    assert_eq!(
+        snapshot_files(&hooks),
+        before,
+        "dry-run changed a hook file"
+    );
+}
+
+/// Outside a git repository the cleanup does nothing and says nothing.
+#[test]
+fn test_init_outside_a_repository_prints_nothing_about_search_hooks() {
+    let sandbox = Sandbox::new();
+
+    sandbox
+        .init()
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("search git hooks").not());
 }
 
 // ============================================================================
@@ -2429,12 +2654,11 @@ fn test_init_without_a_declaration_still_takes_the_skip_path() {
 
 /// Run `skim init` in `sandbox`, with `--dev` when asked, and return stdout.
 ///
-/// Nothing is done here to keep `install_search_integration` away from the
-/// repository this test binary runs from: [`Sandbox::skim`] pins the cwd to the
-/// sandbox home for every invocation in this file, so with no `.git` above the
-/// sandbox there is no project root, no search hooks are installed and no
-/// background index build is spawned. This used to be applied at three call
-/// sites and missed at the other thirty-odd.
+/// Nothing is done here to keep the old-hook cleanup away from the repository
+/// this test binary runs from: [`Sandbox::skim`] pins the cwd to the sandbox
+/// home for every invocation in this file, so with no `.git` above the sandbox
+/// there is no project root and no hook is rewritten. This used to be applied at
+/// three call sites and missed at the other thirty-odd.
 fn run_init(sandbox: &Sandbox, dev: bool) -> String {
     let mut cmd = sandbox.skim();
     cmd.args(["init", "--agent", "claude-code", "--no-guidance"]);
@@ -2687,11 +2911,11 @@ fn test_every_invocation_in_this_file_is_sandboxed() {
     }
 
     // The cwd axis, pinned at this file's chokepoint. No environment variable
-    // can confine it: a successful `skim init` ends by walking ancestors of the
-    // process cwd for a project root and writing git hooks into it, so an
-    // invocation left at the cargo-supplied cwd installs real post-commit,
-    // post-merge and post-checkout hooks into the skim clone this test binary
-    // was built from. Assembled from fragments for the same reason as the
+    // can confine it: `skim init` walks ancestors of the process cwd for a
+    // project root and rewrites the git hooks in it, so an invocation left at the
+    // cargo-supplied cwd edits the real post-commit, post-merge and
+    // post-checkout hooks of the skim clone this test binary was built from.
+    // Assembled from fragments for the same reason as the
     // needles above — spelled whole, this assertion would satisfy itself.
     let cwd_pin = concat!("cmd.current_dir(self.", "home());");
     assert!(
@@ -2810,9 +3034,9 @@ fn test_every_init_test_file_is_sandboxed() {
                 found, 0,
                 "{name} uses `{needle}` {found}×, which {why}. Route every \
                  invocation through `{builder}` with a `TempDir` home: a global \
-                 `skim init --uninstall` DELETES real agent config, and a \
-                 successful `skim init` writes git hooks into whatever \
-                 repository encloses the cwd (PF-017)."
+                 `skim init --uninstall` DELETES real agent config, and \
+                 `skim init` rewrites the git hooks of whatever repository \
+                 encloses the cwd (PF-017)."
             );
         }
     }

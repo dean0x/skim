@@ -72,6 +72,10 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     if hooks.drift {
         drift = true;
     }
+    // Advisory only: old search git hooks never set the drift verdict.
+    if let Some(note) = old_search_hooks_note(crate::cmd::init::old_search_hooks_dir().as_deref()) {
+        println!("{note}");
+    }
     println!();
 
     // 4. Wrappers
@@ -649,6 +653,21 @@ fn print_hook_section(
     Ok(verdict)
 }
 
+/// The advisory line for old search git hooks, or `None` when there are none.
+///
+/// Skim 2.x wrote a block into `post-commit`, `post-merge` and `post-checkout`.
+/// The block now runs a command that exits 2. A note only: it sets neither the
+/// drift verdict nor the exit code. `dir` is the hooks folder where the block
+/// still sits, for the repository around the current folder.
+fn old_search_hooks_note(dir: Option<&std::path::Path>) -> Option<String> {
+    // `{:?}` quotes control bytes that a repository-controlled path can hold.
+    dir.map(|dir| {
+        format!(
+            "  ⚠  Old search git hooks: found in {dir:?} — run skim init --uninstall or skim init"
+        )
+    })
+}
+
 /// Advisory lines about `PostToolUse` hooks of other tools, for one agent.
 ///
 /// Claude Code gives the model one `PostToolUse` result per Bash call, so another
@@ -869,6 +888,32 @@ fn print_cache_section() {
         }
         None => println!("  Analytics DB: (unknown)"),
     }
+
+    // Advisory only: old index data never sets the drift verdict.
+    if let Some(dir) = cache_env.resolve_cache_dir()
+        && let Some(note) = old_search_index_note(
+            crate::cmd::search::legacy_cache::legacy_index_report(&dir),
+            &dir.join("search"),
+        )
+    {
+        println!("{note}");
+    }
+}
+
+/// The advisory line for old search index data, or `None` when there is none.
+///
+/// `report` is `(folders, bytes)` from `legacy_index_report`; `search_dir` is the
+/// folder that holds the data. `skim --clear-cache` removes it.
+fn old_search_index_note(
+    report: Option<(u64, u64)>,
+    search_dir: &std::path::Path,
+) -> Option<String> {
+    report.map(|(folders, bytes)| {
+        format!(
+            "  ⚠  Old search index data: {folders} folders, {} MB in {search_dir:?} — run skim --clear-cache",
+            crate::cmd::search::legacy_cache::format_megabytes(bytes)
+        )
+    })
 }
 
 // ============================================================================
@@ -1119,6 +1164,7 @@ fn print_help() {
     println!("      never as `✓` — `skim doctor | grep dev-pinned` is the CI guard");
     println!("  Wrapper directory (~/.skim/bin) status and symlink count");
     println!("  Cache directory and analytics DB paths");
+    println!("  Old search git hooks and old search index data, as advisory notes (never drift)");
     println!("  Staleness vs. HEAD (run from the skim source directory for accurate results)");
     println!();
     println!("Exit codes:");
@@ -1704,6 +1750,53 @@ mod tests {
         let mut facts = facts_with_foreign_post_hooks(vec![("/f.json", "/usr/bin/one")], vec![]);
         facts.hook_installed = false;
         assert!(foreign_post_hook_notes(&facts).is_empty());
+    }
+
+    // ---- old search notes ----
+
+    #[test]
+    fn test_old_search_hooks_note_is_absent_without_a_block() {
+        assert_eq!(old_search_hooks_note(None), None);
+    }
+
+    #[test]
+    fn test_old_search_hooks_note_names_the_folder_and_the_remedy() {
+        let note = old_search_hooks_note(Some(std::path::Path::new("/r/.git/hooks"))).unwrap();
+        assert!(
+            note.contains("Old search git hooks: found in \"/r/.git/hooks\""),
+            "{note}"
+        );
+        assert!(
+            note.contains("skim init --uninstall or skim init"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn test_old_search_hooks_note_quotes_control_bytes_in_the_path() {
+        let note =
+            old_search_hooks_note(Some(std::path::Path::new("/r\u{1b}[31m\n/hooks"))).unwrap();
+        assert!(!note.contains('\u{1b}'), "{note:?}");
+        assert_eq!(note.lines().count(), 1, "{note:?}");
+    }
+
+    #[test]
+    fn test_old_search_index_note_is_absent_without_data() {
+        assert_eq!(
+            old_search_index_note(None, std::path::Path::new("/c/search")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_old_search_index_note_gives_folders_size_and_remedy() {
+        let note = old_search_index_note(Some((3, 12_340_000)), std::path::Path::new("/c/search"))
+            .unwrap();
+        assert!(
+            note.contains("Old search index data: 3 folders, 12.3 MB in \"/c/search\""),
+            "{note}"
+        );
+        assert!(note.contains("run skim --clear-cache"), "{note}");
     }
 
     // ---- query_binary_info acquisition-path test ----

@@ -380,8 +380,11 @@ struct Args {
     #[arg(long, help = "Disable caching of transformed output")]
     no_cache: bool,
 
-    /// Clear the entire cache directory (~/.cache/skim/)
-    #[arg(long, help = "Clear all cached files and exit")]
+    /// Clear the cached files and the old search index data (~/.cache/skim/)
+    #[arg(
+        long,
+        help = "Clear all cached files and old search index data, and exit"
+    )]
     clear_cache: bool,
 
     /// Show token count statistics (output to stderr)
@@ -1672,6 +1675,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
 
     if args.clear_cache {
         cache::clear_cache()?;
+        cmd::clear_legacy_search_data();
         println!("Cache cleared successfully");
         return Ok(());
     }

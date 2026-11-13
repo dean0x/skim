@@ -108,8 +108,14 @@ fn test_dot_routes_to_file_operation() {
 
 #[test]
 fn test_no_positional_routes_to_file_operation() {
-    // Flags only, no positional → FileOperation → clap handles --clear-cache
-    common::skim().arg("--clear-cache").assert().success();
+    // Flags only, no positional → FileOperation → clap handles --clear-cache.
+    // The cache folder is a temp folder, so the run clears nothing of the host's.
+    let cache_dir = TempDir::new().unwrap();
+    common::skim()
+        .env("SKIM_CACHE_DIR", cache_dir.path())
+        .arg("--clear-cache")
+        .assert()
+        .success();
 }
 
 #[test]

@@ -205,19 +205,19 @@ pub fn sandbox_var_path(home: &std::path::Path, relative: &str) -> std::path::Pa
 ///
 /// # The working directory is part of the sandbox
 ///
-/// No environment variable can confine `skim init`'s *last* step. A successful
-/// install ends in `install_search_integration`, which resolves its project root
-/// with a 64-step ancestor walk from `std::env::current_dir()` and, on a hit,
-/// writes `post-commit`, `post-merge` and `post-checkout` into that repository's
-/// `.git/hooks` and spawns a detached `skim search --build`. Left at the cwd
-/// cargo supplies (`crates/rskim`), that walk lands on the skim clone the test
-/// binary was built from: the suite installs real git hooks into the developer's
-/// working copy, and `SKIM_CACHE_DIR` cannot contain it because `.git/hooks` is
-/// outside every path [`SANDBOX_REDIRECTED_VARS`] names.
+/// No environment variable can confine the old-hook cleanup of `skim init` and
+/// `skim init --uninstall`. Both run `remove_legacy_search_hooks`, which resolves
+/// its project root with a 64-step ancestor walk from `std::env::current_dir()`
+/// and, on a hit, takes the old search block out of that repository's
+/// `post-commit`, `post-merge` and `post-checkout` hooks. Left at the cwd cargo
+/// supplies (`crates/rskim`), that walk lands on the skim clone the test binary
+/// was built from: the suite rewrites real git hooks in the developer's working
+/// copy, and `SKIM_CACHE_DIR` cannot contain it because `.git/hooks` is outside
+/// every path [`SANDBOX_REDIRECTED_VARS`] names.
 ///
 /// Pinning the cwd to the sandbox home closes that axis for every caller at
 /// once: the home is a bare `TempDir` with no `.git` above it, so the walk
-/// returns `None` and the installer skips search integration entirely.
+/// returns `None` and the cleanup does nothing.
 ///
 /// Tests may chain additional `.env(...)` or `.current_dir(...)` calls to add or
 /// override; a chained call applied after this one wins, which is how the
