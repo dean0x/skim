@@ -48,29 +48,38 @@ pub(super) const MAX_CEILING_ENTRIES: usize = 64;
 pub(super) struct RootRules {
     pub(super) ceilings: Vec<PathBuf>,
     pub(super) home: Option<PathBuf>,
+    /// `GIT_CEILING_DIRECTORIES` holds more than [`MAX_CEILING_ENTRIES`]
+    /// absolute entries. The entries past the bound are not read, so the walk
+    /// does not go up at all: it cannot pass a ceiling it did not read.
+    pub(super) ceiling_overflow: bool,
 }
 
 impl RootRules {
     /// The rules of this process: `GIT_CEILING_DIRECTORIES` and the home
     /// folder.
     pub(super) fn from_env() -> Self {
-        let ceilings = std::env::var_os("GIT_CEILING_DIRECTORIES")
-            .map(|value| parse_ceilings(&value))
+        let (ceilings, ceiling_overflow) = std::env::var_os("GIT_CEILING_DIRECTORIES")
+            .map(|value| (parse_ceilings(&value), too_many_ceilings(&value)))
             .unwrap_or_default();
         let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
-        RootRules { ceilings, home }
+        RootRules {
+            ceilings,
+            home,
+            ceiling_overflow,
+        }
     }
 
     /// Whether the walk ends before `candidate`, an ancestor of the start.
     fn stops_at(&self, candidate: &Path) -> bool {
-        candidate.parent().is_none()
+        self.ceiling_overflow
+            || candidate.parent().is_none()
             || self.home.as_deref() == Some(candidate)
             || self.ceilings.iter().any(|c| c == candidate)
     }
 }
 
-/// The usable entries of a `GIT_CEILING_DIRECTORIES` value: absolute paths,
-/// at most [`MAX_CEILING_ENTRIES`]. An entry is kept as written, and its
+/// The usable entries of a `GIT_CEILING_DIRECTORIES` value: the first
+/// [`MAX_CEILING_ENTRIES`] absolute paths. An entry is kept as written, and its
 /// canonical form is added when that differs, because the walk compares
 /// canonical paths.
 fn parse_ceilings(value: &std::ffi::OsStr) -> Vec<PathBuf> {
@@ -86,8 +95,16 @@ fn parse_ceilings(value: &std::ffi::OsStr) -> Vec<PathBuf> {
         }
         ceilings.push(entry);
     }
-    ceilings.truncate(MAX_CEILING_ENTRIES);
     ceilings
+}
+
+/// Whether a `GIT_CEILING_DIRECTORIES` value holds more absolute entries than
+/// [`parse_ceilings`] reads. It reads at most one entry past the bound.
+fn too_many_ceilings(value: &std::ffi::OsStr) -> bool {
+    std::env::split_paths(value)
+        .filter(|p| p.is_absolute())
+        .nth(MAX_CEILING_ENTRIES)
+        .is_some()
 }
 
 /// Walk up from `canonical` (a pre-canonicalized path) looking for the nearest

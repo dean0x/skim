@@ -4,7 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{MAX_CEILING_ENTRIES, RootRules, discover_project_root_with, parse_ceilings};
+use super::{
+    MAX_CEILING_ENTRIES, RootRules, discover_project_root_with, parse_ceilings, too_many_ceilings,
+};
 
 /// A canonical temp folder with `repo/.git` and `repo/a/b` below it.
 fn repo_with_subfolder() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -39,6 +41,7 @@ fn walk_never_steps_into_a_ceiling_folder() {
     let rules = RootRules {
         ceilings: vec![repo.join("a")],
         home: None,
+        ceiling_overflow: false,
     };
     let found = discover_project_root_with(&sub, &rules);
     assert_eq!(found, sub, "a ceiling above the start ends the search");
@@ -50,6 +53,7 @@ fn walk_may_start_in_a_ceiling_folder() {
     let rules = RootRules {
         ceilings: vec![repo.clone()],
         home: None,
+        ceiling_overflow: false,
     };
     // The start itself is never excluded: it holds the repository.
     assert_eq!(discover_project_root_with(&repo, &rules), repo);
@@ -62,6 +66,7 @@ fn walk_never_takes_the_home_folder_from_below() {
     let rules = RootRules {
         ceilings: Vec::new(),
         home: Some(repo.clone()),
+        ceiling_overflow: false,
     };
     let found = discover_project_root_with(&sub, &rules);
     assert_eq!(found, sub, "the home folder is not a root from below");
@@ -73,6 +78,7 @@ fn walk_may_start_in_the_home_folder() {
     let rules = RootRules {
         ceilings: Vec::new(),
         home: Some(repo.clone()),
+        ceiling_overflow: false,
     };
     assert_eq!(discover_project_root_with(&repo, &rules), repo);
 }
@@ -84,6 +90,7 @@ fn walk_does_not_pass_the_home_folder_to_a_repository_above_it() {
     let rules = RootRules {
         ceilings: Vec::new(),
         home: Some(home),
+        ceiling_overflow: false,
     };
     let found = discover_project_root_with(&sub, &rules);
     assert_eq!(found, sub, "the walk ends at the home folder");
@@ -118,6 +125,62 @@ fn ceilings_are_bounded() {
         .collect();
     let value = std::ffi::OsString::from(many.join(":"));
     assert!(parse_ceilings(&value).len() <= MAX_CEILING_ENTRIES);
+}
+
+#[test]
+#[cfg(unix)]
+fn every_ceiling_read_keeps_both_forms_when_each_is_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let links: Vec<PathBuf> = (0..MAX_CEILING_ENTRIES)
+        .map(|n| {
+            let real = base.join(format!("real{n}"));
+            std::fs::create_dir(&real).unwrap();
+            let link = base.join(format!("link{n}"));
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            link
+        })
+        .collect();
+    let value = std::env::join_paths(&links).unwrap();
+    let parsed = parse_ceilings(&value);
+    let last = links.last().unwrap();
+    assert!(
+        parsed.contains(last),
+        "the last entry read is kept as written"
+    );
+    assert!(
+        parsed.contains(&last.canonicalize().unwrap()),
+        "and in its canonical form"
+    );
+}
+
+#[test]
+fn more_ceilings_than_the_bound_is_an_overflow() {
+    let entries = |n: usize| {
+        let list: Vec<String> = (0..n).map(|i| format!("/ceiling/{i}")).collect();
+        std::ffi::OsString::from(list.join(":"))
+    };
+    assert!(!too_many_ceilings(&entries(MAX_CEILING_ENTRIES)));
+    assert!(too_many_ceilings(&entries(MAX_CEILING_ENTRIES + 1)));
+    // A relative entry is not read, so it does not count.
+    let mut value = entries(MAX_CEILING_ENTRIES);
+    value.push(":relative");
+    assert!(!too_many_ceilings(&value));
+}
+
+#[test]
+fn a_ceiling_overflow_keeps_the_walk_in_the_start_folder() {
+    let (_dir, repo, sub) = repo_with_subfolder();
+    let rules = RootRules {
+        ceilings: Vec::new(),
+        home: None,
+        ceiling_overflow: true,
+    };
+    // A ceiling that was not read could sit between the start and the
+    // repository, so the walk does not go up.
+    assert_eq!(discover_project_root_with(&sub, &rules), sub);
+    // The start folder itself is still a root when it holds the repository.
+    assert_eq!(discover_project_root_with(&repo, &rules), repo);
 }
 
 #[test]

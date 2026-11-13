@@ -168,8 +168,16 @@ fn resolve_scan_root(
         ));
     }
     let path = gitdir::discover_project_root_with(cwd, rules);
-    let notice = (path != cwd)
-        .then(|| format!("searching {path:?} (the repository that holds the current folder)"));
+    let notice = if rules.ceiling_overflow {
+        Some(format!(
+            "GIT_CEILING_DIRECTORIES has more than {} entries; \
+             the search does not go above {path:?} to find a repository",
+            gitdir::MAX_CEILING_ENTRIES
+        ))
+    } else {
+        (path != cwd)
+            .then(|| format!("searching {path:?} (the repository that holds the current folder)"))
+    };
     Ok(ScanRoot { path, notice })
 }
 

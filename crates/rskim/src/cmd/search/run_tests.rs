@@ -26,6 +26,7 @@ fn sandbox() -> (tempfile::TempDir, PathBuf, RootRules) {
     let rules = RootRules {
         ceilings: vec![path.clone()],
         home: None,
+        ceiling_overflow: false,
     };
     (dir, path, rules)
 }
@@ -83,6 +84,31 @@ fn an_implicit_root_is_the_repository_and_the_notice_names_it() {
     let at_root = resolve_scan_root(None, &repo, &rules).unwrap();
     assert_eq!(at_root.path, repo);
     assert_eq!(at_root.notice, None);
+}
+
+#[test]
+fn a_ceiling_overflow_searches_the_working_folder_and_the_notice_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let rules = RootRules {
+        ceiling_overflow: true,
+        ..RootRules::default()
+    };
+
+    let root = resolve_scan_root(None, &repo.join("src"), &rules).unwrap();
+
+    assert_eq!(root.path, repo.join("src"));
+    let notice = root.notice.unwrap();
+    assert!(
+        notice.starts_with("GIT_CEILING_DIRECTORIES has more than 64 entries"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains(&format!("{:?}", repo.join("src"))),
+        "{notice}"
+    );
 }
 
 #[test]
