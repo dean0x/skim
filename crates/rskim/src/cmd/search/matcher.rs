@@ -13,14 +13,25 @@
 //! # Whole words (`-w`)
 //!
 //! A match counts when the character before it and the character after it (if
-//! any) are not in `[\p{Alphabetic}\p{Nd}_]`. This is a post-filter on the
-//! matches of the engine, not the boundary rule of `rg -w`: for a pattern that
-//! starts or ends with a non-word character, or that can match at more than one
-//! length from one start, the two can differ. The scoreboard oracle applies
-//! the same rule, so the two sides agree.
+//! any) are not word characters. The word characters are those of the `regex`
+//! crate's Unicode `\w`: letters, marks, decimal digits, connector punctuation
+//! (`_` too) and join controls.
+//!
+//! The rule is part of the compiled pattern, as `rg -w` builds it since
+//! ripgrep 14: `\b{start-half}(?:PATTERN)\b{end-half}`. Each assertion reads
+//! one character and nothing else. So the engine looks for a match that meets
+//! the rule, and does not check a match that it found first:
+//!
+//! - a search of a line costs the same with `-w` as without it;
+//! - an alternative can take its longer branch: `foo|foobar` matches `foobar`;
+//! - a pattern that starts or ends with a non-word character is read at the
+//!   character next to the match, as `rg -w` reads it.
+//!
+//! The lines that match are the lines `rg -nw` prints. `git grep -w` differs on
+//! text that is not ASCII: it takes every byte from 0x80 up as a non-word
+//! character, so it matches `cafe` in `cafeé`. This matcher follows `rg`.
 
 use std::ops::Range;
-use std::sync::OnceLock;
 
 use memchr::memmem;
 use regex::{Regex, RegexBuilder};
@@ -33,9 +44,6 @@ pub(super) const REGEX_DFA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 
 /// Nesting limit of a pattern's syntax tree.
 pub(super) const REGEX_NEST_LIMIT: u32 = 250;
-
-/// The class of word characters of the `-w` rule.
-const WORD_CHAR_CLASS: &str = r"[\p{Alphabetic}\p{Nd}_]";
 
 /// How the pattern text is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +116,6 @@ pub(super) struct Matcher {
     /// literal has no match, so the finder rejects whole files before any line
     /// is read.
     prefilter: Option<memmem::Finder<'static>>,
-    word: bool,
     insensitive: bool,
 }
 
@@ -129,22 +136,24 @@ impl Matcher {
             PatternKind::Literal => regex::escape(spec.pattern),
             PatternKind::Regex => spec.pattern.to_owned(),
         };
-        let regex = RegexBuilder::new(&source)
-            .case_insensitive(insensitive)
-            .size_limit(REGEX_SIZE_LIMIT)
-            .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
-            .nest_limit(REGEX_NEST_LIMIT)
-            .build()
-            .map_err(|e| MatcherError::Invalid {
-                pattern: spec.pattern.to_owned(),
-                detail: last_line(&e.to_string()),
-            })?;
+        let invalid = |e: regex::Error| MatcherError::Invalid {
+            pattern: spec.pattern.to_owned(),
+            detail: last_line(&e.to_string()),
+        };
+        // The pattern alone is compiled first, also under `-w`. A pattern with
+        // an unbalanced group, such as `a)|(b`, would compile inside the word
+        // wrapper as a different pattern.
+        let plain = compile(&source, insensitive).map_err(invalid)?;
+        let regex = if spec.word {
+            compile_whole_word(&source, insensitive).map_err(invalid)?
+        } else {
+            plain
+        };
         let prefilter = (spec.kind == PatternKind::Literal && !insensitive)
             .then(|| memmem::Finder::new(spec.pattern.as_bytes()).into_owned());
         Ok(Matcher {
             regex,
             prefilter,
-            word: spec.word,
             insensitive,
         })
     }
@@ -164,35 +173,19 @@ impl Matcher {
 
     /// Whether `line` (without its `\n`) holds a match.
     pub(super) fn is_match(&self, line: &str) -> bool {
-        if self.word {
-            self.matches(line).next().is_some()
-        } else {
-            self.regex.is_match(line)
-        }
+        self.regex.is_match(line)
     }
 
     /// Every match on `line`, as byte ranges in order. After a match the search
-    /// goes on at its end; after a match that fails the whole-word rule it
-    /// goes on one character past its start. The loop moves forward at every
-    /// step, so it ends within `line.len() + 1` steps.
+    /// goes on at its end, and after an empty match one character on. Each
+    /// step moves forward, so the iterator ends within `line.len() + 1`
+    /// steps. Each step is one search of the rest of the line.
     pub(super) fn matches<'a>(&'a self, line: &'a str) -> Matches<'a> {
         Matches {
             matcher: self,
             line,
             from: 0,
         }
-    }
-
-    fn bounded(&self, line: &str, range: &Range<usize>) -> bool {
-        let before_ok = line[..range.start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !is_word_char(c));
-        let after_ok = line[range.end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !is_word_char(c));
-        before_ok && after_ok
     }
 }
 
@@ -207,40 +200,52 @@ impl Iterator for Matches<'_> {
     type Item = Range<usize>;
 
     fn next(&mut self) -> Option<Range<usize>> {
-        while self.from <= self.line.len() {
-            let found = self.matcher.regex.find_at(self.line, self.from)?;
-            let range = found.range();
-            let step = |at: usize| {
-                self.line[at..]
-                    .chars()
-                    .next()
-                    .map_or(self.line.len() + 1, |c| at + c.len_utf8())
-            };
-            if !self.matcher.word || self.matcher.bounded(self.line, &range) {
-                self.from = if range.is_empty() {
-                    step(range.end)
-                } else {
-                    range.end
-                };
-                return Some(range);
-            }
-            self.from = step(range.start);
+        let end_of_line = self.line.len() + 1;
+        if self.from >= end_of_line {
+            return None;
         }
-        None
+        let Some(found) = self.matcher.regex.find_at(self.line, self.from) else {
+            self.from = end_of_line;
+            return None;
+        };
+        let range = found.range();
+        self.from = if range.is_empty() {
+            self.line[range.end..]
+                .chars()
+                .next()
+                .map_or(end_of_line, |c| range.end + c.len_utf8())
+        } else {
+            range.end
+        };
+        Some(range)
     }
 }
 
-/// Whether `c` is in `[\p{Alphabetic}\p{Nd}_]`.
-fn is_word_char(c: char) -> bool {
-    if c.is_ascii() {
-        return c.is_ascii_alphanumeric() || c == '_';
-    }
-    static CLASS: OnceLock<Option<Regex>> = OnceLock::new();
-    let class = CLASS.get_or_init(|| Regex::new(WORD_CHAR_CLASS).ok());
-    let mut buf = [0u8; 4];
-    class
-        .as_ref()
-        .is_some_and(|class| class.is_match(c.encode_utf8(&mut buf)))
+/// Compile `source` under the size limits.
+fn compile(source: &str, insensitive: bool) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(source)
+        .case_insensitive(insensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+        .nest_limit(REGEX_NEST_LIMIT)
+        .build()
+}
+
+/// Compile `source` with the whole-word rule: the pattern between a start-half
+/// and an end-half word boundary, in a group of its own so that a top-level
+/// alternation stays inside it. `source` has compiled alone before, so its
+/// groups are balanced.
+///
+/// A pattern in `(?x)` mode that ends with a comment would take the closing
+/// parenthesis into the comment. The second form ends the comment with a line
+/// break, which `(?x)` mode ignores. It is tried only when the first form does
+/// not compile. Both forms add one level of nesting to `source`.
+fn compile_whole_word(source: &str, insensitive: bool) -> Result<Regex, regex::Error> {
+    let wrapped = |line_break: &str| {
+        let pattern = format!(r"\b{{start-half}}(?:{source}{line_break})\b{{end-half}}");
+        compile(&pattern, insensitive)
+    };
+    wrapped("").or_else(|first| wrapped("\n").map_err(|_| first))
 }
 
 /// The last non-empty line of a regex error message, without its `error: `
