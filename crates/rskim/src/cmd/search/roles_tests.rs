@@ -587,6 +587,66 @@ fn a_receiver_a_path_segment_and_an_argument_are_references_not_calls() {
 }
 
 #[test]
+fn a_call_inside_a_rust_macro_argument_gets_the_call_role() {
+    let source = "fn t() {\n    assert_eq!(strip_ansi(input), 1);\n    \
+                  assert!(view::paint(x));\n    assert!(panel.draw(y));\n}\n";
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "assert_eq", "strip_ansi"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "assert!(view", "paint"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "assert!(panel", "draw"),
+        Role::Call
+    );
+    // The receiver and the path segment are not callees.
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "assert!(view", "view"),
+        Role::Ref
+    );
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "assert!(panel", "panel"),
+        Role::Ref
+    );
+}
+
+#[test]
+fn a_plain_argument_and_a_definition_in_a_macro_argument_are_not_calls() {
+    let source = "fn t() {\n    assert_eq!(strip_ansi(input), 1);\n    \
+                  keep!(fn made(a: u8) {});\n    keep!(struct Shape(u8););\n    \
+                  keep!(nested!(inner));\n    keep!(table[slot]);\n}\n";
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "assert_eq", "input"),
+        Role::Ref
+    );
+    assert_ne!(
+        role_of(Language::Rust, "rs", source, "keep!(fn", "made"),
+        Role::Call
+    );
+    assert_ne!(
+        role_of(Language::Rust, "rs", source, "keep!(struct", "Shape"),
+        Role::Call
+    );
+    // A nested macro name is followed by `!`, so the token rule does not match it.
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "keep!(nested", "nested"),
+        Role::Ref
+    );
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "keep!(nested", "inner"),
+        Role::Ref
+    );
+    // An index is a bracketed token tree, not a parenthesised one.
+    assert_eq!(
+        role_of(Language::Rust, "rs", source, "keep!(table", "table"),
+        Role::Ref
+    );
+}
+
+#[test]
 fn an_import_needs_an_import_node_above_the_identifier() {
     let ts =
         "import { a } from \"./a\";\nexport { b } from \"./b\";\nexport { c };\nconst c = 1;\n";

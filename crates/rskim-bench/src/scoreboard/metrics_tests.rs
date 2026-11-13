@@ -1,12 +1,10 @@
 //! Unit tests for `metrics.rs` (co-located file, `#[path]`-included).
 
-use rskim_oracle::structural::OracleLang;
-
 use super::*;
 use crate::scoreboard::golden::parse_golden;
 use crate::scoreboard::runner::{SweepPage, TextOutput};
 use crate::scoreboard::test_support::FixtureRepo;
-use crate::scoreboard::types::{Degraded, SnippetLine};
+use crate::scoreboard::types::SnippetLine;
 use crate::scoreboard::universe::{GitIsolation, text_universe};
 
 const SHA: &str = "b8a0a79463382347820f1c2572bde37b68e87c76";
@@ -88,7 +86,6 @@ fn ident_concept_and_lexical_entries_run_the_lexical_checks_and_score_monotone()
         CheckId::LexicalRecall,
         CheckId::LexicalPrecision,
         CheckId::LexicalSilentFn,
-        CheckId::LexicalVerifyMode,
         CheckId::OrderScoreMonotone,
         CheckId::ResultsUniquePaths,
     ];
@@ -106,40 +103,28 @@ fn ident_concept_and_lexical_entries_run_the_lexical_checks_and_score_monotone()
     );
     assert_eq!(
         checks_of(
-            "[[lexical]]\nid = \"skim-X01\"\nquery = \"a b\"\nmode = \"near\"\nnear = 3\ncategory = \"near\"\n"
+            "[[lexical]]\nid = \"skim-X01\"\nquery = \"a b\"\ncategory = \"lang\"\nlang = \"rust\"\n"
         ),
-        with(CheckId::LexicalRecallTracked)
+        [vec![
+            CheckId::LexicalRecall,
+            CheckId::LexicalPrecision,
+            CheckId::LexicalSilentFn,
+            CheckId::OrderScoreMonotone,
+            CheckId::ResultsUniquePaths,
+            CheckId::LexicalRecallTracked,
+        ]]
+        .concat()
     );
 }
 
 #[test]
-fn a_temporal_pagination_entry_runs_pagination_and_lexical_checks_but_not_score_monotone() {
+fn a_pagination_entry_runs_the_pagination_and_lexical_checks_and_score_monotone() {
     assert_eq!(
-        checks_of(
-            "[[pagination]]\nid = \"skim-G001\"\nquery = \"build lock\"\nflags = [\"--hot\"]\nlimits = [3]\n"
-        ),
+        checks_of("[[pagination]]\nid = \"skim-G001\"\nquery = \"build lock\"\nlimits = [3]\n"),
         vec![
             CheckId::LexicalRecall,
             CheckId::LexicalPrecision,
             CheckId::LexicalSilentFn,
-            CheckId::LexicalVerifyMode,
-            CheckId::PaginationComplete,
-            CheckId::PaginationDisjoint,
-            CheckId::PaginationOrdered,
-            CheckId::PaginationHasMoreHonest,
-            CheckId::ResultsUniquePaths,
-        ]
-    );
-}
-
-#[test]
-fn a_text_plus_ast_entry_has_no_oracle_checks() {
-    assert_eq!(
-        checks_of(
-            "[[pagination]]\nid = \"skim-G002\"\nquery = \"x\"\nflags = [\"--ast\", \"try-catch\"]\nlimits = [3]\n"
-        ),
-        vec![
-            CheckId::LexicalVerifyMode,
             CheckId::PaginationComplete,
             CheckId::PaginationDisjoint,
             CheckId::PaginationOrdered,
@@ -151,125 +136,33 @@ fn a_text_plus_ast_entry_has_no_oracle_checks() {
 }
 
 #[test]
-fn standalone_prefix_entries_check_prefix_and_monotonicity_only_where_score_ranks() {
+fn a_prefix_entry_checks_prefix_consistency_with_the_lexical_checks() {
     assert_eq!(
-        checks_of(
-            "[[prefix]]\nid = \"skim-F001\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n"
-        ),
+        checks_of("[[prefix]]\nid = \"skim-F001\"\nquery = \"build lock\"\nlimits = [5]\n"),
         vec![
+            CheckId::LexicalRecall,
+            CheckId::LexicalPrecision,
+            CheckId::LexicalSilentFn,
             CheckId::OrderPrefixConsistent,
             CheckId::OrderScoreMonotone,
-            CheckId::ResultsUniquePaths
+            CheckId::ResultsUniquePaths,
         ]
     );
-    assert_eq!(
-        checks_of("[[prefix]]\nid = \"skim-F002\"\nflags = [\"--hot\"]\nlimits = [5]\n"),
-        vec![CheckId::OrderPrefixConsistent, CheckId::ResultsUniquePaths]
-    );
-    let g = golden_with("[[prefix]]\nid = \"skim-F002\"\nflags = [\"--hot\"]\nlimits = [5]\n");
-    let q = &plan(&g).unwrap()[0];
-    assert_eq!((q.arm, q.query.as_deref()), (Arm::HotCold, None));
-    assert!(!q.measures_text());
-}
-
-fn ast_entry(id: &str, pattern: &str, lang: &str, precision: &str) -> String {
-    format!(
-        "[[ast]]\nid = \"{id}\"\npattern = \"{pattern}\"\nlang = \"{lang}\"\nprecision = \"{precision}\"\n"
-    )
 }
 
 #[test]
-fn an_ast_entry_runs_the_structural_checks_by_its_precision_class() {
-    assert_eq!(
-        checks_of(&ast_entry("skim-A1", "try-catch", "typescript", "hard")),
-        vec![
-            CheckId::ResultsUniquePaths,
-            CheckId::StructuralRecall,
-            CheckId::StructuralPrecision,
-            CheckId::StructuralCoverage,
-        ]
+fn a_lexical_entrys_lang_becomes_the_type_flag_and_the_oracle_filter() {
+    let g = golden_with(
+        "[[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"lang\"\nlang = \"typescript\"\n\
+         [[lexical]]\nid = \"skim-X02\"\nquery = \"fn\"\ncategory = \"short\"\n",
     );
-    assert_eq!(
-        checks_of(&ast_entry("skim-A2", "rust-nested-loop", "rust", "ratchet")),
-        vec![
-            CheckId::ResultsUniquePaths,
-            CheckId::StructuralRecall,
-            CheckId::StructuralCoverage,
-        ],
-        "a ratchet-class entry records structural.precision.<id> instead"
-    );
-}
-
-#[test]
-fn an_ast_entry_plans_a_standalone_ast_call_judged_by_the_structural_oracle() {
-    let g = golden_with(&ast_entry("skim-A1", "try-catch", "tsx", "hard"));
-    let q = &plan(&g).unwrap()[0];
-    assert_eq!((q.kind, q.arm), (EntryKind::Ast, Arm::Ast));
-    assert_eq!(q.query, None);
-    assert_eq!(q.flags.ast.as_deref(), Some("try-catch"));
-    assert!(q.lexical_oracle().is_none());
-    assert_eq!(
-        q.structural_target(),
-        Some(&StructuralTarget {
-            pattern: "try-catch".to_string(),
-            lang: OracleLang::Tsx,
-            precision: PrecisionClass::Hard,
-            expect_oracle_empty: false,
-        })
-    );
-    assert!(!q.measures_text());
-    // A false-positive guard carries its flag into the target and runs the
-    // same checks (precision is what it guards).
-    let guard = golden_with(&format!(
-        "{}expect_oracle_empty = true\n",
-        ast_entry("skim-A2", "try-catch-finally", "javascript", "hard")
-    ));
-    let q = &plan(&guard).unwrap()[0];
-    assert!(q.structural_target().unwrap().expect_oracle_empty);
-    assert!(q.runs(CheckId::StructuralPrecision) && q.runs(CheckId::StructuralRecall));
-    // No other entry kind gets a structural target.
-    let lexical =
-        golden_with("[[lexical]]\nid = \"skim-X01\"\nquery = \"a\"\ncategory = \"substr\"\n");
-    let q = &plan(&lexical).unwrap()[0];
-    assert!(q.structural_target().is_none() && q.lexical_oracle().is_some());
-}
-
-#[test]
-fn is_structural_names_exactly_the_ast_entries() {
-    // Every entry kind, including the two that call `--ast` without being
-    // scored by the structural oracle (a standalone `--ast` [[prefix]] and a
-    // text + `--ast` [[pagination]]).
-    let g = golden_with(&format!(
-        "[[ident]]\nid = \"skim-L01\"\nquery = \"x_y\"\ndef = {{ path = \"a.rs\", line = 1 }}\norigin = \"seed\"\n\
-         [[concept]]\nid = \"skim-C01\"\nquery = \"a b\"\nrelevant = 'a'\n\
-         [[lexical]]\nid = \"skim-X01\"\nquery = \"q\"\ncategory = \"short\"\n\
-         [[pagination]]\nid = \"skim-G002\"\nquery = \"x\"\nflags = [\"--ast\", \"try-catch\"]\nlimits = [3]\n\
-         [[prefix]]\nid = \"skim-F001\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n\
-         {}",
-        ast_entry("skim-A1", "try-catch", "tsx", "hard")
-    ));
     let p = plan(&g).unwrap();
-    assert_eq!(p.len(), 6);
-    for q in &p {
-        assert_eq!(q.is_structural(), q.kind == EntryKind::Ast, "{}", q.id);
-        assert_eq!(
-            q.is_structural(),
-            q.structural_target().is_some(),
-            "{}",
-            q.id
-        );
-        // The structural checks run exactly on the structural entries, and
-        // score monotonicity never on them (their list is path-ordered).
-        assert_eq!(
-            q.runs(CheckId::StructuralRecall),
-            q.is_structural(),
-            "{}",
-            q.id
-        );
-        if q.is_structural() {
-            assert!(!q.runs(CheckId::OrderScoreMonotone), "{}", q.id);
-        }
-    }
+    assert_eq!(p[0].flags, ["-t", "ts"]);
+    assert!(p[1].flags.is_empty());
+    let oracle = p[0].lexical_oracle().unwrap();
+    assert!(oracle.matches("a.ts", "fn"));
+    assert!(!oracle.matches("a.js", "fn"));
+    assert!(p[1].lexical_oracle().unwrap().matches("a.js", "fn"));
 }
 
 #[test]
@@ -309,39 +202,11 @@ fn a_missing_file_fails_recall_and_silent_fn_naming_it() {
 }
 
 #[test]
-fn a_disclosed_miss_is_not_silent() {
-    let mut p = page(rows(&["a.rs"]), false);
-    p.degraded = vec![Degraded {
-        subsystem: "temporal".to_string(),
-        reason: "missing".to_string(),
-        requested: None,
-        applied: None,
-    }];
-    let truth = gt(&["a.rs", "b.rs"]);
-    assert!(is_fail(&check_recall(&p.rows, &truth)));
-    assert!(check_silent_fn(&p, &truth).is_pass());
-}
-
-#[test]
 fn an_extra_file_fails_precision_naming_it() {
     let p = page(rows(&["a.rs", "z.rs"]), false);
     let precision = check_precision(&p.rows, &gt(&["a.rs"]));
     assert!(is_fail(&precision));
     assert!(detail(&precision).contains("z.rs"));
-}
-
-#[test]
-fn verify_mode_must_match_the_declared_mode() {
-    let mut p = page(Vec::new(), false);
-    assert!(check_verify_mode(&p, &VerifyMode::Substring).is_pass());
-    p.verify_mode = VerifyMode::Phrase;
-    let o = check_verify_mode(&p, &VerifyMode::Near);
-    assert!(is_fail(&o));
-    assert!(
-        detail(&o).contains("phrase") && detail(&o).contains("near"),
-        "{}",
-        detail(&o)
-    );
 }
 
 #[test]
@@ -539,27 +404,50 @@ fn a_limited_list_must_be_the_full_lists_prefix() {
 // --- measurements ---------------------------------------------------------------------
 
 #[test]
-fn durations_are_normalized_away() {
+fn bytes_through_the_def_line_end_at_the_line_that_starts_def_path() {
+    let out = b"calls:\n  caller.rs:4: x\ndef a.rs:3-9: fn a() {\n    body\n}\ndef b.rs:1-2: fn b() {}\ntotal: 2\n";
+    let through_a = "calls:\n  caller.rs:4: x\ndef a.rs:3-9: fn a() {\n".len() as u64;
+    assert_eq!(bytes_through_def_line(out, "a.rs"), Some(through_a));
     assert_eq!(
-        normalize_durations(b"3 result(s) for \"q\" in 1234ms\nin ms in 5s"),
-        b"3 result(s) for \"q\" in 0ms\nin ms in 5s".to_vec()
+        bytes_through_def_line(out, "b.rs"),
+        Some(through_a + "    body\n}\ndef b.rs:1-2: fn b() {}\n".len() as u64)
     );
+    assert_eq!(bytes_through_def_line(out, "c.rs"), None);
+    // A path that merely starts another path is not that file's definition.
+    assert_eq!(
+        bytes_through_def_line(b"def a.rs.bak:1-2: x\n", "a.rs"),
+        None
+    );
+    // A line that mentions the definition without starting with it is not one.
+    assert_eq!(bytes_through_def_line(b"  def a.rs:1-2: x\n", "a.rs"), None);
 }
 
 #[test]
-fn bytes_through_the_def_block_include_its_trailing_blank_line() {
-    let out = b"a.rs:3  [text]  score: 2.00\n  >     3| x\n\nb.rs:9  [text]  score: 1.00\n  >     9| y\n\n2 result(s) for \"q\" in 0ms\n";
-    let first = "a.rs:3  [text]  score: 2.00\n  >     3| x\n\n".len() as u64;
-    assert_eq!(bytes_through_block(out, "a.rs"), Some(first));
+fn bytes_through_a_file_block_end_at_the_first_line_of_another_file() {
+    let out = b"words: a b\na.rs  a=2 b=1\na.rs:3: [f] x\na.rs:9: y\nb.rs  a=1 b=1\nb.rs:1: z\ntotal: 2\n";
+    let header = "words: a b\n".len() as u64;
+    let a_block = "a.rs  a=2 b=1\na.rs:3: [f] x\na.rs:9: y\n".len() as u64;
     assert_eq!(
-        bytes_through_block(out, "b.rs"),
-        Some(first + "b.rs:9  [text]  score: 1.00\n  >     9| y\n\n".len() as u64)
+        bytes_through_file_block(out, "a.rs"),
+        Some(header + a_block)
     );
-    assert_eq!(bytes_through_block(out, "c.rs"), None);
-    // A path that merely prefixes another header is not that file's block.
-    assert_eq!(bytes_through_block(b"a.rs.bak:1  [text]\n\n", "a.rs"), None);
-    // A line-less header (short query) still counts.
-    assert_eq!(bytes_through_block(b"a.rs  [text]\n", "a.rs"), Some(13));
+    assert_eq!(
+        bytes_through_file_block(out, "b.rs"),
+        Some(header + a_block + "b.rs  a=1 b=1\nb.rs:1: z\n".len() as u64)
+    );
+    assert_eq!(bytes_through_file_block(out, "c.rs"), None);
+    // `a.rs` does not claim the lines of a longer path that starts with it.
+    assert_eq!(
+        bytes_through_file_block(b"a.rs.bak  a=1\na.rs.bak:1: x\n", "a.rs"),
+        None
+    );
+    assert_eq!(
+        bytes_through_file_block(b"a.rs  a=1\na.rs.bak  a=1\n", "a.rs"),
+        Some("a.rs  a=1\n".len() as u64),
+        "the block of a.rs ends where the block of a.rs.bak starts"
+    );
+    // A block with no matching line still counts: its header is the block.
+    assert_eq!(bytes_through_file_block(b"a.rs  a=1\n", "a.rs"), Some(10));
 }
 
 #[test]
@@ -647,9 +535,6 @@ fn samples(idents: Vec<IdentSample>) -> CorpusSamples {
         tracked_text: 10,
         idents,
         concepts: Vec::new(),
-        oracle_less_rows: BTreeMap::new(),
-        structural: Vec::new(),
-        unscored_rows: BTreeMap::new(),
         refs: Vec::new(),
         costs: Vec::new(),
     }
@@ -707,169 +592,6 @@ fn beating_a_baseline_follows_the_metric_direction() {
 }
 
 #[test]
-fn row_counts_of_entries_without_an_oracle_ratchet_per_entry() {
-    let mut a = samples(Vec::new());
-    a.oracle_less_rows = BTreeMap::from([("a-F002".to_string(), 7), ("a-F003".to_string(), 12)]);
-    let r = ratchet_values(&[&a]);
-    assert_eq!(r["oracle_less.full_rows.a-F002"], 7.0);
-    assert_eq!(r["oracle_less.full_rows.a-F003"], 12.0);
-    for name in r.keys() {
-        assert!(metric_def(name).is_some(), "{name} has no MetricDef");
-    }
-
-    // A shrink is a regression (blessing it needs a reason); growth is an
-    // improvement; either way the value moved, so the gate asks for a bless.
-    let name = "oracle_less.full_rows.a-F003";
-    assert_eq!(compare_ratchet(name, 12.0, 11.0), RatchetChange::Regressed);
-    assert_eq!(compare_ratchet(name, 12.0, 13.0), RatchetChange::Improved);
-    assert_eq!(compare_ratchet(name, 12.0, 12.0), RatchetChange::Unchanged);
-    assert!(
-        metric_def("oracle_less.full_rows.").is_none(),
-        "the metric names an entry"
-    );
-
-    // The aggregate keeps each corpus's entries apart (ids are corpus-prefixed).
-    let mut b = samples(Vec::new());
-    b.oracle_less_rows = BTreeMap::from([("b-F003".to_string(), 4)]);
-    let agg = ratchet_values(&[&a, &b]);
-    assert_eq!(agg["oracle_less.full_rows.a-F003"], 12.0);
-    assert_eq!(agg["oracle_less.full_rows.b-F003"], 4.0);
-    assert!(
-        !ratchet_values(&[&samples(Vec::new())])
-            .keys()
-            .any(|k| k.starts_with("oracle_less.")),
-        "no entry without an oracle, no row-count metric"
-    );
-}
-
-fn structural_sample(id: &str, class: PrecisionClass, intent: bool) -> StructuralSample {
-    StructuralSample {
-        id: id.to_string(),
-        pattern: "rust-nested-loop".to_string(),
-        lang: OracleLang::Rust,
-        precision_class: class,
-        expect_oracle_empty: false,
-        oracle_files: 4,
-        skim_files: 5,
-        recall: 1.0,
-        precision: 0.8,
-        intent_files: intent.then_some(2),
-        intent_recall: intent.then_some(0.5),
-        intent_precision: intent.then_some(0.2),
-        line_on_match: 3,
-    }
-}
-
-#[test]
-fn structural_measurements_ratchet_per_entry_and_unscored_rows_per_pattern() {
-    let mut a = samples(Vec::new());
-    a.structural = vec![
-        structural_sample("a-ast-1", PrecisionClass::Ratchet, true),
-        structural_sample("a-ast-2", PrecisionClass::Hard, false),
-    ];
-    a.unscored_rows = BTreeMap::from([("rust-nested-loop".to_string(), 2)]);
-    let r = ratchet_values(&[&a]);
-    assert_eq!(r["structural.precision.a-ast-1"], 0.8);
-    assert!(
-        !r.contains_key("structural.precision.a-ast-2"),
-        "a hard-class entry's precision is the HARD check"
-    );
-    assert_eq!(r["structural.line_on_match.a-ast-1"], 3.0);
-    assert_eq!(r["structural.line_on_match.a-ast-2"], 3.0);
-    assert_eq!(r["structural.intent_recall.a-ast-1"], 0.5);
-    assert_eq!(r["structural.intent_precision.a-ast-1"], 0.2);
-    assert!(!r.contains_key("structural.intent_recall.a-ast-2"));
-    assert_eq!(r["structural.unscored_rows.rust-nested-loop"], 2.0);
-    for name in r.keys() {
-        assert!(metric_def(name).is_some(), "{name} has no MetricDef");
-    }
-
-    // The aggregate keeps entries apart and sums unscored rows per pattern.
-    let mut b = samples(Vec::new());
-    b.structural = vec![structural_sample("b-ast-1", PrecisionClass::Ratchet, false)];
-    b.unscored_rows = BTreeMap::from([
-        ("rust-nested-loop".to_string(), 5),
-        ("try-catch".to_string(), 0),
-    ]);
-    let agg = ratchet_values(&[&a, &b]);
-    assert_eq!(agg["structural.unscored_rows.rust-nested-loop"], 7.0);
-    assert_eq!(agg["structural.unscored_rows.try-catch"], 0.0);
-    assert!(agg.contains_key("structural.precision.a-ast-1"));
-    assert!(agg.contains_key("structural.precision.b-ast-1"));
-    assert!(
-        !ratchet_values(&[&samples(Vec::new())])
-            .keys()
-            .any(|k| k.starts_with("structural.")),
-        "no [[ast]] entry, no structural metric"
-    );
-}
-
-#[test]
-fn structural_ratchets_are_exact_and_unscored_rows_are_neutral() {
-    for name in [
-        "structural.precision.a-ast-1",
-        "structural.line_on_match.a-ast-1",
-        "structural.intent_recall.a-ast-1",
-        "structural.intent_precision.a-ast-1",
-    ] {
-        assert_eq!(
-            compare_ratchet(name, 0.5, 0.5),
-            RatchetChange::Unchanged,
-            "{name}"
-        );
-        assert_eq!(
-            compare_ratchet(name, 0.5, 0.4999),
-            RatchetChange::Regressed,
-            "{name}"
-        );
-        assert_eq!(
-            compare_ratchet(name, 0.5, 0.6),
-            RatchetChange::Improved,
-            "{name}"
-        );
-    }
-    // No oracle judges unscored rows: a shrink (skim dropped rows, or a new
-    // entry scores them) and a growth (rows in a language no entry scores)
-    // both read `changed`, so the gate asks for a bless and bless needs no
-    // `--accept-regression` reason.
-    let unscored = "structural.unscored_rows.try-catch";
-    assert_eq!(
-        metric_def(unscored).map(|d| d.direction),
-        Some(Direction::Neutral)
-    );
-    assert_eq!(
-        compare_ratchet(unscored, 2.0, 2.0),
-        RatchetChange::Unchanged
-    );
-    for current in [0.0, 1.0, 3.0] {
-        assert_eq!(
-            compare_ratchet(unscored, 2.0, current),
-            RatchetChange::Changed,
-            "2 -> {current}"
-        );
-    }
-    for bare in [
-        "structural.precision.",
-        "structural.line_on_match.",
-        "structural.unscored_rows.",
-        "structural.recall",
-    ] {
-        assert!(metric_def(bare).is_none(), "{bare} names no entry");
-    }
-    // No family prefix shadows another or a fixed metric.
-    for (i, (a, _)) in STRUCTURAL_FAMILIES.iter().enumerate() {
-        for (b, _) in &STRUCTURAL_FAMILIES[i + 1..] {
-            assert!(!a.starts_with(b) && !b.starts_with(a), "{a} / {b}");
-        }
-        assert!(
-            RATCHET_METRICS.iter().all(|d| !d.name.starts_with(a)),
-            "{a}"
-        );
-        assert!(!a.starts_with(ORACLE_LESS_ROWS) && !ORACLE_LESS_ROWS.starts_with(a));
-    }
-}
-
-#[test]
 fn aggregate_ratchets_pool_every_corpus() {
     let a = samples(vec![ident("a-1", Some(1), Some(10))]);
     let mut b = samples(vec![ident("b-1", Some(4), Some(30))]);
@@ -882,6 +604,15 @@ fn aggregate_ratchets_pool_every_corpus() {
 
 // --- evaluate (fixture corpus) -----------------------------------------------------
 
+/// `page` with the engine's file accounting: `searched` files, none left out.
+fn accounted(page: ResultPage, searched: u64) -> ResultPage {
+    ResultPage {
+        searched_files: Some(searched),
+        left_out: Some(BTreeMap::new()),
+        ..page
+    }
+}
+
 #[test]
 fn evaluate_scores_a_fixture_corpus_end_to_end() {
     let repo = FixtureRepo::new();
@@ -889,7 +620,6 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
     repo.write("src/b.rs", "fn x() {}\npub fn check_staleness() {}\n");
     repo.write("src/c.rs", "// build lock\nfn y() {}\n");
     let commit = repo.commit_all("init");
-    let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let golden = parse_golden(&format!(
         "corpus = \"skim\"\ncommit = \"{commit}\"\n\
@@ -898,11 +628,6 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
     ))
     .unwrap();
     let plan = plan(&golden).unwrap();
-    let stats = StatsSnapshot {
-        file_count: 3,
-        skipped_by_reason: BTreeMap::new(),
-        temporal_state: None,
-    };
 
     let mut ident_rows = vec![row("src/b.rs", 2.0), row("src/a.rs", 1.0)];
     ident_rows[0].line = Some(2);
@@ -911,14 +636,19 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
         content: "pub fn check_staleness() {}".to_string(),
         is_match: true,
     }];
+    let def_line = "def src/b.rs:2-2: pub fn check_staleness() {}\n";
+    let ident_text = format!(
+        "{def_line}other:\n  src/a.rs:1: // check_staleness lives in b\ntotal: 2 lines in 2 files\n"
+    );
+    let concept_text = "src/c.rs  lock=1\nsrc/c.rs:1: // build lock\nsrc/a.rs  lock=1\n";
     let observations = vec![
         EntryObservation {
             id: "skim-L01".to_string(),
-            full: page(ident_rows, false),
+            full: accounted(page(ident_rows, false), 3),
             sweeps: Vec::new(),
             limited: Vec::new(),
             text: Some(TextOutput {
-                stdout: b"src/b.rs:2  [text]  score: 2.00\n  >     2| pub fn check_staleness() {}\n\nsrc/a.rs:1  [text]  score: 1.00\n\n2 result(s) for \"check_staleness\" in 3ms\n".to_vec(),
+                stdout: ident_text.into_bytes(),
                 stderr: Vec::new(),
             }),
         },
@@ -929,21 +659,13 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
             sweeps: Vec::new(),
             limited: Vec::new(),
             text: Some(TextOutput {
-                stdout: b"src/c.rs:1\n\n".to_vec(),
+                stdout: concept_text.as_bytes().to_vec(),
                 stderr: b"note\n".to_vec(),
             }),
         },
     ];
 
-    let e = evaluate(
-        &universe,
-        &text,
-        &stats,
-        &plan,
-        &observations,
-        &StructuralEvidence::default(),
-    )
-    .unwrap();
+    let e = evaluate(&text, &plan, &observations).unwrap();
 
     let outcome = |id: &str, check: CheckId| {
         e.outcomes
@@ -963,7 +685,10 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
     };
     assert_eq!(e.outcomes, sorted, "outcomes are sorted by (id, check)");
 
+    assert_eq!(e.searched_files, 3);
     assert_eq!(e.samples.universe_delta, 0);
+    assert_eq!(e.samples.skipped_mismatch, 0);
+    assert_eq!((e.samples.indexed_tracked, e.samples.tracked_text), (3, 3));
     let l = &e.samples.idents[0];
     assert_eq!(
         (l.rank, l.anchor_eq_def, l.def_line_in_snippet),
@@ -975,68 +700,80 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
         (l.rank_baseline_alpha, l.rank_baseline_count),
         (Some(2), Some(2))
     );
-    let block = "src/b.rs:2  [text]  score: 2.00\n  >     2| pub fn check_staleness() {}\n\n";
-    assert_eq!(l.first_correct_bytes, Some(block.len() as u64));
+    assert_eq!(l.first_correct_bytes, Some(def_line.len() as u64));
     let rg = "src/a.rs:1:// check_staleness lives in b\nsrc/b.rs:2:pub fn check_staleness() {}\n";
     assert_eq!(l.rg_first_correct_bytes, Some(rg.len() as u64));
     let c = &e.samples.concepts[0];
     assert_eq!((c.p5, c.p10), (0.5, 0.5));
     assert_eq!((c.p5_baseline_alpha, c.p5_baseline_count), (1.0, 1.0));
-    assert_eq!(c.text_bytes, 17);
+    assert_eq!(c.text_bytes, concept_text.len() as u64 + 5);
+    assert_eq!(
+        c.first_relevant_bytes,
+        Some("src/c.rs  lock=1\nsrc/c.rs:1: // build lock\n".len() as u64),
+        "the block of the first relevant ranked file, not of the first file"
+    );
 }
 
 #[test]
-fn evaluate_records_the_full_list_size_of_entries_without_an_oracle() {
+fn evaluate_counts_the_files_and_left_out_reasons_that_differ_from_the_oracle() {
     let repo = FixtureRepo::new();
     repo.write("a.rs", "x\n");
+    repo.write("b.rs", "x\n");
     let commit = repo.commit_all("init");
-    let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let golden = parse_golden(&format!(
-        "corpus = \"skim\"\ncommit = \"{commit}\"\n\
-         [[lexical]]\nid = \"skim-X01\"\nquery = \"x\"\ncategory = \"short\"\n\
-         [[prefix]]\nid = \"skim-F003\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [2]\n"
+        "corpus = \"skim\"\ncommit = \"{commit}\"\n[[lexical]]\nid = \"skim-X01\"\nquery = \"x\"\ncategory = \"short\"\n"
     ))
     .unwrap();
     let plan = plan(&golden).unwrap();
-    let stats = StatsSnapshot {
-        file_count: 1,
-        skipped_by_reason: BTreeMap::new(),
-        temporal_state: None,
+    // The engine searched 1 of the 2 files and left out one binary file the
+    // oracle does not know of.
+    let full = ResultPage {
+        searched_files: Some(1),
+        left_out: Some(BTreeMap::from([("binary".to_string(), 1)])),
+        ..page(rows(&["a.rs", "b.rs"]), false)
     };
-    let structural = rows(&["a.rs", "b.rs", "c.rs"]);
-    let observations = vec![
-        EntryObservation {
-            id: "skim-X01".to_string(),
-            full: page(rows(&["a.rs"]), false),
-            sweeps: Vec::new(),
-            limited: Vec::new(),
-            text: None,
-        },
-        EntryObservation {
-            id: "skim-F003".to_string(),
-            full: page(structural.clone(), false),
-            sweeps: Vec::new(),
-            limited: vec![(2, page(structural[..2].to_vec(), true))],
-            text: None,
-        },
-    ];
+    let observations = vec![EntryObservation {
+        id: "skim-X01".to_string(),
+        full,
+        sweeps: Vec::new(),
+        limited: Vec::new(),
+        text: None,
+    }];
 
-    let e = evaluate(
-        &universe,
-        &text,
-        &stats,
-        &plan,
-        &observations,
-        &StructuralEvidence::default(),
-    )
-    .unwrap();
+    let e = evaluate(&text, &plan, &observations).unwrap();
 
+    assert_eq!(e.searched_files, 1);
+    assert_eq!(e.left_out, BTreeMap::from([("binary".to_string(), 1)]));
+    assert_eq!(e.samples.universe_delta, 1, "the oracle has one file more");
+    assert_eq!(e.samples.skipped_mismatch, 1, "binary: skim 1, oracle 0");
     assert_eq!(
-        e.samples.oracle_less_rows,
-        BTreeMap::from([("skim-F003".to_string(), 3)]),
-        "only the entry without an oracle is counted"
+        (e.samples.indexed_tracked, e.samples.tracked_text),
+        (1, 2),
+        "coverage is the searched files over the oracle's"
     );
+}
+
+#[test]
+fn evaluate_needs_an_observation_that_states_the_file_accounting() {
+    let repo = FixtureRepo::new();
+    repo.write("a.rs", "x\n");
+    let commit = repo.commit_all("init");
+    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let golden = parse_golden(&format!(
+        "corpus = \"skim\"\ncommit = \"{commit}\"\n[[lexical]]\nid = \"skim-X01\"\nquery = \"x\"\ncategory = \"short\"\n"
+    ))
+    .unwrap();
+    let plan = plan(&golden).unwrap();
+    let observations = vec![EntryObservation {
+        id: "skim-X01".to_string(),
+        full: page(rows(&["a.rs"]), false),
+        sweeps: Vec::new(),
+        limited: Vec::new(),
+        text: None,
+    }];
+    let err = evaluate(&text, &plan, &observations).expect_err("no accounting is no pass");
+    assert!(format!("{err:#}").contains("searched_files"), "{err:#}");
 }
 
 #[test]
@@ -1044,166 +781,13 @@ fn evaluate_rejects_observations_that_do_not_follow_the_plan() {
     let repo = FixtureRepo::new();
     repo.write("a.rs", "x\n");
     let commit = repo.commit_all("init");
-    let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
     let golden = parse_golden(&format!(
         "corpus = \"skim\"\ncommit = \"{commit}\"\n[[lexical]]\nid = \"skim-X01\"\nquery = \"x\"\ncategory = \"short\"\n"
     ))
     .unwrap();
     let plan = plan(&golden).unwrap();
-    let stats = StatsSnapshot {
-        file_count: 1,
-        skipped_by_reason: BTreeMap::new(),
-        temporal_state: None,
-    };
-    assert!(
-        evaluate(
-            &universe,
-            &text,
-            &stats,
-            &plan,
-            &[],
-            &StructuralEvidence::default()
-        )
-        .is_err()
-    );
-}
-
-// --- evaluate: [[ast]] entries --------------------------------------------------------
-
-#[test]
-fn evaluate_scores_ast_entries_against_the_structural_oracle() {
-    use crate::scoreboard::structural_metrics::OracleAnswers;
-    use crate::scoreboard::test_support::oracle;
-    use crate::scoreboard::types::{AstCoverage, AstPage};
-
-    let repo = FixtureRepo::new();
-    repo.write(
-        "src/nested.rs",
-        "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {}\n    }\n}\n",
-    );
-    repo.write("src/plain.rs", "fn f() {}\n");
-    repo.write("web/a.ts", "try {\n  go();\n} catch (e) {}\n");
-    repo.write("lib/C.java", "class C { void m() {} }\n");
-    let commit = repo.commit_all("init");
-    let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
-    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
-    let golden = parse_golden(&format!(
-        "corpus = \"skim\"\ncommit = \"{commit}\"\n{}{}",
-        ast_entry(
-            "skim-ast-rust-nested-loop-rust",
-            "rust-nested-loop",
-            "rust",
-            "ratchet"
-        ),
-        ast_entry(
-            "skim-ast-try-catch-typescript",
-            "try-catch",
-            "typescript",
-            "hard"
-        ),
-    ))
-    .unwrap();
-    let plan = plan(&golden).unwrap();
-    let stats = StatsSnapshot {
-        file_count: 4,
-        skipped_by_reason: BTreeMap::new(),
-        temporal_state: None,
-    };
-    let ast_page = |rows: Vec<ResultRow>, excluded: u64| AstPage {
-        page: page(rows, false),
-        coverage: AstCoverage {
-            size_excluded_files: excluded,
-            ..AstCoverage::default()
-        },
-    };
-    let mut nested = row("src/nested.rs", 1.0);
-    nested.line = Some(3);
-    let patterns = BTreeMap::from([
-        (
-            "rust-nested-loop".to_string(),
-            // plain.rs is a false positive; C.java is unscored.
-            ast_page(
-                vec![nested, row("src/plain.rs", 1.0), row("lib/C.java", 1.0)],
-                0,
-            ),
-        ),
-        // skim misses a.ts; its coverage disagrees with the oracle (0).
-        ("try-catch".to_string(), ast_page(Vec::new(), 1)),
-    ]);
-    let evidence = StructuralEvidence {
-        answers: OracleAnswers::compute(oracle(), universe.files()).unwrap(),
-        patterns,
-    };
-    let observations: Vec<EntryObservation> = plan
-        .iter()
-        .map(|q| {
-            let t = q.structural_target().unwrap();
-            EntryObservation::for_ast(&q.id, &evidence.patterns[&t.pattern], t.lang)
-        })
-        .collect();
-
-    let e = evaluate(&universe, &text, &stats, &plan, &observations, &evidence).unwrap();
-
-    let outcome = |id: &str, check: CheckId| {
-        e.outcomes
-            .iter()
-            .find(|(i, c, _)| i == id && *c == check)
-            .map(|(_, _, o)| o.clone())
-    };
-    let loops = "skim-ast-rust-nested-loop-rust";
-    let tc = "skim-ast-try-catch-typescript";
-    assert!(outcome(loops, CheckId::StructuralRecall).unwrap().is_pass());
-    assert!(
-        outcome(loops, CheckId::StructuralCoverage)
-            .unwrap()
-            .is_pass()
-    );
-    assert_eq!(
-        outcome(loops, CheckId::StructuralPrecision),
-        None,
-        "ratchet class"
-    );
-    assert!(
-        outcome(loops, CheckId::ResultsUniquePaths)
-            .unwrap()
-            .is_pass()
-    );
-    assert!(detail(&outcome(tc, CheckId::StructuralRecall).unwrap()).contains("web/a.ts"));
-    assert!(outcome(tc, CheckId::StructuralPrecision).unwrap().is_pass());
-    assert!(is_fail(&outcome(tc, CheckId::StructuralCoverage).unwrap()));
-
-    let s = &e.samples.structural;
-    assert_eq!(s.len(), 2);
-    assert_eq!((s[0].oracle_files, s[0].skim_files), (1, 2));
-    assert_eq!((s[0].precision, s[0].line_on_match), (0.5, 1));
-    assert_eq!(s[0].intent_recall, Some(1.0));
-    assert_eq!((s[1].recall, s[1].intent_recall), (0.0, None));
-    assert_eq!(
-        e.samples.unscored_rows,
-        BTreeMap::from([
-            ("rust-nested-loop".to_string(), 1),
-            ("try-catch".to_string(), 0)
-        ])
-    );
-    assert!(
-        e.samples.oracle_less_rows.is_empty(),
-        "[[ast]] entries have an oracle"
-    );
-    assert!(e.unindexed_hits.is_empty());
-
-    // Without the pattern's call, scoring an [[ast]] entry is an error.
-    assert!(
-        evaluate(
-            &universe,
-            &text,
-            &stats,
-            &plan,
-            &observations,
-            &StructuralEvidence::default()
-        )
-        .is_err()
-    );
+    assert!(evaluate(&text, &plan, &[]).is_err());
 }
 
 // --- #540: the frozen-answer checks (pure) ----------------------------------------
@@ -1715,9 +1299,10 @@ fn a_refs_entry_runs_the_refs_checks_and_the_unique_path_check_only() {
     );
     let g = golden_with(REFS_TOML);
     let q = &plan(&g).unwrap()[0];
-    assert_eq!((q.kind, q.arm), (EntryKind::Refs, Arm::Lexical));
-    assert_eq!(q.query.as_deref(), Some("launch"));
-    assert!(q.refs_entry().is_some() && q.oracle.is_some());
+    assert_eq!(q.kind, EntryKind::Refs);
+    assert_eq!(q.query, "launch");
+    assert!(q.flags.is_empty());
+    assert!(q.refs_entry().is_some());
     assert!(!q.measures_text());
 }
 
@@ -1756,22 +1341,68 @@ fn a_stakes_entry_compiles_its_flags_into_the_regex_oracle_query() {
         "[[stakes]]\nid = \"skim-S02\"\nquery = \"Launch\"\nflags = [\"-i\", \"-w\"]\nexpect = \"lines\"\n",
     );
     let q = &plan(&g).unwrap()[0];
+    assert_eq!(q.flags, ["-i", "-w"], "the runner passes the flags to skim");
     let stakes = q.stakes_oracle().unwrap();
-    assert!(stakes.query.matches_line("fn launch() {}"), "-i");
-    assert!(!stakes.query.matches_line("fn relaunch() {}"), "-w");
-    // A flag the oracle cannot judge stops the plan instead of being ignored.
-    let filtered = golden_with(
-        "[[stakes]]\nid = \"skim-S03\"\nquery = \"x\"\nflags = [\"-t\", \"rust\"]\nexpect = \"lines\"\n",
+    let StakesRun::Search { query, filter } = &stakes.run else {
+        unreachable!("a valid query is a search: {:?}", stakes.run);
+    };
+    assert!(query.matches_line("fn launch() {}"), "-i");
+    assert!(!query.matches_line("fn relaunch() {}"), "-w");
+    assert!(filter.is_empty());
+}
+
+#[test]
+fn a_stakes_entry_compiles_its_type_and_glob_flags_into_a_path_filter() {
+    let g = golden_with(
+        "[[stakes]]\nid = \"skim-S03\"\nquery = \"x\"\nflags = [\"-t\", \"rust\", \"-g\", \"!tests\"]\nexpect = \"files\"\n",
     );
-    assert!(plan(&filtered).is_err());
+    let stakes = plan(&g)
+        .unwrap()
+        .remove(0)
+        .stakes_oracle()
+        .cloned()
+        .unwrap();
+    let StakesRun::Search { filter, .. } = stakes.run else {
+        unreachable!("a valid query is a search");
+    };
+    assert!(filter.keeps("src/a.rs"));
+    assert!(!filter.keeps("tests/a.rs") && !filter.keeps("src/a.py"));
+    // A type or glob the oracle does not cover stops the plan instead of
+    // being ignored.
+    for flags in ["[\"-t\", \"haskell\"]", "[\"-g\", \"*.{rs,py}\"]"] {
+        let unknown = golden_with(&format!(
+            "[[stakes]]\nid = \"skim-S04\"\nquery = \"x\"\nflags = {flags}\nexpect = \"files\"\n"
+        ));
+        assert!(plan(&unknown).is_err(), "{flags}");
+    }
+}
+
+#[test]
+fn a_stakes_usage_error_is_read_from_the_flags_not_searched() {
+    for flags in [
+        "[\"-F\", \"-E\"]",
+        "[\"-l\", \"-c\"]",
+        "[\"-l\", \"-C\", \"2\"]",
+        "[\"-c\", \"--all\"]",
+    ] {
+        let g = golden_with(&format!(
+            "[[stakes]]\nid = \"skim-S05\"\nquery = \"x\"\nflags = {flags}\nexpect = \"exit\"\nexit = 2\n"
+        ));
+        let stakes = plan(&g)
+            .unwrap()
+            .remove(0)
+            .stakes_oracle()
+            .cloned()
+            .unwrap();
+        assert!(matches!(stakes.run, StakesRun::Usage(_)), "{flags}");
+    }
 }
 
 #[test]
 fn only_a_lexical_table_entry_gains_the_tracked_recall_check() {
     // A paginated query has a lexical oracle but is not a `[[lexical]]` entry.
-    let paginated = checks_of(
-        "[[pagination]]\nid = \"skim-G001\"\nquery = \"build lock\"\nflags = []\nlimits = [3]\n",
-    );
+    let paginated =
+        checks_of("[[pagination]]\nid = \"skim-G001\"\nquery = \"build lock\"\nlimits = [3]\n");
     assert!(!paginated.contains(&CheckId::LexicalRecallTracked));
 }
 
@@ -1792,15 +1423,14 @@ fn every_check_that_runs_on_an_entry_applies_to_its_kind() {
         "[[ident]]\nid = \"skim-L01\"\nquery = \"x_y\"\ndef = {{ path = \"a.rs\", line = 1 }}\norigin = \"seed\"\n\
          [[concept]]\nid = \"skim-C01\"\nquery = \"a b\"\nrelevant = 'a'\nfirst = [\"a.rs\"]\n\
          [[lexical]]\nid = \"skim-X01\"\nquery = \"q\"\ncategory = \"short\"\n\
-         [[pagination]]\nid = \"skim-G001\"\nquery = \"x\"\nflags = []\nlimits = [3]\n\
-         [[prefix]]\nid = \"skim-F001\"\nflags = [\"--hot\"]\nlimits = [5]\n\
-         {}{REFS_TOML}{CLASH_TOML}{}",
-        ast_entry("skim-A1", "try-catch", "tsx", "hard"),
+         [[pagination]]\nid = \"skim-G001\"\nquery = \"x\"\nlimits = [3]\n\
+         [[prefix]]\nid = \"skim-F001\"\nquery = \"x\"\nlimits = [5]\n\
+         {REFS_TOML}{CLASH_TOML}{}",
         stakes_toml("exit", Some(1)),
     );
     let planned = plan(&golden_with(&body)).unwrap();
     let kinds: BTreeSet<EntryKind> = planned.iter().map(|q| q.kind).collect();
-    assert_eq!(kinds.len(), 9, "one entry of every kind: {kinds:?}");
+    assert_eq!(kinds.len(), 8, "one entry of every kind: {kinds:?}");
     for q in &planned {
         for check in CheckId::ALL {
             if q.runs(*check) {
@@ -1923,6 +1553,7 @@ fn concept_sample(id: &str) -> ConceptSample {
         p5_baseline_count: 0.4,
         p10_baseline_count: 0.4,
         text_bytes: 100,
+        first_relevant_bytes: None,
         rg_text_bytes: 300,
         rgw_text_bytes: 200,
     }
@@ -2014,13 +1645,8 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
     repo.write("src/b.rs", "pub fn run(x: u32) {}\n");
     let commit = repo.commit_all("init");
     let git = GitIsolation::new(repo.home());
-    let universe = Universe::compute(repo.root(), &git).unwrap();
     let text = text_universe(repo.root(), &git).unwrap();
-    assert_eq!(
-        (universe.len(), text.len()),
-        (4, 5),
-        "LICENSE is only in the text universe"
-    );
+    assert_eq!(text.len(), 5);
 
     let golden = parse_golden(&format!(
         "corpus = \"skim\"\ncommit = \"{commit}\"\n\
@@ -2034,11 +1660,6 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
     ))
     .unwrap();
     let plan = plan(&golden).unwrap();
-    let stats = StatsSnapshot {
-        file_count: 4,
-        skipped_by_reason: BTreeMap::new(),
-        temporal_state: None,
-    };
 
     let all_zero: BTreeMap<String, u64> = LEFT_OUT_REASONS
         .iter()
@@ -2099,17 +1720,7 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
             })
             .collect()
     };
-    let run = |tracked: bool| {
-        evaluate(
-            &universe,
-            &text,
-            &stats,
-            &plan,
-            &observe(tracked),
-            &StructuralEvidence::default(),
-        )
-        .unwrap()
-    };
+    let run = |tracked: bool| evaluate(&text, &plan, &observe(tracked)).unwrap();
 
     let e = run(false);
     let outcome = |e: &CorpusEvaluation, id: &str, check: CheckId| {
@@ -2119,12 +1730,13 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
             .map(|(_, _, o)| o.clone())
             .expect("the check ran")
     };
-    // The indexed universe has no LICENSE, so plain recall passes while the
-    // text-universe recall sees the miss.
-    assert!(outcome(&e, "skim-X01", CheckId::LexicalRecall).is_pass());
-    let d = detail(&outcome(&e, "skim-X01", CheckId::LexicalRecallTracked));
-    assert!(d.contains("LICENSE"), "{d}");
-    assert!(outcome(&run(true), "skim-X01", CheckId::LexicalRecallTracked).is_pass());
+    // Both recall checks read the one text universe, so a missing LICENSE
+    // fails both and a page that lists it passes both.
+    for check in [CheckId::LexicalRecall, CheckId::LexicalRecallTracked] {
+        let d = detail(&outcome(&e, "skim-X01", check));
+        assert!(d.contains("LICENSE"), "{check}: {d}");
+        assert!(outcome(&run(true), "skim-X01", check).is_pass(), "{check}");
+    }
 
     for check in [
         CheckId::RefsRecall,
@@ -2165,15 +1777,7 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
         .find(|o| o.id == "skim-D01")
         .expect("the clash entry is planned")
         .full = unlabelled_clash_page;
-    let e = evaluate(
-        &universe,
-        &text,
-        &stats,
-        &plan,
-        &unlabelled,
-        &StructuralEvidence::default(),
-    )
-    .unwrap();
+    let e = evaluate(&text, &plan, &unlabelled).unwrap();
     let calls = outcome(&e, "skim-D01", CheckId::ClashCallsRecall);
     assert!(is_fail(&calls), "a call with no role must fail");
     let d = detail(&calls);
@@ -2186,7 +1790,6 @@ fn evaluate_judges_refs_clash_stakes_and_tracked_recall_entries_against_their_fr
     assert_eq!(e.samples.refs.len(), 1);
     assert_eq!(e.samples.refs[0].call_precision, Some(1.0));
     assert_eq!(e.samples.costs, vec![cost(2, 50, 100)]);
-    assert!(e.samples.oracle_less_rows.is_empty());
 }
 
 fn refs_entry_toml() -> &'static str {
@@ -2221,7 +1824,6 @@ fn evaluate_judges_each_stakes_expectation_with_its_own_comparison() {
     repo.write("LICENSE", "launch it\n");
     let commit = repo.commit_all("init");
     let git = GitIsolation::new(repo.home());
-    let universe = Universe::compute(repo.root(), &git).unwrap();
     let text = text_universe(repo.root(), &git).unwrap();
 
     // One query, three expectations: the lines, the files and the counts.
@@ -2233,11 +1835,6 @@ fn evaluate_judges_each_stakes_expectation_with_its_own_comparison() {
     ))
     .unwrap();
     let plan = plan(&golden).unwrap();
-    let stats = StatsSnapshot {
-        file_count: 3,
-        skipped_by_reason: BTreeMap::new(),
-        temporal_state: None,
-    };
     let all_lines = [
         ("LICENSE", 1),
         ("src/lib.rs", 1),
@@ -2277,21 +1874,13 @@ fn evaluate_judges_each_stakes_expectation_with_its_own_comparison() {
             .iter()
             .map(|q| EntryObservation {
                 id: q.id.clone(),
-                full: page.clone(),
+                full: accounted(page.clone(), 3),
                 sweeps: Vec::new(),
                 limited: Vec::new(),
                 text: None,
             })
             .collect();
-        let e = evaluate(
-            &universe,
-            &text,
-            &stats,
-            &plan,
-            &observations,
-            &StructuralEvidence::default(),
-        )
-        .unwrap();
+        let e = evaluate(&text, &plan, &observations).unwrap();
         let passed = |id: &str, check: CheckId| {
             e.outcomes
                 .iter()

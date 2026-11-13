@@ -4,44 +4,34 @@
 //!
 //! The scoreboard drives the release `skim` binary as a subprocess against
 //! pinned real-world corpora and checks its output against oracles that are
-//! independent of skim's own code. The structural oracle is its own crate,
-//! `rskim-oracle`, which depends on no `rskim-*` crate (its
-//! `tests/independence.rs` checks the manifest), so that independence holds
-//! at compile time. Everything in this module is independent by convention
-//! only, because `rskim-bench` depends on `rskim-core`: nothing that scores
-//! skim imports `rskim_core::Language` or a skim tokenizer. [`golden_gen`]
-//! proposes golden entries for human review, passing `rskim_core::Language`
-//! to the symbol extractor as a dispatch key only, and never scores skim.
-//! [`catalog`] holds a frozen table of skim's pattern catalog.
+//! independent of skim's own code. The role oracle and the structural oracle
+//! are their own crate, `rskim-oracle`, which depends on no `rskim-*` crate
+//! (its `tests/independence.rs` checks the manifest), so that independence
+//! holds at compile time. This crate depends on no skim search crate either:
+//! nothing that scores skim imports a skim tokenizer, classifier or file
+//! walker. Every rule that must agree with skim (the word-character class,
+//! the `-t` type table, the `-g` glob rules, the left-out reasons) is carried
+//! as the oracle's own copy. [`golden_gen`] proposes golden entries for human
+//! review from the role oracle, and never scores skim.
 //!
 //! # Modules
 //!
 //! - [`corpus`] — `corpora.toml` and the [`corpus::CorpusSource`] seam
 //!   (production: `rskim_research::clone::ensure_pinned_history_clone`).
-//! - [`universe`] — the oracle's file universe, skip breakdown, and coverage
-//!   universe, mirroring the CLI walker.
-//! - [`oracle`] — ground-truth predicates (and / phrase / near / pnear /
-//!   lang) and the in-process baselines (alphabetical, occurrence-count,
-//!   simulated `rg -n -F`).
+//! - [`universe`] — the oracle's text universe (every tracked text file plus
+//!   the untracked files the ignore files allow) and its left-out
+//!   breakdown, mirroring the engine's file walk.
+//! - [`oracle`] — ground-truth predicates (word set, file type, glob,
+//!   whole word, line) and the in-process baselines (alphabetical,
+//!   occurrence-count, simulated `rg -n -F`).
 //! - [`golden`] — golden-set schema, query flags, loading, integrity.
-//! - [`golden_gen`] — `golden-gen`: candidate `[[ident]]` entries and, with
-//!   `--ast`, candidate `[[ast]]` entries from the structural oracle and the
-//!   gate's own `--ast` pattern calls (a reviewed proposal; uses
-//!   `rskim_core::Language` only as the symbol extractor's dispatch key,
-//!   never scores skim).
-//! - [`catalog`] — skim's `--ast` pattern catalog (a frozen table, name /
-//!   exact / example only) crossed with
-//!   the structural oracle's coverage. The structural oracle itself (#541:
-//!   tree-sitter queries encoding each catalog description, the nested-loop
-//!   intent oracles, the oracle's own AST language table and size cap) is
-//!   the `rskim-oracle` crate, `rskim_oracle::structural`.
-//! - [`structural_metrics`] — scores skim's `--ast` answers against the
-//!   structural oracle: rows split by language, the `structural.*` HARD
-//!   checks, the per-entry measurements, `uncovered_patterns`.
-//! - [`types`] — what a skim invocation returns (rows, pages, stats) and the
-//!   HARD-check vocabulary.
+//! - [`golden_gen`] — `golden-gen`: candidate `[[ident]]` entries from the
+//!   role oracle (a reviewed proposal; never scores skim).
+//! - [`types`] — what a skim invocation returns (rows, pages, occurrences)
+//!   and the HARD-check vocabulary.
 //! - [`runner`] — runs the skim CLI as a sandboxed, time-bounded subprocess:
-//!   build, stats, full lists, pagination sweeps, prefix lists, text runs.
+//!   full lists, pagination sweeps, prefix lists, text runs and the
+//!   `[[stakes]]` calls.
 //! - [`metrics`] — which checks run on which entry ([`metrics::plan`]), the
 //!   pure HARD checks, and the RATCHET measurements and aggregates.
 //! - [`gate`] — the `known_failures.toml` ledger (XFAIL / XPASS) and the
@@ -59,7 +49,6 @@
 //! as a regression).
 
 pub mod baseline;
-pub mod catalog;
 pub mod corpus;
 pub mod fmt;
 pub mod gate;
@@ -70,7 +59,6 @@ pub mod oracle;
 pub mod pipeline;
 pub mod report;
 pub mod runner;
-pub mod structural_metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 pub mod types;

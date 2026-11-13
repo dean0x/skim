@@ -2589,7 +2589,6 @@ dependencies = [
  "rayon",
  "regex",
  "rskim-bench",
- "rskim-core",
  "rskim-oracle",
  "rskim-research",
  "serde",
@@ -2597,11 +2596,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml 0.8.23",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
 ]
 
 [[package]]

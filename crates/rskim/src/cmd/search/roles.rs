@@ -493,7 +493,15 @@ fn call_kinds(lang: Language) -> &'static [(&'static str, &'static str)] {
 ///
 /// The name passes up through the wrappers of [`passes_through`] (a scoped
 /// path, a member access): the receiver of a member access is not the callee.
+///
+/// In Rust, tree-sitter parses a macro argument as a flat `token_tree`, with
+/// no `call_expression`. There an identifier is a callee when the next token
+/// is a parenthesised `token_tree` and the token before it is not a definition
+/// keyword (see [`is_macro_argument_callee`]).
 fn is_callee(node: Node<'_>, lang: Language) -> bool {
+    if lang == Language::Rust && is_macro_argument_callee(node) {
+        return true;
+    }
     let calls = call_kinds(lang);
     let mut current = node;
     for _ in 0..MAX_CALLEE_HOPS {
@@ -512,6 +520,28 @@ fn is_callee(node: Node<'_>, lang: Language) -> bool {
         current = parent;
     }
     false
+}
+
+/// Whether the identifier `node` is a call inside a Rust macro argument.
+///
+/// The rule is by token shape: the parent is a `token_tree`, the next sibling
+/// token is a `token_tree` that opens with `(`, and the previous sibling token
+/// is not a definition keyword. So `f(x)`, `a::f(x)` and `x.f(y)` are calls.
+/// A `name!(..)` is not matched, because `!` follows the name. The limit: the
+/// rule reads tokens, not syntax, so token soup inside a `macro_rules!` body
+/// (a pattern or a template that only looks like a call) can also match.
+fn is_macro_argument_callee(node: Node<'_>) -> bool {
+    const DEFINITION_KEYWORDS: [&str; 6] = ["fn", "struct", "enum", "union", "trait", "type"];
+    if node.kind() != "identifier" || node.parent().is_none_or(|p| p.kind() != "token_tree") {
+        return false;
+    }
+    let opens_with_paren = node.next_sibling().is_some_and(|next| {
+        next.kind() == "token_tree" && next.child(0).is_some_and(|open| open.kind() == "(")
+    });
+    let after_definition_keyword = node
+        .prev_sibling()
+        .is_some_and(|prev| DEFINITION_KEYWORDS.contains(&prev.kind()));
+    opens_with_paren && !after_definition_keyword
 }
 
 /// Whether `child` is the part of `wrapper` that names the thing: the part a

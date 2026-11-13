@@ -6,8 +6,7 @@
 # from `scoreboard golden-gen --corpus flask` (reviewed, then frozen). A
 # changed byte here changes golden_sha256 and requires a bless.
 #
-# flask's docs are .rst, which skim does not index, so the universe is
-# mostly Python (107 files at this commit).
+# flask's docs are .rst. The text universe holds them with the Python files.
 
 corpus = "flask"
 commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"
@@ -302,40 +301,6 @@ id = "flask-Z02"
 query = "error zzqqxxyy"
 category = "zero-hit"
 
-# --- phrase / near ----------------------------------------------------------------------
-
-[[lexical]]
-id = "flask-P01"
-query = "application context"
-mode = "phrase"
-category = "phrase"
-
-[[lexical]]
-id = "flask-P02"
-query = "def url_for"
-mode = "phrase"
-category = "phrase"
-
-[[lexical]]
-id = "flask-P03"
-query = "request context"
-mode = "near"
-near = 3
-category = "near"
-
-[[lexical]]
-id = "flask-P04"
-query = "secret key"
-mode = "pnear"
-near = 2
-category = "near"
-
-[[lexical]]
-id = "flask-P05"
-query = "Flask"
-mode = "phrase"
-category = "phrase"
-
 # --- pagination sweeps (L = 3, 7, 20; full count <= 3 x 63 = 189) ---------------------------
 
 [[pagination]]
@@ -353,24 +318,6 @@ id = "flask-G003"
 query = "test client"
 limits = [3, 7, 20]
 
-[[pagination]]
-id = "flask-G004"
-query = "request context"
-flags = ["--phrase"]
-limits = [3, 7, 20]
-
-[[pagination]]
-id = "flask-G005"
-query = "app context"
-flags = ["--near", "3"]
-limits = [3, 7, 20]
-
-[[pagination]]
-id = "flask-G006"
-query = "config"
-flags = ["--hot"]
-limits = [3, 7, 20]
-
 # Single-token control.
 [[pagination]]
 id = "flask-G007"
@@ -380,54 +327,9 @@ limits = [3, 7, 20]
 # --- prefix consistency ------------------------------------------------------------------
 
 [[prefix]]
-id = "flask-F001"
-query = "def"
-flags = ["--hot"]
-limits = [5, 20]
-
-[[prefix]]
-id = "flask-F002"
-flags = ["--ast", "python-nested-loop", "--hot"]
-limits = [5, 20]
-
-# Standalone --ast: also a #547 score-order (order.score_monotone) entry.
-[[prefix]]
-id = "flask-F003"
-flags = ["--ast", "python-try-except"]
-limits = [5, 20]
-
-[[prefix]]
 id = "flask-F004"
 query = "request"
 limits = [5, 20]
-
-# --- structural (--ast) entries, #541 (scoreboard golden-gen --corpus flask --ast) --------
-# One entry per (pattern, language) where the structural oracle or skim finds a
-# file in this corpus (golden-gen never proposes a vacuous one). precision is
-# "hard" iff the catalog marks the pattern exact; it is frozen here and never
-# re-read from the catalog. The golden-gen counts are proposal-time evidence
-# (release skim 2f2186c), not checked values.
-
-# golden-gen: oracle files 3; skim files 3
-[[ast]]
-id = "flask-ast-python-nested-loop-python"
-pattern = "python-nested-loop"
-lang = "python"
-precision = "ratchet"
-
-# golden-gen: oracle files 18; skim files 18
-[[ast]]
-id = "flask-ast-python-try-except-python"
-pattern = "python-try-except"
-lang = "python"
-precision = "hard"
-
-# golden-gen: oracle files 8; skim files 8
-[[ast]]
-id = "flask-ast-try-finally-python"
-pattern = "try-finally"
-lang = "python"
-precision = "hard"
 
 # --- frozen answers (#540): refs, clash, plain-word first files, stakes -----------
 #
@@ -527,9 +429,14 @@ query = "register blueprint"
 relevant = '(?i)register[_\s-]*blueprint'
 first = ["src/flask/sansio/blueprints.py", "src/flask/sansio/app.py"]
 
-# --- stakes: exit codes of a plain-text search (no flag) ----------------------------
-# A literal that no tracked file holds exits 1; a literal that a tracked file holds
-# exits 0 (the exit codes of rg).
+# --- stakes: a plain-text search judged against the regex oracle ------------------------
+# No answer is frozen here. Each entry names a query, its flags and what is compared with
+# the oracle: the matching lines, the files, the per-file counts, or the exit code. The
+# oracle reads every tracked text file with the rules of rg for -i, -S, -w, -F, -E, -g and
+# -t. Exit codes follow rg: 0 a match, 1 no match, 2 a rejected query or flag set.
+# Q01 and Q02 read the exit codes of a plain literal. Q04 to Q08 state, as regular
+# expressions, the phrase and near queries of the earlier lexical entries. The other
+# entries each use one flag: -i, -E, -l, -c, -g, -t, -w, -C and -S.
 [[stakes]]
 id = "flask-Q01"
 query = "qzvx_absent_7713"
@@ -543,3 +450,94 @@ query = "FLASK_DEBUG"
 flags = []
 expect = "exit"
 exit = 0
+
+[[stakes]]
+id = "flask-Q03"
+query = 'flask'
+flags = ["-F", "-E"]
+expect = "exit"
+exit = 2
+
+[[stakes]]
+id = "flask-Q04"
+query = 'application context'
+flags = ["-F", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "flask-Q05"
+query = 'def url_for'
+flags = ["-F", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "flask-Q06"
+query = 'request\W+(\w+\W+){0,2}context'
+flags = ["-E", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "flask-Q07"
+query = 'secret\W+(\w+\W+)?key'
+flags = ["-E", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "flask-Q08"
+query = 'Flask'
+flags = ["-F", "-c"]
+expect = "counts"
+
+[[stakes]]
+id = "flask-Q09"
+query = 'secret_key'
+flags = ["-i"]
+expect = "lines"
+
+[[stakes]]
+id = "flask-Q10"
+query = 'def (before|after)_request'
+flags = ["-E"]
+expect = "lines"
+
+[[stakes]]
+id = "flask-Q11"
+query = 'wsgi'
+flags = ["-l"]
+expect = "files"
+
+[[stakes]]
+id = "flask-Q12"
+query = 'werkzeug'
+flags = ["-c"]
+expect = "counts"
+
+[[stakes]]
+id = "flask-Q13"
+query = 'wsgi'
+flags = ["-g", "tests/**"]
+expect = "lines"
+
+[[stakes]]
+id = "flask-Q14"
+query = 'teardown_request'
+flags = ["-t", "py"]
+expect = "lines"
+
+[[stakes]]
+id = "flask-Q15"
+query = 'request_context'
+flags = ["-w"]
+expect = "lines"
+
+[[stakes]]
+id = "flask-Q16"
+query = 'has_level_handler'
+flags = ["-C", "2"]
+expect = "lines"
+
+[[stakes]]
+id = "flask-Q17"
+query = 'jinja2'
+flags = ["-S"]
+expect = "lines"

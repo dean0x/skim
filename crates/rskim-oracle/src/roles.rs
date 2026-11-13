@@ -8,6 +8,9 @@
 //! - `call`: the lines where the name is in a callee position;
 //! - `import`: the lines where the name is an identifier below an import node.
 //!
+//! [`definition_names`] lists every declared name of a file with its line,
+//! from the same definition queries.
+//!
 //! The role names are those of the scoreboard's hand classification
 //! (`SiteRole` in `rskim-bench`'s golden module) and of the search engine's
 //! role rules. This crate reads neither: the rules are restated here from the
@@ -105,6 +108,23 @@ pub fn role_sites(lang: OracleLang, source: &str, name: &str) -> anyhow::Result<
         calls: lines_of(Role::Call)?,
         imports: lines_of(Role::Import)?,
     })
+}
+
+/// Every name declared in `source`, parsed as `lang`, with the 1-based line of
+/// its declaration: the names whose [`role_sites`] `defs` would list that line.
+/// Sorted by `(name, line)` and de-duplicated.
+///
+/// # Errors
+///
+/// The parser returns no tree; a query does not compile, or needed more
+/// in-progress matches than the oracle's limit.
+pub fn definition_names(lang: OracleLang, source: &str) -> anyhow::Result<Vec<(String, u32)>> {
+    let oracle = ORACLE
+        .as_ref()
+        .map_err(|message| anyhow::anyhow!("the role oracle does not compile: {message}"))?;
+    let mut scratch = OracleScratch::new();
+    let tree = scratch.parse(lang, source)?;
+    oracle.definitions(lang, &mut scratch, &tree, source)
 }
 
 // ============================================================================
@@ -287,12 +307,73 @@ impl RoleOracle {
         source: &str,
         name: &str,
     ) -> anyhow::Result<Vec<u32>> {
+        let mut lines = Vec::new();
+        self.visit(role, lang, scratch, tree, source, |kind, node| {
+            collect(kind, node, source, name, &mut lines)
+        })?;
+        lines.sort_unstable();
+        lines.dedup();
+        Ok(lines)
+    }
+
+    /// Every declared name with its 1-based line, sorted and de-duplicated.
+    ///
+    /// # Errors
+    ///
+    /// As [`RoleOracle::lines`].
+    fn definitions(
+        &self,
+        lang: OracleLang,
+        scratch: &mut OracleScratch,
+        tree: &Tree,
+        source: &str,
+    ) -> anyhow::Result<Vec<(String, u32)>> {
+        let mut names = Vec::new();
+        self.visit(
+            Role::Definition,
+            lang,
+            scratch,
+            tree,
+            source,
+            |kind, node| {
+                let counts = match kind {
+                    Capture::Name => true,
+                    Capture::NameOutsideBlock => !inside(node, BLOCK_KIND),
+                    Capture::Callee | Capture::ImportNode => false,
+                };
+                if counts {
+                    names.push((text(node, source)?.to_string(), first_line(node)?));
+                }
+                Ok(())
+            },
+        )?;
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// Run the `(role, lang)` query over `tree` and hand every captured node
+    /// to `on_capture` with its meaning.
+    ///
+    /// # Errors
+    ///
+    /// No query for `(role, lang)`; a capture the query did not declare; an
+    /// `on_capture` error (named with the query file); the query exceeded the
+    /// cursor's match limit.
+    fn visit(
+        &self,
+        role: Role,
+        lang: OracleLang,
+        scratch: &mut OracleScratch,
+        tree: &Tree,
+        source: &str,
+        mut on_capture: impl FnMut(Capture, Node<'_>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let compiled = self
             .queries
             .iter()
             .find(|q| q.role == role && q.lang == lang)
             .ok_or_else(|| anyhow::anyhow!("no {} role query for {lang}", role.file_stem()))?;
-        let mut lines = Vec::new();
         {
             let mut matches =
                 scratch
@@ -310,7 +391,7 @@ impl RoleOracle {
                                 capture.index
                             )
                         })?;
-                    collect(*kind, capture.node, source, name, &mut lines)
+                    on_capture(*kind, capture.node)
                         .with_context(|| format!("role query {}", compiled.file_name))?;
                 }
             }
@@ -322,9 +403,7 @@ impl RoleOracle {
             compiled.file_name,
             scratch.cursor.match_limit()
         );
-        lines.sort_unstable();
-        lines.dedup();
-        Ok(lines)
+        Ok(())
     }
 }
 
