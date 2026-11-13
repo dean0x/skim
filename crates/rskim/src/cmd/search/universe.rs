@@ -6,9 +6,10 @@
 //! Every git-tracked regular file (read from the git index in process, with no
 //! `git` subprocess; gitlinks and skip-worktree entries are dropped), plus the
 //! files of an ignore-aware walk of the root (hidden files and ignored files
-//! are skipped, links are not followed). There is no language allow-list, no
-//! minified gate and no file cap. Outside a repository the walk is the whole
-//! set. The caller applies the `-g` and `-t` filters to the listing; then each
+//! are skipped, links are not followed). When the root is a folder inside a
+//! repository, the tracked files below that folder are listed. There is no
+//! language allow-list, no minified gate and no file cap. Outside a repository
+//! the walk is the whole set. The caller applies the `-g` and `-t` filters to the listing; then each
 //! remaining file is read and admitted, or counted under a [`LeftOut`] reason.
 //!
 //! A tracked file that is hidden or looks secret-bearing is listed like any
@@ -188,7 +189,7 @@ pub(super) struct Listing {
 /// Why the universe cannot be listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum UniverseError {
-    /// The root is a repository whose index cannot be read. There is no
+    /// The root is in a repository whose index cannot be read. There is no
     /// partial universe: a half-listed repository would answer "no match" for
     /// files it never looked at.
     GitIndex { detail: String },
@@ -213,29 +214,37 @@ struct TrackedEntry {
     symlink: bool,
 }
 
-/// List the universe of `root`: the tracked files when `root` has a `.git`
-/// entry, plus the ignore-aware walk.
+/// List the universe of `root`: the tracked files of the repository that holds
+/// `root` (all of them when `root` has a `.git` entry, the ones below `root`
+/// when it is a folder inside a repository), plus the ignore-aware walk.
 ///
 /// # Errors
 ///
-/// [`UniverseError::GitIndex`] when `root` is a repository and its index cannot
-/// be opened or read.
+/// [`UniverseError::GitIndex`] when `root` is in a repository and its index
+/// cannot be opened or read.
 pub(super) fn list_universe(root: &Path) -> Result<Listing, UniverseError> {
     let mut found: BTreeMap<PathBuf, CandidateKind> = BTreeMap::new();
     let mut left_out = LeftOutCounts::default();
 
-    if root.join(".git").exists() {
-        let (safe, unsafe_paths) = split_safe(tracked_entries(root)?);
+    if let Some(source) = tracked_source(root) {
+        let (safe, unsafe_paths) = split_safe(tracked_entries(&source.top)?);
         for _ in 0..unsafe_paths {
             left_out.add(LeftOut::OutsideRoot);
         }
         for entry in safe {
+            // A tracked file outside the folder searched is not a candidate.
+            let Ok(rel) = entry.path.strip_prefix(&source.prefix) else {
+                continue;
+            };
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
             let kind = if entry.symlink {
                 CandidateKind::Symlink
             } else {
                 CandidateKind::File
             };
-            found.insert(entry.path, kind);
+            found.insert(rel.to_path_buf(), kind);
         }
     }
     walk_entries(root, &mut found, &mut left_out);
@@ -255,6 +264,34 @@ impl Listing {
     pub(super) fn retain(&mut self, mut keep: impl FnMut(&Path) -> bool) {
         self.candidates.retain(|c| keep(&c.rel));
     }
+}
+
+/// The repository whose index lists the tracked files of a root.
+struct TrackedSource {
+    /// The top folder of the repository.
+    top: PathBuf,
+    /// The root relative to `top`; empty when the root is `top`.
+    prefix: PathBuf,
+}
+
+/// The repository that holds `root`: `root` itself when it has a `.git` entry,
+/// else the nearest enclosing repository under the root-walk rules (a git
+/// ceiling, the home folder and `/` end the walk). `None` outside a repository.
+fn tracked_source(root: &Path) -> Option<TrackedSource> {
+    if root.join(".git").exists() {
+        return Some(TrackedSource {
+            top: root.to_path_buf(),
+            prefix: PathBuf::new(),
+        });
+    }
+    let top = super::gitdir::resolve_repo_toplevel(root)?;
+    let prefix = root
+        .canonicalize()
+        .ok()?
+        .strip_prefix(&top)
+        .ok()?
+        .to_path_buf();
+    Some(TrackedSource { top, prefix })
 }
 
 /// Split index entries into those with a plain relative path and the count of

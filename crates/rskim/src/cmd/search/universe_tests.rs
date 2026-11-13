@@ -234,6 +234,27 @@ fn a_repository_with_nothing_staged_lists_its_walk() {
 }
 
 #[test]
+fn a_root_inside_a_repository_lists_the_tracked_files_below_it() {
+    let repo = Repo::new();
+    repo.track("top.rs", b"fn t() {}\n");
+    repo.track("sub/a.rs", b"fn a() {}\n");
+    repo.track("sub/.env", b"TOKEN=x\n");
+    repo.write(".gitignore", b"sub/vendor/\n");
+    repo.track("sub/vendor/lib.rs", b"fn v() {}\n");
+    repo.write("sub/untracked.txt", b"u\n");
+
+    let listing = list_universe(&repo.root.join("sub")).unwrap();
+
+    // The hidden and the ignored tracked files below the root are listed, with
+    // paths relative to the root; a tracked file above the root is not.
+    assert_eq!(
+        names(&listing),
+        [".env", "a.rs", "untracked.txt", "vendor/lib.rs"]
+    );
+    assert_eq!(listing.left_out, LeftOutCounts::default());
+}
+
+#[test]
 fn an_unreadable_git_index_fails_with_no_partial_universe() {
     let repo = Repo::new();
     repo.track("a.rs", b"fn a() {}\n");
