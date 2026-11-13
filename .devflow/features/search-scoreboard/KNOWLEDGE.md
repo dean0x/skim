@@ -18,6 +18,7 @@ referencedFiles:
   - crates/rskim-oracle/src/roles.rs
   - crates/rskim-oracle/src/structural.rs
   - crates/rskim-oracle/tests/independence.rs
+  - crates/rskim-bench/tests/independence.rs
   - crates/rskim-bench/scoreboard/known_failures.toml
   - crates/rskim-research/src/clone.rs
   - .github/workflows/ci.yml
@@ -49,7 +50,9 @@ couple across the crates, which invariant is enforced where, and the traps.
 
 - **KB-INV-1** Nothing on the scoring path imports skim code. `rskim-bench` depends on `rskim-research` and
   `rskim-oracle` only. Where an oracle must agree with skim it keeps its own copy with a citation, so a policy change
-  on skim's side shows up as a scoreboard diff.
+  on skim's side shows up as a scoreboard diff. `crates/rskim-bench/tests/independence.rs` fails the build when the
+  manifest of `rskim-bench` names another `rskim-*` crate, or the manifest of `rskim-research` names any (`rskim-bench`
+  may name itself, for its `test-utils` dev-dependency).
 - **KB-INV-2** Golden data and frozen answers come from `git grep -nw` at the pin plus a hand read, never from skim's
   output, and CI never regenerates them.
 - **KB-INV-3** `rskim-oracle` has no `rskim-*`, `path` or `git` dependency, no `build.rs`, no `include!` and no
@@ -403,6 +406,7 @@ leaves an older passing report for `bless --from`.
 - `crates/rskim-bench/src/scoreboard/types.rs`: `CheckId`, `Role`, `ResultPage` and the envelope parser.
 - `crates/rskim-oracle/src/roles.rs` (+ `roles_tests.rs`): the role oracle. `src/structural.rs`: language table and scratch.
 - `crates/rskim-oracle/tests/independence.rs` and `queries/roles/*.scm`: the independence guard and the role queries.
+- `crates/rskim-bench/tests/independence.rs`: the manifest guard for `rskim-bench` and `rskim-research`.
 - `crates/rskim-bench/scoreboard/{corpora.toml,golden/*.toml,known_failures.toml,baseline.json}`: the data (`baseline.json` only via `bless`).
 - `crates/rskim-bench/tests/scoreboard.rs`: offline stub-skim tests; `crates/rskim-research/src/clone.rs`: pinned clones, process-group timeout.
 - `.github/workflows/ci.yml`, root `Cargo.toml` (`[profile.dev.package.tree-sitter]`), `.gitattributes` (LF for hashed files).
