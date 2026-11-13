@@ -25,8 +25,7 @@ fn sandbox() -> (tempfile::TempDir, PathBuf, RootRules) {
     let path = dir.path().canonicalize().unwrap();
     let rules = RootRules {
         ceilings: vec![path.clone()],
-        home: None,
-        ceiling_overflow: false,
+        ..RootRules::default()
     };
     (dir, path, rules)
 }
@@ -93,7 +92,7 @@ fn a_ceiling_overflow_searches_the_working_folder_and_the_notice_says_so() {
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::create_dir_all(repo.join("src")).unwrap();
     let rules = RootRules {
-        ceiling_overflow: true,
+        ceilings_dropped: 3,
         ..RootRules::default()
     };
 
@@ -102,13 +101,102 @@ fn a_ceiling_overflow_searches_the_working_folder_and_the_notice_says_so() {
     assert_eq!(root.path, repo.join("src"));
     let notice = root.notice.unwrap();
     assert!(
-        notice.starts_with("GIT_CEILING_DIRECTORIES has more than 64 entries"),
+        notice.starts_with(
+            "GIT_CEILING_DIRECTORIES has 67 entries; the search reads the first 64 and drops 3."
+        ),
         "{notice}"
     );
     assert!(
         notice.contains(&format!("{:?}", repo.join("src"))),
         "{notice}"
     );
+}
+
+#[test]
+fn a_ceiling_overflow_gives_the_same_notice_to_an_explicit_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let rules = RootRules {
+        ceilings_dropped: 1,
+        ..RootRules::default()
+    };
+
+    let root = resolve_scan_root(Some(&repo.join("src")), &repo, &rules).unwrap();
+
+    assert_eq!(root.path, repo.join("src"));
+    let notice = root.notice.unwrap();
+    assert!(
+        notice.starts_with(
+            "GIT_CEILING_DIRECTORIES has 65 entries; the search reads the first 64 and drops 1."
+        ),
+        "{notice}"
+    );
+}
+
+#[test]
+fn a_ceiling_overflow_gives_no_notice_to_a_root_that_holds_a_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let rules = RootRules {
+        ceilings_dropped: 1,
+        ..RootRules::default()
+    };
+
+    // The walk had no reason to go up, so the dropped entries changed nothing.
+    assert_eq!(
+        resolve_scan_root(Some(&repo), &repo, &rules)
+            .unwrap()
+            .notice,
+        None
+    );
+    assert_eq!(resolve_scan_root(None, &repo, &rules).unwrap().notice, None);
+}
+
+#[test]
+fn a_repository_that_another_user_owns_is_not_the_implicit_root_and_the_notice_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+    let rules = RootRules {
+        owns: |_| false,
+        ..RootRules::default()
+    };
+
+    let root = resolve_scan_root(None, &repo.join("src/deep"), &rules).unwrap();
+
+    assert_eq!(root.path, repo.join("src/deep"));
+    let notice = root.notice.unwrap();
+    assert!(
+        notice.starts_with(&format!(
+            "the .git entry in {repo:?} belongs to another user; "
+        )),
+        "{notice}"
+    );
+    assert!(
+        notice.contains(&format!("{:?}", repo.join("src/deep"))),
+        "{notice}"
+    );
+}
+
+#[test]
+fn a_repository_that_another_user_owns_gives_the_same_notice_to_an_explicit_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let rules = RootRules {
+        owns: |_| false,
+        ..RootRules::default()
+    };
+
+    let root = resolve_scan_root(Some(&repo.join("src")), &repo, &rules).unwrap();
+
+    assert_eq!(root.path, repo.join("src"));
+    assert!(root.notice.unwrap().contains("belongs to another user"),);
 }
 
 #[test]

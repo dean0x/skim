@@ -140,6 +140,7 @@ fn a_tracked_file_is_listed_though_it_is_hidden_or_ignored() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_tracked_symlink_is_a_symlink_candidate() {
     let repo = Repo::new();
     repo.track("real.rs", b"fn r() {}\n");
@@ -158,6 +159,7 @@ fn a_tracked_symlink_is_a_symlink_candidate() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_walked_link_is_a_symlink_candidate_and_is_not_followed() {
     let repo = Repo::new();
     repo.track("real.rs", b"fn r() {}\n");
@@ -263,6 +265,82 @@ fn an_unreadable_git_index_fails_with_no_partial_universe() {
     let err = list_universe(&repo.root).unwrap_err();
 
     assert!(matches!(err, UniverseError::GitIndex { .. }), "{err:?}");
+}
+
+/// A repository with a tracked hidden file below `sub`, and `sub` as the root.
+fn repo_with_hidden_file_below_sub() -> (Repo, PathBuf) {
+    let repo = Repo::new();
+    repo.track("sub/a.rs", b"fn a() {}\n");
+    repo.track("sub/.env", b"TOKEN=x\n");
+    let sub = repo.root.join("sub");
+    (repo, sub)
+}
+
+#[test]
+fn a_root_below_a_repository_with_no_head_file_fails_with_no_partial_universe() {
+    let (repo, sub) = repo_with_hidden_file_below_sub();
+    fs::remove_file(repo.root.join(".git/HEAD")).unwrap();
+
+    let err = list_universe_with(&sub, &RootRules::default()).unwrap_err();
+
+    // The top of the same damaged repository fails too, so the answer does not
+    // depend on where the query starts.
+    assert!(matches!(err, UniverseError::Repository { .. }), "{err:?}");
+    assert!(err.to_string().contains("HEAD"), "{err}");
+    assert!(list_universe_with(&repo.root, &RootRules::default()).is_err());
+}
+
+#[test]
+fn a_root_below_a_repository_with_an_unreadable_git_entry_fails() {
+    let (repo, sub) = repo_with_hidden_file_below_sub();
+    // Replace the git directory by a pointer file that names nothing.
+    fs::remove_dir_all(repo.root.join(".git")).unwrap();
+    fs::write(repo.root.join(".git"), b"not a pointer\n").unwrap();
+
+    let err = list_universe_with(&sub, &RootRules::default()).unwrap_err();
+
+    assert!(matches!(err, UniverseError::Repository { .. }), "{err:?}");
+}
+
+#[test]
+fn a_root_outside_every_repository_still_lists_its_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().canonicalize().unwrap();
+    fs::write(plain.join("p.txt"), b"plain\n").unwrap();
+
+    let listing = list_universe_with(&plain, &RootRules::default()).unwrap();
+
+    assert_eq!(names(&listing), ["p.txt"]);
+}
+
+#[test]
+fn a_repository_that_another_user_owns_is_not_read_for_a_folder_below_it() {
+    let (_repo, sub) = repo_with_hidden_file_below_sub();
+    let foreign = RootRules {
+        owns: |_| false,
+        ..RootRules::default()
+    };
+
+    let own = list_universe_with(&sub, &RootRules::default()).unwrap();
+    let other = list_universe_with(&sub, &foreign).unwrap();
+
+    // The owner's index lists the hidden file; the foreign one is not read, so
+    // the walk of the folder is the whole universe.
+    assert_eq!(names(&own), [".env", "a.rs"]);
+    assert_eq!(names(&other), ["a.rs"]);
+}
+
+#[test]
+fn a_ceiling_overflow_leaves_a_folder_below_a_repository_to_its_walk() {
+    let (_repo, sub) = repo_with_hidden_file_below_sub();
+    let overflow = RootRules {
+        ceilings_dropped: 1,
+        ..RootRules::default()
+    };
+
+    let listing = list_universe_with(&sub, &overflow).unwrap();
+
+    assert_eq!(names(&listing), ["a.rs"]);
 }
 
 #[test]
@@ -403,6 +481,7 @@ fn a_symlink_candidate_is_counted_and_never_read() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_path_below_a_folder_that_links_out_of_the_root_is_outside_root() {
     let repo = Repo::new();
     repo.track("sub/file.txt", b"inside\n");
@@ -418,6 +497,7 @@ fn a_path_below_a_folder_that_links_out_of_the_root_is_outside_root() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_folder_link_that_stays_inside_the_root_is_read() {
     let repo = Repo::new();
     repo.write("real/file.txt", b"inside\n");
@@ -430,6 +510,7 @@ fn a_folder_link_that_stays_inside_the_root_is_read() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_last_component_link_swapped_in_after_the_listing_is_not_followed() {
     let repo = Repo::new();
     repo.track("swap.txt", b"original\n");
@@ -450,6 +531,7 @@ fn a_last_component_link_swapped_in_after_the_listing_is_not_followed() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_fifo_in_place_of_a_file_is_unreadable_and_does_not_block() {
     let repo = Repo::new();
     let fifo = repo.root.join("pipe.txt");
@@ -465,10 +547,10 @@ fn a_fifo_in_place_of_a_file_is_unreadable_and_does_not_block() {
 }
 
 #[test]
-fn a_folder_in_place_of_a_file_is_not_a_file_and_is_not_counted() {
+fn a_folder_in_place_of_a_file_is_vanished() {
     let repo = Repo::new();
     fs::create_dir(repo.root.join("nested")).unwrap();
-    assert_eq!(read(&repo.root, "nested"), Read::NotAFile);
+    assert_eq!(read(&repo.root, "nested"), Read::LeftOut(LeftOut::Vanished));
 }
 
 #[test]

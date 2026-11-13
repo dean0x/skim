@@ -9,8 +9,12 @@
 //! are skipped, links are not followed). When the root is a folder inside a
 //! repository, the tracked files below that folder are listed. There is no
 //! language allow-list, no minified gate and no file cap. Outside a repository
-//! the walk is the whole set. The caller applies the `-g` and `-t` filters to the listing; then each
-//! remaining file is read and admitted, or counted under a [`LeftOut`] reason.
+//! the walk is the whole set. A repository that holds the root but cannot be
+//! used (no readable `.git` entry or `HEAD` file) is an error, never a
+//! walk-only answer: the tracked files cannot be counted, and a tracked hidden
+//! file would leave the answer with no count. The caller applies the `-g` and
+//! `-t` filters to the listing; then each remaining file is read and admitted,
+//! or counted under a [`LeftOut`] reason.
 //!
 //! A tracked file that is hidden or looks secret-bearing is listed like any
 //! other file. [`SENSITIVE_PATH_POLICY`] and [`sensitive_admission`] are the one
@@ -32,6 +36,8 @@ use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
+
+use super::gitdir::{RepoLookup, Repository, RootRules, find_repository};
 
 /// The number of leading bytes searched for a NUL byte. A NUL byte there makes
 /// the file binary.
@@ -58,7 +64,7 @@ pub(super) enum LeftOut {
     /// An I/O error, a permission error, or a handle that is not a regular
     /// file (a FIFO, a device).
     Unreadable,
-    /// Tracked, but absent from the work tree.
+    /// Tracked, but absent from the work tree, or replaced by a folder.
     Vanished,
     /// The real path leaves the canonical root, or the index names a path that
     /// is not a plain relative path.
@@ -193,6 +199,10 @@ pub(super) enum UniverseError {
     /// partial universe: a half-listed repository would answer "no match" for
     /// files it never looked at.
     GitIndex { detail: String },
+    /// A repository holds the root, but its state cannot be read (an
+    /// unreadable `.git` entry, a missing `HEAD` file). The same rule applies:
+    /// the tracked files cannot be counted, so there is no answer.
+    Repository { detail: String },
 }
 
 impl std::fmt::Display for UniverseError {
@@ -200,6 +210,12 @@ impl std::fmt::Display for UniverseError {
         match self {
             UniverseError::GitIndex { detail } => {
                 write!(f, "cannot read the git index: {detail}")
+            }
+            UniverseError::Repository { detail } => {
+                write!(
+                    f,
+                    "cannot read the repository that holds the folder: {detail}"
+                )
             }
         }
     }
@@ -214,6 +230,15 @@ struct TrackedEntry {
     symlink: bool,
 }
 
+/// List the universe of `root` under the root rules of this process.
+///
+/// # Errors
+///
+/// See [`list_universe_with`].
+pub(super) fn list_universe(root: &Path) -> Result<Listing, UniverseError> {
+    list_universe_with(root, &RootRules::from_env())
+}
+
 /// List the universe of `root`: the tracked files of the repository that holds
 /// `root` (all of them when `root` has a `.git` entry, the ones below `root`
 /// when it is a folder inside a repository), plus the ignore-aware walk.
@@ -221,31 +246,36 @@ struct TrackedEntry {
 /// # Errors
 ///
 /// [`UniverseError::GitIndex`] when `root` is in a repository and its index
-/// cannot be opened or read.
-pub(super) fn list_universe(root: &Path) -> Result<Listing, UniverseError> {
+/// cannot be opened or read. [`UniverseError::Repository`] when a repository
+/// holds `root` and its state cannot be read.
+pub(super) fn list_universe_with(root: &Path, rules: &RootRules) -> Result<Listing, UniverseError> {
     let mut found: BTreeMap<PathBuf, CandidateKind> = BTreeMap::new();
     let mut left_out = LeftOutCounts::default();
 
-    if let Some(source) = tracked_source(root) {
-        let (safe, unsafe_paths) = split_safe(tracked_entries(&source.top)?);
-        for _ in 0..unsafe_paths {
-            left_out.add(LeftOut::OutsideRoot);
-        }
-        for entry in safe {
-            // A tracked file outside the folder searched is not a candidate.
-            let Ok(rel) = entry.path.strip_prefix(&source.prefix) else {
-                continue;
-            };
-            if rel.as_os_str().is_empty() {
-                continue;
+    match tracked_source(root, rules) {
+        Tracked::Repository(source) => {
+            let (safe, unsafe_paths) = split_safe(tracked_entries(&source.top)?);
+            for _ in 0..unsafe_paths {
+                left_out.add(LeftOut::OutsideRoot);
             }
-            let kind = if entry.symlink {
-                CandidateKind::Symlink
-            } else {
-                CandidateKind::File
-            };
-            found.insert(rel.to_path_buf(), kind);
+            for entry in safe {
+                // A tracked file outside the folder searched is not a candidate.
+                let Ok(rel) = entry.path.strip_prefix(&source.prefix) else {
+                    continue;
+                };
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                let kind = if entry.symlink {
+                    CandidateKind::Symlink
+                } else {
+                    CandidateKind::File
+                };
+                found.insert(rel.to_path_buf(), kind);
+            }
         }
+        Tracked::NoRepository => {}
+        Tracked::Unresolved(detail) => return Err(UniverseError::Repository { detail }),
     }
     walk_entries(root, &mut found, &mut left_out);
 
@@ -266,32 +296,32 @@ impl Listing {
     }
 }
 
-/// The repository whose index lists the tracked files of a root.
-struct TrackedSource {
-    /// The top folder of the repository.
-    top: PathBuf,
-    /// The root relative to `top`; empty when the root is `top`.
-    prefix: PathBuf,
+/// The three states of the lookup of the tracked files of a root. Only
+/// `NoRepository` gives a walk-only universe; `Unresolved` is an error, so a
+/// tracked file never leaves the answer with no count.
+enum Tracked {
+    /// The repository whose index lists the tracked files of the root.
+    Repository(Repository),
+    /// No repository holds the root.
+    NoRepository,
+    /// A repository holds the root, but it cannot be used. The text says why.
+    Unresolved(String),
 }
 
 /// The repository that holds `root`: `root` itself when it has a `.git` entry,
 /// else the nearest enclosing repository under the root-walk rules (a git
-/// ceiling, the home folder and `/` end the walk). `None` outside a repository.
-fn tracked_source(root: &Path) -> Option<TrackedSource> {
-    if root.join(".git").exists() {
-        return Some(TrackedSource {
-            top: root.to_path_buf(),
-            prefix: PathBuf::new(),
-        });
+/// ceiling, the home folder and `/` end the walk, and so does a `.git` entry
+/// that another user owns).
+fn tracked_source(root: &Path, rules: &RootRules) -> Tracked {
+    let canonical = match root.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(e) => return Tracked::Unresolved(format!("cannot resolve {root:?}: {e}")),
+    };
+    match find_repository(&canonical, rules) {
+        RepoLookup::Within(repository) => Tracked::Repository(repository),
+        RepoLookup::Outside => Tracked::NoRepository,
+        RepoLookup::Unresolved(detail) => Tracked::Unresolved(detail),
     }
-    let top = super::gitdir::resolve_repo_toplevel(root)?;
-    let prefix = root
-        .canonicalize()
-        .ok()?
-        .strip_prefix(&top)
-        .ok()?
-        .to_path_buf();
-    Some(TrackedSource { top, prefix })
 }
 
 /// Split index entries into those with a plain relative path and the count of
@@ -392,9 +422,6 @@ pub(super) enum Read {
     Text(String),
     /// The file is left out, for this reason.
     LeftOut(LeftOut),
-    /// Not a file at all: a folder where the index lists a file (a nested
-    /// repository). It is not counted.
-    NotAFile,
 }
 
 /// The canonical root and the canonical form of every parent folder of the
@@ -480,8 +507,11 @@ fn read_file(path: &Path) -> Read {
         Ok(meta) => meta,
         Err(_) => return Read::LeftOut(LeftOut::Unreadable),
     };
+    // A folder where the listing named a file: the file is gone from that path.
+    // Gitlinks are dropped from the index listing, and the walk lists no
+    // folders, so only a changed work tree gives this.
     if meta.is_dir() {
-        return Read::NotAFile;
+        return Read::LeftOut(LeftOut::Vanished);
     }
     // A FIFO or a device is not text; reading it could block.
     if !meta.is_file() {

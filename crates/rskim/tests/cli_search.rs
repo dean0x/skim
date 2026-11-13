@@ -7,7 +7,9 @@
 mod common;
 
 use std::fs;
+#[cfg(unix)]
 use std::io::Read as _;
+#[cfg(unix)]
 use std::process::Stdio;
 
 use common::search_repo::{Run, SearchRepo, finish};
@@ -383,25 +385,41 @@ fn files_that_cannot_be_searched_are_counted_under_their_reason() {
     assert!(text.stderr.contains("1 symlink"));
 }
 
-#[test]
-fn debug_lines_print_only_with_skim_debug_and_carry_the_debug_prefix() {
+/// A repository with one searchable file and an untracked folder that cannot
+/// be listed. The flag is true when the user can list it anyway (root), so the
+/// folder gives no walk error.
+#[cfg(unix)]
+fn repo_with_unlistable_folder() -> (SearchRepo, std::path::PathBuf, bool) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let repo = SearchRepo::new();
     repo.write("ok.txt", "needle\n");
     repo.track_all();
-    // An untracked folder that cannot be listed gives a walk error.
     let locked = repo.root().join("locked");
     fs::create_dir(&locked).unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    // A user that can list a folder without permission (root) gets no error.
     let listable_anyway = fs::read_dir(&locked).is_ok();
+    (repo, locked, listable_anyway)
+}
+
+/// Let the temporary folder be removed again.
+#[cfg(unix)]
+fn unlock(folder: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn debug_lines_print_only_with_skim_debug_and_carry_the_debug_prefix() {
+    let (repo, locked, listable_anyway) = repo_with_unlistable_folder();
 
     let mut cmd = repo.skim();
     cmd.env("SKIM_DEBUG", "1").args(["search", "needle"]);
     let debug = finish(&mut cmd);
     let plain = repo.search(&["needle"]);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    unlock(&locked);
 
     assert_eq!(debug.code, 0, "{}", debug.stderr);
     for stage in [
@@ -414,11 +432,19 @@ fn debug_lines_print_only_with_skim_debug_and_carry_the_debug_prefix() {
         assert!(debug.stderr.contains(&line), "{line:?}: {}", debug.stderr);
     }
     if !listable_anyway {
+        // The error text is quoted, so a path with a control character or a
+        // newline cannot start a second line.
+        let line = debug
+            .stderr
+            .lines()
+            .find(|l| l.starts_with("skim search [debug]: walk error: "))
+            .unwrap_or_else(|| panic!("no walk error line: {}", debug.stderr));
+        let text = line.trim_start_matches("skim search [debug]: walk error: ");
         assert!(
-            debug.stderr.contains("skim search [debug]: walk error: "),
-            "{}",
-            debug.stderr
+            text.starts_with('"') && text.ends_with('"'),
+            "the error text is quoted: {line}"
         );
+        assert!(text.contains("locked"), "{line}");
     }
     // A debug line never takes the form of a line that is always on.
     assert!(
@@ -427,6 +453,23 @@ fn debug_lines_print_only_with_skim_debug_and_carry_the_debug_prefix() {
         debug.stderr
     );
     assert!(!plain.stderr.contains("[debug]"), "{}", plain.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_folder_that_cannot_be_listed_is_counted_as_unreadable() {
+    let (repo, locked, listable_anyway) = repo_with_unlistable_folder();
+
+    let run = repo.search(&["needle", "--json"]);
+    unlock(&locked);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let json = json_of(&run);
+    // The folder is one path the walk could not offer. A user that can list
+    // any folder (root) has none.
+    let unreadable = if listable_anyway { 0 } else { 1 };
+    assert_eq!(json["left_out"]["unreadable"], unreadable);
+    assert_eq!(json["searched_files"], 1);
 }
 
 // ============================================================================
@@ -958,4 +1001,115 @@ fn the_filesystem_root_is_not_searched_without_dash_dash_root() {
         "{}",
         run.stderr
     );
+}
+
+/// A repository whose token sits only in the tracked hidden file `src/.env`.
+/// The walk skips a hidden file, so only the git index lists it.
+fn hidden_token_repo() -> SearchRepo {
+    let repo = SearchRepo::new();
+    repo.write("src/lib.rs", "pub fn plain() {}\n");
+    repo.write("src/.env", "TOKEN=zq7needle\n");
+    repo.track_all();
+    repo
+}
+
+/// A `GIT_CEILING_DIRECTORIES` value of `count` absolute entries.
+#[cfg(unix)]
+fn ceiling_entries(count: usize) -> std::ffi::OsString {
+    std::env::join_paths((0..count).map(|n| format!("/no-such-ceiling/{n}"))).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn ceiling_entries_past_the_bound_print_their_exact_count_for_an_explicit_root() {
+    let repo = hidden_token_repo();
+    let explicit_root_with = |entries: usize| {
+        let mut cmd = repo.skim();
+        cmd.env("GIT_CEILING_DIRECTORIES", ceiling_entries(entries))
+            .args(["search", "-l", "--root", "src", "zq7needle"]);
+        finish(&mut cmd)
+    };
+
+    // At the bound every entry is read, and the index lists the hidden file.
+    let at_bound = explicit_root_with(64);
+    assert_eq!(at_bound.code, 0, "{}", at_bound.stderr);
+    assert!(
+        !at_bound.stderr.contains("GIT_CEILING_DIRECTORIES"),
+        "{}",
+        at_bound.stderr
+    );
+    assert_eq!(at_bound.stdout, ".env\n");
+
+    // One entry past the bound: the walk does not go up, the hidden file is
+    // not listed, and the note says how many entries were dropped.
+    let over = explicit_root_with(65);
+    assert_eq!(over.code, 1, "{}", over.stderr);
+    let note = "skim search: GIT_CEILING_DIRECTORIES has 65 entries; \
+                the search reads the first 64 and drops 1.";
+    assert!(over.stderr.contains(note), "{}", over.stderr);
+    assert_eq!(over.stderr.matches("GIT_CEILING_DIRECTORIES").count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn ceiling_entries_past_the_bound_print_their_exact_count_for_the_implicit_root() {
+    let repo = hidden_token_repo();
+    let mut cmd = repo.skim();
+    cmd.current_dir(repo.root().join("src"))
+        .env("GIT_CEILING_DIRECTORIES", ceiling_entries(70))
+        .args(["search", "-l", "zq7needle"]);
+    let run = finish(&mut cmd);
+
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("has 70 entries; the search reads the first 64 and drops 6."),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_repository_with_no_head_file_exits_2_for_an_explicit_root_below_it() {
+    let repo = hidden_token_repo();
+    fs::remove_file(repo.root().join(".git/HEAD")).unwrap();
+
+    let run = repo.search(&["--root", "src", "zq7needle"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert_eq!(run.stdout, "");
+    assert!(
+        run.stderr
+            .starts_with("skim search: cannot read the repository"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("HEAD"), "{}", run.stderr);
+
+    // With --json the error is on stdout, as for every other exit 2.
+    let json = repo.search(&["--root", "src", "--json", "zq7needle"]);
+    assert_eq!(json.code, 2, "{}", json.stderr);
+    let error = json_of(&json);
+    assert!(error["error"].as_str().is_some_and(|m| m.contains("HEAD")));
+
+    // The top of the same repository gives the same exit code.
+    let top = repo.search(&["zq7needle"]);
+    assert_eq!(top.code, 2, "{}", top.stderr);
+    assert_eq!(top.stdout, "");
+}
+
+#[test]
+fn a_tracked_file_that_became_a_folder_is_counted_as_vanished() {
+    let repo = SearchRepo::new();
+    repo.write("ok.txt", "needle\n");
+    repo.write("was_a_file.txt", "needle\n");
+    repo.track_all();
+    fs::remove_file(repo.root().join("was_a_file.txt")).unwrap();
+    fs::create_dir(repo.root().join("was_a_file.txt")).unwrap();
+
+    let run = repo.search(&["needle", "--json"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let json = json_of(&run);
+    assert_eq!(json["left_out"]["vanished"], 1);
+    assert_eq!(json["searched_files"], 1);
 }

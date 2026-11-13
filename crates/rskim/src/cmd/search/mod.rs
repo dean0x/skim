@@ -135,9 +135,13 @@ struct ScanRoot {
 /// Decide the folder to search.
 ///
 /// With `--root` the folder must exist. Without it the root is the repository
-/// that holds `cwd` (the nearest ancestor with a `.git` entry), found under
-/// `rules`; outside a repository it is `cwd` alone. Nothing implicit reaches
-/// `/` or the home folder from below. `cwd` is canonical.
+/// that holds `cwd` (the nearest ancestor with a `.git` entry that the user
+/// owns), found under `rules`; outside a repository it is `cwd` alone. Nothing
+/// implicit reaches `/` or the home folder from below. `cwd` is canonical.
+///
+/// A walk that does not go up for a reason the user cannot see (too many
+/// ceiling entries, a `.git` entry that another user owns) gives a notice on
+/// both paths.
 ///
 /// # Errors
 ///
@@ -157,9 +161,10 @@ fn resolve_scan_root(
                 "--root {dir:?} is not a directory"
             )));
         }
+        let notice = walk_notice(&canonical, &gitdir::walk_up(&canonical, rules), rules);
         return Ok(ScanRoot {
             path: canonical,
-            notice: None,
+            notice,
         });
     }
     if cwd.parent().is_none() {
@@ -167,18 +172,38 @@ fn resolve_scan_root(
             "refusing to search / implicitly; pass --root /",
         ));
     }
-    let path = gitdir::discover_project_root_with(cwd, rules);
-    let notice = if rules.ceiling_overflow {
-        Some(format!(
-            "GIT_CEILING_DIRECTORIES has more than {} entries; \
-             the search does not go above {path:?} to find a repository",
-            gitdir::MAX_CEILING_ENTRIES
-        ))
-    } else {
+    let walk = gitdir::walk_up(cwd, rules);
+    let path = walk.root(cwd);
+    let notice = walk_notice(&path, &walk, rules).or_else(|| {
         (path != cwd)
             .then(|| format!("searching {path:?} (the repository that holds the current folder)"))
-    };
+    });
     Ok(ScanRoot { path, notice })
+}
+
+/// The notice for a walk that did not go up from `path` for a reason that the
+/// user did not choose. `None` when the walk found a repository, or ended for
+/// a reason the user set on purpose (a ceiling, the home folder, `/`).
+///
+/// A dropped ceiling entry can hide tracked hidden and ignored files, so the
+/// notice states the exact count of the entries read and dropped.
+fn walk_notice(path: &Path, walk: &gitdir::Walk, rules: &gitdir::RootRules) -> Option<String> {
+    match walk {
+        gitdir::Walk::Found(_) => None,
+        gitdir::Walk::NotOwned(ancestor) => Some(format!(
+            "the .git entry in {ancestor:?} belongs to another user; \
+             the search does not go above {path:?} to find a repository"
+        )),
+        gitdir::Walk::NotFound if rules.ceilings_dropped > 0 => Some(format!(
+            "GIT_CEILING_DIRECTORIES has {} entries; the search reads the first {} and drops {}. \
+             It does not go above {path:?} to find a repository, \
+             so the tracked files that the walk skips (hidden and ignored files) are not searched",
+            gitdir::MAX_CEILING_ENTRIES.saturating_add(rules.ceilings_dropped),
+            gitdir::MAX_CEILING_ENTRIES,
+            rules.ceilings_dropped,
+        )),
+        gitdir::Walk::NotFound => None,
+    }
 }
 
 /// Compile the query of `flags`.

@@ -95,7 +95,7 @@ of stdout closed the pipe (`pipe_closed_exit`).
 | `roles.rs` | `Role`, `Labels`, `classify_line`, `Unlabelled`: the role of each hit. |
 | `rank.rs` | `FilePrior`, `rank_labelled`, `rank_words`: the rank order of both views. |
 | `render.rs` | `render`: the text views, `-l`, `-c` and the JSON envelope. Pure: it reads no file and writes no stream. |
-| `gitdir.rs` | `RootRules`, `discover_project_root_with`, `resolve_git_dir`, `resolve_repo_toplevel`, `resolve_common_dir`. |
+| `gitdir.rs` | `RootRules`, `walk_up`, `find_repository`, `resolve_git_dir`, `resolve_repo_toplevel`, `resolve_common_dir`. |
 | `hooks.rs` | Removal of the search git hooks that skim 2.x wrote. |
 | `legacy_cache.rs` | Removal of the index data that skim 2.x cached. |
 
@@ -136,12 +136,13 @@ reader) and `cli_search_legacy.rs` (every removed flag exits 2 with nothing on s
 - **The set.** Every git-tracked regular file, read from the git index in process through `gix` (gitlinks and
   skip-worktree entries are dropped), plus the files of an ignore-aware walk of the root (hidden and ignored files are
   skipped, links are not followed). A root that is a folder inside a repository (`--root`) lists the tracked files below
-  it, read from the index of the repository that holds it (`tracked_source`). Outside a repository the walk is the
-  whole set. There is no language allow-list, no minified gate and no file cap. Hidden and secret-bearing tracked files
+  it, read from the index of the repository that holds it (`tracked_source`). The lookup has three states
+  (`Tracked`): a repository, no repository (the only state that gives a walk-only universe), and unresolved. Outside a
+  repository the walk is the whole set. There is no language allow-list, no minified gate and no file cap. Hidden and secret-bearing tracked files
   are listed (policy A).
 - **Left out.** `LeftOut`: `binary` (a NUL byte in the first `BINARY_PROBE_BYTES` = 8192), `not_utf8`, `too_large`
   (above `MAX_FILE_BYTES` = 5 MiB), `unreadable` (an I/O error, a permission error, or a handle that is not a regular
-  file), `vanished` (tracked but absent), `outside_root` (the real path leaves the canonical root, or the index names a
+  file), `vanished` (tracked but absent, or replaced by a folder), `outside_root` (the real path leaves the canonical root, or the index names a
   path that is not a plain relative path) and `symlink` (a tracked mode `120000` entry or a walked link, counted and
   never read).
 - **Policy A.** `SENSITIVE_PATH_POLICY = SensitivePolicy::List` and `sensitive_admission` admit every path. To leave
@@ -149,6 +150,9 @@ reader) and `cli_search_legacy.rs` (every removed flag exits 2 with nothing on s
   update the help text, README, CHANGELOG and the scoreboard text universe together. `-g '!NAME'` leaves one file out
   today.
 - **Errors.** `UniverseError::GitIndex` when the root has a `.git` entry and its index cannot be read: exit 2.
+  `UniverseError::Repository` when a repository holds the root but its state cannot be read (a `.git` entry that
+  cannot be examined, a pointer or git directory that cannot be read, no readable `HEAD` file): exit 2, with
+  `{"error":…}` on stdout under `--json`. A tracked file never leaves the answer with no count.
 
 ## Scan (`scan.rs`)
 
@@ -215,14 +219,26 @@ node there.
 
 ## Root Discovery (`gitdir.rs`)
 
-`discover_project_root_with(canonical, rules)` walks up at most `MAX_ANCESTORS` = 256 folders for the nearest `.git`
-entry. `RootRules` stops the walk: it never steps into a `GIT_CEILING_DIRECTORIES` entry (absolute paths, at most
-`MAX_CEILING_ENTRIES` = 64, canonical forms added), never reaches the home folder from below and never reaches `/`
-from below. When the variable holds more than 64 absolute entries (`ceiling_overflow`), the walk does not go up at
-all and the query prints a note. The start folder is never excluded. With no match the start folder is the root.
+`walk_up(canonical, rules)` walks up at most `MAX_ANCESTORS` = 256 folders for the nearest `.git` entry and gives a
+`Walk`: `Found`, `NotFound` or `NotOwned`. `RootRules` stops the walk: it never steps into a `GIT_CEILING_DIRECTORIES`
+entry (absolute paths, at most `MAX_CEILING_ENTRIES` = 64, canonical forms added), never reaches the home folder from
+below and never reaches `/` from below. When the variable holds more than 64 absolute entries
+(`RootRules::ceilings_dropped` counts the entries past the bound), the walk does not go up at all. The start folder is
+never excluded and its `.git` entry is not checked for an owner. An ancestor `.git` entry is adopted only when
+`RootRules::owns` accepts it (`owned_by_current_user`, the ownership rule of git: the entry belongs to the current
+user, or to `SUDO_UID`); a `.git` entry that another user owns ends the walk with `NotOwned`. A test puts a stand-in
+in `owns`. With no match the start folder is the root.
+
+`resolve_scan_root` (`mod.rs`) prints one `skim search: …` note, on the implicit and the explicit (`--root`) path, when
+the walk did not go up for a reason the user did not set: the exact count of ceiling entries read and dropped, or the
+folder whose `.git` entry another user owns. No note is printed when the root holds a `.git` entry itself.
+
+`find_repository(root, rules)` gives the lookup of `universe.rs`: `Within` (the `Repository` top and the root prefix),
+`Outside` (no repository, or the walk stopped) or `Unresolved` (a `.git` entry that cannot be examined, an enclosing
+git directory that cannot be read, no readable `HEAD` file). `Unresolved` is exit 2 and never a walk-only answer.
 `resolve_git_dir`, `resolve_repo_toplevel` and `resolve_common_dir` serve `hooks.rs` (linked worktrees, submodules and
-plain repositories resolve the way git does). `resolve_repo_toplevel` also gives `universe.rs` the repository that
-holds a `--root` folder.
+plain repositories resolve the way git does). `resolve_repo_toplevel` is the soft form of `find_repository`: it gives
+`None` for every state except `Within`.
 
 ## Old Data Cleanup
 

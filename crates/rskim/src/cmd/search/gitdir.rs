@@ -8,11 +8,13 @@
 //! be read is reported as `None`.
 //!
 //! `resolve_git_dir` resolves ONE directory and never walks up. Ancestor
-//! discovery lives in `resolve_repo_toplevel`, which for a root with NO `.git`
-//! at all adopts the nearest enclosing repository using
-//! `discover_project_root_from_canonical`, the same bounded ancestor scan that
-//! finds the root of a query, so `--root <subdir>` and a bare invocation from
-//! that subdirectory agree.
+//! discovery lives in [`walk_up`], the bounded ancestor scan that finds the
+//! root of a query. [`find_repository`] builds on it for a root with NO `.git`
+//! at all: it adopts the nearest enclosing repository, so `--root <subdir>` and
+//! a bare invocation from that subdirectory agree.
+//!
+//! An ancestor `.git` is adopted only when the current user owns it, as git
+//! does by default. The start folder is never checked: the user chose it.
 
 use std::path::{Path, PathBuf};
 
@@ -39,43 +41,70 @@ pub(super) const MAX_ANCESTORS: usize = 256;
 /// Most entries of `GIT_CEILING_DIRECTORIES` that the root walk reads.
 pub(super) const MAX_CEILING_ENTRIES: usize = 64;
 
-/// The folders where the ancestor walk for a repository root must stop.
+/// Whether the current user owns a `.git` entry. It is a plain function so a
+/// test can put a stand-in in [`RootRules::owns`]; a test cannot change the
+/// owner of a file.
+pub(super) type OwnerCheck = fn(&Path) -> bool;
+
+/// The folders where the ancestor walk for a repository root must stop, and
+/// the owner rule for the `.git` entry it finds.
 ///
 /// The walk never steps into a ceiling folder, never reaches the home folder
 /// from below, and never reaches the filesystem root from below. A start folder
 /// is never excluded: it can be a ceiling, the home folder or `/` itself.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub(super) struct RootRules {
     pub(super) ceilings: Vec<PathBuf>,
     pub(super) home: Option<PathBuf>,
-    /// `GIT_CEILING_DIRECTORIES` holds more than [`MAX_CEILING_ENTRIES`]
-    /// absolute entries. The entries past the bound are not read, so the walk
-    /// does not go up at all: it cannot pass a ceiling it did not read.
-    pub(super) ceiling_overflow: bool,
+    /// How many absolute entries of `GIT_CEILING_DIRECTORIES` lie past the
+    /// first [`MAX_CEILING_ENTRIES`]. Those entries are not read, so when this
+    /// is not zero the walk does not go up at all: it cannot pass a ceiling it
+    /// did not read.
+    pub(super) ceilings_dropped: usize,
+    /// Whether the current user owns the `.git` entry at a path.
+    pub(super) owns: OwnerCheck,
+}
+
+impl Default for RootRules {
+    fn default() -> Self {
+        RootRules {
+            ceilings: Vec::new(),
+            home: None,
+            ceilings_dropped: 0,
+            owns: owned_by_current_user,
+        }
+    }
 }
 
 impl RootRules {
     /// The rules of this process: `GIT_CEILING_DIRECTORIES` and the home
     /// folder.
     pub(super) fn from_env() -> Self {
-        let (ceilings, ceiling_overflow) = std::env::var_os("GIT_CEILING_DIRECTORIES")
-            .map(|value| (parse_ceilings(&value), too_many_ceilings(&value)))
+        let (ceilings, ceilings_dropped) = std::env::var_os("GIT_CEILING_DIRECTORIES")
+            .map(|value| (parse_ceilings(&value), dropped_ceilings(&value)))
             .unwrap_or_default();
         let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
         RootRules {
             ceilings,
             home,
-            ceiling_overflow,
+            ceilings_dropped,
+            ..RootRules::default()
         }
     }
 
     /// Whether the walk ends before `candidate`, an ancestor of the start.
     fn stops_at(&self, candidate: &Path) -> bool {
-        self.ceiling_overflow
+        self.ceilings_dropped > 0
             || candidate.parent().is_none()
             || self.home.as_deref() == Some(candidate)
             || self.ceilings.iter().any(|c| c == candidate)
     }
+}
+
+/// Whether the current user owns the `.git` entry at `dot_git`, the rule git
+/// applies by default. An entry that cannot be examined is not owned.
+fn owned_by_current_user(dot_git: &Path) -> bool {
+    gix::sec::identity::is_path_owned_by_current_user(dot_git).unwrap_or(false)
 }
 
 /// The usable entries of a `GIT_CEILING_DIRECTORIES` value: the first
@@ -98,46 +127,71 @@ fn parse_ceilings(value: &std::ffi::OsStr) -> Vec<PathBuf> {
     ceilings
 }
 
-/// Whether a `GIT_CEILING_DIRECTORIES` value holds more absolute entries than
-/// [`parse_ceilings`] reads. It reads at most one entry past the bound.
-fn too_many_ceilings(value: &std::ffi::OsStr) -> bool {
+/// How many absolute entries of a `GIT_CEILING_DIRECTORIES` value lie past the
+/// ones [`parse_ceilings`] reads. The count is exact; its only bound is the
+/// length of the value, which the operating system limits.
+fn dropped_ceilings(value: &std::ffi::OsStr) -> usize {
     std::env::split_paths(value)
         .filter(|p| p.is_absolute())
-        .nth(MAX_CEILING_ENTRIES)
-        .is_some()
+        .skip(MAX_CEILING_ENTRIES)
+        .count()
+}
+
+/// Where the walk up from a start folder ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Walk {
+    /// The folder with the nearest `.git` entry: the start folder, or an
+    /// ancestor that the current user owns.
+    Found(PathBuf),
+    /// No `.git` entry within the [`MAX_ANCESTORS`] bound, or a ceiling, the
+    /// home folder or `/` ended the walk first.
+    NotFound,
+    /// The nearest ancestor with a `.git` entry holds one that another user
+    /// owns. The walk stopped below this folder.
+    NotOwned(PathBuf),
+}
+
+impl Walk {
+    /// The folder a query takes as its root when the walk started at `start`:
+    /// the repository folder, else `start` itself.
+    pub(super) fn root(&self, start: &Path) -> PathBuf {
+        match self {
+            Walk::Found(top) => top.clone(),
+            Walk::NotFound | Walk::NotOwned(_) => start.to_path_buf(),
+        }
+    }
 }
 
 /// Walk up from `canonical` (a pre-canonicalized path) looking for the nearest
-/// ancestor that contains a `.git` entry, under the process's [`RootRules`].
+/// ancestor that contains a `.git` entry, under `rules`.
 ///
-/// Returns the first matching ancestor as a `PathBuf`, or `canonical` itself
-/// when no enclosing `.git` is found within the [`MAX_ANCESTORS`] bound, or when
-/// a ceiling, the home folder or `/` ends the walk first.
+/// An ancestor `.git` that `rules.owns` does not accept ends the walk with
+/// [`Walk::NotOwned`]: git refuses such a repository by default, and the walk
+/// must not adopt a tree that the user did not choose. The `.git` entry of the
+/// start folder itself is not checked.
 ///
-/// The caller is responsible for canonicalizing `canonical` first — this variant
-/// skips the `canonicalize()` call to avoid a redundant O(path depth) syscall
-/// chain when the caller already holds a canonical path (e.g.
-/// `resolve_repo_toplevel`).
-fn discover_project_root_from_canonical(canonical: &Path) -> PathBuf {
-    discover_project_root_with(canonical, &RootRules::from_env())
-}
-
-/// [`discover_project_root_from_canonical`] under explicit `rules`.
-pub(super) fn discover_project_root_with(canonical: &Path, rules: &RootRules) -> PathBuf {
+/// The caller is responsible for canonicalizing `canonical` first, to avoid a
+/// redundant O(path depth) syscall chain when the caller already holds a
+/// canonical path.
+pub(super) fn walk_up(canonical: &Path, rules: &RootRules) -> Walk {
     let mut current = canonical;
     for _ in 0..MAX_ANCESTORS {
         if current != canonical && rules.stops_at(current) {
             break;
         }
-        if current.join(".git").exists() {
-            return current.to_path_buf();
+        let dot_git = current.join(".git");
+        if dot_git.exists() {
+            if current != canonical && !(rules.owns)(&dot_git) {
+                return Walk::NotOwned(current.to_path_buf());
+            }
+            return Walk::Found(current.to_path_buf());
         }
         match current.parent() {
             Some(parent) => current = parent,
             None => break,
         }
     }
-    canonical.to_path_buf()
+    Walk::NotFound
 }
 
 /// Resolve the git directory for a project root.
@@ -179,44 +233,92 @@ pub(super) fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Walk up from `project_root` to the nearest enclosing git repository when
+/// The repository that holds a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Repository {
+    /// The top folder of the repository; the root itself when it has a `.git`
+    /// entry.
+    pub(super) top: PathBuf,
+    /// The root relative to `top`; empty when the root is `top`.
+    pub(super) prefix: PathBuf,
+}
+
+/// What the lookup of the repository that holds a root found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RepoLookup {
+    /// The root is in this repository.
+    Within(Repository),
+    /// No repository the search may use holds the root: there is none within
+    /// the walk bounds, or the walk stopped (a ceiling, the home folder, `/`,
+    /// or a `.git` entry that another user owns). The file walk is then the
+    /// whole universe.
+    Outside,
+    /// A repository holds the root, but the search cannot use it. The text
+    /// says why. There is no partial universe for it: tracked files would
+    /// leave the answer with no count.
+    Unresolved(String),
+}
+
+/// Find the repository that holds `root` (a canonical path): `root` itself when
+/// it has a `.git` entry, else the nearest enclosing repository under `rules`.
+///
+/// A repository is `Unresolved` when `root` holds a `.git` entry that cannot be
+/// examined, or when the enclosing repository found has no readable git
+/// directory or `HEAD` file. Only "no repository" gives `Outside`.
+pub(super) fn find_repository(root: &Path, rules: &RootRules) -> RepoLookup {
+    // `try_exists` tells "absent" from "exists but unreadable": a permission
+    // error on `.git` must not trigger the adoption of an enclosing repository.
+    match root.join(".git").try_exists() {
+        Ok(true) => {
+            return RepoLookup::Within(Repository {
+                top: root.to_path_buf(),
+                prefix: PathBuf::new(),
+            });
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return RepoLookup::Unresolved(format!(
+                "cannot look for a .git entry in {root:?}: {e}"
+            ));
+        }
+    }
+    let top = match walk_up(root, rules) {
+        Walk::Found(top) => top,
+        Walk::NotFound | Walk::NotOwned(_) => return RepoLookup::Outside,
+    };
+    // The top folder must contain `root`, and have a git dir with a readable
+    // HEAD file.
+    let Ok(prefix) = root.strip_prefix(&top) else {
+        return RepoLookup::Unresolved(format!("{root:?} is not inside {top:?}"));
+    };
+    let prefix = prefix.to_path_buf();
+    let Some(git_dir) = resolve_git_dir(&top) else {
+        return RepoLookup::Unresolved(format!("the .git entry of {top:?} cannot be read"));
+    };
+    if !git_dir.join("HEAD").is_file() {
+        return RepoLookup::Unresolved(format!(
+            "the git directory {git_dir:?} has no readable HEAD file"
+        ));
+    }
+    RepoLookup::Within(Repository { top, prefix })
+}
+
+/// The nearest enclosing git repository of `project_root`, when
 /// `project_root` itself has no `.git` entry of its own.
 ///
-/// Returns `None` when:
-/// - `project_root` already has a `.git` entry (never re-point it).
-/// - No enclosing repo is found within the `MAX_ANCESTORS` bound.
-/// - The first-match ancestor does not contain `project_root` (containment check).
-/// - The ancestor's git directory has no readable `HEAD` file.
-///
-/// Uses `discover_project_root_from_canonical`, the same bounded ancestor scan
-/// that finds the root of a query.
+/// Returns `None` when `project_root` already has a `.git` entry (never
+/// re-point it), when no usable enclosing repository is found, and for every
+/// failure of the lookup: this serves the removal of old hooks, which takes no
+/// action on a repository it cannot read.
 pub(super) fn resolve_repo_toplevel(project_root: &Path) -> Option<PathBuf> {
-    // Never re-point a root that claims to be a repository already.
-    // Use try_exists() to distinguish "absent" from "exists but unreadable" —
-    // a permission error on `.git` must not silently trigger ancestor adoption
-    // of an enclosing repository; treat the error conservatively as "present"
-    // (return None / NotAdopted) so we never index a different repository's
-    // history when the intended root is blocked by a permission fence.
     if project_root.join(".git").try_exists().unwrap_or(true) {
         return None;
     }
     let canonical = project_root.canonicalize().ok()?;
-    // Call the local from-canonical variant to skip the redundant canonicalize()
-    // that discover_project_root would perform on the already-canonical path
-    // (O(path depth) lstat/readlink syscalls — measured, fixed per finding F2).
-    let top = discover_project_root_from_canonical(&canonical);
-    // `discover_project_root_from_canonical` returns the start path when no
-    // enclosing repo is found.
-    if top == canonical {
-        return None;
+    match find_repository(&canonical, &RootRules::from_env()) {
+        RepoLookup::Within(repository) => Some(repository.top),
+        RepoLookup::Outside | RepoLookup::Unresolved(_) => None,
     }
-    // Containment: `project_root` must live inside the discovered toplevel.
-    if !canonical.starts_with(&top) {
-        return None;
-    }
-    // F10: the toplevel must have a git dir with a readable HEAD file.
-    let git_dir = resolve_git_dir(&top)?;
-    git_dir.join("HEAD").is_file().then_some(top)
 }
 
 // ============================================================================

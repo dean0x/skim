@@ -373,7 +373,6 @@ enum Outcome {
         matched: Option<Matched>,
     },
     LeftOut(LeftOut),
-    NotAFile,
 }
 
 /// The result of phase A: the counts, and what phase B needs to label.
@@ -427,7 +426,6 @@ pub(super) fn count<'a>(
                 matched.extend(m);
             }
             Outcome::LeftOut(reason) => left_out.add(reason),
-            Outcome::NotAFile => {}
         }
     }
     Ok(Counted {
@@ -451,7 +449,6 @@ fn phase_a_file(
     let text = match containment.read(candidate) {
         Read::Text(text) => text,
         Read::LeftOut(reason) => return Outcome::LeftOut(reason),
-        Read::NotAFile => return Outcome::NotAFile,
     };
     let lang = Language::from_path(&candidate.rel);
     let found = match_file(&text, query, lang);
