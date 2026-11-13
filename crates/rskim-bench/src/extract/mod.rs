@@ -17,12 +17,23 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rskim_search::SearchField;
-
 pub mod go;
 pub mod python;
 pub mod rust_lang;
 pub mod typescript;
+
+/// The category of an extracted symbol: what kind of name it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchField {
+    /// A function or method name.
+    FunctionSignature,
+    /// A struct, enum, class, interface, trait or type alias name.
+    TypeDefinition,
+    /// Any other symbol name: a TypeScript class, a Rust `impl` type.
+    SymbolName,
+    /// An import or export name.
+    ImportExport,
+}
 
 /// A named symbol extracted from a source file.
 #[derive(Debug, Clone)]
@@ -165,9 +176,7 @@ pub const TYPESCRIPT_EXTRACT_EXTENSIONS: &[&str] = &["ts", "mts", "cts"];
 mod dispatch_tests {
     use std::path::Path;
 
-    use rskim_search::SearchField;
-
-    use super::extract_symbols;
+    use super::{SearchField, extract_symbols};
 
     #[test]
     fn dispatches_typescript_ts_to_typescript_extractor() {

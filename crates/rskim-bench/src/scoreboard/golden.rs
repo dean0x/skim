@@ -247,7 +247,7 @@ impl PrecisionClass {
 #[serde(deny_unknown_fields)]
 pub struct AstEntry {
     pub id: String,
-    /// A catalog pattern name (`rskim_search::all_patterns`) the oracle
+    /// A catalog pattern name (see `scoreboard::catalog`) the oracle
     /// has a query for in `lang`.
     pub pattern: String,
     /// The oracle language whose files this entry scores.
@@ -1389,10 +1389,7 @@ fn check_prefix(e: &PrefixEntry) -> anyhow::Result<()> {
 /// in the entry's language.
 fn check_ast(e: &AstEntry, catalog: &BTreeMap<&str, PatternCoverage>) -> anyhow::Result<()> {
     match catalog.get(e.pattern.as_str()) {
-        None => anyhow::bail!(
-            "pattern {:?} is not in skim's pattern catalog (rskim_search::all_patterns)",
-            e.pattern
-        ),
+        None => anyhow::bail!("pattern {:?} is not in skim's pattern catalog", e.pattern),
         Some(PatternCoverage::Uncovered { reason }) => {
             anyhow::bail!(
                 "pattern {:?} has no structural oracle query: {reason}",

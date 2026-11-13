@@ -1,19 +1,8 @@
-//! rskim-research library — reusable modules for bigram IDF computation.
+//! rskim-research library — pinned corpus clones and corpus config loading
+//! for the search scoreboard (`rskim-bench`).
 //!
-//! This library is an implementation detail of the `rskim-research` binary
-//! and `gen-synthetic` bootstrap tool. It is not published.
+//! This library is an implementation detail of the scoreboard. It is not
+//! published.
 
-pub mod ast_codegen;
-pub mod ast_extract;
-pub mod ast_idf;
-pub mod ast_pipeline;
-pub mod ast_types;
-pub mod ast_validate;
 pub mod clone;
-pub mod codegen;
 pub mod config;
-pub mod extract;
-pub mod idf;
-pub mod trigram_codegen;
-pub mod types;
-pub mod validate;

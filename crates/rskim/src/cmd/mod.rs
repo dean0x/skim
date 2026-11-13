@@ -458,7 +458,7 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
 /// and git-diff paths. Both call sites that stat a
 /// repo-relative string from git output MUST delegate here — not inline their
 /// own variant — so the invariant stays in one place and cannot drift:
-/// - `cmd::search::walk::list_tracked_files` (git index paths)
+/// - `cmd::search::universe::split_safe` (git index paths)
 /// - `cmd::heatmap::resolve_diff_files` (git diff paths)
 ///
 /// Note: the guard does NOT defend against in-tree symlinks whose targets resolve

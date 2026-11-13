@@ -30,7 +30,7 @@ pub(super) const USAGE_EXIT_CODE: u8 = 2;
 ///
 /// A removed flag is refused during flag parsing, before any file is read or
 /// written. The refusal prints one line on stderr and nothing on stdout.
-const REMOVED_FLAGS: [(&str, &str); 9] = [
+const REMOVED_FLAGS: [(&str, &str); 15] = [
     ("--ast", "use ast-grep for structural search"),
     ("--hot", "use skim heatmap for churn and fix density"),
     ("--cold", "use skim heatmap for churn and fix density"),
@@ -42,8 +42,20 @@ const REMOVED_FLAGS: [(&str, &str); 9] = [
     ("--weights", "there is no fused ranking"),
     ("--phrase", "use -F 'exact words' or -E for a regex"),
     ("--near", "use -F 'exact words' or -E for a regex"),
+    ("--build", NO_INDEX_ADVICE),
+    ("--rebuild", NO_INDEX_ADVICE),
+    ("--update", NO_INDEX_ADVICE),
+    ("--stats", NO_INDEX_ADVICE),
+    ("--install-hooks", OLD_HOOKS_ADVICE),
+    ("--remove-hooks", OLD_HOOKS_ADVICE),
     ("--lang", "use -t TYPE"),
 ];
+
+/// The advice for the commands of the old index.
+const NO_INDEX_ADVICE: &str = "skim search has no index; each query reads the files";
+
+/// The advice for the commands that managed the old search git hooks.
+const OLD_HOOKS_ADVICE: &str = "skim init and skim init --uninstall remove old search hooks";
 
 /// The refusal for `-j`, which the old query form read as `--json`.
 const REMOVED_SHORT_JSON: &str = "-j was removed in 3.0.0; use --json";
@@ -89,31 +101,6 @@ impl std::fmt::Display for UsageError {
 }
 
 impl std::error::Error for UsageError {}
-
-/// A command of the old index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum IndexCommand {
-    Build,
-    Rebuild,
-    Update,
-    Stats,
-    InstallHooks,
-    RemoveHooks,
-}
-
-impl IndexCommand {
-    fn from_flag(flag: &str) -> Option<Self> {
-        match flag {
-            "--build" => Some(IndexCommand::Build),
-            "--rebuild" => Some(IndexCommand::Rebuild),
-            "--update" => Some(IndexCommand::Update),
-            "--stats" => Some(IndexCommand::Stats),
-            "--install-hooks" => Some(IndexCommand::InstallHooks),
-            "--remove-hooks" => Some(IndexCommand::RemoveHooks),
-            _ => None,
-        }
-    }
-}
 
 /// How the pattern argument is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,12 +154,6 @@ pub(super) enum SearchAction {
     /// Refuse a removed flag: print the message on stderr and exit 2. The
     /// message has no program prefix.
     Removed(String),
-    /// A command of the old index.
-    Index {
-        command: IndexCommand,
-        root: Option<PathBuf>,
-        json: bool,
-    },
     /// Search.
     Query(Box<QueryFlags>),
 }
@@ -300,7 +281,6 @@ struct Draft {
     root: Option<PathBuf>,
     globs: Vec<String>,
     types: Vec<String>,
-    index: Option<IndexCommand>,
 }
 
 /// Parse the arguments after `skim search`.
@@ -379,10 +359,6 @@ impl Draft {
     /// Read the flag `arg` (and its value, which may be `next`). Returns how
     /// many arguments the flag used.
     fn flag(&mut self, arg: &str, next: Option<&str>) -> Result<usize, UsageError> {
-        if let Some(command) = IndexCommand::from_flag(arg) {
-            self.index = Some(command);
-            return Ok(1);
-        }
         if let Some(body) = arg.strip_prefix("--") {
             return self.long_flag(arg, body, next);
         }
@@ -504,22 +480,6 @@ impl Draft {
 
     /// Check the conflicts and build the action.
     fn finish(self) -> Result<SearchAction, UsageError> {
-        if let Some(command) = self.index {
-            if self
-                .pattern
-                .as_deref()
-                .is_some_and(|p| !p.trim().is_empty())
-            {
-                return Err(UsageError::new(
-                    "cannot combine a pattern with an index command",
-                ));
-            }
-            return Ok(SearchAction::Index {
-                command,
-                root: self.root,
-                json: self.json,
-            });
-        }
         let Some(pattern) = self.pattern.as_deref() else {
             return Err(UsageError::new(
                 "no pattern given; skim search --help lists the flags",
@@ -710,11 +670,12 @@ Removed flags (each exits 2 and names its replacement):
   --blast-radius              Use skim heatmap, or git log --name-only -- FILE
   --weights                   There is no fused ranking
   --phrase, --near            Use -F 'exact words' or -E for a regex
+  --build, --rebuild,         There is no index; each query reads the files
+  --update, --stats
+  --install-hooks,            Use skim init and skim init --uninstall to remove
+  --remove-hooks              old search hooks
   --lang                      Use -t TYPE
   -j                          Use --json
-
-Old index commands (they run until the index is removed):
-  --build, --rebuild, --update, --stats, --install-hooks, --remove-hooks
 
 Examples:
   skim search launchWorker                 Definition, calls, counts

@@ -17,6 +17,17 @@
 //! If the block is already present, the function is a no-op.  Running install
 //! twice is safe and produces exactly one copy of the block.
 
+// The removal code has no caller in a release build until the old-hook cleanup
+// of `skim init --uninstall` uses it. The expectation fails to hold once that
+// caller exists, which forces this line out.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the old-hook removal has no caller until `skim init --uninstall` runs it"
+    )
+)]
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -93,10 +104,10 @@ pub(crate) struct HooksOutcome {
 ///
 /// Returns `None` when `project_root` has no `.git` entry of its own but IS
 /// inside an enclosing git repository (i.e.
-/// [`staleness::resolve_repo_toplevel`] finds an ancestor).  Callers
+/// [`gitdir::resolve_repo_toplevel`] finds an ancestor).  Callers
 /// **must not** create the directory in this case: doing so would fabricate a
 /// `<root>/.git` directory that permanently disables ancestor adoption
-/// ([`staleness::resolve_repo_toplevel`] refuses to walk past an existing
+/// ([`gitdir::resolve_repo_toplevel`] refuses to walk past an existing
 /// `.git` entry — AC17, PF-017) and silently kills the temporal layer.
 ///
 /// For a linked worktree, routes to the shared `<commondir>/hooks` directory
@@ -122,7 +133,7 @@ pub(crate) struct HooksOutcome {
 /// The resolver applies a two-stage gate before using any derived path as a
 /// write destination:
 ///
-/// 1. [`staleness::resolve_common_dir`] is tried first — it is already validated
+/// 1. [`gitdir::resolve_common_dir`] is tried first — it is already validated
 ///    by the AD-413-3 sanity gate (`HEAD` is_file + is_dir).  When it resolves,
 ///    the result is used directly (this is the normal linked-worktree path).
 /// 2. If the commondir is absent (submodule, or unusual gitdir), the gitdir
@@ -146,7 +157,7 @@ pub(crate) struct HooksOutcome {
 /// - `Err(ancestor)` — `project_root` is a subdirectory of `ancestor`;
 ///   caller must refuse with an error naming `ancestor`.
 pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, PathBuf> {
-    match super::staleness::resolve_git_dir(project_root) {
+    match super::gitdir::resolve_git_dir(project_root) {
         Some(git_dir) => {
             let dot_git = project_root.join(".git");
             if dot_git.is_file() {
@@ -159,7 +170,7 @@ pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, PathBuf>
                 // it (is_dir + HEAD is_file — the existing AD-413-3 gate).
                 // A real linked worktree always has a commondir, so this is the
                 // expected fast path.
-                if let Some(common) = super::staleness::resolve_common_dir(&git_dir) {
+                if let Some(common) = super::gitdir::resolve_common_dir(&git_dir) {
                     return Ok(common.join("hooks"));
                 }
                 // Stage 2: no commondir (submodule gitdir, or an unusual
@@ -186,7 +197,7 @@ pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, PathBuf>
                 // therefore a trustworthy base path.  Follow the commondir if
                 // present (plain repos typically have none), otherwise use
                 // git_dir directly.
-                Ok(super::staleness::resolve_common_dir(&git_dir)
+                Ok(super::gitdir::resolve_common_dir(&git_dir)
                     .unwrap_or(git_dir)
                     .join("hooks"))
             }
@@ -209,7 +220,7 @@ pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, PathBuf>
             // dirs that hooks_tests creates), return the pre-#413 fallback —
             // creating an empty `.git/hooks` there is safe because no ancestor
             // adoption can be disrupted.
-            if let Some(ancestor) = super::staleness::resolve_repo_toplevel(project_root) {
+            if let Some(ancestor) = super::gitdir::resolve_repo_toplevel(project_root) {
                 return Err(ancestor);
             }
             Ok(project_root.join(".git").join("hooks"))
@@ -256,8 +267,8 @@ fn looks_like_git_dir(path: &Path) -> bool {
 /// the write-path gate), which differs from the hand-built plain path even though
 /// no clone-wide sharing is occurring.
 fn is_shared_hooks_dir(project_root: &Path, _hooks_dir: &Path) -> bool {
-    super::staleness::resolve_git_dir(project_root)
-        .and_then(|d| super::staleness::resolve_common_dir(&d))
+    super::gitdir::resolve_git_dir(project_root)
+        .and_then(|d| super::gitdir::resolve_common_dir(&d))
         .is_some()
 }
 

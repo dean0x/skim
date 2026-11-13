@@ -23,6 +23,53 @@ fn read_hook(dir: &std::path::Path, name: &str) -> String {
     fs::read_to_string(dir.join(".git").join("hooks").join(name)).unwrap()
 }
 
+/// Run `git` in `dir`, isolated from the ambient git configuration, and
+/// assert that it succeeds.
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Create a real git repository in `dir` with one commit per entry of
+/// `commit_files`: the message, then the `(path, content)` files to add.
+#[allow(clippy::type_complexity)]
+fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) {
+    git(dir, &["init"]);
+    git(dir, &["config", "user.email", "test@example.com"]);
+    git(dir, &["config", "user.name", "Test"]);
+    for (message, files) in commit_files {
+        for (name, content) in *files {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, content).unwrap();
+            git(dir, &["add", name]);
+        }
+        git(dir, &["commit", "-m", message]);
+    }
+}
+
+/// Add a linked worktree at `worktree` on a new branch `branch` of the
+/// repository at `primary`.
+fn create_real_git_worktree(primary: &std::path::Path, worktree: &std::path::Path, branch: &str) {
+    git(primary, &["branch", branch]);
+    git(
+        primary,
+        &["worktree", "add", worktree.to_str().unwrap(), branch],
+    );
+}
+
 // ============================================================================
 // install_search_hooks
 // ============================================================================
@@ -223,8 +270,8 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
     let worktree = dir.path().join("wt1");
     fs::create_dir_all(&primary).unwrap();
 
-    super::super::staleness::create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    super::super::staleness::create_real_git_worktree(&primary, &worktree, "b1");
+    create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
 
     // Ground truth: git's own hooks path for this worktree, absolutised.
     let out = Command::new("git")
@@ -272,7 +319,7 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
 
     // AC31(c): nothing written per-worktree.
     // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
-    let wt_gitdir = super::super::staleness::resolve_git_dir(&worktree).unwrap();
+    let wt_gitdir = super::super::gitdir::resolve_git_dir(&worktree).unwrap();
     assert!(
         !wt_gitdir.join("hooks").exists(),
         "AC31(c): no per-worktree hooks directory may be created ({wt_gitdir:?})"
@@ -404,9 +451,9 @@ fn test_ac34_multi_worktree_blast_radius() {
     let wt2 = dir.path().join("wt2");
     fs::create_dir_all(&primary).unwrap();
 
-    super::super::staleness::create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    super::super::staleness::create_real_git_worktree(&primary, &wt1, "b1");
-    super::super::staleness::create_real_git_worktree(&primary, &wt2, "b2");
+    create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &wt1, "b1");
+    create_real_git_worktree(&primary, &wt2, "b2");
 
     // Ground-truth shared hooks directory for wt1 (same for wt2 and primary).
     let out = Command::new("git")
@@ -570,7 +617,7 @@ fn test_resolve_hooks_dir_unchanged_for_plain_repo_and_non_repo() {
     // Plain repo: `.git` is a directory with no `commondir`.
     let plain = dir.path().join("plain");
     fs::create_dir_all(&plain).unwrap();
-    super::super::staleness::create_real_git_repo(&plain, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_repo(&plain, &[("init", &[("a.rs", "fn a(){}\n")])]);
     assert!(
         !plain.join(".git").join("commondir").exists(),
         "precondition: a plain repo has no commondir"
@@ -615,7 +662,7 @@ fn test_install_hooks_refuses_subdirectory_root() {
     let dir = tempdir().unwrap();
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
-    super::super::staleness::create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
 
     // Create a subdirectory inside the repo — no .git of its own.
     let subdir = repo.join("src");
@@ -671,7 +718,7 @@ fn test_resolve_hooks_dir_subdirectory_err_payload_is_ancestor_canonical() {
     let dir = tempdir().unwrap();
     let repo = dir.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
-    super::super::staleness::create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
     let repo_canonical = repo.canonicalize().unwrap();
 
     let subdir = repo.join("lib");
@@ -729,17 +776,11 @@ fn test_install_hooks_submodule_no_shared_disclosure_and_normalized_path() {
 
     // Build the sub-repository that will be added as a submodule.
     fs::create_dir_all(&sub_origin).unwrap();
-    super::super::staleness::create_real_git_repo(
-        &sub_origin,
-        &[("init", &[("lib.rs", "fn f(){}\n")])],
-    );
+    create_real_git_repo(&sub_origin, &[("init", &[("lib.rs", "fn f(){}\n")])]);
 
     // Build the superproject.
     fs::create_dir_all(&super_root).unwrap();
-    super::super::staleness::create_real_git_repo(
-        &super_root,
-        &[("init", &[("README.md", "readme\n")])],
-    );
+    create_real_git_repo(&super_root, &[("init", &[("README.md", "readme\n")])]);
 
     // Add sub_origin as a submodule named "sub" inside the superproject.
     // `protocol.file.allow=always` is required when adding a local-path submodule

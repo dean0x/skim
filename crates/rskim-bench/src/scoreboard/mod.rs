@@ -8,13 +8,11 @@
 //! `rskim-oracle`, which depends on no `rskim-*` crate (its
 //! `tests/independence.rs` checks the manifest), so that independence holds
 //! at compile time. Everything in this module is independent by convention
-//! only, because `rskim-bench` depends on `rskim-search` and `rskim-core`:
-//! nothing that scores skim imports `rskim_search::query_substring_present`,
-//! `rskim_core::Language`, or an `rskim-search` tokenizer. Two modules read
-//! skim's code on purpose, and neither scores it: [`catalog`] reads skim's
-//! pattern catalog once and hands its projection to everything that needs
-//! it, and [`golden_gen`] proposes golden entries for human review, passing
-//! `rskim_core::Language` to the symbol extractor as a dispatch key only.
+//! only, because `rskim-bench` depends on `rskim-core`: nothing that scores
+//! skim imports `rskim_core::Language` or a skim tokenizer. [`golden_gen`]
+//! proposes golden entries for human review, passing `rskim_core::Language`
+//! to the symbol extractor as a dispatch key only, and never scores skim.
+//! [`catalog`] holds a frozen table of skim's pattern catalog.
 //!
 //! # Modules
 //!
@@ -31,8 +29,8 @@
 //!   gate's own `--ast` pattern calls (a reviewed proposal; uses
 //!   `rskim_core::Language` only as the symbol extractor's dispatch key,
 //!   never scores skim).
-//! - [`catalog`] — skim's `--ast` pattern catalog (the one read of
-//!   `rskim_search::all_patterns`, name / exact / example only) crossed with
+//! - [`catalog`] — skim's `--ast` pattern catalog (a frozen table, name /
+//!   exact / example only) crossed with
 //!   the structural oracle's coverage. The structural oracle itself (#541:
 //!   tree-sitter queries encoding each catalog description, the nested-loop
 //!   intent oracles, the oracle's own AST language table and size cap) is

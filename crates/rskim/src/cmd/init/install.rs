@@ -983,12 +983,11 @@ fn print_wrapper_install_result(result: &super::wrappers::InstallResult, dry_run
 ///
 /// # Note
 ///
-/// `crate::cmd::search::walk::discover_project_root` performs a similar walk
-/// but returns `anyhow::Result<PathBuf>` (falling back to `cwd` when no `.git`
-/// is found) and canonicalises the start path first.  This function has
-/// different semantics: callers here need `None` to mean "not a git repo" so
-/// they can skip hook installation entirely.  The two functions are kept separate
-/// to preserve the distinct caller contracts.
+/// The root lookup of `skim search` performs a similar walk but falls back to
+/// `cwd` when no `.git` is found and canonicalises the start path first.  This
+/// function has different semantics: callers here need `None` to mean "not a
+/// git repo" so they can skip hook installation entirely.  The two lookups are
+/// kept separate to preserve the distinct caller contracts.
 fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut current = cwd.as_path();

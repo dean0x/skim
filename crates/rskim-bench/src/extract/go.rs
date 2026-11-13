@@ -9,9 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rskim_search::SearchField;
-
-use super::ExtractedSymbol;
+use super::{ExtractedSymbol, SearchField};
 
 /// Extract named symbols from Go source using tree-sitter.
 pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {

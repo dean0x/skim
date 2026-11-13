@@ -45,9 +45,8 @@ use std::path::Path;
 
 use anyhow::Context;
 use rskim_oracle::structural::{OracleLang, PatternCoverage};
-use rskim_search::SearchField;
 
-use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
+use crate::extract::{SearchField, TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
 use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
 use crate::scoreboard::fmt::sample;
 use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};

@@ -11,9 +11,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rskim_search::SearchField;
-
-use super::ExtractedSymbol;
+use super::{ExtractedSymbol, SearchField};
 
 /// Extract named symbols from Rust source using tree-sitter.
 pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {

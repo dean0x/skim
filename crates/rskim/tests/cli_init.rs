@@ -2919,14 +2919,13 @@ fn init_test_files(tests_root: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// # Scope: every crate linked into the binary
 ///
 /// `rskim` itself, its unconditional library dependencies (`rskim-core`,
-/// `rskim-compress`, `rskim-search`, `rskim-tokens`) and the two the `proxy`
+/// `rskim-compress`, `rskim-tokens`) and the two the `proxy`
 /// feature adds (`rskim-contract`, `rskim-proxy`), because release builds enable
 /// it. Scanning the binary crate alone was not enough, and the justification for
-/// doing so named one of the five other crates it links: `rskim-search`'s index
-/// reader reads `SKIM_DEBUG` and `rskim-tokens` reads `ANTHROPIC_API_KEY`, both
-/// invisible to that scope. `rskim-research` and `rskim-bench` are deliberately
-/// out — neither is linked into the binary, so a read there cannot reach a
-/// sandboxed invocation.
+/// doing so named one of the other crates it links: `rskim-tokens` reads
+/// `ANTHROPIC_API_KEY`, invisible to that scope. `rskim-research` and
+/// `rskim-bench` are deliberately out — neither is linked into the binary, so a
+/// read there cannot reach a sandboxed invocation.
 ///
 /// # `#[cfg(test)]` is out of scope
 ///
@@ -2952,7 +2951,6 @@ fn test_sandbox_env_block_classifies_every_env_var_the_binary_reads() {
         "rskim",
         "rskim-core",
         "rskim-compress",
-        "rskim-search",
         "rskim-tokens",
         "rskim-contract",
         "rskim-proxy",

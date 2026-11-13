@@ -1,9 +1,9 @@
 //! Integration tests: `skim search` refuses the flags it no longer accepts.
 //!
-//! The AST and temporal arms are gone. A command line that still names one of
-//! their flags must fail loudly, name the replacement, and leave no trace:
-//! exit code 2, nothing on stdout, nothing written to the project or to the
-//! cache folder (no index is built on the way out).
+//! The AST and temporal arms and the index commands are gone. A command line
+//! that still names one of their flags must fail loudly, name the replacement,
+//! and leave no trace: exit code 2, nothing on stdout, nothing written to the
+//! project or to the cache folder (no index is built on the way out).
 
 use std::fs;
 use std::path::Path;
@@ -60,16 +60,47 @@ const CASES: &[Case] = &[
         args: &["needle", "--weights", "1,1,1"],
         advice: "no fused ranking",
     },
-    // A removed flag beside an action flag: the action must not run.
+    // The old index commands. `--update` is the line an old git hook runs.
+    Case {
+        flag: "--build",
+        args: &["--build"],
+        advice: "has no index",
+    },
+    Case {
+        flag: "--rebuild",
+        args: &["--rebuild"],
+        advice: "has no index",
+    },
+    Case {
+        flag: "--update",
+        args: &["--update"],
+        advice: "has no index",
+    },
+    Case {
+        flag: "--stats",
+        args: &["--stats", "--json"],
+        advice: "has no index",
+    },
+    Case {
+        flag: "--install-hooks",
+        args: &["--install-hooks"],
+        advice: "skim init --uninstall",
+    },
+    Case {
+        flag: "--remove-hooks",
+        args: &["--remove-hooks"],
+        advice: "skim init --uninstall",
+    },
+    // Two removed flags on one line: the first one in the line is named.
     Case {
         flag: "--hot",
         args: &["--hot", "--build"],
         advice: "skim heatmap",
     },
     Case {
-        flag: "--ast",
+        flag: "--build",
         args: &["--build", "--ast", "try-catch"],
-        advice: "ast-grep",
+        advice: "has no index",
     },
 ];
 

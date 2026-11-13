@@ -25,7 +25,6 @@ rskim-compress = { path = "../rskim-compress" }
 # Enabling pulls tokio/hyper/rustls into the tree; default builds are HTTP/TLS-free (AC9).
 rskim-contract = { path = "../rskim-contract", optional = true }
 rskim-proxy = { path = "../rskim-proxy", optional = true }
-rskim-search = { path = "../rskim-search" }
 # Delegates token counting to the multi-provider library (AC13, AC15).
 # Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).
 rskim-tokens = { path = "../rskim-tokens" }

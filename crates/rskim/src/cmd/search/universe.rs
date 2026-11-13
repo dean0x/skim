@@ -32,11 +32,13 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
-use super::walk::{MAX_FILE_BYTES, configure_builder};
-
 /// The number of leading bytes searched for a NUL byte. A NUL byte there makes
 /// the file binary.
 pub(super) const BINARY_PROBE_BYTES: usize = 8192;
+
+/// The largest file a query reads (5 MiB). A larger file is counted under
+/// [`LeftOut::TooLarge`].
+pub(super) const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 // ============================================================================
 // Reasons a candidate is left out
@@ -308,7 +310,15 @@ fn walk_entries(
     left_out: &mut LeftOutCounts,
 ) {
     let mut builder = WalkBuilder::new(root);
-    configure_builder(&mut builder);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .require_git(false)
+        .follow_links(false);
     for item in builder.build() {
         let entry = match item {
             Ok(entry) => entry,

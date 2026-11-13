@@ -2568,7 +2568,6 @@ dependencies = [
  "rskim-core",
  "rskim-oracle",
  "rskim-proxy",
- "rskim-search",
  "rskim-tokens",
  "rusqlite",
  "serde",
@@ -2593,7 +2592,6 @@ dependencies = [
  "rskim-core",
  "rskim-oracle",
  "rskim-research",
- "rskim-search",
  "serde",
  "serde_json",
  "sha2",
@@ -2720,40 +2718,10 @@ name = "rskim-research"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
- "ignore",
- "indicatif",
- "insta",
  "libc",
- "rayon",
- "rskim-core",
  "serde",
- "serde_json",
- "sha2",
  "tempfile",
  "toml 0.8.23",
- "tree-sitter",
-]
-
-[[package]]
-name = "rskim-search"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "criterion",
- "filetime",
- "gix",
- "memmap2",
- "rayon",
- "regex",
- "rskim-core",
- "rusqlite",
- "rustc-hash",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tree-sitter",
 ]
 
 [[package]]

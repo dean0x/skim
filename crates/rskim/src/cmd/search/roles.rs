@@ -14,12 +14,16 @@
 //! 4. `import` when an ancestor of the match is an import node.
 //! 5. `ref` for any other code.
 //!
-//! A hit in a file with no grammar, and a hit in Markdown or a data format
-//! outside a comment or a string, is `text`. A hit with an identifier character
-//! before or after it, in an identifier query, is `partial`; it is decided from
-//! the line and never needs a parse. A file that could not be labelled gives
-//! `unlabelled`. A line takes the best role among its matches, in the tier
-//! order of [`Role`].
+//! A hit in a file with no grammar, and a hit in Markdown prose, is `text`.
+//! The classifier marks Markdown prose as a `Comment` field to rank it, and
+//! [`Labels::new`] maps that field to `Other`, because a Markdown file has no
+//! comments. A hit in a data format outside a comment or a string is `text`;
+//! a data format keeps its real comment and string roles.
+//!
+//! A hit with an identifier character before or after it, in an identifier
+//! query, is `partial`; it is decided from the line and never needs a parse. A
+//! file that could not be labelled gives `unlabelled`. A line takes the best
+//! role among its matches, in the tier order of [`Role`].
 
 use std::collections::HashMap;
 use std::ops::Range;

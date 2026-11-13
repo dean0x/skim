@@ -4,8 +4,7 @@
 //! Ported from the 2026-09-25 seed benchmark
 //! (`.devflow/docs/reviews/vision-gap-2026-09/bench/lib.py`: `gt_and_substring`,
 //! `gt_phrase`, `gt_near`). Deliberately independent of skim's code: nothing
-//! here imports `rskim_search::query_substring_present`,
-//! `rskim_core::Language`, or an `rskim-search` tokenizer. Where a rule must
+//! here imports `rskim_core::Language` or a skim tokenizer. Where a rule must
 //! agree with skim (the word-byte class, the `--lang` names), this module
 //! carries its own copy, so a change on skim's side shows up as a scoreboard
 //! diff instead of silently flowing through.
@@ -458,8 +457,7 @@ pub fn line_truth<'a>(
 // Word tokens (the oracle's own copy of skim's word-byte rule)
 // ============================================================================
 
-/// The oracle's copy of `rskim_search::lexical::tokenize::is_word_byte`
-/// (`crates/rskim-search/src/lexical/tokenize.rs:22-24`): ASCII `[A-Za-z0-9_]`.
+/// The oracle's word-byte rule: ASCII `[A-Za-z0-9_]`.
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }

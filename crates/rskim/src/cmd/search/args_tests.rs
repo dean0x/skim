@@ -40,16 +40,6 @@ const KNOWN_FLAGS: [&str; 30] = [
     "--help",
 ];
 
-/// The commands of the old index. They run until the index is removed.
-const INDEX_FLAGS: [&str; 6] = [
-    "--build",
-    "--rebuild",
-    "--update",
-    "--stats",
-    "--install-hooks",
-    "--remove-hooks",
-];
-
 fn args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| (*s).to_owned()).collect()
 }
@@ -112,9 +102,8 @@ fn a_bad_flag_before_help_is_an_error_not_help() {
 
 #[test]
 fn the_help_text_documents_every_flag() {
-    let flags = KNOWN_FLAGS.iter().chain(INDEX_FLAGS.iter());
     let removed = REMOVED_FLAGS.iter().map(|(flag, _)| flag);
-    for flag in flags.chain(removed) {
+    for flag in KNOWN_FLAGS.iter().chain(removed) {
         assert!(
             SEARCH_HELP_TEXT.contains(flag),
             "the help text does not mention {flag}"
@@ -213,8 +202,37 @@ fn removed_flag_message_names_flag_and_replacement() {
         ("--weights", "there is no fused ranking"),
         ("--phrase", "use -F 'exact words' or -E for a regex"),
         ("--near", "use -F 'exact words' or -E for a regex"),
+        (
+            "--build",
+            "skim search has no index; each query reads the files",
+        ),
+        (
+            "--rebuild",
+            "skim search has no index; each query reads the files",
+        ),
+        (
+            "--update",
+            "skim search has no index; each query reads the files",
+        ),
+        (
+            "--stats",
+            "skim search has no index; each query reads the files",
+        ),
+        (
+            "--install-hooks",
+            "skim init and skim init --uninstall remove old search hooks",
+        ),
+        (
+            "--remove-hooks",
+            "skim init and skim init --uninstall remove old search hooks",
+        ),
         ("--lang", "use -t TYPE"),
     ];
+    assert_eq!(
+        cases.len(),
+        REMOVED_FLAGS.len(),
+        "every removed flag is checked"
+    );
     for (flag, advice) in cases {
         assert_eq!(
             removed_flag_message(flag),
@@ -603,47 +621,37 @@ fn counts_mode_is_read() {
 }
 
 // ============================================================================
-// The old index commands
+// The commands of the old index
 // ============================================================================
 
 #[test]
-fn index_commands_are_read_with_root_and_json() {
-    let cases = [
-        ("--build", IndexCommand::Build),
-        ("--rebuild", IndexCommand::Rebuild),
-        ("--update", IndexCommand::Update),
-        ("--stats", IndexCommand::Stats),
-        ("--install-hooks", IndexCommand::InstallHooks),
-        ("--remove-hooks", IndexCommand::RemoveHooks),
-    ];
-    for (flag, command) in cases {
-        assert_eq!(
-            parse_flags(&args(&[flag, "--root", "dir", "--json"])),
-            Ok(SearchAction::Index {
-                command,
-                root: Some(PathBuf::from("dir")),
-                json: true,
-            })
-        );
+fn an_old_index_command_is_refused_with_its_replacement() {
+    for flag in [
+        "--build",
+        "--rebuild",
+        "--update",
+        "--stats",
+        "--install-hooks",
+        "--remove-hooks",
+    ] {
+        for extra in [&[][..], &["--root", "dir", "--json"][..], &["needle"][..]] {
+            let mut parts = vec![flag];
+            parts.extend_from_slice(extra);
+            match parse_flags(&args(&parts)) {
+                Ok(SearchAction::Removed(message)) => {
+                    assert!(
+                        message.starts_with(&format!("{flag} was removed in 3.0.0; ")),
+                        "{parts:?}: {message}"
+                    );
+                }
+                other => panic!("{parts:?}: expected a refusal, got {other:?}"),
+            }
+        }
     }
 }
 
 #[test]
-fn an_index_command_with_a_pattern_is_an_error() {
-    let message = error(&["needle", "--rebuild"]);
-    assert_eq!(message, "cannot combine a pattern with an index command");
-}
-
-#[test]
-fn an_index_command_with_a_blank_pattern_is_allowed() {
-    assert!(matches!(
-        parse_flags(&args(&["  ", "--rebuild"])),
-        Ok(SearchAction::Index { .. })
-    ));
-}
-
-#[test]
-fn an_index_command_name_after_double_dash_is_the_pattern() {
+fn an_old_index_command_name_after_double_dash_is_the_pattern() {
     let flags = query(&["--", "--rebuild"]);
     assert_eq!(pattern_of(&flags), ("--rebuild", false));
 }
@@ -699,11 +707,5 @@ fn every_listed_flag_is_accepted_by_the_parser() {
             parsed.is_ok(),
             "{flag} is listed but the parser refuses it: {parsed:?}"
         );
-    }
-    for flag in INDEX_FLAGS {
-        assert!(matches!(
-            parse_flags(&args(&[flag])),
-            Ok(SearchAction::Index { .. })
-        ));
     }
 }
