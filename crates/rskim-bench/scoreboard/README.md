@@ -194,9 +194,10 @@ Golden integrity runs before any query, and a violation is exit 2, never a gate 
 - regexes compile;
 - ids are unique, `zero-hit` entries have no ground truth, and pagination fits its bound;
 - the frozen-answer tables hold their rules ([Frozen answers](#frozen-answers-refs-clash-stakes-and-the-text-universe)):
-  a `[[refs]]` site set that differs from the whole-word line set at the pin, a `[[clash]]` with fewer than 2
-  definitions, a `first` path outside the universe and a `[[stakes]]` exit code that disagrees with the oracle's hit
-  count are all errors;
+  a `[[refs]]` site set that differs from the whole-word line set at the pin or has no `call` site, a `[[clash]]`
+  with fewer than 2 definitions or no calls, a `first` path outside the universe, a `[[stakes]]` exit code that
+  disagrees with the oracle's hit count and a `[[stakes]]` `lines`, `files` or `counts` entry with no matching line are
+  all errors;
 - every ledger entry refers to a real entry and check.
 
 For identifiers, `scoreboard golden-gen --corpus <name>` proposes candidates: definitions from the role oracle with
@@ -214,9 +215,9 @@ comes from `git grep -nw` at the pin plus a hand read of every line, never from 
 
 | Table | Holds | Integrity (exit 2 when broken) |
 |---|---|---|
-| `[[refs]]` | `id`, `query` (a bare identifier), `def {path, line}`, `sites [{path, line, role}]`, `origin`. Every line that holds the name as a whole word, with its role: `def`, `call`, `ref`, `import`, `comment`, `string` or `text`. | The `sites` equal the whole-word line set of the query over the text universe at the pin, and `def` is one of them. |
-| `[[clash]]` | `id`, `query`, `defs [{path, line}]` (2 or more), `calls [{path, line, def}]`, `split`, `origin`. A name with two or more definitions. `def` of a call is an index into `defs` or `"unassigned"`. | At least 2 `defs`; each call index is in range; every def and call line holds the name as a whole word; `split = "none"` (the value `"exact"` is refused until calls are split by definition). |
-| `[[stakes]]` | `id`, `query`, `flags` (rg-style, from a closed list), `expect` (`lines`, `files`, `counts` or `exit`) and `exit` for `expect = "exit"`. A plain-text query judged against the regex oracle. | `exit` is present exactly when `expect = "exit"`, and it is `0`, `1` or `2`. `1` needs no matching line in the text universe, `0` needs one, and `2` needs a query or flag set that the oracle rejects. |
+| `[[refs]]` | `id`, `query` (a bare identifier), `def {path, line}`, `sites [{path, line, role}]`, `origin`. Every line that holds the name as a whole word, with its role: `def`, `call`, `ref`, `import`, `comment`, `string` or `text`. | The `sites` equal the whole-word line set of the query over the text universe at the pin, `def` is one of them, and at least one site has the role `call`. |
+| `[[clash]]` | `id`, `query`, `defs [{path, line}]` (2 or more), `calls [{path, line, def}]`, `split`, `origin`. A name with two or more definitions. `def` of a call is an index into `defs` or `"unassigned"`. | At least 2 `defs` and at least 1 call; each call index is in range; every def and call line holds the name as a whole word; `split = "none"` (the value `"exact"` is refused until calls are split by definition). |
+| `[[stakes]]` | `id`, `query`, `flags` (rg-style, from a closed list), `expect` (`lines`, `files`, `counts` or `exit`) and `exit` for `expect = "exit"`. A plain-text query judged against the regex oracle. | `exit` is present exactly when `expect = "exit"`, and it is `0`, `1` or `2`. `1` needs no matching line in the text universe, `0` needs one, and `2` needs a query or flag set that the oracle rejects. A `lines`, `files` or `counts` entry needs at least one matching line, because an empty oracle answer passes any output. |
 | `[[concept]]` `first` | An optional list of paths: the files that hold the answer to a plain-word question. A concept entry without `first` still loads. | Each path is a file of the text universe at the pin. |
 
 The stakes flags are `-g`, `-t`, `-l`, `-c`, `-E`, `-F`, `-i`, `-S`, `-w` and `-C`. The runner sets `--json`, `--limit`,

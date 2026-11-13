@@ -434,7 +434,7 @@ fn a_clash_with_a_repeated_def_or_call_site_is_a_violation() {
         "skim-D1",
         "run",
         &[("a.rs", 1), ("a.rs", 1)],
-        &[],
+        &[("a.rs", 2, "\"unassigned\"")],
         "none",
     ));
     assert!(
@@ -452,6 +452,18 @@ fn a_clash_with_a_repeated_def_or_call_site_is_a_violation() {
         message_of(&repeated_call, "skim-D2").contains("call a.rs:2 is listed twice"),
         "{repeated_call:?}"
     );
+}
+
+#[test]
+fn a_clash_entry_needs_a_call() {
+    let v = clash_violations(&clash(
+        "skim-D1",
+        "run",
+        &[("a.rs", 1), ("b.rs", 1)],
+        &[],
+        "none",
+    ));
+    assert!(message_of(&v, "skim-D1").contains("no calls"), "{v:?}");
 }
 
 // --- [[refs]] schema rules ---------------------------------------------------
@@ -492,21 +504,46 @@ fn a_refs_entry_needs_sites_that_are_distinct_and_include_its_def() {
 }
 
 #[test]
+fn a_refs_entry_needs_a_call_site() {
+    let def_only = clash_violations(&refs("skim-R1", "run", ("a.rs", 1), &[("a.rs", 1, "def")]));
+    assert!(
+        message_of(&def_only, "skim-R1").contains("no call site"),
+        "{def_only:?}"
+    );
+
+    let other_roles = clash_violations(&refs(
+        "skim-R2",
+        "run",
+        ("a.rs", 1),
+        &[
+            ("a.rs", 1, "def"),
+            ("a.rs", 2, "import"),
+            ("a.rs", 3, "comment"),
+        ],
+    ));
+    assert!(
+        message_of(&other_roles, "skim-R2").contains("no call site"),
+        "a ref, import or comment is not a call: {other_roles:?}"
+    );
+}
+
+#[test]
 fn the_refs_and_clash_queries_must_be_bare_identifiers() {
+    let sites = [("a.rs", 1, "def"), ("a.rs", 2, "call")];
     for query in ["", "two words", "a-b", "a.b", "run()", "$run"] {
-        let r = clash_violations(&refs("skim-R1", query, ("a.rs", 1), &[("a.rs", 1, "def")]));
+        let r = clash_violations(&refs("skim-R1", query, ("a.rs", 1), &sites));
         assert!(flagged(&r, "skim-R1"), "refs {query:?}: {r:?}");
         let c = clash_violations(&clash(
             "skim-D1",
             query,
             &[("a.rs", 1), ("b.rs", 1)],
-            &[],
+            &[("a.rs", 2, "\"unassigned\"")],
             "none",
         ));
         assert!(flagged(&c, "skim-D1"), "clash {query:?}: {c:?}");
     }
     for query in ["run", "_run", "run2", "Run_Fast"] {
-        let r = clash_violations(&refs("skim-R1", query, ("a.rs", 1), &[("a.rs", 1, "def")]));
+        let r = clash_violations(&refs("skim-R1", query, ("a.rs", 1), &sites));
         assert!(r.is_empty(), "refs {query:?}: {r:?}");
     }
 }
@@ -1157,7 +1194,7 @@ fn clash_defs_and_calls_must_be_whole_word_lines() {
         "skim-D3",
         "run",
         &[("src/a.rs", 1), ("src/b.rs", 2)],
-        &[],
+        &[("src/a.rs", 2, "\"unassigned\"")],
         "none",
     ));
     assert!(
@@ -1169,7 +1206,7 @@ fn clash_defs_and_calls_must_be_whole_word_lines() {
         "skim-D4",
         "run",
         &[("src/a.rs", 1), ("src/gone.rs", 1)],
-        &[],
+        &[("src/a.rs", 2, "\"unassigned\"")],
         "none",
     ));
     assert!(flagged(&gone, "skim-D4"), "{gone:?}");
@@ -1189,11 +1226,12 @@ fn a_concept_first_path_must_be_in_the_universe() {
 
 // --- the text universe and the stakes exit rule -------------------------------
 
-/// `run` is a whole word in `src/a.rs:1` and in `LICENSE:1`, a file with no
-/// language that the one text universe still reads.
+/// `run` is a whole word in `src/a.rs:1`, `src/a.rs:2` (a call) and
+/// `LICENSE:1`, a file with no language that the one text universe still
+/// reads.
 fn licensed_corpus() -> (FixtureRepo, String, TextUniverse) {
     let repo = FixtureRepo::new();
-    repo.write("src/a.rs", "pub fn run() {}\n");
+    repo.write("src/a.rs", "pub fn run() {}\nfn go() { run(); }\n");
     repo.write("LICENSE", "you may run it\n");
     let sha = repo.commit_all("init");
     let universe = universe_of(&repo);
@@ -1208,11 +1246,20 @@ fn refs_sites_are_judged_against_every_tracked_text_file() {
         "skim-R1",
         "run",
         ("src/a.rs", 1),
-        &[("src/a.rs", 1, "def"), ("LICENSE", 1, "text")],
+        &[
+            ("src/a.rs", 1, "def"),
+            ("src/a.rs", 2, "call"),
+            ("LICENSE", 1, "text"),
+        ],
     );
     assert!(check_against(&u, &sha, &with_license).is_empty());
 
-    let without = refs("skim-R2", "run", ("src/a.rs", 1), &[("src/a.rs", 1, "def")]);
+    let without = refs(
+        "skim-R2",
+        "run",
+        ("src/a.rs", 1),
+        &[("src/a.rs", 1, "def"), ("src/a.rs", 2, "call")],
+    );
     let v = check_against(&u, &sha, &without);
     assert!(
         message_of(&v, "skim-R2").contains("LICENSE:1"),
@@ -1340,6 +1387,54 @@ fn contradicting_or_unreadable_stakes_queries_are_violations() {
         let v = check_against(&u, &sha, &stakes("skim-S1", query, flags, "lines", None));
         assert!(flagged(&v, "skim-S1"), "{query} {flags}: {v:?}");
     }
+}
+
+/// A `[[stakes]]` recall entry (`lines`, `files` or `counts`) whose query the
+/// oracle finds on no line has an empty truth, so any output would pass its
+/// checks. Each expectation is one rule.
+fn stakes_recall_violation(expect: &str, flags: &str, query: &str) -> Vec<IntegrityViolation> {
+    let (_repo, sha, u) = word_corpus();
+    check_against(&u, &sha, &stakes("skim-S1", query, flags, expect, None))
+}
+
+#[test]
+fn a_stakes_lines_entry_with_no_matching_line_is_a_violation() {
+    assert!(stakes_recall_violation("lines", "[]", "run").is_empty());
+    let v = stakes_recall_violation("lines", "[]", "qzvx_absent");
+    assert!(
+        message_of(&v, "skim-S1").contains("finds no matching line"),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn a_stakes_files_entry_with_no_matching_file_is_a_violation() {
+    assert!(stakes_recall_violation("files", "[\"-l\"]", "run").is_empty());
+    let v = stakes_recall_violation("files", "[\"-l\"]", "qzvx_absent");
+    assert!(
+        message_of(&v, "skim-S1").contains("finds no matching line"),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn a_stakes_counts_entry_with_no_matching_line_is_a_violation() {
+    assert!(stakes_recall_violation("counts", "[\"-c\"]", "run").is_empty());
+    let v = stakes_recall_violation("counts", "[\"-c\"]", "qzvx_absent");
+    assert!(
+        message_of(&v, "skim-S1").contains("finds no matching line"),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn a_stakes_recall_entry_whose_file_filter_keeps_no_match_is_a_violation() {
+    // `run` is in .rs files only: under `-t py` the oracle finds no line.
+    let v = stakes_recall_violation("lines", "[\"-t\", \"py\"]", "run");
+    assert!(
+        message_of(&v, "skim-S1").contains("finds no matching line"),
+        "{v:?}"
+    );
 }
 
 // --- loading and hashing --------------------------------------------------------

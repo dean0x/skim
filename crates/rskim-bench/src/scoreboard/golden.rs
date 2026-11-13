@@ -656,8 +656,10 @@ pub fn pagination_bound(limits: &[u32]) -> Option<u64> {
         .map(|&min| u64::from(min) * u64::from(MAX_PAGES - 1))
 }
 
-/// Whether a full count fits [`pagination_bound`]. The runner re-checks this
-/// against skim's actual full list before sweeping.
+/// Whether a full count fits [`pagination_bound`]. Golden integrity checks it
+/// against the oracle's ground truth only. The runner does not check skim's
+/// own full list: a sweep that does not end within [`MAX_PAGES`] pages fails
+/// the `pagination.has_more_honest` check.
 pub fn within_pagination_bound(count: u64, limits: &[u32]) -> bool {
     pagination_bound(limits).is_some_and(|bound| count <= bound)
 }
@@ -735,9 +737,10 @@ impl Violations {
 /// the oracle accepts the query; pagination and prefix `limits` are non-empty
 /// and positive; a concept's `first` list is non-empty with distinct,
 /// non-blank paths; a `[[refs]]` or `[[clash]]` query is a bare identifier; a
-/// `[[refs]]` entry has distinct sites that include its `def`; a `[[clash]]`
-/// has 2 or more distinct defs, distinct calls, every call `def` index in
-/// range and `split = "none"`; a `[[stakes]]` entry uses only flags of
+/// `[[refs]]` entry has distinct sites that include its `def` and at least
+/// one call site; a `[[clash]]` has 2 or more distinct defs, one or more
+/// distinct calls, every call `def` index in range and `split = "none"`; a
+/// `[[stakes]]` entry uses only flags of
 /// [`STAKES_FLAGS`] and none the runner sets itself, reads as a regex-oracle
 /// query (or, for `exit = 2`, as a query the search rejects), pairs `-l` with
 /// `expect = "files"` and `-c` with `expect = "counts"`, and has `exit`
@@ -751,7 +754,8 @@ impl Violations {
 /// is empty; every `[[refs]]` site set equals the whole-word line set of its
 /// query, and its `def` line is one of them; every `[[clash]]` def and call
 /// line holds the query as a whole word; every `[[stakes]]` `exit = 1` has no
-/// matching line and every `exit = 0` has one.
+/// matching line, and every `exit = 0` and every `lines`, `files` or `counts`
+/// entry has at least one (an empty oracle answer would pass any output).
 pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<IntegrityViolation> {
     let mut v = Violations(Vec::new());
 
@@ -941,6 +945,10 @@ fn check_refs(e: &RefsEntry, universe: Option<&TextUniverse>) -> anyhow::Result<
         e.def.path,
         e.def.line
     );
+    anyhow::ensure!(
+        e.sites.iter().any(|s| s.role == SiteRole::Call),
+        "entry has no call site (role = \"call\"); the call check would pass on nothing"
+    );
     let Some(universe) = universe else {
         return Ok(());
     };
@@ -974,6 +982,10 @@ fn check_clash(e: &ClashEntry, universe: Option<&TextUniverse>) -> anyhow::Resul
         e.defs.len() >= 2,
         "a clash needs 2 or more defs, found {}",
         e.defs.len()
+    );
+    anyhow::ensure!(
+        !e.calls.is_empty(),
+        "entry has no calls; the call check would pass on nothing"
     );
     anyhow::ensure!(
         e.split == ClashSplit::None,
@@ -1029,8 +1041,9 @@ fn check_clash(e: &ClashEntry, universe: Option<&TextUniverse>) -> anyhow::Resul
 /// (no match) and 2 (a rejected query); any other value is refused, with or
 /// without a universe. `-l` lists files and `-c` counts lines, so each pairs
 /// with its own expectation. Against the universe, `exit = 1` needs no
-/// matching line and `exit = 0` needs one, over the files the `-g` and `-t`
-/// filters keep.
+/// matching line; `exit = 0` and every `lines`, `files` or `counts` entry need
+/// one, because an empty oracle answer passes any output. The lines are those
+/// of the files the `-g` and `-t` filters keep.
 fn check_stakes(e: &StakesEntry, universe: Option<&TextUniverse>) -> anyhow::Result<()> {
     non_blank(&e.query)?;
     let run = e.run()?;
@@ -1062,24 +1075,25 @@ fn check_stakes(e: &StakesEntry, universe: Option<&TextUniverse>) -> anyhow::Res
         }
         (StakesRun::Search { query, filter }, _) => (query, filter),
     };
-    let (Some(universe), Some(expects_match)) = (universe, expected_exit.map(|c| c == 0)) else {
+    let Some(universe) = universe else {
         return Ok(());
     };
     let hits = line_truth(
         universe.files().filter(|(path, _)| filter.keeps(path)),
         &query,
     );
-    if expects_match {
-        anyhow::ensure!(
-            !hits.is_empty(),
-            "exit = 0 (a match) but the oracle finds no matching line"
-        );
-    } else {
+    if expected_exit == Some(1) {
         anyhow::ensure!(
             hits.is_empty(),
             "exit = 1 (no match) but the oracle finds {} matching line(s), e.g. {}",
             hits.len(),
             show_sites(hits.iter())
+        );
+    } else {
+        anyhow::ensure!(
+            !hits.is_empty(),
+            "the entry needs a match (exit = 0, or a lines, files or counts answer) \
+             but the oracle finds no matching line, so its checks would pass on nothing"
         );
     }
     Ok(())

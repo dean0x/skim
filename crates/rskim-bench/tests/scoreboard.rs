@@ -1748,8 +1748,9 @@ fn integrity_failure_of(extra: &str) -> String {
 
 #[test]
 fn a_refs_entry_whose_sites_differ_from_the_whole_word_lines_exits_2_at_integrity() {
-    // One whole-word line is not listed.
-    let err = integrity_failure_of(&refs_entry(&[("src/staleness.rs", 2, "def")]));
+    // One whole-word line is not listed. The definition line carries the role
+    // `call`, so the entry has a call site and lacks only `src/other.rs:2`.
+    let err = integrity_failure_of(&refs_entry(&[("src/staleness.rs", 2, "call")]));
     assert!(
         err.contains("fixture-R01") && err.contains("missing") && err.contains("src/other.rs:2"),
         "{err}"

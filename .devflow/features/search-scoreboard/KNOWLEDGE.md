@@ -131,7 +131,9 @@ from `-i`, `-S`, `-w`, `-F`, `-E`, `-g`, `-t`, `-l`, `-c` and `-C`). The set of 
   the one-line JSON envelope. An `error` key, a missing key, a wrong type or an unknown role is a harness error
   (exit 2), never a regression.
 - **Integrity** (`golden.rs` `check_refs`, `check_clash`, `check_stakes`): `sites` equal the whole-word line set at the
-  pin; a clash has 2+ `defs` and `split = "none"`; a stakes exit agrees with the oracle's hit count.
+  pin and include a `call` site; a clash has 2+ `defs`, 1+ calls and `split = "none"`; a stakes exit agrees with the
+  oracle's hit count, and a stakes `lines`, `files` or `counts` entry has at least one matching line (an empty answer
+  passes any output).
 - **Stakes calls** (`runner.rs` `observe_stakes`): the entry's own flags go to skim. `-l` and `-c` cannot combine with
   `--json`, so those calls read text output (a path per line, or `path:count`). An entry that expects an exit code
   reads the exit status of a text call. A stakes `-g` is a subset of the `rg` glob rules in `oracle.rs` (`* ? ** !`,
