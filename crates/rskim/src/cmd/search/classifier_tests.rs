@@ -843,3 +843,64 @@ fn test_markdown_tree_takes_the_markdown_classifier() {
         "an H4 heading must not be TypeDefinition; got: {ranges:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// build_field_ranges: the sweep over nested node ranges
+// -----------------------------------------------------------------------
+
+#[test]
+fn the_innermost_node_wins_each_byte_and_gaps_are_other() {
+    use SearchField::{Comment, FunctionBody, StringLiteral};
+    // Pre-order: an outer body over 2..20, a string in it over 5..8, a comment
+    // in the string's place with the same range (the later node is deeper), and
+    // a second string after a gap.
+    let ranges = vec![
+        (2..20, FunctionBody),
+        (5..8, StringLiteral),
+        (5..8, Comment),
+        (12..15, StringLiteral),
+    ];
+
+    let built = build_field_ranges(ranges, 24);
+
+    assert_eq!(
+        built,
+        vec![
+            (0..2, SearchField::Other),
+            (2..5, FunctionBody),
+            (5..8, Comment),
+            (8..12, FunctionBody),
+            (12..15, StringLiteral),
+            (15..20, FunctionBody),
+            (20..24, SearchField::Other),
+        ]
+    );
+}
+
+#[test]
+fn sibling_nodes_with_the_same_field_merge_and_a_child_past_its_parent_is_cut() {
+    use SearchField::{Comment, FunctionBody};
+    let built = build_field_ranges(
+        vec![(0..4, FunctionBody), (4..8, FunctionBody), (6..12, Comment)],
+        10,
+    );
+    // The comment child starts inside the second body and ends after it: it is
+    // cut at the parent's end.
+    assert_eq!(
+        built,
+        vec![
+            (0..6, FunctionBody),
+            (6..8, Comment),
+            (8..10, SearchField::Other)
+        ]
+    );
+    assert_contiguous(&built, 10);
+}
+
+#[test]
+fn no_ranges_give_one_other_range() {
+    assert_eq!(
+        build_field_ranges(Vec::new(), 7),
+        vec![(0..7, SearchField::Other)]
+    );
+}

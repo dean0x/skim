@@ -84,7 +84,7 @@ use super::types::ReadFile;
 // ============================================================================
 
 /// Maximum file size accepted for indexing (5 MiB).
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+pub(super) const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 // Compile-time guard: MAX_FILE_BYTES must fit in a usize so the pre-allocation
 // in open_and_read (`size as usize`) is sound on every supported platform.
@@ -1152,7 +1152,7 @@ fn mtime_secs(entry: &ignore::DirEntry) -> Option<u64> {
 /// builder is subsequently **unioned** with git-tracked files in
 /// [`walk_metadata`] (see [`merge_tracked_union`]). The builder alone is not
 /// the authoritative source of indexable files on git roots.
-fn configure_builder(builder: &mut WalkBuilder) {
+pub(super) fn configure_builder(builder: &mut WalkBuilder) {
     builder
         .hidden(true)
         .git_ignore(true)

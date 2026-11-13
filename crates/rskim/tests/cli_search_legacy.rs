@@ -148,13 +148,13 @@ fn removed_flag_refusal_does_not_echo_attached_value() {
 }
 
 /// A removed flag name after `--` is query text, not a flag: the command runs as
-/// an ordinary query and exits 0.
+/// an ordinary query. It exits 0 when a line holds the text.
 #[test]
 fn removed_flag_name_after_double_dash_is_a_query() {
     let proj = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     fs::create_dir_all(proj.path().join("src")).unwrap();
-    fs::write(proj.path().join("src/a.rs"), "pub fn needle() {}\n").unwrap();
+    fs::write(proj.path().join("src/a.rs"), "// the --ast flag\n").unwrap();
 
     Command::cargo_bin("skim")
         .unwrap()
@@ -164,5 +164,7 @@ fn removed_flag_name_after_double_dash_is_a_query() {
         .env("SKIM_CACHE_DIR", cache.path())
         .env("SKIM_DISABLE_ANALYTICS", "1")
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("src/a.rs:1:"))
+        .stderr(predicate::str::contains("was removed").not());
 }

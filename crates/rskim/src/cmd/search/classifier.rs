@@ -429,16 +429,16 @@ pub(super) fn classify_tree(
 
 /// Build the final contiguous range list from pre-order node ranges.
 ///
-/// Implements "innermost wins": processes ranges in reverse (children first)
-/// so deeper nodes claim bytes before their parents. Uncovered bytes become
-/// [`SearchField::Other`]. Adjacent same-field ranges are merged.
+/// Implements "innermost wins": a byte takes the field of the innermost node
+/// that covers it, and a byte no node covers is [`SearchField::Other`]. One
+/// sweep over the ranges with a stack of the open nodes does it in time linear
+/// in the number of ranges. Adjacent same-field ranges are merged.
 ///
 /// # Preconditions
 ///
-/// - `node_ranges` must be in **pre-order** (parents before children). The
-///   reverse-iteration loop relies on children appearing after their parents.
-/// - Ranges may overlap; the algorithm resolves overlaps via interval subtraction
-///   so the deepest (innermost) node wins each byte.
+/// - `node_ranges` must be in **pre-order** (parents before children) and
+///   properly nested, as the nodes of a syntax tree are. A range that ends
+///   after its parent is cut at the parent's end.
 /// - `source_len` must equal the byte length of the source that was parsed.
 ///
 /// # Output guarantees
@@ -458,42 +458,48 @@ pub(super) fn build_field_ranges(
         return vec![(0..source_len, SearchField::Other)];
     }
 
-    // Track which byte intervals are still unclaimed. Starts as the full source.
-    // Double-buffer to reuse allocations across iterations.
-    let mut uncovered: Vec<Range<usize>> = vec![];
-    uncovered.push(0..source_len);
-    let mut next_uncovered: Vec<Range<usize>> = Vec::new();
     let mut result: Vec<(Range<usize>, SearchField)> = Vec::with_capacity(node_ranges.len() * 2);
-
-    // Reverse: children (later in pre-order) claim bytes before parents.
-    for (range, field) in node_ranges.into_iter().rev() {
-        next_uncovered.clear();
-
-        for unc in &uncovered {
-            if unc.end <= range.start || unc.start >= range.end {
-                // No overlap — interval stays uncovered.
-                next_uncovered.push(unc.clone());
-            } else {
-                // Overlap — split around the claimed region.
-                if unc.start < range.start {
-                    next_uncovered.push(unc.start..range.start);
-                }
-                result.push((unc.start.max(range.start)..unc.end.min(range.end), field));
-                if unc.end > range.end {
-                    next_uncovered.push(range.end..unc.end);
-                }
-            }
+    // The open nodes, innermost last: (end of the node, its field).
+    let mut open: Vec<(usize, SearchField)> = Vec::new();
+    // Every byte before `cursor` is already in `result`.
+    let mut cursor = 0usize;
+    let emit = |result: &mut Vec<(Range<usize>, SearchField)>,
+                cursor: &mut usize,
+                to: usize,
+                field: SearchField| {
+        if *cursor < to {
+            result.push((*cursor..to, field));
+            *cursor = to;
         }
+    };
 
-        std::mem::swap(&mut uncovered, &mut next_uncovered);
+    for (range, field) in node_ranges {
+        // A node that ends before this one starts is closed: its bytes up to
+        // its end are its own.
+        while let Some(&(end, open_field)) = open.last() {
+            if end > range.start {
+                break;
+            }
+            emit(&mut result, &mut cursor, end, open_field);
+            open.pop();
+        }
+        // The bytes between the cursor and this node belong to the node that
+        // is open around it, or to no node.
+        let parent = open.last().copied();
+        emit(
+            &mut result,
+            &mut cursor,
+            range.start,
+            parent.map_or(SearchField::Other, |(_, f)| f),
+        );
+        let end = parent.map_or(range.end, |(parent_end, _)| range.end.min(parent_end));
+        open.push((end, field));
     }
-
-    // Remaining uncovered bytes → Other.
-    for gap in uncovered {
-        result.push((gap, SearchField::Other));
+    while let Some((end, open_field)) = open.pop() {
+        emit(&mut result, &mut cursor, end, open_field);
     }
+    emit(&mut result, &mut cursor, source_len, SearchField::Other);
 
-    result.sort_unstable_by_key(|(r, _)| r.start);
     merge_adjacent(&mut result);
     result
 }

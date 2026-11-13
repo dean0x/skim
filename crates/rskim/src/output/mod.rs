@@ -577,6 +577,24 @@ pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<S
     ))
 }
 
+/// [`elision_marker`] with a caller-supplied remedy clause, for a bound whose
+/// total is known and whose remedy is not `SKIM_PASSTHROUGH=1`.
+///
+/// Returns `None` when nothing was omitted (`shown >= total`). The marker
+/// states the kept and the total count exactly:
+/// `[skim] lines elided beyond 10000 of 48213 — use -c or -l for every file`.
+/// `remedy` is an imperative clause without leading punctuation, as for
+/// [`elision_marker_unbounded_with_remedy`].
+pub(crate) fn elision_marker_with_remedy(
+    shown: usize,
+    total: usize,
+    unit: &str,
+    remedy: &str,
+) -> Option<String> {
+    (shown < total)
+        .then(|| elision_marker_unbounded_with_remedy(&format!("{shown} of {total}"), unit, remedy))
+}
+
 /// [`elision_marker_unbounded`] with a caller-supplied remedy clause.
 ///
 /// The standard remedy — `SKIM_PASSTHROUGH=1 for full output` — is only useful
@@ -1890,6 +1908,29 @@ mod tests {
             marker.contains("SKIM_PASSTHROUGH=1"),
             "must surface the escape hatch: {marker}"
         );
+    }
+
+    #[test]
+    fn test_elision_marker_with_remedy_none_when_nothing_omitted() {
+        assert_eq!(elision_marker_with_remedy(5, 5, "lines", "narrow it"), None);
+        assert_eq!(elision_marker_with_remedy(6, 5, "lines", "narrow it"), None);
+    }
+
+    #[test]
+    fn test_elision_marker_with_remedy_states_counts_and_its_own_remedy() {
+        let marker = elision_marker_with_remedy(
+            10_000,
+            48_213,
+            "lines",
+            "use -c or -l for every file, or narrow the pattern",
+        )
+        .unwrap();
+        assert_eq!(
+            marker,
+            "[skim] lines elided beyond 10000 of 48213 — use -c or -l for every file, \
+             or narrow the pattern"
+        );
+        assert!(!marker.contains(ELISION_HINT), "{marker}");
     }
 
     #[test]

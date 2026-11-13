@@ -66,19 +66,82 @@ pub(super) enum HeadState {
 /// 256 ancestors is far beyond any real filesystem depth.
 pub(super) const MAX_ANCESTORS: usize = 256;
 
+/// Most entries of `GIT_CEILING_DIRECTORIES` that the root walk reads.
+pub(super) const MAX_CEILING_ENTRIES: usize = 64;
+
+/// The folders where the ancestor walk for a repository root must stop.
+///
+/// The walk never steps into a ceiling folder, never reaches the home folder
+/// from below, and never reaches the filesystem root from below. A start folder
+/// is never excluded: it can be a ceiling, the home folder or `/` itself.
+#[derive(Debug, Default, Clone)]
+pub(super) struct RootRules {
+    pub(super) ceilings: Vec<PathBuf>,
+    pub(super) home: Option<PathBuf>,
+}
+
+impl RootRules {
+    /// The rules of this process: `GIT_CEILING_DIRECTORIES` and the home
+    /// folder.
+    pub(super) fn from_env() -> Self {
+        let ceilings = std::env::var_os("GIT_CEILING_DIRECTORIES")
+            .map(|value| parse_ceilings(&value))
+            .unwrap_or_default();
+        let home = dirs::home_dir().and_then(|home| home.canonicalize().ok());
+        RootRules { ceilings, home }
+    }
+
+    /// Whether the walk ends before `candidate`, an ancestor of the start.
+    fn stops_at(&self, candidate: &Path) -> bool {
+        candidate.parent().is_none()
+            || self.home.as_deref() == Some(candidate)
+            || self.ceilings.iter().any(|c| c == candidate)
+    }
+}
+
+/// The usable entries of a `GIT_CEILING_DIRECTORIES` value: absolute paths,
+/// at most [`MAX_CEILING_ENTRIES`]. An entry is kept as written, and its
+/// canonical form is added when that differs, because the walk compares
+/// canonical paths.
+fn parse_ceilings(value: &std::ffi::OsStr) -> Vec<PathBuf> {
+    let mut ceilings = Vec::new();
+    for entry in std::env::split_paths(value)
+        .filter(|p| p.is_absolute())
+        .take(MAX_CEILING_ENTRIES)
+    {
+        if let Ok(canonical) = entry.canonicalize()
+            && canonical != entry
+        {
+            ceilings.push(canonical);
+        }
+        ceilings.push(entry);
+    }
+    ceilings.truncate(MAX_CEILING_ENTRIES);
+    ceilings
+}
+
 /// Walk up from `canonical` (a pre-canonicalized path) looking for the nearest
-/// ancestor that contains a `.git` entry.
+/// ancestor that contains a `.git` entry, under the process's [`RootRules`].
 ///
 /// Returns the first matching ancestor as a `PathBuf`, or `canonical` itself
-/// when no enclosing `.git` is found within the [`MAX_ANCESTORS`] bound.
+/// when no enclosing `.git` is found within the [`MAX_ANCESTORS`] bound, or when
+/// a ceiling, the home folder or `/` ends the walk first.
 ///
 /// The caller is responsible for canonicalizing `canonical` first — this variant
 /// skips the `canonicalize()` call to avoid a redundant O(path depth) syscall
 /// chain when the caller already holds a canonical path (e.g. `resolve_repo_toplevel`
 /// and `walk::discover_project_root`).
 pub(super) fn discover_project_root_from_canonical(canonical: &Path) -> PathBuf {
+    discover_project_root_with(canonical, &RootRules::from_env())
+}
+
+/// [`discover_project_root_from_canonical`] under explicit `rules`.
+pub(super) fn discover_project_root_with(canonical: &Path, rules: &RootRules) -> PathBuf {
     let mut current = canonical;
     for _ in 0..MAX_ANCESTORS {
+        if current != canonical && rules.stops_at(current) {
+            break;
+        }
         if current.join(".git").exists() {
             return current.to_path_buf();
         }
@@ -469,3 +532,7 @@ pub(super) fn resolve_common_dir(git_dir: &Path) -> Option<PathBuf> {
     }
     Some(canonical)
 }
+
+#[cfg(test)]
+#[path = "gitdir_tests.rs"]
+mod tests;

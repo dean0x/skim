@@ -32,6 +32,7 @@ impl Page {
     /// Construct from a `limit` and an optional `offset`.
     ///
     /// `None` offset is treated as 0 (the default when the flag is absent).
+    #[cfg(test)]
     pub(super) fn new(limit: usize, offset: Option<usize>) -> Self {
         Self {
             limit,
@@ -59,6 +60,7 @@ impl Page {
     /// The maximum number of results to return.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub(super) fn limit(self) -> usize {
         self.limit
     }
@@ -66,6 +68,7 @@ impl Page {
     /// The number of verified results to skip before collecting.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub(super) fn offset(self) -> usize {
         self.offset
     }
@@ -89,6 +92,7 @@ impl QueryConfig {
     /// accessor ensures callers consistently derive the same `limit` and `offset`
     /// values that drive the pool calculation.
     #[must_use]
+    #[cfg(test)]
     pub(super) fn page(&self) -> Page {
         Page::new(self.limit, self.offset)
     }
@@ -190,6 +194,7 @@ pub(super) struct ResolvedResult {
 
 /// Output produced by a query execution run.
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 pub(super) struct QueryOutput {
     /// The original query text.
     pub query: String,

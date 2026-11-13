@@ -12,18 +12,31 @@
 //! 7. Truncate to `--limit` LAST — after verification drops non-matching candidates
 //!    (AD-355-2).
 //! 8. Return `QueryOutput`.
+//!
+//! # Status
+//!
+//! `skim search PATTERN` no longer runs this pipeline. Only
+//! `ast_coverage_notice`, `emit_ast_coverage_notice` and `open_lexical_reader`
+//! serve the index commands (`--build`, `--update`, `--stats`). The rest is
+//! built for tests only and goes with the index.
 
 use std::path::Path;
+#[cfg(test)]
 use std::time::Instant;
 
+use rskim_search::NgramIndexReader;
+#[cfg(test)]
 use rskim_search::{
-    NgramIndexReader, QueryEngine, SearchLayer, SearchQuery, SearchResult, count_query_word_tokens,
-    is_single_token,
+    QueryEngine, SearchLayer, SearchQuery, SearchResult, count_query_word_tokens, is_single_token,
 };
 
+#[cfg(test)]
 use super::manifest::FileManifest;
+#[cfg(test)]
 use super::snippet::{SnippetOutcome, VerifyMode, extract_snippet_and_verify};
+#[cfg(test)]
 use super::staleness::auto_refresh_if_stale;
+#[cfg(test)]
 use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
 // ============================================================================
@@ -40,17 +53,20 @@ use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
 /// Shared floor for `candidate_pool`: every widened pool has at least this many
 /// slots so small `--limit` values do not starve the verify step.
+#[cfg(test)]
 const CANDIDATE_POOL_FLOOR: usize = 100;
 
 /// Pool multiplier K for the multi-word lexical candidate pool.
 ///
 /// Value = 5; unmeasured heuristic, tracked under #361 per SEARCH-ADR-003.
+#[cfg(test)]
 pub(super) const LEXICAL_CANDIDATE_POOL_K: usize = 5;
 
 /// Compute the pre-verify candidate pool size for a given path K multiplier.
 ///
 /// Returns `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
 #[inline]
+#[cfg(test)]
 pub(super) fn candidate_pool(limit: usize, k: usize) -> usize {
     limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)
 }
@@ -162,6 +178,7 @@ pub(super) fn emit_ast_coverage_notice(coverage: &rskim_search::AstCoverage) {
 /// | false  | Some(n) | Near(n)         | unordered total span ≤ n             |
 /// | true   | None    | Phrase          | ordered, consecutive positions        |
 /// | true   | Some(n) | PhraseNear(n)   | ordered, total span ≤ n (AD-403-2)   |
+#[cfg(test)]
 pub(super) fn verify_mode_for(phrase: bool, near: Option<u32>) -> VerifyMode {
     match (phrase, near) {
         (false, None) => VerifyMode::Substring,
@@ -186,6 +203,7 @@ pub(super) fn verify_mode_for(phrase: bool, near: Option<u32>) -> VerifyMode {
 /// Names only the flags actually supplied.  Notice is plain text on stderr on
 /// every path including `--json` — stdout stays byte-identical; exit 0.
 #[must_use]
+#[cfg(test)]
 pub(super) fn positional_inert_notice(
     phrase: bool,
     near: Option<u32>,
@@ -221,6 +239,7 @@ pub(super) fn positional_inert_notice(
 ///
 /// Not a hard error — exit code stays 0.  `text` is the trimmed query string.
 #[must_use]
+#[cfg(test)]
 pub(super) fn near_diagnostic_notice(near: Option<u32>, text: &str) -> Option<String> {
     let n = near?;
     // Use the authoritative tokenizer (count_query_word_tokens / collect_word_spans /
@@ -257,12 +276,11 @@ pub(super) fn near_diagnostic_notice(near: Option<u32>, text: &str) -> Option<St
 /// Built with `anyhow::anyhow!` (NO `.context`), so the io source is not printed
 /// twice when the caller formats with `{e:#}`.
 ///
-/// Used at BOTH bare-`?` sites that open the lexical index: the query path
-/// (`execute_query_with_manifest`) and `gather_stats` (mod.rs), which serves both
-/// `--stats` and `--stats --json` from one snapshot.  The `--stats` site runs
-/// AFTER the `auto_refresh_if_stale` self-heal, so an error here means the index
-/// could not be opened even after a rebuild attempt — exactly the state a stuck
-/// user is in, and the one AC-13/AC-14 require to name the artifact and the
+/// Used by `gather_stats` (mod.rs), which serves both `--stats` and
+/// `--stats --json` from one snapshot.  It runs AFTER the
+/// `auto_refresh_if_stale` self-heal, so an error here means the index could
+/// not be opened even after a rebuild attempt — exactly the state a stuck user
+/// is in, and the one AC-13/AC-14 require to name the artifact and the
 /// `--rebuild` remedy.
 ///
 /// # Errors
@@ -290,6 +308,7 @@ pub(super) fn open_lexical_reader(cache_dir: &Path) -> anyhow::Result<NgramIndex
 /// # Errors
 ///
 /// Returns `Err` on I/O failures or if the index is corrupt.
+#[cfg(test)]
 pub(super) fn execute_query(
     config: &QueryConfig,
     analytics: &crate::analytics::AnalyticsConfig,
@@ -458,6 +477,7 @@ pub(super) fn execute_query(
 }
 
 /// Decode a `SnippetOutcome` into the 4-tuple used by `ResolvedResult`.
+#[cfg(test)]
 fn decode_snippet(
     outcome: SnippetOutcome,
 ) -> (
@@ -481,6 +501,7 @@ fn decode_snippet(
 ///
 /// Groups the query string, pagination, and verify-mode fields
 /// so the function signature stays within the seven-argument Clippy limit.
+#[cfg(test)]
 struct SnippetVerifyParams<'a> {
     /// The literal query text used for AND-token verification (AD-355-3).
     query: &'a str,
@@ -539,6 +560,7 @@ struct SnippetVerifyParams<'a> {
 ///
 /// The fan-out is therefore O(K × limit) file reads — bounded for any fixed K and
 /// user-supplied `--limit`.  Calibrating K for large corpora is tracked in #361.
+#[cfg(test)]
 fn resolve_paths_and_snippets_verified(
     raw_results: &[SearchResult],
     sorted_paths: &[&str],
@@ -626,6 +648,7 @@ fn resolve_paths_and_snippets_verified(
 ///   42│ pub fn authenticate(req: &Request) -> Result<Claims> {
 ///   43│     let header = req.header("Authorization")
 /// ```
+#[cfg(test)]
 pub(super) fn format_text_output(
     output: &QueryOutput,
     w: &mut impl std::io::Write,
@@ -668,6 +691,7 @@ pub(super) fn format_text_output(
 }
 
 /// Format query results as a JSON object to `w`.
+#[cfg(test)]
 pub(super) fn format_json_output(
     output: &QueryOutput,
     w: &mut impl std::io::Write,
@@ -685,6 +709,7 @@ pub(super) fn format_json_output(
 ///
 /// `n` is the count of results in the current page, so agents see exactly how
 /// many they received before the "more results exist" hint.
+#[cfg(test)]
 pub(super) fn bounded_page_notice(n: usize, offset: usize, limit: usize) -> String {
     format!(
         "skim search: showing {n} result(s) (offset {offset}, limit {limit}); \

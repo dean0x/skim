@@ -1,40 +1,32 @@
-//! Role agreement test: what the parts of the search engine that exist say
-//! about a name, against the role oracle of the scoreboard.
+//! Tests of the role rules: the agreement with the role oracle of the
+//! scoreboard, and the rules one by one.
 //!
 //! The oracle (`rskim_oracle::roles`) restates, from the grammars alone, the
-//! lines where a name is defined, called and imported. This test reads every
-//! word of one fixture per oracle language and compares the oracle with the
-//! parts of the engine that decide a role today:
+//! lines where a name is defined, called and imported. The agreement test reads
+//! every word of one fixture per oracle language and compares the oracle with
+//! the role the engine gives each occurrence ([`Labels::role`]): the lines with
+//! a `def`, a `call` and an `import` role must be the oracle's lines.
 //!
-//! - `def` comes from the declaration rule (`rskim_core::declarations`): a
-//!   declaration whose name range holds the word.
-//! - `comment` and `string` come from the classifier (`classify_tree`).
-//! - A word the classifier puts in the function-body field is a code
-//!   identifier: a call or a reference. The call rule and the import rule need
-//!   the callee table and the import ancestors, and arrive with the role rules
-//!   themselves, so this test checks the part that exists: every call and
-//!   import site of the oracle holds a code occurrence, never a comment or a
-//!   string only.
-//!
-//! The expected-mismatch table lists each disagreement that is known today,
-//! with its reason. The test fails both for a mismatch that is not in the table
-//! and for a table row that no longer mismatches, so a row leaves the table in
-//! the commit that closes its gap. Ruby is not an oracle language: its calls
-//! have no row here.
+//! The two must agree line for line. Ruby is not an oracle language: its calls
+//! have a test of their own, as have the languages the oracle does not cover.
 //!
 //! Run with `--nocapture` to print the agreement per language.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
+use std::time::Duration;
 
-use rskim_core::{Language, Parser, declarations};
+use rskim_core::Language;
 use rskim_oracle::roles::{RoleSites, role_sites};
 use rskim_oracle::structural::OracleLang;
 
-use super::classifier::classify_tree;
-use super::field::SearchField;
+use super::{
+    Labelling, Labels, Role, Unlabelled, declaration_keywords, has_declaration_keyword, is_partial,
+};
+
+/// A parse time bound that no fixture reaches.
+const PARSE_TIME: Duration = Duration::from_secs(10);
 
 // ============================================================================
 // Fixtures
@@ -225,36 +217,29 @@ fn fixtures() -> Vec<Fixture> {
 }
 
 // ============================================================================
-// What the engine parts say about a name
+// What the engine says about a name
 // ============================================================================
 
-/// The 1-based lines where the engine parts see `name`, by the field they give.
+/// The 1-based lines where the engine gives `name` each role.
 #[derive(Debug, Default)]
 struct EngineSites {
-    /// A declaration names `name` here.
     defs: BTreeSet<u32>,
-    /// The classifier puts an occurrence in the function-body field: a call or
-    /// a reference.
-    code: BTreeSet<u32>,
-    /// An occurrence in any other code field (a definition tier, an import).
-    other_code: BTreeSet<u32>,
+    calls: BTreeSet<u32>,
+    imports: BTreeSet<u32>,
+    refs: BTreeSet<u32>,
     comments: BTreeSet<u32>,
     strings: BTreeSet<u32>,
 }
 
-/// The kind of one disagreement between the engine parts and the oracle.
+/// The kind of one disagreement between the engine and the oracle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Gap {
-    /// The oracle has a definition on this line; no declaration names it.
     DefMissed,
-    /// A declaration names the word on this line; the oracle has no definition.
     DefExtra,
-    /// The oracle has a call on this line; the classifier gives no
-    /// function-body occurrence there.
-    CallNotCode,
-    /// The oracle has a site (a definition, a call or an import) on this line;
-    /// the classifier gives only comment or string occurrences there.
-    SiteInTextOnly,
+    CallMissed,
+    CallExtra,
+    ImportMissed,
+    ImportExtra,
 }
 
 /// One disagreement: fixture label, word, kind, 1-based line.
@@ -284,47 +269,30 @@ fn line_of(source: &str, byte: usize) -> u32 {
     u32::try_from(newlines + 1).unwrap()
 }
 
-fn field_at(ranges: &[(Range<usize>, SearchField)], byte: usize) -> SearchField {
-    ranges
-        .iter()
-        .find(|(range, _)| range.contains(&byte))
-        .map(|(_, field)| *field)
-        .unwrap_or_else(|| panic!("no classifier range holds byte {byte}"))
+fn labels_of(fixture: &Fixture) -> Labels {
+    Labels::new(fixture.source, fixture.lang, fixture.ext, PARSE_TIME)
+        .unwrap_or_else(|e| panic!("{}: {e:?}", fixture.label))
 }
 
-/// Parse `fixture` once and read the engine parts for each word of `names`.
+/// Label `fixture` once and read the role of each occurrence of each word of
+/// `names`.
 fn engine_sites(fixture: &Fixture, names: &BTreeSet<&str>) -> BTreeMap<String, EngineSites> {
     let source = fixture.source;
-    let mut parser = Parser::new_for_extension(fixture.lang, fixture.ext)
-        .unwrap_or_else(|e| panic!("{}: {e}", fixture.label));
-    let tree = parser.parse(source).unwrap();
-    assert!(
-        !tree.root_node().has_error(),
-        "{} fixture has parse errors",
-        fixture.label
-    );
-    let scan = declarations(&tree, source, fixture.lang);
-    assert!(
-        !scan.truncated,
-        "{} declaration walk truncated",
-        fixture.label
-    );
-    let ranges = classify_tree(&tree, source, fixture.lang);
-
+    let labels = labels_of(fixture);
     names
         .iter()
         .map(|&name| {
             let mut sites = EngineSites::default();
-            for decl in scan.decls.iter().filter(|d| d.name == name) {
-                sites.defs.insert(line_of(source, decl.name_bytes.start));
-            }
             for start in occurrences(source, name) {
                 let line = line_of(source, start);
-                let lines = match field_at(&ranges, start) {
-                    SearchField::Comment => &mut sites.comments,
-                    SearchField::StringLiteral => &mut sites.strings,
-                    SearchField::FunctionBody => &mut sites.code,
-                    _ => &mut sites.other_code,
+                let lines = match labels.role(&(start..start + name.len())) {
+                    Role::Def => &mut sites.defs,
+                    Role::Call => &mut sites.calls,
+                    Role::Import => &mut sites.imports,
+                    Role::Comment => &mut sites.comments,
+                    Role::StringLit => &mut sites.strings,
+                    Role::Ref => &mut sites.refs,
+                    other => panic!("{} {name}: unexpected role {other:?}", fixture.label),
                 };
                 lines.insert(line);
             }
@@ -355,8 +323,8 @@ fn lines(sites: &[u32]) -> BTreeSet<u32> {
     sites.iter().copied().collect()
 }
 
-/// Compare the oracle with the engine parts for every word of one fixture.
-/// Returns the disagreements and the count of oracle sites compared.
+/// Compare the oracle with the engine for every word of one fixture. Returns
+/// the disagreements and the count of oracle sites compared.
 fn compare(fixture: &Fixture) -> (BTreeSet<Mismatch>, usize) {
     let names = words(fixture.source);
     let engine = engine_sites(fixture, &names);
@@ -372,95 +340,22 @@ fn compare(fixture: &Fixture) -> (BTreeSet<Mismatch>, usize) {
             imports,
         } = &oracle;
         let seen = &engine[*name];
-        let mut push = |gap, line| {
-            mismatches.insert((fixture.label, name.to_string(), gap, line));
-        };
-
-        let oracle_defs = lines(defs);
-        for &line in oracle_defs.difference(&seen.defs) {
-            push(Gap::DefMissed, line);
-        }
-        for &line in seen.defs.difference(&oracle_defs) {
-            push(Gap::DefExtra, line);
-        }
-        for line in lines(calls).difference(&seen.code) {
-            push(Gap::CallNotCode, *line);
-        }
-        let site_lines: BTreeSet<u32> = [defs, calls, imports]
-            .into_iter()
-            .flat_map(|sites| sites.iter().copied())
-            .collect();
-        for line in site_lines {
-            if !seen.code.contains(&line) && !seen.other_code.contains(&line) {
-                push(Gap::SiteInTextOnly, line);
+        let mut check = |missed, extra, oracle_lines: &[u32], engine_lines: &BTreeSet<u32>| {
+            let oracle_lines = lines(oracle_lines);
+            for &line in oracle_lines.difference(engine_lines) {
+                mismatches.insert((fixture.label, name.to_string(), missed, line));
             }
-        }
+            for &line in engine_lines.difference(&oracle_lines) {
+                mismatches.insert((fixture.label, name.to_string(), extra, line));
+            }
+        };
+        check(Gap::DefMissed, Gap::DefExtra, defs, &seen.defs);
+        check(Gap::CallMissed, Gap::CallExtra, calls, &seen.calls);
+        check(Gap::ImportMissed, Gap::ImportExtra, imports, &seen.imports);
         compared += defs.len() + calls.len() + imports.len();
     }
     (mismatches, compared)
 }
-
-// ============================================================================
-// Expected mismatches
-// ============================================================================
-
-/// A disagreement that is known today, and why.
-struct KnownGap {
-    label: &'static str,
-    name: &'static str,
-    gap: Gap,
-    line: u32,
-    reason: &'static str,
-}
-
-/// Every disagreement between the engine parts and the oracle that the test
-/// accepts. A row leaves this table in the commit that closes its gap.
-const KNOWN_GAPS: &[KnownGap] = &[
-    KnownGap {
-        label: "python",
-        name: "build",
-        gap: Gap::CallNotCode,
-        line: 13,
-        reason: PYTHON_CALL,
-    },
-    KnownGap {
-        label: "python",
-        name: "Widget",
-        gap: Gap::CallNotCode,
-        line: 15,
-        reason: PYTHON_CALL,
-    },
-    KnownGap {
-        label: "python",
-        name: "print",
-        gap: Gap::CallNotCode,
-        line: 16,
-        reason: PYTHON_CALL,
-    },
-    KnownGap {
-        label: "python",
-        name: "use",
-        gap: Gap::CallNotCode,
-        line: 17,
-        reason: PYTHON_CALL,
-    },
-    KnownGap {
-        label: "go",
-        name: "Min",
-        gap: Gap::DefMissed,
-        line: 10,
-        reason: "one `const_spec` names `Max` and `Min`; the declaration rule yields the \
-                 first name of a spec only",
-    },
-];
-
-/// The reason of every Python call row. Ruby has the same node, and no row
-/// because it is not an oracle language.
-const PYTHON_CALL: &str = "a bare Python call is a `call` node, which has import-level priority \
-                           in `node_kind_priority`; the classifier reads its `function` child \
-                           as a declaration name and gives the symbol-name field, not the \
-                           function-body field. The call rule of the role engine reads the \
-                           callee position and not this field";
 
 /// Words that the fixtures put in a comment or in a string, found by reading
 /// each fixture: (fixture label, word, comment lines, string lines).
@@ -477,49 +372,30 @@ const TEXT_ROWS: &[(&str, &str, &[u32], &[u32])] = &[
 ];
 
 // ============================================================================
-// Tests
+// Agreement with the oracle
 // ============================================================================
 
-fn known_mismatches() -> BTreeSet<Mismatch> {
-    KNOWN_GAPS
-        .iter()
-        .map(|g| (g.label, g.name.to_string(), g.gap, g.line))
-        .collect()
-}
-
 #[test]
-fn engine_parts_agree_with_the_role_oracle_except_for_the_known_gaps() {
-    let mut measured = BTreeSet::new();
+fn engine_roles_agree_with_the_role_oracle() {
+    let mut mismatches = BTreeSet::new();
     for fixture in fixtures() {
-        let (mismatches, compared) = compare(&fixture);
+        let (found, compared) = compare(&fixture);
         eprintln!(
             "role agreement {:<10} {compared:>3} oracle sites, {:>2} mismatches",
             fixture.label,
-            mismatches.len()
+            found.len()
         );
-        measured.extend(mismatches);
+        assert!(compared > 0, "{} compared no oracle site", fixture.label);
+        mismatches.extend(found);
     }
-
-    let expected = known_mismatches();
-    let unexpected: Vec<_> = measured.difference(&expected).collect();
-    let stale: Vec<_> = expected.difference(&measured).collect();
     assert!(
-        unexpected.is_empty() && stale.is_empty(),
-        "mismatches not in the known-gap table: {unexpected:#?}\n\
-         known-gap rows that no longer mismatch: {stale:#?}"
+        mismatches.is_empty(),
+        "the engine and the role oracle disagree: {mismatches:#?}"
     );
-    for gap in KNOWN_GAPS {
-        assert!(
-            !gap.reason.is_empty(),
-            "{} {} has no reason",
-            gap.label,
-            gap.name
-        );
-    }
 }
 
 #[test]
-fn comment_and_string_occurrences_get_the_text_fields_and_are_never_oracle_sites() {
+fn comment_and_string_occurrences_get_the_text_roles_and_are_never_oracle_sites() {
     let fixtures = fixtures();
     for &(label, name, comment_lines, string_lines) in TEXT_ROWS {
         let fixture = fixtures
@@ -539,7 +415,7 @@ fn comment_and_string_occurrences_get_the_text_fields_and_are_never_oracle_sites
         for line in comment_lines.iter().chain(string_lines) {
             let site = [&oracle.defs, &oracle.calls, &oracle.imports]
                 .iter()
-                .any(|sites| sites.contains(line) && !seen.code.contains(line));
+                .any(|sites| sites.contains(line) && !seen.refs.contains(line));
             assert!(
                 !site,
                 "{label} {name}: the oracle has a site on line {line}, which holds the word \
@@ -547,4 +423,357 @@ fn comment_and_string_occurrences_get_the_text_fields_and_are_never_oracle_sites
             );
         }
     }
+}
+
+// ============================================================================
+// The rules, one by one
+// ============================================================================
+
+/// The role of the first whole-word occurrence of `needle` at or after the
+/// first occurrence of `after` (or of the start).
+fn role_of(lang: Language, ext: &str, source: &str, after: &str, needle: &str) -> Role {
+    let labels = Labels::new(source, lang, ext, PARSE_TIME).unwrap();
+    let from = source.find(after).unwrap();
+    let start = occurrences(source, needle)
+        .into_iter()
+        .find(|&s| s >= from)
+        .unwrap_or_else(|| panic!("no {needle:?} after {after:?}"));
+    labels.role(&(start..start + needle.len()))
+}
+
+#[test]
+fn a_call_in_python_ruby_and_go_gets_the_call_role() {
+    let python = "def build():\n    pass\n\ndef main():\n    build()\n    obj.build()\n";
+    assert_eq!(
+        role_of(Language::Python, "py", python, "def main", "build"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::Python, "py", python, "obj.", "build"),
+        Role::Call
+    );
+
+    let ruby = "def build(x)\nend\n\ndef main\n  build(1)\n  obj.build\n  Widget.create(2)\nend\n";
+    assert_eq!(
+        role_of(Language::Ruby, "rb", ruby, "def main", "build"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::Ruby, "rb", ruby, "obj.", "build"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::Ruby, "rb", ruby, "Widget", "create"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::Ruby, "rb", ruby, "Widget", "Widget"),
+        Role::Ref,
+        "the receiver of a method call is not the callee"
+    );
+    assert_eq!(role_of(Language::Ruby, "rb", ruby, "", "build"), Role::Def);
+
+    let go = "package main\n\nfunc Serve() {}\n\nfunc main() {\n\tServe()\n\ts.Serve()\n\tgo Serve()\n}\n";
+    assert_eq!(
+        role_of(Language::Go, "go", go, "func main", "Serve"),
+        Role::Call
+    );
+    assert_eq!(role_of(Language::Go, "go", go, "s.", "Serve"), Role::Call);
+    assert_eq!(
+        role_of(Language::Go, "go", go, "go Serve", "Serve"),
+        Role::Call
+    );
+}
+
+#[test]
+fn a_tsx_file_with_jsx_labels_the_definition_and_the_call() {
+    let tsx = "import { Card } from \"./card\";\n\nfunction Page() {\n  return <Card title=\"x\" />;\n}\nconst top = Card();\n";
+    assert_eq!(
+        role_of(Language::TypeScript, "tsx", tsx, "", "Page"),
+        Role::Def
+    );
+    assert_eq!(
+        role_of(Language::TypeScript, "tsx", tsx, "const top", "Card"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::TypeScript, "tsx", tsx, "", "Card"),
+        Role::Import,
+        "the first occurrence is the import"
+    );
+    assert_eq!(
+        role_of(Language::TypeScript, "tsx", tsx, "return", "Card"),
+        Role::Ref,
+        "a JSX element is not a call"
+    );
+}
+
+#[test]
+fn the_callee_table_covers_the_languages_without_an_oracle() {
+    let cases: [(Language, &str, &str, &str, &str); 6] = [
+        (
+            Language::Java,
+            "java",
+            "class A { void run() { helper(1); obj.helper(2); new Helper(); } }\n",
+            "helper(1)",
+            "helper",
+        ),
+        (
+            Language::CSharp,
+            "cs",
+            "class A { void Run() { Helper(1); obj.Helper(2); } }\n",
+            "Helper(1)",
+            "Helper",
+        ),
+        (
+            Language::C,
+            "c",
+            "void run(void) { helper(1); }\n",
+            "helper(1)",
+            "helper",
+        ),
+        (
+            Language::Cpp,
+            "cpp",
+            "void run() { obj.helper(1); }\n",
+            "obj.helper",
+            "helper",
+        ),
+        (
+            Language::Kotlin,
+            "kt",
+            "fun run() { helper(1) }\n",
+            "helper(1)",
+            "helper",
+        ),
+        (
+            Language::Swift,
+            "swift",
+            "func run() { helper(1) }\n",
+            "helper(1)",
+            "helper",
+        ),
+    ];
+    for (lang, ext, source, after, needle) in cases {
+        assert_eq!(
+            role_of(lang, ext, source, after, needle),
+            Role::Call,
+            "{lang:?}: {source}"
+        );
+    }
+    let bash = "run() { helper 1; }\nhelper() { :; }\n";
+    assert_eq!(
+        role_of(Language::Bash, "sh", bash, "helper 1", "helper"),
+        Role::Call
+    );
+}
+
+#[test]
+fn a_receiver_a_path_segment_and_an_argument_are_references_not_calls() {
+    let rust = "fn run() { view::render(); panel.render(); apply(render); }\nfn render() {}\n";
+    assert_eq!(role_of(Language::Rust, "rs", rust, "", "view"), Role::Ref);
+    assert_eq!(
+        role_of(Language::Rust, "rs", rust, "view::", "render"),
+        Role::Call
+    );
+    assert_eq!(
+        role_of(Language::Rust, "rs", rust, "panel", "panel"),
+        Role::Ref
+    );
+    assert_eq!(
+        role_of(Language::Rust, "rs", rust, "apply(", "render"),
+        Role::Ref
+    );
+}
+
+#[test]
+fn an_import_needs_an_import_node_above_the_identifier() {
+    let ts =
+        "import { a } from \"./a\";\nexport { b } from \"./b\";\nexport { c };\nconst c = 1;\n";
+    assert_eq!(
+        role_of(Language::TypeScript, "ts", ts, "", "a"),
+        Role::Import
+    );
+    assert_eq!(
+        role_of(Language::TypeScript, "ts", ts, "", "b"),
+        Role::Import
+    );
+    assert_eq!(
+        role_of(Language::TypeScript, "ts", ts, "export { c }", "c"),
+        Role::Ref,
+        "an export with no source is not an import"
+    );
+    let rust = "use std::fmt::Display;\nfn f(d: Display) {}\n";
+    assert_eq!(
+        role_of(Language::Rust, "rs", rust, "", "Display"),
+        Role::Import
+    );
+    assert_eq!(
+        role_of(Language::Rust, "rs", rust, "fn f", "Display"),
+        Role::Ref
+    );
+}
+
+#[test]
+fn a_declared_name_is_a_def_only_when_the_match_is_the_whole_name() {
+    let rust = "fn launch_worker() {}\n";
+    let labels = Labels::new(rust, Language::Rust, "rs", PARSE_TIME).unwrap();
+    assert_eq!(labels.role(&(3..16)), Role::Def);
+    assert_eq!(
+        labels.role(&(3..9)),
+        Role::Ref,
+        "part of the name is not the name"
+    );
+    assert_eq!(labels.def_lines(&(3..16)), Some((1, 1)));
+    assert_eq!(labels.def_lines(&(3..9)), None);
+}
+
+#[test]
+fn markdown_and_data_formats_give_text_outside_comments_and_strings() {
+    let md = "# launch\n\nlaunch the worker <!-- launch -->\n";
+    let labels = Labels::new(md, Language::Markdown, "md", PARSE_TIME).unwrap();
+    assert_eq!(labels.role(&(2..8)), Role::Text);
+
+    let json = "{\"launch\": \"launch now\"}\n";
+    let labels = Labels::new(json, Language::Json, "json", PARSE_TIME).unwrap();
+    assert_eq!(labels.role(&(2..8)), Role::Text, "a key is text");
+    assert_eq!(labels.role(&(12..18)), Role::StringLit);
+
+    assert_eq!(Labels::text().role(&(0..3)), Role::Text);
+}
+
+#[test]
+fn markdown_prose_and_code_blocks_are_text_not_comments() {
+    let md =
+        "# launch\n\nlaunch the worker\n\n- launch item\n\n> launch quote\n\n```\nlaunch();\n```\n";
+    let labels = Labels::new(md, Language::Markdown, "md", PARSE_TIME).unwrap();
+    for (at, what) in [
+        (md.find("launch the").unwrap(), "a paragraph"),
+        (md.find("launch item").unwrap(), "a list item"),
+        (md.find("launch quote").unwrap(), "a block quote"),
+        (md.find("launch();").unwrap(), "a code block"),
+    ] {
+        assert_eq!(labels.role(&(at..at + 6)), Role::Text, "{what} is text");
+    }
+}
+#[test]
+fn a_parse_past_the_time_bound_gives_no_labels() {
+    let source: String = (0..20_000)
+        .map(|i| format!("fn f{i}() {{ let x = {i}; }}\n"))
+        .collect();
+    let result = Labels::new(&source, Language::Rust, "rs", Duration::ZERO);
+    assert!(matches!(result, Err(Unlabelled::ParseTimeout)));
+}
+
+// ============================================================================
+// Lines
+// ============================================================================
+
+fn classify(
+    labelling: &Labelling,
+    line: &str,
+    matches: impl IntoIterator<Item = std::ops::Range<usize>>,
+    identifier: bool,
+) -> super::LineHit {
+    labelling
+        .classify_line(line, 0, matches, identifier)
+        .unwrap()
+}
+
+#[test]
+fn a_line_takes_the_best_role_among_its_matches() {
+    let source = "// run\nfn run() { run(); }\n";
+    let labelling =
+        Labelling::Labelled(Labels::new(source, Language::Rust, "rs", PARSE_TIME).unwrap());
+    // The line `fn run() { run(); }` starts at byte 7: the def, then the call.
+    let line = "fn run() { run(); }";
+    let hit = labelling
+        .classify_line(line, 7, vec![15..18, 3..6], true)
+        .unwrap();
+    assert_eq!(hit.role, Role::Def);
+    assert_eq!(hit.column, 3);
+    assert_eq!(hit.def_lines, Some((2, 2)));
+}
+
+#[test]
+fn a_hit_inside_a_longer_identifier_is_partial_and_needs_no_parse() {
+    let line = "export function launchWorkerPool(";
+    let unlabelled = Labelling::Unlabelled(Unlabelled::Budget);
+    let hit = classify(&unlabelled, line, std::iter::once(16..28), true);
+    assert_eq!(hit.role, Role::Partial);
+    assert!(is_partial(line, &(16..28)));
+    // Not an identifier query: the file's state decides.
+    let hit = classify(&unlabelled, line, std::iter::once(16..28), false);
+    assert_eq!(hit.role, Role::Unlabelled);
+}
+
+#[test]
+fn a_line_with_a_whole_hit_and_a_partial_hit_is_not_partial() {
+    let line = "launchWorker(launchWorkerPool)";
+    let unlabelled = Labelling::Unlabelled(Unlabelled::Budget);
+    let hit = classify(&unlabelled, line, vec![0..12, 13..25], true);
+    assert_eq!(hit.role, Role::Unlabelled);
+    assert_eq!(hit.column, 0);
+}
+
+#[test]
+fn the_holder_is_the_enclosing_declaration_or_none_at_the_top_level() {
+    let source = "const TOP: u32 = helper();\nfn outer() {\n    helper();\n}\nfn helper() {}\n";
+    let labels = Labels::new(source, Language::Rust, "rs", PARSE_TIME).unwrap();
+    let in_outer = source.find("    helper").unwrap() + 4;
+    let holder = labels.holder(in_outer).unwrap();
+    assert_eq!(holder.name, "outer");
+    assert_eq!((holder.first_line, holder.last_line), (2, 4));
+    assert_eq!(labels.holder(source.find("helper()").unwrap()), None);
+    assert_eq!(Labels::text().holder(3), None);
+}
+
+#[test]
+fn the_declaration_keyword_is_a_whole_word_before_the_match() {
+    let rust = declaration_keywords(Language::Rust);
+    assert!(has_declaration_keyword("pub(super) fn ", rust));
+    assert!(has_declaration_keyword("    struct ", rust));
+    assert!(!has_declaration_keyword("let defn = ", rust));
+    assert!(!has_declaration_keyword("my_fn_helper(", rust));
+    assert!(!has_declaration_keyword("fn", &[]));
+    assert!(declaration_keywords(Language::Json).is_empty());
+    assert!(declaration_keywords(Language::Python).contains(&"def"));
+}
+
+#[test]
+fn role_tiers_are_in_the_documented_order() {
+    let keys: Vec<&str> = Role::ALL.iter().map(|r| r.key()).collect();
+    assert_eq!(
+        keys,
+        [
+            "def",
+            "call",
+            "ref",
+            "unlabelled",
+            "import",
+            "string",
+            "comment",
+            "text",
+            "partial"
+        ]
+    );
+    assert!(Role::ALL.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(Role::Def.tier(), 0);
+    assert_eq!(Role::Partial.tier(), 8);
+}
+
+#[test]
+fn a_partial_hit_in_a_parsed_file_has_no_holder() {
+    let source = "fn outer() {\n    launchWorkerPool();\n}\n";
+    let labelling =
+        Labelling::Labelled(Labels::new(source, Language::Rust, "rs", PARSE_TIME).unwrap());
+    let line = "    launchWorkerPool();";
+
+    let hit = labelling
+        .classify_line(line, 13, std::iter::once(4..16), true)
+        .unwrap();
+
+    assert_eq!(hit.role, Role::Partial);
+    assert_eq!(hit.holder, None);
+    assert_eq!(hit.def_lines, None);
 }

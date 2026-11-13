@@ -786,6 +786,7 @@ impl FileManifest {
     /// truncation rather than returning a short manifest, so this invariant holds
     /// across the JSONL→binary migration — a corrupt binary manifest can never
     /// yield `sorted_paths()` shorter than the set the index was built against.
+    #[cfg(test)]
     pub(super) fn sorted_paths(&self) -> Vec<&str> {
         self.entries.keys().map(String::as_str).collect()
     }

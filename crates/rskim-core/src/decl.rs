@@ -122,9 +122,7 @@ pub fn declarations(tree: &Tree, source: &str, lang: Language) -> DeclScan {
         if item.depth.saturating_add(1) >= cap.max_depth && item.node.child_count() > 0 {
             truncated = true;
         }
-        if let Some(decl) = declaration_at(item.node, source, lang) {
-            decls.push(decl);
-        }
+        push_declarations(item.node, source, lang, &mut decls);
     }
 
     DeclScan { decls, truncated }
@@ -146,19 +144,34 @@ pub fn enclosing_declaration(decls: &[Declaration], byte: usize) -> Option<&Decl
         .find(|d| !LEAF_KINDS.contains(&d.kind) && d.byte_range.contains(&byte))
 }
 
-fn declaration_at(node: Node<'_>, source: &str, lang: Language) -> Option<Declaration> {
+/// Push one [`Declaration`] for each name `node` declares, in source order.
+///
+/// Most declaring nodes have one `name` field. A Go `const_spec` or `var_spec`
+/// can have several (`const Max, Min = 1, 2`); each name is a declaration with
+/// the rows and byte range of the whole spec.
+fn push_declarations(node: Node<'_>, source: &str, lang: Language, out: &mut Vec<Declaration>) {
     let kind = node.kind();
     if !is_declaration_kind(lang, kind) {
-        return None;
+        return;
     }
-    let name_node = name_node(node)?;
-    let name_bytes = name_node.byte_range();
-    let name = source.get(name_bytes.clone()).filter(|n| !n.is_empty())?;
+    let mut cursor = node.walk();
+    let names: Vec<(Range<usize>, &str)> = node
+        .children_by_field_name("name", &mut cursor)
+        .filter(|name| usable_name(node, *name))
+        .filter_map(|name| {
+            let bytes = name.byte_range();
+            let text = source.get(bytes.clone()).filter(|n| !n.is_empty())?;
+            Some((bytes, text))
+        })
+        .collect();
+    if names.is_empty() {
+        return;
+    }
 
     let container = match placement(node, source, lang) {
         Placement::Member(container) => container,
         // A variable inside a function body is a local, not a declaration.
-        Placement::Nested if VARIABLE_KINDS.contains(&kind) => return None,
+        Placement::Nested if VARIABLE_KINDS.contains(&kind) => return,
         Placement::Nested => None,
     };
 
@@ -172,15 +185,15 @@ fn declaration_at(node: Node<'_>, source: &str, lang: Language) -> Option<Declar
         end.row
     };
 
-    Some(Declaration {
+    out.extend(names.into_iter().map(|(name_bytes, name)| Declaration {
         name: name.to_owned(),
         kind,
         name_bytes,
         first_row: start.row,
         last_row,
-        container,
+        container: container.clone(),
         byte_range: node.byte_range(),
-    })
+    }));
 }
 
 fn is_declaration_kind(lang: Language, kind: &str) -> bool {
@@ -223,17 +236,16 @@ fn is_declaration_kind(lang: Language, kind: &str) -> bool {
     }
 }
 
-/// The node that spells the declared name, if the declaration has a usable one.
-fn name_node(node: Node<'_>) -> Option<Node<'_>> {
-    let name = node.child_by_field_name("name")?;
-    if name.is_missing() {
-        return None;
-    }
+/// Whether `name`, a child of the declaring `node` under its `name` field,
+/// spells a declared name.
+///
+/// Walking a repeated field also yields the `,` between the names, so an
+/// anonymous node is no name.
+fn usable_name(node: Node<'_>, name: Node<'_>) -> bool {
     // A destructuring pattern (`const { a, b } = x`) names no single thing.
-    if node.kind() == "variable_declarator" && name.kind() != "identifier" {
-        return None;
-    }
-    Some(name)
+    name.is_named()
+        && !name.is_missing()
+        && !(node.kind() == "variable_declarator" && name.kind() != "identifier")
 }
 
 /// Where a declaration sits relative to the code around it.

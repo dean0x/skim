@@ -1931,44 +1931,6 @@ fn ac403_near_diagnostic_punctuation_tokenizer() {
     );
 }
 
-// ── AC-403-T4: SEARCH_HELP_TEXT positional documentation ─────────────────────
-
-/// AC-403-13: SEARCH_HELP_TEXT must contain documentation for --phrase, --near,
-/// --lang, composition rule, and "word token" (the unit of N).
-/// Must also NOT contain em-dashes or en-dashes in new copy (plain ASCII hyphens).
-#[test]
-fn ac403_search_help_text_positional_documentation() {
-    let help = crate::cmd::search::SEARCH_HELP_TEXT;
-
-    // Required vocabulary.
-    assert!(
-        help.contains("--phrase"),
-        "AC-403-13: SEARCH_HELP_TEXT must document --phrase"
-    );
-    assert!(
-        help.contains("--near"),
-        "AC-403-13: SEARCH_HELP_TEXT must document --near"
-    );
-    assert!(
-        help.contains("--lang"),
-        "AC-403-13: SEARCH_HELP_TEXT must document --lang"
-    );
-    assert!(
-        help.contains("word token") || help.contains("word tokens"),
-        "AC-403-13: SEARCH_HELP_TEXT must explain the 'word token' unit for --near N"
-    );
-    assert!(
-        help.contains("case-sensitive") || help.contains("case sensitive"),
-        "AC-403-13: SEARCH_HELP_TEXT must state --phrase matching is case-sensitive"
-    );
-
-    // Composition rule documented.
-    assert!(
-        help.contains("--phrase --near") || help.contains("--phrase and --near"),
-        "AC-403-13: SEARCH_HELP_TEXT must document the --phrase --near N composition"
-    );
-}
-
 // ============================================================================
 // #405 — ast_coverage_notice pure decision seam (AD-405-4 / PF-008 / D-4)
 // ============================================================================

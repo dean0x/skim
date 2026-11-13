@@ -480,6 +480,7 @@ impl RefreshOutcome {
     /// Use this instead of [`refreshed`](Self::refreshed) when the caller
     /// must distinguish a first build from an incremental refresh — e.g.
     /// to decide whether to emit the AST coverage notice.
+    #[cfg(test)]
     pub fn is_first_build(&self) -> bool {
         matches!(self, RefreshOutcome::FirstBuild)
     }

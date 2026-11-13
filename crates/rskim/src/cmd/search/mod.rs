@@ -1,92 +1,65 @@
-//! Search subcommand — code search via layered n-gram indexing.
+//! Search subcommand: find where a name is defined and where it is used.
+//!
+//! `skim search PATTERN` reads the files at query time. There is no index to
+//! build and nothing is cached or written.
 //!
 //! # Architecture
 //!
-//! All I/O lives here (this module). Business logic is split across:
-//! - `types` — shared configuration and result types
-//! - `walk` — project-root discovery and file traversal
-//! - `manifest` — binary (v5) sidecar for incremental build caching
-//! - `index` — full pipeline orchestration (invoked via `--build`/`--rebuild`)
-//! - `query` — query execution and result formatting
-//! - `snippet` — source context extraction
-//! - `staleness` — git HEAD comparison and auto-refresh
-//! - `hooks` — git hook installation/removal
-//! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
+//! All I/O lives here (this module). The pieces of a query:
+//! - `args` — the closed flag set and its parser
+//! - `filter` — the `-g` and `-t` path filters
+//! - `universe` — the files a query reads, and the files it counts as left out
+//! - `matcher` — the compiled pattern with its case and whole-word rules
+//! - `scan` — phase A counts every matching line, phase B labels and keeps lines
+//! - `classifier`, `field`, `fields` — comment, string and identifier ranges
+//! - `roles` — the role of each match: definition, call, import, ...
+//! - `rank` — the file prior and the rank order of both views
+//! - `render` — the text, JSON, `-l` and `-c` output
+//! - `gitdir` — project-root discovery
+//!
+//! The index commands (`--build`, `--rebuild`, `--update`, `--stats`,
+//! `--install-hooks`, `--remove-hooks`) still run on the old index code:
+//! `walk`, `manifest`, `index`, `query`, `snippet`, `staleness`, `hooks`.
 
+mod args;
 mod build_lock;
-// The classifier serves only the role agreement test until the scan engine
-// reads it; the engine commit lifts the `cfg(test)` gate.
-#[cfg(test)]
 mod classifier;
-#[cfg(test)]
 mod field;
-#[cfg(test)]
 mod fields;
+mod filter;
 mod gitdir;
 pub(crate) mod hooks;
 mod index;
 mod manifest;
+mod matcher;
 mod query;
+mod rank;
+mod render;
+mod roles;
 #[cfg(test)]
-mod roles_tests;
+#[path = "run_tests.rs"]
+mod run_tests;
+mod scan;
+#[cfg(test)]
 mod snippet;
 mod staleness;
 mod types;
+mod universe;
 mod walk;
 
 use std::io::{BufWriter, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
-// ============================================================================
-// User-facing message constants
-// ============================================================================
+use args::{IndexCommand, ListMode, QueryFlags, QueryShape, SearchAction, UsageError};
+use matcher::{CaseMode, Matcher, MatcherSpec, PatternKind};
+use render::{Format, Layout, MatchMode, QueryInfo, Rendered, Report};
+use scan::{Limits, QueryPlan, ScanConfig, ScanQuery};
 
-/// Canonical enumeration of all recognised flags for `skim search`.
-///
-/// Single source of truth: used in the unknown-flag error message so that
-/// adding or renaming a flag requires only one edit here rather than separate
-/// edits to the error string and the doc comment.  The help text at
-/// `print_help` is intentionally separate (different format and prose
-/// descriptions).
-const KNOWN_FLAGS: &str = "--build, --rebuild, --update, --stats, --install-hooks, \
-    --remove-hooks, --json, -j, --limit, -n, --offset, --root, --phrase, --near, --lang, \
-    --help, -h";
-
-/// Exit code for a flag that `skim search` no longer accepts.
-const REMOVED_FLAG_EXIT_CODE: u8 = 2;
-
-/// Flags that `skim search` no longer accepts, each with the advice that
-/// replaces it.
-///
-/// A removed flag is refused during flag parsing, before any file is read or
-/// written. The refusal prints one line on stderr and nothing on stdout.
-const REMOVED_FLAGS: [(&str, &str); 6] = [
-    ("--ast", "use ast-grep for structural search"),
-    ("--hot", "use skim heatmap for churn and fix density"),
-    ("--cold", "use skim heatmap for churn and fix density"),
-    ("--risky", "use skim heatmap for churn and fix density"),
-    (
-        "--blast-radius",
-        "use skim heatmap, or git log --name-only -- FILE, for co-change",
-    ),
-    ("--weights", "there is no fused ranking"),
-];
-
-/// The refusal message for `arg` when it names a removed flag, in the bare
-/// (`--ast`) or the attached-value (`--ast=x`) form.
-///
-/// The message quotes the flag name from [`REMOVED_FLAGS`], never the argument
-/// text, so an attached value cannot reach the terminal.
-fn removed_flag_message(arg: &str) -> Option<String> {
-    REMOVED_FLAGS.iter().find_map(|(flag, advice)| {
-        let is_flag = arg == *flag
-            || arg
-                .strip_prefix(flag)
-                .is_some_and(|rest| rest.starts_with('='));
-        is_flag.then(|| format!("skim search: {flag} was removed in 3.0.0; {advice}"))
-    })
-}
+use crate::cmd::execution::{
+    StdoutStatus, pipe_closed_exit, write_line_to_stderr, write_line_to_stdout, write_to_stdout,
+};
 
 // ============================================================================
 // Public entry point
@@ -94,502 +67,359 @@ fn removed_flag_message(arg: &str) -> Option<String> {
 
 /// Run the `skim search` subcommand.
 ///
-/// Dispatches to:
-/// - `skim search --build` — build the index incrementally
-/// - `skim search --rebuild` — force full rebuild
-/// - `skim search --update` — auto-refresh if stale
-/// - `skim search --stats [--json]` — print index statistics
-/// - `skim search --install-hooks` — install git hooks
-/// - `skim search --remove-hooks` — remove git hooks
-/// - `skim search [--json] [--limit N] <QUERY>` — search
+/// - `skim search [FLAGS] PATTERN` — read the files and print the matches
+/// - `skim search --build | --rebuild | --update | --stats | --install-hooks |
+///   --remove-hooks` — the commands of the old index
 /// - A removed flag (`--ast`, `--hot`, `--cold`, `--risky`, `--blast-radius`,
-///   `--weights`) — refuse with exit 2 and name the replacement
+///   `--weights`, `--phrase`, `--near`, `--lang`, `-j`) — refuse with exit 2
+///   and name the replacement
 /// - No args / `--help` / `-h` — print help
 ///
-/// # AD-375-1 — The `index` positional was removed (#375, avoids PF-006).
+/// A query records no analytics: `analytics` serves only the old index
+/// commands.
 ///
-/// Prior to this change, a leading bareword `index` was intercepted and routed
-/// to the index builder, making `skim search "index"` unsearchable regardless of
-/// quoting (the shell strips quotes before argv dispatch). The word "index" appears
-/// 193+ times in this repo, so it is a valid and useful query term.
-///
-/// The positional intercept shadowed the query path with a confusing error
-/// (`unexpected argument '--limit' found`) whenever a user combined `skim search
-/// index` with any query flag — the textbook PF-006 shape: a dispatch arm that
-/// diverts an advertised/expected input to a different code path.
-///
-/// Builds now go exclusively through `--build` / `--rebuild` / `--update`, which
-/// were already the recommended surface. A cold `skim search index` auto-builds
-/// the index (via `auto_refresh_if_stale`) and then returns lexical results for
-/// the word "index".
-#[allow(clippy::disallowed_methods)] // Search output entry point; delegates to streaming BufWriter sinks in subordinate fns
+/// Exit codes of a query: 0 a line matched, 1 no line matched, 2 a usage or
+/// input error (nothing partial is printed), 141 when the reader of stdout
+/// closed the pipe.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    // AD-412-3: help detection (empty args, --help, -h before --) lives entirely in
-    // parse_flags so the `--` end-of-flags boundary has a single owner.
-    let flags = parse_flags(args)?;
-
-    // AD-403-5 / PF-006: single pre-dispatch guard for positional-flag inert notice.
-    // Fires before `match flags.action` so it covers every arm. A whitespace-only
-    // query is treated as no-text (mirrors the `!text.trim().is_empty()` guard below).
-    let has_text = matches!(&flags.action, SearchAction::Query(t) if !t.trim().is_empty());
-    if let Some(notice) = query::positional_inert_notice(flags.phrase, flags.near, has_text) {
-        eprintln!("{notice}");
-    }
-
-    match flags.action {
-        SearchAction::Help => {
-            print_help();
-            Ok(ExitCode::SUCCESS)
+    match args::parse_flags(args) {
+        Ok(SearchAction::Help) => Ok(print_help()),
+        Ok(SearchAction::Removed(message)) => {
+            // A removed flag never writes stdout, with or without `--json`.
+            Ok(fail_without_stdout(&message))
         }
-        SearchAction::Removed(ref message) => {
-            eprintln!("{message}");
-            Ok(ExitCode::from(REMOVED_FLAG_EXIT_CODE))
-        }
-        SearchAction::Build => run_build(false, &flags.root_override, analytics),
-        SearchAction::Rebuild => run_build(true, &flags.root_override, analytics),
-        SearchAction::Update => run_update(&flags.root_override, analytics),
-        SearchAction::Stats => run_stats(flags.json, &flags.root_override),
-        SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
-        SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
-        // Reject whitespace-only queries at dispatch (defense-in-depth / AC2):
-        // query_substring_present uses split_whitespace which yields no tokens for "  ",
-        // making the predicate vacuously true and letting the AD-355-7 all-files fallback
-        // emit up to 100 arbitrary indexed files for a content-free query. Trimming here
-        // prevents that path from being reached at all and gives a cleaner empty-result
-        // response consistent with what is_empty() returns for a zero-length query.
-        SearchAction::Query(ref text) if !text.trim().is_empty() => {
-            run_query(text.trim(), &flags, analytics)
-        }
-        SearchAction::Query(_) => {
-            // Empty query (no positional args and no action flag) → help.
-            print_help();
-            Ok(ExitCode::SUCCESS)
-        }
+        Ok(SearchAction::Index {
+            command,
+            root,
+            json,
+        }) => run_index_command(command, &root, json, analytics),
+        Ok(SearchAction::Query(flags)) => Ok(run_query(&flags)),
+        Err(e) => Ok(fail(e.message(), args::wants_json(args))),
     }
 }
 
-// ============================================================================
-// Parsed flags
-// ============================================================================
-
-/// The action the user wants to perform, derived from CLI flags.
-///
-/// Encodes the mutually-exclusive mode flags as a single enum variant so that
-/// dispatch is a `match` rather than a cascade of `if flags.X` checks.
-#[derive(Debug, PartialEq, Eq)]
-enum SearchAction {
-    Build,
-    Rebuild,
-    Update,
-    Stats,
-    InstallHooks,
-    RemoveHooks,
-    /// Run a search query with the given text.
-    Query(String),
-    /// Print the help text and exit.
-    ///
-    /// AD-412-3: folded into `parse_flags` so the end-of-flags sentinel
-    /// (`"--"`) lives in a single owner — the `"--"` match arm in
-    /// `parse_flags`. Help detection (empty args, `--help`, `-h`) is
-    /// handled entirely by `parse_flags`.
-    Help,
-    /// Refuse a removed flag: print the message on stderr and exit 2.
-    ///
-    /// Produced by `parse_flags` for the first removed flag it meets, so the
-    /// refusal happens before any index or cache file is touched.
-    Removed(String),
+/// Print the help text.
+fn print_help() -> ExitCode {
+    match write_line_to_stdout(args::SEARCH_HELP_TEXT) {
+        Ok(StdoutStatus::Written) => ExitCode::SUCCESS,
+        Ok(StdoutStatus::PipeClosed) => pipe_closed_exit(),
+        Err(e) => fail_without_stdout(&format!("cannot write the help text: {e}")),
+    }
 }
 
-/// Parsed flags from the CLI args passed to `skim search`.
-#[derive(Debug)]
-struct Flags {
-    action: SearchAction,
+/// Run a command of the old index.
+fn run_index_command(
+    command: IndexCommand,
+    root: &Option<PathBuf>,
     json: bool,
-    limit: usize,
-    /// Pagination offset: skip this many verified results before collecting.
-    ///
-    /// Applied AFTER verification on the pure-lexical exact-symbol path
-    /// (RESOLVED Decision 3 / AC#11): `rank → verify → skip offset → take limit`.
-    /// `None` (the default) is equivalent to offset 0.
-    offset: Option<usize>,
-    root_override: Option<PathBuf>,
-    /// v5 positional search: require contiguous, ordered phrase match (`--phrase`).
-    phrase: bool,
-    /// v5 positional search: max word-token distance for `--near N` (unordered).
-    near: Option<u32>,
-    /// Language filter from `--lang <name>` (e.g. `--lang rust`, `--lang py`).
-    ///
-    /// Accepts both language names (`rust`, `python`, `typescript`) and file
-    /// extensions (`rs`, `py`, `ts`).  `None` means no language restriction.
-    lang: Option<rskim_core::Language>,
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    match command {
+        IndexCommand::Build => run_build(false, root, analytics),
+        IndexCommand::Rebuild => run_build(true, root, analytics),
+        IndexCommand::Update => run_update(root, analytics),
+        IndexCommand::Stats => run_stats(json, root),
+        IndexCommand::InstallHooks => run_install_hooks(root),
+        IndexCommand::RemoveHooks => run_remove_hooks(root),
+    }
 }
 
-/// Single source of truth for all `Flags` field defaults.
-///
-/// `parse_flags` initialises its local variables to these same values; if a
-/// default changes, update both this impl and the corresponding `let mut …`
-/// in `parse_flags` to keep them in sync.  `Flags::help()` delegates here so
-/// adding a new field only requires one edit instead of two (the compiler
-/// enforces exhaustiveness on struct literals in `Default::default`).
-impl Default for Flags {
-    fn default() -> Self {
-        Flags {
-            action: SearchAction::Help,
-            json: false,
-            limit: 20,
-            offset: None,
-            root_override: None,
-            phrase: false,
-            near: None,
-            lang: None,
+// ============================================================================
+// Failures
+// ============================================================================
+
+/// End a command with exit 2: the message on stderr with the program prefix,
+/// and with `json` the error object on stdout.
+fn fail(message: &str, json: bool) -> ExitCode {
+    if json {
+        match write_line_to_stdout(&render::json_error(message)) {
+            Ok(StdoutStatus::Written) => {}
+            Ok(StdoutStatus::PipeClosed) => return pipe_closed_exit(),
+            Err(_) => {}
         }
     }
+    fail_without_stdout(message)
 }
 
-impl Flags {
-    /// Construct a `Flags` value that signals "print help and exit."
-    ///
-    /// All fields other than `action` are at their defaults; they are never
-    /// read on the `SearchAction::Help` dispatch path in `run()`.  Uses
-    /// `Default::default()` so that adding a field only requires one edit
-    /// (the `Default` impl above) rather than duplicating all defaults here.
-    fn help() -> Self {
-        Default::default()
-    }
-
-    /// Construct a `Flags` value that signals "refuse a removed flag."
-    ///
-    /// Like [`Flags::help`], every field other than `action` is at its default
-    /// and is never read on the dispatch path.
-    fn removed(message: String) -> Self {
-        Flags {
-            action: SearchAction::Removed(message),
-            ..Default::default()
-        }
+/// End a command with exit 2 and the message on stderr only.
+fn fail_without_stdout(message: &str) -> ExitCode {
+    match write_line_to_stderr(&format!("skim search: {message}")) {
+        Ok(StdoutStatus::PipeClosed) => pipe_closed_exit(),
+        Ok(StdoutStatus::Written) | Err(_) => ExitCode::from(args::USAGE_EXIT_CODE),
     }
 }
 
-/// Parse and validate a `--limit` value string.
+// ============================================================================
+// Query execution
+// ============================================================================
+
+/// The folder a query searches, and the notice that names it.
+#[derive(Debug, PartialEq, Eq)]
+struct ScanRoot {
+    path: PathBuf,
+    /// Set when the implicit root is not the current folder.
+    notice: Option<String>,
+}
+
+/// Decide the folder to search.
 ///
-/// Accepts any positive (>= 1) `usize`. Returns an error for non-numeric
-/// values or zero.
-fn parse_limit_value(raw: &str) -> anyhow::Result<usize> {
-    let parsed = raw
-        .parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("--limit value must be a positive integer, got {:?}", raw))?;
-    if parsed == 0 {
-        anyhow::bail!("--limit must be >= 1 (got 0)");
-    }
-    Ok(parsed)
-}
-
-/// Parse and validate a `--offset` value string.
-///
-/// Accepts any non-negative integer (`usize`). Returns an error for non-numeric
-/// values. Parallel to `parse_limit_value` so both flag arms read identically.
-/// Typed as `usize` to match `limit` and `SearchQuery::offset`, eliminating the
-/// `as usize` casts that `u64` required at all consumption sites.
-fn parse_offset_value(raw: &str) -> anyhow::Result<usize> {
-    raw.parse::<usize>().map_err(|_| {
-        anyhow::anyhow!(
-            "--offset value must be a non-negative integer, got {:?}",
-            raw
-        )
-    })
-}
-
-/// Parse and validate a `--near` value string as a positive word-token distance.
-///
-/// AD-393-9: `--near 0` is rejected with an actionable error because a span of
-/// zero word-tokens is only satisfied by a single-word query (trivially true) or
-/// an exact-adjacent match with no gap — both cases are better expressed as
-/// `--phrase` (exact adjacent) or a bare term search.  Zero is structurally
-/// allowed by the `u32` type but semantically meaningless for proximity search,
-/// so we reject it early with a clear message rather than silently producing
-/// unexpected results.
-fn parse_near_value(raw: &str) -> anyhow::Result<u32> {
-    let n = raw
-        .parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("--near value must be a positive integer, got {raw:?}"))?;
-    if n == 0 {
-        anyhow::bail!(
-            "--near span must be > 0 for multiple words; \
-             use --phrase for exact adjacent matching"
-        );
-    }
-    Ok(n)
-}
-
-/// Parse a `--lang` value into a [`rskim_core::Language`].
-///
-/// Accepts both file extensions (`rs`, `py`, `ts`) and language display names
-/// (`rust`, `python`, `typescript`); case-insensitive.  Returns an actionable
-/// error listing accepted values when the input is unrecognised.
-fn parse_lang_value(raw: &str) -> anyhow::Result<rskim_core::Language> {
-    use rskim_core::Language;
-    // Normalize to lowercase once so both the extension lookup and the name
-    // match arm are case-insensitive.  Without this `--lang RS` (uppercase
-    // extension) was rejected while `--lang rs` succeeded — an inconsistency
-    // that surprised users.  Language::from_extension is case-sensitive, so
-    // we must lower before calling it.
-    let raw_lower = raw.to_ascii_lowercase();
-    // Try file extension first so callers can pass "rs", "py", etc.
-    if let Some(lang) = Language::from_extension(&raw_lower) {
-        return Ok(lang);
-    }
-    // Names that from_extension does not handle (no matching file extension).
-    // Everything else ("go", "java", "c", "cpp", "sql", "swift", "json", "yaml",
-    // "toml", "markdown") is already returned above via from_extension.
-    match raw_lower.as_str() {
-        "rust" => Ok(Language::Rust),
-        "python" => Ok(Language::Python),
-        "typescript" => Ok(Language::TypeScript),
-        "javascript" => Ok(Language::JavaScript),
-        "c++" => Ok(Language::Cpp),
-        "csharp" | "c#" => Ok(Language::CSharp),
-        "ruby" => Ok(Language::Ruby),
-        "kotlin" => Ok(Language::Kotlin),
-        _ => Err(anyhow::anyhow!(
-            "--lang: unknown language {:?}; accepted names: rust, python, typescript, \
-             javascript, go, java, markdown, c, cpp, csharp, ruby, sql, kotlin, swift, \
-             json, yaml, toml — or file extensions: rs, py, ts, js, md, c, cpp, cs, rb, kt",
-            raw
-        )),
-    }
-}
-
-/// Extract a value from a flag that supports both space-separated and equals forms.
-///
-/// Handles `--flag value` (space-separated) and `--flag=value` (equals) forms.
-/// Returns `(value, consumed_next)` where:
-/// - `value` is the trimmed non-empty string value.
-/// - `consumed_next` is `true` when the space-separated form consumed the next token
-///   (the caller must advance `i` by one extra position).
+/// With `--root` the folder must exist. Without it the root is the repository
+/// that holds `cwd` (the nearest ancestor with a `.git` entry), found under
+/// `rules`; outside a repository it is `cwd` alone. Nothing implicit reaches
+/// `/` or the home folder from below. `cwd` is canonical.
 ///
 /// # Errors
 ///
-/// Returns `Err` when the value token is absent (space form) or empty/whitespace-only
-/// (both forms).
-///
-/// # Examples
-///
-/// ```text
-/// take_flag_value("--root=src", None, "--root")            → Ok(("src", false))
-/// take_flag_value("--root", Some("src"), "--root")         → Ok(("src", true))
-/// take_flag_value("--root", None, "--root")                → Err(…missing…)
-/// take_flag_value("--root=  ", None, "--root")             → Err(…empty…)
-/// take_flag_value("--root", Some("--help"), "--root")      → Err(…requires a value; to print help…)
-/// take_flag_value("--root", Some("-h"), "--root")          → Err(…requires a value; to print help…)
-/// ```
-fn take_flag_value(
-    arg: &str,
-    next_arg: Option<&String>,
-    flag: &str,
-) -> anyhow::Result<(String, bool)> {
-    let prefix = format!("{flag}=");
-    if let Some(val) = arg.strip_prefix(&prefix) {
-        let trimmed = val.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("{flag} value must not be empty or whitespace-only");
+/// [`UsageError`] for a missing or non-folder `--root`, and for an implicit
+/// search from `/`.
+fn resolve_scan_root(
+    explicit: Option<&Path>,
+    cwd: &Path,
+    rules: &gitdir::RootRules,
+) -> Result<ScanRoot, UsageError> {
+    if let Some(dir) = explicit {
+        let canonical = dir
+            .canonicalize()
+            .map_err(|e| UsageError::new(format!("--root {dir:?}: {e}")))?;
+        if !canonical.is_dir() {
+            return Err(UsageError::new(format!(
+                "--root {dir:?} is not a directory"
+            )));
         }
-        return Ok((trimmed.to_string(), false));
+        return Ok(ScanRoot {
+            path: canonical,
+            notice: None,
+        });
     }
-    // Space-separated form: the value is in the next token.
-    let val =
-        next_arg.ok_or_else(|| anyhow::anyhow!("{flag} requires a value (e.g. {flag} <value>)"))?;
-    // AD-412-3: bail so --help/-h is never consumed as a flag value (e.g. `--root --help`).
-    if matches!(val.as_str(), "--help" | "-h") {
-        anyhow::bail!(
-            "{flag} requires a value (got {:?}); \
-             to print help, run: `skim search --help`",
-            val
-        );
+    if cwd.parent().is_none() {
+        return Err(UsageError::new(
+            "refusing to search / implicitly; pass --root /",
+        ));
     }
-    let trimmed = val.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("{flag} value must not be empty or whitespace-only");
-    }
-    Ok((trimmed.to_string(), true))
+    let path = gitdir::discover_project_root_with(cwd, rules);
+    let notice = (path != cwd)
+        .then(|| format!("searching {path:?} (the repository that holds the current folder)"));
+    Ok(ScanRoot { path, notice })
 }
 
-/// Parse the flags from `args`.
+/// Compile the query of `flags`.
 ///
 /// # Errors
 ///
-/// - `--limit` / `-n` without a following value.
-/// - `--limit` / `-n` value that is not a valid `usize`.
-/// - `--limit=<value>` with a non-numeric value.
-/// - `--root` without a following value.
-/// - Unrecognised dash-leading flags — any `--foo` or `-x` (length >= 2) that is
-///   not a known flag (see `KNOWN_FLAGS`). Bare `-` is a positional query token;
-///   a literal dash-leading term is searchable after the `--` end-of-flags separator.
-/// - Combining a text query with an action flag (`--build` / `--rebuild` /
-///   `--update` / `--stats` / `--install-hooks` / `--remove-hooks`) — an
-///   ambiguous mixed form.
-///
-/// A removed flag (see `REMOVED_FLAGS`) is not an error here: the returned
-/// `Flags` carries `SearchAction::Removed`, which `run` turns into exit 2.
-fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
-    // AD-412-3: empty args → help immediately. --help/-h before `--` → help via the
-    // match arm below. Post-`--` tokens are drained as literal query text (AD-412-2).
-    if args.is_empty() {
-        return Ok(Flags::help());
-    }
-
-    let mut action_flag: Option<SearchAction> = None;
-    let mut json = false;
-    let mut limit: usize = 20;
-    let mut offset: Option<usize> = None;
-    let mut root_override: Option<PathBuf> = None;
-    let mut query_parts: Vec<String> = Vec::new();
-    let mut phrase = false;
-    let mut near: Option<u32> = None;
-    let mut lang: Option<rskim_core::Language> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--build" => action_flag = Some(SearchAction::Build),
-            "--rebuild" => action_flag = Some(SearchAction::Rebuild),
-            "--update" => action_flag = Some(SearchAction::Update),
-            "--stats" => action_flag = Some(SearchAction::Stats),
-            "--install-hooks" => action_flag = Some(SearchAction::InstallHooks),
-            "--remove-hooks" => action_flag = Some(SearchAction::RemoveHooks),
-            "--json" | "-j" => json = true,
-            s if s == "--limit" || s == "-n" || s.starts_with("--limit=") => {
-                // Both space-separated (`--limit 10`, `-n 10`) and equals (`--limit=10`)
-                // forms are handled by take_flag_value — same idiom as --root.
-                // `-n` is a short alias; errors always say "--limit" for consistency.
-                // `-n` has no equals form so the "--limit=" prefix never fires for it.
-                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--limit")?;
-                limit = parse_limit_value(&raw)?;
-                if consumed {
-                    i += 1;
-                }
-            }
-            s if s == "--offset" || s.starts_with("--offset=") => {
-                // Pagination offset: skip N verified results before collecting.
-                // Applied AFTER verification (RESOLVED Decision 3 / AC#11).
-                // Space-separated (`--offset 5`) and equals (`--offset=5`) both accepted.
-                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--offset")?;
-                offset = Some(parse_offset_value(&raw)?);
-                if consumed {
-                    i += 1;
-                }
-            }
-            s if s == "--root" || s.starts_with("--root=") => {
-                let (val, consumed) = take_flag_value(s, args.get(i + 1), "--root")?;
-                root_override = Some(PathBuf::from(val));
-                if consumed {
-                    i += 1;
-                }
-            }
-            // A removed flag ends parsing at once: the refusal must come before
-            // any later token can raise a different error or touch the index.
-            s if let Some(message) = removed_flag_message(s) => {
-                return Ok(Flags::removed(message));
-            }
-            // AD-403-6: When BOTH --phrase and --near are given, the composed semantic is
-            // PhraseNear(n) — ordered, total span <= n — NOT just phrase.  See
-            // verify_mode_for in query.rs (AD-403-1) for the exhaustive mapping.
-            // v5 positional search (#392 / #380 Phase 2). Shell strips quotes, so
-            // `skim search "alpha beta"` and `skim search alpha beta` both arrive as
-            // text "alpha beta"; `--phrase` is the explicit contiguous-match signal.
-            "--phrase" => phrase = true,
-            s if s == "--near" || s.starts_with("--near=") => {
-                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--near")?;
-                near = Some(parse_near_value(&raw)?);
-                if consumed {
-                    i += 1;
-                }
-            }
-            s if s == "--lang" || s.starts_with("--lang=") => {
-                // Language filter: restrict results to files of a given language.
-                // Accepts display names ("rust", "python") and extensions ("rs", "py").
-                // D17 / AC16: honored on all search paths (positional + fallback + lexical).
-                let (raw, consumed) = take_flag_value(s, args.get(i + 1), "--lang")?;
-                lang = Some(parse_lang_value(&raw)?);
-                if consumed {
-                    i += 1;
-                }
-            }
-            // AD-412-3: --help/-h before `--` triggers help; after `--` these tokens
-            // are already drained as literal query text and never reach this arm.
-            "--help" | "-h" => return Ok(Flags::help()),
-            // AD-412-2: end-of-flags separator. Drains all remaining tokens verbatim into
-            // the query and stops flag parsing. Escape hatch for dash-leading literals
-            // (`-Werror`, `->`, `--rebuild`). Only the first `--` is special; a second
-            // `--` becomes literal query text. Output flags must appear BEFORE `--`.
-            "--" => {
-                query_parts.extend(args[i + 1..].iter().cloned());
-                break;
-            }
-            // AD-412-1: reject any unrecognised dash-prefixed token (both `--foo` and
-            // `-x`), symmetric for short and long flags. Bare `-` (len == 1) falls
-            // through to the positional catch-all. Matches on token shape only (no
-            // sibling-flag-absent guard — avoids PF-006).
-            // AD-412-4: {s:?} (Debug, quoted) prevents ANSI-escape injection in output.
-            s if s.starts_with('-') && s.len() >= 2 => {
-                anyhow::bail!(
-                    "unrecognised flag {s:?}. \
-                     To search a literal dash-leading term, use `--` (e.g. `skim search -- {s:?}`). \
-                     Valid flags: {KNOWN_FLAGS}"
-                );
-            }
-            // Positional arg — part of the query text.
-            s => query_parts.push(s.to_string()),
+/// [`UsageError`] for an empty or invalid pattern, or one past a size limit.
+fn build_query(flags: &QueryFlags) -> Result<(ScanQuery, QueryInfo), UsageError> {
+    let compile =
+        |spec: MatcherSpec<'_>| Matcher::new(spec).map_err(|e| UsageError::new(e.to_string()));
+    match &flags.shape {
+        QueryShape::Pattern { text, identifier } => {
+            let kind = if flags.regex {
+                PatternKind::Regex
+            } else {
+                PatternKind::Literal
+            };
+            let matcher = compile(MatcherSpec {
+                pattern: text,
+                kind,
+                case: flags.case,
+                word: flags.word,
+            })?;
+            let mode = match (flags.regex, flags.word) {
+                (true, _) => MatchMode::Regex,
+                (false, true) => MatchMode::Word,
+                (false, false) => MatchMode::Literal,
+            };
+            let info = QueryInfo {
+                text: text.clone(),
+                words: Vec::new(),
+                mode,
+                ignore_case: matcher.is_case_insensitive(),
+            };
+            let query = ScanQuery {
+                plan: QueryPlan::Pattern(matcher),
+                identifier: *identifier,
+            };
+            Ok((query, info))
         }
-        i += 1;
+        QueryShape::Words(words) => {
+            // One case rule for the whole phrase, as `rg` reads smart case.
+            let phrase = words.join(" ");
+            let insensitive = flags.case.is_insensitive(&phrase);
+            let case = if insensitive {
+                CaseMode::Insensitive
+            } else {
+                CaseMode::Sensitive
+            };
+            let matchers = words
+                .iter()
+                .map(|word| {
+                    compile(MatcherSpec {
+                        pattern: word,
+                        kind: PatternKind::Literal,
+                        case,
+                        word: flags.word,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let info = QueryInfo {
+                text: phrase,
+                words: words.clone(),
+                mode: MatchMode::Words,
+                ignore_case: insensitive,
+            };
+            let query = ScanQuery {
+                plan: QueryPlan::Words(matchers),
+                identifier: false,
+            };
+            Ok((query, info))
+        }
     }
+}
 
-    // AD-412-5: error when an action flag and a text query appear together (mixed form).
-    validate_no_mixed_form(action_flag.as_ref(), &query_parts)?;
+/// The output form of `flags`.
+fn format_of(flags: &QueryFlags) -> Format {
+    match (flags.list, flags.json) {
+        (ListMode::Files, _) => Format::FilesWithMatches,
+        (ListMode::Counts, _) => Format::Counts,
+        (ListMode::Lines, true) => Format::Json,
+        (ListMode::Lines, false) => Format::Text,
+    }
+}
 
-    let action = action_flag.unwrap_or_else(|| SearchAction::Query(query_parts.join(" ")));
+/// What a finished query leaves to print.
+struct Outcome {
+    rendered: Rendered,
+    matched: bool,
+}
 
-    Ok(Flags {
-        action,
-        json,
-        limit,
-        offset,
-        root_override,
-        phrase,
-        near,
-        lang,
+/// Run a query in the current folder and print the result.
+fn run_query(flags: &QueryFlags) -> ExitCode {
+    let started = Instant::now();
+    let cwd = match std::env::current_dir().and_then(|dir| dir.canonicalize()) {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            return fail(&format!("cannot read the current folder: {e}"), flags.json);
+        }
+    };
+    let root = match resolve_scan_root(flags.root.as_deref(), &cwd, &gitdir::RootRules::from_env())
+    {
+        Ok(root) => root,
+        Err(e) => return fail(e.message(), flags.json),
+    };
+    if let Some(notice) = &root.notice
+        && write_line_to_stderr(&format!("skim search: {notice}"))
+            .is_ok_and(|status| status == StdoutStatus::PipeClosed)
+    {
+        return pipe_closed_exit();
+    }
+    match search(flags, &root.path, started) {
+        Ok(outcome) => emit(&outcome),
+        Err(e) => fail(e.message(), flags.json),
+    }
+}
+
+/// List, filter, scan and render. Reads files; prints nothing.
+///
+/// # Errors
+///
+/// [`UsageError`] when the pattern, a filter or the git index is unusable, or
+/// the scan cannot start.
+fn search(flags: &QueryFlags, root: &Path, started: Instant) -> Result<Outcome, UsageError> {
+    let (query, info) = build_query(flags)?;
+    let filter = filter::PathFilter::new(root, &flags.globs, &flags.types)
+        .map_err(|e| UsageError::new(e.to_string()))?;
+
+    let stage = Instant::now();
+    let mut listing = universe::list_universe(root).map_err(|e| UsageError::new(e.to_string()))?;
+    let listed = listing.candidates.len();
+    listing.retain(|rel| filter.keeps(rel));
+    crate::debug_log!(
+        "skim search [debug]: list: {} of {listed} files kept in {:?}",
+        listing.candidates.len(),
+        stage.elapsed()
+    );
+
+    let limits = Limits::default();
+    let config = ScanConfig {
+        root,
+        query: &query,
+        limits,
+        context: flags.context,
+    };
+
+    let stage = Instant::now();
+    let counted = scan::count(&config, listing).map_err(|e| UsageError::new(e.to_string()))?;
+    crate::debug_log!("skim search [debug]: read and match: {:?}", stage.elapsed());
+
+    let stage = Instant::now();
+    let output = match flags.list {
+        ListMode::Lines => counted.label(),
+        ListMode::Files | ListMode::Counts => counted.into_counts(),
+    };
+    crate::debug_log!(
+        "skim search [debug]: parse and label: {:?} ({} files parsed, {} bytes)",
+        stage.elapsed(),
+        output.cost.files_parsed,
+        output.cost.bytes_parsed
+    );
+
+    let identifier = matches!(
+        &flags.shape,
+        QueryShape::Pattern {
+            identifier: true,
+            ..
+        }
+    );
+    let layout = Layout {
+        all: flags.all || !identifier,
+        full: flags.full,
+        context: flags.context,
+        limit: flags.limit,
+        offset: flags.offset,
+        limits,
+    };
+    let report = Report {
+        query: &info,
+        scan: &output,
+        layout,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    };
+    let stage = Instant::now();
+    let rendered = render::render(&report, format_of(flags));
+    crate::debug_log!(
+        "skim search [debug]: rank and render: {:?}",
+        stage.elapsed()
+    );
+    Ok(Outcome {
+        rendered,
+        matched: output.total_lines() > 0,
     })
 }
 
-/// AD-412-5: Validate that an action flag and a text query are not combined.
-///
-/// Extracted from `parse_flags` to reduce that function's cyclomatic complexity.
-/// Returns an error with an actionable message if both are present.
-///
-/// # AD-412-4 (security)
-///
-/// `{query:?}` uses Debug formatting (quoted, escaped) so ANSI-escape, newline,
-/// or other control bytes in a crafted positional token cannot clear the terminal
-/// or forge log lines in AI agent output.  The Debug-quoted form is still a
-/// valid, copy-pasteable `skim search -- "..."` argument.
-fn validate_no_mixed_form(
-    action_flag: Option<&SearchAction>,
-    query_parts: &[String],
-) -> anyhow::Result<()> {
-    // AD-412-5: use the same "is there a real query?" predicate as the `has_text`
-    // binding in `run()` and the `SearchAction::Query` dispatch guard so
-    // whitespace-only positional tokens (e.g. `skim search "  " --rebuild`) are
-    // not treated as a genuine text query here while being silently ignored downstream.
-    if action_flag.is_some() && query_parts.iter().any(|p| !p.trim().is_empty()) {
-        let query = query_parts.join(" ");
-        anyhow::bail!(
-            "cannot combine a text query ({query:?}) with an action flag \
-             (--build / --rebuild / --update / --stats / --install-hooks / --remove-hooks). \
-             To search for the literal text, use: `skim search -- {query:?}`"
-        );
+/// Print the result: stdout first, then the notes on stderr. Returns the exit
+/// code of the query.
+fn emit(outcome: &Outcome) -> ExitCode {
+    if !outcome.rendered.stdout.is_empty() {
+        match write_to_stdout(&outcome.rendered.stdout) {
+            Ok(StdoutStatus::Written) => {}
+            Ok(StdoutStatus::PipeClosed) => return pipe_closed_exit(),
+            Err(e) => return fail_without_stdout(&format!("cannot write the result: {e}")),
+        }
     }
-    Ok(())
+    for line in &outcome.rendered.stderr {
+        match write_line_to_stderr(line) {
+            Ok(StdoutStatus::Written) => {}
+            Ok(StdoutStatus::PipeClosed) => return pipe_closed_exit(),
+            Err(e) => return fail_without_stdout(&format!("cannot write a note: {e}")),
+        }
+    }
+    if outcome.matched {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }
 
 // ============================================================================
@@ -1049,153 +879,6 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 }
 
 // ============================================================================
-// Query execution
-// ============================================================================
-
-#[allow(clippy::disallowed_methods)] // Search result streaming; result set may be large, BufWriter for throughput
-fn run_query(
-    text: &str,
-    flags: &Flags,
-    analytics: &crate::analytics::AnalyticsConfig,
-) -> anyhow::Result<ExitCode> {
-    let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
-    std::fs::create_dir_all(&cache_dir)?;
-
-    // AD-403-6: degenerate --near diagnostic (fail loud, never silently — SEARCH-ADR-001).
-    // Emitted here on the text-query path ONLY (has_text is true by construction).
-    // Case (a): single-word query + --near N (N cannot constrain anything).
-    // Case (b): N < word_count - 1 (structurally unsatisfiable; returns empty results
-    // silently without this notice).  stderr only; exit 0.
-    if let Some(notice) = query::near_diagnostic_notice(flags.near, text) {
-        eprintln!("{notice}");
-    }
-
-    let config = types::QueryConfig {
-        text: text.to_string(),
-        limit: flags.limit,
-        // AD-372-3 / RESOLVED Decision 3: offset is applied AFTER verification in
-        // resolve_paths_and_snippets_verified (rank → verify → skip offset → take limit).
-        // On the exact-symbol path query.rs sets sq.offset=None so the reader returns
-        // the full ranked intersection; effective_offset from config.offset is then
-        // passed to the post-verify skip.  On the multi-word path offset is also
-        // applied post-verify (same code path).
-        offset: flags.offset,
-        json: flags.json,
-        root,
-        cache_dir,
-        phrase: flags.phrase,
-        near: flags.near,
-        lang: flags.lang,
-    };
-
-    let output = query::execute_query(&config, analytics)?;
-
-    // AD-404-11 / D-5: emit bounded-page notice when has_more is true.
-    // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
-    if output.has_more {
-        let page = config.page();
-        eprintln!(
-            "{}",
-            query::bounded_page_notice(output.total, page.offset(), page.limit())
-        );
-    }
-
-    let mut stdout = BufWriter::new(std::io::stdout());
-    if flags.json {
-        query::format_json_output(&output, &mut stdout)?;
-    } else {
-        query::format_text_output(&output, &mut stdout)?;
-    }
-    stdout.flush()?;
-
-    Ok(ExitCode::SUCCESS)
-}
-
-// ============================================================================
-// Help text
-// ============================================================================
-
-/// Full `skim search` help text.
-///
-/// Extracted to a `const` (from the old inline `println!` literal) so tests can
-/// assert its contents as a falsifiable unit test (PF-008 doc-drift guard).
-pub(super) const SEARCH_HELP_TEXT: &str = "\
-Usage: skim search [OPTIONS] [QUERY]
-
-Search code using layered n-gram BM25F indexing.
-
-Subcommands / modes:
-  (none)           Print this help message
-
-Options:
-  --build          Build the index incrementally (auto-build on first query)
-  --rebuild        Rebuild the index from scratch
-  --update         Refresh if index is stale (git HEAD changed)
-  --stats          Show index statistics
-  --install-hooks  Install git post-commit/merge hooks for auto-refresh.
-                   In a linked worktree, writes to the shared hooks dir
-                   (applies to all worktrees in the clone).
-  --remove-hooks   Remove skim git hooks. In a linked worktree, removes
-                   from the shared hooks dir (applies clone-wide).
-  --json, -j       Output results as JSON
-  --limit N, -n N  Maximum results to return (default: 20)
-  --offset N       Skip N verified results (pagination; default: 0)
-  --root PATH      Override project root (default: walk up to .git)
-  --               End of flags. All tokens after `--` are literal query text,
-                   even if they look like flags. Use this to search for
-                   dash-leading terms (e.g. `skim search -- -Werror`).
-                   Output flags (--json, --limit) must be placed BEFORE `--`.
-  -h, --help       Print this help message
-
-Positional query options:
-  --phrase         Require query words in order, adjacent (no gaps between tokens).
-                   Matching is case-sensitive and byte-exact. Punctuation is a word
-                   separator, so --phrase \"foo bar\" matches foo::bar() and foo bar.
-                   A single-word --phrase is a whole-word-exact search: --phrase alpha
-                   does NOT match 'alphabet'. Inert without a text query.
-
-  --near N         Require all query words within a window of N word tokens, in any
-                   order. N counts word tokens (not characters or lines). N >= 1.
-                   Example: --near 5 means the matched words span at most 5 positions.
-                   Inert without a text query.
-
-  --phrase --near N  Require query words in order (strictly ascending positions) AND
-                   total span ≤ N word tokens (same N as bare --near). Narrows
-                   --near N by additionally enforcing query word order; never grows
-                   the result set versus bare --near N.
-                   Identity: --phrase --near (k-1) == --phrase for a k-word query.
-                   Example: \"alpha beta gamma\" --phrase --near 4 matches if alpha,
-                   beta, and gamma appear in that order within 4 word-token positions.
-
-Language filter option:
-  --lang LANG      Filter results to files of a given language (e.g. --lang rust,
-                   --lang python). Accepted as language name or extension.
-
-Removed flags (each exits 2 and names its replacement):
-  --ast                        Use ast-grep for structural search
-  --hot, --cold, --risky       Use skim heatmap for churn and fix density
-  --blast-radius               Use skim heatmap, or git log --name-only -- FILE
-  --weights                    There is no fused ranking
-
-General examples:
-  skim search \"authenticate\"                Search for 'authenticate'
-  skim search --limit 5 \"parse_url\"         Return at most 5 results
-  skim search --json \"UserService\"          JSON output
-  skim search --build                       Build the search index
-  skim search --rebuild                     Rebuild from scratch
-  skim search --update                      Refresh stale index
-  skim search --stats                       Show index statistics
-  skim search --install-hooks               Install hooks (clone-wide in a linked worktree)";
-
-fn print_help() {
-    // AD-375-3: the `index` subcommand line was removed with #375 (avoids PF-008).
-    // `skim search index` now runs a QUERY for the word "index"; builds go through
-    // --build / --rebuild / --update (already documented in Options above).
-    // Body lives in SEARCH_HELP_TEXT so tests can assert it without driving the CLI.
-    println!("{SEARCH_HELP_TEXT}");
-}
-
-// ============================================================================
 // Shared JSON stats builder
 // ============================================================================
 
@@ -1422,719 +1105,6 @@ mod tests {
         assert_eq!(result, ExitCode::SUCCESS);
     }
 
-    /// AC6 (#375): `skim search index --help` now prints PARENT search help and
-    /// exits 0.  After removing the `index` positional intercept (AD-375-1, avoids
-    /// PF-006), the `--help` short-circuit at the top of `run()` fires before any
-    /// query dispatch, printing the parent help and returning SUCCESS.
-    ///
-    /// The deleted predecessor test (`test_index_help_dispatches_to_index_not_parent`)
-    /// asserted the opposite: that the positional intercept routes `index --help` to
-    /// `index::run` (which printed IndexCli help).  That premise is gone.
-    ///
-    /// Discriminating assertion (PF-007): `index --help` must exit SUCCESS AND the
-    /// parent-help marker "layered n-gram BM25F" must be present.  If the intercept
-    /// were restored, `index::run` would print IndexCli help (which does NOT contain
-    /// "layered n-gram BM25F") — the stdout assertion would fail.
-    #[test]
-    fn test_index_help_token_prints_parent_help() {
-        // Capture stdout by redirecting inside the test.  The easiest approach is to
-        // drive the subprocess surface (via skim_bin_path) so stdout is truly captured.
-        // The in-process `run()` call prints to stdout directly, so we use the binary.
-        let output = std::process::Command::new(skim_bin_path())
-            .args(["search", "index", "--help"])
-            .output()
-            .expect("skim binary must be invocable in test");
-
-        assert!(
-            output.status.success(),
-            "`skim search index --help` must exit 0; got: {:?}",
-            output.status
-        );
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Parent-only marker: present in mod.rs print_help but absent from IndexCli
-        // clap help (IndexCli about = "Build or update the search index for the
-        // current project.", no BM25F or n-gram language).
-        assert!(
-            stdout.contains("layered n-gram BM25F"),
-            "`skim search index --help` must print PARENT search help (containing \
-             'layered n-gram BM25F'), not IndexCli help; got stdout:\n{stdout}"
-        );
-        // Confirm IndexCli's about string is NOT present (proves parent help, not
-        // index-builder help, was rendered).
-        assert!(
-            !stdout.contains("Build or update the search index for the current project."),
-            "`skim search index --help` must NOT print IndexCli help; got stdout:\n{stdout}"
-        );
-    }
-
-    /// AC8 (#375): bareword 'index' is parsed as a query term, not a build action.
-    ///
-    /// Verifies that after removing the positional intercept (AD-375-1), `index`
-    /// in argv is accumulated into `query_parts` and dispatched as
-    /// `SearchAction::Query("index")`.  This is the parse_flags-layer discriminator:
-    /// if the intercept were restored the intercept fires before parse_flags and
-    /// this arm is unreachable via run() — but here we call parse_flags directly to
-    /// assert the dispatch-mapping invariant.
-    #[test]
-    fn test_bareword_index_is_parsed_as_query() {
-        let flags = parse_flags(&["index".to_string()]).unwrap();
-        // Discriminating assertion (PF-007): must be a Query action, not Build.
-        // If parse_flags somehow mapped "index" to SearchAction::Build, this fails.
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("index".to_string()),
-            "bareword 'index' must be accumulated into a query, not routed to the builder"
-        );
-    }
-
-    // ============================================================================
-    // parse_flags — action dispatch
-    // ============================================================================
-
-    #[test]
-    fn test_parse_flags_build() {
-        let flags = parse_flags(&["--build".to_string()]).unwrap();
-        assert_eq!(flags.action, SearchAction::Build);
-    }
-
-    #[test]
-    fn test_parse_flags_rebuild() {
-        let flags = parse_flags(&["--rebuild".to_string()]).unwrap();
-        assert_eq!(flags.action, SearchAction::Rebuild);
-    }
-
-    #[test]
-    fn test_stats_flag_parsed_correctly() {
-        let flags = parse_flags(&["--stats".to_string()]).unwrap();
-        assert_eq!(flags.action, SearchAction::Stats);
-    }
-
-    #[test]
-    fn test_install_hooks_flag_parsed() {
-        let flags = parse_flags(&["--install-hooks".to_string()]).unwrap();
-        assert_eq!(flags.action, SearchAction::InstallHooks);
-    }
-
-    #[test]
-    fn test_remove_hooks_flag_parsed() {
-        let flags = parse_flags(&["--remove-hooks".to_string()]).unwrap();
-        assert_eq!(flags.action, SearchAction::RemoveHooks);
-    }
-
-    // ============================================================================
-    // parse_flags — modifier flags
-    // ============================================================================
-
-    #[test]
-    fn test_parse_flags_limit() {
-        let flags = parse_flags(&["--limit".to_string(), "5".to_string()]).unwrap();
-        assert_eq!(flags.limit, 5);
-    }
-
-    #[test]
-    fn test_parse_flags_limit_equals() {
-        let flags = parse_flags(&["--limit=10".to_string()]).unwrap();
-        assert_eq!(flags.limit, 10);
-    }
-
-    #[test]
-    fn test_parse_flags_short_n() {
-        let flags = parse_flags(&["-n".to_string(), "3".to_string()]).unwrap();
-        assert_eq!(flags.limit, 3);
-    }
-
-    #[test]
-    fn test_parse_flags_json() {
-        let flags = parse_flags(&["--json".to_string()]).unwrap();
-        assert!(flags.json);
-    }
-
-    #[test]
-    fn test_parse_flags_offset_space() {
-        let flags = parse_flags(&["--offset".to_string(), "5".to_string()]).unwrap();
-        assert_eq!(flags.offset, Some(5));
-    }
-
-    #[test]
-    fn test_parse_flags_offset_equals() {
-        let flags = parse_flags(&["--offset=10".to_string()]).unwrap();
-        assert_eq!(flags.offset, Some(10));
-    }
-
-    #[test]
-    fn test_parse_flags_offset_zero() {
-        let flags = parse_flags(&["--offset".to_string(), "0".to_string()]).unwrap();
-        assert_eq!(flags.offset, Some(0));
-    }
-
-    #[test]
-    fn test_parse_flags_offset_default_is_none() {
-        let flags = parse_flags(&["--limit".to_string(), "5".to_string()]).unwrap();
-        assert_eq!(
-            flags.offset, None,
-            "offset must default to None when not supplied"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_offset_invalid_is_error() {
-        let err = parse_flags(&["--offset".to_string(), "abc".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("--offset"),
-            "error message must mention '--offset'; got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_root_space() {
-        let flags = parse_flags(&["--root".to_string(), "/tmp/proj".to_string()]).unwrap();
-        assert_eq!(flags.root_override, Some(PathBuf::from("/tmp/proj")));
-    }
-
-    #[test]
-    fn test_parse_flags_root_equals() {
-        let flags = parse_flags(&["--root=/tmp/other".to_string()]).unwrap();
-        assert_eq!(flags.root_override, Some(PathBuf::from("/tmp/other")));
-    }
-
-    // ============================================================================
-    // parse_flags — query text
-    // ============================================================================
-
-    #[test]
-    fn test_parse_flags_query_text() {
-        let flags = parse_flags(&["fn".to_string(), "parse_url".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("fn parse_url".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_combined_json_limit_query() {
-        let flags = parse_flags(&[
-            "--json".to_string(),
-            "--limit".to_string(),
-            "5".to_string(),
-            "authenticate".to_string(),
-        ])
-        .unwrap();
-        assert!(flags.json);
-        assert_eq!(flags.limit, 5);
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("authenticate".to_string())
-        );
-    }
-
-    // ============================================================================
-    // parse_flags — error cases
-    // ============================================================================
-
-    #[test]
-    fn test_parse_flags_limit_missing_value_is_error() {
-        let err = parse_flags(&["--limit".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("--limit requires a value"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_limit_non_numeric_is_error() {
-        let err = parse_flags(&["--limit".to_string(), "abc".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("positive integer"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_limit_equals_non_numeric_is_error() {
-        let err = parse_flags(&["--limit=abc".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("positive integer"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_root_missing_value_is_error() {
-        let err = parse_flags(&["--root".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--root requires"),
-            "unexpected error message: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_unrecognised_flag_is_error() {
-        let err = parse_flags(&["--unknown-flag".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unrecognised flag"),
-            "unexpected error message: {msg}"
-        );
-        // KNOWN_FLAGS completeness: the error message embeds KNOWN_FLAGS verbatim,
-        // so `-n` (the --limit short alias added in #412) must appear in the
-        // "Valid flags" listing.  A regression removing `-n` from KNOWN_FLAGS would
-        // make this test fail while all other assertions still pass.
-        assert!(
-            msg.contains("-n"),
-            "unrecognised-flag error must list -n in the valid-flags help text; got: {msg}"
-        );
-        // --help/-h must appear in the valid-flags listing so users see a complete
-        // picture of recognised tokens when they mistype a flag.
-        assert!(
-            msg.contains("--help"),
-            "unrecognised-flag error must list --help in the valid-flags help text; got: {msg}"
-        );
-    }
-
-    // ============================================================================
-    // AD-412-3: --help/-h must not be silently consumed as a flag value
-    // ============================================================================
-
-    /// `--limit --help`: `--help` must not be swallowed as the limit value.
-    #[test]
-    fn test_parse_flags_help_after_limit_is_not_consumed_as_value() {
-        let err = parse_flags(&["--limit".to_string(), "--help".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--limit requires a value"),
-            "AD-412-3: --help must not be silently consumed as the --limit value; got: {msg}"
-        );
-        assert!(
-            msg.contains("skim search --help"),
-            "error must point at the help surface; got: {msg}"
-        );
-    }
-
-    /// `--root --help`: `--help` must not be silently accepted as a directory path.
-    ///
-    /// Before the fix `--root --help` ran a real search rooted at the bogus
-    /// path "--help" with exit 0, which was the worst outcome (silent wrong
-    /// behavior).  After the fix it is a clear error.
-    #[test]
-    fn test_parse_flags_help_after_root_is_not_consumed_as_value() {
-        let err = parse_flags(&["--root".to_string(), "--help".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--root requires a value"),
-            "AD-412-3: --help must not be silently consumed as the --root path; got: {msg}"
-        );
-        assert!(
-            msg.contains("skim search --help"),
-            "error must point at the help surface; got: {msg}"
-        );
-    }
-
-    // ============================================================================
-    // AD-412-3: help-vs-error precedence (finding 5) — pin sequential behavior
-    // ============================================================================
-
-    /// `--badflag --help` → error, NOT help.
-    ///
-    /// Pre-delta (ad7b590), `run()` pre-scanned argv for `--help`/`-h` BEFORE
-    /// calling `parse_flags`, so a help request anywhere in argv — even after an
-    /// invalid flag — printed help and exited 0.
-    ///
-    /// Post-AD-412-3, `parse_flags` processes tokens sequentially: `--badflag`
-    /// hits the unrecognised-flag arm and errors before `--help` is reached.
-    /// This is consistent with #412's strict left-to-right direction and with
-    /// getopt semantics.  The test pins the new behaviour so any future regression
-    /// (restoring a pre-scan) is immediately detected (PF-007: discriminating).
-    #[test]
-    fn test_parse_flags_bad_flag_before_help_errors_not_help() {
-        let err = parse_flags(&["--badflag".to_string(), "--help".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        // Must error on the bad flag — NOT silently print help.
-        assert!(
-            msg.contains("unrecognised flag"),
-            "AD-412-3: --badflag before --help must produce an error (not help); got: {msg}"
-        );
-        // The error must name the offending token (PF-007: discriminating observable).
-        assert!(
-            msg.contains("--badflag"),
-            "error must name the unrecognised flag '--badflag'; got: {msg}"
-        );
-    }
-
-    /// `--limit xyz --help` → error (bad value wins, not help).
-    ///
-    /// The invalid value `xyz` triggers `parse_limit_value` to error before
-    /// `--help` is reached (another sequential-error-wins case).
-    #[test]
-    fn test_parse_flags_bad_limit_value_before_help_errors_not_help() {
-        let err = parse_flags(&[
-            "--limit".to_string(),
-            "xyz".to_string(),
-            "--help".to_string(),
-        ])
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("positive integer"),
-            "AD-412-3: bad --limit value before --help must produce a parse error; got: {msg}"
-        );
-    }
-
-    // ============================================================================
-    // Unknown single-dash flags rejected symmetrically (AC1, AC11)
-    // ============================================================================
-
-    /// AC1: -i is rejected with "unrecognised flag" (not folded into the query).
-    /// AC11: error message mentions the `--` escape hatch.
-    #[test]
-    fn test_parse_flags_unknown_short_flag_i_is_error() {
-        let err = parse_flags(&["-i".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unrecognised flag"),
-            "AC1: -i must produce 'unrecognised flag'; got: {msg}"
-        );
-        assert!(
-            msg.contains("--"),
-            "AC11: error message must mention the '--' escape hatch; got: {msg}"
-        );
-    }
-
-    /// AC1: -w is rejected symmetrically with long flags.
-    #[test]
-    fn test_parse_flags_unknown_short_flag_w_is_error() {
-        let err = parse_flags(&["-w".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("unrecognised flag"),
-            "AC1: -w must produce 'unrecognised flag'"
-        );
-    }
-
-    /// AC1: -C is rejected symmetrically with long flags.
-    #[test]
-    fn test_parse_flags_unknown_short_flag_c_is_error() {
-        let err = parse_flags(&["-C".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("unrecognised flag"),
-            "AC1: -C must produce 'unrecognised flag'"
-        );
-    }
-
-    // ============================================================================
-    // `--` end-of-flags separator (AC2, AC3, AC10)
-    // ============================================================================
-
-    /// AC2: `['--', '-i']` yields Query("-i") — separator drains following tokens verbatim.
-    #[test]
-    fn test_parse_flags_dashdash_before_short_flag_becomes_query() {
-        let flags = parse_flags(&["--".to_string(), "-i".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("-i".to_string()),
-            "AC2: ['--', '-i'] must yield Query(\"-i\")"
-        );
-    }
-
-    /// AC2: `['foo', '--', '--limit']` yields Query("foo --limit").
-    #[test]
-    fn test_parse_flags_query_then_dashdash_drains_flag_as_literal() {
-        let flags =
-            parse_flags(&["foo".to_string(), "--".to_string(), "--limit".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("foo --limit".to_string()),
-            "AC2: ['foo', '--', '--limit'] must yield Query(\"foo --limit\")"
-        );
-    }
-
-    /// AC2/AC3: `['--', '--rebuild']` yields Query("--rebuild") — no rebuild action fired.
-    #[test]
-    fn test_parse_flags_dashdash_before_action_flag_yields_query() {
-        let flags = parse_flags(&["--".to_string(), "--rebuild".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("--rebuild".to_string()),
-            "AC2/AC3: ['--', '--rebuild'] must yield Query(\"--rebuild\"); no rebuild action"
-        );
-    }
-
-    // ============================================================================
-    // AC10: bare `-` stays positional; dash-leading literals searchable via `--`
-    // ============================================================================
-
-    /// AC10: bare `-` (len == 1) is a valid query token, not a flag.
-    #[test]
-    fn test_parse_flags_bare_dash_is_positional() {
-        let flags = parse_flags(&["-".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("-".to_string()),
-            "AC10: bare '-' must be treated as a positional query token"
-        );
-    }
-
-    /// AC10: `['--', '->']` yields Query("->").
-    #[test]
-    fn test_parse_flags_dashdash_before_arrow_becomes_query() {
-        let flags = parse_flags(&["--".to_string(), "->".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("->".to_string()),
-            "AC10: ['--', '->'] must yield Query(\"->\")"
-        );
-    }
-
-    /// AC10: `['--', '-Werror']` yields Query("-Werror").
-    #[test]
-    fn test_parse_flags_dashdash_before_werror_becomes_query() {
-        let flags = parse_flags(&["--".to_string(), "-Werror".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("-Werror".to_string()),
-            "AC10: ['--', '-Werror'] must yield Query(\"-Werror\")"
-        );
-    }
-
-    /// AC10: `['--', '-5']` yields Query("-5").
-    #[test]
-    fn test_parse_flags_dashdash_before_negative_number_becomes_query() {
-        let flags = parse_flags(&["--".to_string(), "-5".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("-5".to_string()),
-            "AC10: ['--', '-5'] must yield Query(\"-5\")"
-        );
-    }
-
-    /// Only the first `--` is special; a second `--` becomes literal query text.
-    /// `['--', '--', 'x']` must yield Query("-- x") — the second `--` is drained
-    /// verbatim as a query token, not re-interpreted as a separator.
-    #[test]
-    fn test_parse_flags_second_dashdash_is_literal_query_text() {
-        let flags = parse_flags(&["--".to_string(), "--".to_string(), "x".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("-- x".to_string()),
-            "second '--' must be literal query text, not a separator; expected Query(\"-- x\")"
-        );
-    }
-
-    /// Trailing `--` with nothing after it drains an empty slice — must not panic
-    /// and must preserve any query tokens accumulated before the separator.
-    /// `['foo', '--']` must yield Query("foo").
-    #[test]
-    fn test_parse_flags_trailing_dashdash_yields_preceding_query() {
-        let flags = parse_flags(&["foo".to_string(), "--".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("foo".to_string()),
-            "trailing '--' with nothing after must yield Query(\"foo\"), not panic"
-        );
-    }
-
-    // ============================================================================
-    // Mixed-form hard error: action flag + query text (AC14)
-    // ============================================================================
-
-    /// AC14: `['foo', '--rebuild']` is rejected — cannot combine query and action flag.
-    #[test]
-    fn test_parse_flags_mixed_form_query_and_rebuild_is_error() {
-        let err = parse_flags(&["foo".to_string(), "--rebuild".to_string()]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("cannot combine"),
-            "AC14: mixed query+action must produce 'cannot combine'; got: {msg}"
-        );
-        assert!(
-            msg.contains("--"),
-            "AC14: error message must mention the '--' escape hatch; got: {msg}"
-        );
-    }
-
-    /// AC14: `['myterm', '--build']` is also rejected as mixed form.
-    #[test]
-    fn test_parse_flags_mixed_form_query_and_build_is_error() {
-        let err = parse_flags(&["myterm".to_string(), "--build".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("cannot combine"),
-            "AC14: query + --build must be rejected as mixed form"
-        );
-    }
-
-    /// AD-412-5: a whitespace-only positional combined with an action flag MUST
-    /// succeed (not error as mixed form).
-    ///
-    /// `validate_no_mixed_form` uses `.any(|p| !p.trim().is_empty())` so a
-    /// positional whose only content is whitespace is not counted as a real text
-    /// query.  `skim search "  " --rebuild` therefore dispatches to `Rebuild` and
-    /// silently discards the whitespace token — consistent with every downstream
-    /// dispatch site that trims before use.
-    ///
-    /// Discriminating coverage (avoids PF-007): a regression reverting the predicate
-    /// to `!query_parts.is_empty()` would restore the old `Err("cannot combine")`
-    /// and make this test fail, while the two non-whitespace tests above (`foo`,
-    /// `myterm`) continue to pass — so the stale guard cannot hide behind them.
-    #[test]
-    fn test_parse_flags_whitespace_only_positional_with_action_flag_succeeds() {
-        let flags = parse_flags(&["  ".to_string(), "--rebuild".to_string()]).unwrap();
-        assert_eq!(
-            flags.action,
-            SearchAction::Rebuild,
-            "AD-412-5: whitespace-only positional + --rebuild must yield Rebuild, \
-             not a mixed-form error"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_short_n_missing_value_is_error() {
-        let err = parse_flags(&["-n".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("--limit requires a value"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    // ============================================================================
-    // Regression: -j short alias for --json (issue mod.rs:136)
-    // ============================================================================
-
-    #[test]
-    fn test_parse_flags_short_j_sets_json() {
-        let flags = parse_flags(&["-j".to_string()]).unwrap();
-        assert!(flags.json, "-j must set json=true");
-    }
-
-    #[test]
-    fn test_parse_flags_short_j_combined_with_query() {
-        let flags = parse_flags(&["-j".to_string(), "authenticate".to_string()]).unwrap();
-        assert!(flags.json);
-        assert_eq!(
-            flags.action,
-            SearchAction::Query("authenticate".to_string())
-        );
-    }
-
-    // ============================================================================
-    // Regression: --limit 0 must be rejected (issue mod.rs:142)
-    // ============================================================================
-
-    #[test]
-    fn test_parse_flags_limit_zero_space_is_error() {
-        let err = parse_flags(&["--limit".to_string(), "0".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("--limit must be >= 1"),
-            "expected rejection of 0, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_limit_zero_equals_is_error() {
-        let err = parse_flags(&["--limit=0".to_string()]).unwrap_err();
-        assert!(
-            err.to_string().contains("--limit must be >= 1"),
-            "expected rejection of 0, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_flags_limit_one_is_valid() {
-        let flags = parse_flags(&["--limit".to_string(), "1".to_string()]).unwrap();
-        assert_eq!(flags.limit, 1);
-    }
-
-    // ── Removed flags ─────────────────────────────────────────────────────────
-
-    fn args(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// Each removed flag yields a one-line message that names the flag and the
-    /// replacement, so a reader knows what to run instead.
-    #[test]
-    fn removed_flag_message_names_flag_and_replacement() {
-        for (flag, advice) in REMOVED_FLAGS {
-            let message = removed_flag_message(flag)
-                .unwrap_or_else(|| panic!("{flag} must be refused as a removed flag"));
-            assert!(
-                message.starts_with("skim search: "),
-                "message must carry the program prefix: {message:?}"
-            );
-            assert!(
-                message.contains(flag) && message.contains(advice),
-                "message must name {flag} and its replacement {advice:?}: {message:?}"
-            );
-            assert!(!message.contains('\n'), "message must be one line");
-        }
-    }
-
-    /// The attached-value form (`--ast=x`) is refused too, and the attached text
-    /// never reaches the message.
-    #[test]
-    fn removed_flag_message_covers_attached_value_without_echoing_it() {
-        let message = removed_flag_message("--ast=try-catch\u{1b}[31m").unwrap();
-        assert!(message.contains("--ast was removed"), "got {message:?}");
-        assert!(
-            !message.contains("try-catch") && !message.contains('\u{1b}'),
-            "attached text must not reach the message: {message:?}"
-        );
-    }
-
-    /// Flags and words that only start like a removed flag are not refused.
-    #[test]
-    fn removed_flag_message_ignores_lookalikes() {
-        for arg in [
-            "--ast-grep",
-            "--hotfix",
-            "--weightsx",
-            "--root",
-            "ast",
-            "-hot",
-        ] {
-            assert_eq!(
-                removed_flag_message(arg),
-                None,
-                "{arg} is not a removed flag"
-            );
-        }
-    }
-
-    /// A removed flag ends parsing at once: a later bad value must not replace
-    /// the refusal with a different error.
-    #[test]
-    fn parse_flags_removed_flag_wins_over_later_tokens() {
-        let flags = parse_flags(&args(&["--ast", "try-catch", "--limit", "abc"])).unwrap();
-        assert!(
-            matches!(&flags.action, SearchAction::Removed(m) if m.contains("--ast")),
-            "expected a removal refusal, got {:?}",
-            flags.action
-        );
-    }
-
-    /// A removed flag after a text query still refuses; the query is not run.
-    #[test]
-    fn parse_flags_removed_flag_after_text_query_is_refused() {
-        let flags = parse_flags(&args(&["needle", "--hot"])).unwrap();
-        assert!(
-            matches!(&flags.action, SearchAction::Removed(m) if m.contains("--hot")),
-            "expected a removal refusal, got {:?}",
-            flags.action
-        );
-    }
-
-    /// After `--`, a removed flag name is query text, not a flag.
-    #[test]
-    fn parse_flags_removed_flag_name_after_double_dash_is_query_text() {
-        let flags = parse_flags(&args(&["--", "--ast"])).unwrap();
-        assert_eq!(flags.action, SearchAction::Query("--ast".to_string()));
-    }
-
-    /// The refusal exits 2, the code for a refused command line.
-    #[test]
-    fn removed_flag_exit_code_is_two() {
-        assert_eq!(REMOVED_FLAG_EXIT_CODE, 2);
-    }
-
     /// Shared git-repo helper — delegates to the canonical `staleness::create_real_git_repo`.
     /// Named identically to its counterpart in `staleness_tests.rs` so readers
     /// scanning the two test files see a single shared-helper relationship rather
@@ -2286,20 +1256,11 @@ mod tests {
 
         let cache_dir_display = cache_dir.display().to_string();
 
-        // A query must fail with an actionable error (AC-13).
-        let result = run(
-            &[
-                "zebra_widget".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-                "--limit".to_string(),
-                "2".to_string(),
-            ],
-            &TEST_ANALYTICS,
-        );
-
-        // AC-13: exit 1 (run() returns Err for unrecoverable open failures).
-        let err = result.unwrap_err();
+        // Opening the index must fail with an actionable error (AC-13). A query
+        // no longer opens the index; `--stats` and the index commands do.
+        let err = query::open_lexical_reader(&cache_dir)
+            .err()
+            .expect("T-13: a byte-flipped index.skpost must not open");
         let msg = format!("{err:#}");
 
         // AC-13 clause 1: error names the artifact directory.

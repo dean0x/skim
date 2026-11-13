@@ -20,6 +20,8 @@
 //! every helper will trigger an "unused" warning without this attribute.
 #![allow(dead_code)]
 
+pub mod search_repo;
+
 /// Build a `skim` command with analytics disabled — the safe default.
 ///
 /// Sets:
@@ -168,6 +170,7 @@ pub const SANDBOX_REMOVED_VARS: &[&str] = &[
     "SKIM_GEMINI_DIR",          // session-provider transcript dir (Gemini)
     "SKIM_CRUSH_DIR",           // session-provider transcript dir (Crush)
     "ANTHROPIC_API_KEY",        // rskim-tokens credential; a host key reaches the live API
+    "GIT_CEILING_DIRECTORIES",  // `skim search` root walk; a host value moves the root
 ];
 
 /// Env vars deliberately inherited from the host.
