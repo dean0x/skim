@@ -37,11 +37,14 @@ version: 9
 - **KB-INV-4** Every bound is a named constant. A bound that hides lines prints a note with exact counts and the remedy.
   Nothing is dropped without a count.
 - **KB-INV-5** Roles come from syntax. The `def` role reuses the `rskim-core` declaration rule (`Declaration.name_bytes`,
-  `DeclScan.truncated`, `Parser::parse_bounded`). A call is a hit in callee position. Calls are not split by definition:
-  a name with two or more definitions gets a note.
-- **KB-INV-6** A tracked path and the work tree are untrusted. `Containment` canonicalizes each parent folder, requires it
-  to stay inside the canonical root, and opens the file by that parent plus the file name with no link followed and no
-  block on a FIFO. The opened handle is checked before a byte is read.
+  `DeclScan.truncated`, `enclosing_declaration`). The parse is a plain `parse` with no time bound
+  (`Parser::parse_bounded` has no search caller); the parse budget counts files and bytes. A call is a hit in callee position. Calls are not split by
+  definition: a name with two or more definitions gets a note.
+- **KB-INV-6** A tracked path and the work tree are untrusted. `Containment` canonicalizes each parent folder once, before
+  any file is read, and requires it to stay inside the canonical root. It then opens the file by that canonical parent
+  plus the file name. Only the last part of the path is opened with no link followed (`O_NOFOLLOW`) and no block on a
+  FIFO. The parent folders are checked before the open, not at the open: a folder that another process replaces with a
+  link after the check is followed (the README names this limit). The opened handle is checked before a byte is read.
 - **KB-INV-7** Text output never prints a control byte or a bidi format control (U+202A to U+202E, U+2066 to U+2069) from
   a file name or a line (`render::quote_path`, `escape_text`). A file name that starts with a quote is C-quoted too, so no
   name looks like the quoted form of another. Letters of a right-to-left script print as they are. JSON keeps the serde
@@ -191,8 +194,9 @@ declaration; `call` when the identifier is in a callee position; `comment` or `s
 `text`. A hit with an identifier character before or after it, in an identifier query, is `partial` (decided from the
 line, no parse). `MAX_CALLEE_HOPS` = 8 and `MAX_IMPORT_HOPS` = 256 bound the ancestor walks.
 
-Known limit: a call written inside a macro argument (a Rust token tree) is labelled `ref`, because the tree has no call
-node there.
+A Rust macro argument is a flat token tree with no call node. There `is_macro_argument_callee` labels an identifier
+`call` when the next token is a parenthesised group and the token before it is not a definition keyword (`fn`,
+`struct`, `enum`, `union`, `trait`, `type`). Every other identifier in the token tree is `ref`.
 
 ## Rank (`rank.rs`)
 
@@ -300,4 +304,4 @@ plain repositories resolve the way git does). `resolve_repo_toplevel` is the sof
 ## Related
 
 - Feature knowledge `search-scoreboard`: the gate that judges this module, and its independent oracles.
-- Feature knowledge `symbol-read`: the declaration rule and `Parser::parse_bounded` that the `def` role reuses.
+- Feature knowledge `symbol-read`: the declaration rule that the `def` role reuses.

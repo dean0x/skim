@@ -19,11 +19,10 @@
 //! This crate depends on no `rskim-*` crate (`tests/independence.rs` checks
 //! every dependency table of its manifest), so nothing from skim's AST search
 //! stack — linearization, n-grams, the query engine, re-parse verification —
-//! can reach an answer. Not even skim's pattern catalog is an input: the
-//! oracle knows its own registry by pattern NAME ([`query_sources`],
-//! [`UNCOVERED`], [`coverage_of`]), and the scoreboard (`rskim-bench`) crosses
-//! it with the catalog it reads, so a catalog pattern with no oracle query is
-//! listed as uncovered instead of silently skipped. Where the oracle must
+//! can reach an answer. Not even a list of skim patterns is an input: the
+//! oracle keeps its own registry by pattern NAME ([`query_sources`],
+//! [`UNCOVERED`], [`coverage_of`]), and `rskim-bench` reads no list of skim
+//! patterns to cross it with. Where the oracle must
 //! agree with skim (the extension table, the AST-indexed language list, the
 //! size cap) it keeps its OWN copy with a citation, so a policy change on
 //! skim's side shows up as a scoreboard diff (the `oracle.rs` / `universe.rs`
