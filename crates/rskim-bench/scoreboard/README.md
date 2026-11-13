@@ -213,6 +213,13 @@ comes from `git grep -nw` at the pin plus a hand read of every line, never from 
 `[[refs]]` entries, 1 `[[clash]]` entry (a name with two definitions at the pin), 2 concept entries with `first`, and
 17 `[[stakes]]` entries (the same set of subjects on every corpus).
 
+The oracle reads `-w` as `rg -w` does (`compile_whole_word` in `src/scoreboard/oracle.rs`, its own copy of the rule): the
+pattern sits between two half word boundaries, and a word character is a character of the `regex` crate `\w`
+(letters, marks, decimal digits, connector punctuation, join controls). `git grep -w` takes each byte from 0x80 up as a
+non-word character, so on text that is not ASCII it gives other lines: it matches `cafe` in `cafeé`, and `rg -w` does
+not. A site that `git grep -nw` froze and the oracle rejects fails golden integrity (exit 2). Settle it by hand, not by
+a change to the oracle.
+
 | Table | Holds | Integrity (exit 2 when broken) |
 |---|---|---|
 | `[[refs]]` | `id`, `query` (a bare identifier), `def {path, line}`, `sites [{path, line, role}]`, `origin`. Every line that holds the name as a whole word, with its role: `def`, `call`, `ref`, `import`, `comment`, `string` or `text`. | The `sites` equal the whole-word line set of the query over the text universe at the pin, `def` is one of them, and at least one site has the role `call`. |

@@ -2,8 +2,8 @@
 //! scoreboard (#203).
 //!
 //! Deliberately independent of skim's code: nothing here imports a skim crate
-//! or a skim tokenizer. Where a rule must agree with skim (the word-character
-//! class, the `-t` type table, the `-g` glob rules), this module carries its
+//! or a skim tokenizer. Where a rule must agree with skim (the `-w` rule, the
+//! `-t` type table, the `-g` glob rules), this module carries its
 //! own copy, so a change on skim's side shows up as a scoreboard diff instead
 //! of silently flowing through.
 //!
@@ -87,115 +87,6 @@ pub fn ground_truth<'a>(
 }
 
 // ============================================================================
-// Whole-word lines (the `-w` boundary rule)
-// ============================================================================
-
-/// The word-character class of the `-w` boundary rule:
-/// `[\p{Alphabetic}\p{Nd}_]`.
-const WORD_CHAR_CLASS: &str = r"[\p{Alphabetic}\p{Nd}_]";
-
-/// Whole-word matching of a literal over lines, the ground truth for a
-/// `-w` search. A match is a whole word iff the character before it and the
-/// character after it (if any) are not word characters
-/// (`WORD_CHAR_CLASS`). The literal is compared case-sensitively and
-/// byte for byte, never as a regex.
-///
-/// Limit: for a literal that starts or ends with a non-word character this
-/// rule can differ from `rg -w`. Golden queries for the whole-word tables are
-/// bare identifiers, and the golden integrity checks refuse any other query.
-#[derive(Debug, Clone)]
-pub struct WholeWord {
-    class: Regex,
-}
-
-impl WholeWord {
-    /// Build the matcher.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the word-character class does not compile.
-    pub fn new() -> anyhow::Result<Self> {
-        Ok(WholeWord {
-            class: Regex::new(WORD_CHAR_CLASS)?,
-        })
-    }
-
-    fn is_word_char(&self, c: char) -> bool {
-        let mut buf = [0u8; 4];
-        self.class.is_match(c.encode_utf8(&mut buf))
-    }
-
-    /// Whether `line` holds `word` as a whole word. An empty `word` never
-    /// matches. Overlapping occurrences are all tried.
-    pub fn in_line(&self, line: &str, word: &str) -> bool {
-        if word.is_empty() {
-            return false;
-        }
-        self.any_bounded(line, |from| {
-            line[from..]
-                .find(word)
-                .map(|rel| (from + rel, from + rel + word.len()))
-        })
-    }
-
-    /// Whether the match `start..end` of `line` has no word character right
-    /// before it and none right after it.
-    fn bounded(&self, line: &str, start: usize, end: usize) -> bool {
-        let before_ok = line[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !self.is_word_char(c));
-        let after_ok = line[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !self.is_word_char(c));
-        before_ok && after_ok
-    }
-
-    /// Whether some match of `line` is [`bounded`](Self::bounded). `find(from)`
-    /// returns the leftmost match that starts at or after the byte `from`.
-    /// After a rejected match the search resumes one character past its start,
-    /// so overlapping matches are all tried. Every step moves `from` forward,
-    /// so the loop ends within `line.len() + 1` steps.
-    fn any_bounded(&self, line: &str, find: impl Fn(usize) -> Option<(usize, usize)>) -> bool {
-        let mut from = 0;
-        while let Some((start, end)) = find(from) {
-            if self.bounded(line, start, end) {
-                return true;
-            }
-            // Step one character on (not one byte, to stay on a boundary).
-            let Some(next) = line[start..].chars().next() else {
-                return false;
-            };
-            from = start + next.len_utf8();
-        }
-        false
-    }
-
-    /// Every `(path, 1-based line)` over `files` whose line holds `word` as
-    /// a whole word. Lines are split on `\n` only (the line number is 1 + the
-    /// count of `\n` bytes before the line).
-    pub fn lines<'a>(
-        &self,
-        files: impl IntoIterator<Item = (&'a str, &'a str)>,
-        word: &str,
-    ) -> BTreeSet<(String, u32)> {
-        let mut out = BTreeSet::new();
-        for (path, text) in files {
-            for (idx, line) in text.split('\n').enumerate() {
-                let Ok(number) = u32::try_from(idx + 1) else {
-                    break;
-                };
-                if self.in_line(line, word) {
-                    out.insert((path.to_string(), number));
-                }
-            }
-        }
-        out
-    }
-}
-
-// ============================================================================
 // Line-level ground truth (literal and regex lines, the `rg` flag set)
 // ============================================================================
 
@@ -207,14 +98,6 @@ pub enum LineMode {
     Literal { case_insensitive: bool, word: bool },
     /// The pattern is a regex (`-E`).
     Regex { case_insensitive: bool, word: bool },
-}
-
-impl LineMode {
-    fn word(self) -> bool {
-        match self {
-            LineMode::Literal { word, .. } | LineMode::Regex { word, .. } => word,
-        }
-    }
 }
 
 /// Whether a search ignores case. `-i` always does. `-S` (smart case) does
@@ -235,16 +118,11 @@ enum Finder {
 }
 
 impl Finder {
-    /// The leftmost match that starts at or after the byte `from` (a
-    /// character boundary of `line`), as `(start, end)`. `from` may equal
-    /// `line.len()`: an empty match can sit at the end of the line. A regex
-    /// reads the whole `line` for context, so `^` stays at the line start.
-    fn find_from(&self, line: &str, from: usize) -> Option<(usize, usize)> {
+    /// Whether `line` holds a match.
+    fn is_match(&self, line: &str) -> bool {
         match self {
-            Finder::Exact(text) => line[from..]
-                .find(text.as_str())
-                .map(|rel| (from + rel, from + rel + text.len())),
-            Finder::Pattern(re) => re.find_at(line, from).map(|m| (m.start(), m.end())),
+            Finder::Exact(text) => line.contains(text.as_str()),
+            Finder::Pattern(re) => re.is_match(line),
         }
     }
 }
@@ -259,12 +137,11 @@ impl Finder {
 ///   turns `-i` and `-S` into that switch.
 /// - The unit is a line. A line is a hit when it holds a match. An
 ///   empty-match regex matches every line.
-/// - With `word`, a match counts only when the character before it and the
-///   one after it (if any) are not in `[\p{Alphabetic}\p{Nd}_]`. This is a
-///   post-filter: the leftmost match at each start is tried in turn, and a
-///   match that fails the filter is dropped. Limit: for a pattern that starts
-///   or ends with a non-word character, or that can match at more than one
-///   length from one start, this can differ from `rg -w`.
+/// - With `word`, the lines are those that `rg -nw` prints: the `-w` rule is
+///   part of the compiled pattern (see `compile_whole_word`), so a pattern with
+///   more than one possible match is searched for a match that meets the rule.
+///   `git grep -nw` gives other lines on text that is not ASCII; the oracle
+///   follows `rg`.
 ///
 /// Limit: the engine and this oracle both use the regex crate. The frozen hit
 /// lists in this module's tests guard against a fault in that crate.
@@ -273,8 +150,6 @@ pub struct LineQuery {
     raw: String,
     mode: LineMode,
     finder: Finder,
-    /// Set exactly when the mode asks for whole words.
-    boundary: Option<WholeWord>,
 }
 
 impl LineQuery {
@@ -292,27 +167,38 @@ impl LineQuery {
             }
             LineMode::Literal {
                 case_insensitive: false,
-                ..
+                word: false,
             } => Finder::Exact(pattern.to_string()),
             LineMode::Literal {
-                case_insensitive: true,
-                ..
-            } => Finder::Pattern(compile_pattern(&regex::escape(pattern), true)?),
+                case_insensitive,
+                word,
+            } => Finder::Pattern(compile(&regex::escape(pattern), case_insensitive, word)?),
             LineMode::Regex {
-                case_insensitive, ..
-            } => Finder::Pattern(compile_pattern(pattern, case_insensitive)?),
-        };
-        let boundary = if mode.word() {
-            Some(WholeWord::new()?)
-        } else {
-            None
+                case_insensitive,
+                word,
+            } => Finder::Pattern(compile(pattern, case_insensitive, word)?),
         };
         Ok(LineQuery {
             raw: pattern.to_string(),
             mode,
             finder,
-            boundary,
         })
+    }
+
+    /// The query for a bare identifier as `rg -nwF` reads it: a case-sensitive
+    /// literal that counts only as a whole word.
+    ///
+    /// # Errors
+    ///
+    /// `word` is empty.
+    pub fn whole_word(word: &str) -> anyhow::Result<Self> {
+        Self::new(
+            word,
+            LineMode::Literal {
+                case_insensitive: false,
+                word: true,
+            },
+        )
     }
 
     /// The pattern as given.
@@ -327,10 +213,16 @@ impl LineQuery {
 
     /// Whether `line` (without its `\n`) is a hit.
     pub fn matches_line(&self, line: &str) -> bool {
-        match &self.boundary {
-            None => self.finder.find_from(line, 0).is_some(),
-            Some(boundary) => boundary.any_bounded(line, |from| self.finder.find_from(line, from)),
-        }
+        self.finder.is_match(line)
+    }
+}
+
+/// Compile `pattern`, under the `-w` rule when `word` is set.
+fn compile(pattern: &str, case_insensitive: bool, word: bool) -> anyhow::Result<Regex> {
+    if word {
+        compile_whole_word(pattern, case_insensitive)
+    } else {
+        compile_pattern(pattern, case_insensitive)
     }
 }
 
@@ -339,6 +231,40 @@ fn compile_pattern(pattern: &str, case_insensitive: bool) -> anyhow::Result<Rege
         .case_insensitive(case_insensitive)
         .build()
         .map_err(|e| anyhow::anyhow!("pattern {pattern:?} does not compile: {e}"))
+}
+
+/// Compile `source` under the `-w` rule of `rg`: the pattern between a
+/// start-half and an end-half word boundary, in a group of its own so that a
+/// top-level alternation stays inside it:
+/// `\b{start-half}(?:SOURCE)\b{end-half}`.
+///
+/// ripgrep 14 and later build the rule this way (15.2.0 checked). This is the
+/// oracle's own copy of that construction. Each assertion reads the one
+/// character next to the match, so:
+///
+/// - the engine looks for a match that meets the rule: `foo|foobar` matches in
+///   `foobar`;
+/// - a pattern that starts or ends with a non-word character is read at the
+///   character next to the match.
+///
+/// A word character is a character of the regex crate's Unicode `\w`: letters,
+/// marks, decimal digits, connector punctuation and join controls.
+/// `git grep -w` takes each byte from 0x80 up as a non-word character, so it
+/// matches `cafe` in `cafeé`; `rg -w` does not, and the oracle follows `rg`.
+///
+/// `source` compiles alone first. Wrapped, a pattern such as `a)(b` would read
+/// as the valid group `(?:a)(b)`. A `(?x)` pattern that ends with a comment
+/// would take the closing parenthesis into the comment; the second form ends
+/// the comment with a line break, which `(?x)` mode ignores.
+fn compile_whole_word(source: &str, case_insensitive: bool) -> anyhow::Result<Regex> {
+    compile_pattern(source, case_insensitive)?;
+    let wrapped = |line_break: &str| {
+        compile_pattern(
+            &format!(r"\b{{start-half}}(?:{source}{line_break})\b{{end-half}}"),
+            case_insensitive,
+        )
+    };
+    wrapped("").or_else(|first| wrapped("\n").map_err(|_| first))
 }
 
 /// The lines of `text` as `rg` reads them, with 1-based numbers. Lines split
@@ -490,13 +416,7 @@ pub fn simulate_rg_word<'a>(
     files: impl IntoIterator<Item = (&'a str, &'a str)>,
     word: &str,
 ) -> anyhow::Result<RgSimulation> {
-    let query = LineQuery::new(
-        word,
-        LineMode::Literal {
-            case_insensitive: false,
-            word: true,
-        },
-    )?;
+    let query = LineQuery::whole_word(word)?;
     Ok(render_rg(files, |line| query.matches_line(line)))
 }
 
@@ -1191,13 +1111,13 @@ mod tests {
 
     // --- whole-word lines -----------------------------------------------------
 
-    fn ww() -> WholeWord {
-        WholeWord::new().unwrap()
+    fn ww(word: &str) -> LineQuery {
+        LineQuery::whole_word(word).unwrap()
     }
 
     #[test]
     fn a_word_between_non_word_characters_is_a_whole_word() {
-        let w = ww();
+        let q = ww("foo");
         for line in [
             "foo",
             "foo()",
@@ -1207,13 +1127,13 @@ mod tests {
             "::foo::bar",
             "\tfoo\r",
         ] {
-            assert!(w.in_line(line, "foo"), "{line:?}");
+            assert!(q.matches_line(line), "{line:?}");
         }
     }
 
     #[test]
     fn a_word_next_to_a_letter_digit_or_underscore_is_not_a_whole_word() {
-        let w = ww();
+        let q = ww("foo");
         for line in [
             "foobar",
             "barfoo",
@@ -1225,41 +1145,38 @@ mod tests {
             "foo\u{e9}",
             "\u{663}foo",
         ] {
-            assert!(!w.in_line(line, "foo"), "{line:?}");
+            assert!(!q.matches_line(line), "{line:?}");
         }
     }
 
     #[test]
     fn a_later_whole_word_counts_when_an_earlier_occurrence_is_inside_a_longer_word() {
-        let w = ww();
-        assert!(w.in_line("foobar foo", "foo"));
-        assert!(w.in_line("xfoo foo!", "foo"));
-        assert!(!w.in_line("foobar xfoo", "foo"));
+        let q = ww("foo");
+        assert!(q.matches_line("foobar foo"));
+        assert!(q.matches_line("xfoo foo!"));
+        assert!(!q.matches_line("foobar xfoo"));
     }
 
     #[test]
     fn overlapping_occurrences_are_all_tried() {
-        let w = ww();
         // "aa" starts at 0 (a letter follows) and at 1 (a letter precedes):
         // neither is a whole word.
-        assert!(!w.in_line("aaa-", "aa"));
+        assert!(!ww("aa").matches_line("aaa-"));
         // "a-a" starts at 1 (a letter precedes) and, overlapping it, at 3
         // ('-' precedes, the line ends): only the second is a whole word.
-        assert!(w.in_line("xa-a-a", "a-a"));
+        assert!(ww("a-a").matches_line("xa-a-a"));
     }
 
     #[test]
     fn matching_is_case_sensitive_and_literal() {
-        let w = ww();
-        assert!(!w.in_line("Foo", "foo"));
-        assert!(!w.in_line("foo", "f.o"), "the word is not a regex");
-        assert!(w.in_line("a.b", "a.b"));
+        assert!(!ww("foo").matches_line("Foo"));
+        assert!(!ww("f.o").matches_line("foo"), "the word is not a regex");
+        assert!(ww("a.b").matches_line("a.b"));
     }
 
     #[test]
-    fn an_empty_word_never_matches() {
-        assert!(!ww().in_line("anything", ""));
-        assert!(ww().lines([("a.rs", "x\n")], "").is_empty());
+    fn an_empty_word_is_refused() {
+        assert!(LineQuery::whole_word("").is_err());
     }
 
     #[test]
@@ -1269,7 +1186,7 @@ mod tests {
             ("b.txt", "nothing\nfoo\n"),
             ("c.rs", "foo_bar\n"),
         ];
-        let got = ww().lines(files, "foo");
+        let got = line_truth(files, &ww("foo"));
         let want: BTreeSet<(String, u32)> = [("a.rs", 1), ("a.rs", 3), ("b.txt", 2)]
             .into_iter()
             .map(|(p, l)| (p.to_string(), l))
@@ -1279,7 +1196,7 @@ mod tests {
 
     #[test]
     fn a_crlf_line_keeps_its_line_number() {
-        let got = ww().lines([("w.rs", "x\r\nfoo\r\ny")], "foo");
+        let got = line_truth([("w.rs", "x\r\nfoo\r\ny")], &ww("foo"));
         assert_eq!(
             got.into_iter().collect::<Vec<_>>(),
             [("w.rs".to_string(), 2)]
@@ -1430,18 +1347,6 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_word_literal_agrees_with_the_whole_word_oracle() {
-        let ww = WholeWord::new().unwrap();
-        for word in ["run", "running", "Run", "run_all"] {
-            assert_eq!(
-                truth(word, literal(false, true)),
-                ww.lines(LINE_FIXTURE, word),
-                "{word}"
-            );
-        }
-    }
-
-    #[test]
     fn smart_case_is_insensitive_only_for_a_pattern_without_an_uppercase_character() {
         for (pattern, ignore_case, smart_case, want) in [
             ("run", false, false, false),
@@ -1498,11 +1403,130 @@ mod tests {
     }
 
     #[test]
-    fn a_regex_anchor_stays_at_the_line_start_after_a_rejected_match() {
-        // `^.` matches `-` at 0, which has a word character after it. The
-        // search then resumes at 1, where `^` cannot match. (Run on the slice
-        // `a-` it would match `a`, a whole word between `-` and `-`.)
+    fn a_regex_anchor_stays_at_the_line_start_under_the_whole_word_rule() {
+        // `^.` matches `-` at 0, which has a word character after it, and
+        // matches nowhere else. (Run on the slice `a-` it would match `a`, a
+        // whole word between `-` and `-`.)
         assert!(!lq("^.", regex_mode(false, true)).matches_line("-a-"));
+    }
+
+    /// Assert each `(line, expected)` pair against `query.matches_line`.
+    fn assert_lines(query: &LineQuery, table: &[(&str, bool)]) {
+        for &(line, expected) in table {
+            assert_eq!(query.matches_line(line), expected, "line {line:?}");
+        }
+    }
+
+    // The next four tables are frozen from `rg -nw` (ripgrep 15.2.0) over
+    // these lines. They were not derived by running the oracle.
+
+    #[test]
+    fn a_whole_word_pattern_that_starts_with_a_non_word_character_reads_the_character_before_it() {
+        // `rg -nwF -e '-foo'`: the rule reads the character before the match,
+        // not the first character of the pattern.
+        assert_lines(
+            &lq("-foo", literal(false, true)),
+            &[
+                ("-foo", true),
+                ("a -foo b", true),
+                ("x-foo", false),
+                ("-foobar", false),
+                ("-foo_", false),
+                ("-foo-", true),
+                (".-foo", true),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_whole_word_pattern_that_ends_with_a_non_word_character_reads_the_character_after_it() {
+        // `rg -nwF -e 'foo('`.
+        assert_lines(
+            &lq("foo(", literal(false, true)),
+            &[
+                ("foo(", true),
+                ("foo(x", false),
+                ("a foo( b", true),
+                ("xfoo(", false),
+                ("foo(1)", false),
+                ("foo( ", true),
+                ("(foo(", true),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_whole_word_alternation_may_take_its_longer_branch() {
+        // `rg -nw 'foo|foobar'`: `foo` fails the rule at the start of
+        // `foobar`, and the longer branch is still tried.
+        assert_lines(
+            &lq("foo|foobar", regex_mode(false, true)),
+            &[
+                ("foobar", true),
+                ("foo", true),
+                ("foo bar", true),
+                ("xfoo foo_", false),
+            ],
+        );
+        // `rg -nwF 'foo|foobar'` reads the bar as text.
+        assert_lines(
+            &lq("foo|foobar", literal(false, true)),
+            &[("foobar", false), ("x foo|foobar y", true)],
+        );
+    }
+
+    #[test]
+    fn a_whole_word_reads_the_word_characters_of_rg() {
+        // `rg -nwF -e cafe`: letters, digits, marks, connector punctuation and
+        // join controls are word characters. `git grep -nwF cafe` reads each
+        // byte from 0x80 up as a non-word character and so differs on the
+        // non-ASCII rows.
+        assert_lines(
+            &lq("cafe", literal(false, true)),
+            &[
+                ("caf\u{e9} cafe!", true),
+                ("cafe", true),
+                ("cafe\u{e9}", false),
+                ("cafe\u{663}", false),
+                ("cafe\u{301}", false),
+                ("cafe\u{203f}", false),
+                ("cafe\u{200d}", false),
+                ("\u{e9}_cafe", false),
+            ],
+        );
+    }
+
+    #[test]
+    fn every_pattern_mode_reads_the_same_word_characters() {
+        // One wrapper serves all modes. These rows follow from the `regex`
+        // crate's `\w`; they are not frozen from `rg`.
+        for mode in [literal(true, true), regex_mode(false, true)] {
+            assert_lines(
+                &lq("cafe", mode),
+                &[
+                    ("cafe!", true),
+                    ("cafe\u{301}", false),
+                    ("\u{203f}cafe", false),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn a_whole_word_regex_that_does_not_compile_alone_is_refused() {
+        // `a)(b` closes and opens a group. Wrapped, it would read as the valid
+        // `(?:a)(b)`, so the pattern is compiled alone first.
+        let err = LineQuery::new("a)(b", regex_mode(false, true)).unwrap_err();
+        assert!(err.to_string().contains("\"a)(b\""), "{err}");
+    }
+
+    #[test]
+    fn a_whole_word_extended_regex_may_end_in_a_comment() {
+        // In `(?x)` mode a `#` comment runs to the end of the line, and the
+        // wrapper must not close its group inside it. This row follows from
+        // the `regex` crate's syntax; it is not frozen from `rg`.
+        let q = lq("(?x) foo # the word", regex_mode(false, true));
+        assert_lines(&q, &[("a foo b", true), ("afoo b", false)]);
     }
 
     #[test]

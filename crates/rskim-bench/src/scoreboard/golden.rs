@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 
 use crate::scoreboard::MAX_PAGES;
 use crate::scoreboard::oracle::{
-    LangFilter, LexicalQuery, LineMode, LineQuery, PathFilter, WholeWord, ground_truth,
-    is_case_insensitive, line_truth,
+    LangFilter, LexicalQuery, LineMode, LineQuery, PathFilter, ground_truth, is_case_insensitive,
+    line_truth,
 };
 use crate::scoreboard::types::{CheckId, EntryKind, Role};
 use crate::scoreboard::universe::TextUniverse;
@@ -826,14 +826,13 @@ fn non_blank(query: &str) -> anyhow::Result<()> {
 /// How many offending sites one violation message names.
 const SITES_SHOWN: usize = 5;
 
-/// The line at `path:line` in the text universe must hold `query` as a
-/// whole word.
+/// The line at `path:line` in the text universe must hold the query of `word`
+/// as a whole word.
 fn check_word_line(
     universe: &TextUniverse,
-    word: &WholeWord,
+    word: &LineQuery,
     path: &str,
     line: u32,
-    query: &str,
 ) -> anyhow::Result<()> {
     let text = universe.text(path).with_context(|| {
         format!("{path}:{line} is not in the oracle's text universe at the pinned commit")
@@ -844,8 +843,9 @@ fn check_word_line(
         .nth(idx)
         .with_context(|| format!("{path} has no line {line}"))?;
     anyhow::ensure!(
-        word.in_line(held, query),
-        "{path}:{line} does not contain {query:?} as a whole word (line is {held:?})"
+        word.matches_line(held),
+        "{path}:{line} does not contain {:?} as a whole word (line is {held:?})",
+        word.raw()
     );
     Ok(())
 }
@@ -853,11 +853,13 @@ fn check_word_line(
 /// A `[[refs]]` or `[[clash]]` query is a bare identifier: Unicode letters and
 /// digits (`char::is_alphanumeric`) and underscore.
 ///
-/// The oracle's word class is Unicode (`[\p{Alphabetic}\p{Nd}_]`). `git grep
-/// -w`, which froze the sites, counts only ASCII letters, digits and
-/// underscore as word characters. The oracle's word set contains git's, so a
-/// line that git froze and the oracle rejects is an integrity violation
-/// (exit 2), not a silent pass.
+/// The oracle reads `-w` as `rg -w` does: a word character is a character of
+/// the regex crate's Unicode `\w` (letters, marks, decimal digits, connector
+/// punctuation and join controls). `git grep -w`, which froze the sites,
+/// counts only ASCII letters, digits and underscore as word characters. The
+/// oracle's word set contains git's, so a line that git froze and the oracle
+/// rejects (a match next to a combining mark, for example) is an integrity
+/// violation (exit 2), not a silent pass.
 fn check_identifier(query: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !query.is_empty() && query.chars().all(|c| c == '_' || c.is_alphanumeric()),
@@ -891,10 +893,9 @@ fn check_ident(e: &IdentEntry, universe: Option<&TextUniverse>) -> anyhow::Resul
     );
     check_word_line(
         universe,
-        &WholeWord::new()?,
+        &LineQuery::whole_word(&e.query)?,
         &e.def.path,
         e.def.line,
-        &e.query,
     )
 }
 
@@ -952,9 +953,9 @@ fn check_refs(e: &RefsEntry, universe: Option<&TextUniverse>) -> anyhow::Result<
     let Some(universe) = universe else {
         return Ok(());
     };
-    let word = WholeWord::new()?;
-    check_word_line(universe, &word, &e.def.path, e.def.line, &e.query)?;
-    let truth = word.lines(universe.files(), &e.query);
+    let word = LineQuery::whole_word(&e.query)?;
+    check_word_line(universe, &word, &e.def.path, e.def.line)?;
+    let truth = line_truth(universe.files(), &word);
     let missing: Vec<&(String, u32)> = truth.difference(&frozen).collect();
     let extra: Vec<&(String, u32)> = frozen.difference(&truth).collect();
     let mut problems = Vec::new();
@@ -1025,12 +1026,12 @@ fn check_clash(e: &ClashEntry, universe: Option<&TextUniverse>) -> anyhow::Resul
     let Some(universe) = universe else {
         return Ok(());
     };
-    let word = WholeWord::new()?;
+    let word = LineQuery::whole_word(&e.query)?;
     for d in &e.defs {
-        check_word_line(universe, &word, &d.path, d.line, &e.query)?;
+        check_word_line(universe, &word, &d.path, d.line)?;
     }
     for c in &e.calls {
-        check_word_line(universe, &word, &c.path, c.line, &e.query)?;
+        check_word_line(universe, &word, &c.path, c.line)?;
     }
     Ok(())
 }

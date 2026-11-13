@@ -1130,6 +1130,31 @@ fn a_refs_site_on_a_line_without_the_whole_word_is_a_violation() {
 }
 
 #[test]
+fn a_refs_site_next_to_a_combining_mark_is_not_a_whole_word_line() {
+    // `rg -nw` reads a combining mark as a word character, so `run` is not a
+    // whole word on line 2. `git grep -nw` reads the mark as a non-word byte
+    // and would freeze that line; the integrity check refuses it.
+    let repo = FixtureRepo::new();
+    repo.write("src/a.rs", "pub fn run() {}\nfn run\u{301}() {}\nrun();\n");
+    let sha = repo.commit_all("init");
+    let u = universe_of(&repo);
+    let sites = |with_marked_line: bool| {
+        let mut sites = vec![("src/a.rs", 1, "def"), ("src/a.rs", 3, "call")];
+        if with_marked_line {
+            sites.push(("src/a.rs", 2, "ref"));
+        }
+        check_against(&u, &sha, &refs("skim-R1", "run", ("src/a.rs", 1), &sites))
+    };
+    assert!(sites(false).is_empty());
+    let v = sites(true);
+    let message = message_of(&v, "skim-R1");
+    assert!(
+        message.contains("not a whole-word line") && message.contains("src/a.rs:2"),
+        "{v:?}"
+    );
+}
+
+#[test]
 fn a_refs_site_outside_the_universe_is_a_violation() {
     let v = word_violations(&refs(
         "skim-R1",

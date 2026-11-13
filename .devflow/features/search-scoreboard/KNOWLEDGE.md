@@ -104,7 +104,9 @@ be pagination entries. `lexical.silent_fn` fails when a ground-truth file is mis
 ### Frozen answers (#540): `[[refs]]`, `[[clash]]`, `[[stakes]]`, concept `first`, the text universe
 
 Every frozen set comes from `git grep -nw` at the pin plus a hand read of each line. Golden integrity (exit 2) checks
-the sets against the oracle, so a missing or an extra site cannot move the target. Each corpus holds 3+ `[[refs]]`
+the sets against the oracle, so a missing or an extra site cannot move the target. The oracle reads `-w` as `rg -w`
+does; `git grep -w` takes each byte from 0x80 up as a non-word character, so a site that git froze next to a mark or a
+connector character fails integrity and is settled by hand. Each corpus holds 3+ `[[refs]]`
 (ids `<corpus>-R<nn>`), 1 `[[clash]]` (`-D<nn>`; skim's is `run_parsed_command`, two definitions), 2 concept entries with
 `first`, and 17 `[[stakes]]` (`-Q01` a zero-hit query with `exit = 1`; `-Q02` a match with `exit = 0`; `-Q03` the
 conflicting flags `-F -E` with `exit = 2`; `-Q04`..`-Q17` flag cases that expect `files`, `lines` or `counts`, built
@@ -178,7 +180,8 @@ needs a reason. Fix the mismatch instead: the oracle reproduces the engine's uni
 Nothing on the scoring path may import skim's search code. Where an oracle must agree with skim it keeps **its own
 cited copy**, so a policy change on skim's side shows up as a scoreboard diff instead of flowing through silently:
 
-- `oracle.rs`: the word-character class, the `rg` `-t` type table and the `-g` glob subset, `LANGS`;
+- `oracle.rs`: the `-w` rule (`compile_whole_word`: `\b{start-half}(?:PATTERN)\b{end-half}` with the `regex` crate `\w`,
+  as `rg` 14+ builds it), the `rg` `-t` type table and the `-g` glob subset, `LANGS`;
 - `universe.rs`: `MAX_FILE_BYTES` (5 MiB), the left-out reasons, the hidden-component rule for untracked files;
 - `rskim-oracle`: `structural.rs` carries the language table (`OracleLang`, `classify`, `EXT_CLASSES`).
 
