@@ -287,3 +287,48 @@ fn query_leaves_old_hooks_and_old_index_data_unchanged() {
         "a query changed the cache folder"
     );
 }
+
+/// `skim --clear-cache` removes the old index files and says what it left. The
+/// note about the entries that stay is the only disclosure of them.
+#[test]
+fn clear_cache_removes_old_index_files_and_says_what_it_left_in_place() {
+    let cache = tempfile::tempdir().unwrap();
+    let search = cache.path().join("search");
+    let shard = search.join("0123456789abcdef");
+    fs::create_dir_all(&shard).unwrap();
+    for name in [
+        "index.skidx",
+        "temporal.db",
+        "temporal.db-wal",
+        ".tmpAb12Z9",
+    ] {
+        fs::write(shard.join(name), name.as_bytes()).unwrap();
+    }
+    fs::write(shard.join("notes.txt"), b"mine").unwrap();
+    fs::write(search.join("stray.txt"), b"mine too").unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("--clear-cache")
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed old search index data (1 folders, 0.0 MB)",
+        ))
+        .stderr(predicate::str::contains(format!(
+            "Note: 2 entries under {search:?} are not old index files and were left in place"
+        )));
+
+    for name in [
+        "index.skidx",
+        "temporal.db",
+        "temporal.db-wal",
+        ".tmpAb12Z9",
+    ] {
+        assert!(!shard.join(name).exists(), "{name} must go");
+    }
+    assert_eq!(fs::read(shard.join("notes.txt")).unwrap(), b"mine");
+    assert_eq!(fs::read(search.join("stray.txt")).unwrap(), b"mine too");
+}

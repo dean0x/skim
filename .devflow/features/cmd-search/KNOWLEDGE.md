@@ -248,13 +248,23 @@ plain repositories resolve the way git does). `resolve_repo_toplevel` is the sof
   not UTF-8 or is larger than `MAX_HOOK_BYTES` (1 MiB) is not skim's and stays. The rewrite keeps the file permissions.
   Callers: `cmd/init/install.rs` (`skim init` and `skim init --uninstall`, with a dry run). `skim doctor` prints an
   advisory line through `cmd::init::old_search_hooks_dir` and never changes its exit code for it.
-- **`legacy_cache.rs`**: `LEGACY_ARTIFACTS` names the 12 files skim 2.x wrote in `<cache>/search/<id>/` (`<id>` is 16
-  lowercase hex digits). `clear_legacy_index_data` removes only those names, only as regular files in a folder with a
-  valid `<id>`, then each empty project folder, then `<cache>/search` when empty. No step follows a link; one pass
-  inspects at most `MAX_SEARCH_ENTRIES` = 4096 entries, and when more follow (`LegacyCleanup.more`) the clear prints a
-  note to run it again. Callers: `cmd/mod.rs` (`skim --clear-cache`) and
-  `cmd/doctor/mod.rs` (`legacy_index_report`, an advisory line with the size; it has the same bound, and when
-  `LegacyReport.more` is set the line says "at least" for the folders and the size).
+- **`legacy_cache.rs`**: `LEGACY_ARTIFACTS` names the 15 files skim 2.x wrote in `<cache>/search/<id>/` (`<id>` is 16
+  lowercase hex digits). That includes the `-wal`, `-shm` and `-journal` files of `temporal.db`. The temp files of the
+  old atomic writer (`.tmp` and 6 ASCII letters or digits, `is_temp_artifact_name`) go too. `clear_legacy_index_data`
+  removes only those names, only as regular files in a folder with a valid `<id>`, then each empty project folder, then
+  `<cache>/search` when empty. No step follows a link. It enters `<cache>/search` and a project folder only when
+  `owned_by_current_user` (the ownership rule of git) accepts it, because `SKIM_CACHE_DIR` can name a shared folder; a
+  folder it does not own is counted in `foreign` and left alone.
+- **Bounds of one pass** (`Skipped`, exact counts): `MAX_SEARCH_ENTRIES` = 65536 entries listed in `<cache>/search`,
+  `MAX_PROJECT_FOLDERS` = 4096 project folders worked on, `MAX_FOLDER_ENTRIES` = 1024 entries read in one project
+  folder. A kept entry spends only the listing bound. The note to run `skim --clear-cache` again is printed only when
+  the pass freed a place inside a bound (`LegacyCleanup.freed`: a project folder removed, or a file removed from a
+  folder the bound cut short); otherwise the note names the folder for a check by hand.
+- **Callers of `legacy_cache.rs`**: `cmd/mod.rs` (`skim --clear-cache`, text from `cleanup_lines`) and
+  `cmd/doctor/mod.rs` (`legacy_index_report`, an advisory line with the size). The report gives `LegacyFinding::Found`
+  (with `foreign` and `skipped`; the counts read "at least" when a bound fired) or `LegacyFinding::Unreadable` when
+  `<cache>/search` cannot be inspected or listed. The doctor line offers `skim --clear-cache` only when it found old
+  files; otherwise it names the folder for a check by hand. Neither changes the exit code.
 
 ## Gotchas
 

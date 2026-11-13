@@ -848,15 +848,39 @@ pub(super) fn remove_legacy_search_hooks(dry_run: bool) {
         }
         return;
     }
-    match crate::cmd::search::hooks::remove_search_hooks(&project_root) {
+    let result = crate::cmd::search::hooks::remove_search_hooks(&project_root);
+    match legacy_hooks_line(&result) {
+        Some(LegacyHooksLine::Removed(line)) => println!("{line}"),
+        Some(LegacyHooksLine::Failed(note)) => eprintln!("{note}"),
+        None => {}
+    }
+}
+
+/// What `skim init` says once the removal of the old search git hooks has run.
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyHooksLine {
+    /// A block was removed: a line for stdout.
+    Removed(String),
+    /// The removal failed: a note for stderr.
+    Failed(String),
+}
+
+/// The line for the outcome of `remove_search_hooks`, or `None` when no hook held
+/// a block.
+fn legacy_hooks_line(
+    result: &anyhow::Result<crate::cmd::search::hooks::HooksOutcome>,
+) -> Option<LegacyHooksLine> {
+    match result {
         // `{:?}` quotes ESC/CR/LF that a repository-controlled path can hold.
-        Ok(outcome) if outcome.changed => println!(
+        Ok(outcome) if outcome.changed => Some(LegacyHooksLine::Removed(format!(
             "  {} Old search git hooks removed from {:?}",
             check_mark(true),
             outcome.dir
-        ),
-        Ok(_) => {}
-        Err(e) => eprintln!("  Note: could not remove old search git hooks: {e}"),
+        ))),
+        Ok(_) => None,
+        Err(e) => Some(LegacyHooksLine::Failed(format!(
+            "  Note: could not remove old search git hooks: {e}"
+        ))),
     }
 }
 
@@ -2597,5 +2621,49 @@ mod tests {
             !super::permissions_blocks_fast_path(&flags, AgentKind::ClaudeCode, tmp.path()),
             "None with no sidecar must not block the fast path"
         );
+    }
+
+    // ---- the note about the removal of the old search git hooks ----
+
+    #[test]
+    fn test_legacy_hooks_line_is_a_note_when_the_removal_fails() {
+        let failure: anyhow::Result<crate::cmd::search::hooks::HooksOutcome> = Err(
+            anyhow::anyhow!("could not read hook \"/r/.git/hooks/post-commit\""),
+        );
+
+        assert_eq!(
+            super::legacy_hooks_line(&failure),
+            Some(super::LegacyHooksLine::Failed(
+                "  Note: could not remove old search git hooks: could not read hook \"/r/.git/hooks/post-commit\""
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_legacy_hooks_line_names_the_folder_when_a_block_was_removed() {
+        let removed = Ok(crate::cmd::search::hooks::HooksOutcome {
+            dir: std::path::PathBuf::from("/r/.git/hooks"),
+            changed: true,
+        });
+
+        let Some(super::LegacyHooksLine::Removed(line)) = super::legacy_hooks_line(&removed) else {
+            panic!("a removed block must give a line for stdout");
+        };
+
+        assert!(
+            line.ends_with("Old search git hooks removed from \"/r/.git/hooks\""),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_hooks_line_is_absent_when_no_hook_held_a_block() {
+        let unchanged = Ok(crate::cmd::search::hooks::HooksOutcome {
+            dir: std::path::PathBuf::from("/r/.git/hooks"),
+            changed: false,
+        });
+
+        assert_eq!(super::legacy_hooks_line(&unchanged), None);
     }
 }

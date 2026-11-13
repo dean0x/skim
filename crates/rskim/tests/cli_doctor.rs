@@ -1135,3 +1135,42 @@ fn test_doctor_reports_old_search_data_as_advisory_with_no_exit_change() {
         2_000_000
     );
 }
+
+/// A cache folder that cannot be inspected must not look like a cache folder
+/// without old data. `skim doctor` says that it could not read the folder, as an
+/// advisory note: the exit code and the status line do not change.
+#[test]
+fn test_doctor_says_when_the_old_search_folder_cannot_be_read() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("repo");
+    std::fs::create_dir_all(project.join(".git").join("hooks")).unwrap();
+    // A file where the cache folder should be: `<cache>/search` cannot be inspected.
+    let broken_cache = home.join("cache-is-a-file");
+    std::fs::write(&broken_cache, b"not a folder").unwrap();
+    let run_doctor = |cache: Option<&std::path::Path>| {
+        let mut cmd = common::skim_sandboxed(home);
+        cmd.arg("doctor")
+            .current_dir(&project)
+            .env("PATH", common::hermetic_path());
+        if let Some(cache) = cache {
+            cmd.env("SKIM_CACHE_DIR", cache);
+        }
+        cmd.output().unwrap()
+    };
+
+    let baseline = run_doctor(None);
+    let broken = run_doctor(Some(&broken_cache));
+    let broken_stdout = String::from_utf8_lossy(&broken.stdout).into_owned();
+
+    assert!(
+        broken_stdout.contains("Old search index data: could not read")
+            && broken_stdout.contains("check the folder by hand"),
+        "an unreadable folder must be reported:\n{broken_stdout}"
+    );
+    assert_eq!(
+        broken.status.code(),
+        baseline.status.code(),
+        "an advisory note must not change the exit code"
+    );
+}

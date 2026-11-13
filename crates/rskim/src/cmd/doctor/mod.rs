@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use crate::analytics::AnalyticsConfig;
 use crate::cmd::search::legacy_cache::{
-    LegacyReport, MAX_SEARCH_ENTRIES, format_megabytes, legacy_index_report,
+    LegacyFinding, LegacyReport, format_megabytes, legacy_index_report,
 };
 use crate::cmd::session::AgentKind;
 
@@ -902,27 +902,53 @@ fn print_cache_section() {
 
 /// The advisory line for old search index data, or `None` when there is none.
 ///
-/// `report` is the result of `legacy_index_report`; `search_dir` is the folder
-/// that holds the data. `skim --clear-cache` removes it. When the report did not
-/// inspect every entry, the counts read "at least".
+/// `finding` is the result of `legacy_index_report`; `search_dir` is the folder
+/// that holds the data. `skim --clear-cache` removes it. When a bound left
+/// entries uninspected, the counts read "at least" and the line names each bound
+/// with its exact count. The line gives the `skim --clear-cache` remedy only when
+/// the report found old files: a run cannot remove what the report has not seen.
+/// A folder that another user owns, or that could not be read, gets a line that
+/// names the folder for a check by hand.
 fn old_search_index_note(
-    report: Option<LegacyReport>,
+    finding: Option<LegacyFinding>,
     search_dir: &std::path::Path,
 ) -> Option<String> {
-    report.map(|LegacyReport { folders, bytes, more }| {
-        let megabytes = format_megabytes(bytes);
-        let (floor, bound) = if more {
-            (
-                "at least ",
-                format!(" (only the first {MAX_SEARCH_ENTRIES} entries were inspected)"),
-            )
-        } else {
-            ("", String::new())
-        };
-        format!(
-            "  ⚠  Old search index data: {floor}{folders} folders, {floor}{megabytes} MB in {search_dir:?}{bound} — run skim --clear-cache"
-        )
-    })
+    const HEAD: &str = "  ⚠  Old search index data:";
+    let report = match finding? {
+        LegacyFinding::Unreadable(kind) => {
+            return Some(format!(
+                "{HEAD} could not read {search_dir:?} ({kind}) — check the folder by hand"
+            ));
+        }
+        LegacyFinding::Found(report) => report,
+    };
+    let LegacyReport {
+        folders,
+        bytes,
+        foreign,
+        skipped,
+    } = report;
+    let floor = if skipped.any() { "at least " } else { "" };
+    let mut clauses = skipped.clauses();
+    if foreign > 0 {
+        clauses.push(format!(
+            "{foreign} folders belong to another user and were not entered"
+        ));
+    }
+    let detail = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", clauses.join("; "))
+    };
+    if folders == 0 {
+        return Some(format!(
+            "{HEAD} none found in {search_dir:?}{detail} — check the folder by hand"
+        ));
+    }
+    let megabytes = format_megabytes(bytes);
+    Some(format!(
+        "{HEAD} {floor}{folders} folders, {floor}{megabytes} MB in {search_dir:?}{detail} — run skim --clear-cache"
+    ))
 }
 
 // ============================================================================
@@ -1191,6 +1217,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::search::legacy_cache::{MAX_PROJECT_FOLDERS, MAX_SEARCH_ENTRIES, Skipped};
 
     const TEST_ANALYTICS: AnalyticsConfig = AnalyticsConfig {
         enabled: false,
@@ -1797,20 +1824,22 @@ mod tests {
         );
     }
 
+    fn found(report: LegacyReport) -> Option<LegacyFinding> {
+        Some(LegacyFinding::Found(report))
+    }
+
     #[test]
     fn test_old_search_index_note_gives_folders_size_and_remedy() {
         let report = LegacyReport {
             folders: 3,
             bytes: 12_340_000,
-            more: false,
+            ..LegacyReport::default()
         };
-        let note = old_search_index_note(Some(report), std::path::Path::new("/c/search")).unwrap();
-        assert!(
-            note.contains("Old search index data: 3 folders, 12.3 MB in \"/c/search\""),
-            "{note}"
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: 3 folders, 12.3 MB in \"/c/search\" — run skim --clear-cache"
         );
-        assert!(!note.contains("at least"), "{note}");
-        assert!(note.contains("run skim --clear-cache"), "{note}");
     }
 
     #[test]
@@ -1818,19 +1847,94 @@ mod tests {
         let report = LegacyReport {
             folders: 3,
             bytes: 12_340_000,
-            more: true,
+            skipped: Skipped {
+                folders: 7,
+                listing: true,
+                crowded: 2,
+            },
+            ..LegacyReport::default()
         };
-        let note = old_search_index_note(Some(report), std::path::Path::new("/c/search")).unwrap();
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
         assert!(
             note.contains("Old search index data: at least 3 folders, at least 12.3 MB in"),
             "{note}"
         );
         assert!(
-            note.contains(&format!("first {MAX_SEARCH_ENTRIES} entries")),
+            note.contains(&format!(
+                "7 project folders past the first {MAX_PROJECT_FOLDERS} were not inspected"
+            )),
             "{note}"
         );
-        assert!(note.contains("run skim --clear-cache"), "{note}");
+        assert!(
+            note.contains(&format!(
+                "only the first {MAX_SEARCH_ENTRIES} entries of the folder were read"
+            )),
+            "{note}"
+        );
+        assert!(note.contains("2 project folders hold more than"), "{note}");
+        assert!(note.ends_with("run skim --clear-cache"), "{note}");
         assert_eq!(note.lines().count(), 1, "{note:?}");
+    }
+
+    /// With no old file among the entries read, a run of `skim --clear-cache` has
+    /// nothing known to remove, so the line must not offer it as the remedy.
+    #[test]
+    fn test_old_search_index_note_names_the_folder_instead_of_a_remedy_that_may_do_nothing() {
+        let report = LegacyReport {
+            skipped: Skipped {
+                folders: 0,
+                listing: true,
+                crowded: 0,
+            },
+            ..LegacyReport::default()
+        };
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "  ⚠  Old search index data: none found in \"/c/search\" (only the first {MAX_SEARCH_ENTRIES} entries of the folder were read) — check the folder by hand"
+            )
+        );
+        assert!(!note.contains("--clear-cache"), "{note}");
+    }
+
+    #[test]
+    fn test_old_search_index_note_counts_folders_of_another_user() {
+        let report = LegacyReport {
+            folders: 1,
+            bytes: 2_000_000,
+            foreign: 4,
+            ..LegacyReport::default()
+        };
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: 1 folders, 2.0 MB in \"/c/search\" (4 folders belong to another user and were not entered) — run skim --clear-cache"
+        );
+
+        let only_foreign = LegacyReport {
+            foreign: 1,
+            ..LegacyReport::default()
+        };
+        let note =
+            old_search_index_note(found(only_foreign), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: none found in \"/c/search\" (1 folders belong to another user and were not entered) — check the folder by hand"
+        );
+    }
+
+    /// A folder that cannot be read must not look like a folder with no old data.
+    #[test]
+    fn test_old_search_index_note_says_when_the_folder_could_not_be_read() {
+        let finding = Some(LegacyFinding::Unreadable(
+            std::io::ErrorKind::PermissionDenied,
+        ));
+        let note = old_search_index_note(finding, std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: could not read \"/c/search\" (permission denied) — check the folder by hand"
+        );
     }
 
     // ---- query_binary_info acquisition-path test ----
