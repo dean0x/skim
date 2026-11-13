@@ -5,11 +5,16 @@
 //! malformed input degrades gracefully — the output is always a valid,
 //! contiguous, sorted range list.
 //!
+//! Each scanner marks the comments and the quoted strings of its format and
+//! leaves every other byte (keys, headers, numbers, structure) to
+//! [`SearchField::Other`]: the role rules read the comment and string fields
+//! only. A key is never a string.
+//!
 //! # JSON scanner
 //!
-//! Byte-by-byte state machine tracking brace/bracket depth and
-//! key-vs-value position. String values are scanned with
-//! [`scan_json_string`] which handles `\"`, `\\`, and `\uXXXX` escapes.
+//! Byte-by-byte state machine tracking the stack of open objects and arrays
+//! and the key-vs-value position in each object. String values are scanned
+//! with [`scan_json_string`] which handles `\"`, `\\`, and `\uXXXX` escapes.
 //!
 //! # YAML scanner
 //!
@@ -48,10 +53,8 @@ enum JsonFrame {
 /// Classify byte ranges in a JSON source string.
 ///
 /// Field mapping:
-/// - Depth-0 key whose value is `{` or `[` → [`SearchField::TypeDefinition`]
-/// - Other keys → [`SearchField::SymbolName`]
-/// - String values → [`SearchField::StringLiteral`]
-/// - Everything else (numbers, booleans, null, structural chars) → [`SearchField::Other`]
+/// - String values (in an object or in an array) → [`SearchField::StringLiteral`]
+/// - Everything else (keys, numbers, booleans, null, structural chars) → [`SearchField::Other`]
 ///
 /// The output satisfies all contiguity invariants via [`fill_gaps_and_merge`].
 pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
@@ -70,8 +73,6 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
     const MAX_JSON_DEPTH: usize = 1024;
 
     // Stack-based depth tracking:
-    // - brace_depth: count of currently open `{` objects
-    // - bracket_depth: count of currently open `[` arrays
     // - open_depth: count of currently open `{` and `[` together
     // - frames: one entry per open container (up to MAX_JSON_DEPTH), innermost
     //   last. An object frame says whether we expect to read a key (vs. a
@@ -80,8 +81,6 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
     //   * flips to false after reading the key's `:` separator
     //   * flips back to true after `,`
     //   An array frame has no key position, so `,` and `:` leave it alone.
-    let mut brace_depth: usize = 0;
-    let mut bracket_depth: usize = 0;
     let mut open_depth: usize = 0;
     let mut frames: Vec<JsonFrame> = Vec::new();
     let mut i = 0;
@@ -90,7 +89,6 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
         let b = bytes[i];
         match b {
             b'{' => {
-                brace_depth += 1;
                 open_depth += 1;
                 // Start of an object: next token expected is a key (or `}`).
                 // Only track state up to MAX_JSON_DEPTH to bound heap usage.
@@ -99,7 +97,14 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 }
                 i += 1;
             }
-            b'}' => {
+            b'[' => {
+                open_depth += 1;
+                if open_depth <= MAX_JSON_DEPTH {
+                    frames.push(JsonFrame::Array);
+                }
+                i += 1;
+            }
+            b'}' | b']' => {
                 // Only pop if we pushed: containers opened beyond
                 // MAX_JSON_DEPTH do not push, so closing ones must not pop.
                 // Check before saturating_sub so the comparison uses the
@@ -108,23 +113,6 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                     frames.pop();
                 }
                 open_depth = open_depth.saturating_sub(1);
-                brace_depth = brace_depth.saturating_sub(1);
-                i += 1;
-            }
-            b'[' => {
-                bracket_depth += 1;
-                open_depth += 1;
-                if open_depth <= MAX_JSON_DEPTH {
-                    frames.push(JsonFrame::Array);
-                }
-                i += 1;
-            }
-            b']' => {
-                if open_depth <= MAX_JSON_DEPTH {
-                    frames.pop();
-                }
-                open_depth = open_depth.saturating_sub(1);
-                bracket_depth = bracket_depth.saturating_sub(1);
                 i += 1;
             }
             b':' => {
@@ -143,28 +131,13 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 i += 1;
             }
             b'"' => {
-                // String token: scan to the end of the string.
-                let str_start = i;
+                // String token: scan to the end of the string. A key is not
+                // a string value, so only a value is marked.
                 let str_end = scan_json_string(bytes, i);
-
                 let is_key = matches!(frames.last(), Some(JsonFrame::Object { expect_key: true }));
-                // bracket_depth > 0 means we're inside an array.
-                let inside_array_at_root = bracket_depth > 0 && brace_depth <= bracket_depth;
-
-                if is_key {
-                    // Key string: determine whether this should be TypeDefinition or SymbolName.
-                    // TypeDefinition: depth-0 key (brace_depth == 1) AND value is object/array.
-                    let field = if brace_depth == 1 && !inside_array_at_root {
-                        classify_json_key_at_depth0(bytes, str_end, len)
-                    } else {
-                        SearchField::SymbolName
-                    };
-                    ranges.push((str_start..str_end, field));
-                } else {
-                    // Value string → StringLiteral.
-                    ranges.push((str_start..str_end, SearchField::StringLiteral));
+                if !is_key {
+                    ranges.push((i..str_end, SearchField::StringLiteral));
                 }
-
                 i = str_end;
             }
             _ => {
@@ -174,41 +147,6 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
     }
 
     fill_gaps_and_merge(ranges, len)
-}
-
-/// Determine the [`SearchField`] for a depth-0 JSON key by looking ahead past
-/// the closing quote, optional whitespace, colon, and optional whitespace to
-/// check whether the next character is `{` or `[`.
-///
-/// Returns [`SearchField::TypeDefinition`] if the value is an object or array,
-/// [`SearchField::SymbolName`] otherwise.
-///
-/// `after_key` is the byte index immediately after the key's closing `"`.
-fn classify_json_key_at_depth0(bytes: &[u8], after_key: usize, len: usize) -> SearchField {
-    let mut j = after_key;
-    j = skip_json_whitespace(bytes, j, len);
-    if j < len && bytes[j] == b':' {
-        j += 1;
-    }
-    j = skip_json_whitespace(bytes, j, len);
-    if j < len && (bytes[j] == b'{' || bytes[j] == b'[') {
-        SearchField::TypeDefinition
-    } else {
-        SearchField::SymbolName
-    }
-}
-
-/// Skip JSON whitespace (space, tab, newline, carriage-return) from `pos`.
-///
-/// Returns the index of the first non-whitespace byte, or `len` if the end
-/// of input is reached.
-#[inline]
-fn skip_json_whitespace(bytes: &[u8], pos: usize, len: usize) -> usize {
-    let mut i = pos;
-    while i < len && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
-        i += 1;
-    }
-    i
 }
 
 /// Scan a JSON string starting at `pos` (the opening `"`).
@@ -257,10 +195,9 @@ fn scan_json_string(bytes: &[u8], pos: usize) -> usize {
 /// Classify byte ranges in a YAML source string (block-style only).
 ///
 /// Field mapping:
-/// - Indent-0 keys → [`SearchField::TypeDefinition`]
-/// - Indent-1+ keys → [`SearchField::SymbolName`]
 /// - Quoted string values after `:` → [`SearchField::StringLiteral`]
 /// - `#` comments → [`SearchField::Comment`]
+/// - Keys → Other
 /// - Multi-document `---` and `...` markers → Other
 /// - List items `- item` → Other (content is value, not key)
 ///
@@ -323,35 +260,12 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
 
         // --- List items: `- ` or `- ` then key/value on same line
         // List item lines can have an inline key: `  - name: foo`
-        // We strip the `- ` prefix and re-classify the remainder.
-        let (eff_indent, eff_rest_start, eff_rest) =
-            strip_list_prefix(bytes, indent, rest_start, rest, line_end);
+        // We strip the `- ` prefix and look at the remainder.
+        let (eff_rest_start, eff_rest) = strip_list_prefix(bytes, rest_start, rest, line_end);
 
         // --- Key detection: look for `: ` or `:\n` or `:\r\n` or end-of-line-colon.
-        // We need to find the key text and the colon position.
+        // The key is not marked; the colon tells where its value starts.
         if let Some(colon_rel) = find_yaml_key_colon(eff_rest) {
-            let key_start = eff_rest_start;
-            let key_end = eff_rest_start + colon_rel;
-
-            // Key field based on effective indent.
-            let key_field = if eff_indent == 0 {
-                SearchField::TypeDefinition
-            } else {
-                SearchField::SymbolName
-            };
-
-            // Trim trailing whitespace from key.
-            let key_text = &bytes[key_start..key_end];
-            let trimmed_end = key_end
-                - key_text
-                    .iter()
-                    .rev()
-                    .take_while(|&&b| b == b' ' || b == b'\t')
-                    .count();
-            if trimmed_end > key_start {
-                ranges.push((key_start..trimmed_end, key_field));
-            }
-
             // Look for a value on the same line after the colon.
             let value_start_rel = colon_rel + 1; // skip `:`
             if value_start_rel < eff_rest.len() {
@@ -396,28 +310,23 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
 
 /// Strip the YAML list-item prefix (`- ` or `-`) from a line's content bytes.
 ///
-/// Returns `(effective_indent, effective_rest_start, effective_rest)`:
-/// - `effective_indent`: the indent level to use for key classification
-///   (incremented by 1 for list items so they are treated as nested)
+/// Returns `(effective_rest_start, effective_rest)`:
 /// - `effective_rest_start`: absolute byte index of the content after the prefix
 /// - `effective_rest`: byte slice of the remaining line content
 ///
 /// If the line does not start with a list prefix, the inputs are returned unchanged.
 fn strip_list_prefix<'a>(
     bytes: &'a [u8],
-    indent: usize,
     rest_start: usize,
     rest: &'a [u8],
     line_end: usize,
-) -> (usize, usize, &'a [u8]) {
+) -> (usize, &'a [u8]) {
     if rest.starts_with(b"- ") || rest == b"-\n" || rest == b"-\r\n" || rest == b"-" {
         let list_item_offset = if rest.starts_with(b"- ") { 2 } else { 1 };
         let new_rest_start = rest_start + list_item_offset;
-        let new_rest = &bytes[new_rest_start..line_end];
-        // List items get an effective indent of indent + 1 (nested under the list key).
-        (indent + 1, new_rest_start, new_rest)
+        (new_rest_start, &bytes[new_rest_start..line_end])
     } else {
-        (indent, rest_start, rest)
+        (rest_start, rest)
     }
 }
 
@@ -450,12 +359,10 @@ fn find_yaml_key_colon(line_content: &[u8]) -> Option<usize> {
 /// Classify byte ranges in a TOML source string.
 ///
 /// Field mapping:
-/// - `[section]` headers → [`SearchField::TypeDefinition`]
-/// - `[[array]]` headers → [`SearchField::TypeDefinition`]
-/// - Keys (including dotted keys like `a.b.c`) → [`SearchField::SymbolName`]
 /// - Quoted string values (`"..."`, `'...'`) → [`SearchField::StringLiteral`]
 /// - `# comments` → [`SearchField::Comment`]
-/// - Everything else → [`SearchField::Other`]
+/// - `[section]` and `[[array]]` headers, keys (including dotted keys like
+///   `a.b.c`) and everything else → [`SearchField::Other`]
 ///
 /// Multi-line strings (`"""..."""`, `'''...'''`) are scanned to their closing
 /// delimiter and the entire span is classified as [`SearchField::StringLiteral`].
@@ -500,14 +407,8 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 continue;
             }
             b'[' => {
-                // Section header: `[section]` or `[[array]]`.
-                // Find the closing `]` (or `]]`); fall back to EOL for malformed input.
-                let header_end = bytes[i..eol]
-                    .iter()
-                    .rposition(|&b| b == b']')
-                    .map(|close| i + close + 1)
-                    .unwrap_or(eol);
-                ranges.push((i..header_end, SearchField::TypeDefinition));
+                // Section header: `[section]` or `[[array]]`. It holds no
+                // string or comment, so the line is skipped.
                 i = (eol + 1).min(len);
                 continue;
             }
@@ -516,17 +417,6 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 // Find the `=` sign (but not inside a string).
                 if let Some(eq_rel) = find_toml_eq_sign(&bytes[i..eol]) {
                     let eq_abs = i + eq_rel;
-                    // Key: from i to eq_abs, trimming trailing whitespace.
-                    let trimmed_key_end = eq_abs
-                        - bytes[i..eq_abs]
-                            .iter()
-                            .rev()
-                            .take_while(|&&b| b == b' ' || b == b'\t')
-                            .count();
-                    if trimmed_key_end > i {
-                        ranges.push((i..trimmed_key_end, SearchField::SymbolName));
-                    }
-
                     // Value: from eq_abs+1 to eol.
                     let val_region_start = eq_abs + 1;
                     if val_region_start < eol {

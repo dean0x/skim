@@ -713,6 +713,256 @@ fn markdown_prose_and_code_blocks_are_text_not_comments() {
     }
 }
 
+/// Sources of one language that hold the word `needle` once, and only inside a
+/// comment (`comments`) or only inside a string (`strings`). Each source is
+/// one form of the comment or the string of the language.
+struct TextForms {
+    /// The file extension the engine parses the sources with.
+    ext: &'static str,
+    comments: &'static [&'static str],
+    strings: &'static [&'static str],
+}
+
+/// Every language of `rskim_core`. [`text_forms`] has no wildcard arm: a new
+/// `Language` variant does not compile until it has a row there, and this list
+/// must name it for the test below to read that row.
+const LANGUAGES: [Language; 18] = [
+    Language::TypeScript,
+    Language::JavaScript,
+    Language::Python,
+    Language::Rust,
+    Language::Go,
+    Language::Java,
+    Language::Markdown,
+    Language::Json,
+    Language::Yaml,
+    Language::C,
+    Language::Cpp,
+    Language::Toml,
+    Language::CSharp,
+    Language::Ruby,
+    Language::Sql,
+    Language::Kotlin,
+    Language::Swift,
+    Language::Bash,
+];
+
+/// The comment and string forms of each language, read off its grammar
+/// (`node-types.json` at the pinned version).
+fn text_forms(lang: Language) -> TextForms {
+    match lang {
+        Language::TypeScript => TextForms {
+            ext: "ts",
+            comments: &[
+                "// needle\nconst a = 1;\n",
+                "/* needle */ const a = 1;\n",
+                "<!-- needle -->\nconst a = 1;\n",
+            ],
+            strings: &[
+                "const s = \"needle\";\n",
+                "const s = `needle`;\n",
+                "const s = `${a} needle`;\n",
+            ],
+        },
+        Language::JavaScript => TextForms {
+            ext: "js",
+            comments: &[
+                "// needle\nconst a = 1;\n",
+                "/* needle */ const a = 1;\n",
+                "<!-- needle -->\nconst a = 1;\n",
+            ],
+            strings: &[
+                "const s = \"needle\";\n",
+                "const s = `needle`;\n",
+                "const s = `${a} needle`;\n",
+            ],
+        },
+        Language::Python => TextForms {
+            ext: "py",
+            comments: &["# needle\na = 1\n"],
+            strings: &[
+                "s = \"needle\"\n",
+                "def f():\n    \"\"\"needle\"\"\"\n",
+                "s = f\"needle {a}\"\n",
+            ],
+        },
+        Language::Rust => TextForms {
+            ext: "rs",
+            comments: &[
+                "// needle\nfn f() {}\n",
+                "/* needle */ fn f() {}\n",
+                "/// needle\nfn f() {}\n",
+            ],
+            strings: &[
+                "fn f() { let s = \"needle\"; }\n",
+                "fn f() { let s = r#\"needle\"#; }\n",
+            ],
+        },
+        Language::Go => TextForms {
+            ext: "go",
+            comments: &["// needle\npackage a\n", "/* needle */\npackage a\n"],
+            strings: &[
+                "package a\nvar s = \"needle\"\n",
+                "package a\nvar s = `needle`\n",
+            ],
+        },
+        Language::Java => TextForms {
+            ext: "java",
+            comments: &["// needle\nclass A {}\n", "/* needle */ class A {}\n"],
+            strings: &[
+                "class A { String s = \"needle\"; }\n",
+                "class A { String s = \"\"\"\n    needle\n    \"\"\"; }\n",
+            ],
+        },
+        Language::C => TextForms {
+            ext: "c",
+            comments: &["// needle\nint a;\n", "/* needle */ int a;\n"],
+            strings: &["const char *s = \"needle\";\n"],
+        },
+        Language::Cpp => TextForms {
+            ext: "cpp",
+            comments: &["// needle\nint a;\n", "/* needle */ int a;\n"],
+            strings: &[
+                "const char *s = \"needle\";\n",
+                "const char *s = R\"(needle)\";\n",
+            ],
+        },
+        Language::CSharp => TextForms {
+            ext: "cs",
+            comments: &["// needle\nclass A {}\n", "/* needle */ class A {}\n"],
+            strings: &[
+                "class A { string s = \"needle\"; }\n",
+                "class A { string s = @\"needle\"; }\n",
+                "class A { string s = $\"needle {a}\"; }\n",
+                "class A { string s = \"\"\"needle\"\"\"; }\n",
+            ],
+        },
+        Language::Ruby => TextForms {
+            ext: "rb",
+            comments: &["# needle\na = 1\n", "=begin\nneedle\n=end\na = 1\n"],
+            strings: &[
+                "s = \"needle\"\n",
+                "s = 'needle'\n",
+                "s = <<~TEXT\n  needle\nTEXT\n",
+            ],
+        },
+        Language::Sql => TextForms {
+            ext: "sql",
+            comments: &["-- needle\nSELECT 1;\n", "/* needle */ SELECT 1;\n"],
+            strings: &["SELECT 'needle';\n"],
+        },
+        Language::Kotlin => TextForms {
+            ext: "kt",
+            comments: &["// needle\nval a = 1\n", "/* needle */ val a = 1\n"],
+            strings: &[
+                "val s = \"needle\"\n",
+                "val s = \"\"\"needle\"\"\"\n",
+                "val s = \"needle $a\"\n",
+            ],
+        },
+        Language::Swift => TextForms {
+            ext: "swift",
+            comments: &["// needle\nlet a = 1\n", "/* needle */\nlet a = 1\n"],
+            strings: &[
+                "let s = \"needle\"\n",
+                "let s = \"\"\"\n    needle\n    \"\"\"\n",
+                "let s = #\"needle\"#\n",
+            ],
+        },
+        Language::Bash => TextForms {
+            ext: "sh",
+            comments: &["# needle\necho a\n"],
+            strings: &[
+                "echo \"needle\"\n",
+                "echo 'needle'\n",
+                "echo $'needle'\n",
+                "cat <<EOF\nneedle\nEOF\n",
+            ],
+        },
+        Language::Json => TextForms {
+            ext: "json",
+            comments: &[],
+            strings: &["{\"k\": \"needle\"}\n"],
+        },
+        Language::Yaml => TextForms {
+            ext: "yaml",
+            comments: &["# needle\nk: v\n"],
+            strings: &["k: \"needle\"\n"],
+        },
+        Language::Toml => TextForms {
+            ext: "toml",
+            comments: &["# needle\nk = 1\n"],
+            strings: &["k = \"needle\"\n"],
+        },
+        // A Markdown file has no comments and no strings: its prose is text
+        // (see `markdown_prose_and_code_blocks_are_text_not_comments`).
+        Language::Markdown => TextForms {
+            ext: "md",
+            comments: &[],
+            strings: &[],
+        },
+    }
+}
+
+#[test]
+fn a_word_in_a_comment_or_a_string_gets_that_role_in_every_language() {
+    let mut wrong = Vec::new();
+    for lang in LANGUAGES {
+        let forms = text_forms(lang);
+        for (what, sources, want) in [
+            ("comment", forms.comments, Role::Comment),
+            ("string", forms.strings, Role::StringLit),
+        ] {
+            for source in sources {
+                let got = role_of(lang, forms.ext, source, "", "needle");
+                if got != want {
+                    wrong.push(format!("{lang:?} {what} {source:?}: {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a word in a comment or a string must get the comment or string role: {wrong:#?}"
+    );
+}
+
+#[test]
+fn a_name_inside_a_string_interpolation_is_a_reference_not_a_string() {
+    let cases: [(Language, &str, &str); 7] = [
+        (Language::JavaScript, "js", "const s = `a ${foo} b`;\n"),
+        (Language::Python, "py", "s = f\"{foo} x\"\n"),
+        (Language::Ruby, "rb", "s = \"#{foo} x\"\n"),
+        (Language::Kotlin, "kt", "val s = \"${foo} x\"\n"),
+        (Language::Swift, "swift", "let s = \"\\(foo) x\"\n"),
+        (Language::Bash, "sh", "echo \"$foo x\"\n"),
+        (
+            Language::CSharp,
+            "cs",
+            "class A { string s = $\"{foo} x\"; }\n",
+        ),
+    ];
+    for (lang, ext, source) in cases {
+        assert_eq!(
+            role_of(lang, ext, source, "", "foo"),
+            Role::Ref,
+            "{lang:?}: {source:?}"
+        );
+    }
+}
+
+#[test]
+fn a_sql_number_a_boolean_and_null_are_references_not_strings() {
+    let source = "SELECT 'x', 42, TRUE, NULL;\n";
+    for word in ["42", "TRUE", "NULL"] {
+        assert_eq!(
+            role_of(Language::Sql, "sql", source, "", word),
+            Role::Ref,
+            "{word}"
+        );
+    }
+}
+
 // ============================================================================
 // Lines
 // ============================================================================

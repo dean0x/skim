@@ -75,121 +75,93 @@ fn field_text<'a>(
 // JSON tests
 // ============================================================================
 
-/// F-JSON-01: simple object — key is SymbolName, value is StringLiteral.
+/// F-JSON-01: simple object — the key is not a string, the value is a
+/// StringLiteral.
 #[test]
-fn f_json_01_key_is_symbol_name_value_is_string_literal() {
+fn f_json_01_key_is_not_a_string_value_is_a_string_literal() {
     let source = r#"{"name": "skim"}"#;
     let ranges = classify_json(source);
     assert_contiguous(&ranges, source.len());
 
-    let key_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        key_texts.iter().any(|t| t.contains("name")),
-        "key 'name' should be SymbolName; symbol texts: {key_texts:?}; ranges: {ranges:?}"
-    );
-
-    let str_texts = field_text(source, &ranges, SearchField::StringLiteral);
-    assert!(
-        str_texts.iter().any(|t| t.contains("skim")),
-        "value 'skim' should be StringLiteral; string texts: {str_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""skim""#],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-JSON-02: depth-0 key whose value is an object → TypeDefinition.
+/// F-JSON-02: keys of nested objects are not strings.
 #[test]
-fn f_json_02_depth0_key_with_object_value_is_type_definition() {
+fn f_json_02_keys_of_nested_objects_are_not_strings() {
     let source = r#"{"deps": {"serde": "1.0"}}"#;
     let ranges = classify_json(source);
     assert_contiguous(&ranges, source.len());
 
-    let type_def_texts = field_text(source, &ranges, SearchField::TypeDefinition);
-    assert!(
-        type_def_texts.iter().any(|t| t.contains("deps")),
-        "'deps' should be TypeDefinition (depth-0, value is object); type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""1.0""#],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-JSON-03: depth-0 key with scalar value → SymbolName, NOT TypeDefinition.
+/// F-JSON-04: a value with escaped quotes is one StringLiteral.
 #[test]
-fn f_json_03_depth0_key_with_scalar_value_is_symbol_name() {
-    let source = r#"{"name": "skim"}"#;
-    let ranges = classify_json(source);
-    assert_contiguous(&ranges, source.len());
-
-    // "name" has a scalar string value, so it must NOT be TypeDefinition.
-    assert!(
-        !has_field(&ranges, SearchField::TypeDefinition),
-        "'name' with scalar value must NOT produce TypeDefinition; ranges: {ranges:?}"
-    );
-    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        sym_texts.iter().any(|t| t.contains("name")),
-        "'name' must be SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
-    );
-}
-
-/// F-JSON-04: key and value with escaped quotes — must not panic, must be contiguous.
-#[test]
-fn f_json_04_escaped_quotes_no_panic() {
+fn f_json_04_escaped_quotes_stay_in_one_string() {
     let source = r#"{"key": "val with \"quotes\""}"#;
     let ranges = classify_json(source);
     assert_contiguous(&ranges, source.len());
     assert_field_lengths_sum(&ranges, source.len());
+
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""val with \"quotes\"""#],
+        "ranges: {ranges:?}"
+    );
 }
 
-/// F-JSON-05: empty object → contiguous (all Other).
+/// F-JSON-05: empty object → one Other range.
 #[test]
 fn f_json_05_empty_object_all_other() {
     let source = "{}";
     let ranges = classify_json(source);
-    assert_contiguous(&ranges, source.len());
-    assert_field_lengths_sum(&ranges, source.len());
+    assert_eq!(ranges, vec![(0..2, SearchField::Other)]);
 }
 
-/// F-JSON-06: deep nesting — root key is TypeDefinition, inner keys are SymbolName.
+/// F-JSON-06: deep nesting — only the innermost value is a string.
 #[test]
-fn f_json_06_deep_nesting_root_type_def_inner_symbol() {
+fn f_json_06_deep_nesting_only_the_value_is_a_string() {
     let source = r#"{"a":{"b":{"c":"deep"}}}"#;
     let ranges = classify_json(source);
     assert_contiguous(&ranges, source.len());
 
-    // "a" at depth 0 with object value → TypeDefinition
-    let type_def_texts = field_text(source, &ranges, SearchField::TypeDefinition);
-    assert!(
-        type_def_texts.iter().any(|t| t.contains("a")),
-        "'a' should be TypeDefinition; type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
-    );
-
-    // Inner keys "b", "c" → SymbolName
-    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        sym_texts.iter().any(|t| t.contains("b")) || sym_texts.iter().any(|t| t.contains("c")),
-        "inner keys should be SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""deep""#],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-JSON-07: array at root — keys inside array objects are SymbolName (not TypeDefinition).
+/// F-JSON-07: array at root — keys inside the objects are not strings, the
+/// strings of the array are.
 #[test]
-fn f_json_07_array_at_root_keys_are_symbol_name() {
-    let source = r#"[{"id": 1}, {"id": 2}]"#;
+fn f_json_07_array_at_root_keys_are_not_strings() {
+    let source = r#"[{"id": "x"}, "y"]"#;
     let ranges = classify_json(source);
     assert_contiguous(&ranges, source.len());
 
-    // Inside array-at-root, no keys should be TypeDefinition.
-    assert!(
-        !has_field(&ranges, SearchField::TypeDefinition),
-        "keys inside root array must NOT be TypeDefinition; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""x""#, r#""y""#],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-JSON-08: non-string values (numbers, booleans) are Other.
+/// F-JSON-08: numbers, booleans and null are not strings.
 #[test]
 fn f_json_08_non_string_values_are_other() {
-    let source = r#"{"key": 42, "flag": true}"#;
+    let source = r#"{"key": 42, "flag": true, "none": null}"#;
     let ranges = classify_json(source);
-    assert_contiguous(&ranges, source.len());
-    assert_field_lengths_sum(&ranges, source.len());
-    // Just verifies it doesn't panic and is contiguous.
+    assert_eq!(ranges, vec![(0..source.len(), SearchField::Other)]);
 }
 
 /// F-JSON-09: JSON nested beyond MAX_JSON_DEPTH (1024) does not panic and
@@ -258,70 +230,53 @@ fn f_json_11_nested_arrays_and_objects_in_arrays_keep_key_and_value_positions() 
 // YAML tests
 // ============================================================================
 
-/// F-YAML-01: top-level key is TypeDefinition, nested key is SymbolName.
+/// F-YAML-01: keys at any indent are not strings or comments.
 #[test]
-fn f_yaml_01_top_level_type_def_nested_symbol_name() {
+fn f_yaml_01_keys_are_other() {
     let source = "database:\n  host: localhost\n";
     let ranges = classify_yaml(source);
-    assert_contiguous(&ranges, source.len());
-
-    let type_def_texts = field_text(source, &ranges, SearchField::TypeDefinition);
-    assert!(
-        type_def_texts.iter().any(|t| t.contains("database")),
-        "'database' should be TypeDefinition; type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
-    );
-
-    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        sym_texts.iter().any(|t| t.contains("host")),
-        "'host' should be SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
-    );
+    assert_eq!(ranges, vec![(0..source.len(), SearchField::Other)]);
 }
 
-/// F-YAML-02: comment line is classified as Comment.
+/// F-YAML-02: a comment line is a Comment.
 #[test]
 fn f_yaml_02_comment_line_is_comment() {
     let source = "# comment\nkey: val\n";
     let ranges = classify_yaml(source);
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::Comment),
-        "comment line should produce Comment field; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::Comment),
+        vec!["# comment\n"],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-YAML-03: quoted string value is StringLiteral.
+/// F-YAML-03: a quoted value is a StringLiteral, its key is not.
 #[test]
 fn f_yaml_03_quoted_string_value_is_string_literal() {
     let source = "name: \"skim\"\n";
     let ranges = classify_yaml(source);
     assert_contiguous(&ranges, source.len());
 
-    let str_texts = field_text(source, &ranges, SearchField::StringLiteral);
-    assert!(
-        str_texts.iter().any(|t| t.contains("skim")),
-        "quoted value 'skim' should be StringLiteral; str texts: {str_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"skim\""],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-YAML-04: multi-level nesting — root TypeDefinition, deeper keys SymbolName.
+/// F-YAML-04: multi-level nesting — only the quoted value is a string.
 #[test]
 fn f_yaml_04_multi_level_nesting() {
-    let source = "a:\n  b:\n    c: val\n";
+    let source = "a:\n  b:\n    c: \"val\"\n";
     let ranges = classify_yaml(source);
     assert_contiguous(&ranges, source.len());
 
-    let type_def_texts = field_text(source, &ranges, SearchField::TypeDefinition);
-    assert!(
-        type_def_texts.iter().any(|t| t.contains("a")),
-        "'a' should be TypeDefinition; type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
-    );
-
-    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        sym_texts.iter().any(|t| t.contains("b")) || sym_texts.iter().any(|t| t.contains("c")),
-        "nested keys should be SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"val\""],
+        "ranges: {ranges:?}"
     );
 }
 
@@ -334,17 +289,17 @@ fn f_yaml_05_multi_doc_separators() {
     assert_field_lengths_sum(&ranges, source.len());
 }
 
-/// F-YAML-06: list item key is SymbolName, parent key is TypeDefinition.
+/// F-YAML-06: the value of a key in a list item is read after the `- `.
 #[test]
-fn f_yaml_06_list_parent_type_def_item_key_symbol() {
-    let source = "items:\n  - name: foo\n";
+fn f_yaml_06_list_item_key_value_is_a_string() {
+    let source = "items:\n  - name: \"foo\"\n";
     let ranges = classify_yaml(source);
     assert_contiguous(&ranges, source.len());
 
-    let type_def_texts = field_text(source, &ranges, SearchField::TypeDefinition);
-    assert!(
-        type_def_texts.iter().any(|t| t.contains("items")),
-        "'items' should be TypeDefinition; type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"foo\""],
+        "ranges: {ranges:?}"
     );
 }
 
@@ -389,109 +344,92 @@ fn f_yaml_07_quoted_string_excludes_trailing_newline() {
 // TOML tests
 // ============================================================================
 
-/// F-TOML-01: [package] header is TypeDefinition, key is SymbolName, value is StringLiteral.
+/// F-TOML-01: a header and a key are not strings, the value is a StringLiteral.
 #[test]
 fn f_toml_01_section_header_key_value() {
     let source = "[package]\nname = \"skim\"\n";
     let ranges = classify_toml(source);
     assert_contiguous(&ranges, source.len());
 
-    // [package] → TypeDefinition
-    let type_def_texts = field_text(source, &ranges, SearchField::TypeDefinition);
-    assert!(
-        type_def_texts.iter().any(|t| t.contains("package")),
-        "'[package]' should be TypeDefinition; type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
-    );
-
-    // name → SymbolName
-    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        sym_texts.iter().any(|t| t.contains("name")),
-        "'name' should be SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
-    );
-
-    // "skim" → StringLiteral
-    let str_texts = field_text(source, &ranges, SearchField::StringLiteral);
-    assert!(
-        str_texts.iter().any(|t| t.contains("skim")),
-        "'skim' should be StringLiteral; str texts: {str_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"skim\""],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-TOML-02: [[bin]] array header is TypeDefinition.
+/// F-TOML-02: an array header is not a string.
 #[test]
-fn f_toml_02_array_section_type_def() {
+fn f_toml_02_array_header_is_other() {
     let source = "[[bin]]\nname = \"skim\"\n";
     let ranges = classify_toml(source);
     assert_contiguous(&ranges, source.len());
 
-    let type_def_texts = field_text(source, &ranges, SearchField::TypeDefinition);
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"skim\""],
+        "ranges: {ranges:?}"
+    );
     assert!(
-        type_def_texts.iter().any(|t| t.contains("bin")),
-        "'[[bin]]' should be TypeDefinition; type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
+        !has_field(&ranges, SearchField::Comment),
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-TOML-03: comment line is Comment.
+/// F-TOML-03: a comment line is a Comment.
 #[test]
 fn f_toml_03_comment_line() {
     let source = "# Config\n[db]\nurl = \"pg\"\n";
     let ranges = classify_toml(source);
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::Comment),
-        "'# Config' should be Comment; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::Comment),
+        vec!["# Config"],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-TOML-04: inline comment after value is Comment.
+/// F-TOML-04: an inline comment after a value is a Comment.
 #[test]
 fn f_toml_04_inline_comment() {
     let source = "[db]\nurl = \"pg\" # inline\n";
     let ranges = classify_toml(source);
     assert_contiguous(&ranges, source.len());
 
-    let comment_texts = field_text(source, &ranges, SearchField::Comment);
-    assert!(
-        comment_texts.iter().any(|t| t.contains("inline")),
-        "inline comment should be Comment; comment texts: {comment_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::Comment),
+        vec!["# inline"],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-TOML-05: dotted key is SymbolName.
+/// F-TOML-05: a dotted key is not a string.
 #[test]
-fn f_toml_05_dotted_key_is_symbol_name() {
+fn f_toml_05_dotted_key_is_other() {
     let source = "a.b.c = \"val\"\n";
     let ranges = classify_toml(source);
     assert_contiguous(&ranges, source.len());
 
-    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        sym_texts.iter().any(|t| t.contains("a.b.c")),
-        "'a.b.c' should be SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"val\""],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-TOML-06: AC-4 acceptance test — section, key, and long string value.
+/// F-TOML-06: a long string value with a URL is one StringLiteral.
 #[test]
-fn f_toml_06_acceptance_test() {
+fn f_toml_06_url_value_is_one_string() {
     let source = "[database]\ndatabase_url = \"postgres://localhost/mydb\"\n";
     let ranges = classify_toml(source);
     assert_contiguous(&ranges, source.len());
     assert_field_lengths_sum(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "should have TypeDefinition for [database]; ranges: {ranges:?}"
-    );
-    assert!(
-        has_field(&ranges, SearchField::SymbolName),
-        "should have SymbolName for key; ranges: {ranges:?}"
-    );
-    assert!(
-        has_field(&ranges, SearchField::StringLiteral),
-        "should have StringLiteral for URL value; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"postgres://localhost/mydb\""],
+        "ranges: {ranges:?}"
     );
 }
 
@@ -558,7 +496,8 @@ fn f_toml_10_triple_single_quote_backslash_literal() {
     );
 }
 
-/// F-TOML-11: quoted TOML key containing `=` is classified as a single SymbolName.
+/// F-TOML-11: a quoted TOML key containing `=` is not a string, and its `=` is
+/// not the separator.
 ///
 /// `find_toml_eq_sign` skips over `=` inside double-quoted key strings.
 /// This test exercises that backslash-escape-aware path.
@@ -571,10 +510,10 @@ fn f_toml_11_escaped_eq_in_quoted_key() {
     assert_contiguous(&ranges, source.len());
     assert_field_lengths_sum(&ranges, source.len());
 
-    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
-    assert!(
-        sym_texts.iter().any(|t| t.contains("path=here")),
-        "quoted key with '=' inside must be a single SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"value\""],
+        "ranges: {ranges:?}"
     );
 }
 
@@ -630,88 +569,68 @@ fn classify_markdown(source: &str) -> rskim_core::Result<Vec<(Range<usize>, Sear
     Ok(super::markdown::classify_markdown(&tree, source))
 }
 
-/// F-MD-01: H1 heading is TypeDefinition, body text is Comment.
+/// F-MD-01: body text is a Comment, a heading is not.
 #[test]
-fn f_md_01_h1_type_def_body_comment() {
+fn f_md_01_body_text_is_comment_heading_is_not() {
     let source = "# Title\n\nBody text.\n";
     let ranges = classify_markdown(source).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "H1 should be TypeDefinition; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::Comment),
+        vec!["Body text.\n"],
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-MD-02: H3 heading is TypeDefinition.
+/// F-MD-02: ATX headings and link reference definitions are neither prose nor
+/// code.
 #[test]
-fn f_md_02_h3_type_def() {
-    let source = "### H3\n\nText.\n";
+fn f_md_02_headings_and_link_reference_definitions_are_other() {
+    let source = "# H1\n\n### H3\n\n#### H4\n\n[ref]: https://example.com\n";
     let ranges = classify_markdown(source).unwrap();
     assert_contiguous(&ranges, source.len());
 
     assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "H3 should be TypeDefinition; ranges: {ranges:?}"
+        !has_field(&ranges, SearchField::Comment) && !has_field(&ranges, SearchField::Code),
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-MD-03: H4 heading is NOT TypeDefinition (Other).
+/// F-MD-03: a fenced code block is Code.
 #[test]
-fn f_md_03_h4_is_not_type_def() {
-    let source = "#### H4\n\nText.\n";
-    let ranges = classify_markdown(source).unwrap();
-    assert_contiguous(&ranges, source.len());
-
-    // H4 must not produce TypeDefinition — it maps to Other.
-    assert!(
-        !has_field(&ranges, SearchField::TypeDefinition),
-        "H4 must NOT be TypeDefinition; ranges: {ranges:?}"
-    );
-}
-
-/// F-MD-04: fenced code block is FunctionBody.
-#[test]
-fn f_md_04_fenced_code_block_is_function_body() {
+fn f_md_03_fenced_code_block_is_code() {
     let source = "# T\n\n```rust\nfn f(){}\n```\n";
     let ranges = classify_markdown(source).unwrap();
     assert_contiguous(&ranges, source.len());
 
     assert!(
-        has_field(&ranges, SearchField::FunctionBody),
-        "fenced code block should be FunctionBody; ranges: {ranges:?}"
+        field_text(source, &ranges, SearchField::Code)
+            .iter()
+            .any(|t| t.contains("fn f(){}")),
+        "ranges: {ranges:?}"
     );
 }
 
-/// F-MD-05: link reference definition is ImportExport.
+/// F-MD-04: a fenced code block in a list item is Code, not the Comment of the
+/// list item around it.
 #[test]
-fn f_md_05_link_ref_def_is_import_export() {
-    let source = "# T\n\n[ref]: https://example.com\n";
+fn f_md_04_code_block_in_a_list_item_is_code_not_comment() {
+    let source = "- item\n\n  ```\n  call();\n  ```\n";
     let ranges = classify_markdown(source).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::ImportExport),
-        "link reference definition should be ImportExport; ranges: {ranges:?}"
-    );
+    let at = source.find("call();").unwrap();
+    let field = ranges
+        .iter()
+        .find(|(range, _)| range.contains(&at))
+        .map(|(_, field)| *field);
+    assert_eq!(field, Some(SearchField::Code), "ranges: {ranges:?}");
 }
 
-/// F-MD-06: setext H1 heading is TypeDefinition.
+/// F-MD-05: a block quote is a Comment.
 #[test]
-fn f_md_06_setext_h1_type_def() {
-    let source = "Title\n=====\n\nBody.\n";
-    let ranges = classify_markdown(source).unwrap();
-    assert_contiguous(&ranges, source.len());
-
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "setext H1 should be TypeDefinition; ranges: {ranges:?}"
-    );
-}
-
-/// F-MD-07: blockquote is Comment.
-#[test]
-fn f_md_07_blockquote_is_comment() {
+fn f_md_05_blockquote_is_comment() {
     let source = "# T\n\n> quote text\n";
     let ranges = classify_markdown(source).unwrap();
     assert_contiguous(&ranges, source.len());
@@ -722,9 +641,9 @@ fn f_md_07_blockquote_is_comment() {
     );
 }
 
-/// F-MD-08: list items are Comment.
+/// F-MD-06: list items are Comment.
 #[test]
-fn f_md_08_list_is_comment() {
+fn f_md_06_list_is_comment() {
     let source = "# T\n\n- item 1\n- item 2\n";
     let ranges = classify_markdown(source).unwrap();
     assert_contiguous(&ranges, source.len());
@@ -852,25 +771,24 @@ fn i_01_classify_source_json_dispatch() {
     let ranges = classify_source(source, rskim_core::Language::Json).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    // With format-specific classification, JSON should no longer be all-Other.
-    // At minimum, the key "name" should be SymbolName.
-    assert!(
-        has_field(&ranges, SearchField::SymbolName),
-        "JSON classify_source should produce SymbolName for key; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec![r#""skim""#],
+        "ranges: {ranges:?}"
     );
 }
 
 /// I-02: classify_source dispatches YAML to the format-specific scanner.
 #[test]
 fn i_02_classify_source_yaml_dispatch() {
-    let source = "host: localhost\n";
+    let source = "host: \"localhost\"\n";
     let ranges = classify_source(source, rskim_core::Language::Yaml).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition)
-            || has_field(&ranges, SearchField::SymbolName),
-        "YAML classify_source should produce TypeDefinition or SymbolName; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"localhost\""],
+        "ranges: {ranges:?}"
     );
 }
 
@@ -881,50 +799,42 @@ fn i_03_classify_source_toml_dispatch() {
     let ranges = classify_source(source, rskim_core::Language::Toml).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "TOML classify_source should produce TypeDefinition for section; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"skim\""],
+        "ranges: {ranges:?}"
     );
 }
 
-/// I-04: classify_source dispatches Markdown to the format-specific scanner.
+/// I-04: classify_source dispatches Markdown to the Markdown classifier.
 #[test]
 fn i_04_classify_source_markdown_dispatch() {
     let source = "# Title\n\nBody.\n";
     let ranges = classify_source(source, rskim_core::Language::Markdown).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "Markdown classify_source should produce TypeDefinition for H1; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::Comment),
+        vec!["Body.\n"],
+        "ranges: {ranges:?}"
     );
 }
 
-/// I-05: classify_source still works correctly for tree-sitter languages.
+/// I-05: classify_source takes the tree-sitter path for a code language.
 #[test]
 fn i_05_classify_source_rust_unchanged() {
-    let source = "struct Foo { x: u32 }";
+    let source = "fn f() { let s = \"x\"; } // note";
     let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "Rust struct should still have TypeDefinition; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::StringLiteral),
+        vec!["\"x\""],
+        "ranges: {ranges:?}"
     );
-}
-
-/// I-06: Markdown is now dispatched to the tree-sitter-based classifier.
-///
-/// Verifies that classify_source for Markdown produces non-trivial field
-/// classification (not all-Other) for a document with a heading.
-#[test]
-fn i_06_classify_source_markdown_produces_type_def_for_heading() {
-    let source = "## Section\n\nContent.\n";
-    let ranges = classify_source(source, rskim_core::Language::Markdown).unwrap();
-    assert_contiguous(&ranges, source.len());
-
-    assert!(
-        has_field(&ranges, SearchField::TypeDefinition),
-        "Markdown H2 should produce TypeDefinition via classify_source; ranges: {ranges:?}"
+    assert_eq!(
+        field_text(source, &ranges, SearchField::Comment),
+        vec!["// note"],
+        "ranges: {ranges:?}"
     );
 }

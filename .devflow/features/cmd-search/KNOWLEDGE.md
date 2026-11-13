@@ -91,7 +91,7 @@ of stdout closed the pipe (`pipe_closed_exit`).
 | `universe.rs` | `list_universe`, `Containment`, `LeftOut`, `SensitivePolicy`, `sensitive_admission`. |
 | `matcher.rs` | `Matcher`: one compiled pattern, the case rules, the whole-word rule, the regex size limits. |
 | `scan.rs` | `count` (phase A) and `label` / `into_counts` (phase B), `Limits`, `ScanOutput`. |
-| `classifier.rs`, `field.rs`, `fields/` | The syntactic field of a byte range: comment, string, identifier. Markdown and data formats have their own classifiers. |
+| `classifier.rs`, `field.rs`, `fields/` | The syntactic field of a byte range: comment, string, code (a name or a body, kept so that the innermost range wins). The role rules read only the comment and string fields. Markdown and data formats have their own classifiers. |
 | `roles.rs` | `Role`, `Labels`, `classify_line`, `Unlabelled`: the role of each hit. |
 | `rank.rs` | `FilePrior`, `rank_labelled`, `rank_words`: the rank order of both views. |
 | `render.rs` | `render`: the text views, `-l`, `-c` and the JSON envelope. Pure: it reads no file and writes no stream. |

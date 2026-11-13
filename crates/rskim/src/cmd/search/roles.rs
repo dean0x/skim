@@ -15,7 +15,7 @@
 //! 5. `ref` for any other code.
 //!
 //! A hit in a file with no grammar, and a hit in Markdown prose, is `text`.
-//! The classifier marks Markdown prose as a `Comment` field to rank it, and
+//! The Markdown classifier marks prose as a `Comment` field, and
 //! [`Labels::new`] maps that field to `Other`, because a Markdown file has no
 //! comments. A hit in a data format outside a comment or a string is `text`;
 //! a data format keeps its real comment and string roles.
@@ -246,8 +246,8 @@ impl Labels {
             Parser::new_for_extension(lang, ext).map_err(|_| Unlabelled::ParseFailed)?;
         let tree = parser.parse(source).map_err(|_| Unlabelled::ParseFailed)?;
         if lang == Language::Markdown {
-            // The classifier marks Markdown prose as `Comment` to rank it. A
-            // Markdown file has no comments, so its prose is `text`.
+            // The Markdown classifier marks prose as `Comment`. A Markdown
+            // file has no comments, so its prose is `text`.
             let fields = classify_tree(&tree, source, lang)
                 .into_iter()
                 .map(|(range, field)| match field {
