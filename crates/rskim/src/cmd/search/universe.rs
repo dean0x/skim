@@ -360,7 +360,7 @@ fn walk_entries(
         let entry = match item {
             Ok(entry) => entry,
             Err(e) => {
-                crate::debug_log!("skim search: walk error: {e}");
+                crate::debug_log!("skim search [debug]: walk error: {:?}", e.to_string());
                 left_out.add(LeftOut::Unreadable);
                 continue;
             }

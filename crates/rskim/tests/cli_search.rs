@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Read as _;
 use std::process::Stdio;
 
-use common::search_repo::{Run, SearchRepo};
+use common::search_repo::{Run, SearchRepo, finish};
 use serde_json::Value;
 
 // ============================================================================
@@ -361,6 +361,52 @@ fn files_that_cannot_be_searched_are_counted_under_their_reason() {
     assert!(text.stderr.contains("1 too_large"));
     assert!(text.stderr.contains("1 vanished"));
     assert!(text.stderr.contains("1 symlink"));
+}
+
+#[test]
+fn debug_lines_print_only_with_skim_debug_and_carry_the_debug_prefix() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = SearchRepo::new();
+    repo.write("ok.txt", "needle\n");
+    repo.track_all();
+    // An untracked folder that cannot be listed gives a walk error.
+    let locked = repo.root().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // A user that can list a folder without permission (root) gets no error.
+    let listable_anyway = fs::read_dir(&locked).is_ok();
+
+    let mut cmd = repo.skim();
+    cmd.env("SKIM_DEBUG", "1").args(["search", "needle"]);
+    let debug = finish(&mut cmd);
+    let plain = repo.search(&["needle"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(debug.code, 0, "{}", debug.stderr);
+    for stage in [
+        "list:",
+        "read and match:",
+        "parse and label:",
+        "rank and render:",
+    ] {
+        let line = format!("skim search [debug]: {stage}");
+        assert!(debug.stderr.contains(&line), "{line:?}: {}", debug.stderr);
+    }
+    if !listable_anyway {
+        assert!(
+            debug.stderr.contains("skim search [debug]: walk error: "),
+            "{}",
+            debug.stderr
+        );
+    }
+    // A debug line never takes the form of a line that is always on.
+    assert!(
+        !debug.stderr.contains("skim search: walk error"),
+        "{}",
+        debug.stderr
+    );
+    assert!(!plain.stderr.contains("[debug]"), "{}", plain.stderr);
 }
 
 // ============================================================================
