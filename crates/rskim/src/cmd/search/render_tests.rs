@@ -818,6 +818,12 @@ fn a_path_with_a_control_character_prints_c_quoted() {
         quote_path(Path::new("q\"\\\t\r\u{7f}.rs")),
         "\"q\\\"\\\\\\t\\r\\177.rs\""
     );
+    // A C1 control (here U+009B, a one-character escape start on some
+    // terminals) is quoted with the octal escapes of its UTF-8 bytes.
+    assert_eq!(
+        quote_path(Path::new("a\u{9b}[31mb.rs")),
+        "\"a\\302\\233[31mb.rs\""
+    );
 }
 
 #[cfg(unix)]

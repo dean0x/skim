@@ -16,7 +16,8 @@
 //! # Escapes
 //!
 //! Text output never prints a control byte from a file name or a line. A path
-//! with a control character is C-quoted (`"a\nb"`); a path that is not UTF-8 is
+//! with a control character is C-quoted (`"a\nb"`; a C1 control prints as the
+//! octal escapes of its UTF-8 bytes, `"\302\233"`); a path that is not UTF-8 is
 //! quoted with octal escapes for every byte above `0x7F`, as git does with
 //! `core.quotePath`. In line text, C0 controls except TAB and DEL print as
 //! `\xHH`, and C1 controls print as `\u{HH}`, so a hit cannot move the cursor
@@ -251,7 +252,7 @@ fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
 pub(super) fn quote_path(path: &Path) -> String {
     let bytes = path_bytes(path);
     match std::str::from_utf8(&bytes) {
-        Ok(text) if !text.chars().any(|c| c.is_ascii_control()) => text.to_owned(),
+        Ok(text) if !text.chars().any(char::is_control) => text.to_owned(),
         Ok(text) => {
             let mut out = String::with_capacity(text.len() + 2);
             out.push('"');
@@ -262,7 +263,13 @@ pub(super) fn quote_path(path: &Path) -> String {
                     '\r' => out.push_str("\\r"),
                     '"' => out.push_str("\\\""),
                     '\\' => out.push_str("\\\\"),
-                    c if c.is_ascii_control() => out.push_str(&format!("\\{:03o}", c as u32)),
+                    // A C0 or a C1 control: the octal escape of each UTF-8 byte.
+                    c if c.is_control() => {
+                        let mut buf = [0u8; 4];
+                        for b in c.encode_utf8(&mut buf).bytes() {
+                            out.push_str(&format!("\\{b:03o}"));
+                        }
+                    }
                     c => out.push(c),
                 }
             }
