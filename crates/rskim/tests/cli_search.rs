@@ -804,6 +804,63 @@ fn every_run_time_exit_2_cause_prints_one_error_object_under_json() {
     }
 }
 
+/// Run `skim search ARGS` in a working folder that no longer exists. The shell
+/// enters a new folder, removes it, then replaces itself with `skim`, so the
+/// child starts with a working folder that the system cannot name.
+#[cfg(unix)]
+fn search_from_a_removed_folder(repo: &SearchRepo, args: &[&str]) -> Run {
+    let doomed = repo.home().join("doomed");
+    fs::create_dir(&doomed).unwrap();
+    let skim = repo.std_search_command(args);
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(r#"cd "$1" && rmdir "$1" && shift && exec "$@""#)
+        .arg("sh")
+        .arg(&doomed)
+        .arg(skim.get_program())
+        .args(skim.get_args());
+    for (key, value) in skim.get_envs() {
+        match value {
+            Some(value) => cmd.env(key, value),
+            None => cmd.env_remove(key),
+        };
+    }
+    let output = cmd.output().expect("run sh");
+    assert!(!doomed.exists(), "the working folder was not removed");
+    Run {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_working_folder_exits_2_with_the_error_text_and_under_json_one_error_object() {
+    let repo = launch_repo();
+
+    let plain = search_from_a_removed_folder(&repo, &["launch_worker"]);
+    assert_eq!(plain.code, 2, "{}", plain.stderr);
+    assert_eq!(plain.stdout, "");
+    assert!(
+        plain
+            .stderr
+            .starts_with("skim search: cannot read the current folder: "),
+        "{}",
+        plain.stderr
+    );
+
+    let json = search_from_a_removed_folder(&repo, &["launch_worker", "--json"]);
+    assert_json_error("removed working folder", &json);
+    assert!(
+        json_of(&json)["error"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("cannot read the current folder: ")),
+        "{}",
+        json.stdout
+    );
+}
+
 #[test]
 fn two_runs_of_one_query_give_equal_cost_counters() {
     let repo = launch_repo();
