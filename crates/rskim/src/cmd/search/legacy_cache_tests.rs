@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 use super::{
-    LEGACY_ARTIFACTS, LegacyCleanup, format_megabytes, legacy_index_report,
+    LEGACY_ARTIFACTS, LegacyCleanup, LegacyReport, format_megabytes, legacy_index_report,
     remove_legacy_index_data,
 };
 
@@ -322,12 +322,40 @@ fn test_report_counts_what_cleanup_would_remove() {
 
     let report = legacy_index_report(base.path());
 
-    assert_eq!(report, Some((2, total)));
+    assert_eq!(
+        report,
+        Some(LegacyReport {
+            folders: 2,
+            bytes: total,
+            more: false
+        })
+    );
     // The report removed nothing.
     assert!(first.join("index.skidx").exists());
     // And it is the number that cleanup then removes.
     let cleanup = remove_legacy_index_data(base.path()).unwrap();
     assert_eq!((cleanup.folders, cleanup.bytes), (2, total));
+}
+
+#[test]
+fn test_report_says_when_entries_past_the_bound_went_uninspected() {
+    let base = tempdir().unwrap();
+    let search = base.path().join("search");
+    fs::create_dir_all(&search).unwrap();
+    for n in 0..=super::MAX_SEARCH_ENTRIES {
+        fs::write(search.join(format!("other{n}")), b"").unwrap();
+    }
+
+    // No old file is among the first entries, yet one entry went uninspected:
+    // the report must not claim there is nothing.
+    assert_eq!(
+        legacy_index_report(base.path()),
+        Some(LegacyReport {
+            folders: 0,
+            bytes: 0,
+            more: true
+        })
+    );
 }
 
 #[test]

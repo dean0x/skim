@@ -46,7 +46,7 @@ const PROJECT_FOLDER_NAME_LEN: usize = 16;
 
 /// Most entries of `<cache>/search` one pass inspects. A cache that holds more
 /// project folders is cleaned over several runs.
-const MAX_SEARCH_ENTRIES: usize = 4096;
+pub(crate) const MAX_SEARCH_ENTRIES: usize = 4096;
 
 /// What a cleanup removed and what it left.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -179,11 +179,26 @@ pub(crate) fn remove_legacy_index_data(base: &Path) -> io::Result<LegacyCleanup>
     Ok(cleanup)
 }
 
+/// What [`legacy_index_report`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LegacyReport {
+    /// Project folders with old index files, among the entries inspected.
+    pub folders: u64,
+    /// Bytes in those files.
+    pub bytes: u64,
+    /// `<cache>/search` holds more than [`MAX_SEARCH_ENTRIES`] entries. The
+    /// entries past the bound were not inspected, so `folders` and `bytes` are
+    /// lower bounds.
+    pub more: bool,
+}
+
 /// The project folders with old index files, and their size in bytes, under the
-/// cache folder `base`. `None` when there are none. It removes nothing.
+/// cache folder `base`. `None` when there are none and no entry went
+/// uninspected. It removes nothing.
 ///
-/// Counts the same files that [`remove_legacy_index_data`] removes.
-pub(crate) fn legacy_index_report(base: &Path) -> Option<(u64, u64)> {
+/// Counts the same files that [`remove_legacy_index_data`] removes, inside the
+/// same bound of [`MAX_SEARCH_ENTRIES`] entries.
+pub(crate) fn legacy_index_report(base: &Path) -> Option<LegacyReport> {
     let Ok(SearchDir::Folder(search)) = classify_search_dir(base) else {
         return None;
     };
@@ -196,7 +211,11 @@ pub(crate) fn legacy_index_report(base: &Path) -> Option<(u64, u64)> {
             bytes += artifacts.iter().map(|(_, len)| len).sum::<u64>();
         }
     }
-    (folders > 0).then_some((folders, bytes))
+    (folders > 0 || scan.more).then_some(LegacyReport {
+        folders,
+        bytes,
+        more: scan.more,
+    })
 }
 
 /// `bytes` as megabytes (10^6 bytes) with one decimal, for the notices.
