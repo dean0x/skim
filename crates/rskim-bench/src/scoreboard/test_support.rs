@@ -20,53 +20,76 @@ use crate::scoreboard::runner::{SkimRunner, SkimSandbox};
 ///
 /// # Panics
 ///
-/// Panics when the script cannot be written or does not start.
+/// Panics when the script cannot be written, does not start, or does not exit
+/// within [`START_TIMEOUT_SECS`].
 #[cfg(unix)]
 pub fn script_runner(dir: &Path, body: &str) -> SkimRunner {
+    let bin = write_script(dir, body);
+    if let Err(e) = start_until_runnable(&bin, START_TIMEOUT_SECS) {
+        panic!("the stand-in skim {} is not usable: {e:#}", bin.display());
+    }
+    SkimRunner::new(bin, SkimSandbox::new(dir.join("home")))
+}
+
+/// Write `body` as the executable POSIX shell script `<dir>/skim`.
+#[cfg(unix)]
+fn write_script(dir: &Path, body: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let bin = dir.join("skim");
     std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    wait_until_runnable(&bin);
-    SkimRunner::new(bin, SkimSandbox::new(dir.join("home")))
+    bin
 }
+
+/// How long one start of a stand-in script may run before it is killed. The
+/// scripts only print and exit, so this bound is never close to being used.
+#[cfg(unix)]
+const START_TIMEOUT_SECS: u64 = 10;
 
 /// Start the new script once, and try again while the kernel says it is busy.
 ///
 /// On Linux, `execve(2)` fails with ETXTBSY (os error 26) while a child that
 /// another test thread forked still holds the write handle of the new file.
-/// That window ends when the child execs. The write handle of this function
-/// is already closed, so after one start succeeds, no later fork can get it,
-/// and the test's own start cannot fail this way. The script bodies only
-/// print and exit, so the extra start has no side effect.
+/// That window ends when the child execs. The write handle of the caller is
+/// already closed, so after one start succeeds, no later fork can get it, and
+/// the test's own start cannot fail this way. The script bodies only print and
+/// exit, so the extra start has no side effect.
 ///
-/// Bound: 5 tries, with a sleep of `25 ms × 2^try` after each busy try.
+/// Every start runs through the bounded runner, so a script that never exits
+/// is killed, with its process group, after `timeout_secs`, and that is an
+/// error. Bound: 5 tries, with a sleep of `25 ms × 2^try` after each busy try.
 #[cfg(unix)]
-fn wait_until_runnable(bin: &Path) {
+fn start_until_runnable(bin: &Path, timeout_secs: u64) -> anyhow::Result<()> {
     use std::process::Stdio;
 
-    const ETXTBSY: i32 = 26;
     const MAX_TRIES: u32 = 5;
 
+    let label = format!("the stand-in skim {}", bin.display());
     for attempt in 0..MAX_TRIES {
-        match Command::new(bin)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(_) => return,
-            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+        let mut cmd = Command::new(bin);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match rskim_research::clone::git_output_with_timeout(cmd, &label, timeout_secs) {
+            Ok(_) => return Ok(()),
+            Err(e) if is_busy(&e) => {
                 std::thread::sleep(std::time::Duration::from_millis(25 << attempt));
             }
-            Err(e) => panic!("the stand-in skim {} does not start: {e}", bin.display()),
+            Err(e) => return Err(e),
         }
     }
-    panic!(
-        "the stand-in skim {} is still busy after {MAX_TRIES} tries",
-        bin.display()
-    );
+    anyhow::bail!("{label} is still busy after {MAX_TRIES} tries")
+}
+
+/// Whether `err` carries ETXTBSY (os error 26) anywhere in its cause chain.
+#[cfg(unix)]
+fn is_busy(err: &anyhow::Error) -> bool {
+    const ETXTBSY: i32 = 26;
+
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.raw_os_error() == Some(ETXTBSY))
 }
 
 /// A throwaway git repository plus an isolated `HOME` for every git command
@@ -176,5 +199,67 @@ impl FixtureRepo {
 impl Default for FixtureRepo {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn a_stand_in_that_never_exits_is_killed_at_the_start_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_script(dir.path(), "sleep 8");
+
+        let started = Instant::now();
+        let err = start_until_runnable(&bin, 1).expect_err("a script that outlasts the bound");
+
+        assert!(format!("{err:#}").contains("timed out after 1s"), "{err:#}");
+        // The bound plus the kill grace of the runner, with room to spare, and
+        // well short of the 8 s the script asks for.
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_stand_in_that_exits_with_a_failure_status_has_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write_script(dir.path(), "exit 3");
+
+        start_until_runnable(&bin, START_TIMEOUT_SECS).expect("a script that runs and exits");
+    }
+
+    #[test]
+    fn a_stand_in_that_does_not_exist_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let started = Instant::now();
+        let err = start_until_runnable(&dir.path().join("absent"), START_TIMEOUT_SECS)
+            .expect_err("a missing script");
+
+        assert!(format!("{err:#}").contains("spawning"), "{err:#}");
+        // One try: the retry sleeps of a busy file alone add up to 775 ms.
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_busy_file_error_is_recognised_under_the_context_the_runner_adds() {
+        let busy = anyhow::Error::new(std::io::Error::from_raw_os_error(26))
+            .context("spawning the stand-in skim");
+        let missing = anyhow::Error::new(std::io::Error::from_raw_os_error(2))
+            .context("spawning the stand-in skim");
+
+        assert!(is_busy(&busy));
+        assert!(!is_busy(&missing));
+        assert!(!is_busy(&anyhow::anyhow!("timed out")));
     }
 }
