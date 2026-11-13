@@ -20,7 +20,7 @@ use crate::scoreboard::runner::{SkimRunner, SkimSandbox};
 ///
 /// # Panics
 ///
-/// Panics when the script cannot be written.
+/// Panics when the script cannot be written or does not start.
 #[cfg(unix)]
 pub fn script_runner(dir: &Path, body: &str) -> SkimRunner {
     use std::os::unix::fs::PermissionsExt;
@@ -28,7 +28,45 @@ pub fn script_runner(dir: &Path, body: &str) -> SkimRunner {
     let bin = dir.join("skim");
     std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wait_until_runnable(&bin);
     SkimRunner::new(bin, SkimSandbox::new(dir.join("home")))
+}
+
+/// Start the new script once, and try again while the kernel says it is busy.
+///
+/// On Linux, `execve(2)` fails with ETXTBSY (os error 26) while a child that
+/// another test thread forked still holds the write handle of the new file.
+/// That window ends when the child execs. The write handle of this function
+/// is already closed, so after one start succeeds, no later fork can get it,
+/// and the test's own start cannot fail this way. The script bodies only
+/// print and exit, so the extra start has no side effect.
+///
+/// Bound: 5 tries, with a sleep of `25 ms × 2^try` after each busy try.
+#[cfg(unix)]
+fn wait_until_runnable(bin: &Path) {
+    use std::process::Stdio;
+
+    const ETXTBSY: i32 = 26;
+    const MAX_TRIES: u32 = 5;
+
+    for attempt in 0..MAX_TRIES {
+        match Command::new(bin)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(_) => return,
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(25 << attempt));
+            }
+            Err(e) => panic!("the stand-in skim {} does not start: {e}", bin.display()),
+        }
+    }
+    panic!(
+        "the stand-in skim {} is still busy after {MAX_TRIES} tries",
+        bin.display()
+    );
 }
 
 /// A throwaway git repository plus an isolated `HOME` for every git command
