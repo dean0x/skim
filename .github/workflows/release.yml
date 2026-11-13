@@ -17,6 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history, the same as the ci.yml test job: the pinned-SHA
+          # JSON-content tests (#508, cli_git_diff_json_content and
+          # cli_git_show_json_content) read a real commit and its parent,
+          # which a depth-1 checkout does not have.
+          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
