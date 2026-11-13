@@ -1,9 +1,9 @@
 //! Drives the `skim` CLI as a subprocess, the way agents use it (#203).
 //!
-//! Every query is `skim search --root <clone> --json --limit N [--offset K]
-//! [flags] [-- <query>]`: all flags go before `--` (the CLI requires output
-//! flags there), and the query always follows `--`, so `-D warnings` and
-//! `->` parse as text.
+//! A JSON query is `skim search --root <clone> --json --limit N [--offset K]
+//! [flags] -- <query>`: all flags go before `--`, and the query always
+//! follows `--`, so `-D warnings` and `->` parse as text. The scan engine
+//! reads the files on every call, so there is nothing to build first.
 //!
 //! - **Environment**: [`SkimSandbox`] copies `skim_sandboxed_with_bin`
 //!   (`crates/rskim/tests/common/mod.rs`, test-only so it cannot be imported)
@@ -12,14 +12,17 @@
 //! - **Time**: every subprocess is bounded by [`SKIM_TIMEOUT_SECS`] through
 //!   `rskim_research::clone::git_output_with_timeout`; a sweep is bounded by
 //!   [`MAX_PAGES`].
-//! - **Exit status**: stdout must parse as the arm's JSON envelope. A
-//!   non-zero exit with a parsable envelope is accepted (a no-match exit
-//!   code must not read as a crash), and the page keeps the real exit code
+//! - **Exit status**: stdout must parse as the JSON envelope. A non-zero exit
+//!   with a parsable envelope is accepted (a no-match exit code must not read
+//!   as a crash), and the page keeps the real exit code
 //!   (`ResultPage::exit_code`), which `stakes.exit` judges. A signal, a
-//!   timeout, non-JSON stdout, a malformed envelope (an unknown `field`
-//!   value included), or a `degraded[]` page for an entry that ranks by
-//!   temporal data is an error, which the scoreboard reports as a harness
-//!   error (exit 2), never as a regression.
+//!   timeout, non-JSON stdout, an `error` envelope or a malformed envelope
+//!   (an unknown role included) is an error, which the scoreboard reports as
+//!   a harness error (exit 2), never as a regression.
+//! - **`[[stakes]]` entries** pass their own flags to skim. `-l` and `-c`
+//!   cannot be combined with `--json`, so those calls read the text output
+//!   (a path per line, or `path:count`); an entry that expects an exit code
+//!   reads the status of a text call and nothing else.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -27,20 +30,18 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::Instant;
 
 use anyhow::Context;
-use rskim_oracle::structural::OracleLang;
 use serde_json::Value;
 
 use crate::scoreboard::MAX_PAGES;
-use crate::scoreboard::golden::{QueryFlags, pagination_bound, within_pagination_bound};
+use crate::scoreboard::golden::{StakesEntry, StakesExpect};
 use crate::scoreboard::metrics::PlannedQuery;
-use crate::scoreboard::structural_metrics::rows_in;
-use crate::scoreboard::types::{Arm, AstPage, EntryKind, ResultPage, StatsSnapshot};
+use crate::scoreboard::types::{EntryKind, ResultPage};
 use crate::scoreboard::universe::GitIsolation;
 
 /// Per-subprocess timeout (seconds).
 pub const SKIM_TIMEOUT_SECS: u64 = 120;
 
-/// `--limit` for a "full list" call. The CLI has no upper clamp.
+/// `--limit` for a "full list" call. The CLI accepts 1 to 1000000.
 pub const FULL_LIST_LIMIT: u32 = 1_000_000;
 
 /// How much of skim's stdout / stderr an error message quotes.
@@ -64,8 +65,8 @@ const REMOVED_SKIM_ENV: &[&str] = &[
 // ============================================================================
 
 /// The isolated environment every skim (and oracle git) subprocess runs in:
-/// one scoreboard-owned `HOME` per run, holding skim's cache (and so its
-/// index) and every agent config dir.
+/// one scoreboard-owned `HOME` per run, holding skim's cache and every agent
+/// config dir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkimSandbox {
     home: PathBuf,
@@ -112,11 +113,11 @@ impl SkimSandbox {
 // ============================================================================
 
 /// Arguments for one JSON query: `search --root <root> --json --limit N
-/// [--offset K] <flags> [-- <query>]` (`--offset` only when `K > 0`).
+/// [--offset K] <flags> -- <query>` (`--offset` only when `K > 0`).
 pub fn search_args(
     root: &Path,
-    query: Option<&str>,
-    flags: &QueryFlags,
+    query: &str,
+    flags: &[String],
     limit: u32,
     offset: u64,
 ) -> Vec<OsString> {
@@ -131,38 +132,46 @@ pub fn search_args(
     if offset > 0 {
         args.extend(["--offset".into(), offset.to_string().into()]);
     }
-    args.extend(flags.to_args().into_iter().map(OsString::from));
-    if let Some(query) = query {
-        args.extend(["--".into(), query.into()]);
-    }
+    args.extend(flags.iter().map(OsString::from));
+    args.extend(["--".into(), query.into()]);
     args
 }
 
 /// Arguments for a text-mode run at the default `--limit` (what an agent
-/// reads): `search --root <root> -- <query>`.
-pub fn text_args(root: &Path, query: &str) -> Vec<OsString> {
-    vec![
+/// reads): `search --root <root> <flags> -- <query>`.
+pub fn text_args(root: &Path, query: &str, flags: &[String]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
         "search".into(),
         "--root".into(),
         root.as_os_str().to_owned(),
-        "--".into(),
-        query.into(),
-    ]
+    ];
+    args.extend(flags.iter().map(OsString::from));
+    args.extend(["--".into(), query.into()]);
+    args
 }
 
 /// A root-free description of a JSON query, for error messages.
-fn query_label(query: Option<&str>, flags: &QueryFlags, limit: u32, offset: u64) -> String {
+fn query_label(query: &str, flags: &[String], limit: u32, offset: u64) -> String {
     let mut label = format!("skim search --json --limit {limit}");
     if offset > 0 {
         label.push_str(&format!(" --offset {offset}"));
     }
-    for flag in flags.to_args() {
+    for flag in flags {
         label.push(' ');
-        label.push_str(&flag);
+        label.push_str(flag);
     }
-    if let Some(query) = query {
-        label.push_str(&format!(" -- {query:?}"));
+    label.push_str(&format!(" -- {query:?}"));
+    label
+}
+
+/// A root-free description of a text-mode query, for error messages.
+fn text_label(query: &str, flags: &[String]) -> String {
+    let mut label = String::from("skim search");
+    for flag in flags {
+        label.push(' ');
+        label.push_str(flag);
     }
+    label.push_str(&format!(" -- {query:?} (text mode)"));
     label
 }
 
@@ -205,7 +214,8 @@ pub struct TextOutput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntryObservation {
     pub id: String,
-    /// The full list (`--limit` [`FULL_LIST_LIMIT`], no offset).
+    /// The full list (`--limit` [`FULL_LIST_LIMIT`], no offset). A
+    /// `[[stakes]]` entry's list is read from the call its flags need.
     pub full: ResultPage,
     /// One sweep per limit (`[[pagination]]` only).
     pub sweeps: Vec<Sweep>,
@@ -213,32 +223,6 @@ pub struct EntryObservation {
     pub limited: Vec<(u32, ResultPage)>,
     /// Text-mode output (`[[ident]]` / `[[concept]]` only).
     pub text: Option<TextOutput>,
-}
-
-impl EntryObservation {
-    /// This observation with the corpus accounting of `stats` on its full
-    /// list (`universe.accounted` reads it there). The other lists are
-    /// pages of the same call and state none.
-    #[must_use]
-    pub fn with_accounting(self, stats: &StatsSnapshot) -> Self {
-        EntryObservation {
-            full: self.full.with_accounting(stats),
-            ..self
-        }
-    }
-
-    /// An `[[ast]]` entry's observation: the rows of its pattern's
-    /// `--ast <pattern>` answer `call` in `lang` ([`rows_in`]) as its full
-    /// list, and nothing else (the entry is never observed on its own).
-    pub fn for_ast(id: &str, call: &AstPage, lang: OracleLang) -> Self {
-        EntryObservation {
-            id: id.to_string(),
-            full: rows_in(&call.page, lang),
-            sweeps: Vec::new(),
-            limited: Vec::new(),
-            text: None,
-        }
-    }
 }
 
 /// An observation plus the timings of every call behind it.
@@ -257,18 +241,11 @@ struct JsonCall {
     timing: Timing,
 }
 
-impl JsonCall {
-    /// The process exit code, which `stakes.exit` judges.
-    ///
-    /// # Errors
-    ///
-    /// The process has no exit code (a signal ended it): [`SkimRunner::json`]
-    /// refuses that first, and this refuses it too rather than invent a code.
-    fn exit_code(&self) -> anyhow::Result<i32> {
-        self.status
-            .code()
-            .with_context(|| format!("{}: no exit code ({})", self.label, self.status))
-    }
+/// One text-mode call.
+struct TextCall {
+    output: TextOutput,
+    exit_code: i32,
+    timing: Timing,
 }
 
 // ============================================================================
@@ -306,126 +283,38 @@ impl SkimRunner {
         &self.sandbox
     }
 
-    /// `skim search --build --root <root>`; must exit 0.
-    ///
-    /// # Errors
-    ///
-    /// Spawn failure, timeout, or a non-zero exit (stderr quoted).
-    pub fn build(&self, root: &Path) -> anyhow::Result<()> {
-        let args: Vec<OsString> = vec![
-            "search".into(),
-            "--build".into(),
-            "--root".into(),
-            root.as_os_str().to_owned(),
-        ];
-        let label = "skim search --build";
-        let (out, _) = self.exec(&args, label)?;
-        anyhow::ensure!(
-            out.status.success(),
-            "{label} failed ({}): {}",
-            out.status,
-            excerpt(&out.stderr)
-        );
-        Ok(())
-    }
-
-    /// `skim search --stats --json --root <root>`.
-    ///
-    /// # Errors
-    ///
-    /// Spawn failure, timeout, a signal, or stdout that is not a stats
-    /// object (including skim's `{"error": …}` envelope).
-    pub fn stats(&self, root: &Path) -> anyhow::Result<StatsSnapshot> {
-        let args: Vec<OsString> = vec![
-            "search".into(),
-            "--stats".into(),
-            "--json".into(),
-            "--root".into(),
-            root.as_os_str().to_owned(),
-        ];
-        let label = "skim search --stats --json";
-        let (out, _) = self.exec(&args, label)?;
-        ensure_not_signalled(&out, label)?;
-        StatsSnapshot::parse(&out.stdout)
-            .with_context(|| format!("{label} ({}); stderr: {}", out.status, excerpt(&out.stderr)))
-    }
-
     /// One JSON query page, with the process's exit code (any exit code is
     /// accepted when stdout is a parsable envelope).
     ///
     /// # Errors
     ///
-    /// Spawn failure, timeout, a signal, non-JSON stdout, or an envelope
-    /// that does not parse for `arm`.
+    /// Spawn failure, timeout, a signal, non-JSON stdout, an `error`
+    /// envelope, or an envelope that does not parse.
     pub fn page(
         &self,
         root: &Path,
-        arm: Arm,
-        query: Option<&str>,
-        flags: &QueryFlags,
+        query: &str,
+        flags: &[String],
         limit: u32,
         offset: u64,
     ) -> anyhow::Result<(ResultPage, Timing)> {
         let call = self.json(root, query, flags, limit, offset)?;
-        let page = ResultPage::from_json(arm, &call.value).with_context(|| {
-            format!(
-                "{}: unexpected {arm:?} JSON envelope ({})",
-                call.label, call.status
-            )
+        let page = ResultPage::from_json(&call.value).with_context(|| {
+            format!("{}: unexpected JSON envelope ({})", call.label, call.status)
         })?;
-        let page = ResultPage {
-            exit_code: call.exit_code()?,
-            ..page
-        };
-        Ok((page, call.timing))
-    }
-
-    /// `skim search --root <root> --json --limit 1000000 --ast <pattern>`:
-    /// the pattern's full standalone list (every language) and its
-    /// `ast_coverage`. The scoreboard makes this call once per (corpus,
-    /// pattern) and splits the rows among the pattern's `[[ast]]` entries,
-    /// and those entries' checks and the unscored-row counts take the list
-    /// to be the pattern's complete answer.
-    ///
-    /// # Errors
-    ///
-    /// As [`SkimRunner::page`], plus a malformed `ast_coverage`, or a list
-    /// that reports `has_more` (truncated at [`FULL_LIST_LIMIT`], so not
-    /// complete).
-    pub fn ast_list(&self, root: &Path, pattern: &str) -> anyhow::Result<(AstPage, Timing)> {
-        let flags = QueryFlags {
-            ast: Some(pattern.to_string()),
-            ..QueryFlags::default()
-        };
-        let call = self.json(root, None, &flags, FULL_LIST_LIMIT, 0)?;
-        let AstPage { page, coverage } = AstPage::from_json(&call.value).with_context(|| {
-            format!(
-                "{}: unexpected standalone --ast JSON envelope ({})",
-                call.label, call.status
-            )
-        })?;
-        let page = AstPage {
-            page: ResultPage {
-                exit_code: call.exit_code()?,
-                ..page
-            },
-            coverage,
-        };
-        anyhow::ensure!(
-            !page.page.has_more,
-            "{}: the full list reports has_more = true at --limit {FULL_LIST_LIMIT}, so it is not \
-             the pattern's complete answer and cannot be split among its [[ast]] entries",
-            call.label
-        );
-        Ok((page, call.timing))
+        let exit_code = call
+            .status
+            .code()
+            .with_context(|| format!("{}: no exit code ({})", call.label, call.status))?;
+        Ok((ResultPage { exit_code, ..page }, call.timing))
     }
 
     /// Run one JSON query and parse stdout as JSON.
     fn json(
         &self,
         root: &Path,
-        query: Option<&str>,
-        flags: &QueryFlags,
+        query: &str,
+        flags: &[String],
         limit: u32,
         offset: u64,
     ) -> anyhow::Result<JsonCall> {
@@ -469,8 +358,7 @@ impl SkimRunner {
         let mut timings = Vec::new();
         for index in 0..MAX_PAGES {
             let offset = u64::from(index) * u64::from(limit);
-            let (page, timing) =
-                self.page(root, q.arm, q.query.as_deref(), &q.flags, limit, offset)?;
+            let (page, timing) = self.page(root, &q.query, &q.flags, limit, offset)?;
             let more = page.has_more;
             pages.push(SweepPage { offset, page });
             timings.push(timing);
@@ -482,76 +370,56 @@ impl SkimRunner {
     }
 
     /// A text-mode run at the default limit. Any normal exit is accepted:
-    /// only the bytes are measured, and the JSON calls for the same query
-    /// judge correctness.
+    /// the caller reads the bytes or the exit code.
+    fn text_call(&self, root: &Path, query: &str, flags: &[String]) -> anyhow::Result<TextCall> {
+        let label = text_label(query, flags);
+        let (out, wall_ms) = self.exec(&text_args(root, query, flags), &label)?;
+        ensure_not_signalled(&out, &label)?;
+        let exit_code = out
+            .status
+            .code()
+            .with_context(|| format!("{label}: no exit code ({})", out.status))?;
+        Ok(TextCall {
+            output: TextOutput {
+                stdout: out.stdout,
+                stderr: out.stderr,
+            },
+            exit_code,
+            timing: Timing {
+                wall_ms,
+                duration_ms: None,
+            },
+        })
+    }
+
+    /// A text-mode run at the default limit, for the byte metrics.
     ///
     /// # Errors
     ///
     /// Spawn failure, timeout, or a signal.
     pub fn text(&self, root: &Path, query: &str) -> anyhow::Result<(TextOutput, Timing)> {
-        let label = format!("skim search -- {query:?} (text mode)");
-        let (out, wall_ms) = self.exec(&text_args(root, query), &label)?;
-        ensure_not_signalled(&out, &label)?;
-        Ok((
-            TextOutput {
-                stdout: out.stdout,
-                stderr: out.stderr,
-            },
-            Timing {
-                wall_ms,
-                duration_ms: None,
-            },
-        ))
+        let call = self.text_call(root, query, &[])?;
+        Ok((call.output, call.timing))
     }
 
-    /// Run every call a non-`[[ast]]` entry `q` needs: the full list; for
-    /// `[[pagination]]`, one sweep per limit (after checking an oracle-less
-    /// full list against the pagination bound); for `[[prefix]]`, one
-    /// limited list per limit; for `[[ident]]` / `[[concept]]`, one
-    /// text-mode run.
+    /// Run every call entry `q` needs: the full list; for `[[pagination]]`,
+    /// one sweep per limit; for `[[prefix]]`, one limited list per limit; for
+    /// `[[ident]]` / `[[concept]]`, one text-mode run; for `[[stakes]]`, the
+    /// one call its flags and expectation name ([`SkimRunner::observe_stakes`]).
     ///
     /// # Errors
     ///
-    /// An `[[ast]]` entry (its rows come from its pattern's single
-    /// [`SkimRunner::ast_list`] call); a `[[stakes]]` entry with `flags` (the
-    /// runner passes none of them to skim, so skim would answer another
-    /// query than the one the regex oracle judges); any call error; an oracle-less
-    /// (`--ast` / `--blast-radius`) pagination entry whose full list exceeds
-    /// `min(limits) × (MAX_PAGES − 1)` — golden integrity cannot bound those
-    /// in advance; or an entry that ranks by temporal data whose pages
-    /// report `degraded[]`.
+    /// Any call error.
     pub fn observe(&self, root: &Path, q: &PlannedQuery) -> anyhow::Result<Observed> {
-        anyhow::ensure!(
-            !q.is_structural(),
-            "{}: an [[ast]] entry is observed through its pattern's single call \
-             (SkimRunner::ast_list), not per entry",
-            q.id
-        );
         if let Some(stakes) = q.stakes_oracle() {
-            anyhow::ensure!(
-                stakes.entry.flags.is_empty(),
-                "{}: the runner does not pass the [[stakes]] flags {:?} to skim, so skim would \
-                 answer another query than the one the regex oracle judges; use flags = []",
-                q.id,
-                stakes.entry.flags
-            );
+            return self.observe_stakes(root, q, &stakes.entry);
         }
         let mut timings = Vec::new();
-        let query = q.query.as_deref();
-        let (full, t) = self.page(root, q.arm, query, &q.flags, FULL_LIST_LIMIT, 0)?;
+        let (full, t) = self.page(root, &q.query, &q.flags, FULL_LIST_LIMIT, 0)?;
         timings.push(t);
 
         let mut sweeps = Vec::new();
         if q.kind == EntryKind::Pagination {
-            if q.oracle.is_none() {
-                let count = u64::try_from(full.rows.len())?;
-                anyhow::ensure!(
-                    within_pagination_bound(count, &q.limits),
-                    "skim's full list has {count} rows, over the pagination bound {:?} \
-                     (min(limits) x (MAX_PAGES - 1)); narrow the query or raise its limits",
-                    pagination_bound(&q.limits)
-                );
-            }
             for &limit in &q.limits {
                 let (sweep, t) = self.sweep(root, q, limit)?;
                 sweeps.push(sweep);
@@ -562,33 +430,78 @@ impl SkimRunner {
         let mut limited = Vec::new();
         if q.kind == EntryKind::Prefix {
             for &limit in &q.limits {
-                let (page, t) = self.page(root, q.arm, query, &q.flags, limit, 0)?;
+                let (page, t) = self.page(root, &q.query, &q.flags, limit, 0)?;
                 limited.push((limit, page));
                 timings.push(t);
             }
         }
 
-        let text = match (q.measures_text(), query) {
-            (true, Some(query)) => {
-                let (text, t) = self.text(root, query)?;
-                timings.push(t);
-                Some(text)
-            }
-            (true, None) => anyhow::bail!("a ranking entry has no query"),
-            (false, _) => None,
+        let text = if q.measures_text() {
+            let (text, t) = self.text(root, &q.query)?;
+            timings.push(t);
+            Some(text)
+        } else {
+            None
         };
 
-        let observation = EntryObservation {
-            id: q.id.clone(),
-            full,
-            sweeps,
-            limited,
-            text,
-        };
-        ensure_ranking_applied(q, &observation)?;
         Ok(Observed {
-            observation,
+            observation: EntryObservation {
+                id: q.id.clone(),
+                full,
+                sweeps,
+                limited,
+                text,
+            },
             timings,
+        })
+    }
+
+    /// One `[[stakes]]` call, with the entry's own flags:
+    ///
+    /// - `expect = "exit"`: a text call, of which only the exit code is read;
+    /// - `-l`: a text call, one path per line;
+    /// - `-c`: a text call, one `path:count` per line;
+    /// - otherwise a JSON call for the full list.
+    fn observe_stakes(
+        &self,
+        root: &Path,
+        q: &PlannedQuery,
+        entry: &StakesEntry,
+    ) -> anyhow::Result<Observed> {
+        let text_page = |parse: fn(&[u8], i32) -> anyhow::Result<ResultPage>| {
+            let call = self.text_call(root, &q.query, &q.flags)?;
+            let page = parse(&call.output.stdout, call.exit_code).with_context(|| {
+                format!(
+                    "{}: unexpected text output; stderr: {:?}",
+                    text_label(&q.query, &q.flags),
+                    excerpt(&call.output.stderr)
+                )
+            })?;
+            anyhow::Ok((page, call.timing))
+        };
+        let (full, timing) = if entry.expect == StakesExpect::Exit {
+            let call = self.text_call(root, &q.query, &q.flags)?;
+            let page = ResultPage {
+                exit_code: call.exit_code,
+                ..ResultPage::default()
+            };
+            (page, call.timing)
+        } else if entry.has_flag("-l") {
+            text_page(ResultPage::from_files_text)?
+        } else if entry.has_flag("-c") {
+            text_page(ResultPage::from_counts_text)?
+        } else {
+            self.page(root, &q.query, &q.flags, FULL_LIST_LIMIT, 0)?
+        };
+        Ok(Observed {
+            observation: EntryObservation {
+                id: q.id.clone(),
+                full,
+                sweeps: Vec::new(),
+                limited: Vec::new(),
+                text: None,
+            },
+            timings: vec![timing],
         })
     }
 
@@ -605,41 +518,6 @@ impl SkimRunner {
         let out = rskim_research::clone::git_output_with_timeout(cmd, label, self.timeout_secs)
             .with_context(|| format!("running {} ({label})", self.bin.display()))?;
         Ok((out, start.elapsed().as_secs_f64() * 1000.0))
-    }
-}
-
-/// An entry that ranks by skim's temporal data (a temporal sort or
-/// `--blast-radius`) must not come back with `degraded[]` on any page: skim
-/// then served a fallback order, and scoring it would judge that order as
-/// if it were the requested ranking.
-///
-/// # Errors
-///
-/// `q` uses temporal data and a page reports a degraded subsystem.
-fn ensure_ranking_applied(q: &PlannedQuery, observation: &EntryObservation) -> anyhow::Result<()> {
-    if !q.flags.uses_temporal_data() {
-        // Without a requested ranking, degraded[] feeds lexical.silent_fn.
-        return Ok(());
-    }
-    let sweep_pages = observation
-        .sweeps
-        .iter()
-        .flat_map(|s| s.pages.iter().map(|p| &p.page));
-    let limited_pages = observation.limited.iter().map(|(_, page)| page);
-    let mut pages = std::iter::once(&observation.full)
-        .chain(sweep_pages)
-        .chain(limited_pages);
-    match pages.find_map(|p| p.degraded.first()) {
-        None => Ok(()),
-        Some(d) => anyhow::bail!(
-            "skim did not apply the requested ranking: degraded[] reports {} {} \
-             (requested {}, applied {}), so the entry's ordering checks would judge a \
-             fallback order",
-            d.subsystem,
-            d.reason,
-            d.requested.as_deref().unwrap_or("?"),
-            d.applied.as_deref().unwrap_or("?")
-        ),
     }
 }
 
@@ -673,6 +551,8 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+    use crate::scoreboard::golden::parse_golden;
+    use crate::scoreboard::metrics::plan;
     #[cfg(unix)]
     use crate::scoreboard::test_support::script_runner;
 
@@ -682,19 +562,17 @@ mod tests {
             .collect()
     }
 
-    fn flags(v: &[&str]) -> QueryFlags {
-        QueryFlags::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    fn flags(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
+
+    /// A valid envelope of no files.
+    #[cfg(unix)]
+    const EMPTY_ENVELOPE: &str = r#"{"files":[],"has_more":false,"total_lines":0,"definitions":{"count":0,"at_least":false,"sites":[]},"searched_files":3,"left_out":{"binary":1},"parse":{"unlabelled_files":0},"cost":{"files_read":3,"bytes_read":9,"files_parsed":0,"bytes_parsed":0}}"#;
 
     #[test]
     fn json_args_put_every_flag_before_the_separator_and_the_query_after() {
-        let args = search_args(
-            Path::new("/c"),
-            Some("-D warnings"),
-            &flags(&["--near", "5", "--phrase"]),
-            7,
-            14,
-        );
+        let args = search_args(Path::new("/c"), "-D warnings", &flags(&["-t", "ts"]), 7, 14);
         assert_eq!(
             strings(&args),
             [
@@ -706,9 +584,8 @@ mod tests {
                 "7",
                 "--offset",
                 "14",
-                "--phrase",
-                "--near",
-                "5",
+                "-t",
+                "ts",
                 "--",
                 "-D warnings"
             ]
@@ -716,25 +593,12 @@ mod tests {
     }
 
     #[test]
-    fn offset_zero_and_standalone_arms_omit_offset_and_separator() {
-        let args = search_args(
-            Path::new("/c"),
-            None,
-            &flags(&["--ast", "god-function"]),
-            FULL_LIST_LIMIT,
-            0,
-        );
+    fn offset_zero_omits_offset() {
+        let args = search_args(Path::new("/c"), "fn", &[], FULL_LIST_LIMIT, 0);
         assert_eq!(
             strings(&args),
             [
-                "search",
-                "--root",
-                "/c",
-                "--json",
-                "--limit",
-                "1000000",
-                "--ast",
-                "god-function"
+                "search", "--root", "/c", "--json", "--limit", "1000000", "--", "fn"
             ]
         );
     }
@@ -742,8 +606,16 @@ mod tests {
     #[test]
     fn text_args_use_the_default_limit_and_no_json() {
         assert_eq!(
-            strings(&text_args(Path::new("/c"), "build lock")),
+            strings(&text_args(Path::new("/c"), "build lock", &[])),
             ["search", "--root", "/c", "--", "build lock"]
+        );
+        assert_eq!(
+            strings(&text_args(
+                Path::new("/c"),
+                "x",
+                &flags(&["-l", "-g", "!a"])
+            )),
+            ["search", "--root", "/c", "-l", "-g", "!a", "--", "x"]
         );
     }
 
@@ -782,131 +654,11 @@ mod tests {
         assert_eq!(cmd.get_program(), OsStr::new("skim"));
     }
 
-    #[test]
-    fn a_ranked_entry_whose_ranking_skim_did_not_apply_is_an_error() {
-        use crate::scoreboard::types::Degraded;
-
-        let golden = crate::scoreboard::golden::parse_golden(
-            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
-             [[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n\
-             [[pagination]]\nid = \"skim-G007\"\nquery = \"build lock\"\nflags = [\"--hot\"]\nlimits = [3]\n\
-             [[prefix]]\nid = \"skim-F001\"\nquery = \"fn\"\nflags = [\"--hot\"]\nlimits = [5]\n",
-        )
-        .unwrap();
-        let plan = crate::scoreboard::metrics::plan(&golden).unwrap();
-        let (plain, swept, prefix) = (&plan[0], &plan[1], &plan[2]);
-
-        let temporal = Degraded {
-            subsystem: "temporal".to_string(),
-            reason: "unsupported_version".to_string(),
-            requested: Some("hot".to_string()),
-            applied: Some("lexical".to_string()),
-        };
-        let page = |degraded: Vec<Degraded>| ResultPage {
-            degraded,
-            ..ResultPage::default()
-        };
-        let observation = |q: &PlannedQuery, full, sweeps, limited| EntryObservation {
-            id: q.id.clone(),
-            full,
-            sweeps,
-            limited,
-            text: None,
-        };
-        let sweep = |p: ResultPage| {
-            vec![Sweep {
-                limit: 3,
-                pages: vec![SweepPage { offset: 0, page: p }],
-            }]
-        };
-
-        // Nothing degraded: fine.
-        let clean = observation(prefix, page(vec![]), vec![], vec![(5, page(vec![]))]);
-        ensure_ranking_applied(prefix, &clean).unwrap();
-
-        // Degraded on the full list, a limited page, or a sweep page: an error
-        // naming the entry and skim's reason, never a scored result.
-        for (q, obs) in [
-            (
-                prefix,
-                observation(prefix, page(vec![temporal.clone()]), vec![], vec![]),
-            ),
-            (
-                prefix,
-                observation(
-                    prefix,
-                    page(vec![]),
-                    vec![],
-                    vec![(5, page(vec![temporal.clone()]))],
-                ),
-            ),
-            (
-                swept,
-                observation(
-                    swept,
-                    page(vec![]),
-                    sweep(page(vec![temporal.clone()])),
-                    vec![],
-                ),
-            ),
-        ] {
-            let err = ensure_ranking_applied(q, &obs).expect_err("a degraded ranking");
-            let msg = format!("{err:#}");
-            assert!(msg.contains("unsupported_version"), "{msg}");
-            assert!(msg.contains("lexical"), "{msg}");
-        }
-
-        // Without a requested ranking, degraded[] is lexical.silent_fn's input.
-        let lexical = observation(plain, page(vec![temporal]), vec![], vec![]);
-        ensure_ranking_applied(plain, &lexical).unwrap();
-    }
-
-    #[test]
-    fn an_ast_entry_is_never_observed_on_its_own() {
-        let golden = crate::scoreboard::golden::parse_golden(
-            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
-             [[ast]]\nid = \"skim-ast-try-catch-tsx\"\npattern = \"try-catch\"\nlang = \"tsx\"\nprecision = \"hard\"\n",
-        )
-        .unwrap();
-        let plan = crate::scoreboard::metrics::plan(&golden).unwrap();
-        // The binary does not exist: the refusal comes before any call.
-        let runner = SkimRunner::new("/nonexistent/skim", SkimSandbox::new("/sb"));
-        let err = runner
-            .observe(Path::new("/c"), &plan[0])
-            .expect_err("an [[ast]] entry's rows come from its pattern's call");
-        assert!(format!("{err:#}").contains("ast_list"), "{err:#}");
-    }
-
-    #[test]
-    fn a_stakes_entry_with_flags_is_refused_because_the_runner_cannot_pass_them() {
-        let golden = crate::scoreboard::golden::parse_golden(
-            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
-             [[stakes]]\nid = \"skim-Q09\"\nquery = \"Launch\"\nflags = [\"-i\"]\nexpect = \"lines\"\n",
-        )
-        .unwrap();
-        let plan = crate::scoreboard::metrics::plan(&golden).unwrap();
-        // The binary does not exist: the refusal comes before any call.
-        let runner = SkimRunner::new("/nonexistent/skim", SkimSandbox::new("/sb"));
-        let err = runner
-            .observe(Path::new("/c"), &plan[0])
-            .expect_err("skim would run without the -i the oracle reads");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("skim-Q09"), "{msg}");
-        assert!(msg.contains("\"-i\""), "{msg}");
-    }
-
     // --- the exit status of the process -----------------------------------------
 
     #[cfg(unix)]
-    fn lexical_page(runner: &SkimRunner) -> anyhow::Result<(ResultPage, Timing)> {
-        runner.page(
-            Path::new("/c"),
-            Arm::Lexical,
-            Some("qzvx_absent_7713"),
-            &QueryFlags::default(),
-            10,
-            0,
-        )
+    fn page_of(runner: &SkimRunner) -> anyhow::Result<(ResultPage, Timing)> {
+        runner.page(Path::new("/c"), "qzvx_absent_7713", &[], 10, 0)
     }
 
     #[cfg(unix)]
@@ -916,83 +668,180 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let runner = script_runner(
                 dir.path(),
-                &format!("printf '{{\"results\":[]}}'\nexit {code}"),
+                &format!("printf '%s' '{EMPTY_ENVELOPE}'\nexit {code}"),
             );
-            let (page, _) = lexical_page(&runner).unwrap();
+            let (page, _) = page_of(&runner).unwrap();
             assert_eq!(page.exit_code, code);
+            assert_eq!(page.searched_files, Some(3));
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn an_ast_list_carries_the_exit_code_of_the_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let runner = script_runner(dir.path(), "printf '{\"results\":[]}'\nexit 1");
-        let (ast, _) = runner.ast_list(Path::new("/c"), "try-catch").unwrap();
-        assert_eq!(ast.page.exit_code, 1);
+    fn an_error_envelope_is_a_harness_error_whatever_the_exit_code() {
+        for code in [0, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = script_runner(
+                dir.path(),
+                &format!("printf '{{\"error\":\"bad glob\"}}'\nexit {code}"),
+            );
+            let err = page_of(&runner).expect_err("an error envelope");
+            assert!(format!("{err:#}").contains("bad glob"), "{err:#}");
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn an_envelope_that_does_not_parse_is_a_harness_error_whatever_the_exit_code() {
+    fn stdout_that_is_not_json_is_a_harness_error_whatever_the_exit_code() {
         for code in [0, 1] {
             let dir = tempfile::tempdir().unwrap();
             let runner = script_runner(
                 dir.path(),
-                &format!("printf 'skim search: no index found'\nexit {code}"),
+                &format!("printf 'skim search: no repository'\nexit {code}"),
             );
-            let err = lexical_page(&runner).expect_err("stdout is not JSON");
+            let err = page_of(&runner).expect_err("stdout is not JSON");
             assert!(format!("{err:#}").contains("not valid JSON"), "{err:#}");
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_lexical_envelope_with_an_unknown_field_is_a_harness_error() {
+    fn an_envelope_with_an_unknown_role_is_a_harness_error() {
         let dir = tempfile::tempdir().unwrap();
-        let runner = script_runner(
-            dir.path(),
-            "printf '{\"results\":[{\"path\":\"a.rs\",\"score\":1.0,\"field\":\"text\"}]}'",
+        let envelope = EMPTY_ENVELOPE.replace(
+            r#""files":[]"#,
+            r#""files":[{"path":"a.rs","score":1.0,"line_count":1,"words_matched":1,"words_total":1,"occurrences":[{"line":1,"role":"nonsense"}]}]"#,
         );
-        let err = lexical_page(&runner).expect_err("an unknown field value");
-        assert!(format!("{err:#}").contains("\"text\""), "{err:#}");
+        let runner = script_runner(dir.path(), &format!("printf '%s' '{envelope}'"));
+        let err = page_of(&runner).expect_err("an unknown role");
+        assert!(format!("{err:#}").contains("nonsense"), "{err:#}");
     }
 
     #[cfg(unix)]
     #[test]
     fn a_process_killed_by_a_signal_is_a_harness_error_not_an_exit_code() {
         let dir = tempfile::tempdir().unwrap();
-        let runner = script_runner(dir.path(), "printf '{\"results\":[]}'\nkill -9 $$");
-        let err = lexical_page(&runner).expect_err("a killed process");
+        let runner = script_runner(dir.path(), "printf '%s' '{}'\nkill -9 $$");
+        let err = page_of(&runner).expect_err("a killed process");
         assert!(format!("{err:#}").contains("signal"), "{err:#}");
     }
 
+    // --- [[stakes]] calls ---------------------------------------------------------
+
+    /// The planned `[[stakes]]` entry made of `flags` and `expect`.
+    #[cfg(unix)]
+    fn stakes_entry(flags: &str, expect: &str) -> PlannedQuery {
+        let golden = parse_golden(&format!(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
+             [[stakes]]\nid = \"skim-Q09\"\nquery = \"Launch\"\nflags = {flags}\nexpect = \"{expect}\"\n{}",
+            if expect == "exit" { "exit = 1\n" } else { "" }
+        ))
+        .unwrap();
+        plan(&golden).unwrap().remove(0)
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn the_accounting_of_the_stats_lands_on_the_full_list_only() {
-        let stats =
-            StatsSnapshot::parse(br#"{"file_count":7,"skipped_by_reason":{"binary":2}}"#).unwrap();
-        let observation = EntryObservation {
-            id: "x".to_string(),
-            full: ResultPage::default(),
-            sweeps: Vec::new(),
-            limited: vec![(5, ResultPage::default())],
-            text: None,
-        }
-        .with_accounting(&stats);
-        assert_eq!(observation.full.searched_files, Some(7));
-        assert_eq!(
-            observation.full.left_out,
-            Some(BTreeMap::from([("binary".to_string(), 2)]))
+    fn a_list_stakes_call_is_a_text_call_that_reads_a_path_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // `-l` cannot be combined with `--json`: the script refuses it.
+        let runner = script_runner(
+            dir.path(),
+            "case \" $* \" in *' --json '*) exit 2;; esac\nprintf 'a.rs\\nb/c.rs\\n'",
         );
-        assert_eq!(observation.limited[0].1.searched_files, None);
+        let q = stakes_entry("[\"-l\"]", "files");
+        let observed = runner.observe(Path::new("/c"), &q).unwrap();
+        let paths: Vec<&str> = observed
+            .observation
+            .full
+            .rows
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect();
+        assert_eq!(paths, ["a.rs", "b/c.rs"]);
+        assert_eq!(observed.observation.full.exit_code, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_count_stakes_call_reads_path_and_count_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = script_runner(
+            dir.path(),
+            "case \" $* \" in *' --json '*) exit 2;; esac\nprintf 'a.rs:3\\nb/c.rs:10\\n'",
+        );
+        let q = stakes_entry("[\"-c\"]", "counts");
+        let full = runner
+            .observe(Path::new("/c"), &q)
+            .unwrap()
+            .observation
+            .full;
+        assert_eq!(
+            full.line_counts,
+            BTreeMap::from([("a.rs".to_string(), 3), ("b/c.rs".to_string(), 10)])
+        );
+        assert_eq!(full.rows.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_count_line_without_a_count_is_a_harness_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = script_runner(dir.path(), "printf 'a.rs\\n'");
+        let q = stakes_entry("[\"-c\"]", "counts");
+        let err = runner
+            .observe(Path::new("/c"), &q)
+            .expect_err("a -c line is path:count");
+        assert!(format!("{err:#}").contains("path:count"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_stakes_call_reads_the_status_and_nothing_else() {
+        for code in [0, 1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            // The output is not a valid listing and not JSON: it is not read.
+            let runner = script_runner(
+                dir.path(),
+                &format!("printf 'whatever: x\\n\\n'\nexit {code}"),
+            );
+            let q = stakes_entry("[\"-l\"]", "exit");
+            let full = runner
+                .observe(Path::new("/c"), &q)
+                .unwrap()
+                .observation
+                .full;
+            assert_eq!(full.exit_code, code);
+            assert!(full.rows.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stakes_call_without_a_list_flag_is_a_json_call_with_the_entry_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        // The script answers only a call that has `--json` and `-i` before `--`.
+        let runner = script_runner(
+            dir.path(),
+            &format!(
+                "case \" $* \" in *' --json '*' -i '*'-- Launch ') printf '%s' '{EMPTY_ENVELOPE}';; *) exit 9;; esac"
+            ),
+        );
+        let q = stakes_entry("[\"-i\"]", "lines");
+        let observed = runner.observe(Path::new("/c"), &q).unwrap();
+        assert_eq!(observed.observation.full.searched_files, Some(3));
     }
 
     #[test]
     fn labels_carry_no_root() {
-        let label = query_label(Some("fn"), &flags(&["--hot"]), 5, 10);
+        let label = query_label("fn", &flags(&["-t", "rust"]), 5, 10);
         assert_eq!(
             label,
-            "skim search --json --limit 5 --offset 10 --hot -- \"fn\""
+            "skim search --json --limit 5 --offset 10 -t rust -- \"fn\""
+        );
+        assert_eq!(
+            text_label("fn", &flags(&["-l"])),
+            "skim search -l -- \"fn\" (text mode)"
         );
     }
 

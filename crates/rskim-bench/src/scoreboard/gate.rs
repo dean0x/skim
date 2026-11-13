@@ -20,9 +20,8 @@
 //! # Gate
 //!
 //! [`evaluate`] fails on: unledgered HARD failures; XPASSes; a missing
-//! baseline; a corpus, commit, golden digest (a golden file or the
-//! structural-oracle fingerprint) or HARD state that differs from the
-//! baseline; and any RATCHET value outside tolerance in either
+//! baseline; a corpus, commit, golden digest (the golden file) or HARD state
+//! that differs from the baseline; and any RATCHET value outside tolerance in either
 //! direction ("bless required"). Every failure names its check (or metric)
 //! and query ids.
 
@@ -219,7 +218,7 @@ pub fn apply_ledger(
 }
 
 /// Ledger refs naming a check that never runs on that entry (e.g.
-/// `order.score_monotone` on a `--hot` list), which would XFAIL nothing.
+/// `order.score_monotone` on a `[[stakes]]` entry), which would XFAIL nothing.
 pub fn unplanned_ledger_refs(refs: &[LedgerRef<'_>], plan: &[PlannedQuery]) -> Vec<String> {
     refs.iter()
         .filter(|r| !plan.iter().any(|q| q.id == r.id && q.runs(r.check)))
@@ -366,10 +365,7 @@ fn baseline_failures(inputs: &GateInputs<'_>, baseline: &Baseline) -> Vec<GateFa
             out.push(bless_failure(
                 None,
                 Vec::new(),
-                format!(
-                    "corpus {}: golden file or structural-oracle fingerprint changed; bless required",
-                    c.name
-                ),
+                format!("corpus {}: golden file changed; bless required", c.name),
             ));
         }
         out.extend(hard_state_changes(c, b));

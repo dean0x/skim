@@ -372,6 +372,35 @@ fn the_role_queries_give_the_frozen_lines_for_go() {
 }
 
 #[test]
+fn the_declared_names_are_the_definition_rows_of_the_frozen_tables() {
+    for (lang, source, table) in fixtures() {
+        let found = definition_names(lang, source).unwrap();
+        // Every table row: the lines the name is declared on equal the table's.
+        for &(name, defs, ..) in table {
+            let lines: Vec<u32> = found
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|&(_, line)| line)
+                .collect();
+            assert_eq!(lines, defs, "{lang} {name}");
+        }
+        // Every declared name is a name `role_sites` agrees is declared there.
+        for (name, line) in &found {
+            let sites = role_sites(lang, source, name).unwrap();
+            assert!(sites.defs.contains(line), "{lang} {name} line {line}");
+        }
+    }
+}
+
+#[test]
+fn a_file_with_no_declaration_declares_no_name() {
+    assert!(
+        definition_names(OracleLang::Rust, "// nothing\n")
+            .unwrap()
+            .is_empty()
+    );
+}
+#[test]
 fn an_empty_name_is_an_error_not_an_empty_answer() {
     let err = role_sites(OracleLang::Rust, RUST, "").unwrap_err();
     assert!(format!("{err:#}").contains("non-empty name"), "{err:#}");

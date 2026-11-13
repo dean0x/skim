@@ -1137,8 +1137,8 @@ impl TransformResult {
 /// NO panics allowed in library code (enforced by clippy lints).
 ///
 /// This enum is `#[non_exhaustive]` — new variants may be added in minor versions
-/// without a semver-breaking change (matches sibling crates rskim-tokens, rskim-llm,
-/// rskim-contract, and rskim-search).
+/// without a semver-breaking change (matches sibling crates rskim-tokens, rskim-llm
+/// and rskim-contract).
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum SkimError {

@@ -65,7 +65,9 @@ pub use transform::truncate::{
 
 /// Return the structural priority of a tree-sitter node kind (1–5).
 ///
-/// Used by the BM25F classifier to map node kinds to [`SearchField`] variants.
+/// The declaration rule (`decl.rs`) uses it to tell a declaration kind from a
+/// container kind for languages without their own table. The `skim search`
+/// classifier uses it to tell code nodes (priority 3 and up) from other nodes.
 /// Priority 5 = type definitions, 4 = function signatures, 3 = import/export,
 /// 2 = class/module containers, 1 = everything else (including unknown kinds).
 ///

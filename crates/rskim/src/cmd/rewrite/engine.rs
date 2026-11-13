@@ -441,8 +441,7 @@ thread_local! {
     ///
     /// A THREAD-LOCAL rather than a global: libtest runs each test on its own
     /// thread, so per-thread state cannot be raced by tests running
-    /// concurrently under `RUST_TEST_THREADS`.  Same rationale, and the same
-    /// shape, as `cmd::search::walk::ENUM_CALL_COUNT`.
+    /// concurrently under `RUST_TEST_THREADS`.
     static RESOLVER_OVERRIDE: std::cell::Cell<Option<ResolverProbe>> =
         const { std::cell::Cell::new(None) };
 }

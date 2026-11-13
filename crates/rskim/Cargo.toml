@@ -25,7 +25,6 @@ rskim-compress = { path = "../rskim-compress" }
 # Enabling pulls tokio/hyper/rustls into the tree; default builds are HTTP/TLS-free (AC9).
 rskim-contract = { path = "../rskim-contract", optional = true }
 rskim-proxy = { path = "../rskim-proxy", optional = true }
-rskim-search = { path = "../rskim-search" }
 # Delegates token counting to the multi-provider library (AC13, AC15).
 # Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).
 rskim-tokens = { path = "../rskim-tokens" }
@@ -75,3 +74,6 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 filetime = { workspace = true }
 rskim-contract = { path = "../rskim-contract" }
+# The role oracle of the scoreboard: the agreement test of the search roles
+# (cmd/search/roles_tests.rs) reads it. The oracle depends on no rskim crate.
+rskim-oracle = { path = "../rskim-oracle" }

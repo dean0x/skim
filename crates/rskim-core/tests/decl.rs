@@ -376,6 +376,46 @@ var counter int
 }
 
 #[test]
+fn go_specs_that_name_several_things_declare_every_name() {
+    // `const Max, Min = 1, 2` is one `const_spec` with two `name` fields.
+    // Each name is a declaration with the rows of the whole spec, so
+    // `--symbol Min` finds it. Locals of a function body stay locals.
+    let src = r#"package main
+
+const Max, Min = 1, 2
+
+var (
+	left, right int
+	solo        int
+)
+
+func Run() {
+	var a, b int
+	_, _ = a, b
+}
+"#;
+    let scan = scan(Language::Go, "go", src);
+
+    assert_eq!(
+        names_and_kinds(&scan),
+        vec![
+            ("Max", "const_spec"),
+            ("Min", "const_spec"),
+            ("left", "var_spec"),
+            ("right", "var_spec"),
+            ("solo", "var_spec"),
+            ("Run", "function_declaration"),
+        ]
+    );
+    assert_name_ranges_spell_names(&scan, src);
+    let min = find(&scan, "Min");
+    assert_eq!((min.first_row, min.last_row), (2, 2));
+    assert_eq!(min.name_bytes.start, offset_of(src, "Min"));
+    let right = find(&scan, "right");
+    assert_eq!((right.first_row, right.last_row), (5, 5));
+}
+
+#[test]
 fn go_local_variables_and_constants_are_not_declarations() {
     // The same rule as TypeScript: a variable in a function body is a local.
     // A type declared in a function body stays a declaration, as in Rust.

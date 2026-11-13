@@ -10,7 +10,6 @@
 //! scoreboard check [same flags]           # run + gate against baseline.json / known_failures.toml
 //! scoreboard bless --from report.json [--data-dir D] [--accept-regression "<reason>"]
 //! scoreboard golden-gen --corpus NAME [--corpus-dir D] [--data-dir D]   # TOML proposal on stdout
-//! scoreboard golden-gen --corpus NAME --ast [--skim-bin P] [...]         # [[ast]] proposal (runs skim)
 //! ```
 //!
 //! # Exit codes
@@ -19,34 +18,26 @@
 //!   `bless` exits 0 when it wrote the baseline).
 //! - `1` — gate failure (`check`), or `bless` refused.
 //! - `2` — harness error: clone verification, golden integrity, an invalid
-//!   data file, a skim crash / timeout / unparsable output, temporal data
-//!   skim reports unusable for entries that rank by it, a vacuous `[[ast]]`
-//!   entry or a stale `expect_oracle_empty` flag, a structural oracle
-//!   failure, a corpus changed by the run. A
-//!   harness error is never reported as a regression, and leaves
-//!   no `report.json` / `report.md` in `--out` (`run` / `check` remove the
-//!   previous ones first).
+//!   data file, a skim crash / timeout / unparsable output or `error` envelope,
+//!   a corpus changed by the run. A harness error is never reported as a
+//!   regression, and leaves no `report.json` / `report.md` in `--out` (`run` /
+//!   `check` remove the previous ones first).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use rskim_oracle::structural::StructuralOracle;
 
 use rskim_bench::scoreboard::baseline::{Baseline, BlessDecision, BlessInputs, bless};
-use rskim_bench::scoreboard::catalog::skim_catalog;
 use rskim_bench::scoreboard::corpus::{
-    CorpusSpec, DEFAULT_CORPUS_DIR, GitCorpusSource, find_corpus, load_corpora,
-    materialize_verified,
+    DEFAULT_CORPUS_DIR, GitCorpusSource, find_corpus, load_corpora, materialize_verified,
 };
-use rskim_bench::scoreboard::fmt::entries_noun;
 use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
 use rskim_bench::scoreboard::report::{GateStatus, Report, clear_outputs, total, write_outputs};
 use rskim_bench::scoreboard::runner::{SkimRunner, SkimSandbox};
-use rskim_bench::scoreboard::structural_metrics::{OracleAnswers, called_patterns};
-use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
+use rskim_bench::scoreboard::universe::{GitIsolation, text_universe};
 
 const EXIT_PASS: u8 = 0;
 const EXIT_GATE_FAIL: u8 = 1;
@@ -72,9 +63,8 @@ enum Command {
     Check(EngineArgs),
     /// Rewrite baseline.json from a report.json (e.g. the CI artifact).
     Bless(BlessArgs),
-    /// Print candidate `[[ident]]` entries for one corpus — or, with `--ast`,
-    /// candidate `[[ast]]` entries (a proposal to review and freeze in
-    /// `golden/<corpus>.toml`; never run in CI).
+    /// Print candidate `[[ident]]` entries for one corpus (a proposal to
+    /// review and freeze in `golden/<corpus>.toml`; never run in CI).
     GoldenGen(GoldenGenArgs),
 }
 
@@ -131,16 +121,6 @@ struct GoldenGenArgs {
     /// The data dir holding corpora.toml.
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
-
-    /// Propose `[[ast]]` entries instead of `[[ident]]` ones: runs the
-    /// structural oracle and skim's `--ast <pattern>` (so it needs
-    /// `--skim-bin`).
-    #[arg(long)]
-    ast: bool,
-
-    /// The skim binary `--ast` calls.
-    #[arg(long, default_value = DEFAULT_SKIM_BIN)]
-    skim_bin: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,10 +251,7 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
         .prefix("skim-scoreboard-golden-gen-")
         .tempdir()
         .context("creating the isolated HOME")?;
-    let universe = Universe::compute(&root, &GitIsolation::new(home.path()))?;
-    if args.ast {
-        return golden_gen_ast(args, spec, &root, &universe, home.path());
-    }
+    let universe = text_universe(&root, &GitIsolation::new(home.path()))?;
     let candidates = golden_gen::generate(&spec.name, &universe, golden_gen::GENERATED_PER_CORPUS)?;
 
     println!(
@@ -290,50 +267,6 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
         "scoreboard: golden-gen {}: {} candidate(s) over {} universe file(s)",
         spec.name,
         candidates.len(),
-        universe.len()
-    );
-    Ok(EXIT_PASS)
-}
-
-/// `golden-gen --ast`: run the structural oracle over the universe, call
-/// skim once per catalog pattern through the gate's call loop (sandboxed
-/// under `home`, as in `run`), and print the non-vacuous `[[ast]]` entries
-/// (a skim-only one as an `expect_oracle_empty` guard), after a comment
-/// listing the rows no proposed entry would score.
-fn golden_gen_ast(
-    args: &GoldenGenArgs,
-    spec: &CorpusSpec,
-    root: &Path,
-    universe: &Universe,
-    home: &Path,
-) -> anyhow::Result<u8> {
-    let (corpus, commit) = (spec.name.as_str(), spec.commit.as_str());
-    let skim_bin = resolve_skim_bin(&args.skim_bin)?;
-    let oracle = StructuralOracle::new().context("compiling the structural oracle")?;
-    let answers = OracleAnswers::compute(&oracle, universe.files()).context("structural oracle")?;
-    let runner = SkimRunner::new(skim_bin, SkimSandbox::new(home));
-    runner.build(root)?;
-    let catalog = skim_catalog();
-    let skim = pipeline::call_patterns(&runner, root, called_patterns(&catalog))?
-        .into_iter()
-        .map(|(pattern, (page, _))| (pattern, page))
-        .collect();
-    let candidates = golden_gen::generate_ast(corpus, &catalog, &answers, &skim)?;
-
-    println!(
-        "# golden-gen --ast proposal for corpus {corpus} at {commit} ({} {}; review, then freeze in golden/{corpus}.toml)",
-        candidates.len(),
-        entries_noun(candidates.len())
-    );
-    print!(
-        "{}",
-        golden_gen::render_unscored_comment(&golden_gen::unscored_after(&candidates, &skim))
-    );
-    print!("{}", golden_gen::render_ast_toml(&candidates));
-    eprintln!(
-        "scoreboard: golden-gen --ast {corpus}: {} candidate(s) from {} pattern call(s) over {} universe file(s)",
-        candidates.len(),
-        skim.len(),
         universe.len()
     );
     Ok(EXIT_PASS)

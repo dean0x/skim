@@ -11,52 +11,45 @@
 //!   `concept.first_right_top5` checks compare it with an answer frozen in
 //!   the golden file. A check whose data the page does not state fails: it
 //!   never passes by default.
-//! - [`evaluate`] scores one corpus: outcomes, per-query samples, and
-//!   `unindexed_hits` (INFO). It reads two universes: the allow-listed
-//!   indexed universe, and the text universe of every tracked text file
-//!   (for `lexical.recall_tracked`, the frozen line sets and the
-//!   `stakes.*` checks). [`ratchet_values`] turns samples (one corpus, or
-//!   every corpus for the aggregate) into RATCHET values, and
+//! - [`evaluate`] scores one corpus: outcomes and per-query samples. It reads
+//!   the text universe of every tracked text file, the one universe the
+//!   engine and the oracle share. [`ratchet_values`] turns samples (one
+//!   corpus, or every corpus for the aggregate) into RATCHET values, and
 //!   [`reference_values`] into the INFO reference rows (the `rg -nw`
-//!   columns), which no baseline holds and no gate reads.
+//!   columns and the first relevant file of a concept), which no baseline
+//!   holds and no gate reads.
 //! - [`RATCHET_METRICS`] defines each RATCHET metric's good direction and
-//!   tolerance; [`compare_ratchet`] applies them for the gate and `bless`.
-//!   Each entry with no oracle also ratchets its full-list row count
-//!   ([`ORACLE_LESS_ROWS`]); `[[ast]]` entries ratchet their structural
-//!   measurements ([`STRUCTURAL_FAMILIES`]). A row whose entries state no
-//!   value (for example `cost.*` while the engine states no cost) is
-//!   absent from the values, and an absent row never fails the gate.
+//!   tolerance; [`compare_ratchet`] applies them for the gate and `bless`. A
+//!   row whose entries state no value (for example `roles.precision.go` when no
+//!   page labels a Go file) is absent from the values, and an
+//!   absent row never fails the gate.
 //!
 //! No function here imports skim's own search code: every expectation comes
-//! from the oracles (`oracle.rs`, and `structural.rs` through
-//! `structural_metrics.rs`) over the oracle's universes, or from the golden
-//! file.
+//! from the oracles (`oracle.rs`) over the oracle's universe, or from the
+//! golden file.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use regex::Regex;
+use rskim_oracle::roles::role_sites;
+use rskim_oracle::structural::{LangClass, OracleLang, classify};
 use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::MAX_PAGES;
 use crate::scoreboard::fmt::{round4, sample};
 use crate::scoreboard::golden::{
-    ClashEntry, DefSite, GoldenFile, PrecisionClass, QueryFlags, RefsEntry, SiteRole, StakesEntry,
-    StakesExpect,
+    ClashEntry, DefSite, GoldenFile, RefsEntry, SiteRole, StakesEntry, StakesExpect, StakesRun,
 };
 use crate::scoreboard::oracle::{
-    LexicalQuery, LineQuery, MatchMode, baseline_alphabetical, baseline_occurrence_count,
-    ground_truth, line_truth, simulate_rg_fixed, simulate_rg_word,
+    LexicalQuery, baseline_alphabetical, baseline_occurrence_count, ground_truth, line_truth,
+    simulate_rg_fixed, simulate_rg_word,
 };
 use crate::scoreboard::runner::{EntryObservation, Sweep};
-use crate::scoreboard::structural_metrics::{
-    EntryScore, StructuralEvidence, StructuralSample, StructuralTarget, score_entry, unscored_rows,
-};
 use crate::scoreboard::types::{
-    Arm, CheckId, CheckOutcome, Cost, EntryKind, ResultPage, ResultRow, Role, StatsSnapshot,
-    VerifyMode,
+    CheckId, CheckOutcome, Cost, EntryKind, ResultPage, ResultRow, Role,
 };
-use crate::scoreboard::universe::{LEFT_OUT_REASONS, TextUniverse, Universe};
+use crate::scoreboard::universe::{LEFT_OUT_REASONS, TextUniverse};
 
 // ============================================================================
 // Plan
@@ -83,9 +76,6 @@ pub enum Target {
 pub enum Oracle {
     /// A lexical predicate over the oracle universe (`oracle.rs`).
     Lexical(LexicalQuery),
-    /// The structural oracle for one pattern in one language (`[[ast]]`,
-    /// `structural.rs`).
-    Structural(StructuralTarget),
     /// The frozen sites of one name (`[[refs]]`).
     Refs(RefsEntry),
     /// The frozen definitions and calls of a name with two or more
@@ -95,13 +85,14 @@ pub enum Oracle {
     Stakes(StakesOracle),
 }
 
-/// A `[[stakes]]` entry with its regex-oracle query, compiled once by
+/// A `[[stakes]]` entry with its regex-oracle reading, resolved once by
 /// [`plan`].
 #[derive(Debug, Clone)]
 pub struct StakesOracle {
     pub entry: StakesEntry,
-    /// The lines the entry's flags and query ask for.
-    pub query: LineQuery,
+    /// The lines the entry's flags and query ask for, or the usage error the
+    /// search must report.
+    pub run: StakesRun,
 }
 
 /// One golden entry, resolved into what the runner calls and what the
@@ -110,16 +101,13 @@ pub struct StakesOracle {
 pub struct PlannedQuery {
     pub id: String,
     pub kind: EntryKind,
-    /// The text query (`None` for a standalone `--ast` / temporal prefix,
-    /// and for `[[ast]]`).
-    pub query: Option<String>,
-    pub flags: QueryFlags,
-    /// The JSON envelope the flags produce.
-    pub arm: Arm,
-    /// What judges the full result set; `None` when nothing does (a text +
-    /// `--ast` or `--blast-radius` list, a standalone `--ast` / temporal
-    /// `[[prefix]]`): those lists are only compared with themselves.
-    pub oracle: Option<Oracle>,
+    /// The text query.
+    pub query: String,
+    /// The flags the runner passes before `--`: a golden `lang` as `-t`, or a
+    /// `[[stakes]]` entry's own flags.
+    pub flags: Vec<String>,
+    /// What judges the full result set.
+    pub oracle: Oracle,
     /// `[[pagination]]` sweep limits / `[[prefix]]` limits.
     pub limits: Vec<u32>,
     pub target: Target,
@@ -129,15 +117,7 @@ impl PlannedQuery {
     /// The lexical oracle query, if the entry has one.
     pub fn lexical_oracle(&self) -> Option<&LexicalQuery> {
         match &self.oracle {
-            Some(Oracle::Lexical(query)) => Some(query),
-            _ => None,
-        }
-    }
-
-    /// The structural target of an `[[ast]]` entry.
-    pub fn structural_target(&self) -> Option<&StructuralTarget> {
-        match &self.oracle {
-            Some(Oracle::Structural(target)) => Some(target),
+            Oracle::Lexical(query) => Some(query),
             _ => None,
         }
     }
@@ -145,7 +125,7 @@ impl PlannedQuery {
     /// The frozen sites of a `[[refs]]` entry.
     pub fn refs_entry(&self) -> Option<&RefsEntry> {
         match &self.oracle {
-            Some(Oracle::Refs(entry)) => Some(entry),
+            Oracle::Refs(entry) => Some(entry),
             _ => None,
         }
     }
@@ -153,15 +133,15 @@ impl PlannedQuery {
     /// The frozen definitions and calls of a `[[clash]]` entry.
     pub fn clash_entry(&self) -> Option<&ClashEntry> {
         match &self.oracle {
-            Some(Oracle::Clash(entry)) => Some(entry),
+            Oracle::Clash(entry) => Some(entry),
             _ => None,
         }
     }
 
-    /// The regex oracle query of a `[[stakes]]` entry.
+    /// The regex oracle reading of a `[[stakes]]` entry.
     pub fn stakes_oracle(&self) -> Option<&StakesOracle> {
         match &self.oracle {
-            Some(Oracle::Stakes(stakes)) => Some(stakes),
+            Oracle::Stakes(stakes) => Some(stakes),
             _ => None,
         }
     }
@@ -176,16 +156,6 @@ impl PlannedQuery {
         }
     }
 
-    /// Whether this is an `[[ast]]` entry: judged by the structural oracle,
-    /// with its pattern call's rows in its language as its full list, never
-    /// observed on its own. [`plan`] gives exactly the `[[ast]]` entries a
-    /// structural target; a `[[prefix]]` or `[[pagination]]` entry with
-    /// `--ast` in its flags calls skim with `--ast` too, but is not scored by
-    /// the structural oracle.
-    pub fn is_structural(&self) -> bool {
-        self.structural_target().is_some()
-    }
-
     /// The HARD checks that run on this entry, in [`CheckId::ALL`] order.
     pub fn checks(&self) -> Vec<CheckId> {
         CheckId::ALL
@@ -198,17 +168,10 @@ impl PlannedQuery {
     /// Whether `check` runs on this entry:
     /// - `lexical.recall` / `precision` / `silent_fn`: the full list has a
     ///   lexical oracle ground truth;
-    /// - `lexical.verify_mode`: there is a text query (the lexical envelope);
     /// - `pagination.*`: `[[pagination]]` entries;
     /// - `order.prefix_consistent`: `[[prefix]]` entries;
-    /// - `order.score_monotone`: the list is ranked by `score` (no temporal
-    ///   sort, no `--blast-radius`) and is not an `[[ast]]` entry's slice of
-    ///   a standalone `--ast` list (path-ordered, #547; `[[prefix]]` entries
-    ///   judge that arm's order);
+    /// - `order.score_monotone`: every entry that ranks by score;
     /// - `results.unique_paths`: every entry (every list it fetches);
-    /// - `structural.recall` / `coverage`: `[[ast]]` entries;
-    /// - `structural.precision`: `[[ast]]` entries of class `hard` (a
-    ///   `ratchet` entry records `structural.precision.<id>` instead);
     /// - `refs.*` and `universe.accounted`: `[[refs]]` entries; `clash.*`:
     ///   `[[clash]]` entries;
     /// - `lexical.recall_tracked`: `[[lexical]]` entries;
@@ -227,18 +190,12 @@ impl PlannedQuery {
             CheckId::LexicalRecall | CheckId::LexicalPrecision | CheckId::LexicalSilentFn => {
                 self.lexical_oracle().is_some()
             }
-            CheckId::LexicalVerifyMode => self.arm == Arm::Lexical,
             CheckId::PaginationComplete
             | CheckId::PaginationDisjoint
             | CheckId::PaginationOrdered
             | CheckId::PaginationHasMoreHonest => self.kind == EntryKind::Pagination,
             CheckId::OrderPrefixConsistent => self.kind == EntryKind::Prefix,
-            CheckId::OrderScoreMonotone => !self.is_structural() && !self.flags.has_rank_override(),
-            CheckId::ResultsUniquePaths => true,
-            CheckId::StructuralRecall | CheckId::StructuralCoverage => self.is_structural(),
-            CheckId::StructuralPrecision => self
-                .structural_target()
-                .is_some_and(|t| t.precision == PrecisionClass::Hard),
+            CheckId::OrderScoreMonotone | CheckId::ResultsUniquePaths => true,
             CheckId::RefsRecall | CheckId::RefsCallsRecall | CheckId::UniverseAccounted => {
                 self.refs_entry().is_some()
             }
@@ -262,7 +219,7 @@ impl PlannedQuery {
     }
 
     /// Whether this entry gets a text-mode run for the byte metrics
-    /// (`[[ident]]` and `[[concept]]` only; they never carry temporal flags).
+    /// (`[[ident]]` and `[[concept]]` only).
     pub fn measures_text(&self) -> bool {
         !matches!(self.target, Target::None)
     }
@@ -272,20 +229,19 @@ impl PlannedQuery {
 ///
 /// # Errors
 ///
-/// An entry whose flags, mode or regex do not resolve (golden integrity
-/// reports the same problems first).
+/// An entry whose flags or regex do not resolve (golden integrity reports the
+/// same problems first).
 pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
     let mut out = Vec::new();
     for e in &golden.idents {
         out.push(PlannedQuery {
             id: e.id.clone(),
             kind: EntryKind::Ident,
-            query: Some(e.query.clone()),
-            flags: QueryFlags::default(),
-            arm: Arm::Lexical,
-            oracle: Some(Oracle::Lexical(
-                LexicalQuery::new(&e.query, MatchMode::And, None).with_context(|| e.id.clone())?,
-            )),
+            query: e.query.clone(),
+            flags: Vec::new(),
+            oracle: Oracle::Lexical(
+                LexicalQuery::new(&e.query, None).with_context(|| e.id.clone())?,
+            ),
             limits: Vec::new(),
             target: Target::Definition(e.def.clone()),
         });
@@ -294,12 +250,11 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
         out.push(PlannedQuery {
             id: e.id.clone(),
             kind: EntryKind::Concept,
-            query: Some(e.query.clone()),
-            flags: QueryFlags::default(),
-            arm: Arm::Lexical,
-            oracle: Some(Oracle::Lexical(
-                LexicalQuery::new(&e.query, MatchMode::And, None).with_context(|| e.id.clone())?,
-            )),
+            query: e.query.clone(),
+            flags: Vec::new(),
+            oracle: Oracle::Lexical(
+                LexicalQuery::new(&e.query, None).with_context(|| e.id.clone())?,
+            ),
             limits: Vec::new(),
             target: Target::Relevance {
                 relevant: e.relevance()?,
@@ -308,72 +263,40 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
         });
     }
     for e in &golden.lexicals {
+        let flags = e.flags().with_context(|| e.id.clone())?;
         out.push(PlannedQuery {
             id: e.id.clone(),
             kind: EntryKind::Lexical,
-            query: Some(e.query.clone()),
-            flags: e.flags().with_context(|| e.id.clone())?,
-            arm: Arm::Lexical,
-            oracle: Some(Oracle::Lexical(
-                e.oracle_query().with_context(|| e.id.clone())?,
-            )),
+            query: e.query.clone(),
+            flags: flags.to_args(),
+            oracle: Oracle::Lexical(e.oracle_query().with_context(|| e.id.clone())?),
             limits: Vec::new(),
             target: Target::None,
         });
     }
     for e in &golden.paginations {
-        let flags = QueryFlags::parse(&e.flags).with_context(|| e.id.clone())?;
         out.push(PlannedQuery {
             id: e.id.clone(),
             kind: EntryKind::Pagination,
-            query: Some(e.query.clone()),
-            arm: flags.arm(true)?,
-            oracle: flags
-                .oracle_query(&e.query)
-                .with_context(|| e.id.clone())?
-                .map(Oracle::Lexical),
-            flags,
+            query: e.query.clone(),
+            flags: Vec::new(),
+            oracle: Oracle::Lexical(
+                LexicalQuery::new(&e.query, None).with_context(|| e.id.clone())?,
+            ),
             limits: e.limits.clone(),
             target: Target::None,
         });
     }
     for e in &golden.prefixes {
-        let flags = QueryFlags::parse(&e.flags).with_context(|| e.id.clone())?;
-        let oracle = match &e.query {
-            Some(q) => flags
-                .oracle_query(q)
-                .with_context(|| e.id.clone())?
-                .map(Oracle::Lexical),
-            None => None,
-        };
         out.push(PlannedQuery {
             id: e.id.clone(),
             kind: EntryKind::Prefix,
             query: e.query.clone(),
-            arm: flags.arm(e.query.is_some()).with_context(|| e.id.clone())?,
-            oracle,
-            flags,
+            flags: Vec::new(),
+            oracle: Oracle::Lexical(
+                LexicalQuery::new(&e.query, None).with_context(|| e.id.clone())?,
+            ),
             limits: e.limits.clone(),
-            target: Target::None,
-        });
-    }
-    for e in &golden.asts {
-        out.push(PlannedQuery {
-            id: e.id.clone(),
-            kind: EntryKind::Ast,
-            query: None,
-            flags: QueryFlags {
-                ast: Some(e.pattern.clone()),
-                ..QueryFlags::default()
-            },
-            arm: Arm::Ast,
-            oracle: Some(Oracle::Structural(StructuralTarget {
-                pattern: e.pattern.clone(),
-                lang: e.lang,
-                precision: e.precision,
-                expect_oracle_empty: e.expect_oracle_empty,
-            })),
-            limits: Vec::new(),
             target: Target::None,
         });
     }
@@ -382,6 +305,7 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
             &e.id,
             EntryKind::Refs,
             &e.query,
+            Vec::new(),
             Oracle::Refs(e.clone()),
         ));
     }
@@ -390,34 +314,41 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
             &e.id,
             EntryKind::Clash,
             &e.query,
+            Vec::new(),
             Oracle::Clash(e.clone()),
         ));
     }
     for e in &golden.stakes {
         let stakes = StakesOracle {
-            query: e.line_query().with_context(|| e.id.clone())?,
+            run: e.run().with_context(|| e.id.clone())?,
             entry: e.clone(),
         };
         out.push(frozen_entry(
             &e.id,
             EntryKind::Stakes,
             &e.query,
+            e.flags.clone(),
             Oracle::Stakes(stakes),
         ));
     }
     Ok(out)
 }
 
-/// An entry judged against a frozen answer: one text query on the lexical
-/// envelope, no ranking target, no pagination or prefix limits.
-fn frozen_entry(id: &str, kind: EntryKind, query: &str, oracle: Oracle) -> PlannedQuery {
+/// An entry judged against a frozen answer: one text query, no ranking
+/// target, no pagination or prefix limits.
+fn frozen_entry(
+    id: &str,
+    kind: EntryKind,
+    query: &str,
+    flags: Vec<String>,
+    oracle: Oracle,
+) -> PlannedQuery {
     PlannedQuery {
         id: id.to_string(),
         kind,
-        query: Some(query.to_string()),
-        flags: QueryFlags::default(),
-        arm: Arm::Lexical,
-        oracle: Some(oracle),
+        query: query.to_string(),
+        flags,
+        oracle,
         limits: Vec::new(),
         target: Target::None,
     }
@@ -472,40 +403,18 @@ pub fn check_precision(rows: &[ResultRow], gt: &[String]) -> CheckOutcome {
     ))
 }
 
-/// `lexical.silent_fn`: no ground-truth file is missing while `degraded[]`
-/// is empty (a disclosed miss is a recall failure, not a silent one).
+/// `lexical.silent_fn`: no ground-truth file is missing. The envelope has no
+/// channel that discloses a missed file (every file of the universe is
+/// read), so a miss is always silent.
 pub fn check_silent_fn(page: &ResultPage, gt: &[String]) -> CheckOutcome {
     let missing = missing(&page.rows, gt);
-    if missing.is_empty() || !page.degraded.is_empty() {
+    if missing.is_empty() {
         return CheckOutcome::Pass;
     }
     CheckOutcome::fail(format!(
-        "{} ground-truth file(s) missing with an empty degraded[]: {}",
+        "{} ground-truth file(s) missing and nothing in the output says so: {}",
         missing.len(),
         sample(missing)
-    ))
-}
-
-/// The JSON name of a verify mode (`substring` when absent).
-pub fn verify_mode_name(mode: &VerifyMode) -> &str {
-    match mode {
-        VerifyMode::Substring => "substring",
-        VerifyMode::Phrase => "phrase",
-        VerifyMode::Near => "near",
-        VerifyMode::PhraseNear => "phrase_near",
-        VerifyMode::Unknown(name) => name,
-    }
-}
-
-/// `lexical.verify_mode`: the JSON `verify_mode` equals the declared mode.
-pub fn check_verify_mode(page: &ResultPage, expected: &VerifyMode) -> CheckOutcome {
-    if &page.verify_mode == expected {
-        return CheckOutcome::Pass;
-    }
-    CheckOutcome::fail(format!(
-        "verify_mode is {}, expected {}",
-        verify_mode_name(&page.verify_mode),
-        verify_mode_name(expected)
     ))
 }
 
@@ -682,6 +591,79 @@ pub fn refs_call_precision(page: &ResultPage, entry: &RefsEntry) -> Option<f64> 
         return None;
     }
     Some(group.intersection(&frozen).count() as f64 / group.len() as f64)
+}
+
+/// How many role labels one language has, and how many of them the role
+/// oracle confirms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoleTally {
+    /// The `def`, `call` and `import` labels the page puts on files of the
+    /// language.
+    pub labelled: u64,
+    /// The labels whose line the role oracle lists for the same role.
+    pub confirmed: u64,
+}
+
+impl RoleTally {
+    fn add(&mut self, other: RoleTally) {
+        self.labelled += other.labelled;
+        self.confirmed += other.confirmed;
+    }
+}
+
+/// The `roles.precision.<lang>` input of one page: for each oracle language,
+/// the `def`, `call` and `import` labels of `page.occurrences` and how many of
+/// them the role oracle (`rskim_oracle::roles::role_sites`) confirms.
+///
+/// `name` is the bare identifier the page was searched for. A label is
+/// confirmed when the oracle lists the occurrence's line under the same role
+/// for `name` in that file. `source_of` gives the text of a file of the oracle
+/// universe. A labelled file that is not there has no oracle reading, so its
+/// labels count as not confirmed. Other roles (`ref`, `comment`, `string`,
+/// `text`, `partial`) and files of a language without a role oracle are not
+/// counted. A line counts once per role.
+///
+/// # Errors
+///
+/// The role oracle fails on a file (harness error, never a silent miss).
+pub fn page_role_tallies<'a>(
+    page: &ResultPage,
+    name: &str,
+    source_of: impl Fn(&str) -> Option<&'a str>,
+) -> anyhow::Result<BTreeMap<OracleLang, RoleTally>> {
+    let mut labels: BTreeMap<&str, BTreeSet<(u32, Role)>> = BTreeMap::new();
+    for o in &page.occurrences {
+        if let Some(role @ (Role::Def | Role::Call | Role::Import)) = o.role {
+            labels
+                .entry(o.path.as_str())
+                .or_default()
+                .insert((o.line, role));
+        }
+    }
+    let mut tallies: BTreeMap<OracleLang, RoleTally> = BTreeMap::new();
+    for (path, lines) in labels {
+        let LangClass::Oracle(lang) = classify(path) else {
+            continue;
+        };
+        let sites = match source_of(path) {
+            Some(source) => Some(
+                role_sites(lang, source, name)
+                    .with_context(|| format!("role oracle on {path} for {name:?}"))?,
+            ),
+            None => None,
+        };
+        let tally = tallies.entry(lang).or_default();
+        for (line, role) in lines {
+            tally.labelled += 1;
+            let confirmed = sites.as_ref().is_some_and(|s| match role {
+                Role::Def => s.defs.contains(&line),
+                Role::Call => s.calls.contains(&line),
+                _ => s.imports.contains(&line),
+            });
+            tally.confirmed += u64::from(confirmed);
+        }
+    }
+    Ok(tallies)
 }
 
 /// `clash.defs_complete`: every frozen definition is among the definition
@@ -1139,58 +1121,42 @@ pub fn check_prefix(full: &[ResultRow], limited: &[(u32, ResultPage)]) -> CheckO
 // Measurements (pure)
 // ============================================================================
 
-/// Replace every `in <digits>ms` with `in 0ms`, so the text-mode footer's
-/// duration never changes a byte count.
-pub fn normalize_durations(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    // Each iteration advances `i` by at least one byte.
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"in ") {
-            let digits = i + 3;
-            let end = digits
-                + bytes[digits..]
-                    .iter()
-                    .take_while(|b| b.is_ascii_digit())
-                    .count();
-            if end > digits && bytes[end..].starts_with(b"ms") {
-                out.extend_from_slice(b"in 0ms");
-                i = end + 2;
-                continue;
-            }
+/// Bytes of `stdout` up to and including the line that starts `def <path>:`,
+/// the line of the labelled view that shows a definition of `path`, or
+/// `None` if no line does.
+pub fn bytes_through_def_line(stdout: &[u8], path: &str) -> Option<u64> {
+    let prefix = format!("def {path}:");
+    let mut offset = 0usize;
+    for line in stdout.split_inclusive(|&b| b == b'\n') {
+        offset += line.len();
+        if line.starts_with(prefix.as_bytes()) {
+            return u64::try_from(offset).ok();
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    out
+    None
 }
 
-/// Whether `line` is the header of `path`'s result block in skim's text
-/// output: `<path>:<line>  [field] …` or `<path>  [field] …`.
-fn is_block_header(line: &[u8], path: &str) -> bool {
-    let Some(rest) = line.strip_prefix(path.as_bytes()) else {
-        return false;
+/// Bytes of `stdout` up to and including the end of `path`'s block in the
+/// word view, or `None` if `path` has no block.
+///
+/// The block starts at the header line `<path>  <word counts>`. Its matching
+/// lines are `<path>:<line>: …`. It ends at the first line that does not
+/// start with `path` (followed by `:` or two spaces, so `a.rs` does not
+/// claim the lines of `a.rs.orig`).
+pub fn bytes_through_file_block(stdout: &[u8], path: &str) -> Option<u64> {
+    let starts_block = |line: &[u8]| line.starts_with(format!("{path}  ").as_bytes());
+    let continues_block = |line: &[u8]| {
+        line.strip_prefix(path.as_bytes())
+            .is_some_and(|rest| rest.starts_with(b":") || rest.starts_with(b"  "))
     };
-    rest.starts_with(b"  [")
-        || (rest.first() == Some(&b':') && rest.get(1).is_some_and(u8::is_ascii_digit))
-}
-
-/// Bytes of `stdout` up to and including `path`'s result block (its header,
-/// its snippet lines and the blank line closing it), or `None` if `path`
-/// has no block.
-pub fn bytes_through_block(stdout: &[u8], path: &str) -> Option<u64> {
     let mut offset = 0usize;
     let mut in_block = false;
     for line in stdout.split_inclusive(|&b| b == b'\n') {
-        offset += line.len();
-        let content = line.strip_suffix(b"\n").unwrap_or(line);
-        if in_block {
-            if content.is_empty() {
-                return u64::try_from(offset).ok();
-            }
-        } else if is_block_header(content, path) {
-            in_block = true;
+        if in_block && !continues_block(line) {
+            break;
         }
+        in_block = in_block || starts_block(line);
+        offset += line.len();
     }
     if in_block {
         u64::try_from(offset).ok()
@@ -1246,11 +1212,10 @@ pub struct IdentSample {
     pub anchor_eq_def: bool,
     /// The defining file's snippet shows `def.line`.
     pub def_line_in_snippet: bool,
-    /// Text-mode stdout + stderr bytes at the default limit, durations
-    /// normalized.
+    /// Text-mode stdout + stderr bytes at the default limit.
     pub text_bytes: u64,
-    /// Text-mode bytes through the defining file's block (`None` = not on
-    /// page 1: a miss).
+    /// Text-mode bytes through the line that shows the definition (`None` =
+    /// not on page 1: a miss).
     pub first_correct_bytes: Option<u64>,
     /// Simulated `rg -n -F --sort path` output bytes.
     pub rg_text_bytes: u64,
@@ -1275,6 +1240,10 @@ pub struct ConceptSample {
     pub p5_baseline_count: f64,
     pub p10_baseline_count: f64,
     pub text_bytes: u64,
+    /// Text-mode bytes through the end of the first relevant file's block in
+    /// the word view (`None` = no relevant file shown on page 1).
+    #[serde(default)]
+    pub first_relevant_bytes: Option<u64>,
     pub rg_text_bytes: u64,
     pub rgw_text_bytes: u64,
 }
@@ -1293,24 +1262,22 @@ pub struct RefsSample {
 /// Everything one corpus contributes to the RATCHET values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorpusSamples {
-    /// Oracle universe size − skim `file_count`.
+    /// Oracle universe size − the envelope's `searched_files`.
     pub universe_delta: i64,
-    /// Persisted skip reasons whose counts differ between oracle and skim.
+    /// Left-out reasons whose counts differ between oracle and envelope.
     pub skipped_mismatch: u64,
+    /// Files of the oracle universe the engine searched: the smaller of the
+    /// two counts.
     pub indexed_tracked: u64,
+    /// Files of the oracle universe.
     pub tracked_text: u64,
     pub idents: Vec<IdentSample>,
     pub concepts: Vec<ConceptSample>,
-    /// Full-list row count of each entry with no oracle
-    /// ([`PlannedQuery::oracle`] is `None`), by id.
-    pub oracle_less_rows: BTreeMap<String, u64>,
-    /// Per-`[[ast]]`-entry measurements, in plan order.
-    pub structural: Vec<StructuralSample>,
-    /// skim `--ast` rows no `[[ast]]` entry scores, per pattern skim was
-    /// called for.
-    pub unscored_rows: BTreeMap<String, u64>,
     /// Per-`[[refs]]`-entry measurements, in plan order.
     pub refs: Vec<RefsSample>,
+    /// Per language, the role labels of the `[[refs]]` and `[[clash]]` pages and
+    /// the ones the role oracle confirms ([`page_role_tallies`]).
+    pub roles: BTreeMap<OracleLang, RoleTally>,
     /// The work counters of every call that states them, in plan order.
     pub costs: Vec<Cost>,
 }
@@ -1392,10 +1359,7 @@ const fn reference(name: &'static str, tolerance: Tolerance) -> MetricDef {
     def(name, Direction::Neutral, tolerance, "baseline")
 }
 
-/// Every fixed RATCHET metric (tolerance 0 except bytes at ±3%). The
-/// per-entry family [`ORACLE_LESS_ROWS`] is defined by
-/// [`ORACLE_LESS_ROWS_DEF`], the structural families by
-/// [`STRUCTURAL_FAMILIES`].
+/// Every fixed RATCHET metric (tolerance 0 except bytes at ±3%).
 pub const RATCHET_METRICS: &[MetricDef] = &[
     def(
         "universe.delta",
@@ -1520,8 +1484,9 @@ pub const RATCHET_METRICS: &[MetricDef] = &[
         Tolerance::Exact,
         "ratchet (exact counter)",
     ),
-    // No code in this version reads the role oracle, so these rows have no
-    // value yet: the search output labels no role the oracle could judge.
+    // Precision of the `def`, `call` and `import` labels of the `[[refs]]` and
+    // `[[clash]]` pages, judged by the role oracle (`page_role_tallies`). A
+    // language with no label in any corpus has no value.
     def(
         "roles.precision.rust",
         Direction::HigherBetter,
@@ -1560,119 +1525,9 @@ pub const RATCHET_METRICS: &[MetricDef] = &[
     ),
 ];
 
-/// Name prefix of the per-entry RATCHET values `oracle_less.full_rows.<id>`:
-/// the full-list row count of each entry with no oracle (`--ast`,
-/// `--blast-radius`, a standalone temporal arm).
-pub const ORACLE_LESS_ROWS: &str = "oracle_less.full_rows.";
-
-/// The definition every `oracle_less.full_rows.<id>` value shares. No oracle
-/// judges those lists' size, so a shrink is a regression (blessing it needs
-/// a reason) and a growth an improvement; either way the gate asks for a
-/// bless. An empty list is a harness error before it gets here
-/// (`pipeline::require_oracle_less_rows`).
-pub static ORACLE_LESS_ROWS_DEF: MetricDef = def(
-    "oracle_less.full_rows.<id>",
-    Direction::HigherBetter,
-    Tolerance::Exact,
-    "ratchet (no oracle)",
-);
-
-/// Name prefix of `structural.precision.<id>`: the file-level precision of
-/// an `[[ast]]` entry of class `ratchet` (a `hard` entry's precision is the
-/// HARD check `structural.precision` instead).
-pub const STRUCTURAL_PRECISION: &str = "structural.precision.";
-
-/// Name prefix of `structural.line_on_match.<id>`: how many of an `[[ast]]`
-/// entry's rows anchor on the first line of an oracle match.
-pub const STRUCTURAL_LINE_ON_MATCH: &str = "structural.line_on_match.";
-
-/// Name prefix of `structural.intent_recall.<id>` (nested-loop entries).
-pub const STRUCTURAL_INTENT_RECALL: &str = "structural.intent_recall.";
-
-/// Name prefix of `structural.intent_precision.<id>` (nested-loop entries).
-pub const STRUCTURAL_INTENT_PRECISION: &str = "structural.intent_precision.";
-
-/// Name prefix of `structural.unscored_rows.<pattern>`: skim `--ast` rows no
-/// `[[ast]]` entry of this corpus scores, for every catalog pattern of a
-/// corpus with an `[[ast]]` entry (0 included). Neutral: any move needs a
-/// bless, never a reason (see [`STRUCTURAL_FAMILIES`]).
-pub const STRUCTURAL_UNSCORED_ROWS: &str = "structural.unscored_rows.";
-
-/// The structural RATCHET families (#541), each `(name prefix, definition)`;
-/// the name suffix is an `[[ast]]` id, or a pattern for
-/// [`STRUCTURAL_UNSCORED_ROWS`]. Every value is exact. The precision and
-/// intent fractions and the anchor count are higher-is-better: a drop is a
-/// regression, and blessing it needs `--accept-regression`. Unscored rows
-/// are neutral: no oracle judges them, and a move either way has an
-/// ordinary cause (a shrink: a new entry now scores those rows, or skim
-/// stopped returning rows no entry judges; a growth: skim returns rows in a
-/// language no entry scores). So a move reads `changed`: the gate asks for a
-/// bless, and bless needs no reason.
-pub static STRUCTURAL_FAMILIES: [(&str, MetricDef); 5] = [
-    (
-        STRUCTURAL_PRECISION,
-        def(
-            "structural.precision.<id>",
-            Direction::HigherBetter,
-            Tolerance::Exact,
-            "ratchet (class \"ratchet\"; 1 = oracle-exact)",
-        ),
-    ),
-    (
-        STRUCTURAL_LINE_ON_MATCH,
-        def(
-            "structural.line_on_match.<id>",
-            Direction::HigherBetter,
-            Tolerance::Exact,
-            "ratchet (rows on an oracle match line)",
-        ),
-    ),
-    (
-        STRUCTURAL_INTENT_RECALL,
-        def(
-            "structural.intent_recall.<id>",
-            Direction::HigherBetter,
-            Tolerance::Exact,
-            "ratchet (intent oracle)",
-        ),
-    ),
-    (
-        STRUCTURAL_INTENT_PRECISION,
-        def(
-            "structural.intent_precision.<id>",
-            Direction::HigherBetter,
-            Tolerance::Exact,
-            "ratchet (intent oracle)",
-        ),
-    ),
-    (
-        STRUCTURAL_UNSCORED_ROWS,
-        def(
-            "structural.unscored_rows.<pattern>",
-            Direction::Neutral,
-            Tolerance::Exact,
-            "ratchet (no oracle)",
-        ),
-    ),
-];
-
-/// The definition of the RATCHET metric `name` (a fixed metric, an
-/// `oracle_less.full_rows.<id>` value, or a structural family member).
+/// The definition of the RATCHET metric `name`.
 pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
-    let names_one = |prefix: &str| {
-        name.strip_prefix(prefix)
-            .is_some_and(|rest| !rest.is_empty())
-    };
-    RATCHET_METRICS
-        .iter()
-        .find(|d| d.name == name)
-        .or_else(|| names_one(ORACLE_LESS_ROWS).then_some(&ORACLE_LESS_ROWS_DEF))
-        .or_else(|| {
-            STRUCTURAL_FAMILIES
-                .iter()
-                .find(|(prefix, _)| names_one(prefix))
-                .map(|(_, d)| d)
-        })
+    RATCHET_METRICS.iter().find(|d| d.name == name)
 }
 
 /// How a RATCHET value moved against its baseline.
@@ -1770,9 +1625,7 @@ type RankOf = fn(&IdentSample) -> Option<u64>;
 
 /// RATCHET values pooled over `samples` (one corpus, or every corpus for
 /// the aggregate), rounded to 4 decimal places. `ident.*` / `concept.*` /
-/// `bytes.*` are present only when the pool has entries of that kind, and
-/// `oracle_less.full_rows.<id>` once per entry with no oracle in the pool
-/// (ids are corpus-prefixed, so the aggregate keeps them apart).
+/// `bytes.*` are present only when the pool has entries of that kind.
 /// `refs.call_precision` and `cost.*` are present only when at least one
 /// entry states a value; a row with no value is left out, not set to zero.
 pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
@@ -1787,7 +1640,7 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
         "universe.skipped_by_reason_mismatch",
         Some(samples.iter().map(|s| s.skipped_mismatch).sum::<u64>() as f64),
     );
-    let indexed: u64 = samples.iter().map(|s| s.indexed_tracked).sum();
+    let searched: u64 = samples.iter().map(|s| s.indexed_tracked).sum();
     let text: u64 = samples.iter().map(|s| s.tracked_text).sum();
     put(
         &mut out,
@@ -1795,7 +1648,7 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
         Some(if text == 0 {
             1.0
         } else {
-            indexed as f64 / text as f64
+            searched as f64 / text as f64
         }),
     );
 
@@ -1808,59 +1661,10 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
         put_concept_values(&mut out, &concepts);
     }
     put_text_byte_values(&mut out, &idents, &concepts);
-    for (id, &rows) in samples.iter().flat_map(|s| s.oracle_less_rows.iter()) {
-        put(
-            &mut out,
-            &format!("{ORACLE_LESS_ROWS}{id}"),
-            Some(rows as f64),
-        );
-    }
-    put_structural_values(&mut out, samples);
     put_refs_values(&mut out, samples);
+    put_role_values(&mut out, samples);
     put_cost_values(&mut out, samples);
     out
-}
-
-/// The structural families ([`STRUCTURAL_FAMILIES`]): one value per
-/// `[[ast]]` entry (ids are corpus-prefixed, so the aggregate keeps
-/// corpora apart), and `structural.unscored_rows.<pattern>` summed over the
-/// pooled corpora.
-fn put_structural_values(out: &mut BTreeMap<String, f64>, samples: &[&CorpusSamples]) {
-    for s in samples.iter().flat_map(|s| s.structural.iter()) {
-        if s.precision_class == PrecisionClass::Ratchet {
-            put(
-                out,
-                &format!("{STRUCTURAL_PRECISION}{}", s.id),
-                Some(s.precision),
-            );
-        }
-        put(
-            out,
-            &format!("{STRUCTURAL_LINE_ON_MATCH}{}", s.id),
-            Some(s.line_on_match as f64),
-        );
-        put(
-            out,
-            &format!("{STRUCTURAL_INTENT_RECALL}{}", s.id),
-            s.intent_recall,
-        );
-        put(
-            out,
-            &format!("{STRUCTURAL_INTENT_PRECISION}{}", s.id),
-            s.intent_precision,
-        );
-    }
-    let mut unscored: BTreeMap<&str, u64> = BTreeMap::new();
-    for (pattern, &rows) in samples.iter().flat_map(|s| s.unscored_rows.iter()) {
-        *unscored.entry(pattern.as_str()).or_insert(0) += rows;
-    }
-    for (pattern, rows) in unscored {
-        put(
-            out,
-            &format!("{STRUCTURAL_UNSCORED_ROWS}{pattern}"),
-            Some(rows as f64),
-        );
-    }
 }
 
 /// `refs.call_precision`: the mean over the `[[refs]]` entries whose page
@@ -1876,6 +1680,23 @@ fn put_refs_values(out: &mut BTreeMap<String, f64>, samples: &[&CorpusSamples]) 
                 .filter_map(|r| r.call_precision),
         ),
     );
+}
+
+/// `roles.precision.<lang>`: the labels the role oracle confirms over the labels
+/// the pages put on files of the language, pooled over every corpus. A language
+/// with no label has no value.
+fn put_role_values(out: &mut BTreeMap<String, f64>, samples: &[&CorpusSamples]) {
+    for lang in OracleLang::ALL {
+        let mut pooled = RoleTally::default();
+        for tally in samples.iter().filter_map(|s| s.roles.get(&lang)) {
+            pooled.add(*tally);
+        }
+        put(
+            out,
+            &format!("roles.precision.{lang}"),
+            (pooled.labelled > 0).then(|| pooled.confirmed as f64 / pooled.labelled as f64),
+        );
+    }
 }
 
 /// `cost.*_median`: the median of each work counter over every call that
@@ -2009,14 +1830,17 @@ fn put_text_byte_values(
 }
 
 /// The INFO reference rows (#540): the byte columns of the `rg -nw`
-/// simulation, the search an agent types for a bare identifier. They are not
-/// RATCHET metrics: the report records them under `info`, outside the
-/// baseline, so no move of theirs ever gates. A row with no value is absent.
+/// simulation, the search an agent types for a bare identifier, and the bytes
+/// to the first relevant file of a concept. They are not RATCHET metrics: the
+/// report records them under `info`, outside the baseline, so no move of
+/// theirs ever gates. A row with no value is absent.
 ///
 /// - `bytes.rgw_text_median`: output bytes over every ranking entry (idents
 ///   and concepts);
 /// - `bytes.rgw_first_correct_median`: output bytes through the definition
-///   line, over the idents whose definition `rg -nw` shows.
+///   line, over the idents whose definition `rg -nw` shows;
+/// - `bytes.first_relevant_median`: output bytes through the first relevant
+///   file's block, over the concepts that show a relevant file.
 ///
 /// Pooled over `samples` the way [`ratchet_values`] pools them, rounded to 4
 /// decimal places.
@@ -2028,12 +1852,18 @@ pub fn reference_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
         .chain(concepts().map(|c| c.rgw_text_bytes))
         .collect();
     let first_correct: Vec<u64> = idents().filter_map(|i| i.rgw_first_correct_bytes).collect();
+    let first_relevant: Vec<u64> = concepts().filter_map(|c| c.first_relevant_bytes).collect();
     let mut out = BTreeMap::new();
     put(&mut out, "bytes.rgw_text_median", percentile(&text, 0.5));
     put(
         &mut out,
         "bytes.rgw_first_correct_median",
         percentile(&first_correct, 0.5),
+    );
+    put(
+        &mut out,
+        "bytes.first_relevant_median",
+        percentile(&first_relevant, 0.5),
     );
     out
 }
@@ -2042,16 +1872,16 @@ pub fn reference_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
 // Evaluation
 // ============================================================================
 
-/// One corpus's raw results: HARD outcomes (before the ledger), samples,
-/// and INFO.
+/// One corpus's raw results: HARD outcomes (before the ledger) and samples.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorpusEvaluation {
     /// `(id, check, outcome)`, sorted by `(id, check)`.
     pub outcomes: Vec<(String, CheckId, CheckOutcome)>,
     pub samples: CorpusSamples,
-    /// Ground-truth hits among tracked text files outside the indexed
-    /// universe, by id (non-zero only).
-    pub unindexed_hits: BTreeMap<String, u64>,
+    /// The files the engine searched (`searched_files`).
+    pub searched_files: u64,
+    /// The files the engine left out, by reason (`left_out`).
+    pub left_out: BTreeMap<String, u64>,
 }
 
 /// `plan` and `observations` paired entry by entry: observations follow the
@@ -2087,34 +1917,27 @@ pub fn paired<'a>(
     Ok(plan.iter().zip(observations))
 }
 
-/// Score one corpus. `structural` holds the structural oracle's answers and
-/// skim's `--ast` calls for the `[[ast]]` entries (empty when there are
-/// none); an `[[ast]]` entry's observation holds skim's rows in its language.
+/// Score one corpus against its oracle universe `text`.
 ///
 /// # Errors
 ///
 /// `observations` does not follow `plan` one-for-one (same length, same
-/// ids), or an entry lacks an observation (or structural evidence) its
-/// checks need.
+/// ids), no observation states the engine's file accounting, or an entry
+/// lacks an observation its checks need.
 pub fn evaluate(
-    universe: &Universe,
     text: &TextUniverse,
-    stats: &StatsSnapshot,
     plan: &[PlannedQuery],
     observations: &[EntryObservation],
-    structural: &StructuralEvidence,
 ) -> anyhow::Result<CorpusEvaluation> {
     let mut outcomes = Vec::new();
     let mut idents = Vec::new();
     let mut concepts = Vec::new();
-    let mut unindexed_hits = BTreeMap::new();
-    let mut oracle_less_rows = BTreeMap::new();
-    let mut structural_samples = Vec::new();
     let mut refs = Vec::new();
     let mut costs = Vec::new();
+    let mut roles: BTreeMap<OracleLang, RoleTally> = BTreeMap::new();
 
     for (q, obs) in paired(plan, observations)? {
-        let oracle = eval_oracle(q, obs, universe, text, structural)?;
+        let oracle = eval_oracle(q, text);
         let pagination = (q.kind == EntryKind::Pagination)
             .then(|| check_pagination(&obs.full.rows, &obs.sweeps));
         let inputs = CheckInputs {
@@ -2131,12 +1954,23 @@ pub fn evaluate(
         let gt = oracle.ground_truth();
         match &q.target {
             Target::Definition(def) => {
-                idents.push(measure_ident(q, def, obs, universe, gt)?);
+                idents.push(measure_ident(q, def, obs, text, gt)?);
             }
             Target::Relevance { relevant, .. } => {
-                concepts.push(measure_concept(q, relevant, obs, universe, gt)?);
+                concepts.push(measure_concept(q, relevant, obs, text, gt)?);
             }
             Target::None => {}
+        }
+        let role_name = q
+            .refs_entry()
+            .map(|e| e.query.as_str())
+            .or_else(|| q.clash_entry().map(|e| e.query.as_str()));
+        if let Some(name) = role_name {
+            for (lang, tally) in page_role_tallies(&obs.full, name, |p| text.text(p))
+                .with_context(|| format!("{}: roles.precision", q.id))?
+            {
+                roles.entry(lang).or_default().add(tally);
+            }
         }
         if let Some(entry) = q.refs_entry() {
             refs.push(RefsSample {
@@ -2145,144 +1979,96 @@ pub fn evaluate(
             });
         }
         costs.extend(obs.full.cost);
-
-        match oracle {
-            OracleEval::Lexical {
-                unindexed_hits: hits,
-                ..
-            } => {
-                if hits > 0 {
-                    unindexed_hits.insert(q.id.clone(), hits);
-                }
-            }
-            OracleEval::Structural(score) => structural_samples.push(score.sample),
-            OracleEval::Frozen => {}
-            OracleEval::None { full_rows } => {
-                oracle_less_rows.insert(q.id.clone(), full_rows);
-            }
-        }
     }
     outcomes.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
 
-    let coverage = universe.coverage();
+    let (searched, left_out) = accounting(observations)?;
+    let oracle_files = u64::try_from(text.len())?;
     Ok(CorpusEvaluation {
         outcomes,
         samples: CorpusSamples {
-            universe_delta: i64::try_from(universe.len())? - i64::try_from(stats.file_count)?,
-            skipped_mismatch: skip_mismatches(
-                &universe.persisted_skipped_by_reason(),
-                &stats.skipped_by_reason,
-            ),
-            indexed_tracked: u64::try_from(coverage.indexed_tracked)?,
-            tracked_text: u64::try_from(coverage.tracked_text)?,
+            universe_delta: i64::try_from(oracle_files)? - i64::try_from(searched)?,
+            skipped_mismatch: left_out_mismatches(text, left_out),
+            indexed_tracked: oracle_files.min(searched),
+            tracked_text: oracle_files,
             idents,
             concepts,
-            oracle_less_rows,
-            structural: structural_samples,
-            unscored_rows: unscored_rows(
-                plan.iter().filter_map(PlannedQuery::structural_target),
-                &structural.patterns,
-            ),
             refs,
+            roles,
             costs,
         },
-        unindexed_hits,
+        searched_files: searched,
+        left_out: left_out.clone(),
     })
 }
 
+/// The engine's file accounting (`searched_files` and `left_out`), from the
+/// first observation that states both. A call with `-g` or `-t` (a lexical
+/// entry with `lang`, or a stakes entry with a filter) searches fewer files
+/// than the corpus holds, so only a call with no filter speaks for the whole
+/// corpus. The first observation is such a call only because the plan lists
+/// the `[[ident]]` entries first and they carry no flags: a golden file with
+/// no ident entry would take its accounting from a call of another kind.
+///
+/// # Errors
+///
+/// No observation states both.
+fn accounting(observations: &[EntryObservation]) -> anyhow::Result<(u64, &BTreeMap<String, u64>)> {
+    observations
+        .iter()
+        .find_map(|o| Some((o.full.searched_files?, o.full.left_out.as_ref()?)))
+        .context("no observation states searched_files and left_out")
+}
+
+/// Left-out reasons whose count differs between the engine (`skim`) and the
+/// oracle (a reason one side omits counts 0).
+fn left_out_mismatches(text: &TextUniverse, skim: &BTreeMap<String, u64>) -> u64 {
+    let reasons: BTreeSet<&str> = LEFT_OUT_REASONS
+        .iter()
+        .copied()
+        .chain(skim.keys().map(String::as_str))
+        .collect();
+    reasons
+        .into_iter()
+        .filter(|r| text.left_out_count(r) != skim.get(*r).copied().unwrap_or(0))
+        .count() as u64
+}
+
 /// What an entry's oracle says about its full list, resolved once per entry
-/// by [`eval_oracle`]: the per-oracle-family seam of [`evaluate`]. The checks
-/// ([`run_check`]), the ranking measurements and the per-family tallies all
-/// read it, so a new oracle family (#542's temporal oracle) is one more
-/// variant here and one more arm of [`eval_oracle`]'s match.
+/// by [`eval_oracle`]. The checks ([`run_check`]) and the ranking
+/// measurements read it.
 #[derive(Debug)]
 enum OracleEval {
     /// A lexical oracle (`oracle.rs`).
     Lexical {
         /// Its ground truth over the universe.
         gt: Vec<String>,
-        /// Its ground-truth hits among tracked text files outside the
-        /// indexed universe (INFO `unindexed_hits`).
-        unindexed_hits: u64,
-        /// Its ground truth over the text universe, for a `[[lexical]]`
-        /// entry (`lexical.recall_tracked`); `None` for other kinds.
-        text_gt: Option<Vec<String>>,
     },
-    /// The structural oracle (`[[ast]]`): the entry's structural HARD
-    /// outcomes and measurements.
-    Structural(EntryScore),
     /// A frozen answer or the regex oracle (`[[refs]]`, `[[clash]]`,
     /// `[[stakes]]`): the checks read the entry itself, and nothing ratchets
     /// per entry.
     Frozen,
-    /// No oracle: the full list's row count, which ratchets instead
-    /// ([`ORACLE_LESS_ROWS`]).
-    None {
-        /// Rows in the entry's full list.
-        full_rows: u64,
-    },
 }
 
 impl OracleEval {
     /// The lexical ground truth, if the entry has a lexical oracle.
     fn ground_truth(&self) -> Option<&[String]> {
         match self {
-            OracleEval::Lexical { gt, .. } => Some(gt),
-            OracleEval::Structural(_) | OracleEval::Frozen | OracleEval::None { .. } => None,
-        }
-    }
-
-    /// The ground truth over the text universe, if the entry has one.
-    fn text_ground_truth(&self) -> Option<&[String]> {
-        match self {
-            OracleEval::Lexical { text_gt, .. } => text_gt.as_deref(),
-            OracleEval::Structural(_) | OracleEval::Frozen | OracleEval::None { .. } => None,
-        }
-    }
-
-    /// The structural score, if the entry is an `[[ast]]` entry.
-    fn structural(&self) -> Option<&EntryScore> {
-        match self {
-            OracleEval::Structural(score) => Some(score),
-            OracleEval::Lexical { .. } | OracleEval::Frozen | OracleEval::None { .. } => None,
+            OracleEval::Lexical { gt } => Some(gt),
+            OracleEval::Frozen => None,
         }
     }
 }
 
-/// Resolve `q`'s oracle for [`evaluate`], with one match on
-/// [`PlannedQuery::oracle`]: a lexical oracle's ground truth over `universe`
-/// (and its hits outside it), the structural score of an `[[ast]]` entry's
-/// rows against `structural`, or the full-list row count of an entry with no
-/// oracle.
-///
-/// # Errors
-///
-/// An `[[ast]]` entry the structural oracle has no query for, or whose
-/// pattern skim was not called with (named by the entry id); a count that
-/// does not fit a `u64`.
-fn eval_oracle(
-    q: &PlannedQuery,
-    obs: &EntryObservation,
-    universe: &Universe,
-    text: &TextUniverse,
-    structural: &StructuralEvidence,
-) -> anyhow::Result<OracleEval> {
-    Ok(match &q.oracle {
-        Some(Oracle::Lexical(query)) => OracleEval::Lexical {
-            gt: ground_truth(universe.files(), query),
-            unindexed_hits: u64::try_from(
-                ground_truth(universe.unindexed_text_files(), query).len(),
-            )?,
-            text_gt: (q.kind == EntryKind::Lexical).then(|| ground_truth(text.files(), query)),
+/// Resolve `q`'s oracle for [`evaluate`]: a lexical oracle's ground truth
+/// over `text`, or the entry itself for a frozen answer.
+fn eval_oracle(q: &PlannedQuery, text: &TextUniverse) -> OracleEval {
+    match &q.oracle {
+        Oracle::Lexical(query) => OracleEval::Lexical {
+            gt: ground_truth(text.files(), query),
         },
-        Some(Oracle::Structural(target)) => OracleEval::Structural(
-            score_entry(&q.id, target, &obs.full.rows, structural).with_context(|| q.id.clone())?,
-        ),
-        Some(Oracle::Refs(_) | Oracle::Clash(_) | Oracle::Stakes(_)) => OracleEval::Frozen,
-        None => OracleEval::None {
-            full_rows: u64::try_from(obs.full.rows.len())?,
-        },
-    })
+        Oracle::Refs(_) | Oracle::Clash(_) | Oracle::Stakes(_) => OracleEval::Frozen,
+    }
 }
 
 /// What an entry's checks read besides its observation.
@@ -2308,24 +2094,24 @@ fn run_check(
             .context("no oracle ground truth")
     };
     let pagination = || inputs.pagination.context("no pagination sweep");
-    let structural = || inputs.oracle.structural().context("no structural score");
-    let text_gt = || {
-        inputs
-            .oracle
-            .text_ground_truth()
-            .context("no text-universe ground truth")
-    };
     let refs = || q.refs_entry().context("not a [[refs]] entry");
     let clash = || q.clash_entry().context("not a [[clash]] entry");
     let stakes = || q.stakes_oracle().context("not a [[stakes]] entry");
     let stakes_truth = || -> anyhow::Result<BTreeSet<(String, u32)>> {
-        Ok(line_truth(inputs.text.files(), &stakes()?.query))
+        match &stakes()?.run {
+            StakesRun::Search { query, filter } => Ok(line_truth(
+                inputs.text.files().filter(|(path, _)| filter.keeps(path)),
+                query,
+            )),
+            StakesRun::Usage(reason) => {
+                anyhow::bail!("the oracle reads this query as a usage error ({reason})")
+            }
+        }
     };
     Ok(match check {
         CheckId::LexicalRecall => check_recall(&obs.full.rows, gt()?),
         CheckId::LexicalPrecision => check_precision(&obs.full.rows, gt()?),
         CheckId::LexicalSilentFn => check_silent_fn(&obs.full, gt()?),
-        CheckId::LexicalVerifyMode => check_verify_mode(&obs.full, &q.flags.verify_mode()),
         CheckId::PaginationComplete => pagination()?.complete.clone(),
         CheckId::PaginationDisjoint => pagination()?.disjoint.clone(),
         CheckId::PaginationOrdered => pagination()?.ordered.clone(),
@@ -2335,15 +2121,12 @@ fn run_check(
         CheckId::ResultsUniquePaths => {
             check_unique_paths(&obs.full.rows, &obs.sweeps, &obs.limited)
         }
-        CheckId::StructuralRecall => structural()?.recall.clone(),
-        CheckId::StructuralPrecision => structural()?.precision.clone(),
-        CheckId::StructuralCoverage => structural()?.coverage.clone(),
         CheckId::RefsRecall => check_refs_recall(&obs.full, refs()?),
         CheckId::RefsCallsRecall => check_refs_calls_recall(&obs.full, refs()?),
         CheckId::ClashDefsComplete => check_clash_defs_complete(&obs.full, clash()?),
         CheckId::ClashDefCount => check_clash_def_count(&obs.full, clash()?),
         CheckId::ClashCallsRecall => check_clash_calls_recall(&obs.full, clash()?),
-        CheckId::LexicalRecallTracked => check_recall_tracked(&obs.full.rows, text_gt()?),
+        CheckId::LexicalRecallTracked => check_recall_tracked(&obs.full.rows, gt()?),
         CheckId::UniverseAccounted => check_universe_accounted(&obs.full, inputs.text),
         CheckId::IdentDefFirst => match &q.target {
             Target::Definition(def) => check_def_first(&obs.full, def),
@@ -2367,23 +2150,13 @@ fn run_check(
     })
 }
 
-/// Number of skip reasons whose counts differ (a missing reason counts 0).
-fn skip_mismatches(oracle: &BTreeMap<String, u64>, skim: &BTreeMap<String, u64>) -> u64 {
-    let reasons: BTreeSet<&String> = oracle.keys().chain(skim.keys()).collect();
-    reasons
-        .into_iter()
-        .filter(|r| oracle.get(*r).copied().unwrap_or(0) != skim.get(*r).copied().unwrap_or(0))
-        .count() as u64
-}
-
 fn text_bytes(obs: &EntryObservation) -> anyhow::Result<(Vec<u8>, u64)> {
     let text = obs
         .text
         .as_ref()
         .context("no text-mode output for a ranking entry")?;
-    let stdout = normalize_durations(&text.stdout);
-    let total = stdout.len() + normalize_durations(&text.stderr).len();
-    Ok((stdout, u64::try_from(total)?))
+    let total = text.stdout.len() + text.stderr.len();
+    Ok((text.stdout.clone(), u64::try_from(total)?))
 }
 
 /// 1-based rank of `path` in `ranked`.
@@ -2395,30 +2168,30 @@ fn measure_ident(
     q: &PlannedQuery,
     def: &DefSite,
     obs: &EntryObservation,
-    universe: &Universe,
+    text: &TextUniverse,
     gt: Option<&[String]>,
 ) -> anyhow::Result<IdentSample> {
-    let query = q.query.as_deref().context("an ident entry has no query")?;
+    let query = q.query.as_str();
     let gt = gt.context("an ident entry has no ground truth")?;
     let rows = &obs.full.rows;
     let position = rows.iter().position(|r| r.path == def.path);
     let def_row = position.map(|i| &rows[i]);
     let (stdout, text_bytes) = text_bytes(obs)?;
-    let rg = simulate_rg_fixed(universe.files(), query);
-    let rgw = simulate_rg_word(universe.files(), query)?;
+    let rg = simulate_rg_fixed(text.files(), query);
+    let rgw = simulate_rg_word(text.files(), query)?;
     Ok(IdentSample {
         id: q.id.clone(),
         rank: position.map(|i| i as u64 + 1),
         rank_baseline_alpha: rank_in(&baseline_alphabetical(gt), &def.path),
         rank_baseline_count: rank_in(
-            &baseline_occurrence_count(gt, query, |p| universe.text(p)),
+            &baseline_occurrence_count(gt, query, |p| text.text(p)),
             &def.path,
         ),
         anchor_eq_def: def_row.is_some_and(|r| r.line == Some(def.line)),
         def_line_in_snippet: def_row
             .is_some_and(|r| r.snippet.iter().any(|l| l.line_number == def.line)),
         text_bytes,
-        first_correct_bytes: bytes_through_block(&stdout, &def.path),
+        first_correct_bytes: bytes_through_def_line(&stdout, &def.path),
         rg_text_bytes: u64::try_from(rg.total_bytes())?,
         rg_first_correct_bytes: rg
             .bytes_through(&def.path, def.line)
@@ -2436,20 +2209,21 @@ fn measure_concept(
     q: &PlannedQuery,
     relevant: &Regex,
     obs: &EntryObservation,
-    universe: &Universe,
+    text: &TextUniverse,
     gt: Option<&[String]>,
 ) -> anyhow::Result<ConceptSample> {
-    let query = q.query.as_deref().context("a concept entry has no query")?;
+    let query = q.query.as_str();
     let gt = gt.context("a concept entry has no ground truth")?;
-    let is_relevant = |path: &str| universe.text(path).is_some_and(|t| relevant.is_match(t));
+    let is_relevant = |path: &str| text.text(path).is_some_and(|t| relevant.is_match(t));
     let ranked = paths(&obs.full.rows);
     let alpha = baseline_alphabetical(gt);
     let alpha: Vec<&str> = alpha.iter().map(String::as_str).collect();
-    let count = baseline_occurrence_count(gt, query, |p| universe.text(p));
+    let count = baseline_occurrence_count(gt, query, |p| text.text(p));
     let count: Vec<&str> = count.iter().map(String::as_str).collect();
-    let (_, text_bytes) = text_bytes(obs)?;
-    let rg = simulate_rg_fixed(universe.files(), query);
-    let rgw = simulate_rg_word(universe.files(), query)?;
+    let (stdout, text_bytes) = text_bytes(obs)?;
+    let first_relevant = ranked.iter().copied().find(|p| is_relevant(p));
+    let rg = simulate_rg_fixed(text.files(), query);
+    let rgw = simulate_rg_word(text.files(), query)?;
     Ok(ConceptSample {
         id: q.id.clone(),
         p5: round4(precision_at_k(&ranked, 5, is_relevant)),
@@ -2459,6 +2233,7 @@ fn measure_concept(
         p5_baseline_count: round4(precision_at_k(&count, 5, is_relevant)),
         p10_baseline_count: round4(precision_at_k(&count, 10, is_relevant)),
         text_bytes,
+        first_relevant_bytes: first_relevant.and_then(|p| bytes_through_file_block(&stdout, p)),
         rg_text_bytes: u64::try_from(rg.total_bytes())?,
         rgw_text_bytes: u64::try_from(rgw.total_bytes())?,
     })

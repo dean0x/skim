@@ -28,12 +28,13 @@ use std::process::{Command, Output};
 use rskim_bench::scoreboard::MAX_PAGES;
 use rskim_bench::scoreboard::corpus::load_corpora;
 use rskim_bench::scoreboard::golden::{
-    ClashSplit, IntegrityContext, Origin, check_integrity, parse_golden,
+    ClashSplit, IntegrityContext, Origin, StakesExpect, check_integrity, parse_golden,
 };
-use rskim_bench::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
-use rskim_bench::scoreboard::structural_metrics::called_patterns;
-use rskim_bench::scoreboard::test_support::{FixtureRepo, catalog};
-use rskim_bench::scoreboard::universe::{GitIsolation, TextUniverse, Universe, text_universe};
+use rskim_bench::scoreboard::oracle::{LexicalQuery, ground_truth};
+use rskim_bench::scoreboard::test_support::FixtureRepo;
+use rskim_bench::scoreboard::universe::{
+    GitIsolation, LEFT_OUT_REASONS, TextUniverse, text_universe,
+};
 use rskim_research::clone::verify_pinned_clone;
 use serde_json::{Value, json};
 
@@ -89,6 +90,17 @@ id = "fixture-X01"
 query = "marker"
 category = "substr"
 
+[[lexical]]
+id = "fixture-X02"
+query = "marker"
+category = "lang"
+lang = "rust"
+
+[[lexical]]
+id = "fixture-X03"
+query = "qzvx_absent_7713"
+category = "zero-hit"
+
 [[pagination]]
 id = "fixture-G001"
 query = "fn"
@@ -97,12 +109,6 @@ limits = [2]
 [[prefix]]
 id = "fixture-F001"
 query = "fn"
-flags = ["--hot"]
-limits = [1]
-
-[[prefix]]
-id = "fixture-F002"
-flags = ["--ast", "god-function"]
 limits = [1]
 "#
     )
@@ -112,22 +118,15 @@ limits = [1]
 const IDENT: (&str, &str, &[&str]) = ("fixture-L01", "check_staleness", &[]);
 const CONCEPT: (&str, &str, &[&str]) = ("fixture-C01", "build lock", &[]);
 const LEXICAL: (&str, &str, &[&str]) = ("fixture-X01", "marker", &[]);
+const LEXICAL_RUST: (&str, &str, &[&str]) = ("fixture-X02", "marker", &["-t", "rust"]);
 const PAGINATION: (&str, &str, &[&str]) = ("fixture-G001", "fn", &[]);
-const PREFIX: (&str, &str, &[&str]) = ("fixture-F001", "fn", &["--hot"]);
-/// Standalone `--ast`: no query (the stub keys it on the empty string) and
-/// no oracle.
-const AST: (&str, &str, &[&str]) = ("fixture-F002", "", &["--ast", "god-function"]);
+const PREFIX: (&str, &str, &[&str]) = ("fixture-F001", "fn", &[]);
 const PAGE_LIMIT: u32 = 2;
 const PREFIX_LIMIT: u32 = 1;
 const FULL_LIMIT: u32 = 1_000_000;
 
-/// The `[[ast]]` entry the structural tests add (#541): `rust-nested-loop`
-/// in Rust. The structural oracle matches `src/loops.rs` only (both loops
-/// are block statements, lines 2 and 3; the intent is the inner loop).
-const AST_ID: &str = "fixture-ast-rust-nested-loop-rust";
-const AST_PATTERN: &str = "rust-nested-loop";
-const AST_ENTRY: &str = "\n[[ast]]\nid = \"fixture-ast-rust-nested-loop-rust\"\n\
-                         pattern = \"rust-nested-loop\"\nlang = \"rust\"\nprecision = \"ratchet\"\n";
+/// A query that no file of the fixture holds.
+const ABSENT: &str = "qzvx_absent_7713";
 
 // ============================================================================
 // Stub skim
@@ -137,19 +136,19 @@ const AST_ENTRY: &str = "\n[[ast]]\nid = \"fixture-ast-rust-nested-loop-rust\"\n
 /// from argv, keys the response on hex(query + "\n" + " flag" per flag
 /// token), and serves `q_<key>/l<limit>_o<offset>.json`, falling back to
 /// `q_<key>/l<limit>_default.json` (JSON) or `q_<key>/text.txt` (text mode).
+/// A `q_<key>/exit_code` file sets the exit status. Every call is logged in
+/// `calls.log` (key, mode, limit, offset) and `argv.log` (the argument list).
 const STUB: &str = r#"#!/bin/sh
 set -u
-mode=query
 json=0
 limit=20
 offset=0
 query=
 flags=
+printf '%s\n' "$*" >> "$STUB_DIR/argv.log"
 if [ "${1:-}" = search ]; then shift; fi
 while [ $# -gt 0 ]; do
   case "$1" in
-    --build) mode=build ;;
-    --stats) mode=stats ;;
     --json) json=1 ;;
     --root) shift ;;
     --limit) shift; limit=$1 ;;
@@ -159,10 +158,6 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-case $mode in
-  build) printf 'build\n' >> "$STUB_DIR/calls.log"; exit 0 ;;
-  stats) cat "$STUB_DIR/stats.json"; exit 0 ;;
-esac
 key=$(printf '%s\n%s' "$query" "$flags" | od -An -v -tx1 | tr -d ' \n')
 printf '%s json=%s limit=%s offset=%s\n' "$key" "$json" "$limit" "$offset" >> "$STUB_DIR/calls.log"
 dir="$STUB_DIR/q_$key"
@@ -191,102 +186,151 @@ fn key(query: &str, flags: &[&str]) -> String {
         .collect()
 }
 
-/// One canned result row.
+/// One canned matching line.
 #[derive(Debug, Clone)]
 struct Row {
     path: String,
     line: u32,
     content: String,
+    /// The role the output names for the line; `None` derives it from the
+    /// line's text.
+    role: Option<&'static str>,
 }
 
 impl Row {
-    /// The `field` the binary prints for this line (`SearchField::name`): a
-    /// type or function declaration is a definition field, a comment is
-    /// `comment`, and any other line is `function_body`.
-    fn field(&self) -> &'static str {
+    /// The role the engine names for this line: a declaration is `def`, a
+    /// comment is `comment`, a line with a call is `call`, any other line is
+    /// `text`.
+    fn role(&self) -> &'static str {
+        if let Some(role) = self.role {
+            return role;
+        }
         let line = self.content.trim_start();
-        if ["struct ", "pub struct ", "enum ", "pub enum "]
+        if ["fn ", "pub fn ", "struct ", "pub struct "]
             .iter()
             .any(|p| line.starts_with(p))
         {
-            "type_definition"
-        } else if ["fn ", "pub fn "].iter().any(|p| line.starts_with(p)) {
-            "function_signature"
+            "def"
         } else if line.starts_with("//") {
             "comment"
+        } else if line.contains('(') {
+            "call"
         } else {
-            "function_body"
+            "text"
         }
     }
 }
 
-fn row_json(row: &Row, score: f64) -> Value {
-    json!({
-        "path": row.path,
-        "score": score,
-        "field": row.field(),
-        "line_number": row.line,
-        "snippet": {"lines": [{"line_number": row.line, "content": row.content, "is_match": true}]},
-        "stale": false,
-    })
+/// `rows` grouped by path, in the order each path is first seen.
+fn by_file(rows: &[Row]) -> Vec<(&str, Vec<&Row>)> {
+    let mut files: Vec<(&str, Vec<&Row>)> = Vec::new();
+    for row in rows {
+        match files.iter_mut().find(|(path, _)| *path == row.path) {
+            Some((_, lines)) => lines.push(row),
+            None => files.push((&row.path, vec![row])),
+        }
+    }
+    files
 }
 
-/// A lexical-envelope page: `rows` are ranks `offset..offset + rows.len()`
-/// of a list of `total_len` rows, scored `total_len - rank` (strictly
-/// descending).
-fn page_json(query: &str, rows: &[Row], offset: usize, total_len: usize, has_more: bool) -> String {
-    let results: Vec<Value> = rows
-        .iter()
+fn zero_left_out() -> Value {
+    Value::Object(
+        LEFT_OUT_REASONS
+            .iter()
+            .map(|r| (r.to_string(), json!(0)))
+            .collect(),
+    )
+}
+
+/// The definition sites a page states: the `def` lines of `rows` that hold
+/// `query`.
+fn definition_sites(rows: &[Row], query: &str) -> Vec<(String, u32)> {
+    rows.iter()
+        .filter(|r| r.role() == "def" && r.content.contains(query))
+        .map(|r| (r.path.clone(), r.line))
+        .collect()
+}
+
+/// The engine's JSON envelope for the page `offset..` of a list of `total`
+/// files. `rows` are the page's matching lines; each file holds the lines
+/// with its path, and is scored `total - rank` (strictly descending).
+fn envelope(
+    query: &str,
+    rows: &[Row],
+    offset: usize,
+    total: usize,
+    has_more: bool,
+    searched_files: u64,
+) -> Value {
+    let words = query.split_whitespace().count();
+    let files: Vec<Value> = by_file(rows)
+        .into_iter()
         .enumerate()
-        .map(|(i, r)| row_json(r, (total_len - (offset + i)) as f64))
-        .collect();
-    json!({
-        "query": query,
-        "total": rows.len(),
-        "duration_ms": 1,
-        "has_more": has_more,
-        "results": results,
-    })
-    .to_string()
-}
-
-/// A standalone `--ast` page (`crates/rskim-search/src/compound/output.rs`):
-/// rows carry `score`, `line` and a one-line `snippet` string.
-fn ast_page_json(rows: &[(Row, f64)], has_more: bool) -> String {
-    ast_envelope(rows, has_more).to_string()
-}
-
-fn ast_envelope(rows: &[(Row, f64)], has_more: bool) -> Value {
-    let results: Vec<Value> = rows
-        .iter()
-        .map(|(r, score)| {
+        .map(|(i, (path, lines))| {
             json!({
-                "path": r.path,
-                "score": score,
-                "line": r.line,
-                "snippet": r.content,
+                "path": path,
+                "rank": offset + i + 1,
+                "score": (total - (offset + i)) as f64,
+                "words_matched": words,
+                "words_total": words,
+                "line_count": lines.len(),
+                "roles": {},
+                "occurrences": lines
+                    .iter()
+                    .map(|r| json!({"line": r.line, "role": r.role(), "text": r.content}))
+                    .collect::<Vec<_>>(),
+                "occurrences_elided": 0,
             })
         })
         .collect();
-    json!({"total": rows.len(), "has_more": has_more, "results": results})
+    let sites = definition_sites(rows, query);
+    json!({
+        "query": query,
+        "match_mode": "substring",
+        "case": "sensitive",
+        "view": "labelled",
+        "total_lines": rows.len(),
+        "total_files": total,
+        "has_more": has_more,
+        "definitions": {
+            "count": sites.len(),
+            "at_least": false,
+            "sites": sites
+                .iter()
+                .map(|(path, line)| json!({"path": path, "line": line}))
+                .collect::<Vec<_>>(),
+        },
+        "files": files,
+        "searched_files": searched_files,
+        "left_out": zero_left_out(),
+        "parse": {"files": 2, "bytes": 400, "budget_hit": false, "unlabelled_files": 0},
+        "cost": {"files_read": searched_files, "bytes_read": 1000, "files_parsed": 2, "bytes_parsed": 400},
+        "notices": [],
+        "duration_ms": 1,
+    })
 }
 
-/// skim's text format (`query.rs::format_text_output`) for the first 20 rows.
-fn text_output(query: &str, rows: &[Row]) -> String {
-    if rows.is_empty() {
-        return format!("no results for {query:?}\n");
-    }
-    let shown: Vec<&Row> = rows.iter().take(20).collect();
-    let mut out = String::new();
-    for (i, r) in shown.iter().enumerate() {
-        let score = (rows.len() - i) as f64;
-        out.push_str(&format!(
-            "{}:{}  [text]  score: {score:.2}\n  >  {:>4}│ {}\n\n",
-            r.path, r.line, r.line, r.content
-        ));
-    }
-    out.push_str(&format!("{} result(s) for {query:?} in 7ms\n", shown.len()));
-    out
+/// The labelled view's text for `rows`: one `<role> <path>:<line>: <text>`
+/// line per matching line.
+fn text_labelled(rows: &[Row]) -> String {
+    rows.iter()
+        .map(|r| format!("{} {}:{}: {}\n", r.role(), r.path, r.line, r.content))
+        .collect()
+}
+
+/// The word view's text for `rows`: per file a `<path>  <word counts>` header,
+/// its `<path>:<line>: <text>` lines and an empty line.
+fn text_words(rows: &[Row], words: &str) -> String {
+    by_file(rows)
+        .into_iter()
+        .map(|(path, lines)| {
+            let body: String = lines
+                .iter()
+                .map(|r| format!("{path}:{}: {}\n", r.line, r.content))
+                .collect();
+            format!("{path}  {words}\n{body}\n")
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -301,7 +345,6 @@ struct Harness {
     stub_dir: tempfile::TempDir,
     out_dir: tempfile::TempDir,
     commit: String,
-    universe: Universe,
     text: TextUniverse,
 }
 
@@ -324,7 +367,6 @@ impl Harness {
             source.root().to_str().unwrap(),
             root.to_str().unwrap(),
         ]);
-        let universe = Universe::compute(&root, &GitIsolation::new(source.home())).unwrap();
         let text = text_universe(&root, &GitIsolation::new(source.home())).unwrap();
 
         let h = Harness {
@@ -334,7 +376,6 @@ impl Harness {
             stub_dir: tempfile::tempdir().unwrap(),
             out_dir: tempfile::tempdir().unwrap(),
             commit,
-            universe,
             text,
         };
         fs::write(
@@ -348,23 +389,8 @@ impl Harness {
         h.write_golden(DEF_LINE);
         h.write_ledger("");
         h.install_stub();
-        h.write_empty_pattern_calls();
         h.write_correct_responses();
         h
-    }
-
-    /// Serve an empty `--ast <pattern>` full list for every catalog pattern:
-    /// a corpus with an `[[ast]]` entry calls skim for each of them. Tests
-    /// override the patterns they are about.
-    fn write_empty_pattern_calls(&self) {
-        for pattern in called_patterns(catalog()) {
-            self.write_response(
-                "",
-                &["--ast", pattern],
-                &format!("l{FULL_LIMIT}_o0.json"),
-                &ast_page_json(&[], false),
-            );
-        }
     }
 
     fn write_golden(&self, def_line: u32) {
@@ -380,43 +406,6 @@ impl Harness {
             format!("{}{extra}", golden_toml(&self.commit, def_line)),
         )
         .unwrap();
-    }
-
-    /// Add the `[[ast]]` entry and serve its pattern's `--ast` list: the
-    /// structural oracle's file anchored on `line`, plus a README row (a
-    /// language the oracle cannot score). `coverage` is the envelope's
-    /// `ast_coverage` (`None`: omitted, i.e. clean).
-    fn enable_structural(&self, line: Option<u32>, coverage: Option<Value>) {
-        self.write_golden_with(DEF_LINE, AST_ENTRY);
-        let rows: Vec<(Row, f64)> = line
-            .map(|line| Row {
-                path: "src/loops.rs".to_string(),
-                line,
-                content: "for b in 0..2 {".to_string(),
-            })
-            .into_iter()
-            .chain(std::iter::once(Row {
-                path: "README.md".to_string(),
-                line: 1,
-                content: "# Fixture".to_string(),
-            }))
-            .zip([2.0, 1.0])
-            .collect();
-        self.write_structural(&rows, coverage);
-    }
-
-    /// Serve `rows` (and `coverage`) as `--ast rust-nested-loop`'s full list.
-    fn write_structural(&self, rows: &[(Row, f64)], coverage: Option<Value>) {
-        let mut envelope = ast_envelope(rows, false);
-        if let Some(coverage) = coverage {
-            envelope["ast_coverage"] = coverage;
-        }
-        self.write_response(
-            "",
-            &["--ast", AST_PATTERN],
-            &format!("l{FULL_LIMIT}_o0.json"),
-            &envelope.to_string(),
-        );
     }
 
     /// The ledger: `body`.
@@ -445,30 +434,21 @@ impl Harness {
         let path = self.stub_path();
         fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        self.write_stats(Some("ready"));
-    }
-
-    /// The stub's `--stats --json` answer: the fixture universe, plus
-    /// `temporal_state` (`None` leaves the key out).
-    fn write_stats(&self, temporal_state: Option<&str>) {
-        let mut stats = json!({
-            "file_count": self.universe.len(),
-            "skipped_by_reason": self.universe.persisted_skipped_by_reason(),
-        });
-        if let Some(state) = temporal_state {
-            stats["temporal_state"] = json!(state);
-        }
-        fs::write(self.stub_dir.path().join("stats.json"), stats.to_string()).unwrap();
     }
 
     // --- canned responses ---------------------------------------------------
 
-    /// The oracle's ground truth for an `and` query, as rows anchored on the
-    /// first line holding the query's first token. `first` moves one path to
-    /// rank 1.
+    /// The files the stub says it searched.
+    fn searched(&self) -> u64 {
+        u64::try_from(self.text.len()).unwrap()
+    }
+
+    /// The oracle's ground truth for `query` over the text universe, as one
+    /// row per file anchored on the first line holding the query's first
+    /// word. `first` moves one path to rank 1.
     fn correct_rows(&self, query: &str, first: Option<&str>) -> Vec<Row> {
-        let q = LexicalQuery::new(query, MatchMode::And, None).unwrap();
-        let mut paths = ground_truth(self.universe.files(), &q);
+        let q = LexicalQuery::new(query, None).unwrap();
+        let mut paths = ground_truth(self.text.files(), &q);
         if let Some(first) = first {
             let at = paths.iter().position(|p| p == first).unwrap();
             let p = paths.remove(at);
@@ -478,7 +458,7 @@ impl Harness {
         paths
             .into_iter()
             .map(|path| {
-                let text = self.universe.text(&path).unwrap();
+                let text = self.text.text(&path).unwrap();
                 let (idx, line) = text
                     .split('\n')
                     .enumerate()
@@ -488,6 +468,7 @@ impl Harness {
                     path,
                     line: u32::try_from(idx + 1).unwrap(),
                     content: line.to_string(),
+                    role: None,
                 }
             })
             .collect()
@@ -507,30 +488,46 @@ impl Harness {
     }
 
     /// Make the stub exit with `code` after it prints the canned answer of
-    /// `query` (the current binary exits 0 on a query with no hit).
+    /// `query` (a query with no hit exits 1).
     fn write_exit_code(&self, query: &str, flags: &[&str], code: i32) {
         self.write_response(query, flags, "exit_code", &code.to_string());
     }
 
-    fn write_full(&self, query: &str, flags: &[&str], rows: &[Row]) {
-        let body = page_json(query, rows, 0, rows.len(), false);
-        self.write_response(query, flags, &format!("l{FULL_LIMIT}_o0.json"), &body);
+    /// Serve `body` as the full list of `query`.
+    fn write_full_json(&self, query: &str, flags: &[&str], body: &Value) {
+        self.write_response(
+            query,
+            flags,
+            &format!("l{FULL_LIMIT}_o0.json"),
+            &body.to_string(),
+        );
     }
 
-    /// Honest pages `--offset 0, limit, 2·limit, …` of `rows`.
+    fn write_full(&self, query: &str, flags: &[&str], rows: &[Row]) {
+        let body = envelope(query, rows, 0, by_file(rows).len(), false, self.searched());
+        self.write_full_json(query, flags, &body);
+    }
+
+    /// Honest pages `--offset 0, limit, 2·limit, …` of `rows` (one row per file).
     fn write_pages(&self, query: &str, flags: &[&str], rows: &[Row], limit: u32) {
         let limit = limit as usize;
         let mut offset = 0;
         loop {
             let end = (offset + limit).min(rows.len());
-            let body = page_json(
+            let body = envelope(
                 query,
                 &rows[offset..end],
                 offset,
                 rows.len(),
                 end < rows.len(),
+                self.searched(),
             );
-            self.write_response(query, flags, &format!("l{limit}_o{offset}.json"), &body);
+            self.write_response(
+                query,
+                flags,
+                &format!("l{limit}_o{offset}.json"),
+                &body.to_string(),
+            );
             offset += limit;
             if offset >= rows.len() {
                 break;
@@ -540,49 +537,31 @@ impl Harness {
 
     fn write_limited(&self, query: &str, flags: &[&str], rows: &[Row], limit: u32) {
         let n = (limit as usize).min(rows.len());
-        let body = page_json(query, &rows[..n], 0, rows.len(), n < rows.len());
-        self.write_response(query, flags, &format!("l{limit}_o0.json"), &body);
-    }
-
-    fn write_text(&self, query: &str, flags: &[&str], rows: &[Row]) {
-        self.write_response(query, flags, "text.txt", &text_output(query, rows));
-    }
-
-    /// Rows for the standalone `--ast` entry, scored `scores` in rank order
-    /// (at most two rows). With no oracle, any structural match set will do.
-    fn ast_rows(&self, scores: &[f64]) -> Vec<(Row, f64)> {
-        let rows = self.correct_rows(IDENT.1, Some(DEF_PATH));
-        assert!(
-            scores.len() <= rows.len(),
-            "the fixture has {} rows",
-            rows.len()
+        let body = envelope(
+            query,
+            &rows[..n],
+            0,
+            rows.len(),
+            n < rows.len(),
+            self.searched(),
         );
-        rows.into_iter().zip(scores.iter().copied()).collect()
-    }
-
-    /// Serve the standalone `--ast` entry: `scored` as its full list, and the
-    /// full list's first rows as its `--limit` page.
-    fn write_ast(&self, scored: &[(Row, f64)]) {
-        let (_, q, f) = AST;
         self.write_response(
-            q,
-            f,
-            &format!("l{FULL_LIMIT}_o0.json"),
-            &ast_page_json(scored, false),
-        );
-        let n = (PREFIX_LIMIT as usize).min(scored.len());
-        self.write_response(
-            q,
-            f,
-            &format!("l{PREFIX_LIMIT}_o0.json"),
-            &ast_page_json(&scored[..n], n < scored.len()),
+            query,
+            flags,
+            &format!("l{limit}_o0.json"),
+            &body.to_string(),
         );
     }
 
+    fn write_text(&self, query: &str, flags: &[&str], text: &str) {
+        self.write_response(query, flags, "text.txt", text);
+    }
+
+    /// Serve the ident entry: its full list and its labelled text.
     fn write_ident(&self, rows: &[Row]) {
         let (_, q, f) = IDENT;
         self.write_full(q, f, rows);
-        self.write_text(q, f, rows);
+        self.write_text(q, f, &text_labelled(rows));
     }
 
     fn write_correct_responses(&self) {
@@ -591,10 +570,22 @@ impl Harness {
         let (_, q, f) = CONCEPT;
         let rows = self.correct_rows(q, None);
         self.write_full(q, f, &rows);
-        self.write_text(q, f, &rows);
+        self.write_text(q, f, &text_words(&rows, "build 1/2 lock 1/2"));
 
         let (_, q, f) = LEXICAL;
         self.write_full(q, f, &self.correct_rows(q, None));
+
+        let (_, q, f) = LEXICAL_RUST;
+        let rows: Vec<Row> = self
+            .correct_rows(q, None)
+            .into_iter()
+            .filter(|r| r.path.ends_with(".rs"))
+            .collect();
+        self.write_full(q, f, &rows);
+
+        // A query with no hit prints a normal envelope and exits 1.
+        self.write_full(ABSENT, &[], &[]);
+        self.write_exit_code(ABSENT, &[], 1);
 
         let (_, q, f) = PAGINATION;
         let rows = self.correct_rows(q, None);
@@ -605,12 +596,10 @@ impl Harness {
         let rows = self.correct_rows(q, None);
         self.write_full(q, f, &rows);
         self.write_limited(q, f, &rows, PREFIX_LIMIT);
-
-        self.write_ast(&self.ast_rows(&[2.0, 1.0]));
     }
 
-    /// Serve the lexical entry's full list without one ground-truth file
-    /// (and an empty `degraded[]`): a silent false negative.
+    /// Serve the lexical entry's full list without one ground-truth file: a
+    /// silent false negative.
     fn drop_lexical_ground_truth_file(&self) -> String {
         let (_, q, f) = LEXICAL;
         let mut rows = self.correct_rows(q, None);
@@ -622,6 +611,15 @@ impl Harness {
 
     fn calls(&self) -> Vec<String> {
         fs::read_to_string(self.stub_dir.path().join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The argument list of every call the stub received.
+    fn argv(&self) -> Vec<String> {
+        fs::read_to_string(self.stub_dir.path().join("argv.log"))
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
@@ -681,23 +679,6 @@ impl Harness {
             "golden-gen",
             "--corpus",
             corpus,
-            "--corpus-dir",
-            self.corpus_dir.path().to_str().unwrap(),
-            "--data-dir",
-            self.data_dir.path().to_str().unwrap(),
-        ])
-    }
-
-    /// `golden-gen --ast` for the fixture corpus, calling the stub.
-    fn golden_gen_ast(&self) -> Output {
-        let stub = self.stub_path();
-        self.scoreboard(&[
-            "golden-gen",
-            "--corpus",
-            "fixture",
-            "--ast",
-            "--skim-bin",
-            stub.to_str().unwrap(),
             "--corpus-dir",
             self.corpus_dir.path().to_str().unwrap(),
             "--data-dir",
@@ -770,6 +751,19 @@ fn outcome(report: &Value, id: &str, check: &str) -> Option<String> {
         .map(|c| c["outcome"].as_str().unwrap().to_string())
 }
 
+/// The failure detail the report holds for `(id, check)`.
+fn detail_of(report: &Value, id: &str, check: &str) -> String {
+    report["corpora"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["checks"].as_array().unwrap().iter())
+        .find(|c| c["id"] == id && c["check"] == check)
+        .and_then(|c| c["detail"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -786,7 +780,7 @@ fn a_correct_skim_passes_run_bless_and_check() {
         "lexical.recall",
         "lexical.precision",
         "lexical.silent_fn",
-        "lexical.verify_mode",
+        "lexical.recall_tracked",
         "order.score_monotone",
     ] {
         assert_eq!(
@@ -795,11 +789,6 @@ fn a_correct_skim_passes_run_bless_and_check() {
             "{check}"
         );
     }
-    // The tracked-text recall agrees with the indexed one on this fixture.
-    assert_eq!(
-        outcome(&report, "fixture-X01", "lexical.recall_tracked").as_deref(),
-        Some("pass")
-    );
     // The first definition site is the frozen definition line.
     assert_eq!(
         outcome(&report, "fixture-L01", "ident.def_first").as_deref(),
@@ -809,30 +798,25 @@ fn a_correct_skim_passes_run_bless_and_check() {
         outcome(&report, "fixture-G001", "pagination.complete").as_deref(),
         Some("pass")
     );
+    // Every prefix list is checked for ordering by score too.
     assert_eq!(
         outcome(&report, "fixture-F001", "order.prefix_consistent").as_deref(),
         Some("pass")
     );
-    // `--hot` reorders the list: exempt from score monotonicity.
     assert_eq!(
-        outcome(&report, "fixture-F001", "order.score_monotone"),
-        None
+        outcome(&report, "fixture-F001", "order.score_monotone").as_deref(),
+        Some("pass")
     );
+    // A zero-hit query exits 1 with a normal envelope: that is a page.
+    assert_eq!(
+        outcome(&report, "fixture-X03", "lexical.silent_fn").as_deref(),
+        Some("pass")
+    );
+    // The accounting the output states agrees with the oracle's.
     assert_eq!(report["corpora"][0]["universe"]["delta"], 0);
-    // No [[ast]] entry: no pattern call and no oracle pass to time.
-    let latency = report["latency"]["corpora"]["fixture"].as_object().unwrap();
-    assert!(
-        !latency.contains_key("pattern_calls_wall_ms"),
-        "{latency:?}"
-    );
-    assert!(
-        !latency.contains_key("structural_oracle_wall_ms"),
-        "{latency:?}"
-    );
-    assert!(
-        !stderr(&run).contains("structural oracle"),
-        "{}",
-        stderr(&run)
+    assert_eq!(
+        report["corpora"][0]["ratchet"]["coverage.tracked_text"],
+        1.0
     );
 
     let bless = h.bless(None);
@@ -843,7 +827,22 @@ fn a_correct_skim_passes_run_bless_and_check() {
 }
 
 #[test]
-fn the_rg_word_rows_are_info_and_rows_the_output_cannot_state_are_absent() {
+fn the_scoreboard_only_runs_searches_and_never_builds_or_asks_for_stats() {
+    let h = Harness::new();
+    assert_exit(&h.run(), 0);
+
+    let argv = h.argv();
+    assert!(!argv.is_empty());
+    for line in &argv {
+        assert!(line.starts_with("search "), "{line}");
+        for retired in ["--build", "--rebuild", "--update", "--stats"] {
+            assert!(!line.contains(retired), "{line}");
+        }
+    }
+}
+
+#[test]
+fn the_rg_word_rows_are_info_and_the_cost_rows_follow_the_cost_the_output_states() {
     let h = Harness::new();
     assert_exit(&h.run(), 0);
     let report = h.report();
@@ -858,27 +857,72 @@ fn the_rg_word_rows_are_info_and_rows_the_output_cannot_state_are_absent() {
         );
     }
 
-    // The stub, like the current binary, states no cost, labels no call and
-    // names no role the role oracle could judge: those rows have no value,
-    // and the `rg -nw` rows are not RATCHET values.
+    // The stub states the cost counters of every call: their medians are
+    // RATCHET values, and no `rg -nw` row is.
     for ratchet in [&corpus["ratchet"], &report["aggregate"]["ratchet"]] {
+        assert_eq!(ratchet["cost.files_parsed_median"], 2.0);
+        assert_eq!(ratchet["cost.bytes_parsed_median"], 400.0);
+        assert_eq!(ratchet["cost.bytes_read_median"], 1000.0);
         let names: Vec<&String> = ratchet.as_object().unwrap().keys().collect();
-        for prefix in ["cost.", "roles.", "refs.", "bytes.rgw"] {
-            assert!(
-                names.iter().all(|n| !n.starts_with(prefix)),
-                "{prefix}: {names:?}"
-            );
-        }
+        assert!(
+            names.iter().all(|n| !n.starts_with("bytes.rgw")),
+            "{names:?}"
+        );
     }
 
-    // None of it reaches the baseline, and the gate stays green.
+    // The cost reaches the baseline, the `rg -nw` rows do not, and the gate
+    // stays green.
     assert_exit(&h.bless(None), 0);
     let baseline = fs::read_to_string(h.baseline_path()).unwrap();
-    for name in ["rgw", "cost.", "roles.", "refs."] {
-        assert!(!baseline.contains(name), "{name} is in the baseline");
-    }
+    assert!(baseline.contains("cost.bytes_parsed_median"));
+    assert!(
+        !baseline.contains("rgw"),
+        "an rg -nw row is in the baseline"
+    );
     assert_exit(&h.check(), 0);
     assert_eq!(h.report()["gate"]["status"], "pass");
+}
+
+#[test]
+fn the_text_bytes_end_at_the_definition_line_and_at_the_end_of_the_first_relevant_block() {
+    let h = Harness::new();
+    // The definition line is the fourth line; a decoy line names a path that
+    // only starts like the definition's path, and a call line follows.
+    let ident = [
+        "call src/other.rs:2: if check_staleness() {}\n",
+        "ref src/other.rs:1: fn refresh() {\n",
+        "def src/staleness.rs.bak:2: decoy\n",
+        "def src/staleness.rs:2: pub fn check_staleness() -> bool {\n",
+        "call src/other.rs:9: later\n",
+    ];
+    let (_, q, f) = IDENT;
+    h.write_text(q, f, &ident.concat());
+    // The first relevant file is README.md. Its block has two lines and ends
+    // at a line of another path, though that path starts like README.md.
+    let concept = [
+        "README.md  build 1/2 lock 1/2\n",
+        "README.md:3: The build lock and the elision marker.\n",
+        "README.md:5: more\n",
+        "README.md.orig:1: not a line of README.md\n",
+        "src/lock.rs  build 1/2 lock 1/2\n",
+        "src/lock.rs:1: /// Holds the build lock.\n",
+    ];
+    let (_, q, f) = CONCEPT;
+    h.write_text(q, f, &concept.concat());
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    let corpus = &report["corpora"][0];
+    let len = |lines: &[&str]| lines.iter().map(|l| l.len()).sum::<usize>() as f64;
+    assert_eq!(
+        corpus["ratchet"]["bytes.first_correct_median"],
+        len(&ident[..4])
+    );
+    assert_eq!(
+        corpus["info"]["reference"]["bytes.first_relevant_median"],
+        len(&concept[..3])
+    );
 }
 
 #[test]
@@ -911,6 +955,73 @@ fn a_dropped_ground_truth_file_is_a_silent_false_negative_failure() {
 }
 
 #[test]
+fn a_file_that_holds_only_some_of_the_words_is_not_a_row() {
+    let h = Harness::new();
+    h.bless_current();
+
+    // The word view lists a file with one of the two words after the files
+    // with both. It is not in the AND set: no row, so no precision failure.
+    let (_, q, f) = CONCEPT;
+    let rows = h.correct_rows(q, None);
+    let mut body = envelope(q, &rows, 0, rows.len(), false, h.searched());
+    body["files"].as_array_mut().unwrap().push(json!({
+        "path": "src/staleness.rs",
+        "rank": rows.len() + 1,
+        "score": 0.5,
+        "words_matched": 1,
+        "words_total": 2,
+        "line_count": 1,
+        "roles": {},
+        "occurrences": [{"line": 1, "role": "comment", "text": "// staleness checks"}],
+        "occurrences_elided": 0,
+    }));
+    h.write_full_json(q, f, &body);
+
+    assert_exit(&h.check(), 0);
+    let report = h.report();
+    for check in [
+        "lexical.precision",
+        "lexical.recall",
+        "results.unique_paths",
+    ] {
+        assert_eq!(
+            outcome(&report, "fixture-C01", check).as_deref(),
+            Some("pass"),
+            "{check}"
+        );
+    }
+}
+
+#[test]
+fn a_type_filter_is_passed_as_dash_t_and_scored_by_the_oracles_type_table() {
+    let h = Harness::new();
+    assert_exit(&h.run(), 0);
+    assert!(
+        h.argv()
+            .iter()
+            .any(|a| a.contains("-t rust") && a.ends_with("-- marker")),
+        "{:?}",
+        h.argv()
+    );
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-X02", "lexical.precision").as_deref(),
+        Some("pass")
+    );
+
+    // A skim that ignores the type filter lists README.md too.
+    let (_, q, f) = LEXICAL_RUST;
+    h.write_full(q, f, &h.correct_rows(q, None));
+    assert_exit(&h.run(), 0);
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-X02", "lexical.precision").as_deref(),
+        Some("fail")
+    );
+    assert!(detail_of(&report, "fixture-X02", "lexical.precision").contains("README.md"));
+}
+
+#[test]
 fn an_empty_page_claiming_has_more_fails_honesty_and_the_sweep_stops_at_max_pages() {
     let h = Harness::new();
     h.bless_current();
@@ -925,13 +1036,13 @@ fn an_empty_page_claiming_has_more_fails_honesty_and_the_sweep_stops_at_max_page
         q,
         f,
         &format!("l{PAGE_LIMIT}_o{last}.json"),
-        &page_json(q, &rows[last..], last, rows.len(), true),
+        &envelope(q, &rows[last..], last, rows.len(), true, h.searched()).to_string(),
     );
     h.write_response(
         q,
         f,
         &format!("l{PAGE_LIMIT}_default.json"),
-        r#"{"total":0,"has_more":true,"results":[]}"#,
+        &envelope(q, &[], 0, rows.len(), true, h.searched()).to_string(),
     );
     let before = h.calls().len();
 
@@ -1061,6 +1172,30 @@ fn a_ratchet_regression_needs_an_accepted_reason_to_bless() {
         "fixture: def file demoted on purpose"
     );
     assert_exit(&h.check(), 0);
+}
+
+#[test]
+fn a_text_view_that_grows_is_a_ratchet_regression_in_bytes() {
+    let h = Harness::new();
+    h.bless_current();
+
+    // The same answer in a text view twice as long.
+    let (_, q, f) = IDENT;
+    let rows = h.correct_rows(q, Some(DEF_PATH));
+    let text = text_labelled(&rows);
+    h.write_text(q, f, &format!("{text}{text}"));
+    let check = h.check();
+
+    assert_exit(&check, 1);
+    let failures = gate_failures(&h.report());
+    assert!(
+        failures
+            .iter()
+            .any(|(kind, check, _, message)| kind == "ratchet"
+                && check == "bytes.text_median"
+                && message.contains("regressed")),
+        "{failures:#?}"
+    );
 }
 
 /// Ledgering a check that the baseline blessed as `pass` downgrades it to
@@ -1207,140 +1342,46 @@ fn unparsable_skim_output_is_a_harness_error() {
     assert!(err.contains("JSON"), "{err}");
 }
 
-/// skim refuses its temporal data (here: a `temporal.db` written by a newer
-/// skim) and says so in `--stats`, so `--hot` is not applied. A ledgered
-/// `--hot` check then "passes" on the fallback order; the gate must not call
-/// that an XPASS ("promote: remove the ledger entry"), which would bake the
-/// broken temporal layer into the ledger and the baseline.
 #[test]
-fn unusable_temporal_data_is_a_harness_error_not_an_xpass() {
+fn an_error_envelope_from_skim_is_a_harness_error_naming_the_message() {
     let h = Harness::new();
-    h.bless_current();
-    h.write_ledger(
-        r##"[[xfail]]
-issue = "#9002"
-check = "order.prefix_consistent"
-ids = ["fixture-F001"]
-note = "fixture"
-"##,
+    let (_, q, f) = LEXICAL;
+    h.write_full_json(
+        q,
+        f,
+        &json!({"error": "pattern rejected: nothing to search"}),
     );
-    h.write_stats(Some("newer-schema"));
+    h.write_exit_code(q, f, 2);
 
     let check = h.check();
 
     assert_exit(&check, 2);
     let err = stderr(&check);
-    assert!(err.contains("newer-schema"), "{err}");
-    assert!(err.contains("fixture-F001"), "{err}");
-    assert!(!err.contains("XPASS"), "{err}");
+    assert!(err.contains("fixture-X01"), "{err}");
+    assert!(err.contains("pattern rejected: nothing to search"), "{err}");
     assert!(
         !h.report_path().exists(),
         "a harness error writes no report"
     );
 }
 
-/// A `--hot` query whose JSON discloses that the temporal ranking was not
-/// applied (`degraded[]`) cannot be scored as a `--hot` result.
 #[test]
-fn a_temporal_ranking_skim_reports_as_degraded_is_a_harness_error() {
+fn an_envelope_without_searched_files_is_a_harness_error() {
     let h = Harness::new();
-    let (_, q, f) = PREFIX;
+    let (_, q, f) = LEXICAL;
     let rows = h.correct_rows(q, None);
-    let mut body: Value = serde_json::from_str(&page_json(q, &rows, 0, rows.len(), false)).unwrap();
-    body["degraded"] = json!([{
-        "subsystem": "temporal",
-        "reason": "missing",
-        "requested": "hot",
-        "applied": "lexical",
-        "message": "temporal.db is missing; --hot not applied",
-        "remediation": "skim search --rebuild",
-    }]);
-    h.write_response(q, f, &format!("l{FULL_LIMIT}_o0.json"), &body.to_string());
+    let mut body = envelope(q, &rows, 0, rows.len(), false, h.searched());
+    body.as_object_mut().unwrap().remove("searched_files");
+    h.write_full_json(q, f, &body);
 
     let check = h.check();
 
     assert_exit(&check, 2);
-    let err = stderr(&check);
-    assert!(err.contains("fixture-F001"), "{err}");
-    assert!(err.contains("degraded"), "{err}");
     assert!(
-        !h.report_path().exists(),
-        "a harness error writes no report"
+        stderr(&check).contains("searched_files"),
+        "{}",
+        stderr(&check)
     );
-}
-
-/// A standalone `--ast` entry has no oracle, so an empty full list satisfies
-/// every check that runs on it. If skim's structural layer broke and returned
-/// nothing, a ledgered `order.score_monotone` (#547 on the real corpora) would
-/// "XPASS" and ask for a promotion that bakes the breakage into the ledger and
-/// the baseline. It is a harness error naming the corpus and the entry.
-#[test]
-fn an_empty_list_without_an_oracle_is_a_harness_error_not_an_xpass() {
-    let h = Harness::new();
-    // Scores rise down the list: the #547 shape, ledgered.
-    h.write_ast(&h.ast_rows(&[1.0, 2.0]));
-    h.write_ledger(
-        r##"[[xfail]]
-issue = "#9003"
-check = "order.score_monotone"
-ids = ["fixture-F002"]
-note = "fixture"
-"##,
-    );
-    h.bless_current();
-    assert_eq!(
-        outcome(&h.report(), "fixture-F002", "order.score_monotone").as_deref(),
-        Some("xfail")
-    );
-    h.write_ast(&[]);
-
-    let check = h.check();
-
-    assert_exit(&check, 2);
-    let err = stderr(&check);
-    assert!(err.contains("corpus fixture"), "{err}");
-    assert!(err.contains("fixture-F002"), "{err}");
-    assert!(err.contains("empty"), "{err}");
-    assert!(!err.contains("XPASS"), "{err}");
-    assert!(
-        !h.report_path().exists(),
-        "a harness error writes no report"
-    );
-}
-
-/// With no oracle to judge a `--ast` list, its row count is a RATCHET value:
-/// a silent shrink fails the gate, and blessing it needs a reason.
-#[test]
-fn a_shrinking_list_without_an_oracle_is_a_ratchet_regression() {
-    let h = Harness::new();
-    h.bless_current();
-    let metric = "oracle_less.full_rows.fixture-F002";
-    assert_eq!(h.report()["corpora"][0]["ratchet"][metric], 2.0);
-
-    h.write_ast(&h.ast_rows(&[2.0]));
-    let check = h.check();
-
-    assert_exit(&check, 1);
-    let failures = gate_failures(&h.report());
-    assert!(
-        failures
-            .iter()
-            .any(|(kind, check, _, message)| kind == "ratchet"
-                && check == metric
-                && message.contains("regressed")),
-        "{failures:#?}"
-    );
-    let refused = h.bless(None);
-    assert_exit(&refused, 1);
-    let err = stderr(&refused);
-    assert!(err.contains(metric), "{err}");
-    assert!(err.contains("--accept-regression"), "{err}");
-
-    assert_exit(
-        &h.bless(Some("fixture: one structural match removed on purpose")),
-        0,
-    );
-    assert_exit(&h.check(), 0);
 }
 
 /// A file listed twice is invisible to the set-based checks (recall,
@@ -1351,10 +1392,14 @@ fn a_path_listed_twice_in_a_full_list_fails_unique_paths() {
     let h = Harness::new();
     h.bless_current();
 
-    let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
-    rows.insert(1, rows[0].clone());
+    // The envelope groups the lines of one path into one file entry, so a
+    // path listed twice is two file entries.
     let (_, q, f) = IDENT;
-    h.write_full(q, f, &rows);
+    let rows = h.correct_rows(q, Some(DEF_PATH));
+    let mut body = envelope(q, &rows, 0, rows.len(), false, h.searched());
+    let first = body["files"][0].clone();
+    body["files"].as_array_mut().unwrap().insert(1, first);
+    h.write_full_json(q, f, &body);
     let check = h.check();
 
     assert_exit(&check, 1);
@@ -1378,30 +1423,20 @@ fn a_path_listed_twice_in_a_full_list_fails_unique_paths() {
     );
 }
 
-/// Every entry kind — ident, concept, lexical, pagination, a `--hot` prefix
-/// and a standalone `--ast` prefix — is checked for a repeated path.
+/// Every entry kind — ident, concept, lexical, pagination and prefix — is
+/// checked for a repeated path.
 #[test]
 fn a_repeated_last_row_fails_unique_paths_on_every_entry_kind() {
     let h = Harness::new();
     h.bless_current();
 
-    for (_, q, f) in [CONCEPT, LEXICAL, PAGINATION, PREFIX] {
-        let mut rows = h.correct_rows(q, None);
-        rows.push(rows.last().unwrap().clone());
-        h.write_full(q, f, &rows);
+    for (_, q, f) in [IDENT, CONCEPT, LEXICAL, PAGINATION, PREFIX] {
+        let rows = h.correct_rows(q, None);
+        let mut body = envelope(q, &rows, 0, rows.len(), false, h.searched());
+        let last = body["files"].as_array().unwrap().last().unwrap().clone();
+        body["files"].as_array_mut().unwrap().push(last);
+        h.write_full_json(q, f, &body);
     }
-    let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
-    rows.push(rows.last().unwrap().clone());
-    h.write_full(IDENT.1, IDENT.2, &rows);
-    let mut scored = h.ast_rows(&[2.0, 1.0]);
-    scored.push(scored.last().unwrap().clone());
-    let (_, q, f) = AST;
-    h.write_response(
-        q,
-        f,
-        &format!("l{FULL_LIMIT}_o0.json"),
-        &ast_page_json(&scored, false),
-    );
     let check = h.check();
 
     assert_exit(&check, 1);
@@ -1411,7 +1446,7 @@ fn a_repeated_last_row_fails_unique_paths_on_every_entry_kind() {
         .filter(|(kind, check, _, _)| kind == "unledgered" && check == "results.unique_paths")
         .map(|(_, _, ids, _)| ids)
         .collect();
-    let every_id: Vec<String> = [IDENT, CONCEPT, LEXICAL, PAGINATION, PREFIX, AST]
+    let every_id: Vec<String> = [IDENT, CONCEPT, LEXICAL, PAGINATION, PREFIX]
         .iter()
         .map(|(id, _, _)| id.to_string())
         .collect::<std::collections::BTreeSet<_>>()
@@ -1487,10 +1522,8 @@ fn golden_gen_prints_integrity_clean_ident_candidates() {
         &IntegrityContext {
             corpus: "fixture",
             commit: &h.commit,
-            universe: Some(&h.universe),
-            text: Some(&h.text),
+            universe: Some(&h.text),
             ledger: &[],
-            catalog: catalog(),
         },
     );
     assert!(violations.is_empty(), "{violations:?}");
@@ -1505,108 +1538,8 @@ fn golden_gen_names_the_known_corpora_for_an_unknown_one() {
 }
 
 #[test]
-fn golden_gen_ast_calls_every_catalog_pattern_once_and_prints_parsable_entries() {
-    let h = Harness::new();
-    // skim finds the nested loop the oracle matches; deep-nesting (no oracle
-    // query) returns a row whose path would inject TOML and a terminal escape
-    // if it reached the unscored-rows comment raw.
-    h.write_structural(
-        &[(
-            Row {
-                path: "src/loops.rs".to_string(),
-                line: 3,
-                content: "for b in 0..2 {".to_string(),
-            },
-            1.0,
-        )],
-        None,
-    );
-    let hostile = "src/evil\n[[ast]]\nid = \"fixture-injected\"\x1b[2J.rs";
-    h.write_response(
-        "",
-        &["--ast", "deep-nesting"],
-        &format!("l{FULL_LIMIT}_o0.json"),
-        &ast_page_json(
-            &[(
-                Row {
-                    path: hostile.to_string(),
-                    line: 1,
-                    content: "x".to_string(),
-                },
-                1.0,
-            )],
-            false,
-        ),
-    );
-
-    let out = h.golden_gen_ast();
-    assert_exit(&out, 0);
-
-    // One build, then every catalog pattern called exactly once.
-    let calls = h.calls();
-    let patterns = called_patterns(catalog());
-    assert_eq!(calls.len(), 1 + patterns.len(), "{calls:?}");
-    assert_eq!(calls[0], "build", "{calls:?}");
-    for pattern in &patterns {
-        let logged = format!(
-            "{} json=1 limit={FULL_LIMIT} offset=0",
-            key("", &["--ast", pattern])
-        );
-        assert_eq!(
-            calls.iter().filter(|c| **c == logged).count(),
-            1,
-            "--ast {pattern}: {calls:?}"
-        );
-    }
-
-    // stdout is a proposal that parses under a golden header: the entry the
-    // oracle and skim agree on, and nothing the hostile path injected.
-    let proposal = String::from_utf8(out.stdout).unwrap();
-    assert!(!proposal.contains('\x1b'), "{proposal:?}");
-    assert!(
-        proposal.contains(
-            r#"#   deep-nesting 1: src/evil\n[[ast]]\nid = "fixture-injected"\u{1b}[2J.rs:1"#
-        ),
-        "{proposal}"
-    );
-    let golden = parse_golden(&format!(
-        "corpus = \"fixture\"\ncommit = \"{}\"\n{proposal}",
-        h.commit
-    ))
-    .unwrap();
-    let entry = golden
-        .asts
-        .iter()
-        .find(|e| e.id == AST_ID)
-        .unwrap_or_else(|| panic!("no {AST_ID} entry in:\n{proposal}"));
-    assert_eq!(entry.pattern, AST_PATTERN);
-    assert!(
-        !entry.expect_oracle_empty,
-        "the oracle matches src/loops.rs"
-    );
-    assert!(
-        golden.asts.iter().all(|e| e.id.starts_with("fixture-ast-")),
-        "{proposal}"
-    );
-    let violations = check_integrity(
-        &golden,
-        &IntegrityContext {
-            corpus: "fixture",
-            commit: &h.commit,
-            universe: Some(&h.universe),
-            text: Some(&h.text),
-            ledger: &[],
-            catalog: catalog(),
-        },
-    );
-    assert!(violations.is_empty(), "{violations:?}");
-}
-
-#[test]
 fn two_consecutive_runs_write_identical_reports_apart_from_latency() {
     let h = Harness::new();
-    // The structural section (the oracle runs over files in parallel) too.
-    h.enable_structural(Some(3), None);
 
     assert_exit(&h.run(), 0);
     let first = fs::read_to_string(h.report_path()).unwrap();
@@ -1626,587 +1559,8 @@ fn two_consecutive_runs_write_identical_reports_apart_from_latency() {
 }
 
 // ============================================================================
-// Structural oracle (#541)
-// ============================================================================
-
-/// The ratchet value `metric` of the (only) corpus.
-fn ratchet(report: &Value, metric: &str) -> Value {
-    report["corpora"][0]["ratchet"][metric].clone()
-}
-
-#[test]
-fn a_structural_entry_is_scored_against_the_oracle_then_blessed_and_checked() {
-    let h = Harness::new();
-    h.enable_structural(Some(3), None);
-
-    let run = h.run();
-    assert_exit(&run, 0);
-    let report = h.report();
-    for check in [
-        "structural.recall",
-        "structural.coverage",
-        "results.unique_paths",
-    ] {
-        assert_eq!(
-            outcome(&report, AST_ID, check).as_deref(),
-            Some("pass"),
-            "{check}"
-        );
-    }
-    // Class "ratchet": precision is a RATCHET value, not a HARD check; and the
-    // path-ordered standalone list is not judged by score.
-    for check in [
-        "structural.precision",
-        "order.score_monotone",
-        "lexical.recall",
-    ] {
-        assert_eq!(outcome(&report, AST_ID, check), None, "{check}");
-    }
-    assert_eq!(
-        ratchet(&report, &format!("structural.precision.{AST_ID}")),
-        1.0
-    );
-    assert_eq!(
-        ratchet(&report, &format!("structural.line_on_match.{AST_ID}")),
-        1.0
-    );
-    assert_eq!(
-        ratchet(&report, &format!("structural.intent_recall.{AST_ID}")),
-        1.0
-    );
-    assert_eq!(
-        ratchet(&report, &format!("structural.intent_precision.{AST_ID}")),
-        1.0
-    );
-    // The README row is in a language the oracle has no grammar for.
-    assert_eq!(
-        ratchet(&report, "structural.unscored_rows.rust-nested-loop"),
-        1.0
-    );
-
-    let section = &report["corpora"][0]["structural"];
-    assert_eq!(
-        section["entries"][0],
-        json!({
-            "id": AST_ID,
-            "pattern": "rust-nested-loop",
-            "lang": "rust",
-            "precision_class": "ratchet",
-            "oracle_files": 1,
-            "skim_files": 1,
-            "recall": 1.0,
-            "precision": 1.0,
-            "intent_files": 1,
-            "intent_recall": 1.0,
-            "intent_precision": 1.0,
-            "line_on_match": 1,
-        })
-    );
-    assert_eq!(
-        section["coverage"],
-        json!({"oracle_over_cap": 0, "skim_size_excluded_files": [0], "skim_undetermined_files": [0]})
-    );
-    let uncovered = report["uncovered_patterns"].as_array().unwrap();
-    let cause = |name: &str| {
-        uncovered
-            .iter()
-            .find(|p| p["name"] == name)
-            .map(|p| p["cause"].as_str().unwrap().to_string())
-    };
-    assert_eq!(cause("deep-nesting").as_deref(), Some("no_oracle"));
-    assert_eq!(cause("try-catch").as_deref(), Some("no_entry"));
-    assert_eq!(cause(AST_PATTERN), None);
-    let md = fs::read_to_string(h.out_dir.path().join("report.md")).unwrap();
-    assert!(md.contains("### Structural (`--ast`)"), "{md}");
-    assert!(
-        md.contains(&format!(
-            "| `{AST_ID}` | rust-nested-loop | rust | ratchet |"
-        )),
-        "{md}"
-    );
-    assert!(md.contains("## Uncovered structural patterns"), "{md}");
-
-    // One `--ast` call for the pattern, not one per entry.
-    let key = key("", &["--ast", AST_PATTERN]);
-    assert_eq!(
-        h.calls().iter().filter(|c| c.starts_with(&key)).count(),
-        1,
-        "{:?}",
-        h.calls()
-    );
-
-    assert_exit(&h.bless(None), 0);
-    assert_exit(&h.check(), 0);
-}
-
-#[test]
-fn every_catalog_pattern_is_called_and_rows_no_entry_scores_are_counted() {
-    let h = Harness::new();
-    h.enable_structural(Some(3), None);
-    // deep-nesting has no oracle query; try-catch has one, but the fixture
-    // corpus has no try-catch entry (and a Rust row has no try-catch query).
-    for (pattern, path, line) in [
-        ("deep-nesting", "src/loops.rs", 3),
-        ("try-catch", "src/other.rs", 2),
-    ] {
-        h.write_response(
-            "",
-            &["--ast", pattern],
-            &format!("l{FULL_LIMIT}_o0.json"),
-            &ast_page_json(
-                &[(
-                    Row {
-                        path: path.to_string(),
-                        line,
-                        content: "x".to_string(),
-                    },
-                    1.0,
-                )],
-                false,
-            ),
-        );
-    }
-
-    let run = h.run();
-    assert_exit(&run, 0);
-    let report = h.report();
-
-    // Every catalog pattern is called, each once (god-function's pattern
-    // call shares its argv with the standalone `--ast god-function` entry's
-    // full list, so that key is logged twice).
-    let calls = h.calls();
-    for pattern in called_patterns(catalog()) {
-        // The trailing space keeps `try-catch` from matching `try-catch-finally`.
-        let logged = format!(
-            "{} json=1 limit={FULL_LIMIT} ",
-            key("", &["--ast", pattern])
-        );
-        let n = calls.iter().filter(|c| c.starts_with(&logged)).count();
-        let want = if pattern == "god-function" { 2 } else { 1 };
-        assert_eq!(n, want, "--ast {pattern}: {calls:?}");
-    }
-
-    // Latency (INFO): each pattern call is timed on its own, apart from the
-    // golden entries' calls, and so is the oracle pass (also on stderr).
-    let latency = &report["latency"]["corpora"]["fixture"];
-    let pattern_calls = latency["pattern_calls_wall_ms"].as_object().unwrap();
-    let timed: Vec<&str> = pattern_calls.keys().map(String::as_str).collect();
-    assert_eq!(timed, called_patterns(catalog()), "{latency}");
-    let entries = latency["entries_wall_ms"].as_object().unwrap();
-    assert!(
-        entries.keys().all(|id| id.starts_with("fixture-")),
-        "{latency}"
-    );
-    assert!(
-        !entries.contains_key(AST_ID),
-        "an [[ast]] entry makes no call of its own"
-    );
-    assert!(
-        latency["structural_oracle_wall_ms"].as_f64().is_some(),
-        "{latency}"
-    );
-    assert!(
-        stderr(&run).contains("[scoreboard] fixture: structural oracle: "),
-        "{}",
-        stderr(&run)
-    );
-
-    // Every called pattern carries an unscored count, 0 included.
-    let unscored = &report["corpora"][0]["structural"]["unscored_rows"];
-    assert_eq!(
-        unscored.as_object().unwrap().len(),
-        called_patterns(catalog()).len(),
-        "{unscored}"
-    );
-    for (pattern, rows) in [
-        ("deep-nesting", 1.0),
-        ("try-catch", 1.0),
-        // The standalone entry's two Rust rows: no god-function entry here.
-        ("god-function", 2.0),
-        // The README row: no oracle grammar.
-        (AST_PATTERN, 1.0),
-        ("go-select", 0.0),
-        ("java-synchronized", 0.0),
-    ] {
-        assert_eq!(
-            ratchet(&report, &format!("structural.unscored_rows.{pattern}")),
-            rows,
-            "{pattern}"
-        );
-        assert_eq!(
-            report["aggregate"]["ratchet"][format!("structural.unscored_rows.{pattern}")],
-            rows,
-            "{pattern} (aggregate)"
-        );
-    }
-    let md = fs::read_to_string(h.out_dir.path().join("report.md")).unwrap();
-    assert!(
-        md.contains(
-            "Unscored `--ast` rows (a language no entry scores): deep-nesting 1, god-function 2, \
-             rust-nested-loop 1, try-catch 1"
-        ),
-        "{md}"
-    );
-
-    assert_exit(&h.bless(None), 0);
-    assert_exit(&h.check(), 0);
-
-    // An unscored row that disappears is a RATCHET move, not a silent drop.
-    // No oracle judges unscored rows, so the move is neutral: the gate asks
-    // for a bless, and bless takes it without an --accept-regression reason.
-    h.write_response(
-        "",
-        &["--ast", "deep-nesting"],
-        &format!("l{FULL_LIMIT}_o0.json"),
-        &ast_page_json(&[], false),
-    );
-    let check = h.check();
-    assert_exit(&check, 1);
-    let err = stderr(&check);
-    assert!(
-        err.contains(
-            "FAIL structural.unscored_rows.deep-nesting: [fixture] baseline 1 -> current 0 \
-             (changed); bless required"
-        ),
-        "{err}"
-    );
-    assert!(!err.contains("regressed"), "{err}");
-    assert_exit(&h.bless(None), 0);
-    assert_exit(&h.check(), 0);
-}
-
-#[test]
-fn a_structural_recall_miss_fails_the_gate_and_the_ledger_excuses_it() {
-    let h = Harness::new();
-    h.enable_structural(Some(3), None);
-    h.bless_current();
-
-    // skim loses the oracle's file (only the unscored README row is left).
-    h.enable_structural(None, None);
-    let check = h.check();
-
-    assert_exit(&check, 1);
-    let err = stderr(&check);
-    assert!(
-        err.contains(&format!("FAIL structural.recall [{AST_ID}]")),
-        "{err}"
-    );
-    assert!(err.contains("src/loops.rs"), "{err}");
-
-    h.write_ledger(&format!(
-        "[[xfail]]\nissue = \"#9004\"\ncheck = \"structural.recall\"\nids = [\"{AST_ID}\"]\n"
-    ));
-    assert_exit(&h.run(), 0);
-    assert_eq!(
-        outcome(&h.report(), AST_ID, "structural.recall").as_deref(),
-        Some("xfail")
-    );
-}
-
-#[test]
-fn a_coverage_count_that_disagrees_with_the_oracle_is_a_hard_failure() {
-    let h = Harness::new();
-    // A blessed clean state gates green, so the failure below has one cause.
-    h.enable_structural(Some(3), None);
-    h.bless_current();
-    assert_exit(&h.check(), 0);
-
-    // skim now reports a file over the 1 MiB cap; the oracle sees none.
-    h.enable_structural(
-        Some(3),
-        Some(json!({
-            "size_eligible_files": 5,
-            "size_excluded_files": 1,
-            "undetermined_files": 0,
-            "excluded_by_lang": {"rust": 1}
-        })),
-    );
-    let check = h.check();
-
-    assert_exit(&check, 1);
-    let err = stderr(&check);
-    assert!(
-        err.contains(&format!("FAIL structural.coverage [{AST_ID}]")),
-        "{err}"
-    );
-    assert!(
-        err.contains("ast_coverage.size_excluded_files is 1 (by language: rust 1)"),
-        "{err}"
-    );
-    let report = h.report();
-    assert_eq!(
-        outcome(&report, AST_ID, "structural.coverage").as_deref(),
-        Some("fail")
-    );
-    // The coverage check is the gate's only failure: nothing else moved.
-    let failures = gate_failures(&report);
-    assert_eq!(failures.len(), 1, "{failures:#?}");
-    let (kind, check_id, ids, _) = &failures[0];
-    assert_eq!(
-        (kind.as_str(), check_id.as_str(), ids.as_slice()),
-        (
-            "unledgered",
-            "structural.coverage",
-            [AST_ID.to_string()].as_slice()
-        )
-    );
-}
-
-#[test]
-fn a_truncated_ast_pattern_list_is_a_harness_error() {
-    let h = Harness::new();
-    h.write_golden_with(DEF_LINE, AST_ENTRY);
-    // skim says the `--ast` full list goes on past `--limit 1000000`: the rows
-    // it returned are not the pattern's complete answer, so none is scored.
-    h.write_response(
-        "",
-        &["--ast", AST_PATTERN],
-        &format!("l{FULL_LIMIT}_o0.json"),
-        &ast_page_json(
-            &[(
-                Row {
-                    path: "src/loops.rs".to_string(),
-                    line: 3,
-                    content: "for b in 0..2 {".to_string(),
-                },
-                1.0,
-            )],
-            true,
-        ),
-    );
-
-    let run = h.run();
-
-    assert_exit(&run, 2);
-    let err = stderr(&run);
-    assert!(err.contains(&format!("--ast {AST_PATTERN}")), "{err}");
-    assert!(err.contains("has_more"), "{err}");
-    assert!(
-        !h.report_path().exists(),
-        "a harness error writes no report"
-    );
-}
-
-#[test]
-fn a_vacuous_structural_entry_is_a_harness_error() {
-    let h = Harness::new();
-    // The fixture has no Go file: neither the oracle nor skim finds anything.
-    let id = "fixture-ast-go-select-go";
-    h.write_golden_with(
-        DEF_LINE,
-        &format!("\n[[ast]]\nid = \"{id}\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\n"),
-    );
-    h.write_response(
-        "",
-        &["--ast", "go-select"],
-        &format!("l{FULL_LIMIT}_o0.json"),
-        &ast_page_json(&[], false),
-    );
-
-    let run = h.run();
-
-    assert_exit(&run, 2);
-    let err = stderr(&run);
-    assert!(err.contains("vacuous"), "{err}");
-    assert!(err.contains(id), "{err}");
-    assert!(
-        !h.report_path().exists(),
-        "a harness error writes no report"
-    );
-}
-
-/// A false-positive guard (#546's shape): `rust-unsafe-block` in Rust, where
-/// the fixture has no unsafe block, so the oracle is empty by declaration.
-const GUARD_ID: &str = "fixture-ast-rust-unsafe-block-rust";
-const GUARD_PATTERN: &str = "rust-unsafe-block";
-const GUARD_ENTRY: &str = "\n[[ast]]\nid = \"fixture-ast-rust-unsafe-block-rust\"\n\
-                           pattern = \"rust-unsafe-block\"\nlang = \"rust\"\nprecision = \"hard\"\n\
-                           expect_oracle_empty = true\n";
-
-impl Harness {
-    /// Serve `--ast rust-unsafe-block`: a false positive on `src/loops.rs`
-    /// (`false_positive`), or nothing (the fixed state).
-    fn write_guard(&self, false_positive: bool) {
-        let rows: Vec<(Row, f64)> = false_positive
-            .then(|| Row {
-                path: "src/loops.rs".to_string(),
-                line: 1,
-                content: "fn walk() {".to_string(),
-            })
-            .into_iter()
-            .map(|r| (r, 1.0))
-            .collect();
-        self.write_response(
-            "",
-            &["--ast", GUARD_PATTERN],
-            &format!("l{FULL_LIMIT}_o0.json"),
-            &ast_page_json(&rows, false),
-        );
-    }
-}
-
-#[test]
-fn a_false_positive_guard_survives_the_fix_and_catches_the_false_positive_returning() {
-    let h = Harness::new();
-    h.write_golden_with(DEF_LINE, GUARD_ENTRY);
-    let ledger = format!(
-        "[[xfail]]\nissue = \"#9005\"\ncheck = \"structural.precision\"\nids = [\"{GUARD_ID}\"]\n"
-    );
-
-    // Today: skim returns a file the oracle rejects; the ledger excuses it.
-    h.write_guard(true);
-    h.write_ledger(&ledger);
-    h.bless_current();
-    let report = h.report();
-    assert_eq!(
-        outcome(&report, GUARD_ID, "structural.precision").as_deref(),
-        Some("xfail")
-    );
-    assert_eq!(
-        outcome(&report, GUARD_ID, "structural.recall").as_deref(),
-        Some("pass")
-    );
-    assert_exit(&h.check(), 0);
-
-    // The fix lands: skim returns nothing and the oracle finds nothing. The
-    // guard is not vacuous (no harness error): the ledgered check XPASSes.
-    h.write_guard(false);
-    let check = h.check();
-    assert_exit(&check, 1);
-    let err = stderr(&check);
-    assert!(!err.contains("vacuous"), "{err}");
-    assert_eq!(
-        outcome(&h.report(), GUARD_ID, "structural.precision").as_deref(),
-        Some("xpass")
-    );
-    let section = &h.report()["corpora"][0]["structural"]["entries"];
-    let entry = section
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["id"] == GUARD_ID)
-        .unwrap();
-    assert_eq!(
-        (&entry["oracle_files"], &entry["skim_files"]),
-        (&json!(0), &json!(0))
-    );
-    assert_eq!(
-        (&entry["recall"], &entry["precision"]),
-        (&json!(1.0), &json!(1.0)),
-        "an empty denominator reads as 1"
-    );
-    // The report tells a fixed guard apart from an ordinary empty entry.
-    assert_eq!(entry["expect_oracle_empty"], json!(true));
-    let md = fs::read_to_string(h.out_dir.path().join("report.md")).unwrap();
-    assert!(
-        md.contains(&format!(
-            "| `{GUARD_ID}` | {GUARD_PATTERN} | rust | hard, FP guard | 0 | 0 |"
-        )),
-        "{md}"
-    );
-
-    // Promote: remove the ledger entry, keep the golden entry; `xfail -> pass`
-    // blesses without a reason.
-    h.write_ledger("");
-    assert_exit(&h.check(), 1);
-    assert_exit(&h.bless(None), 0);
-    assert_exit(&h.check(), 0);
-
-    // The false positive comes back: the kept guard fails precision.
-    h.write_guard(true);
-    let check = h.check();
-    assert_exit(&check, 1);
-    let err = stderr(&check);
-    assert!(
-        err.contains(&format!("FAIL structural.precision [{GUARD_ID}]")),
-        "{err}"
-    );
-    assert!(err.contains("src/loops.rs"), "{err}");
-}
-
-#[test]
-fn a_false_positive_guard_in_a_language_the_corpus_has_no_file_in_is_a_harness_error() {
-    let h = Harness::new();
-    // The fixture has no Go file: the guard could never catch anything.
-    let id = "fixture-ast-go-select-go";
-    h.write_golden_with(
-        DEF_LINE,
-        &format!(
-            "\n[[ast]]\nid = \"{id}\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\n\
-             expect_oracle_empty = true\n"
-        ),
-    );
-
-    let run = h.run();
-
-    assert_exit(&run, 2);
-    let err = stderr(&run);
-    assert!(err.contains("golden integrity failed"), "{err}");
-    assert!(err.contains("vacuous"), "{err}");
-    assert!(
-        err.contains(&format!(
-            "\n  {id}: vacuous false-positive guard: no scored go file"
-        )),
-        "{err}"
-    );
-    assert!(
-        !h.report_path().exists(),
-        "a harness error writes no report"
-    );
-}
-
-#[test]
-fn a_false_positive_guard_whose_oracle_matches_is_a_harness_error() {
-    let h = Harness::new();
-    // rust-nested-loop's oracle matches src/loops.rs: the flag is stale.
-    h.write_golden_with(
-        DEF_LINE,
-        &format!("{AST_ENTRY}expect_oracle_empty = true\n"),
-    );
-    h.write_structural(&[], None);
-
-    let run = h.run();
-
-    assert_exit(&run, 2);
-    let err = stderr(&run);
-    assert!(err.contains("golden integrity failed"), "{err}");
-    assert!(err.contains("expect_oracle_empty"), "{err}");
-    assert!(err.contains(AST_ID), "{err}");
-    assert!(err.contains("src/loops.rs"), "{err}");
-    assert!(
-        h.calls().is_empty(),
-        "refused before skim runs: {:?}",
-        h.calls()
-    );
-    assert!(
-        !h.report_path().exists(),
-        "a harness error writes no report"
-    );
-}
-
-#[test]
-fn an_ast_entry_naming_a_pattern_the_oracle_cannot_score_is_a_harness_error() {
-    let h = Harness::new();
-    h.write_golden_with(
-        DEF_LINE,
-        "\n[[ast]]\nid = \"fixture-ast-deep-nesting-rust\"\npattern = \"deep-nesting\"\n\
-         lang = \"rust\"\nprecision = \"ratchet\"\n",
-    );
-
-    let run = h.run();
-
-    assert_exit(&run, 2);
-    let err = stderr(&run);
-    assert!(err.contains("golden integrity failed"), "{err}");
-    assert!(err.contains("no structural oracle query"), "{err}");
-}
-
-// ============================================================================
 // #540: the frozen-answer tables, end to end
 // ============================================================================
-
-/// A query that no file of the fixture holds.
-const ABSENT: &str = "qzvx_absent_7713";
 
 /// A `[[refs]]` entry for `check_staleness`; `sites` are `(path, line, role)`.
 /// The name is a whole word on two lines of the fixture: the definition
@@ -2269,13 +1623,29 @@ fn concept_with_first(id: &str, first: &str) -> String {
     )
 }
 
-/// A zero-hit `[[stakes]]` entry that expects `exit = 1`, and a match entry on
-/// the fixture's `marker` query that expects `exit = 0`.
-fn stakes_entries() -> String {
+/// One `[[stakes]]` entry on the fixture's `marker` query (or `query`).
+fn stakes_entry(id: &str, query: &str, flags: &str, expect: &str, exit: Option<u8>) -> String {
+    let exit = exit.map(|c| format!("exit = {c}\n")).unwrap_or_default();
     format!(
-        "\n[[stakes]]\nid = \"fixture-S01\"\nquery = \"{ABSENT}\"\nflags = []\nexpect = \"exit\"\nexit = 1\n\
-         \n[[stakes]]\nid = \"fixture-S02\"\nquery = \"marker\"\nflags = []\nexpect = \"exit\"\nexit = 0\n"
+        "\n[[stakes]]\nid = \"{id}\"\nquery = \"{query}\"\nflags = {flags}\nexpect = \"{expect}\"\n{exit}"
     )
+}
+
+/// The stakes entries that read exit codes, and the ones that read the new
+/// flags (`-l`, `-c`, `-i`, `-g`, `-t`, `-F -E`, `-w`).
+fn stakes_entries() -> String {
+    [
+        stakes_entry("fixture-S01", ABSENT, "[]", "exit", Some(1)),
+        stakes_entry("fixture-S02", "marker", "[]", "exit", Some(0)),
+        stakes_entry("fixture-S03", "marker", "[\"-l\"]", "files", None),
+        stakes_entry("fixture-S04", "marker", "[\"-c\"]", "counts", None),
+        stakes_entry("fixture-S05", "MARKER", "[\"-i\"]", "lines", None),
+        stakes_entry("fixture-S06", "marker", "[\"-g\", \"*.md\"]", "lines", None),
+        stakes_entry("fixture-S07", "marker", "[\"-t\", \"rust\"]", "files", None),
+        stakes_entry("fixture-S08", "marker", "[\"-F\", \"-E\"]", "exit", Some(2)),
+        stakes_entry("fixture-S09", "marker", "[\"-w\"]", "lines", None),
+    ]
+    .concat()
 }
 
 /// Every new table at once, each with the answer the fixture really has.
@@ -2284,32 +1654,80 @@ fn frozen_answer_entries() -> String {
         exact_refs_entry(),
         clash_entry(TWO_DEFS, CLASH_CALLS, "none"),
         concept_with_first("fixture-C02", "src/lock.rs"),
-        concept_with_first("fixture-C03", "src/marker.rs"),
         stakes_entries(),
     ]
     .concat()
 }
 
-/// A harness that serves the new entries: zero hits for the absent query, as
-/// the current binary answers it (`total` 0, exit 0).
+impl Harness {
+    /// The row for `path:line` of the fixture.
+    fn row(&self, path: &str, line: u32) -> Row {
+        let text = self.text.text(path).unwrap();
+        Row {
+            path: path.to_string(),
+            line,
+            content: text
+                .split('\n')
+                .nth(usize::try_from(line - 1).unwrap())
+                .unwrap()
+                .to_string(),
+            role: None,
+        }
+    }
+
+    /// Serve the ident query with two definition sites (the stub states the
+    /// definitions of a clash): `rows` as its list, `TWO_DEFS` as its sites.
+    fn write_two_defs(&self, rows: &[Row]) {
+        let (_, q, f) = IDENT;
+        let mut body = envelope(q, rows, 0, by_file(rows).len(), false, self.searched());
+        body["definitions"] = json!({
+            "count": 2,
+            "at_least": false,
+            "sites": TWO_DEFS
+                .iter()
+                .map(|(path, line)| json!({"path": path, "line": line}))
+                .collect::<Vec<_>>(),
+        });
+        self.write_full_json(q, f, &body);
+        self.write_text(q, f, &text_labelled(rows));
+    }
+
+    /// Serve `lines` (`(path, line)`) as the full JSON list of `query` with
+    /// `flags`.
+    fn write_lines(&self, query: &str, flags: &[&str], lines: &[(&str, u32)]) {
+        let rows: Vec<Row> = lines.iter().map(|(p, l)| self.row(p, *l)).collect();
+        self.write_full(query, flags, &rows);
+    }
+
+    /// Serve every stakes entry of [`stakes_entries`] with the answer a
+    /// correct search gives.
+    fn write_stakes_responses(&self) {
+        // Exit stakes read the status of a text call only.
+        self.write_text(ABSENT, &[], "");
+        self.write_exit_code(ABSENT, &[], 1);
+        self.write_text("marker", &[], "README.md:3\n");
+        self.write_text("marker", &["-F", "-E"], "");
+        self.write_exit_code("marker", &["-F", "-E"], 2);
+        // `-l` prints the paths in path order, `-c` prints `path:count`.
+        self.write_text("marker", &["-l"], "README.md\nsrc/marker.rs\n");
+        self.write_text("marker", &["-c"], "README.md:1\nsrc/marker.rs:2\n");
+        // The listed lines.
+        let all = [("README.md", 3), ("src/marker.rs", 1), ("src/marker.rs", 2)];
+        self.write_lines("MARKER", &["-i"], &all);
+        self.write_lines("marker", &["-w"], &all);
+        self.write_lines("marker", &["-g", "*.md"], &[("README.md", 3)]);
+        // `-t rust` is the answer of the lexical entry that shares the call.
+    }
+}
+
+/// A harness that serves the new entries with the answers a correct search
+/// gives.
 fn frozen_answer_harness() -> Harness {
     let h = Harness::new();
     h.write_golden_with(DEF_LINE, &frozen_answer_entries());
-    h.write_full(ABSENT, &[], &[]);
+    h.write_two_defs(&h.correct_rows(IDENT.1, Some(DEF_PATH)));
+    h.write_stakes_responses();
     h
-}
-
-/// The failure detail the report holds for `(id, check)`.
-fn detail_of(report: &Value, id: &str, check: &str) -> String {
-    report["corpora"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|c| c["checks"].as_array().unwrap().iter())
-        .find(|c| c["id"] == id && c["check"] == check)
-        .and_then(|c| c["detail"].as_str())
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// `check` over a golden file with `extra` appended: it must stop at
@@ -2330,8 +1748,9 @@ fn integrity_failure_of(extra: &str) -> String {
 
 #[test]
 fn a_refs_entry_whose_sites_differ_from_the_whole_word_lines_exits_2_at_integrity() {
-    // One whole-word line is not listed.
-    let err = integrity_failure_of(&refs_entry(&[("src/staleness.rs", 2, "def")]));
+    // One whole-word line is not listed. The definition line carries the role
+    // `call`, so the entry has a call site and lacks only `src/other.rs:2`.
+    let err = integrity_failure_of(&refs_entry(&[("src/staleness.rs", 2, "call")]));
     assert!(
         err.contains("fixture-R01") && err.contains("missing") && err.contains("src/other.rs:2"),
         "{err}"
@@ -2377,34 +1796,111 @@ fn a_clash_with_one_definition_or_a_split_exits_2_at_integrity() {
 }
 
 #[test]
-fn the_frozen_answer_entries_are_judged_against_the_output_the_current_binary_prints() {
+fn a_stakes_entry_the_oracle_cannot_read_exits_2_at_integrity() {
+    // `-g` with an alternation, an unknown type, and a flag the search lacks.
+    for flags in [
+        "[\"-g\", \"*.{rs,md}\"]",
+        "[\"-t\", \"cobol\"]",
+        "[\"--hidden\"]",
+    ] {
+        let err =
+            integrity_failure_of(&stakes_entry("fixture-S01", "marker", flags, "lines", None));
+        assert!(err.contains("fixture-S01"), "{flags}: {err}");
+    }
+    // An exit the text universe contradicts: `marker` is in the fixture.
+    let err = integrity_failure_of(&stakes_entry(
+        "fixture-S01",
+        "marker",
+        "[]",
+        "exit",
+        Some(1),
+    ));
+    assert!(
+        err.contains("fixture-S01") && err.contains("matching line"),
+        "{err}"
+    );
+}
+
+#[test]
+fn the_frozen_answer_entries_pass_when_the_output_states_them() {
     let h = frozen_answer_harness();
 
     assert_exit(&h.run(), 0);
+
     let report = h.report();
-    let result = |id: &str, check: &str| outcome(&report, id, check);
-
-    // The two frozen sites are in the output, so recall holds; the call line
-    // carries no role in the current output, so the call recall fails.
+    let checks = [
+        ("fixture-R01", "refs.recall"),
+        ("fixture-R01", "refs.calls_recall"),
+        ("fixture-R01", "universe.accounted"),
+        ("fixture-D01", "clash.defs_complete"),
+        ("fixture-D01", "clash.def_count"),
+        ("fixture-D01", "clash.calls_recall"),
+        ("fixture-C02", "concept.first_right_top5"),
+        ("fixture-L01", "ident.def_first"),
+        ("fixture-S01", "stakes.exit"),
+        ("fixture-S02", "stakes.exit"),
+        ("fixture-S03", "stakes.files"),
+        ("fixture-S04", "stakes.counts"),
+        ("fixture-S05", "stakes.lines"),
+        ("fixture-S06", "stakes.lines"),
+        ("fixture-S07", "stakes.files"),
+        ("fixture-S08", "stakes.exit"),
+        ("fixture-S09", "stakes.lines"),
+    ];
+    for (id, check) in checks {
+        assert_eq!(
+            outcome(&report, id, check).as_deref(),
+            Some("pass"),
+            "{id} {check}: {}",
+            detail_of(&report, id, check)
+        );
+    }
+    // The first-file check is for the concepts that freeze one.
     assert_eq!(
-        result("fixture-R01", "refs.recall").as_deref(),
+        outcome(&report, "fixture-C01", "concept.first_right_top5"),
+        None
+    );
+    // A `-l` or `-c` call states no definitions: the entry runs the checks of
+    // its own expectation and the unique-path check, nothing else.
+    assert_eq!(outcome(&report, "fixture-S03", "stakes.lines"), None);
+}
+
+#[test]
+fn a_call_the_output_labels_as_text_fails_the_call_recall() {
+    let h = frozen_answer_harness();
+    let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
+    rows[1].role = Some("text");
+    h.write_two_defs(&rows);
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    for (id, check) in [
+        ("fixture-R01", "refs.calls_recall"),
+        ("fixture-D01", "clash.calls_recall"),
+    ] {
+        assert_eq!(outcome(&report, id, check).as_deref(), Some("fail"), "{id}");
+        let d = detail_of(&report, id, check);
+        assert!(d.contains("src/other.rs:2 (role text)"), "{d}");
+    }
+    // The sites themselves are all listed.
+    assert_eq!(
+        outcome(&report, "fixture-R01", "refs.recall").as_deref(),
         Some("pass")
     );
-    assert_eq!(
-        result("fixture-R01", "refs.calls_recall").as_deref(),
-        Some("fail")
-    );
-    let d = detail_of(&report, "fixture-R01", "refs.calls_recall");
-    assert!(d.contains("src/other.rs:2 (role none)"), "{d}");
-    // The fixture's indexed files are its text files: the accounting agrees.
-    assert_eq!(
-        result("fixture-R01", "universe.accounted").as_deref(),
-        Some("pass")
-    );
+}
 
-    // The output lists the definition site it knows, with no count.
+#[test]
+fn a_definition_list_that_misses_a_definition_fails_the_clash_checks() {
+    let h = frozen_answer_harness();
+    // The ordinary ident page states one definition site.
+    h.write_ident(&h.correct_rows(IDENT.1, Some(DEF_PATH)));
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
     assert_eq!(
-        result("fixture-D01", "clash.defs_complete").as_deref(),
+        outcome(&report, "fixture-D01", "clash.defs_complete").as_deref(),
         Some("fail")
     );
     let d = detail_of(&report, "fixture-D01", "clash.defs_complete");
@@ -2413,56 +1909,34 @@ fn the_frozen_answer_entries_are_judged_against_the_output_the_current_binary_pr
         "{d}"
     );
     assert_eq!(
-        result("fixture-D01", "clash.def_count").as_deref(),
+        outcome(&report, "fixture-D01", "clash.def_count").as_deref(),
         Some("fail")
-    );
-    let d = detail_of(&report, "fixture-D01", "clash.def_count");
-    assert!(d.contains("no definitions.count"), "{d}");
-    // The frozen call line is in the output with no role, so the call recall
-    // fails on it.
-    assert_eq!(
-        result("fixture-D01", "clash.calls_recall").as_deref(),
-        Some("fail")
-    );
-    let d = detail_of(&report, "fixture-D01", "clash.calls_recall");
-    assert!(d.contains("src/other.rs:2 (role none)"), "{d}");
-
-    // `build lock` lists src/lock.rs, not src/marker.rs.
-    assert_eq!(
-        result("fixture-C02", "concept.first_right_top5").as_deref(),
-        Some("pass")
-    );
-    assert_eq!(
-        result("fixture-C03", "concept.first_right_top5").as_deref(),
-        Some("fail")
-    );
-    // The first-file check is for the concepts that freeze one.
-    assert_eq!(result("fixture-C01", "concept.first_right_top5"), None);
-
-    // The absent query exits 0, the match query exits 0.
-    assert_eq!(
-        result("fixture-S01", "stakes.exit").as_deref(),
-        Some("fail")
-    );
-    let d = detail_of(&report, "fixture-S01", "stakes.exit");
-    assert!(d.contains("exit code is 0, expected 1"), "{d}");
-    assert_eq!(
-        result("fixture-S02", "stakes.exit").as_deref(),
-        Some("pass")
     );
 }
 
 #[test]
-fn a_zero_hit_stakes_entry_passes_once_the_run_exits_1() {
+fn a_concept_whose_first_file_is_not_in_the_top_five_fails() {
     let h = frozen_answer_harness();
-    h.write_exit_code(ABSENT, &[], 1);
+    h.write_golden_with(
+        DEF_LINE,
+        &format!(
+            "{}{}",
+            frozen_answer_entries(),
+            concept_with_first("fixture-C03", "src/marker.rs")
+        ),
+    );
 
     assert_exit(&h.run(), 0);
 
+    // `build lock` lists src/lock.rs, not src/marker.rs.
     let report = h.report();
     assert_eq!(
-        outcome(&report, "fixture-S01", "stakes.exit").as_deref(),
+        outcome(&report, "fixture-C02", "concept.first_right_top5").as_deref(),
         Some("pass")
+    );
+    assert_eq!(
+        outcome(&report, "fixture-C03", "concept.first_right_top5").as_deref(),
+        Some("fail")
     );
 }
 
@@ -2471,12 +1945,11 @@ fn a_search_that_counts_a_different_number_of_files_fails_the_universe_accountin
     let h = frozen_answer_harness();
     let files = h.text.len();
     // One file more than the text universe holds, with no reason for it.
-    fs::write(
-        h.stub_dir.path().join("stats.json"),
-        json!({"file_count": files + 1, "skipped_by_reason": {}, "temporal_state": "ready"})
-            .to_string(),
-    )
-    .unwrap();
+    let (_, q, f) = IDENT;
+    let rows = h.correct_rows(q, Some(DEF_PATH));
+    let mut body = envelope(q, &rows, 0, rows.len(), false, h.searched() + 1);
+    body["left_out"] = zero_left_out();
+    h.write_full_json(q, f, &body);
 
     assert_exit(&h.run(), 0);
 
@@ -2491,57 +1964,121 @@ fn a_search_that_counts_a_different_number_of_files_fails_the_universe_accountin
             && d.contains(&format!("has {files}")),
         "{d}"
     );
+    assert_eq!(report["corpora"][0]["universe"]["delta"], -1);
 }
 
-/// The ledger of the failures `frozen_answer_entries` has against the
-/// fixture's current-shaped output.
+#[test]
+fn a_search_that_leaves_a_file_out_without_saying_why_fails_the_universe_accounting() {
+    let h = frozen_answer_harness();
+    let (_, q, f) = IDENT;
+    let rows = h.correct_rows(q, Some(DEF_PATH));
+    let mut body = envelope(q, &rows, 0, rows.len(), false, h.searched());
+    body["left_out"]["symlink"] = json!(1);
+    h.write_full_json(q, f, &body);
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-R01", "universe.accounted").as_deref(),
+        Some("fail")
+    );
+    assert!(detail_of(&report, "fixture-R01", "universe.accounted").contains("symlink"));
+}
+
+#[test]
+fn each_stakes_expectation_fails_on_the_answer_it_judges() {
+    let h = frozen_answer_harness();
+    // `-l` lists a file that holds no match; `-c` counts one line short;
+    // `-i` misses a line; `-t rust` lists README.md; the rejected flag set
+    // exits 0.
+    h.write_text("marker", &["-l"], "README.md\nsrc/lock.rs\nsrc/marker.rs\n");
+    h.write_text("marker", &["-c"], "README.md:1\nsrc/marker.rs:1\n");
+    h.write_lines("MARKER", &["-i"], &[("README.md", 3), ("src/marker.rs", 1)]);
+    h.write_lines(
+        "marker",
+        &["-t", "rust"],
+        &[("README.md", 3), ("src/marker.rs", 1)],
+    );
+    h.write_exit_code("marker", &["-F", "-E"], 0);
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    let expected = [
+        ("fixture-S03", "stakes.files", "src/lock.rs"),
+        ("fixture-S04", "stakes.counts", "src/marker.rs"),
+        ("fixture-S05", "stakes.lines", "src/marker.rs:2"),
+        ("fixture-S07", "stakes.files", "README.md"),
+        ("fixture-S08", "stakes.exit", "exit code is 0, expected 2"),
+    ];
+    for (id, check, naming) in expected {
+        assert_eq!(outcome(&report, id, check).as_deref(), Some("fail"), "{id}");
+        let d = detail_of(&report, id, check);
+        assert!(d.contains(naming), "{id}: {d}");
+    }
+    // The entries the answers still satisfy stay green.
+    for (id, check) in [
+        ("fixture-S06", "stakes.lines"),
+        ("fixture-S09", "stakes.lines"),
+    ] {
+        assert_eq!(outcome(&report, id, check).as_deref(), Some("pass"), "{id}");
+    }
+}
+
+#[test]
+fn a_zero_hit_stakes_entry_fails_while_the_run_exits_0_and_passes_at_exit_1() {
+    let h = frozen_answer_harness();
+    h.write_exit_code(ABSENT, &[], 0);
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-S01", "stakes.exit").as_deref(),
+        Some("fail")
+    );
+    let d = detail_of(&report, "fixture-S01", "stakes.exit");
+    assert!(d.contains("exit code is 0, expected 1"), "{d}");
+
+    h.write_exit_code(ABSENT, &[], 1);
+    assert_exit(&h.run(), 0);
+    assert_eq!(
+        outcome(&h.report(), "fixture-S01", "stakes.exit").as_deref(),
+        Some("pass")
+    );
+}
+
+/// The ledger of the failures the stub gives `fixture-S01` and `fixture-C03`.
 const FROZEN_ANSWER_LEDGER: &str = r##"[[xfail]]
-issue = "#553"
-check = "refs.calls_recall"
-ids = ["fixture-R01"]
-
-[[xfail]]
-issue = "#555"
-check = "clash.defs_complete"
-ids = ["fixture-D01"]
-
-[[xfail]]
-issue = "#555"
-check = "clash.def_count"
-ids = ["fixture-D01"]
-
-[[xfail]]
-issue = "#553"
-check = "clash.calls_recall"
-ids = ["fixture-D01"]
+issue = "#552"
+check = "stakes.exit"
+ids = ["fixture-S01"]
 
 [[xfail]]
 issue = "#556"
 check = "concept.first_right_top5"
 ids = ["fixture-C03"]
-
-[[xfail]]
-issue = "#552"
-check = "stakes.exit"
-ids = ["fixture-S01"]
 "##;
 
 #[test]
 fn the_new_hard_failures_are_ledgered_by_id_and_a_first_bless_needs_no_reason() {
     let h = frozen_answer_harness();
+    h.write_golden_with(
+        DEF_LINE,
+        &format!(
+            "{}{}",
+            frozen_answer_entries(),
+            concept_with_first("fixture-C03", "src/marker.rs")
+        ),
+    );
+    h.write_exit_code(ABSENT, &[], 0);
 
     // Without a ledger the gate names the new failures.
     let unledgered = h.check();
     assert_exit(&unledgered, 1);
     let err = stderr(&unledgered);
-    for check in [
-        "refs.calls_recall",
-        "clash.defs_complete",
-        "clash.def_count",
-        "clash.calls_recall",
-        "concept.first_right_top5",
-        "stakes.exit",
-    ] {
+    for check in ["concept.first_right_top5", "stakes.exit"] {
         assert!(err.contains(check), "{check}: {err}");
     }
 
@@ -2683,13 +2220,32 @@ fn each_golden_file_holds_two_concept_entries_with_first_files() {
 }
 
 #[test]
-fn each_golden_file_holds_a_zero_hit_and_a_match_stakes_entry() {
+fn each_golden_file_holds_a_stakes_entry_for_every_flag_and_every_exit_code() {
     for corpus in CORPORA {
         let golden = parse_golden(&real_golden_text(corpus)).unwrap();
-        for (exit, what) in [(1, "zero-hit"), (0, "match")] {
+        for flag in ["-i", "-E", "-l", "-c", "-g", "-t", "-w", "-C"] {
             assert!(
-                golden.stakes.iter().any(|s| s.exit == Some(exit)),
-                "{corpus} holds no {what} [[stakes]] entry (exit = {exit})"
+                golden.stakes.iter().any(|s| s.has_flag(flag)),
+                "{corpus} holds no [[stakes]] entry with {flag}"
+            );
+        }
+        for exit in [0, 1, 2] {
+            assert!(
+                golden
+                    .stakes
+                    .iter()
+                    .any(|s| s.expect == StakesExpect::Exit && s.exit == Some(exit)),
+                "{corpus} holds no [[stakes]] entry with exit = {exit}"
+            );
+        }
+        for expect in [
+            StakesExpect::Lines,
+            StakesExpect::Files,
+            StakesExpect::Counts,
+        ] {
+            assert!(
+                golden.stakes.iter().any(|s| s.expect == expect),
+                "{corpus} holds no [[stakes]] entry with expect = {expect:?}"
             );
         }
     }
@@ -2718,17 +2274,14 @@ fn the_golden_files_pass_integrity_against_the_pinned_clones() {
             spec.name
         );
         let golden = parse_golden(&real_golden_text(&spec.name)).unwrap();
-        let universe = Universe::compute(&root, &git).unwrap();
         let text = text_universe(&root, &git).unwrap();
         let violations = check_integrity(
             &golden,
             &IntegrityContext {
                 corpus: &spec.name,
                 commit: &spec.commit,
-                universe: Some(&universe),
-                text: Some(&text),
+                universe: Some(&text),
                 ledger: &[],
-                catalog: catalog(),
             },
         );
         assert!(

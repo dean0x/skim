@@ -41,6 +41,7 @@ pub(crate) use helpers::backup_settings_file;
 pub(crate) use helpers::load_or_create_settings;
 pub(crate) use helpers::resolve_real_settings_path;
 pub(crate) use helpers::resolve_skim_binary;
+pub(crate) use install::old_search_hooks_finding;
 pub(crate) use state::ForeignPostHooks;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 pub(crate) use state::has_skim_hook_entry;

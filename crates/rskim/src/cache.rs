@@ -424,11 +424,29 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Clear entire cache directory.
+/// Length of the file stem of a cache entry: a SHA-256 digest in lowercase hex.
+const CACHE_KEY_HEX_LEN: usize = 64;
+
+/// True for the file name skim gives a cache entry: `<sha256 hex>.json`.
 ///
-/// Removes all files inside the cache directory rather than the directory
+/// `SKIM_CACHE_DIR` can name any folder, so a `.json` file in it is not
+/// necessarily skim's.
+fn is_cache_entry_name(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "json")
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.len() == CACHE_KEY_HEX_LEN
+                    && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+}
+
+/// Clear the cache entries in the cache directory.
+///
+/// Removes the entry files inside the cache directory rather than the directory
 /// itself. This avoids ENOTEMPTY races when concurrent processes write
-/// cache entries during deletion.
+/// cache entries during deletion. A file that is not a cache entry stays.
 pub(crate) fn clear_cache() -> Result<()> {
     let cache_dir = get_cache_dir()?;
 
@@ -436,8 +454,8 @@ pub(crate) fn clear_cache() -> Result<()> {
         for entry in fs::read_dir(&cache_dir)? {
             let entry = entry?;
             let path = entry.path();
-            // Only remove JSON cache files; skip analytics.db and other non-cache files.
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+            // Only remove cache entries; skip analytics.db and every other file.
+            if path.is_file() && is_cache_entry_name(&path) {
                 // Best-effort removal; ignore errors from concurrent access.
                 let _ = fs::remove_file(&path);
             }
@@ -464,6 +482,28 @@ mod tests {
             line_numbers: false,
             notice_bytes: 0,
             symbol: None,
+        }
+    }
+
+    /// `clear_cache` removes the entries skim writes and no other file.
+    #[test]
+    fn test_is_cache_entry_name_matches_only_sha256_hex_json() {
+        let key = "0123456789abcdef".repeat(4);
+        assert!(is_cache_entry_name(Path::new(&format!("{key}.json"))));
+        for name in [
+            "notes.json".to_string(),
+            format!("{key}.txt"),
+            key.clone(),
+            format!("{}.json", key.to_uppercase()),
+            format!("{}.json", &key[..63]),
+            format!("{key}0.json"),
+            format!("{}g.json", &key[..63]),
+            ".json".to_string(),
+        ] {
+            assert!(
+                !is_cache_entry_name(Path::new(&name)),
+                "{name} is not a cache entry"
+            );
         }
     }
 

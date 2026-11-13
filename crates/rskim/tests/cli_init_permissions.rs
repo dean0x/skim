@@ -15,10 +15,10 @@
 //! install: it names one directory and leaves `HOME` — and therefore
 //! `~/.skim/bin`, `~/.cache/skim`, every *other* agent's config directory, and
 //! the guidance files under it — resolving to the developer's own.  The working
-//! directory is part of the sandbox for the same reason: a successful install
-//! ends in `install_search_integration`, which walks up from the process cwd and
-//! writes `post-commit`/`post-merge`/`post-checkout` into the first repository it
-//! finds.  Left at the cwd cargo supplies, that is this clone.
+//! directory is part of the sandbox for the same reason: an install runs
+//! `remove_legacy_search_hooks`, which walks up from the process cwd and rewrites
+//! `post-commit`/`post-merge`/`post-checkout` in the first repository it finds.
+//! Left at the cwd cargo supplies, that is this clone.
 //!
 //! The sandbox already points every `*_CONFIG_DIR` inside that home, so these
 //! tests name the directory an assertion is about with [`agent_config_dir`]

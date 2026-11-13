@@ -3,7 +3,6 @@ members = [
     "crates/rskim-core",
     "crates/rskim",
     "crates/rskim-proxy",
-    "crates/rskim-search",
     "crates/rskim-research",
     "crates/rskim-bench",
     "crates/rskim-oracle",
@@ -61,15 +60,9 @@ crossterm = { version = "0.29", default-features = false }
 assert_cmd = "2.0"
 predicates = "3.0"
 tempfile = "3.0"
-memmap2 = "0.9"
-crc32fast = "1.4"
 insta = "1.39"
 criterion = "0.5"
 proptest = "1.4"                 # property-based testing shared by #301 and #302
-# Pinned to 1.x (not 2.x) to unify with tiktoken-rs's transitive rustc-hash ^1.1.0
-# requirement — bumping to 2.x would force two major versions into the binary for
-# a zero-functional-gain hasher swap.  Review when tiktoken-rs drops the 1.x pin.
-rustc-hash = "1"
 serial_test = "3.0"
 libc = "0.2"
 filetime = "0.2"
@@ -140,12 +133,10 @@ lto = true
 codegen-units = 1
 strip = true
 
-# The search scoreboard's structural oracle (rskim-oracle, #541) runs the
-# tree-sitter runtime over every file of every corpus, and CI builds the
-# scoreboard in this profile, so the runtime (its C core included: `cc`
-# follows the package's opt-level) is optimised here too: the oracle pass
-# runs about 5x faster for a few seconds of extra compile. The grammar
-# crates stay at the default: with the runtime optimised, their lexers are
-# under a tenth of the pass (the tree and query cursors are most of it).
+# The role oracle (rskim-oracle) runs the tree-sitter runtime over corpus
+# files when `scoreboard golden-gen` runs, and the scoreboard is built in
+# this profile, so the runtime (its C core included: `cc` follows the
+# package's opt-level) is optimised here too. The grammar crates stay at
+# the default.
 [profile.dev.package.tree-sitter]
 opt-level = 3

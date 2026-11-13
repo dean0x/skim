@@ -26,6 +26,9 @@ use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use crate::analytics::AnalyticsConfig;
+use crate::cmd::search::legacy_cache::{
+    LegacyFinding, LegacyReport, format_megabytes, legacy_index_report,
+};
 use crate::cmd::session::AgentKind;
 
 /// Timeout for each bounded subprocess invocation.
@@ -71,6 +74,10 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     let hooks = print_hook_section(compiled_version, compiled_commit)?;
     if hooks.drift {
         drift = true;
+    }
+    // Advisory only: old search git hooks never set the drift verdict.
+    for note in old_search_hooks_notes(crate::cmd::init::old_search_hooks_finding().as_ref()) {
+        println!("{note}");
     }
     println!();
 
@@ -649,6 +656,44 @@ fn print_hook_section(
     Ok(verdict)
 }
 
+/// The advisory lines for old search git hooks. The list is empty when no hook
+/// holds the block and every hook could be read.
+///
+/// Skim 2.x wrote a block into `post-commit`, `post-merge` and `post-checkout`.
+/// The block now runs a command that exits 2. Notes only: they set neither the
+/// drift verdict nor the exit code. `finding` is what the hooks of the repository
+/// around the current folder hold.
+///
+/// The remedy is `skim init`, which removes the block while it installs for an
+/// agent. With no agent installed it stops before it touches a hook, so the line
+/// says so. `skim init --uninstall` also removes the block, but it takes skim out
+/// of every agent, so the line names it only as the way to remove skim completely.
+///
+/// A hook that cannot be read gets its own line: whether it holds the block is
+/// unknown, so doctor does not report it as clean.
+fn old_search_hooks_notes(
+    finding: Option<&crate::cmd::search::hooks::HooksFinding>,
+) -> Vec<String> {
+    let Some(finding) = finding else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    if finding.block_found {
+        // `{:?}` quotes control bytes that a repository-controlled path can hold.
+        notes.push(format!(
+            "  ⚠  Old search git hooks: found in {:?} — run skim init (it needs an installed agent; \
+             with none it changes nothing). To remove skim completely, run skim init --uninstall",
+            finding.dir
+        ));
+    }
+    notes.extend(
+        finding.unreadable.iter().map(|failure| {
+            format!("  ⚠  Old search git hooks: {failure} — check the hook by hand")
+        }),
+    );
+    notes
+}
+
 /// Advisory lines about `PostToolUse` hooks of other tools, for one agent.
 ///
 /// Claude Code gives the model one `PostToolUse` result per Bash call, so another
@@ -869,6 +914,64 @@ fn print_cache_section() {
         }
         None => println!("  Analytics DB: (unknown)"),
     }
+
+    // Advisory only: old index data never sets the drift verdict.
+    if let Some(dir) = cache_env.resolve_cache_dir()
+        && let Some(note) = old_search_index_note(legacy_index_report(&dir), &dir.join("search"))
+    {
+        println!("{note}");
+    }
+}
+
+/// The advisory line for old search index data, or `None` when there is none.
+///
+/// `finding` is the result of `legacy_index_report`; `search_dir` is the folder
+/// that holds the data. `skim --clear-cache` removes it. When a bound left
+/// entries uninspected, the counts read "at least" and the line names each bound
+/// with its exact count. The line gives the `skim --clear-cache` remedy only when
+/// the report found old files: a run cannot remove what the report has not seen.
+/// A folder that another user owns, or that could not be read, gets a line that
+/// names the folder for a check by hand.
+fn old_search_index_note(
+    finding: Option<LegacyFinding>,
+    search_dir: &std::path::Path,
+) -> Option<String> {
+    const HEAD: &str = "  ⚠  Old search index data:";
+    let report = match finding? {
+        LegacyFinding::Unreadable(kind) => {
+            return Some(format!(
+                "{HEAD} could not read {search_dir:?} ({kind}) — check the folder by hand"
+            ));
+        }
+        LegacyFinding::Found(report) => report,
+    };
+    let LegacyReport {
+        folders,
+        bytes,
+        foreign,
+        skipped,
+    } = report;
+    let floor = if skipped.any() { "at least " } else { "" };
+    let mut clauses = skipped.clauses();
+    if foreign > 0 {
+        clauses.push(format!(
+            "{foreign} folders belong to another user and were not entered"
+        ));
+    }
+    let detail = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", clauses.join("; "))
+    };
+    if folders == 0 {
+        return Some(format!(
+            "{HEAD} none found in {search_dir:?}{detail} — check the folder by hand"
+        ));
+    }
+    let megabytes = format_megabytes(bytes);
+    Some(format!(
+        "{HEAD} {floor}{folders} folders, {floor}{megabytes} MB in {search_dir:?}{detail} — run skim --clear-cache"
+    ))
 }
 
 // ============================================================================
@@ -1119,6 +1222,7 @@ fn print_help() {
     println!("      never as `✓` — `skim doctor | grep dev-pinned` is the CI guard");
     println!("  Wrapper directory (~/.skim/bin) status and symlink count");
     println!("  Cache directory and analytics DB paths");
+    println!("  Old search git hooks and old search index data, as advisory notes (never drift)");
     println!("  Staleness vs. HEAD (run from the skim source directory for accurate results)");
     println!();
     println!("Exit codes:");
@@ -1136,6 +1240,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::search::legacy_cache::{MAX_PROJECT_FOLDERS, MAX_SEARCH_ENTRIES, Skipped};
 
     const TEST_ANALYTICS: AnalyticsConfig = AnalyticsConfig {
         enabled: false,
@@ -1704,6 +1809,239 @@ mod tests {
         let mut facts = facts_with_foreign_post_hooks(vec![("/f.json", "/usr/bin/one")], vec![]);
         facts.hook_installed = false;
         assert!(foreign_post_hook_notes(&facts).is_empty());
+    }
+
+    // ---- old search notes ----
+
+    fn hooks_finding(
+        dir: &str,
+        block_found: bool,
+        unreadable: Vec<crate::cmd::search::hooks::HookFailure>,
+    ) -> crate::cmd::search::hooks::HooksFinding {
+        crate::cmd::search::hooks::HooksFinding {
+            dir: std::path::PathBuf::from(dir),
+            block_found,
+            unreadable,
+        }
+    }
+
+    fn unreadable_hook(path: &str) -> crate::cmd::search::hooks::HookFailure {
+        crate::cmd::search::hooks::HookFailure {
+            path: std::path::PathBuf::from(path),
+            step: crate::cmd::search::hooks::HookStep::Read,
+            kind: std::io::ErrorKind::PermissionDenied,
+        }
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_are_absent_without_a_finding() {
+        assert!(old_search_hooks_notes(None).is_empty());
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_name_the_folder_and_put_skim_init_first() {
+        let finding = hooks_finding("/r/.git/hooks", true, Vec::new());
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        let [note] = notes.as_slice() else {
+            panic!("a block must give one line: {notes:?}");
+        };
+        assert!(
+            note.contains("Old search git hooks: found in \"/r/.git/hooks\""),
+            "{note}"
+        );
+        let first_init = note.find("skim init").expect("the line names skim init");
+        let uninstall = note
+            .find("skim init --uninstall")
+            .expect("the line names the way to remove skim completely");
+        assert_ne!(
+            first_init, uninstall,
+            "skim init must come before skim init --uninstall: {note}"
+        );
+        assert!(
+            note.contains("To remove skim completely, run skim init --uninstall"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_say_what_init_does_with_no_agent() {
+        let finding = hooks_finding("/r/.git/hooks", true, Vec::new());
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        assert!(
+            notes[0].contains("it needs an installed agent; with none it changes nothing"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_quote_control_bytes_in_the_path() {
+        let finding = hooks_finding("/r\u{1b}[31m\n/hooks", true, Vec::new());
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        let note = notes.join("\n");
+        assert!(!note.contains('\u{1b}'), "{note:?}");
+        assert_eq!(note.lines().count(), 1, "{note:?}");
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_report_an_unreadable_hook_as_unknown() {
+        let finding = hooks_finding(
+            "/r/.git/hooks",
+            false,
+            vec![unreadable_hook("/r/.git/hooks/post-commit")],
+        );
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        assert_eq!(
+            notes,
+            vec![
+                "  ⚠  Old search git hooks: could not read hook \"/r/.git/hooks/post-commit\" \
+                 (permission denied) — check the hook by hand"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_old_search_hooks_notes_keep_the_block_line_beside_an_unreadable_hook() {
+        let finding = hooks_finding(
+            "/r/.git/hooks",
+            true,
+            vec![unreadable_hook("/r/.git/hooks/post-merge")],
+        );
+
+        let notes = old_search_hooks_notes(Some(&finding));
+
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("found in"), "{notes:?}");
+        assert!(notes[1].contains("post-merge"), "{notes:?}");
+    }
+
+    #[test]
+    fn test_old_search_index_note_is_absent_without_data() {
+        assert_eq!(
+            old_search_index_note(None, std::path::Path::new("/c/search")),
+            None
+        );
+    }
+
+    fn found(report: LegacyReport) -> Option<LegacyFinding> {
+        Some(LegacyFinding::Found(report))
+    }
+
+    #[test]
+    fn test_old_search_index_note_gives_folders_size_and_remedy() {
+        let report = LegacyReport {
+            folders: 3,
+            bytes: 12_340_000,
+            ..LegacyReport::default()
+        };
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: 3 folders, 12.3 MB in \"/c/search\" — run skim --clear-cache"
+        );
+    }
+
+    #[test]
+    fn test_old_search_index_note_says_at_least_when_entries_went_uninspected() {
+        let report = LegacyReport {
+            folders: 3,
+            bytes: 12_340_000,
+            skipped: Skipped {
+                folders: 7,
+                listing: true,
+                crowded: 2,
+            },
+            ..LegacyReport::default()
+        };
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
+        assert!(
+            note.contains("Old search index data: at least 3 folders, at least 12.3 MB in"),
+            "{note}"
+        );
+        assert!(
+            note.contains(&format!(
+                "7 project folders past the first {MAX_PROJECT_FOLDERS} were not inspected"
+            )),
+            "{note}"
+        );
+        assert!(
+            note.contains(&format!(
+                "only the first {MAX_SEARCH_ENTRIES} entries of the folder were read"
+            )),
+            "{note}"
+        );
+        assert!(note.contains("2 project folders hold more than"), "{note}");
+        assert!(note.ends_with("run skim --clear-cache"), "{note}");
+        assert_eq!(note.lines().count(), 1, "{note:?}");
+    }
+
+    /// With no old file among the entries read, a run of `skim --clear-cache` has
+    /// nothing known to remove, so the line must not offer it as the remedy.
+    #[test]
+    fn test_old_search_index_note_names_the_folder_instead_of_a_remedy_that_may_do_nothing() {
+        let report = LegacyReport {
+            skipped: Skipped {
+                folders: 0,
+                listing: true,
+                crowded: 0,
+            },
+            ..LegacyReport::default()
+        };
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "  ⚠  Old search index data: none found in \"/c/search\" (only the first {MAX_SEARCH_ENTRIES} entries of the folder were read) — check the folder by hand"
+            )
+        );
+        assert!(!note.contains("--clear-cache"), "{note}");
+    }
+
+    #[test]
+    fn test_old_search_index_note_counts_folders_of_another_user() {
+        let report = LegacyReport {
+            folders: 1,
+            bytes: 2_000_000,
+            foreign: 4,
+            ..LegacyReport::default()
+        };
+        let note = old_search_index_note(found(report), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: 1 folders, 2.0 MB in \"/c/search\" (4 folders belong to another user and were not entered) — run skim --clear-cache"
+        );
+
+        let only_foreign = LegacyReport {
+            foreign: 1,
+            ..LegacyReport::default()
+        };
+        let note =
+            old_search_index_note(found(only_foreign), std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: none found in \"/c/search\" (1 folders belong to another user and were not entered) — check the folder by hand"
+        );
+    }
+
+    /// A folder that cannot be read must not look like a folder with no old data.
+    #[test]
+    fn test_old_search_index_note_says_when_the_folder_could_not_be_read() {
+        let finding = Some(LegacyFinding::Unreadable(
+            std::io::ErrorKind::PermissionDenied,
+        ));
+        let note = old_search_index_note(finding, std::path::Path::new("/c/search")).unwrap();
+        assert_eq!(
+            note,
+            "  ⚠  Old search index data: could not read \"/c/search\" (permission denied) — check the folder by hand"
+        );
     }
 
     // ---- query_binary_info acquisition-path test ----

@@ -6,11 +6,79 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use regex::Regex;
+
 use super::noise::{BUS_FACTOR_TOP_SHARE_PCT, COUPLING_MAX_FILES, MIN_FILE_SUPPORT};
 use super::types::{
     AuthorMetrics, ChurnMetrics, CommitInfo, CouplingEdge, CouplingEntry, FixRiskMetrics,
     ModuleHealth,
 };
+
+// ============================================================================
+// Fix-commit classification
+// ============================================================================
+
+/// The fix keywords. A subject word matches one when it is equal to it after
+/// its leading and trailing punctuation is removed, in any letter case.
+const FIX_KEYWORDS: [&str; 5] = ["fix", "bug", "hotfix", "patch", "revert"];
+
+/// Most `[tag]` groups read at the start of a subject.
+const MAX_SUBJECT_TAGS: usize = 4;
+
+/// A conventional-commit type prefix: `type:`, `type(scope):`, `type!:` or
+/// `type(scope)!:`. Group 1 is the type. A type can hold `/` and `.`, so a
+/// path-style prefix (`net/http:`, `mm/slab:`) is a type too.
+///
+/// Compiled once and reused via `std::sync::LazyLock`.
+#[allow(clippy::expect_used)] // hardcoded pattern is always valid
+static TYPE_PREFIX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"^([A-Za-z][A-Za-z0-9_./-]*)(?:\([^)]*\))?!?:").expect("valid regex")
+});
+
+/// True when `word` is a fix keyword (see [`FIX_KEYWORDS`]).
+fn is_fix_keyword(word: &str) -> bool {
+    let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+    FIX_KEYWORDS.iter().any(|k| word.eq_ignore_ascii_case(k))
+}
+
+/// Returns `true` when a commit subject says that the commit fixes something.
+///
+/// The keywords are `fix`, `bug`, `hotfix`, `patch` and `revert`, in any
+/// letter case. A subject is a fix when one of these holds:
+///
+/// - a leading `[tag]` is a keyword (`[fix] crash on load`);
+/// - the conventional-commit type is a keyword (`fix: …`, `fix(scope): …`,
+///   `fix!: …`);
+/// - the first word of the subject, after any `[tag]` groups and type
+///   prefix, is a keyword (`Fix typo`, `Revert "…"`, `docs: fix link`).
+///
+/// A keyword elsewhere in the subject does not count: `docs: explain
+/// later-fix proximity` and `feat: add bug report template` are not fixes.
+/// Every fix-risk number of `skim heatmap` uses this rule.
+#[must_use]
+pub(super) fn is_fix_commit(subject: &str) -> bool {
+    let mut rest = subject.trim_start();
+    for _ in 0..MAX_SUBJECT_TAGS {
+        let Some((tag, after)) = rest
+            .strip_prefix('[')
+            .and_then(|inner| inner.split_once(']'))
+        else {
+            break;
+        };
+        if is_fix_keyword(tag) {
+            return true;
+        }
+        rest = after.trim_start();
+    }
+    if let Some(caps) = TYPE_PREFIX.captures(rest) {
+        if caps.get(1).is_some_and(|ty| is_fix_keyword(ty.as_str())) {
+            return true;
+        }
+        let prefix_len = caps.get(0).map_or(0, |m| m.end());
+        rest = rest.get(prefix_len..).unwrap_or_default();
+    }
+    rest.split_whitespace().next().is_some_and(is_fix_keyword)
+}
 
 // ============================================================================
 // Metric 1: Churn
@@ -226,7 +294,7 @@ pub(crate) fn compute_stability(
     let mut file_fix_count: HashMap<String, usize> = HashMap::new();
 
     for commit in commits {
-        let is_fix = rskim_search::is_fix_commit(&commit.message);
+        let is_fix = is_fix_commit(&commit.message);
         for file in &commit.changed_files {
             let path = file.path_str().into_owned();
             if is_fix {
@@ -349,10 +417,7 @@ pub(crate) fn compute_fix_after_touch(
     window: usize,
 ) -> HashMap<String, FixRiskMetrics> {
     // Classify every commit
-    let is_fix: Vec<bool> = commits
-        .iter()
-        .map(|c| rskim_search::is_fix_commit(&c.message))
-        .collect();
+    let is_fix: Vec<bool> = commits.iter().map(|c| is_fix_commit(&c.message)).collect();
 
     // Per-file: which commit indices touch it?
     let mut file_indices: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1269,5 +1334,119 @@ mod tests {
             module_of(r#""src/na\303\257ve.rs""#, &roots).as_deref(),
             Some("src")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_fix_commit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_fix_commit_documented_examples() {
+        assert!(is_fix_commit("fix: null pointer dereference"));
+        assert!(is_fix_commit("fix(parser): handle empty input"));
+        assert!(is_fix_commit("Revert \"bad change\""));
+        assert!(!is_fix_commit("add feature X"));
+        assert!(!is_fix_commit("feat: add bug report template"));
+        assert!(!is_fix_commit("prefix_word"));
+    }
+
+    #[test]
+    fn test_is_fix_commit_matches_each_keyword_in_any_case() {
+        assert!(is_fix_commit("fix: null pointer dereference"));
+        assert!(is_fix_commit("Fix typo in README"));
+        assert!(is_fix_commit("FIX: urgent security issue"));
+        assert!(is_fix_commit("bug: crash on empty input"));
+        assert!(is_fix_commit("BUG: wrong calculation"));
+        assert!(is_fix_commit("hotfix: production outage"));
+        assert!(is_fix_commit("HOTFIX: urgent"));
+        assert!(is_fix_commit("patch: minor adjustment"));
+        assert!(is_fix_commit("PATCH: something"));
+        assert!(is_fix_commit("revert: bad change"));
+        assert!(is_fix_commit("Revert \"some feature\""));
+        assert!(is_fix_commit("REVERT: rollback"));
+        assert!(is_fix_commit("Bug report addressed"));
+        assert!(is_fix_commit("hoTFiX applied"));
+    }
+
+    #[test]
+    fn test_is_fix_commit_keyword_must_be_a_whole_word() {
+        assert!(!is_fix_commit("prefix the thing"));
+        assert!(!is_fix_commit("bugfix: this is a compound"));
+        assert!(!is_fix_commit("hotfixing something"));
+    }
+
+    #[test]
+    fn test_is_fix_commit_matches_conventional_scope_and_breaking_prefix() {
+        assert!(is_fix_commit("fix(init): finish the setup"));
+        assert!(is_fix_commit("fix!: drop the old flag"));
+        assert!(is_fix_commit("fix(cli)!: rename --foo"));
+        assert!(is_fix_commit("revert(search): undo the cap"));
+        assert!(is_fix_commit("fix:no space after the colon"));
+    }
+
+    #[test]
+    fn test_is_fix_commit_matches_keyword_as_first_word_of_description() {
+        assert!(is_fix_commit("docs: fix the broken link"));
+        assert!(is_fix_commit("chore(ci): fix flaky job"));
+        assert!(is_fix_commit("  Fix trailing whitespace"));
+        assert!(is_fix_commit("Fix: typo"));
+        assert!(is_fix_commit("fix"));
+    }
+
+    /// Go and Linux-kernel histories prefix the subject with a package path.
+    #[test]
+    fn test_is_fix_commit_matches_path_style_prefix() {
+        assert!(is_fix_commit("net/http: fix race"));
+        assert!(is_fix_commit("mm/slab: fix leak"));
+        assert!(is_fix_commit("crates/rskim: fix exit code"));
+        assert!(is_fix_commit("x/tools/gopls: revert \"faster load\""));
+        assert!(!is_fix_commit("net/http: add bug report link"));
+    }
+
+    /// A tag that is not a keyword is not a first word.
+    #[test]
+    fn test_is_fix_commit_tag_with_more_words_is_not_a_fix() {
+        assert!(!is_fix_commit("[fix it] crash on load"));
+        assert!(!is_fix_commit("[bug 4521] handle empty input"));
+        assert!(!is_fix_commit("[core][fix later] add x"));
+    }
+
+    #[test]
+    fn test_is_fix_commit_matches_leading_tags() {
+        assert!(is_fix_commit("[fix] crash on load"));
+        assert!(is_fix_commit("[core] fix crash on load"));
+        assert!(is_fix_commit("[core][parser] Revert \"faster scan\""));
+        assert!(is_fix_commit("[core] fix(parser): crash on load"));
+    }
+
+    /// Issue #597: a keyword inside a description is not a fix.
+    #[test]
+    fn test_is_fix_commit_keyword_inside_description_is_not_a_fix() {
+        assert!(!is_fix_commit("docs: explain later-fix proximity"));
+        assert!(!is_fix_commit("feat: add bug report template"));
+        assert!(!is_fix_commit("feat(heatmap): count fix commits per file"));
+        assert!(!is_fix_commit("refactor: move the patch parser"));
+        assert!(!is_fix_commit("Update README after the hotfix"));
+        assert!(!is_fix_commit("chore: prepare revert tooling"));
+        assert!(!is_fix_commit("test: cover the fix-risk lift"));
+        assert!(!is_fix_commit("feat: fix-up mode for rebase"));
+        assert!(!is_fix_commit("[core] add bug tracker link"));
+    }
+
+    #[test]
+    fn test_is_fix_commit_empty_and_odd_subjects() {
+        assert!(!is_fix_commit(""));
+        assert!(!is_fix_commit("   "));
+        assert!(!is_fix_commit("[unclosed tag fix"));
+        assert!(!is_fix_commit("[]"));
+        assert!(!is_fix_commit("feat:"));
+    }
+
+    #[test]
+    fn test_is_fix_commit_no_match() {
+        assert!(!is_fix_commit("add new feature"));
+        assert!(!is_fix_commit("refactor: improve readability"));
+        assert!(!is_fix_commit("feat: initial implementation"));
+        assert!(!is_fix_commit("chore: update dependencies"));
     }
 }

@@ -6,7 +6,7 @@ authors = ["Skim Contributors"]
 license = "MIT"
 description = "LLM message model: parse/serialize Anthropic & OpenAI request bodies with content-block classification"
 repository = "https://github.com/dean0x/skim"
-# publish = false initially, matching rskim-search / rskim-tokens precedent.
+# publish = false initially, matching rskim-tokens precedent.
 # Wave-1 crate — in-workspace only. External publish tracked in #309.
 publish = false
 

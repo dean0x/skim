@@ -17,14 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # Full history required by two independent groups of history-dependent tests:
-          #   1. test_ac5_dog_food_risky_matches_git_ground_truth compares skim's
-          #      --risky per-file commit counts against `git rev-list` ground truth on this
-          #      repository, including commits reachable only off the first-parent chain.
-          #      A shallow clone truncates that ground truth (git_total=1 in CI run
-          #      33906188121), so the test skips there instead of verifying (AD-407-11).
-          #   2. the corpus harness and the pinned-SHA JSON-content tests (#508) walk real
-          #      commit parents, which a depth-1 checkout cannot provide.
+          # Full history required by the history-dependent tests: the corpus harness
+          # and the pinned-SHA JSON-content tests (#508) walk real commit parents,
+          # which a depth-1 checkout cannot provide.
           # All other jobs keep the default shallow fetch.
           fetch-depth: 0
 
@@ -313,10 +308,10 @@ jobs:
           set -euo pipefail
           # Keep in sync with crates/rskim-bench/scoreboard/README.md ("CI").
           # Beyond cmd/search/: the rskim files it imports from (cmd/mod.rs,
-          # debug.rs, analytics/mod.rs and the analytics/schema.rs and
-          # tokens.rs that module compiles in), the dispatch (main.rs), and
-          # the rskim manifest.
-          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-oracle/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+          # cmd/execution.rs, debug.rs, output/mod.rs, analytics/mod.rs and
+          # the analytics/schema.rs and tokens.rs that module compiles in),
+          # the dispatch (cmd/dispatch.rs and main.rs), and the rskim manifest.
+          SEARCH_PATHS='^(crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/cmd/execution\.rs$|crates/rskim/src/cmd/dispatch\.rs$|crates/rskim/src/output/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-oracle/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
           case "$EVENT_NAME" in
             workflow_dispatch)
               search=true; reason="manual dispatch" ;;

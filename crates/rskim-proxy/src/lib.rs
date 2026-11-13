@@ -52,8 +52,7 @@
 //! dep behind a non-default `proxy` cargo feature (#352): default builds contain no
 //! proxy subcommand and no tokio/hyper/rustls in the dependency tree (AC9:
 //! HTTP/TLS-free default tree); release binaries are built with `--features proxy`.
-//! This follows the `rskim-search` precedent: depends on `rskim-core`/`rskim-contract`
-//! without changing their APIs.
+//! The crate depends on `rskim-core`/`rskim-contract` without changing their APIs.
 //!
 //! ## Public API surface
 //!

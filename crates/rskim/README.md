@@ -101,7 +101,7 @@ Options:
   -j, --jobs <JOBS>         Number of parallel jobs [default: number of CPUs]
       --no-header           Don't print file path headers for multi-file output
       --no-cache            Disable caching (caching is enabled by default)
-      --clear-cache         Clear all cached files and exit
+      --clear-cache         Clear the parser cache and old search index data, and exit
       --show-stats          Show token reduction statistics
   -h, --help                Print help
   -V, --version             Print version

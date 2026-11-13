@@ -6,7 +6,7 @@ authors = ["Skim Contributors"]
 license = "MIT"
 description = "Multi-provider token counting library for skim"
 repository = "https://github.com/dean0x/skim"
-# publish = false initially, matching rskim-search precedent.
+# publish = false initially.
 # Publish follow-up tracked in #324 (crates.io publish when external consumers need it).
 publish = false
 

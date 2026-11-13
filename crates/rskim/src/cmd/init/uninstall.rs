@@ -34,6 +34,10 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value, event_key: &str) 
 }
 
 pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    // First, and whatever the agents hold: the old search git hooks belong to the
+    // repository, not to an agent, so they go also when no agent hook is installed.
+    super::install::remove_legacy_search_hooks(flags.dry_run);
+
     let det_env = DetectionEnv::from_process();
     if resolve_single_agent(flags).is_none() {
         return run_uninstall_auto_detect(flags, &det_env);

@@ -171,7 +171,7 @@ skim file.ts --no-cache
 --clear-cache
 ```
 
-Clear all cached files and exit
+Clear the parser cache and the old search index data, and exit. It keeps every other file in the cache folder, such as `analytics.db`.
 
 **Example:**
 ```bash
@@ -242,7 +242,7 @@ A capped section ends with one line that gives the exact hidden count and the se
 
 | Rule | Value |
 |------|-------|
-| Fix commit | The subject says that the commit fixes something: a `[fix]` tag, a `fix:` / `fix(scope):` / `fix!:` type (also `bug`, `hotfix`, `patch`, `revert`; a path-style type such as `net/http:` counts as a type), or one of these words first in the subject, for example `Revert "..."` or `docs: fix link`. A word inside a description does not count (`docs: explain later-fix proximity` is not a fix). `skim search --risky` uses the same rule. |
+| Fix commit | The subject says that the commit fixes something: a `[fix]` tag, a `fix:` / `fix(scope):` / `fix!:` type (also `bug`, `hotfix`, `patch`, `revert`; a path-style type such as `net/http:` counts as a type), or one of these words first in the subject, for example `Revert "..."` or `docs: fix link`. A word inside a description does not count (`docs: explain later-fix proximity` is not a fix). |
 | Fix-risk and bus-factor support | 5 commits of the file |
 | Coupling support | 3 shared commits |
 | Module support | 5 commits of the module |

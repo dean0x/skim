@@ -130,7 +130,7 @@ fn resolve_diff_files(
 /// dangling link gets the warning, as a deleted path does. A path that is
 /// absolute or goes out of `root` (`..`, a drive prefix) is not tested: the
 /// shared containment rule of `super::is_repo_relative_safe` applies, as for
-/// `walk::list_tracked_files` and `temporal_build::rel_is_regular_file`.
+/// the git index paths of `skim search`.
 fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<String> {
     let not_files: Vec<&str> = files
         .iter()
@@ -753,7 +753,7 @@ fn compute_heatmap(
     // bus-factor author minimum.
     let fix_commits_total = commits
         .iter()
-        .filter(|c| rskim_search::is_fix_commit(&c.message))
+        .filter(|c| metrics::is_fix_commit(&c.message))
         .count();
     let window_authors = commits
         .iter()

@@ -355,7 +355,6 @@ NOISE RULES:
     A fix commit is one whose subject says it fixes something: a [fix]
     tag, a fix: or fix(scope): type (also bug, hotfix, patch, revert), or
     one of these words first in the subject (for example Revert \"...\").
-    skim search --risky uses the same rule.
     Fix risk and bus factor need 5 commits of the file. Fix risk also needs
     the 95% lower bound of the file's fix rate to be above the base rate.
     Coupling needs 3 shared commits. Modules need 5 commits. Bus factor shows

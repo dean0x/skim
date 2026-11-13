@@ -1,14 +1,12 @@
 //! Shared data types for the search scoreboard (#203): what one skim
-//! invocation returns ([`ResultPage`], [`StatsSnapshot`]) and the HARD-check
-//! vocabulary ([`CheckId`], [`CheckOutcome`]).
+//! invocation returns ([`ResultPage`]) and the HARD-check vocabulary
+//! ([`CheckId`], [`CheckOutcome`]).
 //!
-//! skim's JSON is parsed leniently through [`serde_json::Value`] (the design's
-//! "JSON the runner reads" table): unknown keys are ignored, and the
-//! additive `skip_serializing_if` fields default when absent — `has_more` to
-//! `false`, `verify_mode` to substring, `degraded` to empty. What the
-//! scoreboard needs (`results`, each row's `path` and score) must be present
-//! and well-typed; anything else is an error, which the scoreboard reports as
-//! a harness error (exit 2), never as a regression.
+//! skim's `--json` envelope (`render.rs::json_line` in `crates/rskim/src/cmd/
+//! search/`) is parsed leniently through [`serde_json::Value`]: unknown keys
+//! are ignored. What the scoreboard needs must be present and well-typed. An
+//! `error` key, a missing key or a value of the wrong type is an error, which
+//! the scoreboard reports as a harness error (exit 2), never as a regression.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -18,117 +16,37 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::scoreboard::oracle::MatchMode;
-
 // ============================================================================
-// Arms and rows
+// Rows and pages
 // ============================================================================
 
-/// Which JSON envelope a `skim search --json` invocation produces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Arm {
-    /// `QueryOutput` (`crates/rskim/src/cmd/search/types.rs:378-430`): every
-    /// invocation with a text query, including `--phrase`, `--near`, `--lang`,
-    /// text + temporal flags, and text + `--ast`. Rows use `score` and
-    /// `line_number`; `snippet.lines[]` holds the context window.
-    Lexical,
-    /// Standalone `--ast` (`crates/rskim-search/src/compound/output.rs:204-222`).
-    /// Rows use `score` and `line`; `snippet` is one string.
-    Ast,
-    /// Standalone `--hot` / `--cold` (`HotColdJson`); score key `hotspot_score`.
-    HotCold,
-    /// Standalone `--risky` (`RiskyJson`); score key `risk_score`.
-    Risky,
-    /// Standalone `--blast-radius` (`BlastRadiusJson`); score key `jaccard`.
-    BlastRadius,
-}
-
-impl Arm {
-    /// The key holding each row's score.
-    fn score_key(self) -> &'static str {
-        match self {
-            Arm::Lexical | Arm::Ast => "score",
-            Arm::HotCold => "hotspot_score",
-            Arm::Risky => "risk_score",
-            Arm::BlastRadius => "jaccard",
-        }
-    }
-}
-
-/// skim's `verify_mode` (absent = substring), or the mode a golden entry
-/// declares.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum VerifyMode {
-    #[default]
-    Substring,
-    Phrase,
-    Near,
-    PhraseNear,
-    /// A value this scoreboard does not know; kept so `lexical.verify_mode`
-    /// can fail with the value in its detail instead of aborting the run.
-    Unknown(String),
-}
-
-impl VerifyMode {
-    fn from_json_name(name: &str) -> Self {
-        match name {
-            "phrase" => VerifyMode::Phrase,
-            "near" => VerifyMode::Near,
-            "phrase_near" => VerifyMode::PhraseNear,
-            other => VerifyMode::Unknown(other.to_string()),
-        }
-    }
-}
-
-impl From<MatchMode> for VerifyMode {
-    fn from(mode: MatchMode) -> Self {
-        match mode {
-            MatchMode::And => VerifyMode::Substring,
-            MatchMode::Phrase => VerifyMode::Phrase,
-            MatchMode::Near { .. } => VerifyMode::Near,
-            MatchMode::PhraseNear { .. } => VerifyMode::PhraseNear,
-        }
-    }
-}
-
-/// One line of a result's snippet.
+/// One line of a result's snippet: an occurrence the file lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnippetLine {
     /// 1-based line number in the file.
     pub line_number: u32,
     pub content: String,
-    /// The anchor line (always `true` for the single AST snippet line).
+    /// Always `true`: the envelope lists matching lines only.
     pub is_match: bool,
 }
 
-/// One result row, normalized across arms.
+/// One result row: a matched file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultRow {
     /// Repo-relative path.
     pub path: String,
-    /// The arm's score (see [`Arm`] for the key).
+    /// The file's score.
     pub score: f64,
-    /// Anchor line: `line_number` (lexical; `None` when `null`, e.g. queries
-    /// under 3 bytes) or `line` (AST; `None` when absent). Always `None` for
-    /// the temporal arms.
+    /// The line of the file's first listed occurrence; `None` when the file
+    /// lists none.
     pub line: Option<u32>,
-    /// Lexical `snippet.lines[]`, or the AST `snippet` string as a single
-    /// matching line. Empty when absent.
+    /// The file's listed occurrences, as snippet lines.
     pub snippet: Vec<SnippetLine>,
 }
 
-/// One `degraded[]` element (AD-414-5).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Degraded {
-    pub subsystem: String,
-    pub reason: String,
-    pub requested: Option<String>,
-    pub applied: Option<String>,
-}
-
-/// What a matched line is. The names follow the role rules of the search
-/// engine: `def`, `call`, `ref`, `import`, `comment`, `string` and `text`
-/// are the roles a frozen site can have; `partial` (the hit is inside a longer
+/// What a matched line is. The names are the role keys of the search engine:
+/// `def`, `call`, `ref`, `import`, `comment`, `string` and `text` are the
+/// roles a frozen site can have; `partial` (the hit is inside a longer
 /// identifier) and `unlabelled` (the engine did not parse the file) only
 /// occur in the engine's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -178,8 +96,7 @@ impl Role {
     }
 }
 
-/// One matching line of a result page: `path:line`, with its role when the
-/// engine labels it (`None` = the engine gives no role).
+/// One matching line of a result page: `path:line`, with its role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occurrence {
     pub path: String,
@@ -222,40 +139,27 @@ pub struct Cost {
 /// One page of results from one skim invocation.
 ///
 /// A result's rank is its index in `rows` plus the invocation's `--offset`.
-/// skim's `total` is deliberately not kept: it is the page size, not a count.
-///
-/// [`ResultPage::parse`] fills the first four fields, and for the lexical
-/// envelope `occurrences` and `definitions` too (the adapter for the current
-/// output). The other fields are the accounting answers the #540 checks
-/// read: the current output states none of them, so they stay at their
-/// default (nothing observed) until [`ResultPage::with_accounting`] or the
-/// runner fills them, and every check that reads one fails closed on an
-/// absent value.
+/// `rows` are the files that hold every word of the query. In the word view,
+/// the engine lists the files that hold only some words after those, when
+/// fewer than three files hold all of them: such a fallback file is not a
+/// row, and none of its lines is an occurrence.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ResultPage {
     pub rows: Vec<ResultRow>,
     /// `has_more` (absent = `false`).
     pub has_more: bool,
-    /// `verify_mode` (absent = [`VerifyMode::Substring`]). Only the lexical
-    /// envelope carries it.
-    pub verify_mode: VerifyMode,
-    /// `degraded[]` (absent = empty). Standalone `--ast` never carries it
-    /// (#483).
-    pub degraded: Vec<Degraded>,
-    /// The matching lines, one per `path:line`, with their roles.
+    /// The matching lines of the rows' files, with their roles.
     pub occurrences: Vec<Occurrence>,
     /// The definitions of the queried name; `None` = the output has none.
     pub definitions: Option<Definitions>,
-    /// Matched files that have no labels (`parse.unlabelled_files`); `0` when
-    /// absent.
+    /// Matched files that have no labels (`parse.unlabelled_files`).
     pub unlabelled_files: u64,
     /// Files the search read (`searched_files`); `None` = not stated.
     pub searched_files: Option<u64>,
     /// Files left out of the search, by reason (`left_out`); `None` = not
     /// stated.
     pub left_out: Option<BTreeMap<String, u64>>,
-    /// Matching lines per file (`files[].line_count`); empty when the output
-    /// has no counts.
+    /// Matching lines per file (`files[].line_count`) of the rows' files.
     pub line_counts: BTreeMap<String, u64>,
     /// The work counters of the call; `None` = not stated.
     pub cost: Option<Cost>,
@@ -264,18 +168,27 @@ pub struct ResultPage {
     pub exit_code: i32,
 }
 
+/// One `files[]` element, before the word filter.
+struct FileEntry {
+    row: ResultRow,
+    occurrences: Vec<Occurrence>,
+    line_count: u64,
+    words_matched: u64,
+    words_total: u64,
+}
+
 impl ResultPage {
-    /// Parse skim's stdout for `arm`.
+    /// Parse skim's `--json` stdout.
     ///
     /// # Errors
     ///
-    /// Returns an error if stdout is not a JSON object, `results` is missing
-    /// or not an array, a row lacks a string `path` or a numeric score, or a
-    /// present envelope/row field has the wrong type.
-    pub fn parse(arm: Arm, stdout: &[u8]) -> anyhow::Result<Self> {
+    /// Returns an error if stdout is not a JSON object, the object has an
+    /// `error` key, a key the scoreboard reads is missing or has the wrong
+    /// type, or an occurrence names a role this scoreboard does not know.
+    pub fn parse(stdout: &[u8]) -> anyhow::Result<Self> {
         let value: Value =
             serde_json::from_slice(stdout).context("skim stdout is not valid JSON")?;
-        Self::from_json(arm, &value)
+        Self::from_json(&value)
     }
 
     /// [`ResultPage::parse`] over an already-parsed value.
@@ -283,353 +196,192 @@ impl ResultPage {
     /// # Errors
     ///
     /// As [`ResultPage::parse`].
-    pub fn from_json(arm: Arm, value: &Value) -> anyhow::Result<Self> {
+    pub fn from_json(value: &Value) -> anyhow::Result<Self> {
         let obj = as_object(value, "skim output")?;
-        let results = obj
-            .get("results")
-            .context("skim output has no `results`")?
-            .as_array()
-            .context("`results` is not an array")?;
-        let rows = parse_each(results, "results", |row| parse_row(arm, row))?;
-
+        if let Some(error) = obj.get("error") {
+            anyhow::bail!("skim reported an error: {error}");
+        }
+        let files = parse_each(req_array(obj, "files")?, "files", parse_file)?;
         let has_more = opt_bool(obj, "has_more")?.unwrap_or(false);
-        let verify_mode = opt_str(obj, "verify_mode")?
-            .map(VerifyMode::from_json_name)
-            .unwrap_or(VerifyMode::Substring);
-        let degraded = match opt(obj, "degraded", Value::as_array, "an array")? {
-            None => Vec::new(),
-            Some(entries) => parse_each(entries, "degraded", parse_degraded)?,
-        };
+        let definitions = parse_definitions(req(obj, "definitions", Some, "an object")?)?;
+        let parse_obj = as_object(req(obj, "parse", Some, "an object")?, "`parse`")?;
+        let unlabelled_files = req_u64(parse_obj, "unlabelled_files")?;
+        let cost_obj = as_object(req(obj, "cost", Some, "an object")?, "`cost`")?;
 
-        let (occurrences, definitions) = match arm {
-            Arm::Lexical => {
-                let roles = parse_each(results, "results", field_role)?;
-                let (occurrences, definitions) = line_answers(&rows, &roles);
-                (occurrences, Some(definitions))
-            }
-            Arm::Ast | Arm::HotCold | Arm::Risky | Arm::BlastRadius => (Vec::new(), None),
-        };
-
-        Ok(ResultPage {
-            rows,
+        let mut page = ResultPage {
             has_more,
-            verify_mode,
-            degraded,
-            occurrences,
-            definitions,
+            definitions: Some(definitions),
+            unlabelled_files,
+            searched_files: Some(req_u64(obj, "searched_files")?),
+            left_out: Some(parse_left_out(req(obj, "left_out", Some, "an object")?)?),
+            cost: Some(Cost {
+                files_read: req_u64(cost_obj, "files_read")?,
+                bytes_read: req_u64(cost_obj, "bytes_read")?,
+                files_parsed: req_u64(cost_obj, "files_parsed")?,
+                bytes_parsed: req_u64(cost_obj, "bytes_parsed")?,
+            }),
             ..ResultPage::default()
+        };
+        for file in files
+            .into_iter()
+            .filter(|f| f.words_matched == f.words_total)
+        {
+            page.line_counts
+                .insert(file.row.path.clone(), file.line_count);
+            page.occurrences.extend(file.occurrences);
+            page.rows.push(file.row);
+        }
+        Ok(page)
+    }
+
+    /// Parse the stdout of a `-l` run: one path per line. The page has one
+    /// row per path, with no score, line or snippet, and the process's
+    /// `exit_code`. Empty output is a page of no rows.
+    ///
+    /// # Errors
+    ///
+    /// Stdout is not UTF-8, or holds an empty line.
+    pub fn from_files_text(stdout: &[u8], exit_code: i32) -> anyhow::Result<Self> {
+        let mut page = ResultPage {
+            exit_code,
+            ..ResultPage::default()
+        };
+        for path in text_lines(stdout)? {
+            page.rows.push(bare_row(path));
+        }
+        Ok(page)
+    }
+
+    /// Parse the stdout of a `-c` run: one `path:count` per line. The page
+    /// has one row per path and the count of each in `line_counts`.
+    ///
+    /// # Errors
+    ///
+    /// Stdout is not UTF-8, or a line is not `path:count`.
+    pub fn from_counts_text(stdout: &[u8], exit_code: i32) -> anyhow::Result<Self> {
+        let mut page = ResultPage {
+            exit_code,
+            ..ResultPage::default()
+        };
+        for line in text_lines(stdout)? {
+            let (path, count) = line
+                .rsplit_once(':')
+                .with_context(|| format!("count line {line:?} is not path:count"))?;
+            let count = count
+                .parse::<u64>()
+                .with_context(|| format!("count line {line:?} has no integer count"))?;
+            anyhow::ensure!(!path.is_empty(), "count line {line:?} has no path");
+            page.line_counts.insert(path.to_string(), count);
+            page.rows.push(bare_row(path));
+        }
+        Ok(page)
+    }
+}
+
+/// The lines of a text-mode stdout.
+fn text_lines(stdout: &[u8]) -> anyhow::Result<Vec<&str>> {
+    let text = std::str::from_utf8(stdout).context("skim stdout is not UTF-8")?;
+    let lines: Vec<&str> = text.lines().collect();
+    anyhow::ensure!(
+        lines.iter().all(|l| !l.is_empty()),
+        "skim stdout has an empty line"
+    );
+    Ok(lines)
+}
+
+/// A row for a file a text-mode list names: no score, line or snippet.
+fn bare_row(path: &str) -> ResultRow {
+    ResultRow {
+        path: path.to_string(),
+        score: 0.0,
+        line: None,
+        snippet: Vec::new(),
+    }
+}
+
+fn parse_file(value: &Value) -> anyhow::Result<FileEntry> {
+    let obj = as_object(value, "file")?;
+    let path = req_str(obj, "path")?.to_string();
+    let score =
+        req(obj, "score", Value::as_f64, "a number").with_context(|| format!("file {path:?}"))?;
+    let occurrences = parse_each(req_array(obj, "occurrences")?, "occurrences", |o| {
+        parse_occurrence(&path, o)
+    })
+    .with_context(|| format!("file {path:?}"))?;
+    let snippet = occurrences
+        .iter()
+        .map(|o| SnippetLine {
+            line_number: o.line,
+            content: o.text.clone(),
+            is_match: true,
         })
-    }
-
-    /// This page with the corpus accounting of `stats`: `searched_files` is
-    /// the index's file count and `left_out` its persisted skips by reason.
-    /// The current output states neither, so the run takes them from
-    /// `skim search --stats --json`.
-    #[must_use]
-    pub fn with_accounting(self, stats: &StatsSnapshot) -> Self {
-        ResultPage {
-            searched_files: Some(stats.file_count),
-            left_out: Some(stats.skipped_by_reason.clone()),
-            ..self
-        }
-    }
-}
-
-/// The `field` values that name a definition (`SearchField::TypeDefinition`
-/// and `FunctionSignature`).
-const DEFINITION_FIELDS: [&str; 2] = ["type_definition", "function_signature"];
-
-/// The `field` values that name no role this scoreboard uses: the other six
-/// `SearchField` names, and the co-change-only result of `--blast-radius`.
-const OTHER_FIELDS: [&str; 7] = [
-    "symbol_name",
-    "import_export",
-    "function_body",
-    "comment",
-    "string_literal",
-    "other",
-    "co_change_partner",
-];
-
-/// The role a lexical result's `field` gives its matching line: `def` for
-/// a definition field, `None` for any other known field. The binary prints
-/// the name `SearchField::name` returns
-/// (`crates/rskim-search/src/types.rs:154-165`) in
-/// `ResolvedResult::field` (`crates/rskim/src/cmd/search/types.rs:338`), and
-/// `"co_change_partner"` for a co-change-only result
-/// (`crates/rskim/src/cmd/search/query.rs:1234`).
-///
-/// # Errors
-///
-/// The row has no string `field`, or its value is none of those names: a
-/// value this scoreboard does not know is a harness error, never a missing
-/// role.
-fn field_role(row: &Value) -> anyhow::Result<Option<Role>> {
-    let obj = as_object(row, "row")?;
-    let field = opt_str(obj, "field")?.context("row has no `field`")?;
-    if DEFINITION_FIELDS.contains(&field) {
-        Ok(Some(Role::Def))
-    } else if OTHER_FIELDS.contains(&field) {
-        Ok(None)
-    } else {
-        anyhow::bail!(
-            "unknown `field` value {field:?} (known: {})",
-            DEFINITION_FIELDS
-                .iter()
-                .chain(OTHER_FIELDS.iter())
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-/// The line-level answers of a lexical page: one occurrence for each
-/// `is_match` snippet line of a result, with the result's role, and the
-/// definitions, which are the results whose role is `def` and that state a
-/// line. The output states no definition count.
-fn line_answers(rows: &[ResultRow], roles: &[Option<Role>]) -> (Vec<Occurrence>, Definitions) {
-    let mut occurrences = Vec::new();
-    let mut sites = Vec::new();
-    for (row, &role) in rows.iter().zip(roles) {
-        occurrences.extend(
-            row.snippet
-                .iter()
-                .filter(|l| l.is_match)
-                .map(|l| Occurrence {
-                    path: row.path.clone(),
-                    line: l.line_number,
-                    role,
-                }),
-        );
-        if let (Some(Role::Def), Some(line)) = (role, row.line) {
-            sites.push(DefinitionSite {
-                path: row.path.clone(),
-                line,
-            });
-        }
-    }
-    let definitions = Definitions {
-        count: None,
-        at_least: false,
-        sites,
-    };
-    (occurrences, definitions)
-}
-
-fn parse_row(arm: Arm, value: &Value) -> anyhow::Result<ResultRow> {
-    let obj = as_object(value, "row")?;
-    let path = opt_str(obj, "path")?
-        .context("row has no `path`")?
-        .to_string();
-    let score_key = arm.score_key();
-    let score = obj
-        .get(score_key)
-        .and_then(Value::as_f64)
-        .with_context(|| format!("row {path:?} has no numeric `{score_key}`"))?;
-
-    let (line, snippet) = match arm {
-        Arm::Lexical => (opt_u32(obj, "line_number")?, parse_snippet_lines(obj)?),
-        Arm::Ast => {
-            let line = opt_u32(obj, "line")?;
-            let snippet = match (line, opt_str(obj, "snippet")?) {
-                (Some(line_number), Some(content)) => vec![SnippetLine {
-                    line_number,
-                    content: content.to_string(),
-                    is_match: true,
-                }],
-                _ => Vec::new(),
-            };
-            (line, snippet)
-        }
-        Arm::HotCold | Arm::Risky | Arm::BlastRadius => (None, Vec::new()),
-    };
-
-    Ok(ResultRow {
-        path,
-        score,
-        line,
-        snippet,
+        .collect();
+    let line = occurrences.first().map(|o| o.line);
+    Ok(FileEntry {
+        row: ResultRow {
+            path: path.clone(),
+            score,
+            line,
+            snippet,
+        },
+        line_count: req_u64(obj, "line_count").with_context(|| format!("file {path:?}"))?,
+        words_matched: req_u64(obj, "words_matched").with_context(|| format!("file {path:?}"))?,
+        words_total: req_u64(obj, "words_total").with_context(|| format!("file {path:?}"))?,
+        occurrences: occurrences
+            .into_iter()
+            .map(|o| Occurrence {
+                path: path.clone(),
+                line: o.line,
+                role: Some(o.role),
+            })
+            .collect(),
     })
 }
 
-fn parse_snippet_lines(row: &Map<String, Value>) -> anyhow::Result<Vec<SnippetLine>> {
-    let Some(snippet) = row.get("snippet").filter(|v| !v.is_null()) else {
-        return Ok(Vec::new());
-    };
-    let lines = as_object(snippet, "snippet")?
-        .get("lines")
-        .context("snippet has no `lines`")?
-        .as_array()
-        .context("snippet `lines` is not an array")?;
-    lines
+/// One `occurrences[]` element, before it is tied to a page.
+struct ListedLine {
+    line: u32,
+    role: Role,
+    text: String,
+}
+
+fn parse_occurrence(path: &str, value: &Value) -> anyhow::Result<ListedLine> {
+    let obj = as_object(value, "occurrence")?;
+    let name = req_str(obj, "role")?;
+    let role = Role::from_name(name)
+        .with_context(|| format!("{path}: unknown role {name:?} in an occurrence"))?;
+    Ok(ListedLine {
+        line: req(obj, "line", as_line, "a line number")?,
+        role,
+        text: opt_str(obj, "text")?.unwrap_or_default().to_string(),
+    })
+}
+
+fn parse_definitions(value: &Value) -> anyhow::Result<Definitions> {
+    let obj = as_object(value, "`definitions`")?;
+    let sites = parse_each(req_array(obj, "sites")?, "definitions.sites", |site| {
+        let site = as_object(site, "definition site")?;
+        Ok(DefinitionSite {
+            path: req_str(site, "path")?.to_string(),
+            line: req(site, "line", as_line, "a line number")?,
+        })
+    })?;
+    Ok(Definitions {
+        count: Some(req_u64(obj, "count")?),
+        at_least: opt_bool(obj, "at_least")?.unwrap_or(false),
+        sites,
+    })
+}
+
+fn parse_left_out(value: &Value) -> anyhow::Result<BTreeMap<String, u64>> {
+    as_object(value, "`left_out`")?
         .iter()
-        .map(|l| {
-            let obj = as_object(l, "snippet line")?;
-            Ok(SnippetLine {
-                line_number: opt_u32(obj, "line_number")?
-                    .context("snippet line has no `line_number`")?,
-                content: opt_str(obj, "content")?.unwrap_or_default().to_string(),
-                is_match: opt_bool(obj, "is_match")?.unwrap_or(false),
-            })
+        .map(|(reason, n)| {
+            n.as_u64()
+                .map(|n| (reason.clone(), n))
+                .with_context(|| format!("left_out.{reason} is not an integer"))
         })
         .collect()
-}
-
-fn parse_degraded(value: &Value) -> anyhow::Result<Degraded> {
-    let obj = as_object(value, "degraded entry")?;
-    Ok(Degraded {
-        subsystem: opt_str(obj, "subsystem")?
-            .context("degraded entry has no `subsystem`")?
-            .to_string(),
-        reason: opt_str(obj, "reason")?
-            .context("degraded entry has no `reason`")?
-            .to_string(),
-        requested: opt_str(obj, "requested")?.map(str::to_string),
-        applied: opt_str(obj, "applied")?.map(str::to_string),
-    })
-}
-
-// ============================================================================
-// Standalone --ast: rows plus ast_coverage
-// ============================================================================
-
-/// The size-cap accounting a standalone `--ast` envelope carries in
-/// `ast_coverage` (`AstJsonEnvelope`,
-/// `crates/rskim-search/src/compound/output.rs:204-225`; the struct is
-/// `rskim_search::AstCoverage`, `crates/rskim-search/src/ast_index/coverage.rs:81-97`).
-///
-/// skim omits the key when the coverage is clean — no size-excluded and no
-/// undetermined file (`skip_serializing_if`, AD-405-3 / AC-405-9,
-/// `crates/rskim/src/cmd/search/ast.rs:658-670`) — so an absent or `null`
-/// key reads as all-zero.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AstCoverage {
-    /// Indexed files in an AST-participating language over the AST size cap
-    /// (the authoritative total).
-    pub size_excluded_files: u64,
-    /// Indexed files whose size or language skim could not determine.
-    pub undetermined_files: u64,
-    /// `size_excluded_files` by skim language name.
-    pub excluded_by_lang: BTreeMap<String, u64>,
-}
-
-impl AstCoverage {
-    /// Read `ast_coverage` from a standalone `--ast` envelope.
-    ///
-    /// # Errors
-    ///
-    /// `ast_coverage` is present but not an object, lacks an integer
-    /// `size_excluded_files` / `undetermined_files`, or has a non-integer
-    /// `excluded_by_lang` count.
-    pub fn from_envelope(envelope: &Value) -> anyhow::Result<Self> {
-        let obj = as_object(envelope, "skim output")?;
-        let Some(coverage) = obj.get("ast_coverage").filter(|v| !v.is_null()) else {
-            return Ok(AstCoverage::default());
-        };
-        let coverage = as_object(coverage, "ast_coverage")?;
-        let count = |key: &str| {
-            coverage
-                .get(key)
-                .and_then(Value::as_u64)
-                .with_context(|| format!("ast_coverage has no integer `{key}`"))
-        };
-        let excluded_by_lang = match coverage.get("excluded_by_lang") {
-            None | Some(Value::Null) => BTreeMap::new(),
-            Some(v) => as_object(v, "ast_coverage.excluded_by_lang")?
-                .iter()
-                .map(|(lang, n)| {
-                    n.as_u64().map(|n| (lang.clone(), n)).with_context(|| {
-                        format!("ast_coverage.excluded_by_lang.{lang} is not an integer")
-                    })
-                })
-                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
-        };
-        Ok(AstCoverage {
-            size_excluded_files: count("size_excluded_files")?,
-            undetermined_files: count("undetermined_files")?,
-            excluded_by_lang,
-        })
-    }
-}
-
-/// One standalone `--ast <pattern>` answer: its rows and its coverage.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AstPage {
-    pub page: ResultPage,
-    pub coverage: AstCoverage,
-}
-
-impl AstPage {
-    /// Parse a standalone `--ast` envelope.
-    ///
-    /// # Errors
-    ///
-    /// As [`ResultPage::from_json`] for [`Arm::Ast`], and
-    /// [`AstCoverage::from_envelope`].
-    pub fn from_json(value: &Value) -> anyhow::Result<Self> {
-        Ok(AstPage {
-            page: ResultPage::from_json(Arm::Ast, value)?,
-            coverage: AstCoverage::from_envelope(value)?,
-        })
-    }
-}
-
-// ============================================================================
-// --stats --json
-// ============================================================================
-
-/// The parts of `skim search --stats --json` the scoreboard compares
-/// (`build_stats_json`, `crates/rskim/src/cmd/search/mod.rs:2199-2244`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatsSnapshot {
-    /// Files in the index.
-    pub file_count: u64,
-    /// Persisted (producer-phase) skips by reason, zero counts absent —
-    /// compare with [`crate::scoreboard::universe::Universe::persisted_skipped_by_reason`].
-    pub skipped_by_reason: BTreeMap<String, u64>,
-    /// `temporal_state`: the health of skim's temporal data (`"ready"`, or
-    /// `"empty"` / `"corrupt"` / `"newer-schema"` / `"missing"`). `None` when
-    /// the key is absent.
-    pub temporal_state: Option<String>,
-}
-
-impl StatsSnapshot {
-    /// Parse skim's `--stats --json` stdout.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for non-JSON output, skim's `{"error": …}` envelope
-    /// (no index), a missing `file_count`, a non-integer count, or a
-    /// `temporal_state` that is not a string.
-    pub fn parse(stdout: &[u8]) -> anyhow::Result<Self> {
-        let value: Value =
-            serde_json::from_slice(stdout).context("skim --stats stdout is not valid JSON")?;
-        let obj = as_object(&value, "skim --stats output")?;
-        if let Some(err) = obj.get("error") {
-            anyhow::bail!("skim --stats reported an error: {err}");
-        }
-        let file_count = obj
-            .get("file_count")
-            .and_then(Value::as_u64)
-            .context("skim --stats output has no integer `file_count`")?;
-        let skipped_by_reason = match obj.get("skipped_by_reason") {
-            None | Some(Value::Null) => BTreeMap::new(),
-            Some(v) => as_object(v, "skipped_by_reason")?
-                .iter()
-                .map(|(k, n)| {
-                    n.as_u64()
-                        .map(|n| (k.clone(), n))
-                        .with_context(|| format!("skipped_by_reason.{k} is not an integer"))
-                })
-                .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
-        };
-        Ok(StatsSnapshot {
-            file_count,
-            skipped_by_reason,
-            temporal_state: opt_str(obj, "temporal_state")?.map(str::to_string),
-        })
-    }
 }
 
 // ============================================================================
@@ -658,6 +410,28 @@ fn opt<'a, T>(
     }
 }
 
+/// A required key: it must be present, not `null`, and what `get` extracts.
+fn req<'a, T>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+    get: impl Fn(&'a Value) -> Option<T>,
+    what: &str,
+) -> anyhow::Result<T> {
+    opt(obj, key, get, what)?.with_context(|| format!("skim output has no `{key}`"))
+}
+
+fn req_str<'a>(obj: &'a Map<String, Value>, key: &str) -> anyhow::Result<&'a str> {
+    req(obj, key, Value::as_str, "a string")
+}
+
+fn req_u64(obj: &Map<String, Value>, key: &str) -> anyhow::Result<u64> {
+    req(obj, key, Value::as_u64, "an integer")
+}
+
+fn req_array<'a>(obj: &'a Map<String, Value>, key: &str) -> anyhow::Result<&'a [Value]> {
+    req(obj, key, |v| v.as_array().map(Vec::as_slice), "an array")
+}
+
 fn opt_str<'a>(obj: &'a Map<String, Value>, key: &str) -> anyhow::Result<Option<&'a str>> {
     opt(obj, key, Value::as_str, "a string")
 }
@@ -666,14 +440,9 @@ fn opt_bool(obj: &Map<String, Value>, key: &str) -> anyhow::Result<Option<bool>>
     opt(obj, key, Value::as_bool, "a boolean")
 }
 
-/// An integer that fits `u32`.
-fn opt_u32(obj: &Map<String, Value>, key: &str) -> anyhow::Result<Option<u32>> {
-    opt(
-        obj,
-        key,
-        |v| v.as_u64().and_then(|n| u32::try_from(n).ok()),
-        "a line number",
-    )
+/// A JSON integer that fits `u32`.
+fn as_line(value: &Value) -> Option<u32> {
+    value.as_u64().and_then(|n| u32::try_from(n).ok())
 }
 
 /// Parse every element of the JSON array `what`, naming a failing element
@@ -702,9 +471,6 @@ pub enum EntryKind {
     Lexical,
     Pagination,
     Prefix,
-    /// `[[ast]]`: one catalog pattern in one oracle language, scored against
-    /// the structural oracle (#541).
-    Ast,
     /// `[[refs]]`: every site of one name, frozen with its role (#540).
     Refs,
     /// `[[clash]]`: a name with two or more definitions, frozen with its
@@ -719,14 +485,13 @@ pub enum EntryKind {
 /// these by their dotted name).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CheckId {
-    /// Every ground-truth file on the indexed universe is returned.
+    /// Every ground-truth file is returned.
     LexicalRecall,
     /// Every returned file is in the ground truth.
     LexicalPrecision,
-    /// No ground-truth file is missing while `degraded[]` is empty.
+    /// No ground-truth file is missing. The envelope has no channel that
+    /// discloses a missed file, so a miss is always silent.
     LexicalSilentFn,
-    /// JSON `verify_mode` equals the declared mode.
-    LexicalVerifyMode,
     /// The union of all pages equals the full list.
     PaginationComplete,
     /// No file appears on two pages.
@@ -738,21 +503,11 @@ pub enum CheckId {
     PaginationHasMoreHonest,
     /// `--limit N` equals the first N rows of the full list.
     OrderPrefixConsistent,
-    /// `score` is non-increasing down a full list without a temporal sort or
-    /// `--blast-radius`.
+    /// `score` is non-increasing down a full list.
     OrderScoreMonotone,
     /// No path appears twice within one list: the full list, a `--limit`
     /// list, or one page of a sweep.
     ResultsUniquePaths,
-    /// `[[ast]]`: every file the structural oracle matches in the entry's
-    /// language is returned (file-level recall 1.0).
-    StructuralRecall,
-    /// `[[ast]]` with `precision = "hard"`: every returned file of the
-    /// entry's language is an oracle match (file-level precision 1.0).
-    StructuralPrecision,
-    /// `[[ast]]`: the call's `ast_coverage.size_excluded_files` equals the
-    /// oracle's own over-cap count, and nothing is undetermined.
-    StructuralCoverage,
     /// `[[refs]]`: every frozen site is among the page's occurrences.
     RefsRecall,
     /// `[[refs]]`: every frozen call site is an occurrence with the role
@@ -797,7 +552,6 @@ impl CheckId {
         CheckId::LexicalRecall,
         CheckId::LexicalPrecision,
         CheckId::LexicalSilentFn,
-        CheckId::LexicalVerifyMode,
         CheckId::PaginationComplete,
         CheckId::PaginationDisjoint,
         CheckId::PaginationOrdered,
@@ -805,9 +559,6 @@ impl CheckId {
         CheckId::OrderPrefixConsistent,
         CheckId::OrderScoreMonotone,
         CheckId::ResultsUniquePaths,
-        CheckId::StructuralRecall,
-        CheckId::StructuralPrecision,
-        CheckId::StructuralCoverage,
         CheckId::RefsRecall,
         CheckId::RefsCallsRecall,
         CheckId::ClashDefsComplete,
@@ -829,7 +580,6 @@ impl CheckId {
             CheckId::LexicalRecall => "lexical.recall",
             CheckId::LexicalPrecision => "lexical.precision",
             CheckId::LexicalSilentFn => "lexical.silent_fn",
-            CheckId::LexicalVerifyMode => "lexical.verify_mode",
             CheckId::PaginationComplete => "pagination.complete",
             CheckId::PaginationDisjoint => "pagination.disjoint",
             CheckId::PaginationOrdered => "pagination.ordered",
@@ -837,9 +587,6 @@ impl CheckId {
             CheckId::OrderPrefixConsistent => "order.prefix_consistent",
             CheckId::OrderScoreMonotone => "order.score_monotone",
             CheckId::ResultsUniquePaths => "results.unique_paths",
-            CheckId::StructuralRecall => "structural.recall",
-            CheckId::StructuralPrecision => "structural.precision",
-            CheckId::StructuralCoverage => "structural.coverage",
             CheckId::RefsRecall => "refs.recall",
             CheckId::RefsCallsRecall => "refs.calls_recall",
             CheckId::ClashDefsComplete => "clash.defs_complete",
@@ -866,15 +613,12 @@ impl CheckId {
             | CheckId::PaginationOrdered
             | CheckId::PaginationHasMoreHonest => kind == EntryKind::Pagination,
             CheckId::OrderPrefixConsistent => kind == EntryKind::Prefix,
-            // An `[[ast]]` entry is judged by the structural oracle; the
-            // standalone `--ast` arm's ordering is `[[prefix]]` territory.
             // `[[refs]]`, `[[clash]]` and `[[stakes]]` have their own
             // oracles and checks, so no lexical or ordering check runs on
             // them.
             CheckId::LexicalRecall
             | CheckId::LexicalPrecision
             | CheckId::LexicalSilentFn
-            | CheckId::LexicalVerifyMode
             | CheckId::OrderScoreMonotone => matches!(
                 kind,
                 EntryKind::Ident
@@ -886,9 +630,6 @@ impl CheckId {
             // Every entry kind fetches a full list of file rows, one row per
             // path, so the check applies to the new kinds too.
             CheckId::ResultsUniquePaths => true,
-            CheckId::StructuralRecall
-            | CheckId::StructuralPrecision
-            | CheckId::StructuralCoverage => kind == EntryKind::Ast,
             CheckId::RefsRecall | CheckId::RefsCallsRecall | CheckId::UniverseAccounted => {
                 kind == EntryKind::Refs
             }
@@ -971,227 +712,235 @@ impl CheckOutcome {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn page(arm: Arm, json: &str) -> anyhow::Result<ResultPage> {
-        ResultPage::parse(arm, json.as_bytes())
+    fn occurrence(line: u32, role: &str, text: &str) -> Value {
+        json!({
+            "line": line, "column": 1, "role": role, "holder": null,
+            "holder_range": null, "text": text, "text_truncated_bytes": 0,
+        })
     }
 
-    // --- lexical envelope (QueryOutput) --------------------------------------
+    fn file(path: &str, matched: u64, total: u64, lines: &[(u32, &str)]) -> Value {
+        json!({
+            "path": path, "rank": 1, "score": 12.5, "prior": "source", "labelled": true,
+            "words_matched": matched, "words_total": total,
+            "line_count": lines.len(),
+            "roles": {"def": 0, "call": 0, "ref": 0, "import": 0, "string": 0,
+                      "comment": 0, "text": 0, "partial": 0, "unlabelled": 0},
+            "occurrences": lines.iter().map(|(n, r)| occurrence(*n, r, "x")).collect::<Vec<_>>(),
+            "occurrences_elided": 0,
+        })
+    }
+
+    fn envelope(files: Vec<Value>) -> Value {
+        json!({
+            "query": "q", "match_mode": "literal", "case": "sensitive", "view": "labelled",
+            "total_lines": 0, "total_files": files.len(), "has_more": false,
+            "definitions": {"count": 1, "at_least": false, "sites": [
+                {"path": "src/a.rs", "line": 7, "first_line": 7, "end_line": 9, "holder": null}
+            ]},
+            "files": files,
+            "searched_files": 40,
+            "left_out": {"binary": 2, "not_utf8": 0, "too_large": 1, "unreadable": 0,
+                         "vanished": 0, "outside_root": 0, "symlink": 3},
+            "parse": {"files": 2, "bytes": 90, "budget_hit": false, "unlabelled_files": 1},
+            "cost": {"files_read": 40, "bytes_read": 1000, "files_parsed": 2, "bytes_parsed": 90},
+            "notices": [], "duration_ms": 3,
+        })
+    }
+
+    fn page(value: &Value) -> anyhow::Result<ResultPage> {
+        ResultPage::parse(value.to_string().as_bytes())
+    }
+
+    // --- the envelope ---------------------------------------------------------
 
     #[test]
-    fn lexical_page_defaults_every_omitted_envelope_field() {
-        // has_more / verify_mode / degraded are all skip_serializing_if in skim.
-        let p = page(
-            Arm::Lexical,
-            r#"{"query":"check_staleness","total":1,"duration_ms":3,
-                "results":[{"path":"src/a.rs","score":2.5,"field":"function_signature",
-                            "line_number":12,"line_range":{"start":12,"end":13},
-                            "snippet":{"lines":[{"line_number":12,"content":"fn check_staleness()","is_match":true}]},
-                            "stale":false}]}"#,
-        )
+    fn a_page_reads_rows_occurrences_definitions_and_accounting_from_the_envelope() {
+        let p = page(&envelope(vec![
+            file("src/a.rs", 1, 1, &[(7, "def"), (20, "call")]),
+            file("src/b.rs", 1, 1, &[(3, "ref")]),
+        ]))
         .unwrap();
-        assert!(!p.has_more);
-        assert_eq!(p.verify_mode, VerifyMode::Substring);
-        assert!(p.degraded.is_empty());
+
+        let paths: Vec<&str> = p.rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["src/a.rs", "src/b.rs"]);
+        assert_eq!(p.rows[0].score, 12.5);
+        assert_eq!(p.rows[0].line, Some(7), "the line of the first occurrence");
         assert_eq!(
-            p.rows,
-            vec![ResultRow {
-                path: "src/a.rs".to_string(),
-                score: 2.5,
-                line: Some(12),
-                snippet: vec![SnippetLine {
-                    line_number: 12,
-                    content: "fn check_staleness()".to_string(),
-                    is_match: true,
+            p.rows[0].snippet,
+            vec![
+                SnippetLine {
+                    line_number: 7,
+                    content: "x".into(),
+                    is_match: true
+                },
+                SnippetLine {
+                    line_number: 20,
+                    content: "x".into(),
+                    is_match: true
+                },
+            ]
+        );
+        let found: Vec<(&str, u32, Option<Role>)> = p
+            .occurrences
+            .iter()
+            .map(|o| (o.path.as_str(), o.line, o.role))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("src/a.rs", 7, Some(Role::Def)),
+                ("src/a.rs", 20, Some(Role::Call)),
+                ("src/b.rs", 3, Some(Role::Ref)),
+            ]
+        );
+        assert_eq!(
+            p.definitions,
+            Some(Definitions {
+                count: Some(1),
+                at_least: false,
+                sites: vec![DefinitionSite {
+                    path: "src/a.rs".into(),
+                    line: 7
                 }],
-            }]
+            })
         );
-    }
-
-    #[test]
-    fn lexical_page_reads_has_more_verify_mode_and_degraded() {
-        let p = page(
-            Arm::Lexical,
-            r#"{"total":0,"has_more":true,"verify_mode":"phrase_near","results":[],
-                "degraded":[{"subsystem":"temporal","reason":"missing","requested":"hot",
-                             "applied":"lexical","message":"m","remediation":"r"}]}"#,
-        )
-        .unwrap();
-        assert!(p.has_more);
-        assert_eq!(p.verify_mode, VerifyMode::PhraseNear);
+        assert_eq!(p.searched_files, Some(40));
+        let left_out = p.left_out.unwrap();
+        assert_eq!(left_out.get("symlink"), Some(&3));
+        assert_eq!(left_out.len(), 7);
+        assert_eq!(p.unlabelled_files, 1);
         assert_eq!(
-            p.degraded,
-            vec![Degraded {
-                subsystem: "temporal".to_string(),
-                reason: "missing".to_string(),
-                requested: Some("hot".to_string()),
-                applied: Some("lexical".to_string()),
-            }]
+            p.cost,
+            Some(Cost {
+                files_read: 40,
+                bytes_read: 1000,
+                files_parsed: 2,
+                bytes_parsed: 90
+            })
         );
+        assert_eq!(p.line_counts.get("src/a.rs"), Some(&2));
+        assert!(!p.has_more);
+        assert_eq!(p.exit_code, 0);
     }
 
     #[test]
-    fn short_query_rows_carry_a_null_line() {
-        let p = page(
-            Arm::Lexical,
-            r#"{"results":[{"path":"a.rs","score":0.0,"field":"other","line_number":null,"snippet":null}]}"#,
-        )
-        .unwrap();
+    fn a_file_with_no_occurrence_has_no_line() {
+        let p = page(&envelope(vec![file("a.rs", 1, 1, &[])])).unwrap();
         assert_eq!(p.rows[0].line, None);
         assert!(p.rows[0].snippet.is_empty());
     }
 
     #[test]
-    fn verify_mode_names_map_and_unknown_names_are_kept() {
-        for (name, mode) in [
-            ("phrase", VerifyMode::Phrase),
-            ("near", VerifyMode::Near),
-            ("phrase_near", VerifyMode::PhraseNear),
-            ("fuzzy", VerifyMode::Unknown("fuzzy".to_string())),
-        ] {
-            let json = format!(r#"{{"verify_mode":"{name}","results":[]}}"#);
-            assert_eq!(
-                page(Arm::Lexical, &json).unwrap().verify_mode,
-                mode,
-                "{name}"
-            );
-        }
+    fn has_more_is_read_when_present() {
+        let mut e = envelope(vec![]);
+        e["has_more"] = json!(true);
+        assert!(page(&e).unwrap().has_more);
     }
 
     #[test]
-    fn verify_mode_follows_the_declared_match_mode() {
-        use crate::scoreboard::oracle::MatchMode;
-        assert_eq!(VerifyMode::from(MatchMode::And), VerifyMode::Substring);
-        assert_eq!(VerifyMode::from(MatchMode::Phrase), VerifyMode::Phrase);
-        assert_eq!(
-            VerifyMode::from(MatchMode::Near { span: 5 }),
-            VerifyMode::Near
-        );
-        assert_eq!(
-            VerifyMode::from(MatchMode::PhraseNear { span: 5 }),
-            VerifyMode::PhraseNear
-        );
-    }
-
-    // --- other arms ---------------------------------------------------------
-
-    #[test]
-    fn ast_rows_use_line_and_a_string_snippet() {
-        let p = page(
-            Arm::Ast,
-            r#"{"mode":"ast","pattern":"god-function","description":"d","total":2,
-                "results":[{"path":"a.rs","score":1.5,"line":7,"snippet":"fn big() {","layers_matched":["ast"]},
-                           {"path":"b.rs","score":1.0,"layers_matched":["ast"]}]}"#,
-        )
-        .unwrap();
-        assert!(!p.has_more);
-        assert_eq!(p.rows[0].line, Some(7));
-        assert_eq!(
-            p.rows[0].snippet,
-            vec![SnippetLine {
-                line_number: 7,
-                content: "fn big() {".to_string(),
-                is_match: true,
-            }]
-        );
-        assert_eq!((p.rows[1].line, p.rows[1].snippet.len()), (None, 0));
+    fn a_no_match_envelope_is_an_empty_page() {
+        let p = page(&envelope(vec![])).unwrap();
+        assert!(p.rows.is_empty() && p.occurrences.is_empty());
+        assert_eq!(p.searched_files, Some(40));
     }
 
     #[test]
-    fn temporal_arms_read_their_own_score_key() {
-        let hot = page(
-            Arm::HotCold,
-            r#"{"mode":"hot","total":1,"has_more":true,"results":[{"path":"a.rs","hotspot_score":0.9,"changes_30d":1,"changes_90d":2}]}"#,
-        )
+    fn word_view_fallback_files_are_not_rows_and_state_no_occurrence() {
+        let p = page(&envelope(vec![
+            file("both.rs", 2, 2, &[(4, "text")]),
+            file("one_word.rs", 1, 2, &[(9, "text"), (10, "text")]),
+        ]))
         .unwrap();
-        assert_eq!((hot.rows[0].score, hot.has_more), (0.9, true));
+        let paths: Vec<&str> = p.rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["both.rs"]);
+        assert_eq!(p.occurrences.len(), 1);
+        assert_eq!(p.occurrences[0].path, "both.rs");
+        assert!(!p.line_counts.contains_key("one_word.rs"));
+    }
 
-        let risky = page(
-            Arm::Risky,
-            r#"{"mode":"risky","total":1,"results":[{"path":"a.rs","risk_score":0.4,"fix_density":0.1,"fix_commits":1,"total_commits":9}]}"#,
-        )
-        .unwrap();
-        assert_eq!(risky.rows[0].score, 0.4);
-
-        let blast = page(
-            Arm::BlastRadius,
-            r#"{"mode":"blast-radius","target":"a.rs","total":1,"results":[{"path":"b.rs","jaccard":0.25,"count":3}]}"#,
-        )
-        .unwrap();
-        assert_eq!((blast.rows[0].score, blast.rows[0].line), (0.25, None));
+    #[test]
+    fn the_row_reads_no_field_key() {
+        let mut f = file("a.rs", 1, 1, &[(1, "def")]);
+        f["field"] = json!("not_a_known_field");
+        assert!(page(&envelope(vec![f])).is_ok());
     }
 
     // --- malformed output is an error (harness error, exit 2) ----------------
 
     #[test]
-    fn malformed_output_is_rejected() {
-        for (arm, json) in [
-            (Arm::Lexical, "skim search: no index found"),
-            (Arm::Lexical, r#"{"total":0}"#),
-            (Arm::Lexical, r#"{"results":{}}"#),
-            (
-                Arm::Lexical,
-                r#"{"results":[{"score":1.0,"field":"other"}]}"#,
-            ),
-            (
-                Arm::Lexical,
-                r#"{"results":[{"path":"a.rs","score":"high","field":"other"}]}"#,
-            ),
-            (
-                Arm::Lexical,
-                r#"{"results":[{"path":"a.rs","field":"other"}]}"#,
-            ),
-            (Arm::Lexical, r#"{"has_more":"yes","results":[]}"#),
-            (Arm::Lexical, r#"{"verify_mode":3,"results":[]}"#),
-            (
-                Arm::Lexical,
-                r#"{"results":[{"path":"a.rs","score":1.0,"field":"other","line_number":-1}]}"#,
-            ),
-            (Arm::HotCold, r#"{"results":[{"path":"a.rs","score":1.0}]}"#),
-        ] {
-            assert!(page(arm, json).is_err(), "{arm:?}: {json}");
-        }
-    }
-
-    // --- stats ----------------------------------------------------------------
-
-    #[test]
-    fn stats_snapshot_reads_file_count_and_persisted_skips() {
-        let s = StatsSnapshot::parse(
-            br#"{"file_count":828,"total_ngrams":1,"skipped":[{"path":"a.js","reason":"minified"}],
-                "skipped_by_reason":{"minified":1},"git_head_state":"resolved"}"#,
-        )
-        .unwrap();
-        assert_eq!(s.file_count, 828);
-        assert_eq!(
-            s.skipped_by_reason,
-            BTreeMap::from([("minified".to_string(), 1)])
+    fn an_error_envelope_is_an_error_naming_the_message() {
+        let err = page(&json!({"error": "invalid regex: oops"})).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid regex: oops"),
+            "{err:#}"
         );
     }
 
     #[test]
-    fn stats_snapshot_without_skips_has_an_empty_breakdown() {
-        let s = StatsSnapshot::parse(br#"{"file_count":3}"#).unwrap();
-        assert!(s.skipped_by_reason.is_empty());
+    fn a_key_the_scoreboard_reads_is_required() {
+        for key in [
+            "files",
+            "definitions",
+            "searched_files",
+            "left_out",
+            "parse",
+            "cost",
+        ] {
+            let mut e = envelope(vec![]);
+            e.as_object_mut().unwrap().remove(key);
+            let err = page(&e).unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{key}: {err:#}");
+        }
     }
 
     #[test]
-    fn stats_snapshot_reads_the_temporal_state_when_present() {
-        let ready = StatsSnapshot::parse(br#"{"file_count":3,"temporal_state":"ready"}"#).unwrap();
-        assert_eq!(ready.temporal_state.as_deref(), Some("ready"));
-        let refused =
-            StatsSnapshot::parse(br#"{"file_count":3,"temporal_state":"newer-schema"}"#).unwrap();
-        assert_eq!(refused.temporal_state.as_deref(), Some("newer-schema"));
-        let absent = StatsSnapshot::parse(br#"{"file_count":3}"#).unwrap();
-        assert_eq!(absent.temporal_state, None);
-        assert!(StatsSnapshot::parse(br#"{"file_count":3,"temporal_state":2}"#).is_err());
+    fn a_file_needs_its_path_score_counts_and_occurrences() {
+        for key in [
+            "path",
+            "score",
+            "words_matched",
+            "words_total",
+            "line_count",
+            "occurrences",
+        ] {
+            let mut f = file("a.rs", 1, 1, &[(1, "def")]);
+            f.as_object_mut().unwrap().remove(key);
+            let err = page(&envelope(vec![f])).unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{key}: {err:#}");
+        }
     }
 
     #[test]
-    fn stats_error_envelope_is_surfaced() {
-        let err = StatsSnapshot::parse(br#"{"error":"no index found","cache_dir":"/x"}"#)
-            .expect_err("an error envelope is not a snapshot");
-        assert!(err.to_string().contains("no index found"), "{err}");
+    fn an_unknown_role_is_a_harness_error_naming_the_value() {
+        let err = page(&envelope(vec![file("a.rs", 1, 1, &[(1, "bogus")])])).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("bogus") && text.contains("a.rs"), "{text}");
+    }
+
+    #[test]
+    fn values_of_the_wrong_type_are_rejected() {
+        let mut e = envelope(vec![]);
+        e["searched_files"] = json!("forty");
+        assert!(page(&e).is_err());
+        let mut e = envelope(vec![]);
+        e["left_out"]["binary"] = json!("two");
+        assert!(page(&e).is_err());
+        let mut e = envelope(vec![file("a.rs", 1, 1, &[(1, "def")])]);
+        e["files"][0]["occurrences"][0]["line"] = json!(-1);
+        assert!(page(&e).is_err());
+        let mut e = envelope(vec![]);
+        e["has_more"] = json!("yes");
+        assert!(page(&e).is_err());
+    }
+
+    #[test]
+    fn output_that_is_not_a_json_object_is_rejected() {
+        assert!(ResultPage::parse(b"not json").is_err());
+        assert!(ResultPage::parse(b"[]").is_err());
+        assert!(ResultPage::parse(b"").is_err());
     }
 
     // --- checks ----------------------------------------------------------------
@@ -1204,15 +953,20 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", check.as_str()));
             assert_eq!(serde_json::from_str::<CheckId>(&json).unwrap(), *check);
         }
-        assert_eq!(CheckId::ALL.len(), 27);
-        for (check, name) in [
-            (CheckId::StructuralRecall, "structural.recall"),
-            (CheckId::StructuralPrecision, "structural.precision"),
-            (CheckId::StructuralCoverage, "structural.coverage"),
-        ] {
-            assert_eq!(name.parse::<CheckId>().unwrap(), check);
-        }
+        assert_eq!(CheckId::ALL.len(), 23);
         assert!("lexical.recal".parse::<CheckId>().is_err());
+    }
+
+    #[test]
+    fn the_structural_and_verify_mode_checks_are_gone() {
+        for name in [
+            "structural.recall",
+            "structural.precision",
+            "structural.coverage",
+            "lexical.verify_mode",
+        ] {
+            assert!(name.parse::<CheckId>().is_err(), "{name}");
+        }
     }
 
     #[test]
@@ -1223,20 +977,21 @@ mod tests {
         assert!(!CheckId::OrderPrefixConsistent.applies_to(EntryKind::Pagination));
         assert!(CheckId::OrderScoreMonotone.applies_to(EntryKind::Prefix));
         assert!(CheckId::LexicalRecall.applies_to(EntryKind::Concept));
-        for kind in [
-            EntryKind::Ident,
-            EntryKind::Concept,
-            EntryKind::Lexical,
-            EntryKind::Pagination,
-            EntryKind::Prefix,
-            EntryKind::Ast,
-            EntryKind::Refs,
-            EntryKind::Clash,
-            EntryKind::Stakes,
-        ] {
+        for kind in ALL_KINDS {
             assert!(CheckId::ResultsUniquePaths.applies_to(kind), "{kind:?}");
         }
     }
+
+    const ALL_KINDS: [EntryKind; 8] = [
+        EntryKind::Ident,
+        EntryKind::Concept,
+        EntryKind::Lexical,
+        EntryKind::Pagination,
+        EntryKind::Prefix,
+        EntryKind::Refs,
+        EntryKind::Clash,
+        EntryKind::Stakes,
+    ];
 
     #[test]
     fn lexical_and_ordering_checks_never_apply_to_refs_clash_or_stakes_entries() {
@@ -1246,17 +1001,14 @@ mod tests {
             CheckId::LexicalRecall,
             CheckId::LexicalPrecision,
             CheckId::LexicalSilentFn,
-            CheckId::LexicalVerifyMode,
             CheckId::OrderScoreMonotone,
             CheckId::OrderPrefixConsistent,
             CheckId::PaginationComplete,
-            CheckId::StructuralRecall,
         ] {
             for kind in [EntryKind::Refs, EntryKind::Clash, EntryKind::Stakes] {
                 assert!(!check.applies_to(kind), "{check} on {kind:?}");
             }
         }
-        // The five older kinds keep their lexical checks.
         for kind in [
             EntryKind::Ident,
             EntryKind::Concept,
@@ -1265,43 +1017,6 @@ mod tests {
             EntryKind::Prefix,
         ] {
             assert!(CheckId::LexicalRecall.applies_to(kind), "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn structural_checks_apply_to_ast_entries_only() {
-        let structural = [
-            CheckId::StructuralRecall,
-            CheckId::StructuralPrecision,
-            CheckId::StructuralCoverage,
-        ];
-        for check in structural {
-            assert!(check.applies_to(EntryKind::Ast), "{check}");
-            for kind in [
-                EntryKind::Ident,
-                EntryKind::Concept,
-                EntryKind::Lexical,
-                EntryKind::Pagination,
-                EntryKind::Prefix,
-                EntryKind::Refs,
-                EntryKind::Clash,
-                EntryKind::Stakes,
-            ] {
-                assert!(!check.applies_to(kind), "{check} on {kind:?}");
-            }
-        }
-        // An [[ast]] entry has no lexical oracle, and its standalone list is
-        // path-ordered (#547): no lexical or ordering check can apply.
-        for check in [
-            CheckId::LexicalRecall,
-            CheckId::LexicalPrecision,
-            CheckId::LexicalSilentFn,
-            CheckId::LexicalVerifyMode,
-            CheckId::OrderScoreMonotone,
-            CheckId::OrderPrefixConsistent,
-            CheckId::PaginationComplete,
-        ] {
-            assert!(!check.applies_to(EntryKind::Ast), "{check}");
         }
     }
 
@@ -1346,21 +1061,10 @@ mod tests {
             (CheckId::StakesCounts, "stakes.counts", EntryKind::Stakes),
             (CheckId::StakesExit, "stakes.exit", EntryKind::Stakes),
         ];
-        let kinds = [
-            EntryKind::Ident,
-            EntryKind::Concept,
-            EntryKind::Lexical,
-            EntryKind::Pagination,
-            EntryKind::Prefix,
-            EntryKind::Ast,
-            EntryKind::Refs,
-            EntryKind::Clash,
-            EntryKind::Stakes,
-        ];
         for (check, name, own) in table {
             assert_eq!(check.as_str(), name);
             assert_eq!(name.parse::<CheckId>().unwrap(), check);
-            for kind in kinds {
+            for kind in ALL_KINDS {
                 assert_eq!(check.applies_to(kind), kind == own, "{check} on {kind:?}");
             }
         }
@@ -1385,276 +1089,12 @@ mod tests {
         assert_eq!(Role::from_name(""), None);
     }
 
-    // --- the adapter for the current search output (#540) ---------------------
-
-    /// A `skim search --json` envelope as the current binary prints it (skim
-    /// 2.11.0, `--limit 10 -- check_staleness` over a three-file repository),
-    /// less the `index_stats` object. The first file defines the name, the
-    /// second calls it, and the match line is the `is_match` snippet line.
-    const CURRENT_ENVELOPE: &str = r#"{"query":"check_staleness","total":2,"results":[
-        {"path":"staleness.rs","score":3.636363557547579,"field":"function_signature",
-         "line_number":2,"line_range":{"start":2,"end":3},
-         "snippet":{"lines":[
-            {"line_number":1,"content":"// staleness checks","is_match":false},
-            {"line_number":2,"content":"pub fn check_staleness() -> bool {","is_match":true},
-            {"line_number":3,"content":"    true","is_match":false},
-            {"line_number":4,"content":"}","is_match":false}]},
-         "stale":false},
-        {"path":"other.rs","score":0.6818181670401711,"field":"function_body",
-         "line_number":2,"line_range":{"start":2,"end":3},
-         "snippet":{"lines":[
-            {"line_number":1,"content":"fn refresh() {","is_match":false},
-            {"line_number":2,"content":"    if check_staleness() {}","is_match":true},
-            {"line_number":3,"content":"}","is_match":false},
-            {"line_number":4,"content":"// check_staleness is here","is_match":false}]},
-         "stale":false}],
-        "duration_ms":2}"#;
-
-    fn occurrence(path: &str, line: u32, role: Option<Role>) -> Occurrence {
-        Occurrence {
-            path: path.to_string(),
-            line,
-            role,
-        }
-    }
-
-    #[test]
-    fn the_adapter_reads_occurrences_and_definition_sites_from_a_recorded_current_envelope() {
-        let page = page(Arm::Lexical, CURRENT_ENVELOPE).unwrap();
-        // One occurrence per result: its `is_match` line, never a context line.
-        assert_eq!(
-            page.occurrences,
-            vec![
-                occurrence("staleness.rs", 2, Some(Role::Def)),
-                occurrence("other.rs", 2, None),
-            ]
-        );
-        // The definition sites are the results whose field names a definition.
-        assert_eq!(
-            page.definitions,
-            Some(Definitions {
-                count: None,
-                at_least: false,
-                sites: vec![DefinitionSite {
-                    path: "staleness.rs".to_string(),
-                    line: 2,
-                }],
-            })
-        );
-    }
-
-    #[test]
-    fn the_current_output_states_nothing_beyond_occurrences_and_definition_sites() {
-        let page = page(Arm::Lexical, CURRENT_ENVELOPE).unwrap();
-        assert_eq!(page.unlabelled_files, 0);
-        assert_eq!(page.searched_files, None);
-        assert_eq!(page.left_out, None);
-        assert!(page.line_counts.is_empty());
-        assert_eq!(page.cost, None);
-        assert_eq!(page.exit_code, 0);
-    }
-
-    #[test]
-    fn every_field_value_the_current_binary_prints_maps_to_a_role() {
-        // `SearchField::name` (eight values) and the co-change stub.
-        for (field, role) in [
-            ("type_definition", Some(Role::Def)),
-            ("function_signature", Some(Role::Def)),
-            ("symbol_name", None),
-            ("import_export", None),
-            ("function_body", None),
-            ("comment", None),
-            ("string_literal", None),
-            ("other", None),
-            ("co_change_partner", None),
-        ] {
-            let json = format!(
-                r#"{{"results":[{{"path":"a.rs","score":1.0,"field":"{field}","line_number":3,
-                    "snippet":{{"lines":[{{"line_number":3,"content":"x","is_match":true}}]}}}}]}}"#
-            );
-            let p = page(Arm::Lexical, &json).unwrap();
-            assert_eq!(p.occurrences, vec![occurrence("a.rs", 3, role)], "{field}");
-        }
-    }
-
-    #[test]
-    fn an_unknown_field_value_is_a_harness_error_naming_the_value() {
-        for field in ["text", "Function_Signature", "", "functionSignature"] {
-            let json = format!(
-                r#"{{"results":[{{"path":"a.rs","score":1.0,"field":"{field}","line_number":3}}]}}"#
-            );
-            let err = page(Arm::Lexical, &json).expect_err("an unknown field value");
-            let msg = format!("{err:#}");
-            assert!(msg.contains("field"), "{field:?}: {msg}");
-            assert!(msg.contains(&format!("{field:?}")), "{field:?}: {msg}");
-        }
-    }
-
-    #[test]
-    fn a_lexical_row_without_a_string_field_is_a_harness_error() {
-        for row in [
-            r#"{"path":"a.rs","score":1.0,"line_number":3}"#,
-            r#"{"path":"a.rs","score":1.0,"field":null,"line_number":3}"#,
-            r#"{"path":"a.rs","score":1.0,"field":7,"line_number":3}"#,
-        ] {
-            let json = format!(r#"{{"results":[{row}]}}"#);
-            assert!(page(Arm::Lexical, &json).is_err(), "{row}");
-        }
-    }
-
-    #[test]
-    fn a_result_with_no_snippet_or_line_gives_no_occurrence_and_no_definition_site() {
-        // A query under three bytes: `line_number` and `snippet` are null.
-        let p = page(
-            Arm::Lexical,
-            r#"{"results":[{"path":"a.rs","score":0.0,"field":"function_signature",
-                            "line_number":null,"snippet":null}]}"#,
-        )
-        .unwrap();
-        assert!(p.occurrences.is_empty());
-        assert_eq!(p.definitions.unwrap().sites, vec![]);
-    }
-
-    #[test]
-    fn an_empty_lexical_page_reports_no_definition_sites() {
-        let p = page(Arm::Lexical, r#"{"results": []}"#).unwrap();
-        assert!(p.occurrences.is_empty());
-        let definitions = p.definitions.expect("a lexical page states definitions");
-        assert_eq!(definitions.count, None);
-        assert!(definitions.sites.is_empty());
-    }
-
-    #[test]
-    fn definition_sites_keep_the_rank_order_of_the_results() {
-        let row = |path: &str, field: &str, line: u32| {
-            format!(
-                r#"{{"path":"{path}","score":1.0,"field":"{field}","line_number":{line},
-                    "snippet":{{"lines":[{{"line_number":{line},"content":"x","is_match":true}}]}}}}"#
-            )
-        };
-        let json = format!(
-            r#"{{"results":[{},{},{}]}}"#,
-            row("b.rs", "type_definition", 9),
-            row("c.rs", "function_body", 4),
-            row("a.rs", "function_signature", 1)
-        );
-        let sites = page(Arm::Lexical, &json)
-            .unwrap()
-            .definitions
-            .unwrap()
-            .sites;
-        let at: Vec<(&str, u32)> = sites.iter().map(|s| (s.path.as_str(), s.line)).collect();
-        assert_eq!(at, [("b.rs", 9), ("a.rs", 1)]);
-    }
-
-    #[test]
-    fn the_other_arms_state_no_line_level_answers() {
-        // Their rows carry no `field`, and they name no definition.
-        let p = page(
-            Arm::HotCold,
-            r#"{"results":[{"path":"a.rs","hotspot_score":0.9}]}"#,
-        )
-        .unwrap();
-        assert!(p.occurrences.is_empty());
-        assert_eq!(p.definitions, None);
-        let p = page(
-            Arm::Ast,
-            r#"{"results":[{"path":"a.rs","score":1.5,"line":7,"snippet":"fn big() {"}]}"#,
-        )
-        .unwrap();
-        assert!(p.occurrences.is_empty());
-        assert_eq!(p.definitions, None);
-    }
-
-    #[test]
-    fn the_corpus_accounting_comes_from_the_stats_snapshot() {
-        let stats = StatsSnapshot::parse(
-            br#"{"file_count":828,"skipped_by_reason":{"minified":1,"binary":2}}"#,
-        )
-        .unwrap();
-        let p = page(Arm::Lexical, CURRENT_ENVELOPE)
-            .unwrap()
-            .with_accounting(&stats);
-        assert_eq!(p.searched_files, Some(828));
-        assert_eq!(
-            p.left_out,
-            Some(BTreeMap::from([
-                ("binary".to_string(), 2),
-                ("minified".to_string(), 1)
-            ]))
-        );
-        // Nothing else changes.
-        assert_eq!(p.rows.len(), 2);
-        assert_eq!(p.occurrences.len(), 2);
-    }
-
-    // --- standalone --ast coverage ------------------------------------------------
-
-    #[test]
-    fn a_clean_ast_envelope_omits_ast_coverage_and_reads_as_zero() {
-        let page = AstPage::from_json(
-            &serde_json::from_str(
-                r#"{"mode":"ast","pattern":"try-catch","description":"d","total":1,
-                    "results":[{"path":"a.ts","score":1.0,"line":3,"snippet":"} catch (e) {"}]}"#,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(page.coverage, AstCoverage::default());
-        assert_eq!(page.page.rows[0].line, Some(3));
-        let null = serde_json::json!({"results": [], "ast_coverage": null});
-        assert_eq!(
-            AstCoverage::from_envelope(&null).unwrap(),
-            AstCoverage::default()
-        );
-    }
-
-    #[test]
-    fn ast_coverage_reads_the_excluded_and_undetermined_counts() {
-        let envelope = serde_json::json!({
-            "results": [],
-            "ast_coverage": {
-                "size_eligible_files": 810,
-                "size_excluded_files": 2,
-                "undetermined_files": 0,
-                "excluded_by_lang": {"rust": 1, "javascript": 1},
-                "excluded": [{"path": "a.rs", "lang": "rust", "size_bytes": 2000000,
-                              "limit_bytes": 1048576, "reason": "ast_size_cap"}]
-            }
-        });
-        assert_eq!(
-            AstCoverage::from_envelope(&envelope).unwrap(),
-            AstCoverage {
-                size_excluded_files: 2,
-                undetermined_files: 0,
-                excluded_by_lang: BTreeMap::from([
-                    ("javascript".to_string(), 1),
-                    ("rust".to_string(), 1)
-                ]),
-            }
-        );
-    }
-
-    #[test]
-    fn malformed_ast_coverage_is_rejected() {
-        for coverage in [
-            serde_json::json!([]),
-            serde_json::json!({"undetermined_files": 0}),
-            serde_json::json!({"size_excluded_files": "2", "undetermined_files": 0}),
-            serde_json::json!({"size_excluded_files": 2}),
-            serde_json::json!({"size_excluded_files": 2, "undetermined_files": 0,
-                               "excluded_by_lang": {"rust": -1}}),
-        ] {
-            let envelope = serde_json::json!({"results": [], "ast_coverage": coverage});
-            assert!(AstCoverage::from_envelope(&envelope).is_err(), "{coverage}");
-        }
-    }
-
     #[test]
     fn check_outcome_reports_pass_and_fail() {
         assert!(CheckOutcome::Pass.is_pass());
-        let fail = CheckOutcome::fail("2 files never shown");
-        assert!(!fail.is_pass());
-        assert_eq!(fail.detail(), Some("2 files never shown"));
+        assert_eq!(CheckOutcome::Pass.detail(), None);
+        let f = CheckOutcome::fail("missing a.rs");
+        assert!(!f.is_pass());
+        assert_eq!(f.detail(), Some("missing a.rs"));
     }
 }

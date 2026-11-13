@@ -2,16 +2,27 @@
 //! tree-sitter queries that encode each catalog pattern's documented
 //! description, run over the real grammars.
 //!
+//! # Status
+//!
+//! The `--ast` flag is removed from `skim search` (skim 3.0.0), and nothing
+//! scores the pattern queries any more: `queries/<pattern>.<lang>.scm`, the
+//! registry and the post-filters have no consumer. They stay until a later
+//! change removes them. The language table ([`OracleLang`], [`classify`]),
+//! [`OracleScratch`] and `first_line` are used by the role oracle
+//! ([`crate::roles`]) and by `golden-gen`. A path such as
+//! `crates/rskim-search/src/...` in this file names a source file of the
+//! removed `rskim-search` crate as it was in skim 2.x. It does not exist in the
+//! work tree.
+//!
 //! # Independence
 //!
 //! This crate depends on no `rskim-*` crate (`tests/independence.rs` checks
 //! every dependency table of its manifest), so nothing from skim's AST search
 //! stack — linearization, n-grams, the query engine, re-parse verification —
-//! can reach an answer. Not even skim's pattern catalog is an input: the
-//! oracle knows its own registry by pattern NAME ([`query_sources`],
-//! [`UNCOVERED`], [`coverage_of`]), and the scoreboard (`rskim-bench`) crosses
-//! it with the catalog it reads, so a catalog pattern with no oracle query is
-//! listed as uncovered instead of silently skipped. Where the oracle must
+//! can reach an answer. Not even a list of skim patterns is an input: the
+//! oracle keeps its own registry by pattern NAME ([`query_sources`],
+//! [`UNCOVERED`], [`coverage_of`]), and `rskim-bench` reads no list of skim
+//! patterns to cross it with. Where the oracle must
 //! agree with skim (the extension table, the AST-indexed language list, the
 //! size cap) it keeps its OWN copy with a citation, so a policy change on
 //! skim's side shows up as a scoreboard diff (the `oracle.rs` / `universe.rs`
@@ -22,13 +33,10 @@
 //!
 //! Each `(pattern, language)` pair has one query file,
 //! `crates/rskim-oracle/queries/<pattern>.<lang>.scm`, compiled in with
-//! `include_str!` and hashed into the scoreboard's golden digest
-//! ([`fingerprint`], with every other table an answer depends on), so editing
-//! a query forces a re-bless. Each query file's second line,
+//! `include_str!`. Each query file's second line,
 //! `; Grammar: <crate> <version>`, names the grammar it was written against,
 //! and a test keeps it equal to the version the workspace `Cargo.lock`
-//! resolves: a grammar bump fails that test until the headers are edited,
-//! and the edit changes the digest, so the gate asks for a bless.
+//! resolves: a grammar bump fails that test until the headers are edited.
 //! `.tsx` files are parsed with the TSX grammar (SEARCH-ADR-007: an
 //! independent ground-truth oracle parses with the real grammar; #571),
 //! although skim parses them with the plain TypeScript grammar.
@@ -584,7 +592,7 @@ pub const UNCOVERED: &[(&str, &str)] = &[
 pub const UNCLASSIFIED_REASON: &str =
     "no oracle query registered and no reason recorded (a catalog pattern newer than the oracle)";
 
-/// The text of one registered query, for the golden digest.
+/// The text of one registered query, for the fingerprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuerySource {
     /// Catalog pattern name.
@@ -656,11 +664,10 @@ const ORACLE_INPUTS: OracleInputs<'static> = OracleInputs {
 /// attribute kinds `PostFilter`'s body-element count skips; every
 /// registered query (file name, post-filter, full text), ordered by pattern
 /// and language name; and every intent spec. Each is written out explicitly
-/// (never through `Debug`), so the text is stable across toolchains. The
-/// golden digest folds it in (`rskim-bench`'s
-/// `golden::structural_oracle_sha256`), so an edit
-/// to any of them — a query, a post-filter threshold, an intent's node kinds,
-/// a file's language class or an attribute kind — forces a re-bless.
+/// (never through `Debug`), so the text is stable across toolchains. The tests
+/// prove that an edit to any of them — a query, a post-filter threshold, an
+/// intent's node kinds, a file's language class or an attribute kind — changes
+/// the text. No scoreboard digest folds it in now.
 ///
 /// The text names query files, never directories, so moving the queries does
 /// not change it.

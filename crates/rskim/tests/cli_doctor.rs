@@ -9,10 +9,10 @@
 //! NOT a git repository), pinned by `common::skim_sandboxed` itself; the one test
 //! that needs a repository chains its own `current_dir`. For `skim doctor` the
 //! default makes the staleness-vs-HEAD check skip deterministically and cannot
-//! cause spurious exit-1s. For `skim init` it matters more: a successful install
-//! ends by walking ancestors of the cwd for a project root and writing
-//! `post-commit`, `post-merge` and `post-checkout` into that repository — at the
-//! cargo-supplied cwd, the skim clone this test binary was built from.
+//! cause spurious exit-1s. For `skim init` it matters more: an install walks
+//! ancestors of the cwd for a project root and rewrites `post-commit`,
+//! `post-merge` and `post-checkout` in that repository — at the cargo-supplied
+//! cwd, the skim clone this test binary was built from.
 //!
 //! ## PATH isolation
 //!
@@ -43,9 +43,9 @@ use std::os::unix::fs::PermissionsExt;
 /// prompts and to confine mutations to the known `.claude/hooks/` path.
 ///
 /// The cwd pin is deliberate redundancy: `common::skim_sandboxed` already sets
-/// it, and it is restated at this file's only install site because the hooks
-/// `install_search_integration` writes when the cwd encloses a repository land in
-/// the developer's working copy, outside every directory the sandbox owns.
+/// it, and it is restated at this file's only install site because the old-hook
+/// cleanup of `skim init` rewrites the hooks of a repository that encloses the
+/// cwd, in the developer's working copy, outside every directory the sandbox owns.
 fn do_sandboxed_init(home: &std::path::Path) {
     common::skim_sandboxed(home)
         .args([
@@ -790,9 +790,9 @@ fn test_doctor_dev_marker_with_verified_manifest_waives_commit_gate() {
 /// script: the installed hook must declare dev mode and `skim doctor` must
 /// render it as `dev-pinned`, never as `✓`.
 ///
-/// `current_dir(home)` keeps `install_search_integration` out of the repository
-/// the test runs from — with no `.git` above the sandbox it finds no project
-/// root and spawns no background index build.
+/// `current_dir(home)` keeps the old-hook cleanup of `skim init` out of the
+/// repository the test runs from — with no `.git` above the sandbox it finds no
+/// project root and rewrites no hook.
 #[test]
 fn test_doctor_renders_a_dev_flag_install_as_dev_pinned() {
     let home = TempDir::new().unwrap();
@@ -1043,5 +1043,177 @@ fn test_doctor_foreign_symlink_is_advisory_not_exit_1() {
         target,
         std::path::Path::new("/bin/sh"),
         "doctor must not modify the foreign symlink target"
+    );
+}
+
+// ============================================================================
+// Old search data (skim 2.x)
+// ============================================================================
+
+/// The block that skim 2.x wrote into the search hooks.
+const OLD_SEARCH_BLOCK: &str =
+    "# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end\n";
+
+/// `skim doctor` reports old search hooks and old index data as advisory notes.
+/// It sets no drift verdict, changes no exit code, and writes nothing.
+///
+/// The repository is a fake one in the sandbox home (an empty `.git/hooks` is
+/// enough for the project-root walk). The same `doctor` run before the old data
+/// exists is the baseline for the exit code and the status line.
+#[test]
+fn test_doctor_reports_old_search_data_as_advisory_with_no_exit_change() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("repo");
+    let hooks = project.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let run_doctor = || {
+        common::skim_sandboxed(home)
+            .arg("doctor")
+            .current_dir(&project)
+            .env("PATH", common::hermetic_path())
+            .output()
+            .unwrap()
+    };
+
+    let clean = run_doctor();
+    let clean_stdout = String::from_utf8_lossy(&clean.stdout).into_owned();
+    assert!(
+        !clean_stdout.contains("Old search"),
+        "no old data yet, so no note:\n{clean_stdout}"
+    );
+
+    // The old hooks, with a foreign line, and one old index folder of 2,000,000 bytes.
+    let hook_text = format!("#!/bin/sh\necho mine\n{OLD_SEARCH_BLOCK}");
+    std::fs::write(hooks.join("post-commit"), &hook_text).unwrap();
+    let shard = home
+        .join(".cache")
+        .join("skim")
+        .join("search")
+        .join("0123456789abcdef");
+    std::fs::create_dir_all(&shard).unwrap();
+    std::fs::write(shard.join("index.skpost"), vec![b'x'; 2_000_000]).unwrap();
+
+    let found = run_doctor();
+    let found_stdout = String::from_utf8_lossy(&found.stdout).into_owned();
+
+    assert!(
+        found_stdout.contains("Old search git hooks: found in"),
+        "the old hook block must be reported:\n{found_stdout}"
+    );
+    assert!(
+        found_stdout.contains("run skim init (it needs an installed agent"),
+        "the note must name the remedy:\n{found_stdout}"
+    );
+    assert!(
+        found_stdout.contains("Old search index data: 1 folders, 2.0 MB in"),
+        "the old index data must be reported with its size:\n{found_stdout}"
+    );
+    assert!(
+        found_stdout.contains("run skim --clear-cache"),
+        "the note must name the remedy:\n{found_stdout}"
+    );
+    assert_eq!(
+        found.status.code(),
+        clean.status.code(),
+        "an advisory note must not change the exit code"
+    );
+    let status_line = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("Status:"))
+            .map(str::to_string)
+    };
+    assert_eq!(status_line(&found_stdout), status_line(&clean_stdout));
+
+    // Doctor only reports: the hook and the index file are as they were.
+    assert_eq!(
+        std::fs::read_to_string(hooks.join("post-commit")).unwrap(),
+        hook_text
+    );
+    assert_eq!(
+        std::fs::metadata(shard.join("index.skpost")).unwrap().len(),
+        2_000_000
+    );
+}
+
+/// The doctor line for old search hooks names `skim init` first. It names
+/// `skim init --uninstall` only as the way to remove skim completely, because that
+/// command takes skim out of every agent. It also says that `skim init` changes
+/// nothing when no agent is installed.
+#[test]
+fn test_doctor_old_search_hooks_line_names_skim_init_before_uninstall() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("repo");
+    let hooks = project.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("post-merge"), OLD_SEARCH_BLOCK).unwrap();
+
+    let output = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(&project)
+        .env("PATH", common::hermetic_path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("Old search git hooks"))
+        .unwrap_or_else(|| panic!("the old hook block must be reported:\n{stdout}"));
+    let first_init = line.find("skim init").expect("the line names skim init");
+    let uninstall = line
+        .find("skim init --uninstall")
+        .expect("the line names the way to remove skim completely");
+    assert_ne!(
+        first_init, uninstall,
+        "skim init must come before skim init --uninstall:\n{line}"
+    );
+    assert!(
+        line.contains("it needs an installed agent; with none it changes nothing"),
+        "the line must say what skim init does with no agent:\n{line}"
+    );
+    assert!(
+        line.contains("To remove skim completely, run skim init --uninstall"),
+        "the line must name --uninstall as the way to remove skim:\n{line}"
+    );
+}
+
+/// A cache folder that cannot be inspected must not look like a cache folder
+/// without old data. `skim doctor` says that it could not read the folder, as an
+/// advisory note: the exit code and the status line do not change.
+#[test]
+fn test_doctor_says_when_the_old_search_folder_cannot_be_read() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("repo");
+    std::fs::create_dir_all(project.join(".git").join("hooks")).unwrap();
+    // A file where the cache folder should be: `<cache>/search` cannot be inspected.
+    let broken_cache = home.join("cache-is-a-file");
+    std::fs::write(&broken_cache, b"not a folder").unwrap();
+    let run_doctor = |cache: Option<&std::path::Path>| {
+        let mut cmd = common::skim_sandboxed(home);
+        cmd.arg("doctor")
+            .current_dir(&project)
+            .env("PATH", common::hermetic_path());
+        if let Some(cache) = cache {
+            cmd.env("SKIM_CACHE_DIR", cache);
+        }
+        cmd.output().unwrap()
+    };
+
+    let baseline = run_doctor(None);
+    let broken = run_doctor(Some(&broken_cache));
+    let broken_stdout = String::from_utf8_lossy(&broken.stdout).into_owned();
+
+    assert!(
+        broken_stdout.contains("Old search index data: could not read")
+            && broken_stdout.contains("check the folder by hand"),
+        "an unreadable folder must be reported:\n{broken_stdout}"
+    );
+    assert_eq!(
+        broken.status.code(),
+        baseline.status.code(),
+        "an advisory note must not change the exit code"
     );
 }

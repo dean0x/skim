@@ -21,17 +21,17 @@ language = "Rust"
 
 [[repos]]
 url = "https://github.com/BurntSushi/ripgrep"
-commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"   # = corpus.toml / ast-corpus.toml / cochange-corpus.toml
+commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"
 language = "Rust"
 
 [[repos]]
 url = "https://github.com/pallets/flask"
-commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"   # = corpus.toml / cochange-corpus.toml (ast-corpus.toml pins 36e4a824…, not used)
+commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"
 language = "Python"
 
 [[repos]]
 url = "https://github.com/colinhacks/zod"
-commit = "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5"   # = ast-corpus.toml
+commit = "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5"
 language = "TypeScript"
 
 # Documented fallback for the TypeScript corpus (NOT active). Swap it in for

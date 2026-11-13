@@ -595,6 +595,10 @@ fn run_install_single(
         println!();
     }
 
+    // Before the fast path, so that an install that is already current still
+    // loses the search git hooks that skim 2.x wrote.
+    remove_legacy_search_hooks(flags.dry_run);
+
     // Before the fast path, so that a current install still loses the entries
     // that skim no longer seeds.
     let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run);
@@ -823,76 +827,96 @@ fn execute_install(
         inject_guidance(agent_from_state(state)?, global, env)?;
     }
 
-    // Search hooks + background index — non-fatal, delegated to helper.
-    install_search_integration();
-
     Ok(())
 }
 
-/// Install search git hooks and spawn a background index build.
+/// Remove the search git hooks that skim 2.x installed in the repository around
+/// the current folder.
 ///
-/// Non-fatal: all failures are printed as notices but do not abort the caller.
-/// `find_git_root_from_cwd` already verifies `.git` exists, so no inner `.git`
-/// check is needed — the outer `if let Some(...)` is the only guard required.
-fn install_search_integration() {
+/// Called by `skim init` and `skim init --uninstall`. Nothing is installed and no
+/// program is started. Only the old block goes; every other line of each hook
+/// stays (see `cmd::search::hooks`). With `dry_run`, it names the directory and
+/// writes nothing. Non-fatal: a failure is a note and does not stop the caller.
+/// A hook that cannot be read or rewritten gets its own note, and the other hooks
+/// are still cleaned. Outside a git repository it does nothing.
+pub(super) fn remove_legacy_search_hooks(dry_run: bool) {
     let Some(project_root) = find_git_root_from_cwd() else {
         return;
     };
-
-    match crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
-        Err(e) => eprintln!("  Note: could not install search hooks: {e}"),
-        Ok(outcome) => {
-            println!("  {} Search hooks installed", check_mark(true));
-            // AC34(b): when `resolve_hooks_dir` routes to `<commondir>/hooks`
-            // (a linked worktree), print the resolved path in the skim init stdout
-            // stream.  `install_search_hooks` already emits SHARED_HOOKS_SCOPE_MSG
-            // to stderr for all callers; this line adds the absolute path disclosure
-            // in the `skim init` output itself.
-            //
-            // Gate on `outcome.shared` (the `is_shared_hooks_dir` predicate carried
-            // in the result), NOT on path inequality.  Path inequality fired for git
-            // submodules too — their gitdir is `<super>/.git/modules/<name>`, which
-            // differs from `<root>/.git/hooks` even though no clone-wide sharing
-            // is occurring (the submodule gitdir has no `commondir` file).
-            //
-            // Normalize the path before printing: `resolve_git_dir` returns the
-            // joined raw pointer for `.git`-file repos, which for a submodule contains
-            // `..` components (e.g. `/repo/sub/../.git/modules/sub/hooks`).  Canonical
-            // form is cleaner to read.  Fall back to the raw path if the directory
-            // has not been created yet (should not happen — create_dir_all ran above).
-            if outcome.shared {
-                let display_dir = outcome
-                    .dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| outcome.dir.clone());
-                // F8: use {:?} to quote ESC/CR/LF from repository-controlled
-                // gitdir pointers (AD-413-3 / ADR-008).
+    if dry_run {
+        if let Some(finding) = crate::cmd::search::hooks::find_search_hooks(&project_root) {
+            if finding.block_found {
                 println!(
-                    "    note: hooks installed in {:?} (shared by every worktree of this clone)",
-                    display_dir
+                    "  [dry-run] Would remove old search git hooks from {:?}",
+                    finding.dir
                 );
             }
+            for failure in &finding.unreadable {
+                eprintln!("{}", legacy_hooks_failure_note(failure));
+            }
+        }
+        return;
+    }
+    let result = crate::cmd::search::hooks::remove_search_hooks(&project_root);
+    for line in legacy_hooks_lines(&result) {
+        match line {
+            LegacyHooksLine::Removed(line) => println!("{line}"),
+            LegacyHooksLine::Failed(note) => eprintln!("{note}"),
         }
     }
+}
 
-    // Spawn a background build — fire-and-forget, non-blocking, non-fatal.
-    //
-    // The `Child` handle is intentionally dropped without calling `wait()`.
-    // On Unix the child process is reparented to init (PID 1) when this
-    // process exits and will be reaped there.  The `skim init` command exits
-    // immediately after this block, so the window for a zombie entry in the
-    // process table is negligible.  The build lock in `build_index` prevents
-    // concurrent writes when multiple callers overlap.
-    if let Ok(exe) = std::env::current_exe()
-        && let Ok(child) = std::process::Command::new(&exe)
-            .args(["search", "--build"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-    {
-        eprintln!("  Search index build started (PID {})", child.id());
-        drop(child); // Detach: do not wait for the background process.
+/// What `skim init` says once the removal of the old search git hooks has run.
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyHooksLine {
+    /// A block was removed: a line for stdout.
+    Removed(String),
+    /// The removal failed: a note for stderr.
+    Failed(String),
+}
+
+/// The lines for the outcome of `remove_search_hooks`: the removal line when a
+/// block went, then one note for each hook that could not be read or rewritten.
+/// Empty when no hook held a block and every hook could be read.
+fn legacy_hooks_lines(
+    result: &anyhow::Result<crate::cmd::search::hooks::HooksOutcome>,
+) -> Vec<LegacyHooksLine> {
+    match result {
+        Ok(outcome) => {
+            let mut lines = Vec::new();
+            if outcome.changed {
+                // `{:?}` quotes ESC/CR/LF that a repository-controlled path can hold.
+                lines.push(LegacyHooksLine::Removed(format!(
+                    "  {} Old search git hooks removed from {:?}",
+                    check_mark(true),
+                    outcome.dir
+                )));
+            }
+            lines.extend(
+                outcome
+                    .failures
+                    .iter()
+                    .map(|failure| LegacyHooksLine::Failed(legacy_hooks_failure_note(failure))),
+            );
+            lines
+        }
+        Err(e) => vec![LegacyHooksLine::Failed(format!(
+            "  Note: could not remove old search git hooks: {e}"
+        ))],
     }
+}
+
+/// The note for one hook that skim could not read or rewrite.
+fn legacy_hooks_failure_note(failure: &crate::cmd::search::hooks::HookFailure) -> String {
+    format!("  Note: could not remove old search git hooks: {failure}")
+}
+
+/// What the hooks of the repository around the current folder hold: a hook that
+/// still has the old search block, or a hook that cannot be read. `skim doctor`
+/// reports it. Writes nothing.
+pub(crate) fn old_search_hooks_finding() -> Option<crate::cmd::search::hooks::HooksFinding> {
+    let project_root = find_git_root_from_cwd()?;
+    crate::cmd::search::hooks::find_search_hooks(&project_root)
 }
 
 /// Install or prompt for shell wrapper installation in `~/.skim/bin/`.
@@ -983,12 +1007,11 @@ fn print_wrapper_install_result(result: &super::wrappers::InstallResult, dry_run
 ///
 /// # Note
 ///
-/// `crate::cmd::search::walk::discover_project_root` performs a similar walk
-/// but returns `anyhow::Result<PathBuf>` (falling back to `cwd` when no `.git`
-/// is found) and canonicalises the start path first.  This function has
-/// different semantics: callers here need `None` to mean "not a git repo" so
-/// they can skip hook installation entirely.  The two functions are kept separate
-/// to preserve the distinct caller contracts.
+/// The root lookup of `skim search` performs a similar walk but falls back to
+/// `cwd` when no `.git` is found and canonicalises the start path first.  This
+/// function has different semantics: callers here need `None` to mean "not a
+/// git repo" so they can skip the old-hook cleanup entirely.  The two lookups are
+/// kept separate to preserve the distinct caller contracts.
 fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut current = cwd.as_path();
@@ -2625,6 +2648,91 @@ mod tests {
         assert!(
             !super::permissions_blocks_fast_path(&flags, AgentKind::ClaudeCode, tmp.path()),
             "None with no sidecar must not block the fast path"
+        );
+    }
+
+    // ---- the note about the removal of the old search git hooks ----
+
+    fn outcome(
+        changed: bool,
+        failures: Vec<crate::cmd::search::hooks::HookFailure>,
+    ) -> anyhow::Result<crate::cmd::search::hooks::HooksOutcome> {
+        Ok(crate::cmd::search::hooks::HooksOutcome {
+            dir: std::path::PathBuf::from("/r/.git/hooks"),
+            changed,
+            failures,
+        })
+    }
+
+    fn unreadable(name: &str) -> crate::cmd::search::hooks::HookFailure {
+        crate::cmd::search::hooks::HookFailure {
+            path: std::path::PathBuf::from("/r/.git/hooks").join(name),
+            step: crate::cmd::search::hooks::HookStep::Read,
+            kind: std::io::ErrorKind::PermissionDenied,
+        }
+    }
+
+    #[test]
+    fn test_legacy_hooks_lines_is_a_note_when_the_removal_fails() {
+        let failure: anyhow::Result<crate::cmd::search::hooks::HooksOutcome> = Err(
+            anyhow::anyhow!("\"/r/sub\" is a subdirectory of the git repository \"/r\""),
+        );
+
+        assert_eq!(
+            super::legacy_hooks_lines(&failure),
+            vec![super::LegacyHooksLine::Failed(
+                "  Note: could not remove old search git hooks: \"/r/sub\" is a subdirectory of the git repository \"/r\""
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_legacy_hooks_lines_names_the_folder_when_a_block_was_removed() {
+        let lines = super::legacy_hooks_lines(&outcome(true, Vec::new()));
+
+        let [super::LegacyHooksLine::Removed(line)] = lines.as_slice() else {
+            panic!("a removed block must give one line for stdout: {lines:?}");
+        };
+
+        assert!(
+            line.ends_with("Old search git hooks removed from \"/r/.git/hooks\""),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_hooks_lines_is_empty_when_no_hook_held_a_block() {
+        assert_eq!(
+            super::legacy_hooks_lines(&outcome(false, Vec::new())),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn test_legacy_hooks_lines_gives_a_note_for_each_unreadable_hook_beside_the_removal() {
+        let lines = super::legacy_hooks_lines(&outcome(
+            true,
+            vec![unreadable("post-commit"), unreadable("post-checkout")],
+        ));
+
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            matches!(&lines[0], super::LegacyHooksLine::Removed(line)
+                if line.contains("Old search git hooks removed from")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            super::LegacyHooksLine::Failed(
+                "  Note: could not remove old search git hooks: could not read hook \"/r/.git/hooks/post-commit\" (permission denied)"
+                    .to_string()
+            )
+        );
+        assert!(
+            matches!(&lines[2], super::LegacyHooksLine::Failed(note)
+                if note.contains("post-checkout")),
+            "{lines:?}"
         );
     }
 }

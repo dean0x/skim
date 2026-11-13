@@ -15,7 +15,7 @@ updated: 2026-11-12
 - **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. A whole-file read keeps the exact hash input it had before, so no warm entry is orphaned.
 - **KB-INV-2** A successful symbol read prints its stderr notice on every run, warm or cold, because the reader sees part of the file. The notice is stored in the cache entry, and the read records no analytics row.
 - **KB-INV-3** A variable declared in a function body (TypeScript, JavaScript, Go) is a local and is not a declaration. A variable at the top level is a declaration.
-- **KB-INV-4** The search engine (PR 3) reuses `Declaration.name_bytes`, `enclosing_declaration`, `DeclScan.truncated` and `Parser::parse_bounded`. Keep their signatures and meaning.
+- **KB-INV-4** The search engine reuses `Declaration.name_bytes`, `enclosing_declaration`, `DeclScan.truncated` and `Parser::new_for_extension`. Keep their signatures and meaning. Search parses with plain `parse` and has no time bound.
 - **KB-AP-1** Never treat a name that is missing from `DeclScan.decls` as absent from the file when `DeclScan.truncated` is true. The walk may not have reached it.
 - **KB-AP-2** Do not expect a declaration for a C or C++ function. Its name sits under the `declarator` field, the generic rule needs a `name` field, so the scan finds nothing.
 
@@ -23,7 +23,7 @@ updated: 2026-11-12
 
 `skim FILE --symbol NAME` prints the raw source lines of one named declaration. The work has two halves.
 
-- `rskim-core` owns the declaration rule (`decl.rs`): one walk over a tree-sitter tree gives a list of `Declaration` values. It reads no file and keeps no state. `Parser` in `types.rs` gives two helpers for it: `new_for_extension` and `parse_bounded`.
+- `rskim-core` owns the declaration rule (`decl.rs`): one walk over a tree-sitter tree gives a list of `Declaration` values. It reads no file and keeps no state. `Parser` in `types.rs` gives two helpers for it: `new_for_extension` and `parse_bounded` (only tests call `parse_bounded`).
 - `rskim` owns the reader. `symbol.rs` holds the pure parts (select, render, notice, errors). `process.rs` holds the pipeline (read, parse, scan, cache). `main.rs` holds the argument checks. `cache.rs` holds the cache identity.
 
 No mode transform runs. The output is the lines `git show` would show for that range. The read uses `Mode::Full` only as a cache-key value.
@@ -66,7 +66,7 @@ For `Language::TypeScript` and the extension `tsx` (any case) it loads the TSX g
 - A stop calls `reset()` on the parser. Without it, the next parse would resume at the stop point, whatever source it gets. Test `parser_after_a_stopped_parse_gives_the_tree_a_new_parser_gives` pins this.
 - If the tree is `None` and the callback did not stop it, the result is `SkimError::ParseError`.
 - The callback runs only about once per 100 parse steps. A source short enough to finish before the first call always parses, even with `Duration::ZERO`. A test that wants a stop needs a large source (`many_rust_functions(5000)` in `tests/decl.rs`).
-- The symbol read does not call it: `process_symbol_file` uses plain `parse`. Only tests call it today.
+- No production code calls it. The symbol read (`process_symbol_file`) and `skim search` (`roles.rs`) use plain `parse`, which has no time bound. Only tests call it today.
 
 ## The reader
 
@@ -145,6 +145,5 @@ The generic rule needs `child_by_field_name("name")`. In C and C++ the function 
 
 - `.devflow/features/file-wrapper-fidelity/KNOWLEDGE.md`: elision markers, the unconditional loss-bearing notice class, byte fidelity.
 - `.devflow/features/analytics/KNOWLEDGE.md`: why a symbol read records no row; `SKIM_CACHE_DIR` and test isolation.
-- `.devflow/features/ast-index/KNOWLEDGE.md`: `AstWalkIter` and `AstWalkConfig`, the walk primitive that `declarations` uses.
-- `.devflow/features/cmd-search/KNOWLEDGE.md`: the search layer that PR 3 extends with `enclosing_declaration` and `parse_bounded`.
-- `crates/rskim-core/src/ast_walk.rs`: the cap constants.
+- `.devflow/features/cmd-search/KNOWLEDGE.md`: the search layer that uses `declarations`, `enclosing_declaration` and `new_for_extension`.
+- `crates/rskim-core/src/ast_walk.rs`: `AstWalkIter` and `AstWalkConfig`, the walk primitive that `declarations` uses, and the cap constants.

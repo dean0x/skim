@@ -1,10 +1,6 @@
-//! Unit tests for `structural.rs` (co-located file, `#[path]`-included).
-//!
-//! The tests that need skim's pattern catalog live in `rskim-bench`
-//! (`src/scoreboard/catalog_tests.rs`), which reads the catalog: every query
-//! matches its pattern's catalog example and rejects a near-miss (AC-1), and
-//! every catalog pattern is covered or listed uncovered with a reason. This
-//! crate never reads the catalog.
+//! Unit tests for `structural.rs` (co-located file, `#[path]`-included): the
+//! query registry, the match semantics of each pattern, the language table,
+//! the size cap and the fingerprint.
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
@@ -891,12 +887,12 @@ fn file_matches_reports_every_pattern_of_the_language() {
 }
 
 // ============================================================================
-// Golden fingerprint: every table an answer depends on
+// Fingerprint: every table an answer depends on
 // ============================================================================
 
 /// Renders each edited copy of the oracle inputs and asserts that its
 /// fingerprint differs from the compiled-in inputs' and from every other
-/// edit's, so each edit is proven to reach the golden digest on its own.
+/// edit's, so each edit is proven to reach the fingerprint on its own.
 fn assert_each_edit_changes_the_fingerprint<'a>(
     edits: impl IntoIterator<Item = (&'a str, OracleInputs<'a>)>,
 ) {
@@ -1281,7 +1277,7 @@ fn every_query_names_the_grammar_version_cargo_lock_resolves() {
     assert!(
         problems.is_empty(),
         "query grammar headers disagree with Cargo.lock (a grammar bump must edit every \
-         header it touches, which changes the golden digest and asks for a bless):\n{}",
+         header it touches):\n{}",
         problems.join("\n")
     );
 }

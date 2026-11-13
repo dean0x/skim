@@ -1,6 +1,6 @@
 //! Corpus configuration loader.
 //!
-//! Reads a TOML file describing the repos to clone and analyze.
+//! Reads a TOML file describing the repos to clone and score.
 
 use std::path::Path;
 
@@ -19,38 +19,10 @@ pub struct RepoEntry {
     pub url: String,
     pub commit: String,
     pub language: String,
-    /// When `true`, clone the full repository history (no `--depth 1`).
-    ///
-    /// Required for co-change analysis which needs complete git history.
-    /// Defaults to `false` for backward compatibility.
-    #[serde(default)]
-    pub deep_clone: bool,
 }
 
-/// The set of language strings accepted in corpus.toml.
+/// The set of language strings accepted in a corpus config.
 const VALID_LANGUAGES: &[&str] = &["Rust", "TypeScript", "Python", "Go", "Java"];
-
-/// The set of language strings accepted in ast-corpus.toml.
-///
-/// Covers all 14 tree-sitter languages (the 3 serde-based languages — JSON, YAML,
-/// TOML — are intentionally excluded because `rskim_core::Parser::new()` returns
-/// `Err` for them).
-pub const AST_VALID_LANGUAGES: &[&str] = &[
-    "Rust",
-    "TypeScript",
-    "JavaScript",
-    "Python",
-    "Go",
-    "Java",
-    "C",
-    "Cpp",
-    "CSharp",
-    "Ruby",
-    "SQL",
-    "Kotlin",
-    "Swift",
-    "Markdown",
-];
 
 /// Load and validate a corpus config from a TOML file.
 ///
@@ -72,41 +44,7 @@ pub fn load_corpus_config(path: &Path) -> anyhow::Result<CorpusConfig> {
     Ok(config)
 }
 
-/// Load and validate an AST corpus config from a TOML file.
-///
-/// Like [`load_corpus_config`] but validates against [`AST_VALID_LANGUAGES`]
-/// (14 tree-sitter languages) and accepts `"HEAD"` as a valid commit reference
-/// in addition to 40-character hex SHAs.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read, is not valid TOML, or
-/// contains invalid values (unsupported AST language, bad commit ref, non-https URL).
-pub fn load_ast_corpus_config(path: &Path) -> anyhow::Result<CorpusConfig> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading ast corpus config from {}", path.display()))?;
-
-    let config: CorpusConfig =
-        toml::from_str(&raw).with_context(|| "parsing ast corpus config TOML")?;
-
-    for (i, repo) in config.repos.iter().enumerate() {
-        validate_ast_repo(i, repo)?;
-    }
-
-    Ok(config)
-}
-
-/// Shared validation for fields common to both corpus configs.
-///
-/// Checks HTTPS URL and validates the commit reference using the provided
-/// validator closure. Language validation is intentionally left to the caller
-/// because each corpus accepts a different set of languages.
-fn validate_repo_common(
-    index: usize,
-    repo: &RepoEntry,
-    is_valid_commit: impl Fn(&str) -> bool,
-    commit_hint: &str,
-) -> anyhow::Result<()> {
+fn validate_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
     // Validate URL must use HTTPS.
     if !repo.url.starts_with("https://") {
         bail!(
@@ -116,47 +54,14 @@ fn validate_repo_common(
         );
     }
 
-    // Validate commit using the caller-supplied predicate.
-    if !is_valid_commit(&repo.commit) {
+    // Validate the commit is a full hex SHA.
+    if !(repo.commit.len() == 40 && repo.commit.chars().all(|ch| ch.is_ascii_hexdigit())) {
         bail!(
-            "repos[{}]: commit must be {}, got: {}",
+            "repos[{}]: commit must be a 40-character hex SHA, got: {}",
             index,
-            commit_hint,
             repo.commit
         );
     }
-
-    Ok(())
-}
-
-fn validate_ast_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
-    validate_repo_common(
-        index,
-        repo,
-        |c| c == "HEAD" || (c.len() == 40 && c.chars().all(|ch| ch.is_ascii_hexdigit())),
-        "'HEAD' or a 40-character hex SHA",
-    )?;
-
-    // Validate language is one of the AST-supported target languages.
-    if !AST_VALID_LANGUAGES.contains(&repo.language.as_str()) {
-        bail!(
-            "repos[{}]: unsupported AST language '{}'; valid options are: {}",
-            index,
-            repo.language,
-            AST_VALID_LANGUAGES.join(", ")
-        );
-    }
-
-    Ok(())
-}
-
-fn validate_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
-    validate_repo_common(
-        index,
-        repo,
-        |c| c.len() == 40 && c.chars().all(|ch| ch.is_ascii_hexdigit()),
-        "a 40-character hex SHA",
-    )?;
 
     // Validate language is one of the supported target languages.
     if !VALID_LANGUAGES.contains(&repo.language.as_str()) {
@@ -238,82 +143,16 @@ language = "Python"
         assert!(err.to_string().contains("https://"));
     }
 
-    // ── AST corpus config tests ──────────────────────────────────────────────
-
     #[test]
-    fn ast_config_accepts_ast_languages() {
+    fn head_is_not_a_commit() {
         let content = r#"
 [[repos]]
-url = "https://github.com/BurntSushi/ripgrep"
-commit = "4649aa9700619f94cf9c66876e9549d83420e16c"
+url = "https://github.com/example/repo"
+commit = "HEAD"
 language = "Rust"
-
-[[repos]]
-url = "https://github.com/facebook/react"
-commit = "HEAD"
-language = "JavaScript"
-
-[[repos]]
-url = "https://github.com/dotnet/roslyn"
-commit = "HEAD"
-language = "CSharp"
 "#;
         let (_dir, path) = write_temp_toml(content);
-        let config = load_ast_corpus_config(&path).expect("valid AST config");
-        assert_eq!(config.repos.len(), 3);
-    }
-
-    #[test]
-    fn ast_config_accepts_head_commit() {
-        let content = r#"
-[[repos]]
-url = "https://github.com/facebook/react"
-commit = "HEAD"
-language = "JavaScript"
-"#;
-        let (_dir, path) = write_temp_toml(content);
-        let config = load_ast_corpus_config(&path).expect("HEAD should be accepted");
-        assert_eq!(config.repos[0].commit, "HEAD");
-    }
-
-    #[test]
-    fn ast_config_rejects_invalid_ast_language() {
-        let content = r#"
-[[repos]]
-url = "https://github.com/example/repo"
-commit = "HEAD"
-language = "Haskell"
-"#;
-        let (_dir, path) = write_temp_toml(content);
-        let err = load_ast_corpus_config(&path).expect_err("Haskell not in AST languages");
-        assert!(err.to_string().contains("unsupported AST language"));
-    }
-
-    #[test]
-    fn ast_config_rejects_serde_only_language() {
-        // JSON/YAML/TOML are not tree-sitter languages — must be rejected
-        let content = r#"
-[[repos]]
-url = "https://github.com/example/repo"
-commit = "HEAD"
-language = "Json"
-"#;
-        let (_dir, path) = write_temp_toml(content);
-        let err = load_ast_corpus_config(&path).expect_err("JSON not in AST languages");
-        assert!(err.to_string().contains("unsupported AST language"));
-    }
-
-    #[test]
-    fn existing_config_unchanged_by_ast_additions() {
-        // Verify that the original load_corpus_config still rejects Cpp (only valid in AST).
-        let content = r#"
-[[repos]]
-url = "https://github.com/opencv/opencv"
-commit = "4649aa9700619f94cf9c66876e9549d83420e16c"
-language = "Cpp"
-"#;
-        let (_dir, path) = write_temp_toml(content);
-        let err = load_corpus_config(&path).expect_err("Cpp not in lexical valid languages");
-        assert!(err.to_string().contains("unsupported language"));
+        let err = load_corpus_config(&path).expect_err("HEAD is not a pinned commit");
+        assert!(err.to_string().contains("40-character hex SHA"));
     }
 }

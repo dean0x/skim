@@ -382,21 +382,117 @@ fn test_no_cache_flag() {
 #[test]
 fn test_clear_cache_command() {
     let temp_dir = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test.ts");
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Create cache by running normally
-    common::skim().arg(&file_path).assert().success();
+    common::skim()
+        .env("SKIM_CACHE_DIR", cache_dir.path())
+        .arg(&file_path)
+        .assert()
+        .success();
+    let entries = |dir: &std::path::Path| -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "json")
+            })
+            .count()
+    };
+    assert!(entries(cache_dir.path()) > 0, "the run must write an entry");
 
     // Clear cache
     common::skim()
+        .env("SKIM_CACHE_DIR", cache_dir.path())
         .arg("--clear-cache")
         .assert()
         .success()
         .stdout(predicate::str::contains("Cache cleared successfully"));
+    assert_eq!(entries(cache_dir.path()), 0, "the entries must be gone");
 
     // Should still work after cache clear
-    common::skim().arg(&file_path).assert().success();
+    common::skim()
+        .env("SKIM_CACHE_DIR", cache_dir.path())
+        .arg(&file_path)
+        .assert()
+        .success();
+}
+
+/// `SKIM_CACHE_DIR` can name any folder. `--clear-cache` removes the cache
+/// entries in it (`<sha256 hex>.json`), the old search index files and nothing
+/// else: not a `.json` file that is not an entry, not an unknown file, not a
+/// link or its target.
+#[test]
+fn test_clear_cache_removes_only_skim_files() {
+    let cache_dir = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let base = cache_dir.path();
+
+    // Skim's own files.
+    let entry = format!("{}.json", "ab12".repeat(16));
+    fs::write(base.join(&entry), b"{}").unwrap();
+    let shard = base.join("search").join("0123456789abcdef");
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(shard.join("index.skidx"), vec![b'x'; 1500]).unwrap();
+    fs::write(shard.join("temporal.db"), vec![b'y'; 500]).unwrap();
+
+    // Files that are not skim's.
+    let user_files = [
+        "notes.json",
+        "analytics.db",
+        "report.txt",
+        "temporal.db",
+        "index.skidx",
+    ];
+    for name in user_files {
+        fs::write(base.join(name), name.as_bytes()).unwrap();
+    }
+    fs::write(shard.join("notes.txt"), b"mine").unwrap();
+    fs::write(base.join("search").join("readme.txt"), b"mine").unwrap();
+    let target = outside.path().join("precious.db");
+    fs::write(&target, b"precious").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, shard.join("index.skpost")).unwrap();
+
+    common::skim()
+        .env("SKIM_CACHE_DIR", base)
+        .arg("--clear-cache")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed old search index data (1 folders, 0.0 MB)",
+        ))
+        .stdout(predicate::str::contains("Cache cleared successfully"));
+
+    assert!(!base.join(&entry).exists(), "the cache entry must go");
+    assert!(!shard.join("index.skidx").exists());
+    assert!(!shard.join("temporal.db").exists());
+    for name in user_files {
+        assert_eq!(
+            fs::read(base.join(name)).unwrap(),
+            name.as_bytes(),
+            "{name} is not a skim file and must stay"
+        );
+    }
+    assert_eq!(fs::read(shard.join("notes.txt")).unwrap(), b"mine");
+    assert_eq!(
+        fs::read(base.join("search").join("readme.txt")).unwrap(),
+        b"mine"
+    );
+    #[cfg(unix)]
+    assert!(
+        fs::symlink_metadata(shard.join("index.skpost"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a link with a listed name must stay"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"precious");
 }
 
 #[test]

@@ -78,7 +78,7 @@ pub use counter::Counter;
 pub use encoding::{Encoding, encoding_for_model};
 pub use error::TokenError;
 
-/// Crate-level `Result` alias — mirrors the `rskim-core` / `rskim-search` workspace
+/// Crate-level `Result` alias — mirrors the `rskim-core` workspace
 /// convention of exporting `pub type Result<T> = std::result::Result<T, <CrateError>>`.
 pub type Result<T> = std::result::Result<T, TokenError>;
 

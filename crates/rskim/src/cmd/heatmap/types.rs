@@ -23,11 +23,58 @@
 //!
 //! No logic, no I/O. Pure data model.
 
-use serde::Serialize;
+use std::path::PathBuf;
 
-// Re-export shared commit/file types from rskim-search so heatmap modules
-// use a single canonical definition (eliminates the local duplicate).
-pub(crate) use rskim_search::{CommitInfo, FileChangeInfo};
+use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Git history records
+// ============================================================================
+
+/// A single file touched in a commit, with line-change counts.
+///
+/// Both `additions` and `deletions` use `u64` to accommodate large generated
+/// files without overflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FileChangeInfo {
+    /// Repo-root-relative path of the file.
+    pub(crate) path: PathBuf,
+    /// Number of lines added.
+    pub(crate) additions: u64,
+    /// Number of lines deleted.
+    pub(crate) deletions: u64,
+}
+
+impl FileChangeInfo {
+    /// Returns the path as a string slice, using lossy UTF-8 conversion.
+    ///
+    /// Git paths are always valid UTF-8 in practice, so lossy conversion is
+    /// safe and consistent with the rest of the codebase. Returns a `Cow<str>`
+    /// to avoid an unnecessary allocation when the path is already valid UTF-8.
+    #[must_use]
+    #[inline]
+    pub(crate) fn path_str(&self) -> std::borrow::Cow<'_, str> {
+        self.path.to_string_lossy()
+    }
+}
+
+/// Metadata extracted from a single git commit.
+///
+/// Free of git-library types: the values are converted when `git log` output
+/// is parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CommitInfo {
+    /// Full 40-character hex SHA of the commit.
+    pub(crate) hash: String,
+    /// Unix timestamp of the commit's **author** date (seconds since epoch, UTC).
+    pub(crate) timestamp: i64,
+    /// Author name (from git `author.name`).
+    pub(crate) author: String,
+    /// First line of the commit message.
+    pub(crate) message: String,
+    /// Files touched by this commit.
+    pub(crate) changed_files: Vec<FileChangeInfo>,
+}
 
 // ============================================================================
 // CLI configuration

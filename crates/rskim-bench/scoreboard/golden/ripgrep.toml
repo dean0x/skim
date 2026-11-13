@@ -112,13 +112,6 @@ query = "many_short_regex_set"
 def = { path = "crates/globset/benches/bench.rs", line = 110 }
 origin = "generated"
 
-# golden-gen: and-GT files: 8; order key 04919fd6c261
-[[ident]]
-id = "ripgrep-I10"
-query = "size_limit"
-def = { path = "crates/regex/src/matcher.rs", line = 209 }
-origin = "generated"
-
 # golden-gen: and-GT files: 38; order key 04c32185f99b
 [[ident]]
 id = "ripgrep-I11"
@@ -147,13 +140,6 @@ query = "example"
 def = { path = "crates/searcher/examples/search-stdin.rs", line = 17 }
 origin = "generated"
 
-# golden-gen: and-GT files: 6; order key 08af60567f93
-[[ident]]
-id = "ripgrep-I15"
-query = "elapsed"
-def = { path = "crates/printer/src/stats.rs", line = 32 }
-origin = "generated"
-
 # golden-gen: and-GT files: 4; order key 08bab965911d
 [[ident]]
 id = "ripgrep-I16"
@@ -173,13 +159,6 @@ origin = "generated"
 id = "ripgrep-I18"
 query = "include"
 def = { path = "crates/searcher/src/testutil.rs", line = 505 }
-origin = "generated"
-
-# golden-gen: and-GT files: 2; order key 0a452e53ce19
-[[ident]]
-id = "ripgrep-I19"
-query = "nest_limit"
-def = { path = "crates/regex/src/matcher.rs", line = 256 }
 origin = "generated"
 
 # golden-gen: and-GT files: 2; order key 0a48a37816ef
@@ -304,40 +283,6 @@ id = "ripgrep-Z02"
 query = "error zzqqxxyy"
 category = "zero-hit"
 
-# --- phrase / near ----------------------------------------------------------------------
-
-[[lexical]]
-id = "ripgrep-P01"
-query = "line terminator"
-mode = "phrase"
-category = "phrase"
-
-[[lexical]]
-id = "ripgrep-P02"
-query = "fn search_path"
-mode = "phrase"
-category = "phrase"
-
-[[lexical]]
-id = "ripgrep-P03"
-query = "memory map"
-mode = "near"
-near = 3
-category = "near"
-
-[[lexical]]
-id = "ripgrep-P04"
-query = "binary detection"
-mode = "pnear"
-near = 3
-category = "near"
-
-[[lexical]]
-id = "ripgrep-P05"
-query = "Glob"
-mode = "phrase"
-category = "phrase"
-
 # --- pagination sweeps (L = 3, 7, 20; full count <= 3 x 63 = 189) ---------------------------
 
 [[pagination]]
@@ -355,24 +300,6 @@ id = "ripgrep-G003"
 query = "ignore rules"
 limits = [3, 7, 20]
 
-[[pagination]]
-id = "ripgrep-G004"
-query = "line terminator"
-flags = ["--phrase"]
-limits = [3, 7, 20]
-
-[[pagination]]
-id = "ripgrep-G005"
-query = "memory map"
-flags = ["--near", "3"]
-limits = [3, 7, 20]
-
-[[pagination]]
-id = "ripgrep-G006"
-query = "matcher"
-flags = ["--hot"]
-limits = [3, 7, 20]
-
 # Single-token control.
 [[pagination]]
 id = "ripgrep-G007"
@@ -382,96 +309,9 @@ limits = [3, 7, 20]
 # --- prefix consistency ------------------------------------------------------------------
 
 [[prefix]]
-id = "ripgrep-F001"
-query = "fn"
-flags = ["--hot"]
-limits = [5, 20]
-
-[[prefix]]
-id = "ripgrep-F002"
-flags = ["--ast", "match-with-arms", "--hot"]
-limits = [5, 20]
-
-# Standalone --ast: also a #547 score-order (order.score_monotone) entry.
-[[prefix]]
-id = "ripgrep-F003"
-flags = ["--ast", "god-function"]
-limits = [5, 20]
-
-[[prefix]]
 id = "ripgrep-F004"
 query = "matcher"
 limits = [5, 20]
-
-# --- structural (--ast) entries, #541 (scoreboard golden-gen --corpus ripgrep --ast) ------
-# One entry per (pattern, language) where the structural oracle or skim finds a
-# file in this corpus (golden-gen never proposes a vacuous one). precision is
-# "hard" iff the catalog marks the pattern exact; it is frozen here and never
-# re-read from the catalog. The golden-gen counts are proposal-time evidence
-# (release skim 2f2186c), not checked values.
-
-# golden-gen: oracle files 1; skim files 3
-[[ast]]
-id = "ripgrep-ast-empty-function-rust"
-pattern = "empty-function"
-lang = "rust"
-precision = "hard"
-
-# golden-gen: oracle files 6; skim files 6
-[[ast]]
-id = "ripgrep-ast-excessive-params-rust"
-pattern = "excessive-params"
-lang = "rust"
-precision = "hard"
-
-# golden-gen: oracle files 83; skim files 83
-[[ast]]
-id = "ripgrep-ast-function-with-body-rust"
-pattern = "function-with-body"
-lang = "rust"
-precision = "hard"
-
-# golden-gen: oracle files 10; skim files 10
-[[ast]]
-id = "ripgrep-ast-god-function-rust"
-pattern = "god-function"
-lang = "rust"
-precision = "hard"
-
-# golden-gen: oracle files 54; skim files 54
-[[ast]]
-id = "ripgrep-ast-impl-method-rust"
-pattern = "impl-method"
-lang = "rust"
-precision = "hard"
-
-# golden-gen: oracle files 59; skim files 59
-[[ast]]
-id = "ripgrep-ast-match-with-arms-rust"
-pattern = "match-with-arms"
-lang = "rust"
-precision = "hard"
-
-# golden-gen: oracle files 42; skim files 42
-[[ast]]
-id = "ripgrep-ast-rust-nested-loop-rust"
-pattern = "rust-nested-loop"
-lang = "rust"
-precision = "ratchet"
-
-# golden-gen: oracle files 3; skim files 3
-[[ast]]
-id = "ripgrep-ast-rust-unsafe-block-rust"
-pattern = "rust-unsafe-block"
-lang = "rust"
-precision = "hard"
-
-# golden-gen: oracle files 60; skim files 60
-[[ast]]
-id = "ripgrep-ast-unhandled-result-rust"
-pattern = "unhandled-result"
-lang = "rust"
-precision = "ratchet"
 
 # --- frozen answers (#540): refs, clash, plain-word first files, stakes -----------
 #
@@ -570,9 +410,14 @@ query = "color specification"
 relevant = '(?i)color[_\s-]*specs?'
 first = ["crates/printer/src/color.rs"]
 
-# --- stakes: exit codes of a plain-text search (no flag) ----------------------------
-# A literal that no tracked file holds exits 1; a literal that a tracked file holds
-# exits 0 (the exit codes of rg).
+# --- stakes: a plain-text search judged against the regex oracle ------------------------
+# No answer is frozen here. Each entry names a query, its flags and what is compared with
+# the oracle: the matching lines, the files, the per-file counts, or the exit code. The
+# oracle reads every tracked text file with the rules of rg for -i, -S, -w, -F, -E, -g and
+# -t. Exit codes follow rg: 0 a match, 1 no match, 2 a rejected query or flag set.
+# Q01 and Q02 read the exit codes of a plain literal. Q04 to Q08 state, as regular
+# expressions, the phrase and near queries of the earlier lexical entries. The other
+# entries each use one flag: -i, -E, -l, -c, -g, -t, -w, -C and -S.
 [[stakes]]
 id = "ripgrep-Q01"
 query = "qzvx_absent_7713"
@@ -586,3 +431,94 @@ query = "wsl_prefix"
 flags = []
 expect = "exit"
 exit = 0
+
+[[stakes]]
+id = "ripgrep-Q03"
+query = 'glob'
+flags = ["-F", "-E"]
+expect = "exit"
+exit = 2
+
+[[stakes]]
+id = "ripgrep-Q04"
+query = 'line terminator'
+flags = ["-F", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "ripgrep-Q05"
+query = 'fn search_path'
+flags = ["-F", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "ripgrep-Q06"
+query = 'memory\W+(\w+\W+){0,2}map'
+flags = ["-E", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "ripgrep-Q07"
+query = 'binary\W+(\w+\W+){0,2}detection'
+flags = ["-E", "-l"]
+expect = "files"
+
+[[stakes]]
+id = "ripgrep-Q08"
+query = 'Glob'
+flags = ["-F", "-c"]
+expect = "counts"
+
+[[stakes]]
+id = "ripgrep-Q09"
+query = 'PatternMatcher'
+flags = ["-i"]
+expect = "lines"
+
+[[stakes]]
+id = "ripgrep-Q10"
+query = 'fn (is|set)_binary\w*'
+flags = ["-E"]
+expect = "lines"
+
+[[stakes]]
+id = "ripgrep-Q11"
+query = 'binary_detection'
+flags = ["-l"]
+expect = "files"
+
+[[stakes]]
+id = "ripgrep-Q12"
+query = 'Searcher'
+flags = ["-c"]
+expect = "counts"
+
+[[stakes]]
+id = "ripgrep-Q13"
+query = 'binary_detection'
+flags = ["-g", "crates/core/**"]
+expect = "lines"
+
+[[stakes]]
+id = "ripgrep-Q14"
+query = 'binary_detection'
+flags = ["-t", "rust"]
+expect = "lines"
+
+[[stakes]]
+id = "ripgrep-Q15"
+query = 'binary_detection'
+flags = ["-w"]
+expect = "lines"
+
+[[stakes]]
+id = "ripgrep-Q16"
+query = 'PatternMatcher'
+flags = ["-C", "2"]
+expect = "lines"
+
+[[stakes]]
+id = "ripgrep-Q17"
+query = 'Searcher'
+flags = ["-S"]
+expect = "lines"
