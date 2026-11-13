@@ -1,14 +1,13 @@
 [package]
 name = "rskim-llm"
-version = "0.1.0"
+version = "2.11.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "LLM message model: parse/serialize Anthropic & OpenAI request bodies with content-block classification"
 repository = "https://github.com/dean0x/skim"
-# publish = false initially, matching rskim-tokens precedent.
-# Wave-1 crate — in-workspace only. External publish tracked in #309.
-publish = false
+# Published to crates.io in lockstep with `rskim`, which depends on it.
+# scripts/release-prep.sh bumps this version with the others.
 
 [dependencies]
 serde = { workspace = true }

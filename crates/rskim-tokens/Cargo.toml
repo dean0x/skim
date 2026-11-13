@@ -1,14 +1,13 @@
 [package]
 name = "rskim-tokens"
-version = "0.1.0"
+version = "2.11.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "Multi-provider token counting library for skim"
 repository = "https://github.com/dean0x/skim"
-# publish = false initially.
-# Publish follow-up tracked in #324 (crates.io publish when external consumers need it).
-publish = false
+# Published to crates.io in lockstep with `rskim`, which depends on it.
+# scripts/release-prep.sh bumps this version with the others.
 
 [dependencies]
 tiktoken-rs = { workspace = true }
@@ -35,7 +34,7 @@ net-anthropic = ["dep:ureq", "dep:serde_json"]
 criterion = { workspace = true }
 proptest = { workspace = true }
 static_assertions = { workspace = true }
-rskim-core = { version = "2.10.0", path = "../rskim-core" }
+rskim-core = { version = "2.11.0", path = "../rskim-core" }
 
 [lints.clippy]
 unwrap_used = "deny"

@@ -165,8 +165,8 @@ impl AnthropicNetworkCounter {
     ///
     /// This is a test-only seam. It is exposed publicly (not `pub(crate)`) because
     /// it is called from `tests/net_integration.rs` (an external integration test binary).
-    /// The `rskim-tokens` crate is `publish = false`, so this does not widen the
-    /// published API surface.
+    /// `#[doc(hidden)]` keeps it out of the documented API of the published crate;
+    /// it is not a stable interface.
     #[doc(hidden)]
     pub fn new_for_test(model_id: &str, api_key: &str, endpoint: &'static str) -> Self {
         let agent = ureq::Agent::config_builder()

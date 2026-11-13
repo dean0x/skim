@@ -1701,7 +1701,6 @@ fn ac25_full_router_passes_lossless_content_extension() {
 //     NOTE: rskim-core's TRANSITIVE deps include regex (via tree-sitter) —
 //     only DIRECT deps are checked (per AC26 spec).
 // (2) rskim-compress must NOT depend on hyper/tokio/axum (direct or transitive).
-// (3) rskim-compress must be publish=false.
 //
 // These are implemented as tests that parse Cargo.toml files directly.
 // ============================================================================
@@ -1745,25 +1744,6 @@ fn ac26_rskim_core_no_direct_regex_or_llm_contract() {
         !deps_section.contains("rskim-contract"),
         "AC26: rskim-core/Cargo.toml [dependencies] must NOT contain 'rskim-contract'\n\
          Found in [dependencies] section: {deps_section}",
-    );
-}
-
-/// AC26 — rskim-compress is publish=false.
-///
-/// Discriminating: if `publish = false` is removed from Cargo.toml, this test fails.
-#[test]
-fn ac26_rskim_compress_is_publish_false() {
-    let cargo_toml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-
-    let content = std::fs::read_to_string(&cargo_toml_path).unwrap_or_else(|e| {
-        panic!("must read rskim-compress/Cargo.toml: {e}");
-    });
-
-    assert!(
-        content.contains("publish = false"),
-        "AC26: rskim-compress/Cargo.toml must have 'publish = false'\n\
-         This ensures the crate is not accidentally published to crates.io.\n\
-         Cargo.toml content does not contain 'publish = false'."
     );
 }
 

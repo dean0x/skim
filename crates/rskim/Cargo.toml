@@ -19,15 +19,17 @@ path = "src/main.rs"
 [dependencies]
 rskim-core = { version = "2.11.0", path = "../rskim-core" }
 # rskim-compress: hosts compress_log + BlockRouter (R1/R2 per #304).
-# AC26: rskim-compress is publish=false and must not add regex to rskim-core.
-rskim-compress = { path = "../rskim-compress" }
+# AC26: rskim-compress must not add regex to rskim-core.
+# The internal crates below publish to crates.io in lockstep with rskim
+# (scripts/release-prep.sh bumps every version here with the package version).
+rskim-compress = { version = "2.11.0", path = "../rskim-compress" }
 # rskim-proxy and rskim-contract: gated behind the `proxy` cargo feature (#352).
 # Enabling pulls tokio/hyper/rustls into the tree; default builds are HTTP/TLS-free (AC9).
-rskim-contract = { path = "../rskim-contract", optional = true }
-rskim-proxy = { path = "../rskim-proxy", optional = true }
+rskim-contract = { version = "2.11.0", path = "../rskim-contract", optional = true }
+rskim-proxy = { version = "2.11.0", path = "../rskim-proxy", optional = true }
 # Delegates token counting to the multi-provider library (AC13, AC15).
 # Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).
-rskim-tokens = { path = "../rskim-tokens" }
+rskim-tokens = { version = "2.11.0", path = "../rskim-tokens" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 globset = { workspace = true }

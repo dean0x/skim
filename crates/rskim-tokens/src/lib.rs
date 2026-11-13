@@ -61,7 +61,7 @@
 //! - #302 `rskim-llm` — consumes counter closures for token-budget enforcement.
 //! - #304/#305 — consume counter closures for truncation workflows.
 //! - #309 — Wave-1 tracking issue; convention: no `l3-` infix on crate names.
-//! - #324 — follow-up: publish `rskim-tokens` to crates.io for external consumers.
+//! - #324 — crates.io publish of `rskim-tokens`.
 
 #![deny(missing_docs)]
 

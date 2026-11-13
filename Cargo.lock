@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-compress"
-version = "0.1.0"
+version = "2.11.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2613,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-contract"
-version = "0.1.0"
+version = "2.11.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-llm"
-version = "0.1.0"
+version = "2.11.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-proxy"
-version = "0.1.0"
+version = "2.11.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "rskim-tokens"
-version = "0.1.0"
+version = "2.11.0"
 dependencies = [
  "anyhow",
  "criterion",
