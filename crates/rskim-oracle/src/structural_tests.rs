@@ -1,10 +1,6 @@
-//! Unit tests for `structural.rs` (co-located file, `#[path]`-included).
-//!
-//! The tests that need skim's pattern catalog live in `rskim-bench`
-//! (`src/scoreboard/catalog_tests.rs`), which reads the catalog: every query
-//! matches its pattern's catalog example and rejects a near-miss (AC-1), and
-//! every catalog pattern is covered or listed uncovered with a reason. This
-//! crate never reads the catalog.
+//! Unit tests for `structural.rs` (co-located file, `#[path]`-included): the
+//! query registry, the match semantics of each pattern, the language table,
+//! the size cap and the fingerprint.
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
