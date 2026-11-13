@@ -127,8 +127,10 @@ reader) and `cli_search_legacy.rs` (every removed flag exits 2 with nothing on s
 
 - **The set.** Every git-tracked regular file, read from the git index in process through `gix` (gitlinks and
   skip-worktree entries are dropped), plus the files of an ignore-aware walk of the root (hidden and ignored files are
-  skipped, links are not followed). Outside a repository the walk is the whole set. There is no language allow-list, no
-  minified gate and no file cap. Hidden and secret-bearing tracked files are listed (policy A).
+  skipped, links are not followed). A root that is a folder inside a repository (`--root`) lists the tracked files below
+  it, read from the index of the repository that holds it (`tracked_source`). Outside a repository the walk is the
+  whole set. There is no language allow-list, no minified gate and no file cap. Hidden and secret-bearing tracked files
+  are listed (policy A).
 - **Left out.** `LeftOut`: `binary` (a NUL byte in the first `BINARY_PROBE_BYTES` = 8192), `not_utf8`, `too_large`
   (above `MAX_FILE_BYTES` = 5 MiB), `unreadable` (an I/O error, a permission error, or a handle that is not a regular
   file), `vanished` (tracked but absent), `outside_root` (the real path leaves the canonical root, or the index names a
@@ -197,9 +199,11 @@ node there.
 `discover_project_root_with(canonical, rules)` walks up at most `MAX_ANCESTORS` = 256 folders for the nearest `.git`
 entry. `RootRules` stops the walk: it never steps into a `GIT_CEILING_DIRECTORIES` entry (absolute paths, at most
 `MAX_CEILING_ENTRIES` = 64, canonical forms added), never reaches the home folder from below and never reaches `/`
-from below. The start folder is never excluded. With no match the start folder is the root. `resolve_git_dir`,
-`resolve_repo_toplevel` and `resolve_common_dir` serve `hooks.rs` (linked worktrees, submodules and plain repositories
-resolve the way git does).
+from below. When the variable holds more than 64 absolute entries (`ceiling_overflow`), the walk does not go up at
+all and the query prints a note. The start folder is never excluded. With no match the start folder is the root.
+`resolve_git_dir`, `resolve_repo_toplevel` and `resolve_common_dir` serve `hooks.rs` (linked worktrees, submodules and
+plain repositories resolve the way git does). `resolve_repo_toplevel` also gives `universe.rs` the repository that
+holds a `--root` folder.
 
 ## Old Data Cleanup
 
@@ -212,7 +216,8 @@ resolve the way git does).
 - **`legacy_cache.rs`**: `LEGACY_ARTIFACTS` names the 12 files skim 2.x wrote in `<cache>/search/<id>/` (`<id>` is 16
   lowercase hex digits). `clear_legacy_index_data` removes only those names, only as regular files in a folder with a
   valid `<id>`, then each empty project folder, then `<cache>/search` when empty. No step follows a link; one pass
-  inspects at most `MAX_SEARCH_ENTRIES` = 4096 entries. Callers: `cmd/mod.rs` (`skim --clear-cache`) and
+  inspects at most `MAX_SEARCH_ENTRIES` = 4096 entries, and when more follow (`LegacyCleanup.more`) the clear prints a
+  note to run it again. Callers: `cmd/mod.rs` (`skim --clear-cache`) and
   `cmd/doctor/mod.rs` (`legacy_index_report`, an advisory line with the size).
 
 ## Gotchas
