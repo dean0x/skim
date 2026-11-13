@@ -24,51 +24,49 @@ AI coding agents first, humans second. Agents query with identifiers and short p
 
 A lower rung never trades away a higher one.
 
-1. **Never miss what grep finds.** Recall parity with `rg` on the same files. Table stakes an agent reaches for — case-insensitive, regex, path/type filters, file lists, true counts, a no-match exit code — work here too, so the agent never has to fall back. Anything search can't see (unindexed files, degraded state) is disclosed. A silent false "not found" is the worst bug search can have.
-2. **The right answer first.** grep returns matches in path order; skim returns them in usefulness order — the definition, the most relevant implementation, at the right line, at the top.
-3. **Answer questions grep can't.** Three signals, fused into one ranked answer — no single existing tool combines them (#173):
-   - **Lexical** — trigram index + field-weighted BM25F (definitions outweigh mentions), exact phrase and proximity.
-   - **Structural** — an AST n-gram index: find code by its shape, not just its text.
-   - **Temporal** — git history as a search dimension: what's hot, what's risky, what changes together.
-4. **More signal per token.** Compact, ranked, JSON-first results; ultimately served in skim's compressed views (#208).
-5. **Honest state.** A self-healing local index. When a signal is unavailable, say so and degrade — never guess.
+1. **Never miss what grep finds.** Recall parity with `rg` on the same files. Table stakes an agent reaches for — case-insensitive, regex, path/type filters, file lists, true counts, a no-match exit code — work here too, so the agent never has to fall back. Every file that search cannot read (binary, not UTF-8, too large, unreadable, a link, outside the root) is counted with its reason. A silent false "not found" is the worst bug search can have.
+2. **The right answer first.** grep returns matches in path order. Skim returns the definition first, with its line range, and then each call with the function that holds it. For plain words, the files that hold all the words come first, ranked by file kind.
+3. **Answer questions grep can't.** Every matching line gets a role from the syntax: definition, call, import, string, comment or text. Each line is listed or counted, so one answer shows where a name is defined and where it is used. Other signals live in other tools: `skim heatmap` for git history (what is hot, what is risky, what changes together), and `ast-grep` for the shape of code.
+4. **More signal per token.** Compact, ranked results. Every matching line is listed or counted. JSON on one line. Ultimately served in skim's compressed views (#208).
+5. **Honest state.** There is no index to go stale: each query reads the files. When a bound fires or a file is left out, search says so with exact counts. It never guesses.
 
-Performance targets (sub-50 ms queries, fast incremental updates) matter, but they follow correctness: a fast wrong answer is worse than a slow right one.
+Performance targets (a p95 below 300 ms per query on the scoreboard corpora) matter, but they follow correctness: a fast wrong answer is worse than a slow right one.
 
 ## Principles
 
 - **Local and zero-config.** One binary, no network, no Python, CLI flags only.
-- **Structure and history over embeddings.** Vector similarity scores ~2.6% F1 on structural code search vs ~70% for structural patterns (#173). Revisit only with evidence.
+- **Text, syntax and history over embeddings.** Vector similarity scores ~2.6% F1 on structural code search vs ~70% for structural patterns (#173). Revisit only with evidence.
 - **Measured, not asserted.** A green CI is not evidence of retrieval quality (SEARCH-ADR-007). The scoreboard is.
 
 ## The scoreboard
 
-"Better" is a benchmark, not an adjective. A golden query set over real repositories (#203), run head-to-head against `rg` / `git grep` (text), `ast-grep` (structure), and `git log` (history), tracks:
+"Better" is a benchmark, not an adjective. A golden query set over real repositories (#203), run head-to-head against `rg` / `git grep` (text), with the answers for plain words frozen from a hand read, tracks:
 
 | Metric | Bar |
 |---|---|
 | Recall vs `rg`, same file universe | 100% |
 | Silent false negatives | 0 |
+| Definition first, for a bare identifier | Always |
+| Every site of a name, each with its role | Every frozen site found; every frozen call labelled `call` |
+| A plain-word question | The frozen file is among the first 5 files |
+| `rg`-style flags and exit codes | Equal to the regex oracle |
 | Definition top-1, MRR, precision@k | Beat path-ordered grep output; never regress |
-| Structural precision / recall | At least `ast-grep` on shared patterns |
-| Temporal counts | Exact parity with `git log` |
-| Co-change (blast radius) | Precision/recall on real PRs, trending up |
 | Tokens to first correct answer | Fewer than `rg` |
 
 ### How it runs
 
-The scoreboard lives in [`crates/rskim-bench/scoreboard/`](../crates/rskim-bench/scoreboard/README.md) (#203): an end-to-end harness that drives the release `skim` binary against four pinned, full-history corpora (skim, ripgrep, flask, zod) and checks every answer against independent in-process oracles: `rg -F` semantics over the same file universe for text (no `rg` dependency), and tree-sitter queries for `--ast`.
+The scoreboard lives in [`crates/rskim-bench/scoreboard/`](../crates/rskim-bench/scoreboard/README.md) (#203): an end-to-end harness that drives the release `skim` binary against four pinned, full-history corpora (skim, ripgrep, flask, zod) and checks every answer against independent in-process oracles: `rg -F` and regex semantics over the same file universe for text (no `rg` dependency), and answers frozen from `git grep -nw` and a hand read for names and their roles.
 
 - **Required gate.** The `Search Scoreboard` CI job runs on every PR that touches search code; a search PR merges only with it green.
-- **HARD checks** must pass per query: recall = precision = 1, zero silent misses, honest pagination, prefix consistency, score order. **RATCHET** metrics (definition top-1, MRR, anchor = definition, P@k vs baselines, output bytes) cannot move in either direction without an explicit re-bless of `baseline.json`. Latency is informational.
-- **Structural oracle (#541).** Each `--ast` named pattern is scored per (pattern, language) against a hand-written tree-sitter query (`crates/rskim-oracle/queries/<pattern>.<lang>.scm`) that encodes the pattern's documented description on the real grammar (TSX for `.tsx`). The oracle is its own crate, `rskim-oracle`, which depends on no `rskim-*` crate (a manifest test enforces it), so nothing from skim's AST index can reach an answer; it knows the patterns by name, and the scoreboard crosses those names with skim's catalog, which it reads once. The scoring layer in `rskim-bench` stays independent by convention, like the lexical oracle. File-level recall is HARD (= 1) for every golden `[[ast]]` entry, precision is HARD for `hard`-class entries, and `structural.coverage` (HARD) requires skim's AST size-cap accounting (`ast_coverage`) to equal the oracle's own count of files over the cap, among the files that accounting counts (tree-sitter languages, Bash included). RATCHETs cover the precision of `ratchet`-class entries, whether skim's `line` lands on a match, intent recall and precision for the nested-loop patterns, and the rows no entry scores, counted for every catalog pattern (neutral: a move either way needs a bless, never a reason). Everything the oracle's answers depend on is hashed into the golden digest: the `.scm` query text, the post-filters, the intent specs, the size cap, the extension table (including the class of an unknown extension) and the attribute kinds the body-element count skips. Editing any of them forces a re-bless.
+- **HARD checks** must pass per query: recall = precision = 1, zero silent misses, honest pagination, prefix consistency, score order, and the frozen answers (every site of a name, the definitions of a name that has two, the flags, the exit codes). **RATCHET** metrics (definition top-1, MRR, anchor = definition, P@k vs baselines, output bytes, work counters) cannot move in either direction without an explicit re-bless of `baseline.json`. Latency is informational.
+- **Frozen answers (#540).** `[[refs]]`, `[[clash]]` and `[[stakes]]` entries hold answers that a person read from the pinned source before any skim run. The role oracle (`rskim-oracle`, tree-sitter queries written from the grammars) proposes entries for review. It is its own crate and depends on no `rskim-*` crate (a manifest test enforces it), so nothing from skim's search code can reach an answer.
 - **Known failures are ledgered, never hidden.** Each entry in `known_failures.toml` names its ticket; fixing the bug turns the entry into an XPASS, which fails the gate until the entry is removed.
-- **Manual adversarial dog-food (SEARCH-ADR-007)** remains only for capabilities the scoreboard does not cover yet: the `--ast` patterns `report.md` lists as uncovered (`deep-nesting`, `java-synchronized`, `ruby-begin-rescue`: no oracle query; `go-channel-send`, `go-defer`, `go-goroutine`, `go-select`: no corpus Go file where the oracle or skim finds a match), `--ast` rows in a language or (pattern, language) no entry scores (counted, not judged), containment and compound `--ast` queries, occurrence- and line-level structural precision (scoring is per file), ratchet-class structural precision (recorded, not required to be 1), temporal parity until #542, and any new query flag or arm.
+- **Manual adversarial dog-food (SEARCH-ADR-007)** remains only for what the scoreboard does not cover yet: the text layout of both views and of the notices, role precision outside the frozen names, the split of calls by definition, and any new query flag.
 
 A change to retrieval or ranking merges only if the scoreboard does not regress.
 
 ## Non-goals
 
 - Embedding / semantic vector search (see Principles).
-- LSP features — type resolution, cross-reference by compiled symbol, refactoring.
+- LSP features — type resolution, cross-reference by compiled symbol, refactoring. Roles come from syntax, not from types. Syntax evidence (imports, scope) can assign a call to one of several definitions in a later change. Type resolution stays out.
 - Config files — modes and options stay CLI flags.

@@ -4,8 +4,7 @@
 //!
 //! `AstWalkIter` provides a reusable, bounds-guarded iterator over every node
 //! in a tree-sitter `Tree`. It encapsulates the `TreeCursor`-based DFS loop
-//! that was previously duplicated in `rskim-search/linearize.rs` and
-//! `rskim-research/ast_extract.rs`.
+//! so that no caller needs its own copy of the loop.
 //!
 //! # Traversal order
 //!
@@ -52,8 +51,7 @@
 /// Configuration for `AstWalkIter` bounds guards.
 ///
 /// Both limits guard against pathological inputs (deeply nested code, generated
-/// files with hundreds of thousands of nodes). Matching the defaults used in
-/// `rskim-search` and `rskim-research` (500 / 100 000).
+/// files with hundreds of thousands of nodes). The defaults are 500 and 100 000.
 #[derive(Debug, Clone, Copy)]
 pub struct AstWalkConfig {
     /// Maximum traversal depth. Nodes at this depth or deeper have their
@@ -67,14 +65,14 @@ pub struct AstWalkConfig {
 impl AstWalkConfig {
     /// Default maximum traversal depth (500).
     ///
-    /// Canonical source used by `AstWalkConfig::default()`, `linearize.rs`, and
-    /// `ast_extract.rs`. Update here to change the limit everywhere.
+    /// Canonical source used by `AstWalkConfig::default()` and by every caller
+    /// that states the limit. Update here to change the limit everywhere.
     pub const DEFAULT_MAX_DEPTH: u32 = 500;
 
     /// Default maximum nodes yielded per traversal (100 000).
     ///
-    /// Canonical source used by `AstWalkConfig::default()`, `linearize.rs`, and
-    /// `ast_extract.rs`. Update here to change the limit everywhere.
+    /// Canonical source used by `AstWalkConfig::default()` and by every caller
+    /// that states the limit. Update here to change the limit everywhere.
     pub const DEFAULT_MAX_NODES: u32 = 100_000;
 }
 

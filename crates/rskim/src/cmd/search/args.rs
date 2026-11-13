@@ -643,6 +643,8 @@ Which files:
   Every tracked text file is searched, and so is every untracked file that the
   ignore files allow. Tracked files are searched also when they are hidden or
   may hold secrets (.env, key files): use -g '!NAME' to leave them out.
+  A later release can change this default. One function and one constant in
+  the source set it.
   A file that is binary, not UTF-8, above 5 MiB, unreadable, missing, a link,
   or outside the root is counted under \"left out\" in the last line.
 

@@ -218,7 +218,7 @@ pub fn apply_ledger(
 }
 
 /// Ledger refs naming a check that never runs on that entry (e.g.
-/// `order.score_monotone` on a `--hot` list), which would XFAIL nothing.
+/// `order.score_monotone` on a `[[stakes]]` entry), which would XFAIL nothing.
 pub fn unplanned_ledger_refs(refs: &[LedgerRef<'_>], plan: &[PlannedQuery]) -> Vec<String> {
     refs.iter()
         .filter(|r| !plan.iter().any(|q| q.id == r.id && q.runs(r.check)))

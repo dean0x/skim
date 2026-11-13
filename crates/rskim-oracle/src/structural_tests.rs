@@ -891,12 +891,12 @@ fn file_matches_reports_every_pattern_of_the_language() {
 }
 
 // ============================================================================
-// Golden fingerprint: every table an answer depends on
+// Fingerprint: every table an answer depends on
 // ============================================================================
 
 /// Renders each edited copy of the oracle inputs and asserts that its
 /// fingerprint differs from the compiled-in inputs' and from every other
-/// edit's, so each edit is proven to reach the golden digest on its own.
+/// edit's, so each edit is proven to reach the fingerprint on its own.
 fn assert_each_edit_changes_the_fingerprint<'a>(
     edits: impl IntoIterator<Item = (&'a str, OracleInputs<'a>)>,
 ) {
@@ -1281,7 +1281,7 @@ fn every_query_names_the_grammar_version_cargo_lock_resolves() {
     assert!(
         problems.is_empty(),
         "query grammar headers disagree with Cargo.lock (a grammar bump must edit every \
-         header it touches, which changes the golden digest and asks for a bless):\n{}",
+         header it touches):\n{}",
         problems.join("\n")
     );
 }

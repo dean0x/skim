@@ -83,11 +83,11 @@ du -sh ~/.cache/skim/
 ### Clear Cache
 
 ```bash
-# Clear all cached files
+# Clear the parser cache and old search index data
 skim --clear-cache
 ```
 
-This removes all cache entries. Useful when:
+This removes all parser cache entries (`<64 hex digits>.json`). It also removes the index data that skim 2.x left in `search/` below the cache folder. It keeps every other file, such as `analytics.db`. Useful when:
 - Debugging caching issues
 - Freeing disk space
 - After upgrading Skim (if format changed)

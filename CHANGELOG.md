@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING (3.0.0)
+
+- **`skim search` reads the files at each query. The index is gone.** (#540) The old
+  design built an index (`index.skidx`, `index.skpost`, an AST index and `temporal.db`)
+  and kept it fresh with git hooks. The new design builds nothing, caches nothing and
+  installs no hook. The output, the flags and the exit codes change, so scripts that
+  call `skim search` must change.
+  - **Views.** A bare identifier (`skim search launchWorker`) prints the definition first,
+    with its line range. Each call follows, with the function that holds it. Imports,
+    strings, comments, text and partial matches are counted by role. A quoted argument
+    with several words (`skim search "temporal staleness check"`) lists the files that
+    hold all the words first. `--all` lists every role. `--full` prints the text of long
+    sections. Roles come from syntax, not from types.
+  - **Flags.** The flag set is closed and follows `rg`: `-i`, `-S`, `-w`, `-F`, `-E`,
+    `-g GLOB`, `-t TYPE`, `-l`, `-c`, `-C N`, `--all`, `--full`, `--json`, `--limit N`,
+    `--offset N` and `--root DIR`. `-n` is accepted and does nothing. The pattern is a
+    literal and is case sensitive by default. A command takes one pattern. An unknown flag
+    exits 2.
+  - **Output.** The text output and the JSON output are new. `--json` prints one compact
+    object on one line. Every matching line is listed or counted. The last line counts the
+    files searched and the files left out, each with its reason.
+  - **Exit codes.** `0` a line matched. `1` no line matched. `2` an error. `141` on unix
+    when the reader of stdout stops.
+  - **Removed flags.** Each flag exits 2 with a message that names the replacement and
+    prints nothing on stdout.
+
+    | Removed | Use instead |
+    |---|---|
+    | `--ast` | `ast-grep` for structural search |
+    | `--hot`, `--cold`, `--risky` | `skim heatmap` |
+    | `--blast-radius FILE` | `skim heatmap`, or `git log --name-only -- FILE` |
+    | `--phrase`, `--near N` | `-F 'exact words'`, or `-E` for a regex |
+    | `--lang` | `-t TYPE` |
+    | `-j` | `--json` |
+    | `--weights` | none; there is no fused ranking |
+    | `--build`, `--rebuild`, `--update`, `--stats` | none; there is no index |
+    | `--install-hooks`, `--remove-hooks` | `skim init`, `skim init --uninstall` |
+
+  - **Old git hooks.** Skim 2.x added a block to `post-commit`, `post-merge` and
+    `post-checkout`. Run `skim init` or `skim init --uninstall` to remove the block. Both
+    commands keep every other line of the hook files. To remove the block by hand, delete
+    the lines from `# skim-search-start` to `# skim-search-end` in the three files.
+    `skim doctor` prints an advisory line when the block is still there.
+  - **Old index data.** Skim 2.x wrote the index files under `<cache>/search/`. Run
+    `skim --clear-cache` to remove them. The command also clears the parser cache. It
+    keeps `analytics.db`. A query never deletes a file.
+  - **Hidden and secret-bearing tracked files are searched and listed** (policy A). A
+    tracked hidden file, and a tracked file that may hold secrets (`.env`, key files),
+    is searched and listed like any other tracked file. Use `-g '!NAME'` to leave one out.
+    Untracked hidden files are not searched. A later release can change this default so
+    that such files are left out. The rule sits in one function and one constant, so the
+    change is small.
+  - **Removed code.** The `rskim-search` crate is deleted. So are the `rskim-bench` main
+    binary, the `cochange_validate` and `gen_synthetic` binaries, and the `rskim-research`
+    command line (`rskim-research` is a library only). The search scoreboard is the new
+    merge gate for search changes. It checks the frozen answers for names and their roles
+    in place of the old structural and temporal checks.
+
 ### Added
 
 - **After-run output compression in Claude Code auto mode.** `skim init` now also installs a

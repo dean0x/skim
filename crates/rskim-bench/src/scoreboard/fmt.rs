@@ -3,8 +3,8 @@
 //! failure detail, and the `entry` / `entries` noun for a count.
 //!
 //! A leaf module: it imports nothing from the scoreboard, so `metrics`,
-//! `structural_metrics`, `report`, `golden_gen`, `pipeline` and the
-//! `scoreboard` binary all use it without importing one another.
+//! `report`, `golden_gen`, `pipeline` and the `scoreboard` binary all use it
+//! without importing one another.
 
 /// Paths quoted in a failure detail before "+N more".
 const SAMPLE_PATHS: usize = 5;

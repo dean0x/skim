@@ -303,7 +303,7 @@ const VERSION: &str = concat!(
     skim '*.{js,ts}' --no-header             Process multiple files without headers\n  \
     skim . --jobs 8                          Process current directory with 8 threads\n  \
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
-    skim --clear-cache                       Clear all cached files\n\n\
+    skim --clear-cache                       Clear the parser cache and old search index data\n\n\
 SUBCOMMANDS:\n  \
     cargo <test|build|clippy|nextest|audit>  Cargo subcommand compression\n  \
     go test                                  Go test compression\n  \
@@ -323,7 +323,7 @@ SUBCOMMANDS:\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns\n  \
     rewrite <COMMAND>...                     Rewrite commands into skim equivalents\n  \
-    search                                   Code search over project index\n  \
+    search                                   Find where a name is defined and used\n  \
     stats [--since N] [--format json]        Token analytics dashboard\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
@@ -380,10 +380,10 @@ struct Args {
     #[arg(long, help = "Disable caching of transformed output")]
     no_cache: bool,
 
-    /// Clear the cached files and the old search index data (~/.cache/skim/)
+    /// Clear the parser cache and the old search index data (the cache folder holds both)
     #[arg(
         long,
-        help = "Clear all cached files and old search index data, and exit"
+        help = "Clear the parser cache and old search index data, and exit"
     )]
     clear_cache: bool,
 

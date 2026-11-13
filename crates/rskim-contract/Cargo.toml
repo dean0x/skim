@@ -6,7 +6,7 @@ authors = ["Skim Contributors"]
 license = "MIT"
 description = "Safety invariant contract and fail-open guardrail module for skim Layer 3"
 repository = "https://github.com/dean0x/skim"
-# publish = false matching rskim-search / rskim-tokens precedent.
+# publish = false matching rskim-tokens precedent.
 # Layer-3 crate: no l3- infix per Decision 2 / #309 naming convention.
 publish = false
 

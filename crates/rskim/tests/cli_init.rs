@@ -3509,9 +3509,9 @@ fn cfg_test_regions(source: &str) -> Vec<std::ops::Range<usize>> {
 ///
 /// [`cfg_test_regions`] structurally cannot see these: the gate is written at
 /// the `mod` declaration in the parent, so the module file itself carries no
-/// `#[cfg(test)]` anywhere in it. `cmd/search/index_tests.rs` is the case that
-/// matters — two reads of the cargo-supplied `CARGO_BIN_EXE_skim` that the
-/// shipped binary never makes.
+/// `#[cfg(test)]` anywhere in it. `cmd/search/run_tests.rs` is such a file. A
+/// file like it may read an environment variable, such as the cargo-supplied
+/// `CARGO_BIN_EXE_skim`, that the shipped binary never reads.
 ///
 /// A declaration whose resolved path is not among `sources` is ignored rather
 /// than asserted on: `#[path]` resolution and the `mod.rs`-versus-plain-module

@@ -236,6 +236,25 @@ skim <file> --mode=signatures    # function/method signatures only
 skim <file> --mode=pseudo        # logic without syntactic noise
 ```
 
+### Search and read
+
+`skim search NAME` finds where a name is defined and where it is used. It reads
+the files at query time: there is no index to build.
+
+- One identifier: the definition comes first, with its line range. The calls
+  follow, each with the function that holds it. Imports, strings, comments,
+  text and partial matches are counted by role (`--all` lists them).
+- Several words in one quoted argument: the files that hold all the words come
+  first, ranked. Files with fewer words follow when fewer than 3 files hold all.
+- `-E 'regex'` reads a regex. `-i`, `-S`, `-w`, `-g GLOB`, `-t TYPE`, `-C N`, `-l`
+  and `-c` work as in `rg`. The pattern is a literal and case sensitive by default.
+- Roles come from syntax, not types. A name with several definitions gets a
+  note, and its calls are not split by definition.
+- `skim FILE --symbol NAME` prints the raw source lines of one declaration.
+- Exit codes: 0 a line matched, 1 no match, 2 an error.
+- Tracked hidden and secret-bearing files (`.env`, key files) are searched and
+  listed. Use `-g '!NAME'` to leave one out.
+
 ### Heatmap — Git History Risk Analysis
 
 `skim heatmap` analyzes git history to surface risk hotspots: high-churn files,
@@ -683,6 +702,50 @@ mod tests {
             listed, expected,
             "guidance mode order must equal Mode::Full.cascade_from_here(): {line}"
         );
+    }
+
+    /// The lines of the "Search and read" section: from its heading up to,
+    /// and not including, the next `### ` heading.
+    fn search_section(content: &str) -> Vec<&str> {
+        content
+            .lines()
+            .skip_while(|l| *l != "### Search and read")
+            .enumerate()
+            .take_while(|(i, l)| *i == 0 || !l.starts_with("### "))
+            .map(|(_, l)| l)
+            .collect()
+    }
+
+    /// The guidance tells an agent how to use `skim search` (#204). The section
+    /// stays short, because the whole guidance is loaded into every session.
+    #[test]
+    fn test_guidance_search_and_read_section_is_present_and_bounded() {
+        const MAX_SECTION_LINES: usize = 25;
+        for content in [guidance_content("3.0.0"), guidance_content_mdc("3.0.0")] {
+            let section = search_section(&content);
+            assert!(
+                !section.is_empty(),
+                "the guidance needs a Search and read section"
+            );
+            assert!(
+                section.len() <= MAX_SECTION_LINES,
+                "the Search and read section has {} lines; the bound is {MAX_SECTION_LINES}",
+                section.len()
+            );
+            let text = section.join("\n");
+            for needle in [
+                "skim search",
+                "definition",
+                "calls",
+                "-E",
+                "--symbol",
+                "Exit codes: 0",
+                "hidden and secret-bearing",
+                "-g '!NAME'",
+            ] {
+                assert!(text.contains(needle), "the section must mention {needle:?}");
+            }
+        }
     }
 
     #[test]

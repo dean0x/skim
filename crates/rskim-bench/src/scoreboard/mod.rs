@@ -4,10 +4,10 @@
 //!
 //! The scoreboard drives the release `skim` binary as a subprocess against
 //! pinned real-world corpora and checks its output against oracles that are
-//! independent of skim's own code. The role oracle and the structural oracle
-//! are their own crate, `rskim-oracle`, which depends on no `rskim-*` crate
+//! independent of skim's own code. The role oracle is its own crate,
+//! `rskim-oracle`, which depends on no `rskim-*` crate
 //! (its `tests/independence.rs` checks the manifest), so that independence
-//! holds at compile time. This crate depends on no skim search crate either:
+//! holds at compile time. This crate depends on neither `rskim` nor `rskim-core`:
 //! nothing that scores skim imports a skim tokenizer, classifier or file
 //! walker. Every rule that must agree with skim (the word-character class,
 //! the `-t` type table, the `-g` glob rules, the left-out reasons) is carried

@@ -7,16 +7,14 @@
 //! query engine, re-parse verification) can reach an answer at compile time;
 //! `tests/independence.rs` keeps the manifest that way.
 //!
-//! - [`structural`] — the structural oracle for `skim search --ast <pattern>`
-//!   (#541): one hand-written tree-sitter query per (pattern, language), the
-//!   nested-loop intent oracles, and the oracle's own AST language table and
-//!   size cap.
-//!
 //! - [`roles`] — the role oracle for names (#540): where a name is defined,
 //!   called and imported, from role queries written from the grammars.
 //!
-//! skim's pattern catalog is not an input: the scoreboard reads it in
-//! `rskim-bench` and crosses it with this crate's registry by pattern name.
+//! - [`structural`] — the oracle language table and parser scratch space that
+//!   [`roles`] uses. It also holds the structural oracle of the removed
+//!   `skim search --ast <pattern>` flag (#541): one hand-written tree-sitter
+//!   query per (pattern, language) and the nested-loop intent oracles. Nothing
+//!   scores those queries now (see the module's `Status` section).
 
 pub mod roles;
 pub mod structural;

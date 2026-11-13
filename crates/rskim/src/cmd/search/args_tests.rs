@@ -119,6 +119,12 @@ fn the_help_text_states_the_rule_for_hidden_and_secret_files() {
 }
 
 #[test]
+fn the_help_text_states_that_the_rule_for_hidden_and_secret_files_can_change() {
+    assert!(SEARCH_HELP_TEXT.contains("A later release can change this default"));
+    assert!(SEARCH_HELP_TEXT.contains("One function and one constant"));
+}
+
+#[test]
 fn the_help_text_states_that_list_modes_ignore_limit_and_offset() {
     assert!(SEARCH_HELP_TEXT.contains("--limit and --offset do"));
 }

@@ -15,7 +15,7 @@ updated: 2026-11-12
 - **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. A whole-file read keeps the exact hash input it had before, so no warm entry is orphaned.
 - **KB-INV-2** A successful symbol read prints its stderr notice on every run, warm or cold, because the reader sees part of the file. The notice is stored in the cache entry, and the read records no analytics row.
 - **KB-INV-3** A variable declared in a function body (TypeScript, JavaScript, Go) is a local and is not a declaration. A variable at the top level is a declaration.
-- **KB-INV-4** The search engine (PR 3) reuses `Declaration.name_bytes`, `enclosing_declaration`, `DeclScan.truncated` and `Parser::parse_bounded`. Keep their signatures and meaning.
+- **KB-INV-4** The search engine reuses `Declaration.name_bytes`, `enclosing_declaration`, `DeclScan.truncated` and `Parser::parse_bounded`. Keep their signatures and meaning.
 - **KB-AP-1** Never treat a name that is missing from `DeclScan.decls` as absent from the file when `DeclScan.truncated` is true. The walk may not have reached it.
 - **KB-AP-2** Do not expect a declaration for a C or C++ function. Its name sits under the `declarator` field, the generic rule needs a `name` field, so the scan finds nothing.
 
@@ -145,6 +145,5 @@ The generic rule needs `child_by_field_name("name")`. In C and C++ the function 
 
 - `.devflow/features/file-wrapper-fidelity/KNOWLEDGE.md`: elision markers, the unconditional loss-bearing notice class, byte fidelity.
 - `.devflow/features/analytics/KNOWLEDGE.md`: why a symbol read records no row; `SKIM_CACHE_DIR` and test isolation.
-- `.devflow/features/ast-index/KNOWLEDGE.md`: `AstWalkIter` and `AstWalkConfig`, the walk primitive that `declarations` uses.
-- `.devflow/features/cmd-search/KNOWLEDGE.md`: the search layer that PR 3 extends with `enclosing_declaration` and `parse_bounded`.
-- `crates/rskim-core/src/ast_walk.rs`: the cap constants.
+- `.devflow/features/cmd-search/KNOWLEDGE.md`: the search layer that uses `enclosing_declaration` and `parse_bounded`.
+- `crates/rskim-core/src/ast_walk.rs`: `AstWalkIter` and `AstWalkConfig`, the walk primitive that `declarations` uses, and the cap constants.
