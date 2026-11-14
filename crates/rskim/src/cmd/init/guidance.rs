@@ -3,7 +3,12 @@
 //! Handles reading, writing, and updating the skim guidance section in agent
 //! instruction files (CLAUDE.md, .cursorrules, skim.mdc, etc.).
 
+use std::path::Path;
+
+use anyhow::Context as _;
+
 use super::helpers::check_mark;
+use crate::cmd::safe_fs::{self, ReadFailure};
 use crate::cmd::session::{AgentKind, InstructionEnv, RelativeOverride};
 
 pub(super) const GUIDANCE_START: &str = "<!-- skim-start";
@@ -110,30 +115,43 @@ pub(super) fn resolve_instruction_path(
     }
 }
 
-/// Read the instruction file at `path`, applying size and read-error guards.
+/// Read the instruction file at `path` as strict UTF-8, within
+/// [`MAX_INSTRUCTION_FILE_SIZE`].
 ///
-/// Returns `Ok(None)` when the file should be skipped (too large or unreadable),
-/// which is treated as a soft warning rather than a hard error.
-pub(super) fn read_existing_safely(path: &std::path::Path) -> anyhow::Result<Option<String>> {
-    if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() > MAX_INSTRUCTION_FILE_SIZE
-    {
-        eprintln!(
-            "  warning: {} is too large ({} bytes), skipping guidance",
-            path.display(),
-            meta.len()
-        );
-        return Ok(None);
-    }
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) => {
+/// The open follows no link at the file name and does not block on a FIFO, and
+/// the opened handle must be a regular file. Returns `Ok(None)` when the file
+/// is missing (no warning), and `Ok(None)` after a warning when it must be
+/// skipped: too large, not a regular file, not UTF-8, or unreadable. A skip is
+/// a soft warning, not a hard error, and the file is left as it is.
+pub(super) fn read_existing_safely(path: &Path) -> anyhow::Result<Option<String>> {
+    let read = safe_fs::read_regular_bounded(path, MAX_INSTRUCTION_FILE_SIZE)
+        .and_then(safe_fs::BoundedFile::into_text);
+    match read {
+        Ok((text, _permissions)) => Ok(Some(text)),
+        Err(ReadFailure::Missing) => Ok(None),
+        Err(failure) => {
             eprintln!(
-                "  warning: could not read {}: {} (skipping guidance)",
+                "  warning: {} {} (skipping guidance)",
                 path.display(),
-                e
+                skip_reason(&failure)
             );
             Ok(None)
+        }
+    }
+}
+
+/// The clause that says why a file is skipped.
+fn skip_reason(failure: &ReadFailure) -> String {
+    match failure {
+        ReadFailure::TooLarge => {
+            format!("is too large (over {MAX_INSTRUCTION_FILE_SIZE} bytes)")
+        }
+        ReadFailure::NotUtf8 => "is not valid UTF-8".to_string(),
+        ReadFailure::Folder | ReadFailure::NotRegular => "is not a regular file".to_string(),
+        ReadFailure::Symlink => "is a link".to_string(),
+        ReadFailure::Missing => "is missing".to_string(),
+        ReadFailure::Open(e) | ReadFailure::Inspect(e) | ReadFailure::Read(e) => {
+            format!("could not be read: {e}")
         }
     }
 }
@@ -355,28 +373,24 @@ pub(super) fn strip_skim_section(content: &str) -> Option<String> {
     })
 }
 
-/// Atomically write `content` to `path`, using a sibling `.tmp`-suffixed file.
+/// Write `content` to the guidance file at `path`: the one writer of every
+/// guidance file.
 ///
-/// The tmp extension mirrors the original file extension so rename targets the
-/// correct filesystem entry (e.g. `skim.mdc.tmp` → `skim.mdc`).
-///
-/// Cleans up the tmp file on both write and rename failures (S1).
-pub(super) fn atomic_write_stripped(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
-    // Build tmp extension: "<original_ext>.tmp" or "tmp" if no extension.
-    let tmp_ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
+/// The write goes through [`safe_fs::write_atomic`]: a random temporary name in
+/// the same folder, created exclusively, then renamed over `path`. A file that
+/// already exists keeps its mode. A new file is created with mode 0600.
+pub(super) fn atomic_write_stripped(path: &Path, content: &str) -> anyhow::Result<()> {
+    let permissions = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Some(meta.permissions()),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("could not read the mode of {}", path.display()));
+        }
     };
-    let tmp_path = path.with_extension(&tmp_ext);
-    if let Err(e) = std::fs::write(&tmp_path, content) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    Ok(())
+    safe_fs::write_atomic(path, content, permissions)
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 /// Clean up skim markers from legacy `.cursorrules` during Cursor migration.
