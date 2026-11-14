@@ -10,8 +10,75 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The npm platform packages, without the `@rskim/` scope. The credential
+  # check and the publish job read this one list.
+  NPM_PLATFORM_PACKAGES: cli-darwin-arm64 cli-darwin-x64 cli-linux-x64 cli-linux-arm64 cli-linux-x64-musl cli-linux-arm64-musl cli-win32-x64
 
 jobs:
+  # Every publish job needs this job. A crates.io version can not be removed,
+  # so a release that can not reach every registry must stop before the first
+  # publish (#607).
+  check-credentials:
+    name: Check publish credentials
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Check npm credentials
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # `npm whoami` fails with E401 for a token that is not valid.
+          if ! NPM_USER=$(npm whoami); then
+            echo "::error::npm check: NPM_TOKEN is not valid (npm whoami failed)"
+            exit 1
+          fi
+          echo "npm token user: ${NPM_USER}"
+
+          # The packages that this user can write. A package can not be
+          # published unless the value is "read-write".
+          if ! npm access list packages "${NPM_USER}" --json > npm-access.json; then
+            echo "::error::npm check: can not list the packages of ${NPM_USER}"
+            exit 1
+          fi
+
+          FAILED=0
+          for pkg in rskim $(printf '@rskim/%s ' $NPM_PLATFORM_PACKAGES); do
+            ACCESS=$(jq -r --arg p "$pkg" '.[$p] // "none"' npm-access.json)
+            if [ "$ACCESS" = "read-write" ]; then
+              echo "✅ ${pkg}: read-write"
+            else
+              echo "::error::npm check: ${NPM_USER} has '${ACCESS}' access to ${pkg}, publish needs read-write"
+              FAILED=1
+            fi
+          done
+          exit "$FAILED"
+
+      - name: Check Homebrew tap credentials
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          # Send the same dispatch as the trigger-homebrew job, with an event
+          # type that no tap workflow listens for. The tap workflow runs only
+          # for `update-formula`. HTTP 204 means the token can send the
+          # dispatch; any HTTP error fails the step.
+          if ! curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer ${HOMEBREW_TAP_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/dean0x/homebrew-tap/dispatches \
+            -d '{"event_type":"skim-release-credential-check"}'; then
+            echo ""
+            echo "::error::Homebrew tap check: HOMEBREW_TAP_TOKEN can not send a dispatch to dean0x/homebrew-tap"
+            exit 1
+          fi
+          echo "✅ Homebrew tap dispatch accepted"
+
   test:
     name: Run Test Suite
     runs-on: ubuntu-latest
@@ -272,7 +339,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, check-credentials]
     runs-on: ubuntu-latest
 
     steps:
@@ -318,7 +385,7 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    needs: build
+    needs: [build, check-credentials]
     runs-on: ubuntu-latest
 
     steps:
@@ -372,7 +439,7 @@ jobs:
 
   publish-npm:
     name: Publish npm packages
-    needs: build
+    needs: [build, check-credentials]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -428,7 +495,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
-          for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-x64 cli-linux-arm64 cli-linux-x64-musl cli-linux-arm64-musl cli-win32-x64; do
+          for pkg in $NPM_PLATFORM_PACKAGES; do
             echo "Publishing @rskim/$pkg@${VERSION}..."
             PUBLISHED=$(npm view "@rskim/${pkg}@${VERSION}" version 2>/dev/null || true)
             if [ "$PUBLISHED" = "$VERSION" ]; then
@@ -453,7 +520,7 @@ jobs:
 
   trigger-homebrew:
     name: Trigger Homebrew update
-    needs: [release, publish-crates, publish-npm]
+    needs: [check-credentials, release, publish-crates, publish-npm]
     runs-on: ubuntu-latest
     steps:
       - name: Get version from tag
@@ -461,9 +528,12 @@ jobs:
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Trigger formula update
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.HOMEBREW_TAP_TOKEN }}" \
+          # --fail-with-body: an HTTP error (for example 401) fails the job.
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer ${HOMEBREW_TAP_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/dean0x/homebrew-tap/dispatches \
             -d '{"event_type":"update-formula","client_payload":{"formula":"skim","version":"${{ steps.version.outputs.VERSION }}"}}'
