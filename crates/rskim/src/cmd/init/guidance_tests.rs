@@ -6,9 +6,11 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use super::{
-    GuidanceFormat, GuidanceScope, PathRefusal, TargetRefusal, guidance_target, inject_guidance,
-    remove_guidance,
+    GuidanceFormat, GuidanceHooks, GuidanceScope, PathRefusal, TargetRefusal, guidance_target,
+    inject_guidance, remove_guidance,
 };
+use crate::cmd::init::guidance_block::CURSOR_RULE_FRONTMATTER;
+use crate::cmd::init::helpers::guidance_content;
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
 // ============================================================================
@@ -74,7 +76,7 @@ fn project_scope_ignores_the_overrides() {
         .unwrap();
 
     assert_eq!(target.shown, PathBuf::from("CLAUDE.md"));
-    assert_eq!(target.format, GuidanceFormat::Markdown);
+    assert_eq!(target.format, GuidanceFormat::markdown(GuidanceHooks::Hook));
 }
 
 #[test]
@@ -88,7 +90,10 @@ fn the_cursor_project_file_is_a_cursor_rule_file() {
         .unwrap();
 
     assert_eq!(target.shown, PathBuf::from(".cursor/rules/skim.mdc"));
-    assert_eq!(target.format, GuidanceFormat::Mdc);
+    assert_eq!(
+        target.format,
+        GuidanceFormat::cursor_rule(GuidanceHooks::Hook)
+    );
 }
 
 #[test]
@@ -153,11 +158,18 @@ fn the_text_of_a_target_follows_its_format() {
 
     assert_eq!(
         markdown.render("9.9.9"),
-        super::super::helpers::guidance_content("9.9.9")
+        guidance_content("9.9.9", GuidanceHooks::Hook)
     );
     assert_eq!(
         rule_file.render("9.9.9"),
-        super::super::helpers::guidance_content_mdc("9.9.9")
+        format!(
+            "{CURSOR_RULE_FRONTMATTER}{}",
+            guidance_content("9.9.9", GuidanceHooks::Hook)
+        )
+    );
+    assert_eq!(
+        rule_file.block("9.9.9"),
+        guidance_content("9.9.9", GuidanceHooks::Hook)
     );
 }
 
@@ -474,4 +486,391 @@ fn a_new_instruction_file_is_created_with_mode_0600() {
     let file = home.path().join(".claude").join("CLAUDE.md");
     assert!(file.exists());
     assert_eq!(mode_of(&file), 0o600);
+}
+
+// ============================================================================
+// The render that the writer selects
+// ============================================================================
+
+use super::{GuidanceTarget, LeftReason, UpdateOutcome, strip_target, update_existing_guidance};
+use crate::cmd::init::helpers::{
+    MAX_SEARCH_SECTION_LINES, SEARCH_SECTION_NEEDLES, SEARCH_WHEN, search_section,
+};
+
+const RENDER_VERSION: &str = "3.0.1";
+
+/// `true` when the text for the file of `agent` in this scope may speak of a
+/// hook. Codex has no hook, and Crush shares the project `AGENTS.md` with it.
+fn expects_hook(agent: AgentKind, global: bool) -> bool {
+    !matches!(
+        (agent, global),
+        (AgentKind::CodexCli, _) | (AgentKind::Crush, false)
+    )
+}
+
+#[test]
+fn every_render_the_selector_returns_holds_the_search_lines_and_fits_its_variant() {
+    let home = tempfile::TempDir::new().unwrap();
+    let root = tempfile::TempDir::new().unwrap();
+    let env = env_at(home.path());
+    let mut seen = 0;
+
+    for &agent in AgentKind::all_supported() {
+        for global in [true, false] {
+            let scope = if global {
+                GuidanceScope::Global
+            } else {
+                project_scope(&root)
+            };
+            let Some(target) = guidance_target(agent, &scope, &env).unwrap() else {
+                continue;
+            };
+            seen += 1;
+            let label = format!("{agent} (global: {global})");
+            let render = target.render(RENDER_VERSION);
+
+            let section = search_section(&render);
+            assert!(!section.is_empty(), "{label}: no Search and read section");
+            assert!(
+                section.len() <= MAX_SEARCH_SECTION_LINES,
+                "{label}: the section has {} lines",
+                section.len()
+            );
+            let text = section.join("\n");
+            assert!(text.contains(SEARCH_WHEN), "{label}: no when lines");
+            for needle in SEARCH_SECTION_NEEDLES {
+                assert!(text.contains(needle), "{label}: no {needle:?}");
+            }
+            assert_eq!(
+                render.contains("### Command wrapping"),
+                expects_hook(agent, global),
+                "{label}: the hook claims do not match the agents that read the file"
+            );
+            assert_eq!(
+                render.starts_with("---\n"),
+                target.path.extension().is_some_and(|e| e == "mdc"),
+                "{label}: the frontmatter does not match the file kind"
+            );
+        }
+    }
+
+    // Six agents in two scopes, less the Cursor global file that does not exist.
+    assert_eq!(seen, 11);
+}
+
+#[test]
+fn codex_and_crush_get_one_render_for_their_shared_project_agents_file() {
+    let root = tempfile::TempDir::new().unwrap();
+    let env = env_at(root.path());
+
+    let codex = guidance_target(AgentKind::CodexCli, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+    let crush = guidance_target(AgentKind::Crush, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(codex.path, crush.path);
+    assert_eq!(codex.format.hooks, GuidanceHooks::NoHook);
+    assert_eq!(
+        codex.render(RENDER_VERSION),
+        crush.render(RENDER_VERSION),
+        "the two agents must not rewrite each other's block"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_project_claude_file_that_links_to_agents_md_gets_the_text_of_agents_md() {
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "# Shared rules\n").unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", root.path().join("CLAUDE.md")).unwrap();
+    let env = env_at(root.path());
+
+    let claude = guidance_target(AgentKind::ClaudeCode, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+    let codex = guidance_target(AgentKind::CodexCli, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(claude.path, codex.path);
+    assert_eq!(
+        claude.render(RENDER_VERSION),
+        codex.render(RENDER_VERSION),
+        "a link and its target must get one text"
+    );
+    assert_eq!(claude.format.hooks, GuidanceHooks::NoHook);
+}
+
+#[test]
+fn two_agents_whose_variables_name_one_folder_share_one_global_render() {
+    let home = tempfile::TempDir::new().unwrap();
+    let shared = home.path().join("shared-agent-folder");
+    let crush_alone = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| None);
+    let crush_with_codex = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |name| {
+        matches!(name, "CODEX_HOME" | "CRUSH_CONFIG_DIR").then(|| shared.clone().into_os_string())
+    });
+
+    let alone = guidance_target(AgentKind::Crush, &GuidanceScope::Global, &crush_alone)
+        .unwrap()
+        .unwrap();
+    let with_codex = guidance_target(AgentKind::Crush, &GuidanceScope::Global, &crush_with_codex)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(alone.format.hooks, GuidanceHooks::Hook);
+    assert_eq!(with_codex.path, shared.join("AGENTS.md"));
+    assert_eq!(with_codex.format.hooks, GuidanceHooks::NoHook);
+}
+
+// ============================================================================
+// Updating a file that exists
+// ============================================================================
+
+/// The Cursor rule file of the project `root`, as the selector returns it.
+fn cursor_target(root: &tempfile::TempDir) -> GuidanceTarget {
+    let target = guidance_target(
+        AgentKind::Cursor,
+        &project_scope(root),
+        &env_at(root.path()),
+    )
+    .unwrap()
+    .unwrap();
+    std::fs::create_dir_all(target.path.parent().unwrap()).unwrap();
+    target
+}
+
+fn claude_target(root: &tempfile::TempDir) -> GuidanceTarget {
+    guidance_target(
+        AgentKind::ClaudeCode,
+        &project_scope(root),
+        &env_at(root.path()),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+fn old_block() -> String {
+    guidance_content("3.0.0", GuidanceHooks::Hook)
+}
+
+fn new_block() -> String {
+    guidance_content(RENDER_VERSION, GuidanceHooks::Hook)
+}
+
+/// Write `text` to the file of `target`, update it, and return what happened
+/// and what the file holds.
+fn update(target: &GuidanceTarget, text: &str) -> (UpdateOutcome, String) {
+    std::fs::write(&target.path, text).unwrap();
+    let outcome = update_existing_guidance(target, text, RENDER_VERSION).unwrap();
+    (outcome, std::fs::read_to_string(&target.path).unwrap())
+}
+
+#[test]
+fn an_upgrade_leaves_a_skim_shaped_rule_file_with_exactly_one_frontmatter() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    let doubled = format!(
+        "{CURSOR_RULE_FRONTMATTER}{CURSOR_RULE_FRONTMATTER}{}\n",
+        old_block()
+    );
+
+    let (outcome, after) = update(&target, &doubled);
+
+    assert_eq!(outcome, UpdateOutcome::Replaced { changed: false });
+    assert_eq!(after, format!("{CURSOR_RULE_FRONTMATTER}{}\n", new_block()));
+    assert_eq!(after.matches("alwaysApply: true").count(), 1);
+}
+
+#[test]
+fn an_upgrade_keeps_the_user_text_of_a_rule_file_byte_for_byte() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    let user_before = "# My cursor rules\n\n  Keep   this\t spacing.\n\n";
+    let user_after = "\n\nAfter the block.\n\n\n";
+    let text = format!(
+        "{CURSOR_RULE_FRONTMATTER}{user_before}{CURSOR_RULE_FRONTMATTER}{}{user_after}",
+        old_block()
+    );
+
+    let (outcome, after) = update(&target, &text);
+
+    assert_eq!(outcome, UpdateOutcome::Replaced { changed: false });
+    assert_eq!(
+        after,
+        format!(
+            "{CURSOR_RULE_FRONTMATTER}{user_before}{}{user_after}",
+            new_block()
+        )
+    );
+}
+
+#[test]
+fn a_rule_file_with_user_text_and_a_current_block_is_left_byte_unchanged() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    let text = format!(
+        "{CURSOR_RULE_FRONTMATTER}My notes.\n\n{}\n\nMore notes.\n",
+        new_block()
+    );
+
+    let (outcome, after) = update(&target, &text);
+
+    assert_eq!(outcome, UpdateOutcome::AlreadyCurrent);
+    assert_eq!(after, text);
+}
+
+#[test]
+fn a_rule_file_with_no_markers_is_left_unchanged_and_the_note_names_the_file() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    let text = "---\nalwaysApply: true\n---\n\nMy own rules, no skim block.\n";
+
+    let (outcome, after) = update(&target, text);
+
+    assert_eq!(outcome, UpdateOutcome::Left(LeftReason::NoMarkers));
+    assert_eq!(after, text);
+    let note = outcome.message(&target.shown, RENDER_VERSION).unwrap();
+    assert!(note.contains(".cursor/rules/skim.mdc"), "{note}");
+}
+
+#[test]
+fn a_rule_file_with_a_broken_block_is_left_unchanged() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    let text = format!("{CURSOR_RULE_FRONTMATTER}<!-- skim-start v3.0.0 -->\nno end marker\n");
+
+    let (outcome, after) = update(&target, &text);
+
+    assert_eq!(outcome, UpdateOutcome::Left(LeftReason::BrokenMarkers));
+    assert_eq!(after, text);
+}
+
+#[test]
+fn a_block_of_another_version_is_replaced_even_when_one_version_starts_with_the_other() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = claude_target(&root);
+    // The binary is v3.0.1. A v3.0.10 block starts with the same characters.
+    let newer = guidance_content("3.0.10", GuidanceHooks::Hook);
+
+    let (outcome, after) = update(&target, &format!("# Mine\n\n{newer}\n"));
+
+    assert_eq!(outcome, UpdateOutcome::Replaced { changed: false });
+    assert_eq!(after, format!("# Mine\n\n{}\n", new_block()));
+}
+
+#[test]
+fn a_changed_block_is_replaced_and_the_note_names_the_file() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = claude_target(&root);
+    let edited = new_block().replace("Skim earns its cost", "Skim earns its keep");
+
+    let (outcome, after) = update(&target, &format!("# Mine\n\n{edited}\n"));
+
+    assert_eq!(outcome, UpdateOutcome::Replaced { changed: true });
+    assert_eq!(after, format!("# Mine\n\n{}\n", new_block()));
+    let note = outcome.message(&target.shown, RENDER_VERSION).unwrap();
+    assert_eq!(
+        note,
+        "  Note: Replaced changed guidance in CLAUDE.md; review the diff before a commit"
+    );
+}
+
+#[test]
+fn a_broken_block_in_a_markdown_file_is_left_unchanged() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = claude_target(&root);
+    let text = "<!-- skim-end -->\nsome content\n<!-- skim-start v1.0.0 -->\n";
+
+    let (outcome, after) = update(&target, text);
+
+    assert_eq!(outcome, UpdateOutcome::Left(LeftReason::BrokenMarkers));
+    assert_eq!(after, text);
+}
+
+#[test]
+fn a_current_block_in_a_markdown_file_is_left_byte_unchanged() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = claude_target(&root);
+    let text = format!("# Mine\n\n{}\n\n# More\n", new_block());
+
+    let (outcome, after) = update(&target, &text);
+
+    assert_eq!(outcome, UpdateOutcome::AlreadyCurrent);
+    assert_eq!(after, text);
+}
+
+#[test]
+fn a_markdown_file_with_no_block_gets_one_appended() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = claude_target(&root);
+
+    let (outcome, after) = update(&target, "# My Rules\n");
+
+    assert_eq!(outcome, UpdateOutcome::Appended);
+    assert_eq!(after, format!("# My Rules\n\n{}\n", new_block()));
+}
+
+// ============================================================================
+// Removing the block
+// ============================================================================
+
+#[test]
+fn uninstall_deletes_a_rule_file_that_is_skim_shaped() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    std::fs::write(
+        &target.path,
+        format!(
+            "{CURSOR_RULE_FRONTMATTER}{CURSOR_RULE_FRONTMATTER}{}\n",
+            new_block()
+        ),
+    )
+    .unwrap();
+
+    strip_target(&target).unwrap();
+
+    assert!(!target.path.exists());
+}
+
+#[test]
+fn uninstall_strips_only_the_block_from_a_rule_file_with_user_text() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    std::fs::write(
+        &target.path,
+        format!("{CURSOR_RULE_FRONTMATTER}{}\n\nMy notes.\n", new_block()),
+    )
+    .unwrap();
+
+    strip_target(&target).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&target.path).unwrap(),
+        format!("{}\n\nMy notes.\n", CURSOR_RULE_FRONTMATTER.trim_end())
+    );
+}
+
+#[test]
+fn uninstall_leaves_a_rule_file_with_no_markers_alone() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = cursor_target(&root);
+    let text = "---\nalwaysApply: true\n---\n\nMy own rules.\n";
+    std::fs::write(&target.path, text).unwrap();
+
+    strip_target(&target).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&target.path).unwrap(), text);
+}
+
+#[test]
+fn uninstall_deletes_a_markdown_file_that_holds_only_the_block() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = claude_target(&root);
+    std::fs::write(&target.path, format!("{}\n", new_block())).unwrap();
+
+    strip_target(&target).unwrap();
+
+    assert!(!target.path.exists());
 }

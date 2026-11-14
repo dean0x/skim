@@ -1,61 +1,33 @@
 //! Guidance injection and removal for `skim init`.
 //!
 //! Handles reading, writing, and updating the skim guidance section in agent
-//! instruction files (CLAUDE.md, .cursorrules, skim.mdc, etc.).
+//! instruction files (CLAUDE.md, .cursorrules, skim.mdc, etc.). The shape of a
+//! file and the currency of its block are decided in `guidance_block.rs`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
+use super::guidance_block::{
+    BlockStatus, GuidanceFormat, GuidanceHooks, block_status, skim_shaped, splice, strip_section,
+    strip_skim_section,
+};
 use super::guidance_path::{
     GlobalPathRefusal, GuidanceScope, PathRefusal, ResolvedPath, require_absolute_global,
     resolve_guidance_path,
 };
-use super::helpers::check_mark;
+use super::helpers::{check_mark, guidance_content, render_file};
+use crate::cmd::hooks::{HookSupport, protocol_for_agent};
 use crate::cmd::safe_fs::{self, ReadFailure};
 use crate::cmd::session::{AgentKind, InstructionEnv};
-
-pub(super) const GUIDANCE_START: &str = "<!-- skim-start";
-pub(super) const GUIDANCE_END: &str = "<!-- skim-end -->";
 
 /// Maximum byte size for an instruction file before we skip reading it.
 /// Prevents unbounded allocations on corrupted or adversarially crafted files.
 pub(super) const MAX_INSTRUCTION_FILE_SIZE: u64 = 1_048_576; // 1 MiB
 
-/// Find the skim guidance section markers in content.
-/// Returns `Some((start_byte, end_byte))` where end_byte includes the end marker.
-/// Returns `None` if markers are missing or in wrong order (corrupted file).
-pub(super) fn find_skim_section(content: &str) -> Option<(usize, usize)> {
-    let start = content.find(GUIDANCE_START)?;
-    let end_marker = content.find(GUIDANCE_END)?;
-    if start >= end_marker {
-        return None; // Markers in wrong order
-    }
-    Some((start, end_marker + GUIDANCE_END.len()))
-}
-
 // ============================================================================
 // The guidance target
 // ============================================================================
-
-/// The text layout of a guidance file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GuidanceFormat {
-    /// A Markdown file: CLAUDE.md, AGENTS.md, GEMINI.md and the Copilot file.
-    Markdown,
-    /// A Cursor rule file (`.mdc`), which skim owns.
-    Mdc,
-}
-
-impl GuidanceFormat {
-    fn of(path: &Path) -> Self {
-        if path.extension().is_some_and(|ext| ext == "mdc") {
-            Self::Mdc
-        } else {
-            Self::Markdown
-        }
-    }
-}
 
 /// A guidance file that skim may read and write: where it is, how to show it,
 /// and what skim writes to it.
@@ -69,20 +41,23 @@ pub(super) struct GuidanceTarget {
     pub(super) path: PathBuf,
     /// The path to show in messages.
     pub(super) shown: PathBuf,
-    /// The layout of the file, taken from the resolved `path`.
+    /// The layout and the text of the file, taken from the resolved `path`.
     pub(super) format: GuidanceFormat,
 }
 
 impl GuidanceTarget {
-    /// The text skim writes to this file for `version`.
+    /// The text skim writes to a new file for `version`: the frontmatter of a
+    /// file skim owns, then the block.
     ///
     /// This is the one place that chooses the text. It looks at the resolved
     /// path of the file, so two agents that share a file get the same text.
     pub(super) fn render(&self, version: &str) -> String {
-        match self.format {
-            GuidanceFormat::Markdown => super::helpers::guidance_content(version),
-            GuidanceFormat::Mdc => super::helpers::guidance_content_mdc(version),
-        }
+        render_file(&self.format, version)
+    }
+
+    /// The block skim writes to this file for `version`, without frontmatter.
+    pub(super) fn block(&self, version: &str) -> String {
+        guidance_content(version, self.format.hooks)
     }
 }
 
@@ -120,6 +95,23 @@ pub(super) fn guidance_target(
     scope: &GuidanceScope,
     env: &InstructionEnv,
 ) -> Result<Option<GuidanceTarget>, TargetRefusal> {
+    let Some(ResolvedPath { path, shown }) = resolved_path(agent, scope, env)? else {
+        return Ok(None);
+    };
+    let format = GuidanceFormat::for_path(&path, hooks_for_file(&path, scope, env));
+    Ok(Some(GuidanceTarget {
+        path,
+        shown,
+        format,
+    }))
+}
+
+/// The file of `agent` in `scope`, resolved by the path policy.
+fn resolved_path(
+    agent: AgentKind,
+    scope: &GuidanceScope,
+    env: &InstructionEnv,
+) -> Result<Option<ResolvedPath>, TargetRefusal> {
     let global = matches!(scope, GuidanceScope::Global);
     let Some(path) = agent.instruction_file(global, env) else {
         return Ok(None);
@@ -127,14 +119,32 @@ pub(super) fn guidance_target(
     if global {
         require_absolute_global(agent, &path, env).map_err(TargetRefusal::Stop)?;
     }
-    let ResolvedPath { path, shown } =
-        resolve_guidance_path(&path, scope).map_err(TargetRefusal::Skip)?;
-    let format = GuidanceFormat::of(&path);
-    Ok(Some(GuidanceTarget {
-        path,
-        shown,
-        format,
-    }))
+    resolve_guidance_path(&path, scope)
+        .map(Some)
+        .map_err(TargetRefusal::Skip)
+}
+
+/// Whether the text of the file at the resolved `path` may speak of a skim
+/// hook.
+///
+/// It may not when any agent that reads the file has no hook. The test is on
+/// the resolved path, so Codex (no hook) and Crush (a hook) share one
+/// `AGENTS.md` and never rewrite each other's block, and a `CLAUDE.md` that is
+/// a link to `AGENTS.md` gets the same text as `AGENTS.md`. It does not depend
+/// on which agents are installed.
+fn hooks_for_file(path: &Path, scope: &GuidanceScope, env: &InstructionEnv) -> GuidanceHooks {
+    let hookless_reader = AgentKind::all_supported().iter().any(|&other| {
+        protocol_for_agent(other).hook_support() == HookSupport::AwarenessOnly
+            && matches!(
+                resolved_path(other, scope, env),
+                Ok(Some(resolved)) if resolved.path == path
+            )
+    });
+    if hookless_reader {
+        GuidanceHooks::NoHook
+    } else {
+        GuidanceHooks::Hook
+    }
 }
 
 /// Read the instruction file at `path` as strict UTF-8, within
@@ -179,28 +189,16 @@ fn skip_reason(failure: &ReadFailure) -> String {
 }
 
 /// Write `new_content` as a new instruction file at `path` (create mode).
-pub(super) fn guidance_create(path: &std::path::Path, new_content: &str) -> anyhow::Result<()> {
+pub(super) fn guidance_create(path: &Path, new_content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     atomic_write_stripped(path, &format!("{new_content}\n"))
 }
 
-/// Replace the existing skim section in `existing` with `new_content` (update mode).
-pub(super) fn guidance_update(
-    path: &std::path::Path,
-    existing: &str,
-    start: usize,
-    end: usize,
-    new_content: &str,
-) -> anyhow::Result<()> {
-    let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
-    atomic_write_stripped(path, &updated)
-}
-
 /// Append `new_content` to the end of `existing` (append mode).
 pub(super) fn guidance_append(
-    path: &std::path::Path,
+    path: &Path,
     existing: &str,
     new_content: &str,
 ) -> anyhow::Result<()> {
@@ -214,51 +212,97 @@ pub(super) fn guidance_append(
     atomic_write_stripped(path, &content)
 }
 
+/// Why [`update_existing_guidance`] left a file as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LeftReason {
+    /// A start marker with no end marker after it.
+    BrokenMarkers,
+    /// A file that skim owns, with no skim markers: its text is not skim's.
+    NoMarkers,
+}
+
+/// What [`update_existing_guidance`] did to a file that exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UpdateOutcome {
+    /// The block is current. Nothing was written.
+    AlreadyCurrent,
+    /// The block was replaced. `changed` is `true` when the marker named this
+    /// version and the text differed, `false` when the version differed.
+    Replaced { changed: bool },
+    /// The file is as it was.
+    Left(LeftReason),
+    /// The file had no block, so one was appended. The caller prints the
+    /// install footer.
+    Appended,
+}
+
+impl UpdateOutcome {
+    /// The line that tells the user what happened to the file shown as
+    /// `shown`, or `None` when the caller prints the footer.
+    pub(super) fn message(&self, shown: &Path, version: &str) -> Option<String> {
+        let shown = shown.display();
+        match self {
+            Self::AlreadyCurrent => Some(format!(
+                "  {} Guidance already current (v{version})",
+                check_mark(true)
+            )),
+            Self::Replaced { changed: false } => Some(format!(
+                "  {} Updated guidance in {shown} (-> v{version})",
+                check_mark(true)
+            )),
+            Self::Replaced { changed: true } => Some(format!(
+                "  Note: Replaced changed guidance in {shown}; review the diff before a commit"
+            )),
+            Self::Left(LeftReason::BrokenMarkers) => Some(format!(
+                "  warning: skim markers in {shown} appear corrupted (skipping guidance update)"
+            )),
+            Self::Left(LeftReason::NoMarkers) => Some(format!(
+                "  Note: {shown} holds no skim markers, so skim leaves it unchanged. Move it aside to let skim write it."
+            )),
+            Self::Appended => None,
+        }
+    }
+
+    fn print(&self, shown: &Path, version: &str) {
+        match self.message(shown, version) {
+            Some(line) if matches!(self, Self::Left(LeftReason::BrokenMarkers)) => {
+                eprintln!("{line}");
+            }
+            Some(line) => println!("{line}"),
+            None => {}
+        }
+    }
+}
+
 /// Handle guidance update for a file that already exists on disk.
 ///
-/// Returns `Ok(true)` when the update is complete and no further action is
-/// needed (skip or in-place update).  Returns `Ok(false)` when the caller
-/// should proceed with the post-write footer prints (append path).
+/// The block is compared with `block_status`. A stale or changed block is
+/// replaced; a current one, a broken one and an owned file with no markers are
+/// left alone; a file with no block gets one appended.
 pub(super) fn update_existing_guidance(
-    path: &std::path::Path,
+    target: &GuidanceTarget,
     existing: &str,
     version: &str,
-    new_content: &str,
-) -> anyhow::Result<bool> {
-    // Detect corrupted markers (present but in wrong order)
-    if find_skim_section(existing).is_none() && existing.contains(GUIDANCE_START) {
-        eprintln!(
-            "  warning: skim markers in {} appear corrupted (skipping guidance update)",
-            path.display()
-        );
-        return Ok(true); // treated as done — do not attempt write
-    }
-
-    if let Some((start, end)) = find_skim_section(existing) {
-        // Same version? Skip.
-        if existing[start..end].contains(&format!("v{version}")) {
-            println!(
-                "  {} Guidance already current (v{})",
-                check_mark(true),
-                version
-            );
-            return Ok(true);
+) -> anyhow::Result<UpdateOutcome> {
+    let block = target.block(version);
+    let changed = match block_status(existing, &block, &target.format) {
+        BlockStatus::Current => return Ok(UpdateOutcome::AlreadyCurrent),
+        BlockStatus::Broken => return Ok(UpdateOutcome::Left(LeftReason::BrokenMarkers)),
+        BlockStatus::Absent if target.format.owned => {
+            return Ok(UpdateOutcome::Left(LeftReason::NoMarkers));
         }
-
-        // Different version — update in place.
-        guidance_update(path, existing, start, end, new_content)?;
-        println!(
-            "  {} Updated guidance in {} (-> v{})",
-            check_mark(true),
-            path.display(),
-            version
-        );
-        return Ok(true);
-    }
-
-    // No skim section — append (caller prints footer).
-    guidance_append(path, existing, new_content)?;
-    Ok(false)
+        BlockStatus::Absent => {
+            guidance_append(&target.path, existing, &block)?;
+            return Ok(UpdateOutcome::Appended);
+        }
+        BlockStatus::Stale { .. } => false,
+        BlockStatus::Changed => true,
+    };
+    let Some(updated) = splice(existing, &block, &target.format) else {
+        return Ok(UpdateOutcome::Left(LeftReason::BrokenMarkers));
+    };
+    atomic_write_stripped(&target.path, &updated)?;
+    Ok(UpdateOutcome::Replaced { changed })
 }
 
 /// Inject skim guidance section into the agent's main instruction file.
@@ -266,8 +310,8 @@ pub(super) fn update_existing_guidance(
 /// Four modes:
 /// - **Create**: File doesn't exist → create with just the guidance section
 /// - **Append**: File exists but has no skim section → append to end
-/// - **Update**: File has a skim section with older version → replace in place
-/// - **Skip**: File has a skim section with current version → idempotent no-op
+/// - **Update**: File has a skim section that is not current → replace it
+/// - **Skip**: File has a skim section that is current → idempotent no-op
 pub(super) fn inject_guidance(
     agent: AgentKind,
     global: bool,
@@ -279,7 +323,6 @@ pub(super) fn inject_guidance(
     let path = target.path.as_path();
 
     let version = env!("CARGO_PKG_VERSION");
-    let new_content = target.render(version);
 
     if path.exists() {
         let existing = match read_existing_safely(path)? {
@@ -287,12 +330,14 @@ pub(super) fn inject_guidance(
             None => return Ok(()), // soft skip (too large or unreadable)
         };
 
-        if update_existing_guidance(path, &existing, version, &new_content)? {
+        let outcome = update_existing_guidance(&target, &existing, version)?;
+        outcome.print(&target.shown, version);
+        if outcome != UpdateOutcome::Appended {
             return Ok(());
         }
     } else {
         // File doesn't exist — create.
-        guidance_create(path, &new_content)?;
+        guidance_create(path, &target.render(version))?;
     }
 
     // Legacy cleanup: remove skim markers from .cursorrules when writing skim.mdc.
@@ -377,16 +422,18 @@ pub(super) fn remove_guidance(
 
 /// Remove the skim section from the file of `target`.
 ///
-/// A file that holds only the skim section (and every `.mdc` file, which skim
-/// owns) is deleted. Any other file is rewritten without the section.
+/// A file that is skim-shaped (it holds only the skim section, and for a file
+/// skim owns, its frontmatter) is deleted. Any other file is rewritten without
+/// the section, and the text of the user stays. A file with no section, or a
+/// broken one, is left as it is.
 fn strip_target(target: &GuidanceTarget) -> anyhow::Result<()> {
     let path = target.path.as_path();
     let content = match read_existing_safely(path)? {
         Some(s) => s,
         None => return Ok(()), // soft skip (too large or unreadable)
     };
-    if let Some(stripped) = strip_skim_section(&content) {
-        if target.format == GuidanceFormat::Mdc || stripped.is_empty() {
+    if let Some(stripped) = strip_section(&content, target.format.frontmatter) {
+        if skim_shaped(&content, &target.format) {
             std::fs::remove_file(path)?;
         } else {
             atomic_write_stripped(path, &stripped)?;
@@ -398,24 +445,6 @@ fn strip_target(target: &GuidanceTarget) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// Remove the skim section from `content`, stripping surrounding blank lines.
-///
-/// Returns `None` if no skim section was found.
-/// Returns `Some(cleaned)` where `cleaned` is the trimmed remainder with a
-/// trailing newline appended when non-empty.
-pub(super) fn strip_skim_section(content: &str) -> Option<String> {
-    let (start, end) = find_skim_section(content)?;
-    let before = content[..start].trim_end_matches('\n');
-    let after = &content[end..];
-    let combined = format!("{before}{after}");
-    let trimmed = combined.trim();
-    Some(if trimmed.is_empty() {
-        String::new()
-    } else {
-        format!("{trimmed}\n")
-    })
 }
 
 /// Write `content` to the guidance file at `path`: the one writer of every

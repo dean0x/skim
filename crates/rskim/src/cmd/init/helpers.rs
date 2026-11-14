@@ -4,6 +4,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use super::guidance_block::{GuidanceFormat, GuidanceHooks};
+
 // ============================================================================
 // Shared constants
 // ============================================================================
@@ -141,25 +143,50 @@ pub(crate) fn atomic_write_settings(
 // Guidance content
 // ============================================================================
 
-/// Generate the skim guidance section content with version markers.
+/// The lines that say when to use `skim search`. Every render of the guidance
+/// carries them, in the "Search and read" section.
 ///
-/// Principle-based guidance that helps agents decide when skim adds value
-/// vs when to Read directly.
-pub(super) fn guidance_content(version: &str) -> String {
-    format!(
-        r#"<!-- skim-start v{version} -->
-## Skim — Context-Optimized Code Reading
+/// What an agent trial measured: 14 tasks, two arms (skim and `rg`), three runs
+/// of each, against skim 2.11.0. The agents had the "Search and read" section
+/// and no line on when to use it.
+///
+/// - Questions about the callers of a name: skim answered with 1 call where
+///   `rg` needed 3 to 10, and every skim run was right.
+/// - One concept, found with a quoted multi-word query: 1 call against 2 for
+///   `rg`, at about half the tokens, and every run was right. A second concept
+///   had a file that holds none of the query words: skim was right in 1 run of
+///   3, `rg` with several patterns in 3 of 3. This is why the text names the
+///   `-E` search.
+/// - An exact list of a pattern: `rg` was as right as skim and as cheap or
+///   cheaper (1 call against 1 to 3). This is why the text names `rg`.
+/// - `rg` skips hidden files by default and skim searches tracked ones, so the
+///   second bullet states that difference.
+///
+/// Do not write these claims, because the trial gave no support for them or
+/// contradicted them: "use skim instead of `rg`" in general; skim for
+/// definitions as a win; skim to list the test files that call a function;
+/// skim to find the sites of a refactor; skim to find a concept whose words are
+/// not in the file.
+///
+/// The text is a constant so that a later change is one edit. The tests check
+/// that every render holds it, not its words.
+pub(super) const SEARCH_WHEN: &str = "\
+- When: for the callers of a name, use `skim search NAME`. To find the file
+  for a concept, use a quoted multi-word query; if its words may not be in
+  that file, add an `-E` search. For an exact list of a pattern, use `rg`.
+- Unlike `rg`'s default, it also searches tracked hidden files such as `.env`.";
 
+/// The opening lines of a render for an agent with a skim hook.
+const HOOK_INTRO: &str = "\
 `skim` is installed and a rewrite hook is active that automatically optimizes
-shell commands. For explicit use, call `skim` via Bash.
+shell commands. For explicit use, call `skim` via Bash.";
 
-### What skim does
+/// The opening line of a render for an agent with no skim hook.
+const NO_HOOK_INTRO: &str = "`skim` is installed. Call `skim` via Bash.";
 
-Skim shows you the **structure** of a file — signatures, types, headings,
-definitions — while stripping implementation details and body content.
-It works on code files (functions/classes) and prose files (headings/sections).
-Use `-n` / `--line-numbers` to enrich the output with original source line numbers.
-
+/// What a hook render says about the rewrite hook, the after-run view and the
+/// allowlist. It ends with a blank line.
+const HOOK_NOTES: &str = "\
 ### Command wrapping
 
 The rewrite hook may also wrap supported shell commands (`ls`, `wc`,
@@ -172,9 +199,7 @@ File reads (`cat`, `head`, `tail` on code files) are rewritten
 into direct skim reads (example: `cat file.ts` becomes
 `skim file.ts --mode=pseudo`), so the output is a structured view, not
 raw file contents; seeing `skim` run in place of the original command
-is expected. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20`
-(verbatim lines; when the file is longer, one slot goes to the elision marker); `tail -5 file.ts`
-likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines.
+is expected.
 
 Compression changes how results are presented, and rewritten file reads
 show a structured view rather than exact file contents; skim prints a
@@ -194,7 +219,47 @@ In Claude Code auto mode, skim can also compress the output of some Bash
 commands after they run. A `[skim]` line on stderr names such a view and
 tells you how to get the raw output.
 
-### When to use skim
+";
+
+/// What a no-hook render says in place of [`HOOK_NOTES`]: no claim about a
+/// hook, but the two rules that hold for any agent. It ends with a blank line.
+const NO_HOOK_NOTES: &str = "\
+Compression changes how results are presented: skim shows a structured view,
+not exact file contents. If compressed output ever looks incomplete,
+garbled, or inconsistent with what you expected, flag it to the user
+rather than silently working around it.
+
+The user may have approved a small allowlist of skim commands.
+Do not change permission or allowlist settings yourself to avoid a
+prompt. If a skim command is denied when you did not expect it,
+surface the denial to the user rather than working around it.
+
+";
+
+/// Generate the skim guidance section content with version markers.
+///
+/// Principle-based guidance that helps agents decide when skim adds value
+/// vs when to Read directly. `hooks` says whether the text may speak of the
+/// skim rewrite hook.
+pub(super) fn guidance_content(version: &str, hooks: GuidanceHooks) -> String {
+    let (intro, notes) = match hooks {
+        GuidanceHooks::Hook => (HOOK_INTRO, HOOK_NOTES),
+        GuidanceHooks::NoHook => (NO_HOOK_INTRO, NO_HOOK_NOTES),
+    };
+    format!(
+        r#"<!-- skim-start v{version} -->
+## Skim — Context-Optimized Code Reading
+
+{intro}
+
+### What skim does
+
+Skim shows you the **structure** of a file — signatures, types, headings,
+definitions — while stripping implementation details and body content.
+It works on code files (functions/classes) and prose files (headings/sections).
+Use `-n` / `--line-numbers` to enrich the output with original source line numbers.
+
+{notes}### When to use skim
 
 **General principle:** Use skim when structure is sufficient for your task.
 If your next step requires the actual content (editing, understanding logic,
@@ -241,6 +306,7 @@ skim <file> --mode=pseudo        # logic without syntactic noise
 `skim search NAME` finds where a name is defined and where it is used. It reads
 the files at query time: there is no index to build.
 
+{search_when}
 - One identifier: the definition comes first, with its line range. The calls
   follow, each with the function that holds it. Imports, strings, comments,
   text and partial matches are counted by role (`--all` lists them).
@@ -262,18 +328,6 @@ tightly coupled file pairs, fix-after-touch patterns, module boundary violations
 and bus-factor concentration. Run it when you need to understand where risk lives
 in a codebase before starting work.
 
-The default view is short (30 lines or fewer): the top 10 hotspots by commits,
-the top 5 code-to-code coupling pairs and the top 5 fix-risk files above the
-repository base rate. Each capped list ends with one exact "N more" line that
-names the flag to see more. Noise rules hide signals with low support: fix risk
-and bus factor need 5 commits of a file, coupling needs 3 shared commits, and
-modules need 5 commits. Changelogs, snapshots and generated code are excluded by
-default (`--no-exclude` keeps them). Doc files and the top folders docs, doc,
-.github, .devflow, tests and test stay out of the hotspots, modules and
-insights (`--include-docs` keeps them; `--diff` and file arguments keep every
-path). A commit counts as a fix only when its subject
-says so (`fix:`, `fix(scope):`, a revert, or the keyword as the first word).
-
 **When to use heatmap:**
 - Before you edit a file — `skim heatmap <file>` shows its co-change partners
   (tests first), recent fix commits and owners
@@ -293,19 +347,50 @@ skim heatmap --insights          # top 20 ranked findings
 skim heatmap --json              # JSON version 2: compact and capped
 ```
 <!-- skim-end -->"#,
-        version = version
+        search_when = SEARCH_WHEN,
     )
 }
 
-/// Generate skim guidance content wrapped in Cursor `.mdc` frontmatter.
-///
-/// Cursor's `.mdc` format requires YAML frontmatter. Skim owns the entire file.
-pub(super) fn guidance_content_mdc(version: &str) -> String {
-    let body = guidance_content(version);
+/// The text skim writes to a whole guidance file in `format`: the frontmatter
+/// of a file skim owns, then the block. It has no final newline.
+pub(super) fn render_file(format: &GuidanceFormat, version: &str) -> String {
     format!(
-        "---\ndescription: \"skim — context-optimized code reading for AI agents\"\nalwaysApply: true\n---\n\n{body}"
+        "{}{}",
+        format.frontmatter.unwrap_or(""),
+        guidance_content(version, format.hooks)
     )
 }
+
+/// The lines of the "Search and read" section of a render: from its heading up
+/// to, and not including, the next `### ` heading.
+#[cfg(test)]
+pub(super) fn search_section(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .skip_while(|l| *l != "### Search and read")
+        .enumerate()
+        .take_while(|(i, l)| *i == 0 || !l.starts_with("### "))
+        .map(|(_, l)| l)
+        .collect()
+}
+
+/// The section stays short, because the whole guidance is loaded into every
+/// session.
+#[cfg(test)]
+pub(super) const MAX_SEARCH_SECTION_LINES: usize = 25;
+
+/// What the "Search and read" section of every render must mention.
+#[cfg(test)]
+pub(super) const SEARCH_SECTION_NEEDLES: [&str; 8] = [
+    "skim search",
+    "definition",
+    "calls",
+    "-E",
+    "--symbol",
+    "Exit codes: 0",
+    "hidden and secret-bearing",
+    "-g '!NAME'",
+];
 
 // ============================================================================
 // Settings backup helper (pub(crate) so permissions writers can reuse it)
@@ -577,9 +662,27 @@ pub(super) fn print_help() {
 mod tests {
     use super::*;
 
+    /// Every render skim writes: the hook and no-hook text, plain and with the
+    /// frontmatter of a rule file.
+    fn all_renders() -> Vec<(&'static str, String)> {
+        let mut renders = Vec::new();
+        for (name, hooks) in [
+            ("hook", GuidanceHooks::Hook),
+            ("no-hook", GuidanceHooks::NoHook),
+        ] {
+            renders.push((name, render_file(&GuidanceFormat::markdown(hooks), "3.0.0")));
+            renders.push((
+                "rule file",
+                render_file(&GuidanceFormat::cursor_rule(hooks), "3.0.0"),
+            ));
+        }
+        renders
+    }
+
+    /// The hook render: the only one that may speak of the rewrite hook.
     #[test]
     fn test_guidance_content_has_version_markers() {
-        let content = guidance_content("2.1.0");
+        let content = guidance_content("2.1.0", GuidanceHooks::Hook);
         assert!(content.starts_with("<!-- skim-start v2.1.0 -->"));
         assert!(content.ends_with("<!-- skim-end -->"));
         // Version appears in the skim-start marker
@@ -677,88 +780,197 @@ mod tests {
     /// the worst failure available to a token-budget tool.
     #[test]
     fn test_guidance_mode_ordering_is_the_codes_own_order() {
-        let content = guidance_content("2.1.0");
-        let line = content
-            .lines()
-            .skip_while(|l| !l.starts_with("# Modes ("))
-            .nth(1)
-            .expect("the guidance must carry a mode-ordering line under its header");
+        for (name, content) in all_renders() {
+            let line = content
+                .lines()
+                .skip_while(|l| !l.starts_with("# Modes ("))
+                .nth(1)
+                .expect("the guidance must carry a mode-ordering line under its header");
 
-        let listed: Vec<&str> = line
-            .trim_start_matches("# ")
-            .split('→')
-            // `structure (default)` — the parenthetical is an annotation, not a
-            // mode name, so compare the first token of each cell.
-            .filter_map(|cell| cell.split_whitespace().next())
-            .collect();
+            let listed: Vec<&str> = line
+                .trim_start_matches("# ")
+                .split('→')
+                // `structure (default)` — the parenthetical is an annotation, not a
+                // mode name, so compare the first token of each cell.
+                .filter_map(|cell| cell.split_whitespace().next())
+                .collect();
 
-        let expected: Vec<&str> = rskim_core::Mode::Full
-            .cascade_from_here()
-            .iter()
-            .map(|m| m.name())
-            .collect();
+            let expected: Vec<&str> = rskim_core::Mode::Full
+                .cascade_from_here()
+                .iter()
+                .map(|m| m.name())
+                .collect();
 
-        assert_eq!(
-            listed, expected,
-            "guidance mode order must equal Mode::Full.cascade_from_here(): {line}"
-        );
-    }
-
-    /// The lines of the "Search and read" section: from its heading up to,
-    /// and not including, the next `### ` heading.
-    fn search_section(content: &str) -> Vec<&str> {
-        content
-            .lines()
-            .skip_while(|l| *l != "### Search and read")
-            .enumerate()
-            .take_while(|(i, l)| *i == 0 || !l.starts_with("### "))
-            .map(|(_, l)| l)
-            .collect()
+            assert_eq!(
+                listed, expected,
+                "guidance mode order must equal Mode::Full.cascade_from_here() in the {name} render: {line}"
+            );
+        }
     }
 
     /// The guidance tells an agent how to use `skim search` (#204). The section
     /// stays short, because the whole guidance is loaded into every session.
     #[test]
     fn test_guidance_search_and_read_section_is_present_and_bounded() {
-        const MAX_SECTION_LINES: usize = 25;
-        for content in [guidance_content("3.0.0"), guidance_content_mdc("3.0.0")] {
+        for (name, content) in all_renders() {
             let section = search_section(&content);
             assert!(
                 !section.is_empty(),
-                "the guidance needs a Search and read section"
+                "the {name} render needs a Search and read section"
             );
             assert!(
-                section.len() <= MAX_SECTION_LINES,
-                "the Search and read section has {} lines; the bound is {MAX_SECTION_LINES}",
+                section.len() <= MAX_SEARCH_SECTION_LINES,
+                "the Search and read section of the {name} render has {} lines; the bound is {MAX_SEARCH_SECTION_LINES}",
                 section.len()
             );
             let text = section.join("\n");
-            for needle in [
-                "skim search",
-                "definition",
-                "calls",
-                "-E",
-                "--symbol",
-                "Exit codes: 0",
-                "hidden and secret-bearing",
-                "-g '!NAME'",
+            for needle in SEARCH_SECTION_NEEDLES {
+                assert!(
+                    text.contains(needle),
+                    "the section of the {name} render must mention {needle:?}"
+                );
+            }
+            assert!(
+                text.contains(SEARCH_WHEN),
+                "the section of the {name} render must hold the lines on when to search"
+            );
+        }
+    }
+
+    /// The when lines are short, name both tools and state the one difference
+    /// from `rg` that the trial measured. They do not say to use skim instead of
+    /// `rg`.
+    #[test]
+    fn test_search_when_is_short_and_names_the_tools_and_the_hidden_file_difference() {
+        let lines = SEARCH_WHEN.lines().count();
+        assert!(
+            (2..=4).contains(&lines),
+            "the when lines must be 2 to 4 lines, not {lines}"
+        );
+        assert!(SEARCH_WHEN.contains("`skim search NAME`"));
+        assert!(SEARCH_WHEN.contains("`rg`"));
+        assert!(SEARCH_WHEN.contains("tracked hidden files such as `.env`"));
+        assert!(!SEARCH_WHEN.contains("instead of"));
+    }
+
+    /// An agent with no skim hook gets no claim about a hook. The hook render
+    /// keeps every one of them.
+    #[test]
+    fn test_no_hook_render_has_no_hook_claim_and_the_hook_render_keeps_them() {
+        let hook = guidance_content("3.0.0", GuidanceHooks::Hook);
+        let no_hook = guidance_content("3.0.0", GuidanceHooks::NoHook);
+        for claim in [
+            "### Command wrapping",
+            "rewrite hook",
+            "wrap supported shell commands",
+            "In Claude Code auto mode",
+            "stderr notice",
+        ] {
+            assert!(hook.contains(claim), "the hook render must say {claim:?}");
+            assert!(
+                !no_hook.contains(claim),
+                "the no-hook render must not say {claim:?}"
+            );
+        }
+        assert!(
+            !no_hook.to_lowercase().contains("hook"),
+            "the no-hook render must not speak of a hook"
+        );
+    }
+
+    /// Both rules hold for any agent, so every render keeps them: Codex has
+    /// seeded permissions even though it has no hook.
+    #[test]
+    fn test_every_render_keeps_the_permission_line_and_the_flag_it_line() {
+        for (name, content) in all_renders() {
+            for line in [
+                "Do not change permission or allowlist settings",
+                "flag it to the user",
             ] {
-                assert!(text.contains(needle), "the section must mention {needle:?}");
+                assert!(
+                    content.contains(line),
+                    "the {name} render must keep {line:?}"
+                );
+            }
+        }
+    }
+
+    /// The heatmap noise paragraph and the `head`/`tail` detail cost bytes in
+    /// every session and tell an agent nothing it acts on.
+    #[test]
+    fn test_the_heatmap_noise_paragraph_and_the_head_tail_detail_are_cut() {
+        for (name, content) in all_renders() {
+            for cut in ["Noise rules hide", "`head -20 file.ts` becomes"] {
+                assert!(
+                    !content.contains(cut),
+                    "the {name} render must not hold {cut:?}"
+                );
+            }
+        }
+    }
+
+    /// Bounds on the size of a render, in bytes and lines. Each is the next
+    /// multiple of 256 bytes and of 10 lines above the largest render of its
+    /// variant, a rule file included, for the version "3.0.0": the hook render
+    /// of a rule file is 7,047 bytes and 141 lines, and the no-hook render of a
+    /// rule file is 5,806 bytes and 118 lines. The hook text, which an agent
+    /// loads in every session, was 7,733 bytes before the cuts.
+    const MAX_HOOK_BYTES: usize = 7_168;
+    const MAX_HOOK_LINES: usize = 150;
+    const MAX_NO_HOOK_BYTES: usize = 5_888;
+    const MAX_NO_HOOK_LINES: usize = 120;
+
+    #[test]
+    fn test_every_render_is_within_its_bound() {
+        for (name, hooks, max_bytes, max_lines) in [
+            ("hook", GuidanceHooks::Hook, MAX_HOOK_BYTES, MAX_HOOK_LINES),
+            (
+                "no-hook",
+                GuidanceHooks::NoHook,
+                MAX_NO_HOOK_BYTES,
+                MAX_NO_HOOK_LINES,
+            ),
+        ] {
+            for format in [
+                GuidanceFormat::markdown(hooks),
+                GuidanceFormat::cursor_rule(hooks),
+            ] {
+                let text = render_file(&format, "3.0.0");
+                let (bytes, lines) = (text.len(), text.lines().count());
+                assert!(
+                    bytes <= max_bytes,
+                    "the {name} render (rule file: {}) has {bytes} bytes; the bound is {max_bytes}. Cut text before you raise the bound.",
+                    format.owned
+                );
+                assert!(
+                    lines <= max_lines,
+                    "the {name} render (rule file: {}) has {lines} lines; the bound is {max_lines}. Cut text before you raise the bound.",
+                    format.owned
+                );
             }
         }
     }
 
     #[test]
-    fn test_guidance_content_mdc_has_frontmatter() {
-        let content = guidance_content_mdc("2.1.0");
+    fn test_the_hook_bound_is_below_the_size_before_the_cuts() {
+        const BYTES_BEFORE_THE_CUTS: usize = 7_733;
+        const _: () = assert!(MAX_HOOK_BYTES < BYTES_BEFORE_THE_CUTS);
+    }
+
+    #[test]
+    fn test_cursor_rule_render_has_exactly_one_frontmatter() {
+        let content = render_file(&GuidanceFormat::cursor_rule(GuidanceHooks::Hook), "2.1.0");
         assert!(
             content.starts_with("---\n"),
             "Should start with YAML frontmatter"
         );
-        assert!(content.contains("alwaysApply: true"));
+        assert_eq!(content.matches("alwaysApply: true").count(), 1);
         assert!(content.contains("description:"));
         assert!(content.contains("<!-- skim-start v2.1.0 -->"));
-        assert!(content.contains("<!-- skim-end -->"));
+        assert!(content.ends_with("<!-- skim-end -->"));
+
+        let plain = render_file(&GuidanceFormat::markdown(GuidanceHooks::Hook), "2.1.0");
+        assert!(plain.starts_with("<!-- skim-start v2.1.0 -->"));
     }
 
     // ---- confirm_grant — non-TTY refusal ----

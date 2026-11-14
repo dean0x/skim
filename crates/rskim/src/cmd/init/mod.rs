@@ -19,6 +19,7 @@
 
 mod flags;
 mod guidance;
+mod guidance_block;
 mod guidance_path;
 mod helpers;
 mod install;
