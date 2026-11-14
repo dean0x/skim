@@ -4,7 +4,12 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
+
 use super::guidance_block::{GuidanceFormat, GuidanceHooks};
+use crate::cmd::hooks::protocol_for_agent;
+use crate::cmd::safe_fs::{self, OpenFailure};
+use crate::cmd::session::AgentKind;
 
 // ============================================================================
 // Shared constants
@@ -408,22 +413,93 @@ pub(crate) fn backup_settings_file(config_dir: &Path, real_path: &Path) -> anyho
     backup_config_file(real_path, &config_dir.join(SETTINGS_BACKUP))
 }
 
-/// Copy `real_path` byte for byte to `backup_path` before a write.
+/// The name of the backup that `skim init` writes next to the config file of
+/// `agent`: the file name of that config file with `.bak` added. Cursor gets
+/// `hooks.json.bak` and Crush `crush.json.bak`.
+pub(super) fn config_backup_name(agent: AgentKind) -> String {
+    format!("{}.bak", protocol_for_agent(agent).config_filename())
+}
+
+/// Copy `real_path` byte for byte to `backup_path` before a write: the one
+/// writer of every config-file backup.
 ///
-/// Rejects a `real_path` that is a symlink: the caller resolved it with
-/// [`resolve_real_settings_path`], so a symlink here means the path changed
-/// after resolution. Used for config files whose backup is not
-/// `settings.json.bak` (Copilot CLI's `permissions-config.json`).
+/// The source is opened without following a link. The caller resolved it with
+/// [`resolve_real_settings_path`], so a link here means the path changed after
+/// resolution. A regular file at `backup_path` is replaced. A link, a folder or
+/// any other file at `backup_path` stops the backup with an error, and nothing
+/// at that name is changed. The new backup is created exclusively with mode
+/// 0600, so no write goes through a name that appeared after the check.
+/// Used for config files whose backup is not `settings.json.bak` (Cursor's
+/// `hooks.json`, Crush's `crush.json`, Copilot CLI's `permissions-config.json`).
 pub(crate) fn backup_config_file(real_path: &Path, backup_path: &Path) -> anyhow::Result<()> {
-    if real_path.is_symlink() {
-        anyhow::bail!(
+    let mut source = open_backup_source(real_path)?;
+    clear_regular_backup(backup_path)?;
+    let mut backup = create_new_private(backup_path)
+        .with_context(|| format!("could not create the backup {}", backup_path.display()))?;
+    std::io::copy(&mut source, &mut backup)
+        .with_context(|| format!("could not write the backup {}", backup_path.display()))?;
+    Ok(())
+}
+
+/// Open the file to back up. Refuses a link at the last component and anything
+/// that is not a regular file.
+fn open_backup_source(real_path: &Path) -> anyhow::Result<std::fs::File> {
+    let file = match safe_fs::open_no_follow(real_path) {
+        Ok(file) => file,
+        Err(OpenFailure::Symlink) => anyhow::bail!(
             "settings path became a symlink after resolution: {}\n\
              hint: this may indicate a symlink race; please verify the path manually",
             real_path.display()
-        );
+        ),
+        Err(OpenFailure::Missing) => {
+            anyhow::bail!("cannot back up {}: it does not exist", real_path.display())
+        }
+        Err(OpenFailure::Other(error)) => {
+            return Err(error).with_context(|| format!("could not open {}", real_path.display()));
+        }
+    };
+    let is_file = file
+        .metadata()
+        .with_context(|| format!("could not check {}", real_path.display()))?
+        .is_file();
+    anyhow::ensure!(
+        is_file,
+        "cannot back up {}: it is not a regular file",
+        real_path.display()
+    );
+    Ok(file)
+}
+
+/// Remove a regular file at `backup_path`. Stop on anything else that exists
+/// there, a link included.
+fn clear_regular_backup(backup_path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(backup_path) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::remove_file(backup_path)
+            .with_context(|| format!("could not replace the backup {}", backup_path.display())),
+        Ok(_) => anyhow::bail!(
+            "the backup path {} is a link or not a regular file, so skim stops.\n\
+             hint: remove it, then run the command again",
+            backup_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("could not check the backup {}", backup_path.display())),
     }
-    std::fs::copy(real_path, backup_path)?;
-    Ok(())
+}
+
+/// Create `path` for writing, private to the owner (mode 0600 on unix).
+///
+/// The create fails when anything exists at `path`, a link included: it never
+/// writes through a link and never truncates a file.
+fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// Allow-list entries as one line of display text, separated by `, `.
@@ -1027,6 +1103,129 @@ mod tests {
             backup_bytes, b"{\"key\":\"value\"}",
             "backup must be a byte-exact copy"
         );
+    }
+
+    // ---- backup_config_file: exclusive create ----
+
+    /// A source file and a backup path in a fresh folder.
+    fn backup_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("hooks.json");
+        std::fs::write(&source, b"{\"new\":true}").unwrap();
+        let backup = dir.path().join("hooks.json.bak");
+        (dir, source, backup)
+    }
+
+    #[test]
+    fn a_regular_backup_that_exists_is_replaced_by_the_new_copy() {
+        let (_dir, source, backup) = backup_fixture();
+        std::fs::write(&backup, b"older backup that is longer than the new file").unwrap();
+
+        backup_config_file(&source, &backup).unwrap();
+
+        assert_eq!(std::fs::read(&backup).unwrap(), b"{\"new\":true}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_backup_is_private_to_its_owner_whatever_the_mode_of_the_source() {
+        let (_dir, source, backup) = backup_fixture();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        backup_config_file(&source, &backup).unwrap();
+
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_backup_name_stops_the_backup_and_its_target_stays_unchanged() {
+        let (dir, source, backup) = backup_fixture();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"not a backup").unwrap();
+        std::os::unix::fs::symlink(&victim, &backup).unwrap();
+
+        let error = backup_config_file(&source, &backup).unwrap_err();
+
+        assert!(error.to_string().contains("hooks.json.bak"), "{error}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"not a backup");
+        assert!(
+            std::fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must stay where it was"
+        );
+    }
+
+    #[test]
+    fn a_folder_at_the_backup_name_stops_the_backup() {
+        let (_dir, source, backup) = backup_fixture();
+        std::fs::create_dir(&backup).unwrap();
+
+        let error = backup_config_file(&source, &backup).unwrap_err();
+
+        assert!(error.to_string().contains("hooks.json.bak"), "{error}");
+        assert!(backup.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_as_the_source_stops_the_backup_and_no_backup_is_made() {
+        let (dir, _source, backup) = backup_fixture();
+        let target = dir.path().join("real.json");
+        std::fs::write(&target, b"{}").unwrap();
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = backup_config_file(&link, &backup).unwrap_err();
+
+        assert!(error.to_string().contains("became a symlink"), "{error}");
+        assert!(!backup.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_new_private_refuses_a_file_a_link_and_a_dangling_link() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::write(&existing, b"keep").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&existing, &link).unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+        for path in [&existing, &link, &dangling] {
+            assert!(
+                create_new_private(path).is_err(),
+                "an exclusive create must fail at {}",
+                path.display()
+            );
+        }
+
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+        assert!(!dir.path().join("nowhere").exists());
+    }
+
+    #[test]
+    fn the_backup_name_follows_the_config_file_of_each_agent() {
+        let names: Vec<(AgentKind, String)> = AgentKind::all_supported()
+            .iter()
+            .map(|&agent| (agent, config_backup_name(agent)))
+            .collect();
+
+        for (agent, name) in names {
+            let expected = match agent {
+                AgentKind::Cursor => "hooks.json.bak",
+                AgentKind::Crush => "crush.json.bak",
+                AgentKind::ClaudeCode
+                | AgentKind::GeminiCli
+                | AgentKind::CodexCli
+                | AgentKind::CopilotCli => "settings.json.bak",
+            };
+            assert_eq!(name, expected, "backup name of {agent:?}");
+        }
     }
 
     #[test]

@@ -133,18 +133,67 @@ fn resolved_path(
 /// a link to `AGENTS.md` gets the same text as `AGENTS.md`. It does not depend
 /// on which agents are installed.
 fn hooks_for_file(path: &Path, scope: &GuidanceScope, env: &InstructionEnv) -> GuidanceHooks {
-    let hookless_reader = AgentKind::all_supported().iter().any(|&other| {
-        protocol_for_agent(other).hook_support() == HookSupport::AwarenessOnly
-            && matches!(
-                resolved_path(other, scope, env),
-                Ok(Some(resolved)) if resolved.path == path
-            )
-    });
+    let hookless_reader = agents_reading_file(path, scope, env)
+        .into_iter()
+        .any(|reader| protocol_for_agent(reader).hook_support() == HookSupport::AwarenessOnly);
     if hookless_reader {
         GuidanceHooks::NoHook
     } else {
         GuidanceHooks::Hook
     }
+}
+
+/// The agents whose guidance file in `scope` resolves to `path`.
+///
+/// The test is on the resolved path, so a link and the file it names count as
+/// one file. An agent whose path the policy refuses reads no file here.
+fn agents_reading_file(path: &Path, scope: &GuidanceScope, env: &InstructionEnv) -> Vec<AgentKind> {
+    AgentKind::all_supported()
+        .iter()
+        .copied()
+        .filter(|&other| {
+            matches!(
+                resolved_path(other, scope, env),
+                Ok(Some(resolved)) if resolved.path == path
+            )
+        })
+        .collect()
+}
+
+/// The other agents that read the guidance file of `agent` in `scope`.
+///
+/// Empty when the file of `agent` cannot be resolved: the writer and the
+/// remover then leave that file alone.
+pub(super) fn agents_sharing_file(
+    agent: AgentKind,
+    scope: &GuidanceScope,
+    env: &InstructionEnv,
+) -> Vec<AgentKind> {
+    let Ok(Some(own)) = resolved_path(agent, scope, env) else {
+        return Vec::new();
+    };
+    agents_reading_file(&own.path, scope, env)
+        .into_iter()
+        .filter(|&other| other != agent)
+        .collect()
+}
+
+/// The note that says the block of `shown` stays because other agents use it.
+pub(super) fn kept_shared_note(shown: &Path, shared_with: &[AgentKind]) -> String {
+    let names = shared_with
+        .iter()
+        .map(AgentKind::display_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let verb = if shared_with.len() == 1 {
+        "uses"
+    } else {
+        "use"
+    };
+    format!(
+        "  Note: kept guidance in {}; {names} still {verb} it",
+        shown.display()
+    )
 }
 
 /// Read the instruction file at `path` as strict UTF-8, within
@@ -364,39 +413,51 @@ pub(super) fn inject_guidance(
     Ok(())
 }
 
+/// The note for an agent that has no guidance file in the global scope (Cursor).
+///
+/// It names the command that adds the file to one repository.
+pub(super) fn no_global_file_note(agent: AgentKind) -> String {
+    format!(
+        "  Note: {} has no global guidance file. \
+         In a repository, run `skim init --agent {} --project` to add it.",
+        agent.display_name(),
+        agent.cli_name()
+    )
+}
+
 /// The target `inject_guidance` writes.
 ///
 /// Returns `Ok(None)` after it printed a note when the path policy leaves the
-/// file alone. Returns an error when a global path is wrong. An agent with no
-/// global file (Cursor) uses its project file.
+/// file alone, and when the agent has no global file (Cursor): the file of such
+/// an agent is a project file, and a global install never writes it. Returns an
+/// error when a global path is wrong.
 fn writable_target(
     agent: AgentKind,
     global: bool,
     env: &InstructionEnv,
 ) -> anyhow::Result<Option<GuidanceTarget>> {
     let scope = GuidanceScope::for_flag(global)?;
-    let found = match guidance_target(agent, &scope, env) {
-        Ok(None) if global => {
-            eprintln!(
-                "  {} does not support global guidance. Using project scope.",
-                agent.display_name()
-            );
-            guidance_target(agent, &GuidanceScope::for_flag(false)?, env)
-        }
-        other => other,
-    };
-    match found {
+    match guidance_target(agent, &scope, env) {
         Ok(Some(target)) => Ok(Some(target)),
+        Ok(None) if global => {
+            println!("{}", no_global_file_note(agent));
+            Ok(None)
+        }
         Ok(None) => anyhow::bail!("No instruction file for {}", agent.display_name()),
         Err(refusal) => refusal.report().map(|()| None),
     }
 }
 
 /// Remove skim guidance section from the agent's main instruction file.
+///
+/// `shared_with` lists the other agents that read the same file and are still
+/// set up. While it is not empty the block stays, because removing it would
+/// take the guidance from those agents.
 pub(super) fn remove_guidance(
     agent: AgentKind,
     global: bool,
     env: &InstructionEnv,
+    shared_with: &[AgentKind],
 ) -> anyhow::Result<()> {
     let scope = GuidanceScope::for_flag(global)?;
     let target = match guidance_target(agent, &scope, env) {
@@ -409,11 +470,12 @@ pub(super) fn remove_guidance(
 
     // A missing file has nothing to remove. A refused file is left alone.
     if let Some(target) = target.filter(|t| t.path.exists()) {
-        strip_target(&target)?;
+        strip_target(&target, shared_with)?;
     }
 
-    // Also clean legacy .cursorrules for Cursor
-    if agent == AgentKind::Cursor {
+    // The legacy `.cursorrules` file belongs to a project folder. A global
+    // uninstall never reads or writes in the current folder.
+    if agent == AgentKind::Cursor && !global {
         clean_legacy_cursorrules()?;
     }
 
@@ -426,13 +488,20 @@ pub(super) fn remove_guidance(
 /// skim owns, its frontmatter) is deleted. Any other file is rewritten without
 /// the section, and the text of the user stays. A file with no section, or a
 /// broken one, is left as it is.
-fn strip_target(target: &GuidanceTarget) -> anyhow::Result<()> {
+///
+/// While `shared_with` is not empty, a file with a section is left as it is and
+/// a note says which agents still use it.
+fn strip_target(target: &GuidanceTarget, shared_with: &[AgentKind]) -> anyhow::Result<()> {
     let path = target.path.as_path();
     let content = match read_existing_safely(path)? {
         Some(s) => s,
         None => return Ok(()), // soft skip (too large or unreadable)
     };
     if let Some(stripped) = strip_section(&content, target.format.frontmatter) {
+        if !shared_with.is_empty() {
+            println!("{}", kept_shared_note(&target.shown, shared_with));
+            return Ok(());
+        }
         if skim_shaped(&content, &target.format) {
             std::fs::remove_file(path)?;
         } else {

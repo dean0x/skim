@@ -6,8 +6,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use super::{
-    GuidanceFormat, GuidanceHooks, GuidanceScope, PathRefusal, TargetRefusal, guidance_target,
-    inject_guidance, remove_guidance,
+    GuidanceFormat, GuidanceHooks, GuidanceScope, PathRefusal, TargetRefusal, agents_sharing_file,
+    guidance_target, inject_guidance, kept_shared_note, no_global_file_note, remove_guidance,
+    writable_target,
 };
 use crate::cmd::init::guidance_block::CURSOR_RULE_FRONTMATTER;
 use crate::cmd::init::helpers::guidance_content;
@@ -50,7 +51,7 @@ fn inject_refuses_a_relative_override_and_writes_nothing() {
 fn remove_refuses_a_relative_override() {
     let env = env_with_all(RELATIVE_DIR);
 
-    let error = remove_guidance(AgentKind::GeminiCli, true, &env).unwrap_err();
+    let error = remove_guidance(AgentKind::GeminiCli, true, &env, &[]).unwrap_err();
 
     assert!(error.to_string().contains("GEMINI_CONFIG_DIR"), "{error}");
 }
@@ -103,6 +104,27 @@ fn cursor_has_no_global_target() {
     let target = guidance_target(AgentKind::Cursor, &GuidanceScope::Global, &env).unwrap();
 
     assert_eq!(target, None);
+}
+
+#[test]
+fn a_global_install_for_cursor_has_no_target_and_does_not_fall_back_to_the_project_file() {
+    let env = env_with_all(RELATIVE_DIR);
+
+    let target = writable_target(AgentKind::Cursor, true, &env).unwrap();
+
+    assert_eq!(
+        target, None,
+        "a global Cursor install must not write a file in the current folder"
+    );
+}
+
+#[test]
+fn the_cursor_note_names_the_project_command() {
+    assert_eq!(
+        no_global_file_note(AgentKind::Cursor),
+        "  Note: Cursor has no global guidance file. \
+         In a repository, run `skim init --agent cursor --project` to add it."
+    );
 }
 
 #[test]
@@ -201,7 +223,7 @@ fn install_and_uninstall_follow_a_global_link_to_a_regular_file() {
     assert!(installed.starts_with("# My rules\n"), "{installed}");
     assert!(installed.contains("skim-start"), "{installed}");
 
-    remove_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
+    remove_guidance(AgentKind::ClaudeCode, true, &env, &[]).unwrap();
 
     assert!(
         std::fs::symlink_metadata(&at)
@@ -225,7 +247,7 @@ fn install_and_uninstall_leave_a_global_link_to_a_folder_alone() {
     let env = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| None);
 
     inject_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
-    remove_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
+    remove_guidance(AgentKind::ClaudeCode, true, &env, &[]).unwrap();
 
     assert!(
         std::fs::symlink_metadata(&at)
@@ -342,7 +364,7 @@ fn a_file_that_is_not_utf8_is_skipped_and_stays_byte_unchanged() {
 
     assert_eq!(read_existing_safely(&file).unwrap(), None);
     inject_guidance(AgentKind::ClaudeCode, true, &env_at(home.path())).unwrap();
-    remove_guidance(AgentKind::ClaudeCode, true, &env_at(home.path())).unwrap();
+    remove_guidance(AgentKind::ClaudeCode, true, &env_at(home.path()), &[]).unwrap();
 
     assert_eq!(std::fs::read(&file).unwrap(), bytes);
 }
@@ -442,7 +464,7 @@ fn install_and_uninstall_leave_the_old_temporary_name_unchanged() {
     let env = env_at(home.path());
 
     inject_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
-    remove_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
+    remove_guidance(AgentKind::ClaudeCode, true, &env, &[]).unwrap();
 
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside text\n");
     assert!(
@@ -829,7 +851,7 @@ fn uninstall_deletes_a_rule_file_that_is_skim_shaped() {
     )
     .unwrap();
 
-    strip_target(&target).unwrap();
+    strip_target(&target, &[]).unwrap();
 
     assert!(!target.path.exists());
 }
@@ -844,7 +866,7 @@ fn uninstall_strips_only_the_block_from_a_rule_file_with_user_text() {
     )
     .unwrap();
 
-    strip_target(&target).unwrap();
+    strip_target(&target, &[]).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(&target.path).unwrap(),
@@ -859,7 +881,7 @@ fn uninstall_leaves_a_rule_file_with_no_markers_alone() {
     let text = "---\nalwaysApply: true\n---\n\nMy own rules.\n";
     std::fs::write(&target.path, text).unwrap();
 
-    strip_target(&target).unwrap();
+    strip_target(&target, &[]).unwrap();
 
     assert_eq!(std::fs::read_to_string(&target.path).unwrap(), text);
 }
@@ -870,7 +892,117 @@ fn uninstall_deletes_a_markdown_file_that_holds_only_the_block() {
     let target = claude_target(&root);
     std::fs::write(&target.path, format!("{}\n", new_block())).unwrap();
 
-    strip_target(&target).unwrap();
+    strip_target(&target, &[]).unwrap();
 
     assert!(!target.path.exists());
+}
+
+// ============================================================================
+// A file that other agents share
+// ============================================================================
+
+/// The agents that share the file of `agent` in the project `root`.
+fn sharing_in_project(agent: AgentKind, root: &tempfile::TempDir) -> Vec<AgentKind> {
+    agents_sharing_file(agent, &project_scope(root), &env_at(root.path()))
+}
+
+#[test]
+fn codex_and_crush_share_the_project_agents_file_and_claude_shares_nothing() {
+    let root = tempfile::TempDir::new().unwrap();
+
+    assert_eq!(
+        sharing_in_project(AgentKind::CodexCli, &root),
+        [AgentKind::Crush]
+    );
+    assert_eq!(
+        sharing_in_project(AgentKind::Crush, &root),
+        [AgentKind::CodexCli]
+    );
+    assert_eq!(sharing_in_project(AgentKind::ClaudeCode, &root), []);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_claude_file_that_links_to_agents_md_is_shared_with_codex_and_crush() {
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "shared text\n").unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", root.path().join("CLAUDE.md")).unwrap();
+
+    assert_eq!(
+        sharing_in_project(AgentKind::ClaudeCode, &root),
+        [AgentKind::CodexCli, AgentKind::Crush]
+    );
+}
+
+#[test]
+fn agents_share_a_global_file_only_when_their_variables_name_one_folder() {
+    let home = tempfile::TempDir::new().unwrap();
+    let shared = home.path().join("shared-agent-folder");
+    let apart = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| None);
+    let together = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |name| {
+        matches!(name, "CODEX_HOME" | "CRUSH_CONFIG_DIR").then(|| shared.clone().into_os_string())
+    });
+
+    assert_eq!(
+        agents_sharing_file(AgentKind::CodexCli, &GuidanceScope::Global, &apart),
+        []
+    );
+    assert_eq!(
+        agents_sharing_file(AgentKind::CodexCli, &GuidanceScope::Global, &together),
+        [AgentKind::Crush]
+    );
+}
+
+/// A project `AGENTS.md` that holds the no-hook block and the text of the user.
+fn shared_agents_target(root: &tempfile::TempDir) -> GuidanceTarget {
+    guidance_target(AgentKind::Crush, &project_scope(root), &env_at(root.path()))
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn uninstall_keeps_a_block_while_another_agent_still_uses_the_file() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = shared_agents_target(&root);
+    for text in [
+        format!("{}\n", target.block(RENDER_VERSION)),
+        format!("# My notes\n\n{}\n", target.block(RENDER_VERSION)),
+    ] {
+        std::fs::write(&target.path, &text).unwrap();
+
+        strip_target(&target, &[AgentKind::CodexCli]).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target.path).unwrap(), text);
+    }
+}
+
+#[test]
+fn uninstall_removes_the_block_when_no_other_agent_uses_the_file() {
+    let root = tempfile::TempDir::new().unwrap();
+    let target = shared_agents_target(&root);
+    std::fs::write(
+        &target.path,
+        format!("# My notes\n\n{}\n", target.block(RENDER_VERSION)),
+    )
+    .unwrap();
+
+    strip_target(&target, &[]).unwrap();
+
+    let after = std::fs::read_to_string(&target.path).unwrap();
+    assert!(!after.contains("skim-start"), "{after}");
+    assert!(after.contains("# My notes"), "{after}");
+}
+
+#[test]
+fn the_kept_note_names_the_file_and_the_agents_that_use_it() {
+    let shown = std::path::Path::new("AGENTS.md");
+
+    assert_eq!(
+        kept_shared_note(shown, &[AgentKind::CodexCli]),
+        "  Note: kept guidance in AGENTS.md; Codex CLI still uses it"
+    );
+    assert_eq!(
+        kept_shared_note(shown, &[AgentKind::CodexCli, AgentKind::Crush]),
+        "  Note: kept guidance in AGENTS.md; Codex CLI, Crush still use it"
+    );
 }

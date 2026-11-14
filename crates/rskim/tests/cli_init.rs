@@ -3623,3 +3623,340 @@ fn bodyless_module_name(trimmed: &str) -> Option<&str> {
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
         .then_some(name)
 }
+
+// ============================================================================
+// Cursor has no global guidance file
+// ============================================================================
+
+/// A `.cursorrules` file that holds an old skim block between user text.
+const CURSORRULES_WITH_BLOCK: &str = "# User rules\n\n<!-- skim-start v1.0.0 -->\nold guidance\n<!-- skim-end -->\n\n# More user rules\n";
+
+/// The line that a global run with Cursor prints instead of writing a file.
+const CURSOR_GLOBAL_NOTE: &str = "Note: Cursor has no global guidance file. \
+     In a repository, run `skim init --agent cursor --project` to add it.";
+
+/// Every file and folder under `dir`, by relative path, with the bytes of each
+/// file (`None` for a folder), for a before/after check.
+fn snapshot_tree(dir: &std::path::Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if path.is_dir() {
+                out.insert(name, None);
+                walk(root, &path, out);
+            } else {
+                out.insert(name, Some(fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// A global init with Cursor writes nothing in the current folder, leaves a
+/// `.cursorrules` file as it is, and prints the project command.
+#[test]
+fn test_global_init_with_cursor_writes_nothing_in_the_cwd_and_prints_the_project_command() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cursor");
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join(".cursorrules"), CURSORRULES_WITH_BLOCK).unwrap();
+    let before = snapshot_tree(&project);
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(CURSOR_GLOBAL_NOTE))
+        .stderr(predicate::str::contains("Using project scope").not());
+
+    assert_eq!(snapshot_tree(&project), before);
+}
+
+/// The dry-run of a global Cursor init prints the same line and writes nothing.
+#[test]
+fn test_dry_run_of_a_global_init_with_cursor_prints_the_project_command() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cursor");
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join(".cursorrules"), CURSORRULES_WITH_BLOCK).unwrap();
+    let before = snapshot_tree(&project);
+    let home_before = snapshot_tree(sandbox.home());
+
+    sandbox
+        .init()
+        .args(["--yes", "--dry-run", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(CURSOR_GLOBAL_NOTE));
+
+    assert_eq!(snapshot_tree(&project), before);
+    assert_eq!(snapshot_tree(sandbox.home()), home_before);
+}
+
+/// A global uninstall with Cursor leaves the current folder as it is: the
+/// `.cursorrules` file keeps its block and the project rule file stays.
+#[test]
+fn test_global_uninstall_with_cursor_leaves_the_cwd_unchanged() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cursor");
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "cursor"])
+        .assert()
+        .success();
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join(".cursorrules"), CURSORRULES_WITH_BLOCK).unwrap();
+    fs::create_dir_all(project.join(".cursor/rules")).unwrap();
+    fs::write(project.join(".cursor/rules/skim.mdc"), "my own rule\n").unwrap();
+    let before = snapshot_tree(&project);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim hook has been uninstalled"))
+        .stdout(predicate::str::contains("Cleaned legacy").not());
+
+    assert_eq!(snapshot_tree(&project), before);
+}
+
+// ============================================================================
+// The backup is named after the config file
+// ============================================================================
+
+/// Cursor backs up `hooks.json` to `hooks.json.bak`, and an old
+/// `settings.json.bak` stays as it is.
+#[test]
+fn test_init_backs_up_cursor_hooks_json_to_hooks_json_bak() {
+    let sandbox = Sandbox::bare();
+    let cursor = sandbox.config_dir(".cursor");
+    fs::write(cursor.join("hooks.json"), "{\"version\":1}\n").unwrap();
+    fs::write(cursor.join("settings.json.bak"), "an older backup\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hooks.json -> hooks.json.bak"));
+
+    assert_eq!(
+        fs::read_to_string(cursor.join("hooks.json.bak")).unwrap(),
+        "{\"version\":1}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(cursor.join("settings.json.bak")).unwrap(),
+        "an older backup\n",
+        "an old settings.json.bak must stay as it is"
+    );
+}
+
+/// Crush backs up `crush.json` to `crush.json.bak`.
+#[test]
+fn test_init_backs_up_crush_json_to_crush_json_bak() {
+    let sandbox = Sandbox::bare();
+    let crush = sandbox.config_dir(".crush");
+    fs::write(crush.join("crush.json"), "{\"options\":{}}\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "crush"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("crush.json -> crush.json.bak"));
+
+    assert_eq!(
+        fs::read_to_string(crush.join("crush.json.bak")).unwrap(),
+        "{\"options\":{}}\n"
+    );
+    assert!(!crush.join("settings.json.bak").exists());
+}
+
+/// Gemini keeps the name `settings.json.bak`.
+#[test]
+fn test_init_backs_up_gemini_settings_json_to_settings_json_bak() {
+    let sandbox = Sandbox::bare();
+    let gemini = sandbox.config_dir(".gemini");
+    fs::write(gemini.join("settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "gemini"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "settings.json -> settings.json.bak",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(gemini.join("settings.json.bak")).unwrap(),
+        "{\"theme\":\"dark\"}\n"
+    );
+}
+
+/// The dry-run names the backup file of the agent and writes none.
+#[test]
+fn test_dry_run_names_the_backup_file_of_the_agent() {
+    let sandbox = Sandbox::bare();
+    let cursor = sandbox.config_dir(".cursor");
+    fs::write(cursor.join("hooks.json"), "{}\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--dry-run", "--agent", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would back up"))
+        .stdout(predicate::str::contains("hooks.json -> hooks.json.bak"));
+
+    assert!(!cursor.join("hooks.json.bak").exists());
+    assert!(!cursor.join("settings.json.bak").exists());
+}
+
+/// A link at the backup name stops the install, and the file that the link
+/// names stays as it is.
+#[test]
+fn test_a_link_at_the_backup_name_stops_the_install() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let cursor = project.join(".cursor");
+    fs::create_dir_all(&cursor).unwrap();
+    fs::write(cursor.join("hooks.json"), "{}\n").unwrap();
+    let victim = sandbox.home().join("victim.txt");
+    fs::write(&victim, "keep me\n").unwrap();
+    std::os::unix::fs::symlink(&victim, cursor.join("hooks.json.bak")).unwrap();
+
+    sandbox
+        .init()
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hooks.json.bak"));
+
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me\n");
+    assert_eq!(
+        fs::read_to_string(cursor.join("hooks.json")).unwrap(),
+        "{}\n"
+    );
+    assert!(
+        !cursor.join("rules/skim.mdc").exists(),
+        "a stopped install must not write the guidance file"
+    );
+}
+
+// ============================================================================
+// A guidance file that two agents share
+// ============================================================================
+
+/// Install Codex and then Crush in `project`. Both rely on its `AGENTS.md`.
+fn install_codex_and_crush(sandbox: &Sandbox, project: &std::path::Path) {
+    for agent in ["codex", "crush"] {
+        sandbox
+            .init()
+            .args(["--project", "--yes", "--agent", agent])
+            .current_dir(project)
+            .assert()
+            .success();
+    }
+}
+
+/// Uninstall `agent` from `project`.
+fn uninstall_project_agent(
+    sandbox: &Sandbox,
+    project: &std::path::Path,
+    agent: &str,
+) -> assert_cmd::assert::Assert {
+    sandbox
+        .init()
+        .args(["--project", "--uninstall", "--yes", "--agent", agent])
+        .current_dir(project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim hook has been uninstalled"))
+}
+
+/// Uninstalling Crush keeps the block while Codex is set up. Uninstalling Codex
+/// afterwards removes it and keeps the text of the user.
+#[test]
+fn test_uninstall_of_crush_keeps_the_agents_md_block_while_codex_is_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join("AGENTS.md"), "# My notes\n").unwrap();
+    install_codex_and_crush(&sandbox, &project);
+    let agents_md = project.join("AGENTS.md");
+
+    uninstall_project_agent(&sandbox, &project, "crush").stdout(predicate::str::contains(
+        "Note: kept guidance in AGENTS.md; Codex CLI still uses it",
+    ));
+    let kept = fs::read_to_string(&agents_md).unwrap();
+    assert!(kept.contains("<!-- skim-start"), "{kept}");
+    assert!(kept.contains("# My notes"), "{kept}");
+
+    uninstall_project_agent(&sandbox, &project, "codex")
+        .stdout(predicate::str::contains("kept guidance").not());
+    let removed = fs::read_to_string(&agents_md).unwrap();
+    assert!(!removed.contains("skim-start"), "{removed}");
+    assert!(removed.contains("# My notes"), "{removed}");
+}
+
+/// Uninstalling Codex keeps the block while Crush is set up. Uninstalling Crush
+/// afterwards removes the file, which held only the block.
+#[test]
+fn test_uninstall_of_codex_keeps_the_agents_md_block_while_crush_is_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    install_codex_and_crush(&sandbox, &project);
+    let agents_md = project.join("AGENTS.md");
+
+    uninstall_project_agent(&sandbox, &project, "codex").stdout(predicate::str::contains(
+        "Note: kept guidance in AGENTS.md; Crush still uses it",
+    ));
+    assert!(
+        fs::read_to_string(&agents_md)
+            .unwrap()
+            .contains("<!-- skim-start")
+    );
+
+    uninstall_project_agent(&sandbox, &project, "crush")
+        .stdout(predicate::str::contains("kept guidance").not());
+    assert!(
+        !agents_md.exists(),
+        "the last agent to leave removes a file that held only the block"
+    );
+}
+
+/// With no other agent set up, the uninstall of Crush removes the block as before.
+#[test]
+fn test_uninstall_of_crush_removes_the_agents_md_block_when_codex_is_not_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    sandbox
+        .init()
+        .args(["--project", "--yes", "--agent", "crush"])
+        .current_dir(&project)
+        .assert()
+        .success();
+    assert!(project.join("AGENTS.md").exists());
+
+    uninstall_project_agent(&sandbox, &project, "crush")
+        .stdout(predicate::str::contains("kept guidance").not());
+
+    assert!(!project.join("AGENTS.md").exists());
+}

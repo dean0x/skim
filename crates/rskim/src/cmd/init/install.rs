@@ -7,8 +7,9 @@ use super::flags::{
     DetectionEnv, InitFlags, PermissionsTier, detect_installed_agents, resolve_single_agent,
 };
 use super::helpers::{
-    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
-    confirm_proceed, display_entries, load_or_create_settings, resolve_real_settings_path,
+    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, backup_config_file, check_mark,
+    config_backup_name, confirm_grant, confirm_proceed, display_entries, load_or_create_settings,
+    resolve_real_settings_path,
 };
 use super::state::{
     DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
@@ -1527,37 +1528,6 @@ fn migrate_copilot_legacy(
 // Settings.json patching (B8)
 // ============================================================================
 
-/// Back up the settings file before modification.
-///
-/// Re-checks that `real_path` is not a symlink immediately before copying to
-/// close the TOCTOU window between `resolve_real_settings_path()` and the
-/// actual I/O. Without this guard, an attacker could replace the file with a
-/// symlink after resolution, causing `fs::copy` to overwrite an arbitrary
-/// target.
-///
-/// **Residual TOCTOU window**: a narrow window still exists between the
-/// `is_symlink()` check below and `fs::copy`. Exploitation requires an attacker
-/// with local write access to the config directory and kernel-level scheduling
-/// control. This residual risk is accepted: the user's config directory is
-/// expected to be owner-writable only, and local write access already implies
-/// broader compromise. The guard is defence-in-depth, not a full guarantee.
-fn backup_settings(
-    config_dir: &std::path::Path,
-    real_path: &std::path::Path,
-) -> anyhow::Result<()> {
-    // Guard: reject if the path became a symlink since resolution
-    if real_path.is_symlink() {
-        anyhow::bail!(
-            "settings path became a symlink after resolution: {}\n\
-             hint: this may indicate a symlink race; please verify the path manually",
-            real_path.display()
-        );
-    }
-    let backup_path = config_dir.join(SETTINGS_BACKUP);
-    std::fs::copy(real_path, &backup_path)?;
-    Ok(())
-}
-
 fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     let agent = agent_from_state(state)?;
     let protocol = protocol_for_agent(agent);
@@ -1584,14 +1554,16 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     let real_path = resolve_real_settings_path(&state.settings_path)?;
     let mut settings = load_or_create_settings(&real_path)?;
 
-    // Back up existing file (re-check existence to avoid TOCTOU race)
+    // Back up the existing file under the name of its own config file. The
+    // backup owner stops the install when a link or a folder sits at that name.
     if real_path.exists() {
-        backup_settings(&state.config_dir, &real_path)?;
+        let backup_name = config_backup_name(agent);
+        backup_config_file(&real_path, &state.config_dir.join(&backup_name))?;
         println!(
             "  {} Backed up: {} -> {}",
             check_mark(true),
             state.settings_path.display(),
-            SETTINGS_BACKUP
+            backup_name
         );
     }
 
@@ -1616,7 +1588,7 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
 
 // Re-export guidance symbols used by production code in this module.
 pub(super) use super::guidance::{
-    guidance_target, inject_guidance, read_existing_safely, remove_guidance,
+    guidance_target, inject_guidance, no_global_file_note, read_existing_safely, remove_guidance,
 };
 pub(super) use super::guidance_block::{BlockStatus, block_status};
 pub(super) use super::guidance_path::{GuidanceScope, check_global_target};
@@ -1747,7 +1719,7 @@ pub(super) fn print_dry_run_actions(
             println!(
                 "  [dry-run] Would back up: {} -> {}",
                 state.settings_path.display(),
-                SETTINGS_BACKUP
+                config_backup_name(agent)
             );
         }
         println!(
@@ -1776,6 +1748,7 @@ fn print_dry_run_guidance(
             "  [dry-run] Would inject guidance into {}",
             target.shown.display()
         ),
+        Ok(None) if global => println!("{}", no_global_file_note(agent)),
         Ok(None) => {}
         Err(refusal) => refusal.report()?,
     }
