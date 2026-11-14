@@ -167,6 +167,9 @@ npx rskim file.ts
 
 ```bash
 # Via Homebrew (macOS/Linux)
+# Homebrew 7 loads a formula from a third-party tap only after you trust it.
+# An older Homebrew has no `brew trust` command. Skip that line there.
+brew trust --formula dean0x/tap/skim
 brew install dean0x/tap/skim
 
 # Via npm
@@ -665,7 +668,7 @@ cargo bench
 - `skim learn` — CLI error pattern detection and correction rules
 
 ✅ **Distribution:**
-- cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
+- cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew trust --formula dean0x/tap/skim`, then `brew install dean0x/tap/skim`; an older Homebrew without `brew trust` skips that step)
 - 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.

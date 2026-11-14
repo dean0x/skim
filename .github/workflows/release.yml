@@ -369,8 +369,10 @@ jobs:
 
             ### Via Homebrew (macOS/Linux)
             ```bash
+            brew trust --formula dean0x/tap/skim
             brew install dean0x/tap/skim
             ```
+            Homebrew 7 loads a formula from a third-party tap only after you trust it. An older Homebrew has no `brew trust` command, so skip that line there.
 
             ### Via Binary
             Download the binary for your platform from the assets below.
