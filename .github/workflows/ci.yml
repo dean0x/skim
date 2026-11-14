@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -101,7 +101,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
 
@@ -235,7 +235,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -310,8 +310,9 @@ jobs:
           # Beyond cmd/search/: the rskim files it imports from (cmd/mod.rs,
           # cmd/execution.rs, debug.rs, output/mod.rs, analytics/mod.rs and
           # the analytics/schema.rs and tokens.rs that module compiles in),
-          # the dispatch (cmd/dispatch.rs and main.rs), and the rskim manifest.
-          SEARCH_PATHS='^(crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/cmd/execution\.rs$|crates/rskim/src/cmd/dispatch\.rs$|crates/rskim/src/output/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-oracle/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+          # the dispatch (cmd/dispatch.rs and main.rs), the rskim manifest, and
+          # the pinned Rust version (.github/actions/setup-rust/).
+          SEARCH_PATHS='^(crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/cmd/execution\.rs$|crates/rskim/src/cmd/dispatch\.rs$|crates/rskim/src/output/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-oracle/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$|\.github/actions/setup-rust/)'
           case "$EVENT_NAME" in
             workflow_dispatch)
               search=true; reason="manual dispatch" ;;
@@ -384,7 +385,7 @@ jobs:
           "$RUNNER_TEMP/skim-release/skim" --version
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -477,7 +478,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo registry
         uses: actions/cache@v5

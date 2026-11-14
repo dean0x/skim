@@ -305,7 +305,7 @@ Two jobs in `.github/workflows/ci.yml` run the gate: `changes` (**Detect Search 
     `crates/rskim/src/analytics/mod.rs` (`AnalyticsConfig`) with the `crates/rskim/src/analytics/schema.rs` and
     `crates/rskim/src/tokens.rs` it compiles in, `crates/rskim/src/main.rs` (dispatch) and `crates/rskim/Cargo.toml`;
   - the root `Cargo.toml` / `Cargo.lock`;
-  - `.github/workflows/ci.yml`.
+  - `.github/workflows/ci.yml` and `.github/actions/setup-rust/` (the pinned Rust version of every Rust job).
 
   Adding a `crate::` import to `cmd/search/` from another `rskim` file means adding that file here and to
   `SEARCH_PATHS` in the `changes` job. To find the files, run

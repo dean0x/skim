@@ -1,0 +1,30 @@
+name: Setup Rust (pinned)
+description: >-
+  Install the one Rust version that CI and the release workflow use, so a new
+  Rust release reaches CI only through a reviewed pull request (#601).
+  To update Rust: change `toolchain` below to the new version (for example
+  1.101.0) in a pull request, and let CI run on that pull request.
+  The fuzz job of ci.yml uses nightly and does not use this action.
+
+inputs:
+  components:
+    description: >-
+      Rustup components, comma separated. The default is "rustfmt, clippy":
+      the runner images give these with their own stable toolchain, and
+      the jobs (and the tests that run `cargo clippy`) need them.
+    required: false
+    default: 'rustfmt, clippy'
+  targets:
+    description: Extra compile targets, comma separated.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        # The pin. This is the only place that names the Rust version of CI.
+        toolchain: 1.100.0
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
