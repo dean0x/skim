@@ -14,6 +14,7 @@ use super::helpers::{
 use super::state::{
     DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
 };
+use super::targets::{agent_names, install_targets};
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::sanitize_for_display;
@@ -101,8 +102,8 @@ fn verify_agent_installed(
 /// Returns `true` (treat as current) when:
 /// - `--no-guidance` is set, or
 /// - The agent has no instruction file (guidance feature not applicable), or
-/// - The block in the file is current: [`block_status`] says it is byte-equal to
-///   what this binary writes for `skim_version`.
+/// - The block in the file is current: [`block_is_current`] says it is byte-equal
+///   to what this binary writes for `skim_version`.
 ///
 /// Returns `false` when the path policy refuses the file, so the install goes on
 /// to the writer, which prints the note that names the file. It also returns
@@ -123,15 +124,7 @@ fn is_guidance_current(
     match guidance_target(agent, &scope, env) {
         // No instruction file path = guidance not applicable for this agent
         Ok(None) => true,
-        // Route through read_existing_safely to apply the bounded read,
-        // matching the parallel path in inject_guidance.
-        Ok(Some(target)) => read_existing_safely(&target.path)
-            .ok()
-            .flatten()
-            .is_some_and(|text| {
-                block_status(&text, &target.block(skim_version), &target.format)
-                    == BlockStatus::Current
-            }),
+        Ok(Some(target)) => block_is_current(&target, skim_version),
         Err(_) => false,
     }
 }
@@ -523,11 +516,18 @@ fn run_install_auto_detect(
     flags: &InitFlags,
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // The guidance-only agents come before both early returns below: a user who
+    // has only one of them, or only one other agent, still gets their files.
+    let targets = install_targets(flags, &InstructionEnv::from_process());
+
     let agents = detect_installed_agents(det_env);
     if agents.is_empty() {
+        if targets.handled > 0 {
+            return Ok(targets.exit_code_with(std::process::ExitCode::SUCCESS));
+        }
         eprintln!(
-            "No supported agents found. Install one of: Claude Code, Cursor, Gemini CLI, \
-             Copilot CLI, Codex CLI, Crush"
+            "No supported agents found. Install one of: {}",
+            agent_names(flags)
         );
         return Ok(std::process::ExitCode::FAILURE);
     }
@@ -537,7 +537,8 @@ fn run_install_auto_detect(
     // rather than caught-and-summarised), which is important for test assertions.
     if agents.len() == 1 {
         let agent_flags = agent_flags_for_auto_detect(agents[0], flags);
-        return run_install_single(&agent_flags, agents[0], det_env);
+        let code = run_install_single(&agent_flags, agents[0], det_env)?;
+        return Ok(targets.exit_code_with(code));
     }
 
     let mut any_failed = false;
@@ -560,11 +561,11 @@ fn run_install_auto_detect(
         }
     }
 
-    Ok(if any_failed {
+    Ok(targets.exit_code_with(if any_failed {
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
-    })
+    }))
 }
 
 /// Install skim for a single, explicit agent.
@@ -1588,16 +1589,14 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
 
 // Re-export guidance symbols used by production code in this module.
 pub(super) use super::guidance::{
-    guidance_target, inject_guidance, no_global_file_note, read_existing_safely, remove_guidance,
+    block_is_current, guidance_target, inject_guidance, no_global_file_note, remove_guidance,
 };
-pub(super) use super::guidance_block::{BlockStatus, block_status};
 pub(super) use super::guidance_path::{GuidanceScope, check_global_target};
 
 // Re-export additional guidance symbols for the unit tests below (via `use super::*`).
-// `read_existing_safely` is already exported above for production use; omit here.
 #[cfg(test)]
 pub(super) use super::guidance::{
-    MAX_INSTRUCTION_FILE_SIZE, atomic_write_stripped, guidance_append,
+    MAX_INSTRUCTION_FILE_SIZE, atomic_write_stripped, guidance_append, read_existing_safely,
 };
 #[cfg(test)]
 pub(super) use super::guidance_block::{find_skim_section, strip_skim_section};

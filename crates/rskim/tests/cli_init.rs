@@ -3960,3 +3960,550 @@ fn test_uninstall_of_crush_removes_the_agents_md_block_when_codex_is_not_set_up(
 
     assert!(!project.join("AGENTS.md").exists());
 }
+
+// ============================================================================
+// Guidance-only agents (Kiro, Roo Code, Cline, Augment, Windsurf)
+// ============================================================================
+
+/// The guidance-only agents: name, root folder, guidance file and the
+/// frontmatter that file starts with. Roots and files are relative to the home
+/// folder.
+const GUIDANCE_ONLY: &[(&str, &str, &str, &str)] = &[
+    (
+        "Kiro",
+        ".kiro",
+        ".kiro/steering/skim.md",
+        "---\ninclusion: always\n---\n\n",
+    ),
+    ("Roo Code", ".roo", ".roo/rules/skim.md", ""),
+    ("Cline", ".cline", ".cline/rules/skim.md", ""),
+    ("Augment", ".augment", ".augment/rules/skim.md", ""),
+    (
+        "Windsurf",
+        ".devin",
+        ".devin/rules/skim.md",
+        "---\ntrigger: always_on\n---\n\n",
+    ),
+];
+
+/// Create the root folder of every guidance-only agent in the sandbox home.
+fn create_guidance_only_roots(sandbox: &Sandbox) {
+    for (_, root, _, _) in GUIDANCE_ONLY {
+        sandbox.config_dir(root);
+    }
+}
+
+/// The guidance file of a guidance-only agent, by its file path from the table.
+fn guidance_only_file(sandbox: &Sandbox, file: &str) -> std::path::PathBuf {
+    sandbox.home().join(file)
+}
+
+/// Every guidance-only agent has a file that starts with its own frontmatter,
+/// holds the search section and has no hook text.
+fn assert_guidance_only_files_written(sandbox: &Sandbox) {
+    for (name, _, file, frontmatter) in GUIDANCE_ONLY {
+        let text = fs::read_to_string(guidance_only_file(sandbox, file))
+            .unwrap_or_else(|e| panic!("{name}: no guidance file {file}: {e}"));
+        assert!(
+            text.starts_with(&format!("{frontmatter}<!-- skim-start v")),
+            "{name}: wrong start: {}",
+            &text[..text.len().min(80)]
+        );
+        assert!(text.contains("### Search and read"), "{name}");
+        assert!(
+            !text.contains("### Command wrapping"),
+            "{name}: hook text in the file of an agent with no hook"
+        );
+        assert!(text.ends_with("<!-- skim-end -->\n"), "{name}");
+    }
+}
+
+fn assert_no_guidance_only_files(sandbox: &Sandbox) {
+    for (name, _, file, _) in GUIDANCE_ONLY {
+        assert!(
+            !guidance_only_file(sandbox, file).exists(),
+            "{name}: {file} must not exist"
+        );
+    }
+}
+
+/// With one agent detected, the guidance-only agents still get their files.
+#[test]
+fn test_init_writes_guidance_for_each_installed_guidance_only_agent() {
+    let sandbox = Sandbox::new();
+    create_guidance_only_roots(&sandbox);
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Kiro guidance setup"))
+        .stdout(predicate::str::contains("Windsurf guidance setup"));
+
+    assert_guidance_only_files_written(&sandbox);
+}
+
+/// With two agents detected (the loop, not the single-agent path), the
+/// guidance-only agents still get their files.
+#[test]
+fn test_init_writes_guidance_for_guidance_only_agents_with_two_agents_detected() {
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".gemini");
+    create_guidance_only_roots(&sandbox);
+
+    sandbox.init().arg("--yes").assert().success();
+
+    assert_guidance_only_files_written(&sandbox);
+    assert!(sandbox.home().join(".gemini/GEMINI.md").exists());
+}
+
+/// A user whose only agent is a guidance-only one gets the file and exit 0.
+#[test]
+fn test_init_with_only_a_guidance_only_agent_writes_its_file_and_succeeds() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".kiro");
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Installed guidance in"));
+
+    let text = fs::read_to_string(sandbox.home().join(".kiro/steering/skim.md")).unwrap();
+    assert!(text.starts_with("---\ninclusion: always\n---\n\n<!-- skim-start v"));
+    for (_, root, _, _) in GUIDANCE_ONLY.iter().filter(|(name, ..)| *name != "Kiro") {
+        assert!(
+            !sandbox.home().join(root).exists(),
+            "{root} must not be created"
+        );
+    }
+}
+
+/// With no agent and no guidance-only root, init fails and the message lists
+/// every agent that skim looked for.
+#[test]
+fn test_init_with_no_agent_and_no_root_lists_the_guidance_only_agents() {
+    let sandbox = Sandbox::bare();
+    let before = snapshot_tree(sandbox.home());
+
+    let assert = sandbox.init().arg("--yes").assert().failure();
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("No supported agents found"), "{stderr}");
+    for (name, ..) in GUIDANCE_ONLY {
+        assert!(stderr.contains(name), "{name} is not in: {stderr}");
+    }
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// Skim never creates a root folder, and never writes in the Cline folder under
+/// `Documents`.
+#[test]
+fn test_init_never_creates_a_root_folder_or_writes_under_documents() {
+    let sandbox = Sandbox::new();
+    let documents = sandbox.config_dir("Documents/Cline/Rules");
+    fs::write(documents.join("mine.md"), "my rule\n").unwrap();
+    let documents_before = snapshot_tree(&sandbox.home().join("Documents"));
+
+    sandbox.init().arg("--yes").assert().success();
+
+    for (name, root, _, _) in GUIDANCE_ONLY {
+        assert!(
+            !sandbox.home().join(root).exists(),
+            "{name}: {root} must not be created"
+        );
+    }
+    assert_eq!(
+        snapshot_tree(&sandbox.home().join("Documents")),
+        documents_before
+    );
+}
+
+/// Only a root folder that already exists gets a file.
+#[test]
+fn test_init_writes_only_the_agents_whose_root_exists() {
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".roo");
+
+    sandbox.init().arg("--yes").assert().success();
+
+    assert!(sandbox.home().join(".roo/rules/skim.md").is_file());
+    for (name, root, _, _) in GUIDANCE_ONLY
+        .iter()
+        .filter(|(name, ..)| *name != "Roo Code")
+    {
+        assert!(
+            !sandbox.home().join(root).exists(),
+            "{name}: {root} must not be created"
+        );
+    }
+}
+
+/// `--agent`, `--project` and `--no-guidance` each leave the guidance-only
+/// agents alone.
+#[test]
+fn test_init_skips_the_guidance_only_agents_under_agent_project_and_no_guidance() {
+    for args in [
+        vec!["--yes", "--agent", "claude-code"],
+        vec!["--yes", "--project"],
+        vec!["--yes", "--no-guidance"],
+    ] {
+        let sandbox = Sandbox::new();
+        create_guidance_only_roots(&sandbox);
+        let project = sandbox.project_dir("proj");
+
+        sandbox
+            .init()
+            .args(&args)
+            .current_dir(&project)
+            .assert()
+            .success();
+
+        assert_no_guidance_only_files(&sandbox);
+        for (name, root, _, _) in GUIDANCE_ONLY {
+            assert!(
+                snapshot_tree(&sandbox.home().join(root)).is_empty(),
+                "{name}: {root} changed under {args:?}"
+            );
+        }
+    }
+}
+
+/// The dry-run names one file per guidance-only agent and writes nothing.
+#[test]
+fn test_dry_run_names_each_guidance_only_file_and_writes_nothing() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    let before = snapshot_tree(sandbox.home());
+
+    let assert = sandbox
+        .init()
+        .args(["--yes", "--dry-run"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for (name, _, file, _) in GUIDANCE_ONLY {
+        let line = format!(
+            "[dry-run] Would inject guidance into {}",
+            guidance_only_file(&sandbox, file).display()
+        );
+        assert!(stdout.contains(&line), "{name}: no {line:?} in: {stdout}");
+    }
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// After an install, the dry-run says the files are already current.
+#[test]
+fn test_dry_run_of_a_current_guidance_only_file_says_it_is_current() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".roo");
+    sandbox.init().arg("--yes").assert().success();
+
+    sandbox
+        .init()
+        .args(["--yes", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is already current"))
+        .stdout(predicate::str::contains("Would inject guidance").not());
+}
+
+/// A second install leaves every guidance-only file byte-unchanged.
+#[test]
+fn test_init_twice_leaves_the_guidance_only_files_unchanged() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    let before = snapshot_tree(sandbox.home());
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Guidance already current"));
+
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// A file with the skim name that the user wrote is not touched, by init or by
+/// uninstall.
+#[test]
+fn test_a_guidance_only_file_without_skim_markers_is_left_alone() {
+    let sandbox = Sandbox::bare();
+    let steering = sandbox.config_dir(".kiro/steering");
+    let mine = steering.join("skim.md");
+    fs::write(&mine, "# My own steering\n").unwrap();
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("holds no skim markers"));
+    assert_eq!(fs::read_to_string(&mine).unwrap(), "# My own steering\n");
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&mine).unwrap(), "# My own steering\n");
+}
+
+/// An uninstall with one agent detected removes the guidance-only files.
+#[test]
+fn test_uninstall_removes_each_guidance_only_file_with_one_agent_detected() {
+    let sandbox = Sandbox::new();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    assert_guidance_only_files_written(&sandbox);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed guidance from"));
+
+    assert_no_guidance_only_files(&sandbox);
+}
+
+/// An uninstall with no agent detected still removes the guidance-only files.
+#[test]
+fn test_uninstall_removes_each_guidance_only_file_with_no_agent_detected() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    assert_guidance_only_files_written(&sandbox);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing to uninstall").not());
+
+    assert_no_guidance_only_files(&sandbox);
+    for (name, root, _, _) in GUIDANCE_ONLY {
+        assert!(
+            sandbox.home().join(root).is_dir(),
+            "{name}: the root folder stays"
+        );
+    }
+}
+
+/// An uninstall with two agents detected removes the guidance-only files.
+#[test]
+fn test_uninstall_removes_each_guidance_only_file_with_two_agents_detected() {
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".gemini");
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    assert_no_guidance_only_files(&sandbox);
+}
+
+/// The uninstall takes out only the block of a file that holds text of the user.
+#[test]
+fn test_uninstall_keeps_the_text_of_the_user_in_a_guidance_only_file() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cline");
+    sandbox.init().arg("--yes").assert().success();
+    let file = sandbox.home().join(".cline/rules/skim.md");
+    let installed = fs::read_to_string(&file).unwrap();
+    fs::write(&file, format!("{installed}\n# My own rule\n")).unwrap();
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    let after = fs::read_to_string(&file).unwrap();
+    assert!(after.contains("# My own rule"), "{after}");
+    assert!(!after.contains("skim-start"), "{after}");
+}
+
+/// `--agent`, `--project` and `--no-guidance` each leave the files alone on
+/// uninstall too.
+#[test]
+fn test_uninstall_skips_the_guidance_only_agents_under_agent_project_and_no_guidance() {
+    for args in [
+        vec!["--uninstall", "--yes", "--agent", "claude-code"],
+        vec!["--uninstall", "--yes", "--project"],
+        vec!["--uninstall", "--yes", "--no-guidance"],
+    ] {
+        let sandbox = Sandbox::new();
+        create_guidance_only_roots(&sandbox);
+        sandbox.init().arg("--yes").assert().success();
+        let project = sandbox.project_dir("proj");
+
+        sandbox
+            .init()
+            .args(&args)
+            .current_dir(&project)
+            .assert()
+            .success();
+
+        assert_guidance_only_files_written(&sandbox);
+    }
+}
+
+/// The uninstall dry-run names each file and removes nothing.
+#[test]
+fn test_uninstall_dry_run_names_each_guidance_only_file_and_removes_nothing() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    let before = snapshot_tree(sandbox.home());
+
+    let assert = sandbox
+        .init()
+        .args(["--uninstall", "--dry-run", "--yes"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for (name, _, file, _) in GUIDANCE_ONLY {
+        let line = format!(
+            "[dry-run] Would remove guidance from {}",
+            guidance_only_file(&sandbox, file).display()
+        );
+        assert!(stdout.contains(&line), "{name}: no {line:?} in: {stdout}");
+    }
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// Without `--yes` the uninstall lists the files and asks. A "no" removes
+/// nothing.
+#[test]
+fn test_uninstall_asks_before_it_removes_guidance_only_files() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".roo");
+    sandbox.init().arg("--yes").assert().success();
+    let file = sandbox.home().join(".roo/rules/skim.md");
+
+    sandbox
+        .init()
+        .arg("--uninstall")
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Remove guidance from"))
+        .stdout(predicate::str::contains("Cancelled."));
+    assert!(file.exists(), "a refused uninstall must keep the file");
+
+    sandbox
+        .init()
+        .arg("--uninstall")
+        .write_stdin("y\n")
+        .assert()
+        .success();
+    assert!(!file.exists());
+}
+
+/// With no agent and no skim file, the uninstall message lists the agents.
+#[test]
+fn test_uninstall_with_nothing_to_remove_lists_the_guidance_only_agents() {
+    let sandbox = Sandbox::bare();
+
+    let assert = sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("Nothing to uninstall"), "{stdout}");
+    for (name, ..) in GUIDANCE_ONLY {
+        assert!(stdout.contains(name), "{name} is not in: {stdout}");
+    }
+}
+
+/// A folder that is read-only while the value lives. The mode is restored on
+/// drop, also when a test panics.
+struct ReadOnlyFolder(std::path::PathBuf);
+
+impl ReadOnlyFolder {
+    /// `None` when the user can still write to the folder (root): nothing fails
+    /// there, so a test that needs a failing write cannot run.
+    fn lock(path: &std::path::Path) -> Option<Self> {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        let locked = Self(path.to_path_buf());
+        let probe = path.join("probe");
+        if fs::write(&probe, "x").is_ok() {
+            fs::remove_file(&probe).unwrap();
+            return None;
+        }
+        Some(locked)
+    }
+}
+
+impl Drop for ReadOnlyFolder {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A sandbox with no agent, one agent and two agents detected: the three ways
+/// the auto-detect flow can end.
+fn sandboxes_with_zero_one_and_two_agents() -> Vec<Sandbox> {
+    let two = Sandbox::new();
+    two.config_dir(".gemini");
+    vec![Sandbox::bare(), Sandbox::new(), two]
+}
+
+/// A failed target is reported, the other targets are still written and the exit
+/// code is not 0, whatever the number of detected agents.
+#[test]
+fn test_a_guidance_only_write_that_fails_is_reported_and_the_others_still_run() {
+    for sandbox in sandboxes_with_zero_one_and_two_agents() {
+        let kiro_steering = sandbox.config_dir(".kiro/steering");
+        sandbox.config_dir(".roo");
+        let Some(_locked) = ReadOnlyFolder::lock(&kiro_steering) else {
+            return;
+        };
+
+        let assert = sandbox.init().arg("--yes").assert().failure();
+
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(stderr.contains("Kiro: guidance failed"), "{stderr}");
+        assert!(sandbox.home().join(".roo/rules/skim.md").is_file());
+        assert!(!kiro_steering.join("skim.md").exists());
+    }
+}
+
+/// A removal that fails is reported, the other files are still removed and the
+/// exit code is not 0, whatever the number of detected agents.
+#[test]
+fn test_a_guidance_only_removal_that_fails_is_reported_and_the_others_still_run() {
+    for sandbox in sandboxes_with_zero_one_and_two_agents() {
+        let kiro_steering = sandbox.config_dir(".kiro/steering");
+        sandbox.config_dir(".roo");
+        sandbox.init().arg("--yes").assert().success();
+        let Some(_locked) = ReadOnlyFolder::lock(&kiro_steering) else {
+            return;
+        };
+
+        let assert = sandbox
+            .init()
+            .args(["--uninstall", "--yes"])
+            .assert()
+            .failure();
+
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(stderr.contains("Kiro: guidance removal failed"), "{stderr}");
+        assert!(kiro_steering.join("skim.md").is_file());
+        assert!(!sandbox.home().join(".roo/rules/skim.md").exists());
+    }
+}

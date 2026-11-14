@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 use super::guidance_block::{
-    BlockStatus, GuidanceFormat, GuidanceHooks, block_status, skim_shaped, splice, strip_section,
-    strip_skim_section,
+    BlockStatus, GuidanceFormat, GuidanceHooks, block_status, find_skim_section, skim_shaped,
+    splice, strip_section, strip_skim_section,
 };
 use super::guidance_path::{
     GlobalPathRefusal, GuidanceScope, PathRefusal, ResolvedPath, require_absolute_global,
@@ -356,11 +356,8 @@ pub(super) fn update_existing_guidance(
 
 /// Inject skim guidance section into the agent's main instruction file.
 ///
-/// Four modes:
-/// - **Create**: File doesn't exist → create with just the guidance section
-/// - **Append**: File exists but has no skim section → append to end
-/// - **Update**: File has a skim section that is not current → replace it
-/// - **Skip**: File has a skim section that is current → idempotent no-op
+/// Resolves the file of `agent` with the path policy, then writes it with
+/// [`inject_into`].
 pub(super) fn inject_guidance(
     agent: AgentKind,
     global: bool,
@@ -369,6 +366,20 @@ pub(super) fn inject_guidance(
     let Some(target) = writable_target(agent, global, env)? else {
         return Ok(()); // refused: the note is printed, the file is untouched
     };
+    inject_into(&target, global)
+}
+
+/// Write the skim guidance section into the file of `target`.
+///
+/// This is the one writer of guidance files: the agents and the guidance-only
+/// targets both end here. Four modes:
+/// - **Create**: File doesn't exist → create with just the guidance section
+/// - **Append**: File exists but has no skim section → append to end
+/// - **Update**: File has a skim section that is not current → replace it
+/// - **Skip**: File has a skim section that is current → idempotent no-op
+///
+/// `global` only selects the closing hint: a project file is shared by commit.
+pub(super) fn inject_into(target: &GuidanceTarget, global: bool) -> anyhow::Result<()> {
     let path = target.path.as_path();
 
     let version = env!("CARGO_PKG_VERSION");
@@ -379,7 +390,7 @@ pub(super) fn inject_guidance(
             None => return Ok(()), // soft skip (too large or unreadable)
         };
 
-        let outcome = update_existing_guidance(&target, &existing, version)?;
+        let outcome = update_existing_guidance(target, &existing, version)?;
         outcome.print(&target.shown, version);
         if outcome != UpdateOutcome::Appended {
             return Ok(());
@@ -468,9 +479,9 @@ pub(super) fn remove_guidance(
         }
     };
 
-    // A missing file has nothing to remove. A refused file is left alone.
-    if let Some(target) = target.filter(|t| t.path.exists()) {
-        strip_target(&target, shared_with)?;
+    // A refused file is left alone.
+    if let Some(target) = target {
+        remove_from(&target, shared_with)?;
     }
 
     // The legacy `.cursorrules` file belongs to a project folder. A global
@@ -480,6 +491,44 @@ pub(super) fn remove_guidance(
     }
 
     Ok(())
+}
+
+/// Remove the skim guidance section from the file of `target`.
+///
+/// This is the one remover of guidance files: the agents and the guidance-only
+/// targets both end here. A missing file has nothing to remove. See
+/// [`strip_target`] for what happens to a file that exists.
+pub(super) fn remove_from(
+    target: &GuidanceTarget,
+    shared_with: &[AgentKind],
+) -> anyhow::Result<()> {
+    if target.path.exists() {
+        strip_target(target, shared_with)
+    } else {
+        Ok(())
+    }
+}
+
+/// `true` when the file of `target` can be read and holds a skim block, so a
+/// removal would change it.
+///
+/// It reads the file and prints nothing: a file that cannot be read, or that
+/// holds a broken block, is not one a removal changes.
+pub(super) fn holds_block(target: &GuidanceTarget) -> bool {
+    safe_fs::read_regular_bounded(&target.path, MAX_INSTRUCTION_FILE_SIZE)
+        .and_then(safe_fs::BoundedFile::into_text)
+        .is_ok_and(|(text, _permissions)| find_skim_section(&text).is_some())
+}
+
+/// `true` when the block in the file of `target` is what this binary writes for
+/// `version`. A file that is missing or cannot be read is not current.
+pub(super) fn block_is_current(target: &GuidanceTarget, version: &str) -> bool {
+    read_existing_safely(&target.path)
+        .ok()
+        .flatten()
+        .is_some_and(|text| {
+            block_status(&text, &target.block(version), &target.format) == BlockStatus::Current
+        })
 }
 
 /// Remove the skim section from the file of `target`.

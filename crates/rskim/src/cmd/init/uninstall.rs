@@ -9,6 +9,7 @@ use super::helpers::{
     resolve_real_settings_path,
 };
 use super::state::{detect_state, has_skim_hook_entry, read_settings_json, skim_event_keys};
+use super::targets::{agent_names, remove_targets};
 use crate::cmd::hooks::protocol_for_agent;
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
@@ -51,10 +52,19 @@ fn run_uninstall_auto_detect(
     flags: &InitFlags,
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // The guidance-only agents come before both early returns below: a user who
+    // has only one of them, or only one other agent, still loses their files.
+    let targets = remove_targets(flags, &InstructionEnv::from_process());
+
     let agents = detect_installed_agents(det_env);
     if agents.is_empty() {
-        println!("  No supported agents found. Nothing to uninstall.");
-        return Ok(std::process::ExitCode::SUCCESS);
+        if targets.handled == 0 {
+            println!(
+                "  No supported agents found ({}). Nothing to uninstall.",
+                agent_names(flags)
+            );
+        }
+        return Ok(targets.exit_code_with(std::process::ExitCode::SUCCESS));
     }
 
     // Single-agent fast path: skip the loop overhead when only one agent is detected.
@@ -64,7 +74,8 @@ fn run_uninstall_auto_detect(
             agent: Some(agents[0]),
             ..*flags
         };
-        return run_uninstall_for_agent(&agent_flags, agents[0], det_env);
+        let code = run_uninstall_for_agent(&agent_flags, agents[0], det_env)?;
+        return Ok(targets.exit_code_with(code));
     }
 
     let mut any_failed = false;
@@ -90,11 +101,11 @@ fn run_uninstall_auto_detect(
         }
     }
 
-    Ok(if any_failed {
+    Ok(targets.exit_code_with(if any_failed {
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
-    })
+    }))
 }
 
 /// Uninstall skim for a single explicit agent (dispatched by `run_uninstall`).

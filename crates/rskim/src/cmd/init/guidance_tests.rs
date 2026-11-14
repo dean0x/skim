@@ -518,6 +518,7 @@ use super::{GuidanceTarget, LeftReason, UpdateOutcome, strip_target, update_exis
 use crate::cmd::init::helpers::{
     MAX_SEARCH_SECTION_LINES, SEARCH_SECTION_NEEDLES, SEARCH_WHEN, search_section,
 };
+use crate::cmd::init::targets::TARGETS;
 
 const RENDER_VERSION: &str = "3.0.1";
 
@@ -537,6 +538,45 @@ fn every_render_the_selector_returns_holds_the_search_lines_and_fits_its_variant
     let env = env_at(home.path());
     let mut seen = 0;
 
+    let check_search_section = |label: &str, render: &str| {
+        let section = search_section(render);
+        assert!(!section.is_empty(), "{label}: no Search and read section");
+        assert!(
+            section.len() <= MAX_SEARCH_SECTION_LINES,
+            "{label}: the section has {} lines",
+            section.len()
+        );
+        let text = section.join("\n");
+        assert!(text.contains(SEARCH_WHEN), "{label}: no when lines");
+        for needle in SEARCH_SECTION_NEEDLES {
+            assert!(text.contains(needle), "{label}: no {needle:?}");
+        }
+    };
+
+    // The guidance-only agents have no hook, so their text has no hook claims.
+    for agent in TARGETS {
+        std::fs::create_dir_all(home.path().join(agent.root)).unwrap();
+        let target = agent
+            .resolve(&env)
+            .expect("the root folder exists")
+            .unwrap();
+        seen += 1;
+        let render = target.render(RENDER_VERSION);
+
+        check_search_section(agent.name, &render);
+        assert!(
+            !render.contains("### Command wrapping"),
+            "{}: hook claims in the text of an agent with no hook",
+            agent.name
+        );
+        assert_eq!(
+            render.starts_with("---\n"),
+            agent.frontmatter.is_some(),
+            "{}: the frontmatter does not match the row",
+            agent.name
+        );
+    }
+
     for &agent in AgentKind::all_supported() {
         for global in [true, false] {
             let scope = if global {
@@ -551,18 +591,7 @@ fn every_render_the_selector_returns_holds_the_search_lines_and_fits_its_variant
             let label = format!("{agent} (global: {global})");
             let render = target.render(RENDER_VERSION);
 
-            let section = search_section(&render);
-            assert!(!section.is_empty(), "{label}: no Search and read section");
-            assert!(
-                section.len() <= MAX_SEARCH_SECTION_LINES,
-                "{label}: the section has {} lines",
-                section.len()
-            );
-            let text = section.join("\n");
-            assert!(text.contains(SEARCH_WHEN), "{label}: no when lines");
-            for needle in SEARCH_SECTION_NEEDLES {
-                assert!(text.contains(needle), "{label}: no {needle:?}");
-            }
+            check_search_section(&label, &render);
             assert_eq!(
                 render.contains("### Command wrapping"),
                 expects_hook(agent, global),
@@ -576,8 +605,9 @@ fn every_render_the_selector_returns_holds_the_search_lines_and_fits_its_variant
         }
     }
 
-    // Six agents in two scopes, less the Cursor global file that does not exist.
-    assert_eq!(seen, 11);
+    // Six agents in two scopes, less the Cursor global file that does not exist,
+    // and one file for each guidance-only agent.
+    assert_eq!(seen, 11 + TARGETS.len());
 }
 
 #[test]

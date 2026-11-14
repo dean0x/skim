@@ -24,6 +24,7 @@ mod guidance_path;
 mod helpers;
 mod install;
 mod state;
+mod targets;
 mod uninstall;
 pub(super) mod wrappers;
 
