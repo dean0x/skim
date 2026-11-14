@@ -73,7 +73,7 @@ Automated by `release-prep.sh`:
 1. `cargo install rskim` — shows new version
 2. `npx rskim --version` — shows new version
 3. GitHub Release page — 7 binary assets attached
-4. `brew update && brew info dean0x/tap/skim` — formula updated (PF-001)
+4. `brew update && brew trust --formula dean0x/tap/skim && brew info dean0x/tap/skim` — formula updated (PF-001). Homebrew 7 loads the formula only after the trust step. An older Homebrew has no `brew trust` command, so omit it there.
 
 ## Post-release Cleanup
 
