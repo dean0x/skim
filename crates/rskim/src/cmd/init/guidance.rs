@@ -3,13 +3,17 @@
 //! Handles reading, writing, and updating the skim guidance section in agent
 //! instruction files (CLAUDE.md, .cursorrules, skim.mdc, etc.).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
+use super::guidance_path::{
+    GlobalPathRefusal, GuidanceScope, PathRefusal, ResolvedPath, require_absolute_global,
+    resolve_guidance_path,
+};
 use super::helpers::check_mark;
 use crate::cmd::safe_fs::{self, ReadFailure};
-use crate::cmd::session::{AgentKind, InstructionEnv, RelativeOverride};
+use crate::cmd::session::{AgentKind, InstructionEnv};
 
 pub(super) const GUIDANCE_START: &str = "<!-- skim-start";
 pub(super) const GUIDANCE_END: &str = "<!-- skim-end -->";
@@ -30,89 +34,107 @@ pub(super) fn find_skim_section(content: &str) -> Option<(usize, usize)> {
     Some((start, end_marker + GUIDANCE_END.len()))
 }
 
-/// Why a global guidance path is refused.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum GlobalPathRefusal {
-    /// A config-folder variable holds a relative path. The refusal names it.
-    RelativeOverride(RelativeOverride),
-    /// The path is relative, and no variable is the cause (a relative home folder).
-    NotAbsolute(std::path::PathBuf),
+// ============================================================================
+// The guidance target
+// ============================================================================
+
+/// The text layout of a guidance file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GuidanceFormat {
+    /// A Markdown file: CLAUDE.md, AGENTS.md, GEMINI.md and the Copilot file.
+    Markdown,
+    /// A Cursor rule file (`.mdc`), which skim owns.
+    Mdc,
 }
 
-impl std::fmt::Display for GlobalPathRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl GuidanceFormat {
+    fn of(path: &Path) -> Self {
+        if path.extension().is_some_and(|ext| ext == "mdc") {
+            Self::Mdc
+        } else {
+            Self::Markdown
+        }
+    }
+}
+
+/// A guidance file that skim may read and write: where it is, how to show it,
+/// and what skim writes to it.
+///
+/// [`guidance_target`] is the one place that builds it. The install gate, the
+/// writer, the remover and the dry-run all use it, so they agree on the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GuidanceTarget {
+    /// The file to open and write. Absolute. A link at the file name is
+    /// already followed.
+    pub(super) path: PathBuf,
+    /// The path to show in messages.
+    pub(super) shown: PathBuf,
+    /// The layout of the file, taken from the resolved `path`.
+    pub(super) format: GuidanceFormat,
+}
+
+impl GuidanceTarget {
+    /// The text skim writes to this file for `version`.
+    ///
+    /// This is the one place that chooses the text. It looks at the resolved
+    /// path of the file, so two agents that share a file get the same text.
+    pub(super) fn render(&self, version: &str) -> String {
+        match self.format {
+            GuidanceFormat::Markdown => super::helpers::guidance_content(version),
+            GuidanceFormat::Mdc => super::helpers::guidance_content_mdc(version),
+        }
+    }
+}
+
+/// Why [`guidance_target`] gives no target.
+#[derive(Debug)]
+pub(super) enum TargetRefusal {
+    /// A global path or a config-folder variable is wrong. The command stops
+    /// before it writes anything.
+    Stop(GlobalPathRefusal),
+    /// This one file is left alone. The command goes on without it.
+    Skip(PathRefusal),
+}
+
+impl TargetRefusal {
+    /// Report the refusal. A skip prints one `Note:` line that names the file
+    /// and returns `Ok`. A stop returns the error.
+    pub(super) fn report(self) -> anyhow::Result<()> {
         match self {
-            Self::RelativeOverride(refused) => refused.fmt(f),
-            Self::NotAbsolute(path) => write!(
-                f,
-                "the global guidance path {path:?} is not absolute. \
-                 The home folder must be an absolute path."
-            ),
-        }
-    }
-}
-
-impl std::error::Error for GlobalPathRefusal {}
-
-/// Refuse a global guidance `path` that is not absolute.
-///
-/// Call it before any read or write of a global guidance file: a relative path
-/// would land in the working directory. A relative config-folder variable is
-/// reported by name first, because that is what the user must fix.
-pub(super) fn require_absolute_global(
-    agent: AgentKind,
-    path: &std::path::Path,
-    env: &InstructionEnv,
-) -> Result<(), GlobalPathRefusal> {
-    env.checked_override(agent)
-        .map_err(GlobalPathRefusal::RelativeOverride)?;
-    if path.is_absolute() {
-        Ok(())
-    } else {
-        Err(GlobalPathRefusal::NotAbsolute(path.to_path_buf()))
-    }
-}
-
-/// Run [`require_absolute_global`] on the global instruction file of `agent`.
-///
-/// An agent with no global instruction file passes: nothing is read or written.
-pub(super) fn check_global_target(
-    agent: AgentKind,
-    env: &InstructionEnv,
-) -> Result<(), GlobalPathRefusal> {
-    match agent.instruction_file(true, env) {
-        Some(path) => require_absolute_global(agent, &path, env),
-        None => Ok(()),
-    }
-}
-
-/// Resolve the instruction file path for `agent`, falling back from global to
-/// project scope when the agent does not support a global instruction file.
-///
-/// A global path must be absolute; a relative one is refused, with the cause named.
-pub(super) fn resolve_instruction_path(
-    agent: AgentKind,
-    global: bool,
-    env: &InstructionEnv,
-) -> anyhow::Result<std::path::PathBuf> {
-    match agent.instruction_file(global, env) {
-        Some(p) => {
-            if global {
-                require_absolute_global(agent, &p, env)?;
+            Self::Skip(refusal) => {
+                println!("  Note: {refusal}");
+                Ok(())
             }
-            Ok(p)
+            Self::Stop(refusal) => Err(refusal.into()),
         }
-        None if global => {
-            eprintln!(
-                "  {} does not support global guidance. Using project scope.",
-                agent.display_name()
-            );
-            agent
-                .instruction_file(false, env)
-                .ok_or_else(|| anyhow::anyhow!("No instruction file for {}", agent.display_name()))
-        }
-        None => anyhow::bail!("No instruction file for {}", agent.display_name()),
     }
+}
+
+/// The guidance file of `agent` in `scope`, after the path policy.
+///
+/// Returns `Ok(None)` when the agent has no guidance file in that scope
+/// (Cursor has no global one). Reads the file system for the checks and changes
+/// nothing.
+pub(super) fn guidance_target(
+    agent: AgentKind,
+    scope: &GuidanceScope,
+    env: &InstructionEnv,
+) -> Result<Option<GuidanceTarget>, TargetRefusal> {
+    let global = matches!(scope, GuidanceScope::Global);
+    let Some(path) = agent.instruction_file(global, env) else {
+        return Ok(None);
+    };
+    if global {
+        require_absolute_global(agent, &path, env).map_err(TargetRefusal::Stop)?;
+    }
+    let ResolvedPath { path, shown } =
+        resolve_guidance_path(&path, scope).map_err(TargetRefusal::Skip)?;
+    let format = GuidanceFormat::of(&path);
+    Ok(Some(GuidanceTarget {
+        path,
+        shown,
+        format,
+    }))
 }
 
 /// Read the instruction file at `path` as strict UTF-8, within
@@ -251,29 +273,26 @@ pub(super) fn inject_guidance(
     global: bool,
     env: &InstructionEnv,
 ) -> anyhow::Result<()> {
-    let path = resolve_instruction_path(agent, global, env)?;
-    let path = super::helpers::resolve_real_settings_path(&path)?;
+    let Some(target) = writable_target(agent, global, env)? else {
+        return Ok(()); // refused: the note is printed, the file is untouched
+    };
+    let path = target.path.as_path();
 
     let version = env!("CARGO_PKG_VERSION");
-    let is_mdc = path.extension().is_some_and(|ext| ext == "mdc");
-    let new_content = if is_mdc {
-        super::helpers::guidance_content_mdc(version)
-    } else {
-        super::helpers::guidance_content(version)
-    };
+    let new_content = target.render(version);
 
     if path.exists() {
-        let existing = match read_existing_safely(&path)? {
+        let existing = match read_existing_safely(path)? {
             Some(s) => s,
             None => return Ok(()), // soft skip (too large or unreadable)
         };
 
-        if update_existing_guidance(&path, &existing, version, &new_content)? {
+        if update_existing_guidance(path, &existing, version, &new_content)? {
             return Ok(());
         }
     } else {
         // File doesn't exist — create.
-        guidance_create(&path, &new_content)?;
+        guidance_create(path, &new_content)?;
     }
 
     // Legacy cleanup: remove skim markers from .cursorrules when writing skim.mdc.
@@ -286,18 +305,46 @@ pub(super) fn inject_guidance(
     println!(
         "  {} Installed guidance in {}",
         check_mark(true),
-        path.display()
+        target.shown.display()
     );
 
     // For project scope, remind user to commit
     if !global {
         println!(
             "  Note: guidance added to {} — commit to share with your team.",
-            path.display()
+            target.shown.display()
         );
     }
 
     Ok(())
+}
+
+/// The target `inject_guidance` writes.
+///
+/// Returns `Ok(None)` after it printed a note when the path policy leaves the
+/// file alone. Returns an error when a global path is wrong. An agent with no
+/// global file (Cursor) uses its project file.
+fn writable_target(
+    agent: AgentKind,
+    global: bool,
+    env: &InstructionEnv,
+) -> anyhow::Result<Option<GuidanceTarget>> {
+    let scope = GuidanceScope::for_flag(global)?;
+    let found = match guidance_target(agent, &scope, env) {
+        Ok(None) if global => {
+            eprintln!(
+                "  {} does not support global guidance. Using project scope.",
+                agent.display_name()
+            );
+            guidance_target(agent, &GuidanceScope::for_flag(false)?, env)
+        }
+        other => other,
+    };
+    match found {
+        Ok(Some(target)) => Ok(Some(target)),
+        Ok(None) => anyhow::bail!("No instruction file for {}", agent.display_name()),
+        Err(refusal) => refusal.report().map(|()| None),
+    }
 }
 
 /// Remove skim guidance section from the agent's main instruction file.
@@ -306,45 +353,18 @@ pub(super) fn remove_guidance(
     global: bool,
     env: &InstructionEnv,
 ) -> anyhow::Result<()> {
-    let candidate = agent.instruction_file(global, env);
-    if global && let Some(p) = &candidate {
-        require_absolute_global(agent, p, env)?;
-    }
-    let path = match candidate {
-        Some(p) if p.exists() => p,
-        _ => {
-            // For Cursor, even if the new path doesn't exist, check legacy .cursorrules
-            if agent == AgentKind::Cursor {
-                clean_legacy_cursorrules()?;
-            }
-            return Ok(());
+    let scope = GuidanceScope::for_flag(global)?;
+    let target = match guidance_target(agent, &scope, env) {
+        Ok(target) => target,
+        Err(refusal) => {
+            refusal.report()?;
+            None
         }
     };
 
-    // Resolve symlinks before operating on the path so writes target the real
-    // file, not a dangling or redirected symlink (mirrors inject_guidance).
-    let path = super::helpers::resolve_real_settings_path(&path)?;
-
-    let content = match read_existing_safely(&path)? {
-        Some(s) => s,
-        None => return Ok(()), // soft skip (too large or unreadable)
-    };
-    if let Some(stripped) = strip_skim_section(&content) {
-        if path.extension().is_some_and(|ext| ext == "mdc") {
-            // Skim owns .mdc files entirely — delete on removal
-            std::fs::remove_file(&path)?;
-        } else if stripped.is_empty() {
-            // File was only the skim section — delete the file
-            std::fs::remove_file(&path)?;
-        } else {
-            // Atomic write using dynamic extension (issue 10)
-            atomic_write_stripped(&path, &stripped)?;
-        }
-        println!(
-            "  {} Removed guidance from {}",
-            check_mark(true),
-            path.display()
-        );
+    // A missing file has nothing to remove. A refused file is left alone.
+    if let Some(target) = target.filter(|t| t.path.exists()) {
+        strip_target(&target)?;
     }
 
     // Also clean legacy .cursorrules for Cursor
@@ -352,6 +372,31 @@ pub(super) fn remove_guidance(
         clean_legacy_cursorrules()?;
     }
 
+    Ok(())
+}
+
+/// Remove the skim section from the file of `target`.
+///
+/// A file that holds only the skim section (and every `.mdc` file, which skim
+/// owns) is deleted. Any other file is rewritten without the section.
+fn strip_target(target: &GuidanceTarget) -> anyhow::Result<()> {
+    let path = target.path.as_path();
+    let content = match read_existing_safely(path)? {
+        Some(s) => s,
+        None => return Ok(()), // soft skip (too large or unreadable)
+    };
+    if let Some(stripped) = strip_skim_section(&content) {
+        if target.format == GuidanceFormat::Mdc || stripped.is_empty() {
+            std::fs::remove_file(path)?;
+        } else {
+            atomic_write_stripped(path, &stripped)?;
+        }
+        println!(
+            "  {} Removed guidance from {}",
+            check_mark(true),
+            target.shown.display()
+        );
+    }
     Ok(())
 }
 
@@ -398,21 +443,27 @@ pub(super) fn atomic_write_stripped(path: &Path, content: &str) -> anyhow::Resul
 /// Leaves the file in place (even if empty) since the user may have created it
 /// intentionally. Only removes the skim section markers.
 pub(super) fn clean_legacy_cursorrules() -> anyhow::Result<()> {
-    let legacy = std::path::PathBuf::from(".cursorrules");
-    if !legacy.exists() {
+    // The file is in the project folder, so the project link rules apply.
+    let scope = GuidanceScope::for_flag(false)?;
+    let legacy = match resolve_guidance_path(Path::new(".cursorrules"), &scope) {
+        Ok(resolved) => resolved,
+        Err(refusal) => {
+            println!("  Note: {refusal}");
+            return Ok(());
+        }
+    };
+    if !legacy.path.exists() {
         return Ok(());
     }
-    // S2: apply resolve_real_settings_path so symlinks are handled consistently
-    let legacy = super::helpers::resolve_real_settings_path(&legacy)?;
-    // Route through read_existing_safely to apply the 1 MiB size guard
+    // Route through read_existing_safely to apply the same bounded read
     // that protects all other instruction file reads.
-    let content = match read_existing_safely(&legacy)? {
+    let content = match read_existing_safely(&legacy.path)? {
         Some(s) => s,
         None => return Ok(()), // file too large or unreadable — skip silently
     };
     if let Some(cleaned) = strip_skim_section(&content) {
         // Leave the file in place even when cleaned is empty (user may own it).
-        atomic_write_stripped(&legacy, &cleaned)?;
+        atomic_write_stripped(&legacy.path, &cleaned)?;
         println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
     }
     Ok(())

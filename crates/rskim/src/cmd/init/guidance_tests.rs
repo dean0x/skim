@@ -6,10 +6,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use super::{
-    GlobalPathRefusal, check_global_target, inject_guidance, remove_guidance,
-    require_absolute_global, resolve_instruction_path,
+    GuidanceFormat, GuidanceScope, PathRefusal, TargetRefusal, guidance_target, inject_guidance,
+    remove_guidance,
 };
-use crate::cmd::session::{AgentKind, InstructionEnv, RelativeOverride};
+use crate::cmd::session::{AgentKind, InstructionEnv};
 
 // ============================================================================
 // Helpers
@@ -25,73 +25,6 @@ fn abs_home() -> PathBuf {
 /// An env whose every config-folder variable holds `value`.
 fn env_with_all(value: &str) -> InstructionEnv {
     InstructionEnv::from_lookup(Some(abs_home()), |_| Some(OsString::from(value)))
-}
-
-fn env_without_overrides() -> InstructionEnv {
-    InstructionEnv::from_lookup(Some(abs_home()), |_| None)
-}
-
-// ============================================================================
-// require_absolute_global
-// ============================================================================
-
-#[test]
-fn a_relative_override_is_refused_and_the_message_names_the_variable() {
-    let env = env_with_all(RELATIVE_DIR);
-    let path = AgentKind::CodexCli.instruction_file(true, &env).unwrap();
-
-    let refused = require_absolute_global(AgentKind::CodexCli, &path, &env).unwrap_err();
-
-    assert_eq!(
-        refused,
-        GlobalPathRefusal::RelativeOverride(RelativeOverride {
-            var: "CODEX_HOME",
-            value: PathBuf::from(RELATIVE_DIR),
-        })
-    );
-    assert!(refused.to_string().contains("CODEX_HOME"), "{refused}");
-}
-
-#[test]
-fn an_absolute_global_path_passes() {
-    let env = env_without_overrides();
-    let path = AgentKind::ClaudeCode.instruction_file(true, &env).unwrap();
-    assert_eq!(
-        require_absolute_global(AgentKind::ClaudeCode, &path, &env),
-        Ok(())
-    );
-}
-
-#[test]
-fn a_relative_global_path_without_an_override_is_refused() {
-    // A relative home folder gives a relative global path with no variable at fault.
-    let env = InstructionEnv::from_lookup(Some(PathBuf::from("relative-home")), |_| None);
-    let path = AgentKind::ClaudeCode.instruction_file(true, &env).unwrap();
-
-    let refused = require_absolute_global(AgentKind::ClaudeCode, &path, &env).unwrap_err();
-
-    assert_eq!(refused, GlobalPathRefusal::NotAbsolute(path));
-}
-
-#[test]
-fn an_agent_with_no_global_file_passes_the_target_check() {
-    // Cursor has no global instruction file, so a bad variable does not matter.
-    assert_eq!(
-        check_global_target(AgentKind::Cursor, &env_with_all(RELATIVE_DIR)),
-        Ok(())
-    );
-}
-
-#[test]
-fn the_target_check_refuses_a_relative_override_of_every_agent_with_a_global_file() {
-    let env = env_with_all(RELATIVE_DIR);
-    for &agent in AgentKind::all_supported() {
-        let Some(var) = InstructionEnv::override_var(agent) else {
-            continue;
-        };
-        let refused = check_global_target(agent, &env).unwrap_err().to_string();
-        assert!(refused.contains(var), "{agent}: {refused}");
-    }
 }
 
 // ============================================================================
@@ -120,20 +53,178 @@ fn remove_refuses_a_relative_override() {
     assert!(error.to_string().contains("GEMINI_CONFIG_DIR"), "{error}");
 }
 
-#[test]
-fn project_scope_ignores_the_overrides() {
-    // Project paths are relative by design; only the global scope is checked.
-    let env = env_with_all(RELATIVE_DIR);
-    let path = resolve_instruction_path(AgentKind::ClaudeCode, false, &env).unwrap();
-    assert_eq!(path, PathBuf::from("CLAUDE.md"));
+// ============================================================================
+// guidance_target
+// ============================================================================
+
+fn project_scope(root: &tempfile::TempDir) -> GuidanceScope {
+    GuidanceScope::Project {
+        root: root.path().to_path_buf(),
+    }
 }
 
 #[test]
-fn the_cursor_project_fallback_is_not_refused() {
-    // Cursor has no global file; the fallback path is project-relative on purpose.
+fn project_scope_ignores_the_overrides() {
+    // Project paths are relative by design; only the global scope is checked.
+    let root = tempfile::TempDir::new().unwrap();
     let env = env_with_all(RELATIVE_DIR);
-    let path = resolve_instruction_path(AgentKind::Cursor, true, &env).unwrap();
-    assert_eq!(path, PathBuf::from(".cursor/rules/skim.mdc"));
+
+    let target = guidance_target(AgentKind::ClaudeCode, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(target.shown, PathBuf::from("CLAUDE.md"));
+    assert_eq!(target.format, GuidanceFormat::Markdown);
+}
+
+#[test]
+fn the_cursor_project_file_is_a_cursor_rule_file() {
+    // Cursor has no global file; its project file is a `.mdc` rule file.
+    let root = tempfile::TempDir::new().unwrap();
+    let env = env_with_all(RELATIVE_DIR);
+
+    let target = guidance_target(AgentKind::Cursor, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(target.shown, PathBuf::from(".cursor/rules/skim.mdc"));
+    assert_eq!(target.format, GuidanceFormat::Mdc);
+}
+
+#[test]
+fn cursor_has_no_global_target() {
+    let env = env_with_all(RELATIVE_DIR);
+
+    let target = guidance_target(AgentKind::Cursor, &GuidanceScope::Global, &env).unwrap();
+
+    assert_eq!(target, None);
+}
+
+#[test]
+fn a_relative_override_stops_the_command_and_names_the_variable() {
+    let env = env_with_all(RELATIVE_DIR);
+
+    let refusal = guidance_target(AgentKind::CodexCli, &GuidanceScope::Global, &env).unwrap_err();
+
+    assert!(matches!(refusal, TargetRefusal::Stop(_)), "{refusal:?}");
+    let error = refusal.report().unwrap_err();
+    assert!(error.to_string().contains("CODEX_HOME"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_project_link_that_leaves_the_project_skips_the_file_and_the_command_goes_on() {
+    let root = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::write(outside.path().join("other.md"), "outside text\n").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("other.md"),
+        root.path().join("CLAUDE.md"),
+    )
+    .unwrap();
+
+    let refusal = guidance_target(
+        AgentKind::ClaudeCode,
+        &project_scope(&root),
+        &env_with_all(RELATIVE_DIR),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            refusal,
+            TargetRefusal::Skip(PathRefusal::LeavesProject { .. })
+        ),
+        "{refusal:?}"
+    );
+    refusal.report().unwrap();
+}
+
+#[test]
+fn the_text_of_a_target_follows_its_format() {
+    let root = tempfile::TempDir::new().unwrap();
+    let env = env_with_all(RELATIVE_DIR);
+    let markdown = guidance_target(AgentKind::ClaudeCode, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+    let rule_file = guidance_target(AgentKind::Cursor, &project_scope(&root), &env)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        markdown.render("9.9.9"),
+        super::super::helpers::guidance_content("9.9.9")
+    );
+    assert_eq!(
+        rule_file.render("9.9.9"),
+        super::super::helpers::guidance_content_mdc("9.9.9")
+    );
+}
+
+// ============================================================================
+// Global links through install and uninstall
+// ============================================================================
+
+#[cfg(unix)]
+#[test]
+fn install_and_uninstall_follow_a_global_link_to_a_regular_file() {
+    let home = tempfile::TempDir::new().unwrap();
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let real = home.path().join("dotfiles-claude.md");
+    std::fs::write(&real, "# My rules\n").unwrap();
+    let at = claude.join("CLAUDE.md");
+    std::os::unix::fs::symlink(&real, &at).unwrap();
+    let env = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| None);
+
+    inject_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(&at)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let installed = std::fs::read_to_string(&real).unwrap();
+    assert!(installed.starts_with("# My rules\n"), "{installed}");
+    assert!(installed.contains("skim-start"), "{installed}");
+
+    remove_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(&at)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "# My rules\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn install_and_uninstall_leave_a_global_link_to_a_folder_alone() {
+    let home = tempfile::TempDir::new().unwrap();
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let folder = home.path().join("some-folder");
+    std::fs::create_dir(&folder).unwrap();
+    let at = claude.join("CLAUDE.md");
+    std::os::unix::fs::symlink(&folder, &at).unwrap();
+    let env = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| None);
+
+    inject_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
+    remove_guidance(AgentKind::ClaudeCode, true, &env).unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(&at)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::read_dir(&folder).unwrap().next().is_none(),
+        "nothing may be written into the folder"
+    );
 }
 
 // ============================================================================

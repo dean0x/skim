@@ -101,6 +101,9 @@ fn verify_agent_installed(
 /// - `--no-guidance` is set, or
 /// - The agent has no instruction file (guidance feature not applicable), or
 /// - The file content contains the versioned start marker for `skim_version`.
+///
+/// Returns `false` when the path policy refuses the file, so the install goes on
+/// to the writer, which prints the note that names the file.
 fn is_guidance_current(
     agent: AgentKind,
     flags: &InitFlags,
@@ -110,19 +113,20 @@ fn is_guidance_current(
     if flags.no_guidance {
         return true;
     }
-    let global = !flags.project;
-    agent
-        .instruction_file(global, env)
-        .map(|p| {
-            // Route through read_existing_safely to apply the 1 MiB size guard,
-            // matching the parallel path in inject_guidance.
-            read_existing_safely(&p)
-                .ok()
-                .flatten()
-                .map(|c| c.contains(&format!("{} v{}", GUIDANCE_START, skim_version)))
-                .unwrap_or(false)
-        })
-        .unwrap_or(true) // No instruction file path = guidance not applicable for this agent
+    let Ok(scope) = GuidanceScope::for_flag(!flags.project) else {
+        return false;
+    };
+    match guidance_target(agent, &scope, env) {
+        // No instruction file path = guidance not applicable for this agent
+        Ok(None) => true,
+        // Route through read_existing_safely to apply the bounded read,
+        // matching the parallel path in inject_guidance.
+        Ok(Some(target)) => read_existing_safely(&target.path)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.contains(&format!("{} v{}", GUIDANCE_START, skim_version))),
+        Err(_) => false,
+    }
 }
 
 fn print_install_header(agent_name: &str) {
@@ -1606,8 +1610,9 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
 
 // Re-export guidance symbols used by production code in this module.
 pub(super) use super::guidance::{
-    GUIDANCE_START, check_global_target, inject_guidance, read_existing_safely, remove_guidance,
+    GUIDANCE_START, guidance_target, inject_guidance, read_existing_safely, remove_guidance,
 };
+pub(super) use super::guidance_path::{GuidanceScope, check_global_target};
 
 // Re-export additional guidance symbols for the unit tests below (via `use super::*`).
 // `read_existing_safely` is already exported above for production use; omit here.
@@ -1743,10 +1748,29 @@ pub(super) fn print_dry_run_actions(
             protocol.hook_event_keys().join(", "),
         );
     }
-    if !no_guidance && let Some(path) = agent.instruction_file(global, env) {
-        println!("  [dry-run] Would inject guidance into {}", path.display());
+    if !no_guidance {
+        print_dry_run_guidance(agent, global, env)?;
     }
 
+    Ok(())
+}
+
+/// Print the dry-run line for the guidance file: the file the install would
+/// write, or the note that says why it would leave the file alone.
+fn print_dry_run_guidance(
+    agent: AgentKind,
+    global: bool,
+    env: &InstructionEnv,
+) -> anyhow::Result<()> {
+    let scope = GuidanceScope::for_flag(global)?;
+    match guidance_target(agent, &scope, env) {
+        Ok(Some(target)) => println!(
+            "  [dry-run] Would inject guidance into {}",
+            target.shown.display()
+        ),
+        Ok(None) => {}
+        Err(refusal) => refusal.report()?,
+    }
     Ok(())
 }
 
