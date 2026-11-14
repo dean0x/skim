@@ -26,10 +26,9 @@
 //! [`HookFailure`] and the other hooks are still handled.
 
 use std::fmt;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use tempfile::NamedTempFile;
+use crate::cmd::safe_fs::{self, ReadFailure};
 
 // ============================================================================
 // Constants
@@ -89,7 +88,7 @@ pub(crate) struct HooksFinding {
 /// What skim did to a hook when it failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HookStep {
-    /// Look at the file (`symlink_metadata`).
+    /// Look at the opened file (`fstat`).
     Inspect,
     /// Read the text of the file.
     Read,
@@ -426,34 +425,33 @@ fn scan_dir(hooks_dir: &Path, read: ReadHook<'_>) -> Scan {
 /// that would turn the link into a copy. The read is bounded by the cap, not by
 /// the size the file had when it was inspected.
 fn read_hook(path: &Path) -> Result<Option<Hook>, HookFailure> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
+    let file = match safe_fs::read_regular_bounded(path, MAX_HOOK_BYTES) {
+        Ok(file) => file,
+        // Not a file that skim rewrites.
+        Err(
+            ReadFailure::Symlink
+            | ReadFailure::Missing
+            | ReadFailure::Folder
+            | ReadFailure::NotRegular
+            | ReadFailure::TooLarge
+            | ReadFailure::NotUtf8,
+        ) => return Ok(None),
         // A `.git` that is a file (a gitdir that failed the write-path gate) makes
         // the hooks path unreachable: there is no hook there.
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
+        Err(ReadFailure::Open(e)) if e.kind() == std::io::ErrorKind::NotADirectory => {
             return Ok(None);
         }
-        Err(e) => return Err(HookFailure::new(path, HookStep::Inspect, &e)),
+        Err(ReadFailure::Inspect(e)) => {
+            return Err(HookFailure::new(path, HookStep::Inspect, &e));
+        }
+        Err(ReadFailure::Open(e) | ReadFailure::Read(e)) => {
+            return Err(HookFailure::new(path, HookStep::Read, &e));
+        }
     };
-    if !meta.is_file() {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(MAX_HOOK_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|e| HookFailure::new(path, HookStep::Read, &e))?;
-    if bytes.len() as u64 > MAX_HOOK_BYTES {
-        return Ok(None);
-    }
-    Ok(String::from_utf8(bytes).ok().map(|text| Hook {
-        text,
-        permissions: meta.permissions(),
-    }))
+    Ok(file
+        .into_text()
+        .ok()
+        .map(|(text, permissions)| Hook { text, permissions }))
 }
 
 /// Strip the old block from one hook file.
@@ -467,7 +465,7 @@ fn remove_from_hook(hook_path: &Path, read: ReadHook<'_>) -> Result<bool, HookFa
     if stripped == hook.text {
         return Ok(false);
     }
-    write_hook_atomic(hook_path, &stripped, hook.permissions)
+    safe_fs::write_atomic(hook_path, &stripped, Some(hook.permissions))
         .map_err(|e| HookFailure::new(hook_path, HookStep::Rewrite, &e))?;
     Ok(true)
 }
@@ -508,42 +506,6 @@ fn strip_block(content: &str) -> String {
 /// The canonical form of `dir`, or `dir` itself when it does not exist.
 fn canonical_if_exists(dir: PathBuf) -> PathBuf {
     dir.canonicalize().unwrap_or(dir)
-}
-
-/// Atomically write `content` to `hook_path` via an unpredictably-named temp
-/// file in the same directory (so the rename is always on the same filesystem).
-///
-/// Using `NamedTempFile::new_in` instead of a fixed `.tmp` suffix avoids
-/// a symlink/TOCTOU attack where an adversary pre-creates a predictable path
-/// and redirects the write to an arbitrary target.
-///
-/// The file gets `permissions`, the ones the hook had. A hook that was not
-/// executable stays one that git does not run.
-///
-/// The data reaches the disk before the rename, so a power loss cannot leave the
-/// user's own hook lines as an empty file.
-fn write_hook_atomic(
-    hook_path: &Path,
-    content: &str,
-    permissions: std::fs::Permissions,
-) -> std::io::Result<()> {
-    let parent = hook_path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "hook path has no parent directory",
-        )
-    })?;
-
-    let mut tmp = NamedTempFile::new_in(parent)?;
-
-    use std::io::Write as _;
-    tmp.write_all(content.as_bytes())?;
-    std::fs::set_permissions(tmp.path(), permissions)?;
-    tmp.as_file().sync_all()?;
-
-    tmp.persist(hook_path).map_err(|e| e.error)?;
-
-    Ok(())
 }
 
 // ============================================================================

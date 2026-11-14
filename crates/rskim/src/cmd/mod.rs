@@ -82,6 +82,7 @@ mod pkg;
 #[cfg(feature = "proxy")]
 mod proxy;
 mod rewrite;
+mod safe_fs;
 mod search;
 mod session;
 pub(crate) mod session_sidecar;
