@@ -1,6 +1,8 @@
 //! Flag parsing for `skim init`.
 
-use crate::cmd::session::AgentKind;
+use crate::cmd::session::{
+    AgentKind, RelativeOverride, config_override, require_absolute_override,
+};
 
 /// Which scope of tool permissions to seed during `skim init --permissions`.
 ///
@@ -139,15 +141,39 @@ impl DetectionEnv {
     /// Call this in `main`-adjacent code, then thread the struct down to
     /// callers — never call from within library functions.
     pub(crate) fn from_process() -> Self {
-        let read = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+        Self::from_lookup(dirs::home_dir(), |name| std::env::var_os(name))
+    }
+
+    /// Build the struct from a variable lookup instead of the process env, so a
+    /// test can drive every variable without mutating the process.
+    ///
+    /// An empty value counts as unset (see [`config_override`]). A relative value
+    /// is kept as it is: [`DetectionEnv::checked_override`] refuses it.
+    pub(crate) fn from_lookup(
+        home_dir: Option<std::path::PathBuf>,
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Self {
+        let read = |name: &str| config_override(lookup(name));
         Self {
-            home_dir: dirs::home_dir(),
+            home_dir,
             claude_config_dir: read("CLAUDE_CONFIG_DIR"),
             cursor_config_dir: read("CURSOR_CONFIG_DIR"),
             gemini_config_dir: read("GEMINI_CONFIG_DIR"),
             copilot_config_dir: read("COPILOT_CONFIG_DIR"),
             codex_config_dir: read("CODEX_CONFIG_DIR"),
             crush_config_dir: read("CRUSH_CONFIG_DIR"),
+        }
+    }
+
+    /// The variable that overrides the config folder of `agent`.
+    pub(crate) fn override_var(agent: AgentKind) -> &'static str {
+        match agent {
+            AgentKind::ClaudeCode => "CLAUDE_CONFIG_DIR",
+            AgentKind::Cursor => "CURSOR_CONFIG_DIR",
+            AgentKind::GeminiCli => "GEMINI_CONFIG_DIR",
+            AgentKind::CopilotCli => "COPILOT_CONFIG_DIR",
+            AgentKind::CodexCli => "CODEX_CONFIG_DIR",
+            AgentKind::Crush => "CRUSH_CONFIG_DIR",
         }
     }
 
@@ -167,11 +193,24 @@ impl DetectionEnv {
         }
     }
 
+    /// The override for `agent`, or a typed refusal when its value is relative.
+    ///
+    /// The refusal names the variable. [`DetectionEnv::resolve`] and
+    /// [`detect_installed_agents`] both go through here, so every caller applies
+    /// the same rule; `skim doctor` can print the refusal as a "not checked" row.
+    pub(crate) fn checked_override(
+        &self,
+        agent: AgentKind,
+    ) -> Result<Option<&std::path::Path>, RelativeOverride> {
+        require_absolute_override(Self::override_var(agent), self.override_for(agent))
+    }
+
     /// Resolve the config directory for `agent` with the following precedence:
     ///
     /// 1. `--project` flag → CWD-relative `.<agent-dir>/` (e.g., `.claude/`).
     /// 2. Per-agent env override (`CLAUDE_CONFIG_DIR`, `CURSOR_CONFIG_DIR`, …)
-    ///    → that path verbatim.
+    ///    → that path verbatim. An empty value counts as unset. A relative value
+    ///    is an error that names the variable.
     /// 3. Home-directory default via [`AgentKind::config_dir`], which handles
     ///    platform-specific paths:
     ///    - **Cursor (macOS)**: `~/Library/Application Support/Cursor` when
@@ -203,7 +242,8 @@ impl DetectionEnv {
         }
 
         // Per-agent env override: honored for ALL agents (not just ClaudeCode).
-        if let Some(override_path) = self.override_for(agent) {
+        // A relative override is refused, with the variable named.
+        if let Some(override_path) = self.checked_override(agent)? {
             return Ok(override_path.to_path_buf());
         }
 
@@ -231,6 +271,10 @@ impl DetectionEnv {
 /// ensures test isolation: setting only `CLAUDE_CONFIG_DIR` restricts
 /// auto-detect to Claude Code only, preserving single-agent test behaviour.
 ///
+/// An agent whose override is relative is always listed. The caller then reaches
+/// [`DetectionEnv::resolve`], which refuses the value and names the variable;
+/// a quiet "no agents found" would hide the cause.
+///
 /// Returns an empty `Vec` when no supported agents are found.
 pub(super) fn detect_installed_agents(env: &DetectionEnv) -> Vec<AgentKind> {
     let any_override = AgentKind::all_supported()
@@ -243,7 +287,10 @@ pub(super) fn detect_installed_agents(env: &DetectionEnv) -> Vec<AgentKind> {
             if any_override {
                 // In override mode: only include agents with an explicit env path
                 // that points to an existing directory.
-                env.override_for(agent).map(|p| p.is_dir()).unwrap_or(false)
+                match env.checked_override(agent) {
+                    Ok(path) => path.is_some_and(|p| p.is_dir()),
+                    Err(_) => true,
+                }
             } else {
                 // Normal mode: detect by home-dir presence
                 env.home_dir
@@ -1091,5 +1138,107 @@ mod tests {
             tmp.path(),
             "env override must win even when home_dir is None"
         );
+    }
+
+    // ---- config-folder overrides: empty counts as unset, relative is refused ----
+
+    use std::ffi::OsString;
+
+    const DETECTION_VARS: [(AgentKind, &str); 6] = [
+        (AgentKind::ClaudeCode, "CLAUDE_CONFIG_DIR"),
+        (AgentKind::Cursor, "CURSOR_CONFIG_DIR"),
+        (AgentKind::GeminiCli, "GEMINI_CONFIG_DIR"),
+        (AgentKind::CopilotCli, "COPILOT_CONFIG_DIR"),
+        (AgentKind::CodexCli, "CODEX_CONFIG_DIR"),
+        (AgentKind::Crush, "CRUSH_CONFIG_DIR"),
+    ];
+
+    fn detection_env_with_all(value: &str) -> DetectionEnv {
+        DetectionEnv::from_lookup(Some(std::path::PathBuf::from("/home/user")), |_| {
+            Some(OsString::from(value))
+        })
+    }
+
+    #[test]
+    fn empty_detection_override_counts_as_unset_for_every_agent() {
+        let env = detection_env_with_all("");
+        for (agent, var) in DETECTION_VARS {
+            assert_eq!(env.override_for(agent), None, "{var}");
+            // The resolver then falls back to the home default.
+            assert_eq!(
+                env.resolve(agent, false).unwrap(),
+                agent.config_dir(std::path::Path::new("/home/user")),
+                "{var}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_detection_variable_fills_its_own_agent() {
+        let env = DetectionEnv::from_lookup(None, |name| {
+            Some(std::env::temp_dir().join(name).into_os_string())
+        });
+        for (agent, var) in DETECTION_VARS {
+            assert_eq!(
+                env.override_for(agent),
+                Some(std::env::temp_dir().join(var).as_path()),
+                "{var}"
+            );
+            assert_eq!(DetectionEnv::override_var(agent), var);
+        }
+    }
+
+    #[test]
+    fn resolve_refuses_a_relative_override_and_names_the_variable() {
+        let env = detection_env_with_all("rel/dir");
+        for (agent, var) in DETECTION_VARS {
+            let message = env.resolve(agent, false).unwrap_err().to_string();
+            assert!(
+                message.contains(var),
+                "the message must name {var}: {message}"
+            );
+            assert!(message.contains("rel/dir"), "{message}");
+        }
+    }
+
+    #[test]
+    fn checked_override_returns_the_typed_refusal() {
+        let env = detection_env_with_all("rel/dir");
+        let refused = env.checked_override(AgentKind::CodexCli).unwrap_err();
+        assert_eq!(
+            refused,
+            RelativeOverride {
+                var: "CODEX_CONFIG_DIR",
+                value: std::path::PathBuf::from("rel/dir"),
+            }
+        );
+    }
+
+    #[test]
+    fn project_scope_does_not_read_the_override() {
+        // --project never uses a config-folder variable, so a bad value is not met.
+        let env = detection_env_with_all("rel/dir");
+        assert!(env.resolve(AgentKind::ClaudeCode, true).is_ok());
+    }
+
+    #[test]
+    fn detection_lists_an_agent_with_a_relative_override_so_it_is_refused_by_name() {
+        // `rel/never-created` does not exist, so an is_dir() test would drop the
+        // agent and the user would see only "no agents found".
+        let env = DetectionEnv {
+            claude_config_dir: Some(std::path::PathBuf::from("rel/never-created")),
+            ..DetectionEnv::default()
+        };
+        assert_eq!(detect_installed_agents(&env), vec![AgentKind::ClaudeCode]);
+    }
+
+    #[test]
+    fn detection_with_an_absolute_missing_override_lists_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = DetectionEnv {
+            claude_config_dir: Some(tmp.path().join("missing")),
+            ..DetectionEnv::default()
+        };
+        assert!(detect_installed_agents(&env).is_empty());
     }
 }

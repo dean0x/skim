@@ -563,6 +563,11 @@ fn run_install_single(
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
+    // Before any write: a relative guidance path is refused up front, so the
+    // install does not stop half-done once the hook is in place.
+    if !flags.no_guidance && !flags.project {
+        check_global_target(agent, &env)?;
+    }
     let state = detect_state(agent, flags.project, det_env)?;
 
     // The directory where permissions sidecar and config live.
@@ -1601,7 +1606,7 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
 
 // Re-export guidance symbols used by production code in this module.
 pub(super) use super::guidance::{
-    GUIDANCE_START, inject_guidance, read_existing_safely, remove_guidance,
+    GUIDANCE_START, check_global_target, inject_guidance, read_existing_safely, remove_guidance,
 };
 
 // Re-export additional guidance symbols for the unit tests below (via `use super::*`).

@@ -1,5 +1,6 @@
 //! Agent-agnostic session types (#61)
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -194,41 +195,21 @@ impl AgentKind {
     ) -> Option<std::path::PathBuf> {
         match (self, global) {
             // Global scope — with env var overrides
-            (AgentKind::ClaudeCode, true) => {
-                let base = env
-                    .claude_config_dir
-                    .clone()
-                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".claude")));
-                base.map(|d| d.join("CLAUDE.md"))
-            }
-            (AgentKind::GeminiCli, true) => {
-                let base = env
-                    .gemini_config_dir
-                    .clone()
-                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".gemini")));
-                base.map(|d| d.join("GEMINI.md"))
-            }
-            (AgentKind::CodexCli, true) => {
-                let base = env
-                    .codex_home
-                    .clone()
-                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".codex")));
-                base.map(|d| d.join("AGENTS.md"))
-            }
-            (AgentKind::CopilotCli, true) => {
-                let base = env
-                    .copilot_config_dir
-                    .clone()
-                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".copilot")));
-                base.map(|d| d.join("copilot-instructions.md"))
-            }
-            (AgentKind::Crush, true) => {
-                let base = env
-                    .crush_config_dir
-                    .clone()
-                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".crush")));
-                base.map(|d| d.join("AGENTS.md"))
-            }
+            (AgentKind::ClaudeCode, true) => env
+                .global_base(*self, ".claude")
+                .map(|d| d.join("CLAUDE.md")),
+            (AgentKind::GeminiCli, true) => env
+                .global_base(*self, ".gemini")
+                .map(|d| d.join("GEMINI.md")),
+            (AgentKind::CodexCli, true) => env
+                .global_base(*self, ".codex")
+                .map(|d| d.join("AGENTS.md")),
+            (AgentKind::CopilotCli, true) => env
+                .global_base(*self, ".copilot")
+                .map(|d| d.join("copilot-instructions.md")),
+            (AgentKind::Crush, true) => env
+                .global_base(*self, ".crush")
+                .map(|d| d.join("AGENTS.md")),
             (AgentKind::Cursor, true) => None, // UI-only, no file-based global config
             // Project scope (CWD-relative)
             (AgentKind::ClaudeCode, false) => Some("CLAUDE.md".into()),
@@ -260,6 +241,54 @@ impl std::fmt::Display for AgentKind {
 // InstructionEnv — injected environment for instruction_file()
 // ============================================================================
 
+/// Read one agent config-folder variable.
+///
+/// An empty value counts as unset, the same rule as `SKIM_WRAPPERS_DIR`. A relative
+/// value is returned as it is; [`require_absolute_override`] refuses it later, so
+/// the refusal can name the variable.
+pub(crate) fn config_override(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// A config-folder variable that holds a relative path.
+///
+/// A relative folder would move with the working directory, so every reader and
+/// writer of agent files refuses it and tells the user which variable to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelativeOverride {
+    /// The name of the variable.
+    pub(crate) var: &'static str,
+    /// The value of the variable.
+    pub(crate) value: PathBuf,
+}
+
+impl std::fmt::Display for RelativeOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} must be an absolute path, but its value is the relative path {:?}. \
+             Set it to an absolute path, or unset it.",
+            self.var, self.value
+        )
+    }
+}
+
+impl std::error::Error for RelativeOverride {}
+
+/// Pass an override through when it is unset or absolute; refuse a relative one.
+pub(crate) fn require_absolute_override<'a>(
+    var: &'static str,
+    value: Option<&'a Path>,
+) -> Result<Option<&'a Path>, RelativeOverride> {
+    match value {
+        Some(path) if !path.is_absolute() => Err(RelativeOverride {
+            var,
+            value: path.to_path_buf(),
+        }),
+        other => Ok(other),
+    }
+}
+
 /// Injected environment values for [`AgentKind::instruction_file`].
 ///
 /// Created once at a system boundary (e.g., `run_install`) and threaded to
@@ -288,15 +317,75 @@ impl InstructionEnv {
     /// Read env once at the system boundary. Call this in `main`-adjacent code,
     /// then thread the struct down to callers — never call from within library functions.
     pub fn from_process() -> Self {
-        let read = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        Self::from_lookup(dirs::home_dir(), |name| std::env::var_os(name))
+    }
+
+    /// Build the struct from a variable lookup instead of the process env, so a
+    /// test can drive every variable without mutating the process.
+    ///
+    /// An empty value counts as unset (see [`config_override`]). A relative value
+    /// is kept as it is: [`InstructionEnv::checked_override`] refuses it.
+    pub(crate) fn from_lookup(
+        home_dir: Option<PathBuf>,
+        lookup: impl Fn(&str) -> Option<OsString>,
+    ) -> Self {
+        let read = |name: &str| config_override(lookup(name));
         Self {
-            home_dir: dirs::home_dir(),
+            home_dir,
             claude_config_dir: read("CLAUDE_CONFIG_DIR"),
             codex_home: read("CODEX_HOME"),
             crush_config_dir: read("CRUSH_CONFIG_DIR"),
             gemini_config_dir: read("GEMINI_CONFIG_DIR"),
             copilot_config_dir: read("COPILOT_CONFIG_DIR"),
         }
+    }
+
+    /// The variable that overrides the global instruction folder of `agent`.
+    ///
+    /// `None` for Cursor, which has no global instruction file.
+    pub(crate) fn override_var(agent: AgentKind) -> Option<&'static str> {
+        match agent {
+            AgentKind::ClaudeCode => Some("CLAUDE_CONFIG_DIR"),
+            AgentKind::CodexCli => Some("CODEX_HOME"),
+            AgentKind::CopilotCli => Some("COPILOT_CONFIG_DIR"),
+            AgentKind::Crush => Some("CRUSH_CONFIG_DIR"),
+            AgentKind::GeminiCli => Some("GEMINI_CONFIG_DIR"),
+            AgentKind::Cursor => None,
+        }
+    }
+
+    /// The override value for `agent`, as it was read. It can be relative.
+    fn override_for(&self, agent: AgentKind) -> Option<&Path> {
+        match agent {
+            AgentKind::ClaudeCode => self.claude_config_dir.as_deref(),
+            AgentKind::CodexCli => self.codex_home.as_deref(),
+            AgentKind::CopilotCli => self.copilot_config_dir.as_deref(),
+            AgentKind::Crush => self.crush_config_dir.as_deref(),
+            AgentKind::GeminiCli => self.gemini_config_dir.as_deref(),
+            AgentKind::Cursor => None,
+        }
+    }
+
+    /// The override for `agent`, or a typed refusal when its value is relative.
+    ///
+    /// The refusal names the variable. Callers that write or read a global
+    /// instruction file ask this first; `skim doctor` can print the refusal as a
+    /// "not checked" row.
+    pub(crate) fn checked_override(
+        &self,
+        agent: AgentKind,
+    ) -> Result<Option<&Path>, RelativeOverride> {
+        match (Self::override_var(agent), self.override_for(agent)) {
+            (Some(var), value) => require_absolute_override(var, value),
+            (None, _) => Ok(None),
+        }
+    }
+
+    /// Global instruction folder of `agent`: its override, else `<home>/<default_dir>`.
+    fn global_base(&self, agent: AgentKind, default_dir: &str) -> Option<PathBuf> {
+        self.override_for(agent)
+            .map(Path::to_path_buf)
+            .or_else(|| self.home_dir.as_ref().map(|h| h.join(default_dir)))
     }
 }
 
@@ -861,5 +950,104 @@ mod tests {
         assert_eq!(AgentKind::CodexCli.rules_filename(), "skim-corrections.md");
         assert_eq!(AgentKind::GeminiCli.rules_filename(), "skim-corrections.md");
         assert_eq!(AgentKind::Crush.rules_filename(), "skim-corrections.md");
+    }
+
+    // ---- config-folder overrides: empty counts as unset, relative is refused ----
+
+    use std::ffi::OsString;
+
+    /// A lookup that answers every variable with `value`.
+    fn env_with_all(value: &str) -> InstructionEnv {
+        InstructionEnv::from_lookup(Some(fake_home()), |_| Some(OsString::from(value)))
+    }
+
+    fn abs_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn config_override_treats_an_empty_value_as_unset() {
+        assert_eq!(config_override(Some(OsString::new())), None);
+        assert_eq!(config_override(None), None);
+        assert_eq!(
+            config_override(Some(OsString::from("/abs"))),
+            Some(PathBuf::from("/abs"))
+        );
+    }
+
+    #[test]
+    fn empty_instruction_override_counts_as_unset_for_every_variable() {
+        let env = env_with_all("");
+        assert_eq!(env.claude_config_dir, None);
+        assert_eq!(env.codex_home, None);
+        assert_eq!(env.crush_config_dir, None);
+        assert_eq!(env.gemini_config_dir, None);
+        assert_eq!(env.copilot_config_dir, None);
+        // Guidance then lands under the home folder, not in the working directory.
+        assert_eq!(
+            AgentKind::ClaudeCode.instruction_file(true, &env),
+            Some(fake_home().join(".claude").join("CLAUDE.md"))
+        );
+    }
+
+    #[test]
+    fn each_instruction_variable_fills_its_own_field() {
+        let env = InstructionEnv::from_lookup(Some(fake_home()), |name| {
+            Some(abs_dir(name).into_os_string())
+        });
+        assert_eq!(env.claude_config_dir, Some(abs_dir("CLAUDE_CONFIG_DIR")));
+        assert_eq!(env.codex_home, Some(abs_dir("CODEX_HOME")));
+        assert_eq!(env.crush_config_dir, Some(abs_dir("CRUSH_CONFIG_DIR")));
+        assert_eq!(env.gemini_config_dir, Some(abs_dir("GEMINI_CONFIG_DIR")));
+        assert_eq!(env.copilot_config_dir, Some(abs_dir("COPILOT_CONFIG_DIR")));
+    }
+
+    #[test]
+    fn relative_instruction_override_is_refused_and_names_its_variable() {
+        let env = env_with_all("rel/dir");
+        for &agent in AgentKind::all_supported() {
+            let Some(var) = InstructionEnv::override_var(agent) else {
+                assert_eq!(env.checked_override(agent), Ok(None), "{agent}");
+                continue;
+            };
+            let refused = env.checked_override(agent).unwrap_err();
+            assert_eq!(refused.var, var);
+            assert_eq!(refused.value, PathBuf::from("rel/dir"));
+            assert!(
+                refused.to_string().contains(var),
+                "the message must name {var}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_instruction_override_passes_the_check() {
+        let env = InstructionEnv::from_lookup(Some(fake_home()), |name| {
+            Some(abs_dir(name).into_os_string())
+        });
+        for &agent in AgentKind::all_supported() {
+            if let Some(var) = InstructionEnv::override_var(agent) {
+                assert_eq!(
+                    env.checked_override(agent),
+                    Ok(Some(abs_dir(var).as_path())),
+                    "{agent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn override_var_names_the_variable_that_from_lookup_reads() {
+        // Only the named variable is set; the check must see exactly that value.
+        for &agent in AgentKind::all_supported() {
+            let Some(var) = InstructionEnv::override_var(agent) else {
+                continue;
+            };
+            let env = InstructionEnv::from_lookup(Some(fake_home()), |name| {
+                (name == var).then(|| OsString::from("rel/only"))
+            });
+            let refused = env.checked_override(agent).unwrap_err();
+            assert_eq!(refused.var, var, "{agent}");
+        }
     }
 }

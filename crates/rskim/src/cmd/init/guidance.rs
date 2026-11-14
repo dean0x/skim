@@ -4,7 +4,7 @@
 //! instruction files (CLAUDE.md, .cursorrules, skim.mdc, etc.).
 
 use super::helpers::check_mark;
-use crate::cmd::session::{AgentKind, InstructionEnv};
+use crate::cmd::session::{AgentKind, InstructionEnv, RelativeOverride};
 
 pub(super) const GUIDANCE_START: &str = "<!-- skim-start";
 pub(super) const GUIDANCE_END: &str = "<!-- skim-end -->";
@@ -25,15 +25,78 @@ pub(super) fn find_skim_section(content: &str) -> Option<(usize, usize)> {
     Some((start, end_marker + GUIDANCE_END.len()))
 }
 
+/// Why a global guidance path is refused.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GlobalPathRefusal {
+    /// A config-folder variable holds a relative path. The refusal names it.
+    RelativeOverride(RelativeOverride),
+    /// The path is relative, and no variable is the cause (a relative home folder).
+    NotAbsolute(std::path::PathBuf),
+}
+
+impl std::fmt::Display for GlobalPathRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RelativeOverride(refused) => refused.fmt(f),
+            Self::NotAbsolute(path) => write!(
+                f,
+                "the global guidance path {path:?} is not absolute. \
+                 The home folder must be an absolute path."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GlobalPathRefusal {}
+
+/// Refuse a global guidance `path` that is not absolute.
+///
+/// Call it before any read or write of a global guidance file: a relative path
+/// would land in the working directory. A relative config-folder variable is
+/// reported by name first, because that is what the user must fix.
+pub(super) fn require_absolute_global(
+    agent: AgentKind,
+    path: &std::path::Path,
+    env: &InstructionEnv,
+) -> Result<(), GlobalPathRefusal> {
+    env.checked_override(agent)
+        .map_err(GlobalPathRefusal::RelativeOverride)?;
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(GlobalPathRefusal::NotAbsolute(path.to_path_buf()))
+    }
+}
+
+/// Run [`require_absolute_global`] on the global instruction file of `agent`.
+///
+/// An agent with no global instruction file passes: nothing is read or written.
+pub(super) fn check_global_target(
+    agent: AgentKind,
+    env: &InstructionEnv,
+) -> Result<(), GlobalPathRefusal> {
+    match agent.instruction_file(true, env) {
+        Some(path) => require_absolute_global(agent, &path, env),
+        None => Ok(()),
+    }
+}
+
 /// Resolve the instruction file path for `agent`, falling back from global to
 /// project scope when the agent does not support a global instruction file.
+///
+/// A global path must be absolute; a relative one is refused, with the cause named.
 pub(super) fn resolve_instruction_path(
     agent: AgentKind,
     global: bool,
     env: &InstructionEnv,
 ) -> anyhow::Result<std::path::PathBuf> {
     match agent.instruction_file(global, env) {
-        Some(p) => Ok(p),
+        Some(p) => {
+            if global {
+                require_absolute_global(agent, &p, env)?;
+            }
+            Ok(p)
+        }
         None if global => {
             eprintln!(
                 "  {} does not support global guidance. Using project scope.",
@@ -225,7 +288,11 @@ pub(super) fn remove_guidance(
     global: bool,
     env: &InstructionEnv,
 ) -> anyhow::Result<()> {
-    let path = match agent.instruction_file(global, env) {
+    let candidate = agent.instruction_file(global, env);
+    if global && let Some(p) = &candidate {
+        require_absolute_global(agent, p, env)?;
+    }
+    let path = match candidate {
         Some(p) if p.exists() => p,
         _ => {
             // For Cursor, even if the new path doesn't exist, check legacy .cursorrules
@@ -336,3 +403,11 @@ pub(super) fn clean_legacy_cursorrules() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// ============================================================================
+// Tests (co-located in guidance_tests.rs)
+// ============================================================================
+
+#[cfg(test)]
+#[path = "guidance_tests.rs"]
+mod tests;
