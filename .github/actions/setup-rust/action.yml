@@ -8,9 +8,12 @@ description: >-
 
 inputs:
   components:
-    description: Extra rustup components, comma separated (for example "rustfmt, clippy").
+    description: >-
+      Rustup components, comma separated. The default is "rustfmt, clippy":
+      the runner images give these with their own stable toolchain, and
+      the jobs (and the tests that run `cargo clippy`) need them.
     required: false
-    default: ''
+    default: 'rustfmt, clippy'
   targets:
     description: Extra compile targets, comma separated.
     required: false

@@ -78,5 +78,6 @@ package-lock.json
 .devflow/features/*/*
 !.devflow/features/*/KNOWLEDGE.md
 !.devflow/conventions.md
+!.devflow/project.json
 .claudeignore
 !.devflow/policy.json
