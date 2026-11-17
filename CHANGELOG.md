@@ -26,7 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Empty agent config-folder variables count as unset. Skim refuses relative paths. Use absolute paths instead.
 - Cursor guidance needs `--project`. Earlier global installs can leave `.cursor/rules/skim.mdc` in folders where init ran.
   In each affected folder, run `skim init --uninstall --project --agent cursor`.
-  If it reports `skim hook not found`, remove the leftover skim guidance from that file by hand.
 
 ## [3.0.0] - 2026-11-13
 

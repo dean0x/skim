@@ -3,7 +3,10 @@
 use super::flags::{
     DetectionEnv, InitFlags, detect_installed_agents, resolve_agent, resolve_single_agent,
 };
-use super::guidance::agents_sharing_file;
+use super::guidance::{
+    agents_sharing_file, guidance_target, holds_block, kept_shared_note, remove_from,
+};
+use super::guidance_path::GuidanceScope;
 use super::helpers::{
     HOOK_SCRIPT_NAME, atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
     resolve_real_settings_path,
@@ -198,8 +201,7 @@ fn uninstall_agent(
     let script_exists = hook_script_path.exists();
 
     if !registration_exists && !script_exists {
-        println!("  skim hook not found. Nothing to uninstall.");
-        return Ok(std::process::ExitCode::SUCCESS);
+        return uninstall_guidance_without_hook(flags, agent, det_env, env);
     }
 
     // Integrity check (#57): warn if hook script has been modified since install
@@ -369,6 +371,57 @@ fn uninstall_agent(
     println!("  skim hook has been uninstalled.");
     println!();
 
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Remove guidance left in this scope even when no hook exists there.
+///
+/// Use the same target policy and remover as a hook uninstall. A shared file
+/// keeps its block. As with guidance-only agents, a dry-run needs no prompt.
+fn uninstall_guidance_without_hook(
+    flags: &InitFlags,
+    agent: AgentKind,
+    det_env: &DetectionEnv,
+    env: &InstructionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    let scope = GuidanceScope::for_flag(!flags.project)?;
+    let target = match guidance_target(agent, &scope, env) {
+        Ok(target) => target.filter(holds_block),
+        Err(refusal) => {
+            refusal.report()?;
+            None
+        }
+    };
+    let Some(target) = target else {
+        println!("  skim hook not found. Nothing to uninstall.");
+        return Ok(std::process::ExitCode::SUCCESS);
+    };
+    let still_using = agents_still_using_guidance(agent, flags.project, env, det_env);
+    if !still_using.is_empty() {
+        println!("{}", kept_shared_note(&target.shown, &still_using));
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    if !flags.yes && !flags.dry_run {
+        println!();
+        println!("  skim init --uninstall");
+        println!();
+        println!("    * Remove guidance from {}", target.shown.display());
+        println!();
+        if !confirm_proceed()? {
+            println!("  Cancelled.");
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+    }
+
+    if flags.dry_run {
+        println!(
+            "  [dry-run] Would remove guidance from {}",
+            target.shown.display()
+        );
+    } else {
+        remove_from(&target, &still_using)?;
+    }
     Ok(std::process::ExitCode::SUCCESS)
 }
 

@@ -1771,6 +1771,141 @@ fn test_init_cursor_uninstall_deletes_mdc() {
     assert!(!mdc.exists(), "skim.mdc should be deleted on uninstall");
 }
 
+const CURSOR_GUIDANCE_WITHOUT_HOOK: &str = "---\ndescription: \"skim — context-optimized code reading for AI agents\"\nalwaysApply: true\n---\n\n<!-- skim-start v1.0.0 -->\nold guidance\n<!-- skim-end -->\n";
+
+fn cursor_guidance_without_hook(project: &std::path::Path, text: &str) -> std::path::PathBuf {
+    let file = project.join(".cursor/rules/skim.mdc");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, text).unwrap();
+    file
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_deletes_owned_guidance() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = cursor_guidance_without_hook(&project, CURSOR_GUIDANCE_WITHOUT_HOOK);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed guidance from .cursor/rules/skim.mdc",
+        ))
+        .stdout(predicate::str::contains("Nothing to uninstall").not());
+
+    assert!(
+        !file.exists(),
+        "guidance must go even without a project hook"
+    );
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_keeps_user_text() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let text = format!("{CURSOR_GUIDANCE_WITHOUT_HOOK}\n# User rules\nKeep this text.\n");
+    let file = cursor_guidance_without_hook(&project, &text);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed guidance from .cursor/rules/skim.mdc",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(file).unwrap(),
+        "---\ndescription: \"skim — context-optimized code reading for AI agents\"\nalwaysApply: true\n---\n\n# User rules\nKeep this text.\n"
+    );
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_or_guidance_keeps_the_noop_output() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .assert()
+        .success()
+        .stdout("  skim hook not found. Nothing to uninstall.\n");
+
+    assert!(!project.join(".cursor").exists());
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_dry_run_keeps_guidance() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = cursor_guidance_without_hook(&project, CURSOR_GUIDANCE_WITHOUT_HOOK);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args([
+            "--uninstall",
+            "--project",
+            "--agent",
+            "cursor",
+            "--yes",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[dry-run] Would remove guidance from .cursor/rules/skim.mdc",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(file).unwrap(),
+        CURSOR_GUIDANCE_WITHOUT_HOOK
+    );
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_asks_before_guidance_removal() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = cursor_guidance_without_hook(&project, CURSOR_GUIDANCE_WITHOUT_HOOK);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Remove guidance from .cursor/rules/skim.mdc",
+        ))
+        .stdout(predicate::str::contains("Cancelled."));
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        CURSOR_GUIDANCE_WITHOUT_HOOK
+    );
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor"])
+        .write_stdin("y\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed guidance from .cursor/rules/skim.mdc",
+        ));
+    assert!(!file.exists());
+}
+
 #[test]
 fn test_init_cursor_cleans_legacy_cursorrules() {
     let sandbox = Sandbox::new();
