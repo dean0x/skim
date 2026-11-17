@@ -4056,6 +4056,17 @@ fn test_global_init_with_cursor_writes_nothing_in_the_cwd_and_prints_the_project
         .stdout(predicate::str::contains(CURSOR_GLOBAL_NOTE))
         .stderr(predicate::str::contains("Using project scope").not());
 
+    for extra in [None, Some("--dry-run")] {
+        sandbox
+            .init()
+            .args(["--yes", "--agent", "cursor"])
+            .args(extra)
+            .current_dir(&project)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Already up to date"))
+            .stdout(predicate::str::contains(CURSOR_GLOBAL_NOTE));
+    }
     assert_eq!(snapshot_tree(&project), before);
 }
 

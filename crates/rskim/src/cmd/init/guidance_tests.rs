@@ -676,6 +676,89 @@ fn two_agents_whose_variables_name_one_folder_share_one_global_render() {
     assert_eq!(with_codex.format.hooks, GuidanceHooks::NoHook);
 }
 
+#[cfg(unix)]
+#[test]
+fn linked_config_folders_share_one_render_and_keep_the_shared_block() {
+    use crate::cmd::init::{GuidanceState, Reader, guidance_report};
+
+    for (suffix, existing) in [("", false), ("nested/rules", false), ("", true)] {
+        let home = tempfile::TempDir::new().unwrap();
+        let shared = home.path().join("shared");
+        let alias = home.path().join("alias");
+        std::fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::symlink(&shared, &alias).unwrap();
+        let file = shared.join(suffix).join("AGENTS.md");
+        if existing {
+            std::fs::write(&file, STALE_BLOCK).unwrap();
+        }
+        let env = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |name| match name {
+            "CODEX_HOME" => Some(alias.join(suffix).into_os_string()),
+            "CRUSH_CONFIG_DIR" => Some(shared.join(suffix).into_os_string()),
+            _ => None,
+        });
+        let scope = GuidanceScope::Global;
+        let codex = guidance_target(AgentKind::CodexCli, &scope, &env)
+            .unwrap()
+            .unwrap();
+        let crush = guidance_target(AgentKind::Crush, &scope, &env)
+            .unwrap()
+            .unwrap();
+        assert_eq!(crush.format.hooks, GuidanceHooks::NoHook);
+        assert_eq!(codex.render(RENDER_VERSION), crush.render(RENDER_VERSION));
+
+        inject_guidance(AgentKind::Crush, true, &env).unwrap();
+        let installed = std::fs::read(&file).unwrap();
+        inject_guidance(AgentKind::CodexCli, true, &env).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), installed);
+
+        for (agent, other) in [
+            (AgentKind::Crush, AgentKind::CodexCli),
+            (AgentKind::CodexCli, AgentKind::Crush),
+        ] {
+            let readers = agents_sharing_file(agent, &scope, &env);
+            assert_eq!(readers, [other]);
+            remove_guidance(agent, true, &env, &readers).unwrap();
+            assert_eq!(std::fs::read(&file).unwrap(), installed);
+        }
+        let facts = guidance_report(&env, None);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].state, GuidanceState::Current);
+        assert_eq!(
+            facts[0].readers,
+            [
+                Reader::Agent(AgentKind::CodexCli),
+                Reader::Agent(AgentKind::Crush)
+            ]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_global_file_link_and_a_folder_alias_share_the_no_hook_render() {
+    let home = tempfile::TempDir::new().unwrap();
+    let shared = home.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("AGENTS.md"), STALE_BLOCK).unwrap();
+    std::os::unix::fs::symlink(&shared, home.path().join(".codex")).unwrap();
+    std::fs::create_dir(home.path().join(".claude")).unwrap();
+    std::os::unix::fs::symlink(
+        shared.join("AGENTS.md"),
+        home.path().join(".claude/CLAUDE.md"),
+    )
+    .unwrap();
+    let env = env_at(home.path());
+    let target = guidance_target(AgentKind::ClaudeCode, &GuidanceScope::Global, &env)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(target.format.hooks, GuidanceHooks::NoHook);
+    assert_eq!(
+        agents_sharing_file(AgentKind::ClaudeCode, &GuidanceScope::Global, &env),
+        [AgentKind::CodexCli]
+    );
+}
+
 // ============================================================================
 // Updating a file that exists
 // ============================================================================

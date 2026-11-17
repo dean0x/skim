@@ -181,6 +181,28 @@ pub(super) fn resolve_guidance_path(
     }
 }
 
+/// The identity of a path that passed the policy, for shared-file checks.
+///
+/// Resolve existing ancestors too: two config folders can name the same file
+/// before that file or its immediate parent exists. This key does not grant
+/// permission to read or write; callers still use the checked target path.
+/// If a path cannot be checked, keep its original identity.
+pub(super) fn guidance_file_key(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(real) => {
+                if let Ok(suffix) = path.strip_prefix(ancestor) {
+                    return real.join(suffix);
+                }
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => break,
+        }
+    }
+    path.to_path_buf()
+}
+
 fn unchecked(path: &Path, error: io::Error) -> PathRefusal {
     PathRefusal::Unchecked {
         path: path.to_path_buf(),

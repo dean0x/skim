@@ -13,8 +13,8 @@ use super::guidance_block::{
     splice, strip_section, strip_skim_section,
 };
 use super::guidance_path::{
-    GlobalPathRefusal, GuidanceScope, PathRefusal, ResolvedPath, require_absolute_global,
-    resolve_guidance_path,
+    GlobalPathRefusal, GuidanceScope, PathRefusal, ResolvedPath, guidance_file_key,
+    require_absolute_global, resolve_guidance_path,
 };
 use super::helpers::{check_mark, guidance_content, render_file};
 use crate::cmd::hooks::{HookSupport, protocol_for_agent};
@@ -148,13 +148,14 @@ fn hooks_for_file(path: &Path, scope: &GuidanceScope, env: &InstructionEnv) -> G
 /// The test is on the resolved path, so a link and the file it names count as
 /// one file. An agent whose path the policy refuses reads no file here.
 fn agents_reading_file(path: &Path, scope: &GuidanceScope, env: &InstructionEnv) -> Vec<AgentKind> {
+    let key = guidance_file_key(path);
     AgentKind::all_supported()
         .iter()
         .copied()
         .filter(|&other| {
             matches!(
                 resolved_path(other, scope, env),
-                Ok(Some(resolved)) if resolved.path == path
+                Ok(Some(resolved)) if guidance_file_key(&resolved.path) == key
             )
         })
         .collect()

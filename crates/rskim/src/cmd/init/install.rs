@@ -679,6 +679,9 @@ fn run_install_single(
         if !flags.project {
             maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
         }
+        if !flags.project && !flags.no_guidance && agent.instruction_file(true, &env).is_none() {
+            println!("{}", no_global_file_note(agent));
+        }
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
     }

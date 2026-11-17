@@ -22,7 +22,7 @@ use super::guidance::{
     read_instruction_text,
 };
 use super::guidance_block::{BlockStatus, Marker, block_status};
-use super::guidance_path::{GlobalPathRefusal, GuidanceScope, PathRefusal};
+use super::guidance_path::{GlobalPathRefusal, GuidanceScope, PathRefusal, guidance_file_key};
 use super::targets::TARGETS;
 use crate::cmd::safe_fs::ReadFailure;
 use crate::cmd::session::{AgentKind, InstructionEnv};
@@ -215,10 +215,7 @@ impl Report {
         // A resolved file is keyed by its canonical path, so a link to the folder
         // of another agent is one file. A refused path has no file to resolve.
         let (key, shown) = match &candidate {
-            Candidate::Resolved(target) => (
-                std::fs::canonicalize(&target.path).unwrap_or_else(|_| target.path.clone()),
-                target.shown.clone(),
-            ),
+            Candidate::Resolved(target) => (guidance_file_key(&target.path), target.shown.clone()),
             Candidate::Refused { path, .. } => (path.to_path_buf(), path.to_path_buf()),
         };
         if let Some(seen) = self.seen.get(&key) {
