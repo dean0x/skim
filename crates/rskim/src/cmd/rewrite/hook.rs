@@ -189,6 +189,17 @@ fn log_drift_warnings(
     agent_name: &str,
     cache_dir: &std::path::Path,
 ) {
+    for kind in drifts {
+        let (stamp_kind, message) = drift_log_entry(kind, env);
+        warn_once_daily(cache_dir, stamp_kind, agent_name, &message);
+    }
+}
+
+/// The stamp discriminator and the hook.log line for one drift.
+///
+/// Every line names the remedy, `skim init`, which finds the installed agents
+/// and refreshes their hooks.
+fn drift_log_entry(kind: &DriftKind, env: &DriftEnv) -> (&'static str, String) {
     let hook_version = env.hook_version.as_deref().unwrap_or("?");
     let hook_binary = env.hook_binary.as_deref().unwrap_or("(absent)");
     let hook_commit = env.hook_commit.as_deref().unwrap_or("?");
@@ -198,53 +209,36 @@ fn log_drift_warnings(
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 
-    for kind in drifts {
-        match kind {
-            DriftKind::HookVersionMismatch => {
-                warn_once_daily(
-                    cache_dir,
-                    "version",
-                    agent_name,
-                    &format!(
-                        "version mismatch: hook script v{hook_version}, binary v{} \
-                         (run `./target/release/skim init --yes` to update)",
-                        env.compiled_version
-                    ),
-                );
-            }
-            DriftKind::BinaryPathMismatch => {
-                warn_once_daily(
-                    cache_dir,
-                    "binary",
-                    agent_name,
-                    &format!(
-                        "binary path mismatch: hook was installed from {hook_binary}, \
-                         running from {current_str} (run `./target/release/skim init --yes` to update)"
-                    ),
-                );
-            }
-            DriftKind::CommitMismatch => {
-                warn_once_daily(
-                    cache_dir,
-                    "commit",
-                    agent_name,
-                    &format!(
-                        "binary rebuilt in-place: hook commit {hook_commit}, \
-                         running commit {} (run `./target/release/skim init --yes` to update)",
-                        env.compiled_commit
-                    ),
-                );
-            }
-            DriftKind::HookScriptUnpinned => {
-                warn_once_daily(
-                    cache_dir,
-                    "unpinned",
-                    agent_name,
-                    "hook script predates binary pinning (SKIM_HOOK_BINARY not set); \
-                     run `./target/release/skim init --yes` to upgrade the hook script",
-                );
-            }
-        }
+    match kind {
+        DriftKind::HookVersionMismatch => (
+            "version",
+            format!(
+                "version mismatch: hook script v{hook_version}, binary v{} \
+                 (run `skim init` to update)",
+                env.compiled_version
+            ),
+        ),
+        DriftKind::BinaryPathMismatch => (
+            "binary",
+            format!(
+                "binary path mismatch: hook was installed from {hook_binary}, \
+                 running from {current_str} (run `skim init` to update)"
+            ),
+        ),
+        DriftKind::CommitMismatch => (
+            "commit",
+            format!(
+                "binary rebuilt in-place: hook commit {hook_commit}, \
+                 running commit {} (run `skim init` to update)",
+                env.compiled_commit
+            ),
+        ),
+        DriftKind::HookScriptUnpinned => (
+            "unpinned",
+            "hook script predates binary pinning (SKIM_HOOK_BINARY not set); \
+             run `skim init` to upgrade the hook script"
+                .to_string(),
+        ),
     }
 }
 
@@ -1753,6 +1747,34 @@ mod tests {
     // The hook-drift/ directory is never created — warn_once_daily stamps
     // (e.g. .hook-version-warned-<agent>) are the per-day dedup mechanism.
     // ========================================================================
+
+    /// Every drift line in hook.log names `skim init` as the remedy. It never
+    /// names a path inside a build folder or the `--yes` flag, which a user with
+    /// an installed binary does not have or need.
+    #[test]
+    fn test_drift_log_lines_name_skim_init_as_the_remedy() {
+        let env = DriftEnv {
+            hook_version: Some("2.10.0".to_string()),
+            hook_binary: Some("/old/skim".to_string()),
+            hook_commit: Some("deadbee".to_string()),
+            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc1234f".to_string(),
+        };
+        let kinds = [
+            DriftKind::HookVersionMismatch,
+            DriftKind::BinaryPathMismatch,
+            DriftKind::CommitMismatch,
+            DriftKind::HookScriptUnpinned,
+        ];
+
+        for kind in &kinds {
+            let (_, line) = drift_log_entry(kind, &env);
+            assert!(line.contains("run `skim init` to "), "{kind:?}: {line}");
+            assert!(!line.contains("target/release"), "{kind:?}: {line}");
+            assert!(!line.contains("--yes"), "{kind:?}: {line}");
+        }
+    }
 
     /// Invariant: when drift is detected, the logging path fires
     /// (warn_once_daily stamps written) but the hook response JSON carries no

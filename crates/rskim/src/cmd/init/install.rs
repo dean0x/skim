@@ -7,16 +7,18 @@ use super::flags::{
     DetectionEnv, InitFlags, PermissionsTier, detect_installed_agents, resolve_single_agent,
 };
 use super::helpers::{
-    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
-    confirm_proceed, display_entries, load_or_create_settings, resolve_real_settings_path,
+    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, backup_config_file, check_mark,
+    config_backup_name, confirm_grant, confirm_proceed, display_entries, load_or_create_settings,
+    resolve_real_settings_path,
 };
 use super::state::{
     DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
 };
+use super::targets::{agent_names, install_targets};
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
-use crate::cmd::sanitize_for_display;
 use crate::cmd::session::{AgentKind, InstructionEnv};
+use crate::cmd::{display_path, sanitize_for_display};
 
 // ============================================================================
 // The write-decision predicate
@@ -100,7 +102,13 @@ fn verify_agent_installed(
 /// Returns `true` (treat as current) when:
 /// - `--no-guidance` is set, or
 /// - The agent has no instruction file (guidance feature not applicable), or
-/// - The file content contains the versioned start marker for `skim_version`.
+/// - The block in the file is current: [`block_is_current`] says it is byte-equal
+///   to what this binary writes for `skim_version`.
+///
+/// Returns `false` when the path policy refuses the file, so the install goes on
+/// to the writer, which prints the note that names the file. It also returns
+/// `false` for a block that is stale, changed or broken, and for a file that
+/// cannot be read, so the full install runs and the writer decides.
 fn is_guidance_current(
     agent: AgentKind,
     flags: &InitFlags,
@@ -110,19 +118,15 @@ fn is_guidance_current(
     if flags.no_guidance {
         return true;
     }
-    let global = !flags.project;
-    agent
-        .instruction_file(global, env)
-        .map(|p| {
-            // Route through read_existing_safely to apply the 1 MiB size guard,
-            // matching the parallel path in inject_guidance.
-            read_existing_safely(&p)
-                .ok()
-                .flatten()
-                .map(|c| c.contains(&format!("{} v{}", GUIDANCE_START, skim_version)))
-                .unwrap_or(false)
-        })
-        .unwrap_or(true) // No instruction file path = guidance not applicable for this agent
+    let Ok(scope) = GuidanceScope::for_flag(!flags.project) else {
+        return false;
+    };
+    match guidance_target(agent, &scope, env) {
+        // No instruction file path = guidance not applicable for this agent
+        Ok(None) => true,
+        Ok(Some(target)) => block_is_current(&target, skim_version),
+        Err(_) => false,
+    }
 }
 
 fn print_install_header(agent_name: &str) {
@@ -512,11 +516,18 @@ fn run_install_auto_detect(
     flags: &InitFlags,
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // The guidance-only agents come before both early returns below: a user who
+    // has only one of them, or only one other agent, still gets their files.
+    let targets = install_targets(flags, &InstructionEnv::from_process());
+
     let agents = detect_installed_agents(det_env);
     if agents.is_empty() {
+        if targets.handled > 0 {
+            return Ok(targets.exit_code_with(std::process::ExitCode::SUCCESS));
+        }
         eprintln!(
-            "No supported agents found. Install one of: Claude Code, Cursor, Gemini CLI, \
-             Copilot CLI, Codex CLI, Crush"
+            "No supported agents found. Install one of: {}",
+            agent_names(flags)
         );
         return Ok(std::process::ExitCode::FAILURE);
     }
@@ -526,7 +537,8 @@ fn run_install_auto_detect(
     // rather than caught-and-summarised), which is important for test assertions.
     if agents.len() == 1 {
         let agent_flags = agent_flags_for_auto_detect(agents[0], flags);
-        return run_install_single(&agent_flags, agents[0], det_env);
+        let code = run_install_single(&agent_flags, agents[0], det_env)?;
+        return Ok(targets.exit_code_with(code));
     }
 
     let mut any_failed = false;
@@ -549,11 +561,11 @@ fn run_install_auto_detect(
         }
     }
 
-    Ok(if any_failed {
+    Ok(targets.exit_code_with(if any_failed {
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
-    })
+    }))
 }
 
 /// Install skim for a single, explicit agent.
@@ -563,6 +575,11 @@ fn run_install_single(
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
+    // Before any write: a relative guidance path is refused up front, so the
+    // install does not stop half-done once the hook is in place.
+    if !flags.no_guidance && !flags.project {
+        check_global_target(agent, &env)?;
+    }
     let state = detect_state(agent, flags.project, det_env)?;
 
     // The directory where permissions sidecar and config live.
@@ -661,6 +678,9 @@ fn run_install_single(
         // actually creating symlinks.
         if !flags.project {
             maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
+        }
+        if !flags.project && !flags.no_guidance && agent.instruction_file(true, &env).is_none() {
+            println!("{}", no_global_file_note(agent));
         }
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
@@ -1512,37 +1532,6 @@ fn migrate_copilot_legacy(
 // Settings.json patching (B8)
 // ============================================================================
 
-/// Back up the settings file before modification.
-///
-/// Re-checks that `real_path` is not a symlink immediately before copying to
-/// close the TOCTOU window between `resolve_real_settings_path()` and the
-/// actual I/O. Without this guard, an attacker could replace the file with a
-/// symlink after resolution, causing `fs::copy` to overwrite an arbitrary
-/// target.
-///
-/// **Residual TOCTOU window**: a narrow window still exists between the
-/// `is_symlink()` check below and `fs::copy`. Exploitation requires an attacker
-/// with local write access to the config directory and kernel-level scheduling
-/// control. This residual risk is accepted: the user's config directory is
-/// expected to be owner-writable only, and local write access already implies
-/// broader compromise. The guard is defence-in-depth, not a full guarantee.
-fn backup_settings(
-    config_dir: &std::path::Path,
-    real_path: &std::path::Path,
-) -> anyhow::Result<()> {
-    // Guard: reject if the path became a symlink since resolution
-    if real_path.is_symlink() {
-        anyhow::bail!(
-            "settings path became a symlink after resolution: {}\n\
-             hint: this may indicate a symlink race; please verify the path manually",
-            real_path.display()
-        );
-    }
-    let backup_path = config_dir.join(SETTINGS_BACKUP);
-    std::fs::copy(real_path, &backup_path)?;
-    Ok(())
-}
-
 fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     let agent = agent_from_state(state)?;
     let protocol = protocol_for_agent(agent);
@@ -1569,14 +1558,16 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     let real_path = resolve_real_settings_path(&state.settings_path)?;
     let mut settings = load_or_create_settings(&real_path)?;
 
-    // Back up existing file (re-check existence to avoid TOCTOU race)
+    // Back up the existing file under the name of its own config file. The
+    // backup owner stops the install when a link or a folder sits at that name.
     if real_path.exists() {
-        backup_settings(&state.config_dir, &real_path)?;
+        let backup_name = config_backup_name(agent);
+        backup_config_file(&real_path, &state.config_dir.join(&backup_name))?;
         println!(
             "  {} Backed up: {} -> {}",
             check_mark(true),
             state.settings_path.display(),
-            SETTINGS_BACKUP
+            backup_name
         );
     }
 
@@ -1601,16 +1592,17 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
 
 // Re-export guidance symbols used by production code in this module.
 pub(super) use super::guidance::{
-    GUIDANCE_START, inject_guidance, read_existing_safely, remove_guidance,
+    block_is_current, guidance_target, inject_guidance, no_global_file_note, remove_guidance,
 };
+pub(super) use super::guidance_path::{GuidanceScope, check_global_target};
 
 // Re-export additional guidance symbols for the unit tests below (via `use super::*`).
-// `read_existing_safely` is already exported above for production use; omit here.
 #[cfg(test)]
 pub(super) use super::guidance::{
-    MAX_INSTRUCTION_FILE_SIZE, atomic_write_stripped, find_skim_section, guidance_append,
-    guidance_update, strip_skim_section, update_existing_guidance,
+    MAX_INSTRUCTION_FILE_SIZE, atomic_write_stripped, guidance_append, read_existing_safely,
 };
+#[cfg(test)]
+pub(super) use super::guidance_block::{find_skim_section, strip_skim_section};
 
 // ============================================================================
 // Dry-run output (B11)
@@ -1729,7 +1721,7 @@ pub(super) fn print_dry_run_actions(
             println!(
                 "  [dry-run] Would back up: {} -> {}",
                 state.settings_path.display(),
-                SETTINGS_BACKUP
+                config_backup_name(agent)
             );
         }
         println!(
@@ -1738,10 +1730,30 @@ pub(super) fn print_dry_run_actions(
             protocol.hook_event_keys().join(", "),
         );
     }
-    if !no_guidance && let Some(path) = agent.instruction_file(global, env) {
-        println!("  [dry-run] Would inject guidance into {}", path.display());
+    if !no_guidance {
+        print_dry_run_guidance(agent, global, env)?;
     }
 
+    Ok(())
+}
+
+/// Print the dry-run line for the guidance file: the file the install would
+/// write, or the note that says why it would leave the file alone.
+fn print_dry_run_guidance(
+    agent: AgentKind,
+    global: bool,
+    env: &InstructionEnv,
+) -> anyhow::Result<()> {
+    let scope = GuidanceScope::for_flag(global)?;
+    match guidance_target(agent, &scope, env) {
+        Ok(Some(target)) => println!(
+            "  [dry-run] Would inject guidance into {}",
+            display_path(&target.shown)
+        ),
+        Ok(None) if global => println!("{}", no_global_file_note(agent)),
+        Ok(None) => {}
+        Err(refusal) => refusal.report()?,
+    }
     Ok(())
 }
 
@@ -1753,6 +1765,7 @@ pub(super) fn print_dry_run_actions(
 mod tests {
     use super::*;
     use crate::cmd::hooks::protocol_for_agent;
+    use crate::cmd::init::guidance_block::GuidanceHooks;
     use crate::cmd::init::helpers::guidance_content;
     use crate::cmd::session::AgentKind;
 
@@ -1855,7 +1868,7 @@ mod tests {
         std::fs::write(&path, existing).unwrap();
 
         let version = "2.1.0";
-        let guidance = guidance_content(version);
+        let guidance = guidance_content(version, GuidanceHooks::Hook);
         guidance_append(&path, existing, &guidance).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
@@ -1864,31 +1877,11 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_guidance_updates_stale_version() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("CLAUDE.md");
-
-        let old_guidance = guidance_content("1.0.0");
-        let existing = format!("# Header\n\n{}\n\n# Footer\n", old_guidance);
-        std::fs::write(&path, &existing).unwrap();
-
-        let new_guidance = guidance_content("2.1.0");
-        let (start, end) = find_skim_section(&existing).expect("markers should be present");
-        guidance_update(&path, &existing, start, end, &new_guidance).unwrap();
-
-        let result = std::fs::read_to_string(&path).unwrap();
-        assert!(result.contains("v2.1.0"));
-        assert!(!result.contains("v1.0.0"));
-        assert!(result.contains("# Header"));
-        assert!(result.contains("# Footer"));
-    }
-
-    #[test]
     fn test_remove_guidance_strips_section() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("CLAUDE.md");
 
-        let guidance = guidance_content("2.1.0");
+        let guidance = guidance_content("2.1.0", GuidanceHooks::Hook);
         let existing = format!("# Header\n\n{}\n\n# Footer\n", guidance);
         std::fs::write(&path, &existing).unwrap();
 
@@ -1906,7 +1899,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("CLAUDE.md");
 
-        let guidance = guidance_content("2.1.0");
+        let guidance = guidance_content("2.1.0", GuidanceHooks::Hook);
         std::fs::write(&path, format!("{}\n", guidance)).unwrap();
         assert!(path.exists());
 
@@ -1955,108 +1948,73 @@ mod tests {
         );
     }
 
-    // ---- update_existing_guidance: all four code paths ----
+    // ---- is_guidance_current: the gate asks the question the writer asks ----
 
-    #[test]
-    fn test_update_existing_guidance_corrupted_markers_skips() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("CLAUDE.md");
-        // End marker appears before start marker — corrupted.
-        let corrupted = "<!-- skim-end -->\nsome content\n<!-- skim-start v1.0.0 -->\n";
-        std::fs::write(&path, corrupted).unwrap();
-
-        let result = update_existing_guidance(&path, corrupted, "2.0.0", "new content").unwrap();
-
-        assert!(
-            result,
-            "corrupted markers path must return true (done, skip write)"
-        );
-        // File should not have been modified.
-        let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            on_disk, corrupted,
-            "file must be unchanged when markers are corrupted"
-        );
+    fn global_flags() -> super::super::flags::InitFlags {
+        super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            dev: false,
+            agent: None,
+            wrappers: None,
+            permissions: None,
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        }
     }
 
     #[test]
-    fn test_update_existing_guidance_same_version_skips() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("CLAUDE.md");
-        let existing = "<!-- skim-start v2.0.0 -->\nguidance\n<!-- skim-end -->\n";
-        std::fs::write(&path, existing).unwrap();
+    fn test_guidance_gate_is_open_only_for_a_current_block() {
+        let home = tempfile::TempDir::new().unwrap();
+        let env = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| None);
+        let file = home.path().join(".claude").join("CLAUDE.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let flags = global_flags();
+        let gate = |text: Option<&str>| {
+            match text {
+                Some(text) => std::fs::write(&file, text).unwrap(),
+                None => drop(std::fs::remove_file(&file)),
+            }
+            is_guidance_current(AgentKind::ClaudeCode, &flags, "3.0.1", &env)
+        };
+        let current = guidance_content("3.0.1", GuidanceHooks::Hook);
+        let longer_version = guidance_content("3.0.10", GuidanceHooks::Hook);
+        let edited = current.replace("Skim earns its cost", "Skim earns its keep");
+        let broken = current.replace("<!-- skim-end -->", "");
 
-        let result = update_existing_guidance(&path, existing, "2.0.0", "new content").unwrap();
-
+        assert!(!gate(None), "no file: the install must run");
+        assert!(gate(Some(&format!("{current}\n"))), "a current block");
         assert!(
-            result,
-            "same-version path must return true (done, skip write)"
+            gate(Some(&format!("# Mine\n\n{current}\n\n# More\n"))),
+            "a current block with text around it"
         );
-        // File should not have been modified.
-        let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            on_disk, existing,
-            "file must be unchanged when version matches"
+        assert!(
+            !gate(Some(&format!("{longer_version}\n"))),
+            "v3.0.10 is not v3.0.1"
         );
+        assert!(
+            !gate(Some(&format!("{edited}\n"))),
+            "the same version with other text"
+        );
+        assert!(!gate(Some(&broken)), "a start marker with no end marker");
     }
 
     #[test]
-    fn test_update_existing_guidance_different_version_updates_in_place() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("CLAUDE.md");
-        let old_guidance = guidance_content("1.0.0");
-        let existing = format!("# Header\n\n{old_guidance}\n\n# Footer\n");
-        std::fs::write(&path, &existing).unwrap();
+    fn test_guidance_gate_is_open_when_guidance_is_off() {
+        let home = tempfile::TempDir::new().unwrap();
+        let env = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| None);
+        let mut flags = global_flags();
+        flags.no_guidance = true;
 
-        let new_guidance = guidance_content("3.0.0");
-        let result = update_existing_guidance(&path, &existing, "3.0.0", &new_guidance).unwrap();
-
-        assert!(
-            result,
-            "different-version path must return true (update done)"
-        );
-        let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            on_disk.contains("v3.0.0"),
-            "updated file must contain new version"
-        );
-        assert!(
-            !on_disk.contains("v1.0.0"),
-            "updated file must not contain old version"
-        );
-        assert!(
-            on_disk.contains("# Header"),
-            "surrounding content must be preserved"
-        );
-        assert!(
-            on_disk.contains("# Footer"),
-            "surrounding content must be preserved"
-        );
-    }
-
-    #[test]
-    fn test_update_existing_guidance_no_section_appends() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("CLAUDE.md");
-        let existing = "# My Rules\n\nSome existing content.\n";
-        std::fs::write(&path, existing).unwrap();
-
-        let new_guidance = guidance_content("2.5.0");
-        let result = update_existing_guidance(&path, existing, "2.5.0", &new_guidance).unwrap();
-
-        assert!(
-            !result,
-            "no-section path must return false (caller should print footer)"
-        );
-        let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            on_disk.starts_with("# My Rules"),
-            "existing content must be kept"
-        );
-        assert!(
-            on_disk.contains("<!-- skim-start v2.5.0 -->"),
-            "new guidance must be appended"
-        );
+        assert!(is_guidance_current(
+            AgentKind::ClaudeCode,
+            &flags,
+            "3.0.1",
+            &env
+        ));
     }
 
     // ---- agent_from_state ----

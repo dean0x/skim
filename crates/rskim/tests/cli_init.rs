@@ -1452,6 +1452,20 @@ fn test_hook_version_mismatch_warning() {
         log_content.contains("version mismatch"),
         "hook.log should contain version mismatch warning, got: {log_content}"
     );
+    // The remedy is the installed command, not a path in a build folder. The
+    // unset SKIM_HOOK_BINARY also makes the unpinned line.
+    assert!(
+        log_content.contains("(run `skim init` to update)"),
+        "the version line should name `skim init`, got: {log_content}"
+    );
+    assert!(
+        log_content.contains("run `skim init` to upgrade the hook script"),
+        "the unpinned line should name `skim init`, got: {log_content}"
+    );
+    assert!(
+        !log_content.contains("target/release") && !log_content.contains("--yes"),
+        "hook.log should not name a build path or --yes, got: {log_content}"
+    );
 }
 
 /// F6: When `SKIM_HOOK_BINARY` is set to a path that differs from the running
@@ -1516,6 +1530,14 @@ fn test_hook_binary_mismatch_warning() {
     assert!(
         log_content.contains("binary path mismatch") || log_content.contains("binary"),
         "hook.log should contain binary mismatch warning, got: {log_content}"
+    );
+    assert!(
+        log_content.contains("(run `skim init` to update)"),
+        "the binary line should name `skim init`, got: {log_content}"
+    );
+    assert!(
+        !log_content.contains("target/release") && !log_content.contains("--yes"),
+        "hook.log should not name a build path or --yes, got: {log_content}"
     );
 }
 
@@ -1587,6 +1609,53 @@ fn test_init_creates_guidance() {
         content.contains("skim") || content.contains("rskim"),
         "Guidance should reference skim or rskim"
     );
+}
+
+#[test]
+fn test_init_warns_once_and_keeps_fifo_guidance() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    for project in [true, false] {
+        let sandbox = Sandbox::new();
+        let cwd = sandbox.project_dir("proj");
+        let claude_md = if project {
+            cwd.join("CLAUDE.md")
+        } else {
+            sandbox.claude_config().join("CLAUDE.md")
+        };
+        let fifo_path = std::ffi::CString::new(claude_md.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo takes a NUL-terminated path and a mode; both are valid.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let before = fs::symlink_metadata(&claude_md).unwrap();
+
+        for _ in 0..2 {
+            let mut cmd = sandbox.init();
+            cmd.args(["--agent", "claude-code", "--yes", "--no-wrappers"])
+                .current_dir(&cwd)
+                .timeout(std::time::Duration::from_secs(15));
+            if project {
+                cmd.arg("--project");
+            }
+            let output = cmd.assert().success().get_output().clone();
+
+            let after = fs::symlink_metadata(&claude_md).unwrap();
+            assert!(after.file_type().is_fifo(), "init must keep the FIFO");
+            assert_eq!(before.ino(), after.ino(), "init must not replace the FIFO");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr
+                    .matches("is not a regular file (skipping guidance)")
+                    .count(),
+                1,
+                "init must warn once per file per run: {stderr}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("Already up to date"),
+                "unreadable guidance must not pass the current-block gate: {stdout}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1687,6 +1756,177 @@ fn test_init_dry_run_shows_guidance() {
         .stdout(predicate::str::contains("guidance"));
 }
 
+const GUIDANCE_PATH_WITH_CONTROL: &str = "AGENTS\u{1b}[31m.md";
+const GUIDANCE_PATH_DISPLAY: &str = "AGENTS?[31m.md";
+const STALE_GUIDANCE: &str =
+    "user rules\n<!-- skim-start v0.0.1 -->\nold guidance\n<!-- skim-end -->\n";
+
+fn link_guidance(project: &std::path::Path, name: &str, text: &str) -> std::path::PathBuf {
+    let file = project.join(GUIDANCE_PATH_WITH_CONTROL);
+    fs::write(&file, text).unwrap();
+    std::os::unix::fs::symlink(&file, project.join(name)).unwrap();
+    file
+}
+
+fn assert_guidance_path_display(assert: assert_cmd::assert::Assert, expected: &str) {
+    let assert = assert.success();
+    let output = assert.get_output();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    for text in [stdout, stderr] {
+        assert!(
+            text.chars().all(|c| !c.is_control() || c == '\n'),
+            "control character in {text:?}"
+        );
+    }
+    assert!(
+        stdout.contains(expected) || stderr.contains(expected),
+        "missing {expected:?} in stdout {stdout:?} and stderr {stderr:?}"
+    );
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_install_messages() {
+    let changed = format!(
+        "user rules\n<!-- skim-start v{} -->\nchanged guidance\n<!-- skim-end -->\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    for (text, dry_run, message) in [
+        ("user rules\n", false, "Installed guidance in"),
+        (STALE_GUIDANCE, false, "Updated guidance in"),
+        (changed.as_str(), false, "Replaced changed guidance in"),
+        ("<!-- skim-start v0.0.1 -->\n", false, "skim markers in"),
+        ("user rules\n", true, "Would inject guidance into"),
+    ] {
+        let sandbox = Sandbox::new();
+        let project = sandbox.project_dir("proj");
+        link_guidance(&project, "CLAUDE.md", text);
+        let mut command = sandbox.init();
+        command
+            .current_dir(&project)
+            .args(["--project", "--agent", "claude", "--yes"]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        assert_guidance_path_display(
+            command.assert(),
+            &format!("{message} {GUIDANCE_PATH_DISPLAY}"),
+        );
+    }
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_skipped_file_warnings() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("proj");
+    let file = link_guidance(&project, "CLAUDE.md", "");
+    fs::write(&file, [0xff]).unwrap();
+
+    assert_guidance_path_display(
+        sandbox
+            .init()
+            .current_dir(&project)
+            .args(["--project", "--agent", "claude", "--yes"])
+            .assert(),
+        "AGENTS?[31m.md is not valid UTF-8 (skipping guidance)",
+    );
+    assert_eq!(fs::read(file).unwrap(), [0xff]);
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_uninstall_and_prompt() {
+    for with_hook in [false, true] {
+        let sandbox = Sandbox::new();
+        let project = sandbox.project_dir("proj");
+        let file = link_guidance(&project, "CLAUDE.md", STALE_GUIDANCE);
+        if with_hook {
+            sandbox
+                .init()
+                .current_dir(&project)
+                .args(["--project", "--agent", "claude", "--yes"])
+                .assert()
+                .success();
+        }
+        let before = fs::read(&file).unwrap();
+        for (flags, message) in [
+            (vec!["--dry-run", "--yes"], "[dry-run]"),
+            (vec![], "Proceed?"),
+            (vec!["--yes"], "Removed guidance from AGENTS?[31m.md"),
+        ] {
+            let mut command = sandbox.init();
+            command
+                .current_dir(&project)
+                .args(["--uninstall", "--project", "--agent", "claude"])
+                .args(&flags)
+                .write_stdin("n\n");
+            let assert = command.assert();
+            if !with_hook && !flags.contains(&"--yes") {
+                assert_guidance_path_display(assert, "Remove guidance from AGENTS?[31m.md");
+            } else {
+                assert_guidance_path_display(assert, message);
+            }
+            if !flags.contains(&"--yes") || flags.contains(&"--dry-run") {
+                assert_eq!(fs::read(&file).unwrap(), before);
+            }
+        }
+        assert_eq!(fs::read_to_string(file).unwrap(), "user rules\n");
+    }
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_shared_file_notes() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("proj");
+    let file = link_guidance(&project, "CLAUDE.md", STALE_GUIDANCE);
+    std::os::unix::fs::symlink(&file, project.join("AGENTS.md")).unwrap();
+    for agent in ["codex", "claude"] {
+        sandbox
+            .init()
+            .current_dir(&project)
+            .args(["--project", "--agent", agent, "--yes"])
+            .assert()
+            .success();
+    }
+    let before = fs::read(&file).unwrap();
+    // The first uninstall has a hook. The second has only shared guidance.
+    for _ in 0..2 {
+        assert_guidance_path_display(
+            sandbox
+                .init()
+                .current_dir(&project)
+                .args(["--uninstall", "--project", "--agent", "claude", "--yes"])
+                .assert(),
+            "kept guidance in AGENTS?[31m.md; Codex CLI still uses it",
+        );
+        assert_eq!(fs::read(&file).unwrap(), before);
+    }
+}
+
+#[test]
+fn test_global_guidance_path_display_filters_target_messages() {
+    let sandbox = Sandbox::bare();
+    let rules = sandbox.config_dir(".kiro/steering");
+    let file = link_guidance(&rules, "skim.md", STALE_GUIDANCE);
+    for (flags, message) in [
+        (vec!["--dry-run", "--yes"], "Would inject guidance into"),
+        (vec!["--yes"], "Updated guidance in"),
+        (vec!["--dry-run", "--yes"], "is already current"),
+        (
+            vec!["--uninstall", "--dry-run"],
+            "Would remove guidance from",
+        ),
+        (vec!["--uninstall"], "Proceed?"),
+        (vec!["--uninstall", "--yes"], "Removed guidance from"),
+    ] {
+        let assert = sandbox.init().args(&flags).write_stdin("n\n").assert();
+        assert_guidance_path_display(assert, message);
+        if !flags.contains(&"--uninstall") || !flags.contains(&"--yes") {
+            assert!(file.exists());
+        }
+    }
+    assert_eq!(fs::read_to_string(file).unwrap(), "user rules\n");
+}
+
 // ============================================================================
 // Cursor .mdc format
 // ============================================================================
@@ -1747,6 +1987,201 @@ fn test_init_cursor_uninstall_deletes_mdc() {
         .success();
 
     assert!(!mdc.exists(), "skim.mdc should be deleted on uninstall");
+}
+
+const CURSOR_GUIDANCE_WITHOUT_HOOK: &str = "---\ndescription: \"skim — context-optimized code reading for AI agents\"\nalwaysApply: true\n---\n\n<!-- skim-start v1.0.0 -->\nold guidance\n<!-- skim-end -->\n";
+
+fn cursor_guidance_without_hook(project: &std::path::Path, text: &str) -> std::path::PathBuf {
+    let file = project.join(".cursor/rules/skim.mdc");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, text).unwrap();
+    file
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_deletes_owned_guidance() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = cursor_guidance_without_hook(&project, CURSOR_GUIDANCE_WITHOUT_HOOK);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed guidance from .cursor/rules/skim.mdc",
+        ))
+        .stdout(predicate::str::contains("Nothing to uninstall").not());
+
+    assert!(
+        !file.exists(),
+        "guidance must go even without a project hook"
+    );
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_keeps_user_text() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let text = format!("{CURSOR_GUIDANCE_WITHOUT_HOOK}\n# User rules\nKeep this text.\n");
+    let file = cursor_guidance_without_hook(&project, &text);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed guidance from .cursor/rules/skim.mdc",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(file).unwrap(),
+        "---\ndescription: \"skim — context-optimized code reading for AI agents\"\nalwaysApply: true\n---\n\n# User rules\nKeep this text.\n"
+    );
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_or_guidance_keeps_the_noop_output() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .assert()
+        .success()
+        .stdout("  skim hook not found. Nothing to uninstall.\n");
+
+    assert!(!project.join(".cursor").exists());
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_dry_run_keeps_guidance() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = cursor_guidance_without_hook(&project, CURSOR_GUIDANCE_WITHOUT_HOOK);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args([
+            "--uninstall",
+            "--project",
+            "--agent",
+            "cursor",
+            "--yes",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[dry-run] Would remove guidance from .cursor/rules/skim.mdc",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(file).unwrap(),
+        CURSOR_GUIDANCE_WITHOUT_HOOK
+    );
+}
+
+#[test]
+fn test_cursor_uninstall_without_hook_asks_before_guidance_removal() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = cursor_guidance_without_hook(&project, CURSOR_GUIDANCE_WITHOUT_HOOK);
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Remove guidance from .cursor/rules/skim.mdc",
+        ))
+        .stdout(predicate::str::contains("Cancelled."));
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        CURSOR_GUIDANCE_WITHOUT_HOOK
+    );
+
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--agent", "cursor"])
+        .write_stdin("y\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed guidance from .cursor/rules/skim.mdc",
+        ));
+    assert!(!file.exists());
+}
+
+/// A hookless uninstall must keep the exact bytes that another set-up agent uses.
+#[test]
+fn test_codex_uninstall_without_hook_keeps_guidance_while_crush_is_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = project.join("AGENTS.md");
+    fs::write(&file, "# User rules\nKeep this text.\n").unwrap();
+    // Crush counts as set up through its hook registration, not its folder alone.
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--project", "--yes", "--agent", "crush"])
+        .assert()
+        .success();
+    assert!(!project.join(".codex").exists());
+    let before = fs::read(&file).unwrap();
+
+    let result = sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--yes", "--agent", "codex"])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(&file).unwrap(), before);
+    result.stdout(predicate::str::contains(
+        "Note: kept guidance in AGENTS.md; Crush still uses it",
+    ));
+    assert!(!project.join(".codex").exists());
+}
+
+/// Global guidance removal must keep the exact user text on both sides of the block.
+#[test]
+fn test_global_gemini_uninstall_without_hook_removes_only_the_guidance_block() {
+    let sandbox = Sandbox::bare();
+    let config = sandbox.config_dir(".gemini");
+    let file = config.join("GEMINI.md");
+    fs::write(
+        &file,
+        "# User rules\nKeep this text.\n\n<!-- skim-start v0.0.1 -->\nold guidance\n<!-- skim-end -->\n\n# More user rules\nKeep these too.\n",
+    )
+    .unwrap();
+    assert!(!config.join("settings.json").exists());
+    assert!(!config.join("hooks").exists());
+
+    let result = sandbox
+        .init()
+        .args(["--uninstall", "--yes", "--agent", "gemini"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        b"# User rules\nKeep this text.\n\n# More user rules\nKeep these too.\n"
+    );
+    result
+        .stdout(predicate::str::contains("Removed guidance from"))
+        .stdout(predicate::str::contains("GEMINI.md"));
 }
 
 #[test]
@@ -1823,6 +2258,223 @@ fn test_rewrite_help_mentions_agent_flag() {
 // ============================================================================
 // Guidance upgrade bypass tests (issue 11)
 // ============================================================================
+
+fn project_init(sandbox: &Sandbox, project: &std::path::Path, agent: &str) -> String {
+    let output = sandbox
+        .init()
+        .args(["--project", "--agent", agent, "--yes", "--no-wrappers"])
+        .current_dir(project)
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap()
+}
+
+const PROJECT_GUIDANCE: &[(&str, &str)] = &[
+    ("claude-code", "CLAUDE.md"),
+    ("codex", "AGENTS.md"),
+    ("gemini", "GEMINI.md"),
+    ("copilot", ".github/copilot-instructions.md"),
+    ("cursor", ".cursor/rules/skim.mdc"),
+];
+
+#[test]
+fn test_init_refreshes_each_stale_project_guidance_file_in_the_same_scope() {
+    for &(agent, file) in PROJECT_GUIDANCE {
+        let sandbox = Sandbox::new();
+        let project = sandbox.project_dir("project");
+        project_init(&sandbox, &project, agent);
+        let path = project.join(file);
+        let current = fs::read_to_string(&path).unwrap();
+        let stale = current.replace(
+            &format!("<!-- skim-start v{} -->", env!("CARGO_PKG_VERSION")),
+            "<!-- skim-start v0.0.1 -->",
+        );
+        assert_ne!(stale, current, "{agent}");
+        fs::write(&path, stale).unwrap();
+
+        let stdout = project_init(&sandbox, &project, agent);
+
+        assert!(!stdout.contains("Already up to date"), "{agent}: {stdout}");
+        assert!(stdout.contains("Updated guidance in"), "{agent}: {stdout}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), current, "{agent}");
+    }
+}
+
+#[test]
+fn test_init_keeps_a_broken_block_warns_and_skips_the_fast_path() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    project_init(&sandbox, &project, "claude-code");
+    let path = project.join("CLAUDE.md");
+    let broken = fs::read_to_string(&path)
+        .unwrap()
+        .replace("<!-- skim-end -->", "user text without an end marker");
+    fs::write(&path, &broken).unwrap();
+
+    for _ in 0..2 {
+        let output = sandbox
+            .init()
+            .args(["--project", "--agent", "claude-code", "--yes"])
+            .current_dir(&project)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stdout.contains("Already up to date"), "{stdout}");
+        assert!(
+            stderr.contains("warning: skim markers in CLAUDE.md"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+    }
+}
+
+#[test]
+fn test_project_init_and_uninstall_refuse_an_outside_instruction_file_and_dry_run_names_it() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    project_init(&sandbox, &project, "claude-code");
+    let path = project.join("CLAUDE.md");
+    let outside = sandbox.home().join("outside.md");
+    fs::rename(&path, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    let before = fs::read(&outside).unwrap();
+
+    let stdout = project_init(&sandbox, &project, "claude-code");
+    assert!(!stdout.contains("Already up to date"), "{stdout}");
+    assert!(
+        stdout.contains("Note: CLAUDE.md leads outside this project folder"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), before);
+    let project_before = snapshot_tree(&project);
+
+    sandbox
+        .init()
+        .args(["--project", "--agent", "claude-code", "--yes", "--dry-run"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Note: CLAUDE.md leads outside this project folder",
+        ));
+    assert_eq!(snapshot_tree(&project), project_before);
+    sandbox
+        .init()
+        .args([
+            "--uninstall",
+            "--project",
+            "--agent",
+            "claude-code",
+            "--yes",
+        ])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "CLAUDE.md leads outside this project folder",
+        ));
+    assert_eq!(fs::read(&outside).unwrap(), before);
+    assert_eq!(fs::read_link(&path).unwrap(), outside);
+}
+
+#[test]
+fn test_project_init_refuses_cursor_guidance_in_a_folder_that_leads_outside() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    let outside = sandbox.project_dir("outside");
+    std::os::unix::fs::symlink(&outside, project.join(".cursor")).unwrap();
+    fs::write(outside.join("user.md"), "user instructions\n").unwrap();
+
+    let stdout = project_init(&sandbox, &project, "cursor");
+
+    assert!(
+        stdout.contains(".cursor/rules/skim.mdc leads outside this project folder"),
+        "{stdout}"
+    );
+    assert!(!outside.join("rules").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("user.md")).unwrap(),
+        "user instructions\n"
+    );
+    assert!(
+        fs::symlink_metadata(project.join(".cursor"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn test_project_claude_link_uses_the_shared_agents_file_and_stays_current_in_both_gates() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    let agents = project.join("AGENTS.md");
+    fs::write(&agents, "user instructions\n").unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", project.join("CLAUDE.md")).unwrap();
+    project_init(&sandbox, &project, "claude-code");
+    project_init(&sandbox, &project, "codex");
+    let current = fs::read_to_string(&agents).unwrap();
+    assert!(current.starts_with("user instructions\n"));
+    assert_eq!(current.matches("<!-- skim-start").count(), 1);
+    assert!(!current.contains("## Command wrapping"));
+    let before = snapshot_tree(&project);
+
+    for agent in ["claude-code", "codex"] {
+        let stdout = project_init(&sandbox, &project, agent);
+        assert!(stdout.contains("Already up to date"), "{agent}: {stdout}");
+        sandbox
+            .init()
+            .args(["--project", "--agent", agent, "--yes", "--dry-run"])
+            .current_dir(&project)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Already up to date"));
+        assert_eq!(snapshot_tree(&project), before, "{agent}");
+    }
+    assert_eq!(
+        fs::read_link(project.join("CLAUDE.md")).unwrap(),
+        std::path::Path::new("AGENTS.md")
+    );
+}
+
+#[test]
+fn test_project_cursor_keeps_an_outside_legacy_file_and_prints_its_refusal() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    let outside = sandbox.home().join("outside.md");
+    let text = "user text\n<!-- skim-start v0.0.1 -->\nold block\n<!-- skim-end -->\n";
+    fs::write(&outside, text).unwrap();
+    std::os::unix::fs::symlink(&outside, project.join(".cursorrules")).unwrap();
+
+    let stdout = project_init(&sandbox, &project, "cursor");
+
+    assert!(
+        stdout.contains("Note: .cursorrules leads outside this project folder"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), text);
+    sandbox
+        .init()
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Note: .cursorrules leads outside this project folder",
+        ));
+    assert_eq!(fs::read_to_string(&outside).unwrap(), text);
+    assert_eq!(
+        fs::read_link(project.join(".cursorrules")).unwrap(),
+        outside
+    );
+}
 
 #[test]
 fn test_init_guidance_upgrade_updates_stale_version() {
@@ -3622,4 +4274,899 @@ fn bodyless_module_name(trimmed: &str) -> Option<&str> {
     name.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
         .then_some(name)
+}
+
+// ============================================================================
+// Cursor has no global guidance file
+// ============================================================================
+
+/// A `.cursorrules` file that holds an old skim block between user text.
+const CURSORRULES_WITH_BLOCK: &str = "# User rules\n\n<!-- skim-start v1.0.0 -->\nold guidance\n<!-- skim-end -->\n\n# More user rules\n";
+
+/// The line that a global run with Cursor prints instead of writing a file.
+const CURSOR_GLOBAL_NOTE: &str = "Note: Cursor has no global guidance file. \
+     In a repository, run `skim init --agent cursor --project` to add it.";
+
+/// Every file and folder under `dir`, by relative path, with the bytes of each
+/// file (`None` for a folder), for a before/after check.
+fn snapshot_tree(dir: &std::path::Path) -> BTreeMap<String, Option<Vec<u8>>> {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if path.is_dir() {
+                out.insert(name, None);
+                walk(root, &path, out);
+            } else {
+                out.insert(name, Some(fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// A global init with Cursor writes nothing in the current folder, leaves a
+/// `.cursorrules` file as it is, and prints the project command.
+#[test]
+fn test_global_init_with_cursor_writes_nothing_in_the_cwd_and_prints_the_project_command() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cursor");
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join(".cursorrules"), CURSORRULES_WITH_BLOCK).unwrap();
+    let before = snapshot_tree(&project);
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(CURSOR_GLOBAL_NOTE))
+        .stderr(predicate::str::contains("Using project scope").not());
+
+    for extra in [None, Some("--dry-run")] {
+        sandbox
+            .init()
+            .args(["--yes", "--agent", "cursor"])
+            .args(extra)
+            .current_dir(&project)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Already up to date"))
+            .stdout(predicate::str::contains(CURSOR_GLOBAL_NOTE));
+    }
+    assert_eq!(snapshot_tree(&project), before);
+}
+
+/// The dry-run of a global Cursor init prints the same line and writes nothing.
+#[test]
+fn test_dry_run_of_a_global_init_with_cursor_prints_the_project_command() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cursor");
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join(".cursorrules"), CURSORRULES_WITH_BLOCK).unwrap();
+    let before = snapshot_tree(&project);
+    let home_before = snapshot_tree(sandbox.home());
+
+    sandbox
+        .init()
+        .args(["--yes", "--dry-run", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(CURSOR_GLOBAL_NOTE));
+
+    assert_eq!(snapshot_tree(&project), before);
+    assert_eq!(snapshot_tree(sandbox.home()), home_before);
+}
+
+/// A global uninstall with Cursor leaves the current folder as it is: the
+/// `.cursorrules` file keeps its block and the project rule file stays.
+#[test]
+fn test_global_uninstall_with_cursor_leaves_the_cwd_unchanged() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cursor");
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "cursor"])
+        .assert()
+        .success();
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join(".cursorrules"), CURSORRULES_WITH_BLOCK).unwrap();
+    fs::create_dir_all(project.join(".cursor/rules")).unwrap();
+    fs::write(project.join(".cursor/rules/skim.mdc"), "my own rule\n").unwrap();
+    let before = snapshot_tree(&project);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim hook has been uninstalled"))
+        .stdout(predicate::str::contains("Cleaned legacy").not());
+
+    assert_eq!(snapshot_tree(&project), before);
+}
+
+// ============================================================================
+// The backup is named after the config file
+// ============================================================================
+
+/// Cursor backs up `hooks.json` to `hooks.json.bak`, and an old
+/// `settings.json.bak` stays as it is.
+#[test]
+fn test_init_backs_up_cursor_hooks_json_to_hooks_json_bak() {
+    let sandbox = Sandbox::bare();
+    let cursor = sandbox.config_dir(".cursor");
+    fs::write(cursor.join("hooks.json"), "{\"version\":1}\n").unwrap();
+    fs::write(cursor.join("settings.json.bak"), "an older backup\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hooks.json -> hooks.json.bak"));
+
+    assert_eq!(
+        fs::read_to_string(cursor.join("hooks.json.bak")).unwrap(),
+        "{\"version\":1}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(cursor.join("settings.json.bak")).unwrap(),
+        "an older backup\n",
+        "an old settings.json.bak must stay as it is"
+    );
+}
+
+/// Crush backs up `crush.json` to `crush.json.bak`.
+#[test]
+fn test_init_backs_up_crush_json_to_crush_json_bak() {
+    let sandbox = Sandbox::bare();
+    let crush = sandbox.config_dir(".crush");
+    fs::write(crush.join("crush.json"), "{\"options\":{}}\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "crush"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("crush.json -> crush.json.bak"));
+
+    assert_eq!(
+        fs::read_to_string(crush.join("crush.json.bak")).unwrap(),
+        "{\"options\":{}}\n"
+    );
+    assert!(!crush.join("settings.json.bak").exists());
+}
+
+/// Gemini keeps the name `settings.json.bak`.
+#[test]
+fn test_init_backs_up_gemini_settings_json_to_settings_json_bak() {
+    let sandbox = Sandbox::bare();
+    let gemini = sandbox.config_dir(".gemini");
+    fs::write(gemini.join("settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--agent", "gemini"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "settings.json -> settings.json.bak",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(gemini.join("settings.json.bak")).unwrap(),
+        "{\"theme\":\"dark\"}\n"
+    );
+}
+
+/// The dry-run names the backup file of the agent and writes none.
+#[test]
+fn test_dry_run_names_the_backup_file_of_the_agent() {
+    let sandbox = Sandbox::bare();
+    let cursor = sandbox.config_dir(".cursor");
+    fs::write(cursor.join("hooks.json"), "{}\n").unwrap();
+
+    sandbox
+        .init()
+        .args(["--yes", "--dry-run", "--agent", "cursor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would back up"))
+        .stdout(predicate::str::contains("hooks.json -> hooks.json.bak"));
+
+    assert!(!cursor.join("hooks.json.bak").exists());
+    assert!(!cursor.join("settings.json.bak").exists());
+}
+
+/// A link at the backup name stops the install, and the file that the link
+/// names stays as it is.
+#[test]
+fn test_a_link_at_the_backup_name_stops_the_install() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let cursor = project.join(".cursor");
+    fs::create_dir_all(&cursor).unwrap();
+    fs::write(cursor.join("hooks.json"), "{}\n").unwrap();
+    let victim = sandbox.home().join("victim.txt");
+    fs::write(&victim, "keep me\n").unwrap();
+    std::os::unix::fs::symlink(&victim, cursor.join("hooks.json.bak")).unwrap();
+
+    sandbox
+        .init()
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .current_dir(&project)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hooks.json.bak"));
+
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me\n");
+    assert_eq!(
+        fs::read_to_string(cursor.join("hooks.json")).unwrap(),
+        "{}\n"
+    );
+    assert!(
+        !cursor.join("rules/skim.mdc").exists(),
+        "a stopped install must not write the guidance file"
+    );
+}
+
+// ============================================================================
+// A guidance file that two agents share
+// ============================================================================
+
+/// Install Codex and then Crush in `project`. Both rely on its `AGENTS.md`.
+fn install_codex_and_crush(sandbox: &Sandbox, project: &std::path::Path) {
+    for agent in ["codex", "crush"] {
+        sandbox
+            .init()
+            .args(["--project", "--yes", "--agent", agent])
+            .current_dir(project)
+            .assert()
+            .success();
+    }
+}
+
+/// Uninstall `agent` from `project`.
+fn uninstall_project_agent(
+    sandbox: &Sandbox,
+    project: &std::path::Path,
+    agent: &str,
+) -> assert_cmd::assert::Assert {
+    sandbox
+        .init()
+        .args(["--project", "--uninstall", "--yes", "--agent", agent])
+        .current_dir(project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim hook has been uninstalled"))
+}
+
+/// Uninstalling Crush keeps the block while Codex is set up. Uninstalling Codex
+/// afterwards removes it and keeps the text of the user.
+#[test]
+fn test_uninstall_of_crush_keeps_the_agents_md_block_while_codex_is_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    fs::write(project.join("AGENTS.md"), "# My notes\n").unwrap();
+    install_codex_and_crush(&sandbox, &project);
+    let agents_md = project.join("AGENTS.md");
+
+    uninstall_project_agent(&sandbox, &project, "crush").stdout(predicate::str::contains(
+        "Note: kept guidance in AGENTS.md; Codex CLI still uses it",
+    ));
+    let kept = fs::read_to_string(&agents_md).unwrap();
+    assert!(kept.contains("<!-- skim-start"), "{kept}");
+    assert!(kept.contains("# My notes"), "{kept}");
+
+    uninstall_project_agent(&sandbox, &project, "codex")
+        .stdout(predicate::str::contains("kept guidance").not());
+    let removed = fs::read_to_string(&agents_md).unwrap();
+    assert!(!removed.contains("skim-start"), "{removed}");
+    assert!(removed.contains("# My notes"), "{removed}");
+}
+
+/// Uninstalling Codex keeps the block while Crush is set up. Uninstalling Crush
+/// afterwards removes the file, which held only the block.
+#[test]
+fn test_uninstall_of_codex_keeps_the_agents_md_block_while_crush_is_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    install_codex_and_crush(&sandbox, &project);
+    let agents_md = project.join("AGENTS.md");
+
+    uninstall_project_agent(&sandbox, &project, "codex").stdout(predicate::str::contains(
+        "Note: kept guidance in AGENTS.md; Crush still uses it",
+    ));
+    assert!(
+        fs::read_to_string(&agents_md)
+            .unwrap()
+            .contains("<!-- skim-start")
+    );
+
+    uninstall_project_agent(&sandbox, &project, "crush")
+        .stdout(predicate::str::contains("kept guidance").not());
+    assert!(
+        !agents_md.exists(),
+        "the last agent to leave removes a file that held only the block"
+    );
+}
+
+/// With no other agent set up, the uninstall of Crush removes the block as before.
+#[test]
+fn test_uninstall_of_crush_removes_the_agents_md_block_when_codex_is_not_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    sandbox
+        .init()
+        .args(["--project", "--yes", "--agent", "crush"])
+        .current_dir(&project)
+        .assert()
+        .success();
+    assert!(project.join("AGENTS.md").exists());
+
+    uninstall_project_agent(&sandbox, &project, "crush")
+        .stdout(predicate::str::contains("kept guidance").not());
+
+    assert!(!project.join("AGENTS.md").exists());
+}
+
+// ============================================================================
+// Guidance-only agents (Kiro, Roo Code, Cline, Augment, Windsurf)
+// ============================================================================
+
+/// The guidance-only agents: name, root folder, guidance file and the
+/// frontmatter that file starts with. Roots and files are relative to the home
+/// folder.
+const GUIDANCE_ONLY: &[(&str, &str, &str, &str)] = &[
+    (
+        "Kiro",
+        ".kiro",
+        ".kiro/steering/skim.md",
+        "---\ninclusion: always\n---\n\n",
+    ),
+    ("Roo Code", ".roo", ".roo/rules/skim.md", ""),
+    ("Cline", ".cline", ".cline/rules/skim.md", ""),
+    ("Augment", ".augment", ".augment/rules/skim.md", ""),
+    (
+        "Windsurf",
+        ".devin",
+        ".devin/rules/skim.md",
+        "---\ntrigger: always_on\n---\n\n",
+    ),
+];
+
+/// Create the root folder of every guidance-only agent in the sandbox home.
+fn create_guidance_only_roots(sandbox: &Sandbox) {
+    for (_, root, _, _) in GUIDANCE_ONLY {
+        sandbox.config_dir(root);
+    }
+}
+
+/// The guidance file of a guidance-only agent, by its file path from the table.
+fn guidance_only_file(sandbox: &Sandbox, file: &str) -> std::path::PathBuf {
+    sandbox.home().join(file)
+}
+
+/// Every guidance-only agent has a file that starts with its own frontmatter,
+/// holds the search section and has no hook text.
+fn assert_guidance_only_files_written(sandbox: &Sandbox) {
+    for (name, _, file, frontmatter) in GUIDANCE_ONLY {
+        let text = fs::read_to_string(guidance_only_file(sandbox, file))
+            .unwrap_or_else(|e| panic!("{name}: no guidance file {file}: {e}"));
+        assert!(
+            text.starts_with(&format!("{frontmatter}<!-- skim-start v")),
+            "{name}: wrong start: {}",
+            &text[..text.len().min(80)]
+        );
+        assert!(text.contains("### Search and read"), "{name}");
+        assert!(
+            !text.contains("### Command wrapping"),
+            "{name}: hook text in the file of an agent with no hook"
+        );
+        assert!(text.ends_with("<!-- skim-end -->\n"), "{name}");
+    }
+}
+
+fn assert_no_guidance_only_files(sandbox: &Sandbox) {
+    for (name, _, file, _) in GUIDANCE_ONLY {
+        assert!(
+            !guidance_only_file(sandbox, file).exists(),
+            "{name}: {file} must not exist"
+        );
+    }
+}
+
+/// With one agent detected, the guidance-only agents still get their files.
+#[test]
+fn test_init_writes_guidance_for_each_installed_guidance_only_agent() {
+    let sandbox = Sandbox::new();
+    create_guidance_only_roots(&sandbox);
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Kiro guidance setup"))
+        .stdout(predicate::str::contains("Windsurf guidance setup"));
+
+    assert_guidance_only_files_written(&sandbox);
+}
+
+/// With two agents detected (the loop, not the single-agent path), the
+/// guidance-only agents still get their files.
+#[test]
+fn test_init_writes_guidance_for_guidance_only_agents_with_two_agents_detected() {
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".gemini");
+    create_guidance_only_roots(&sandbox);
+
+    sandbox.init().arg("--yes").assert().success();
+
+    assert_guidance_only_files_written(&sandbox);
+    assert!(sandbox.home().join(".gemini/GEMINI.md").exists());
+}
+
+/// A user whose only agent is a guidance-only one gets the file and exit 0.
+#[test]
+fn test_init_with_only_a_guidance_only_agent_writes_its_file_and_succeeds() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".kiro");
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Installed guidance in"));
+
+    let text = fs::read_to_string(sandbox.home().join(".kiro/steering/skim.md")).unwrap();
+    assert!(text.starts_with("---\ninclusion: always\n---\n\n<!-- skim-start v"));
+    for (_, root, _, _) in GUIDANCE_ONLY.iter().filter(|(name, ..)| *name != "Kiro") {
+        assert!(
+            !sandbox.home().join(root).exists(),
+            "{root} must not be created"
+        );
+    }
+}
+
+/// With no agent and no guidance-only root, init fails and the message lists
+/// every agent that skim looked for.
+#[test]
+fn test_init_with_no_agent_and_no_root_lists_the_guidance_only_agents() {
+    let sandbox = Sandbox::bare();
+    let before = snapshot_tree(sandbox.home());
+
+    let assert = sandbox.init().arg("--yes").assert().failure();
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("No supported agents found"), "{stderr}");
+    for (name, ..) in GUIDANCE_ONLY {
+        assert!(stderr.contains(name), "{name} is not in: {stderr}");
+    }
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// Skim never creates a root folder, and never writes in the Cline folder under
+/// `Documents`.
+#[test]
+fn test_init_never_creates_a_root_folder_or_writes_under_documents() {
+    let sandbox = Sandbox::new();
+    let documents = sandbox.config_dir("Documents/Cline/Rules");
+    fs::write(documents.join("mine.md"), "my rule\n").unwrap();
+    let documents_before = snapshot_tree(&sandbox.home().join("Documents"));
+
+    sandbox.init().arg("--yes").assert().success();
+
+    for (name, root, _, _) in GUIDANCE_ONLY {
+        assert!(
+            !sandbox.home().join(root).exists(),
+            "{name}: {root} must not be created"
+        );
+    }
+    assert_eq!(
+        snapshot_tree(&sandbox.home().join("Documents")),
+        documents_before
+    );
+}
+
+/// Only a root folder that already exists gets a file.
+#[test]
+fn test_init_writes_only_the_agents_whose_root_exists() {
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".roo");
+
+    sandbox.init().arg("--yes").assert().success();
+
+    assert!(sandbox.home().join(".roo/rules/skim.md").is_file());
+    for (name, root, _, _) in GUIDANCE_ONLY
+        .iter()
+        .filter(|(name, ..)| *name != "Roo Code")
+    {
+        assert!(
+            !sandbox.home().join(root).exists(),
+            "{name}: {root} must not be created"
+        );
+    }
+}
+
+/// `--agent`, `--project` and `--no-guidance` each leave the guidance-only
+/// agents alone.
+#[test]
+fn test_init_skips_the_guidance_only_agents_under_agent_project_and_no_guidance() {
+    for args in [
+        vec!["--yes", "--agent", "claude-code"],
+        vec!["--yes", "--project"],
+        vec!["--yes", "--no-guidance"],
+    ] {
+        let sandbox = Sandbox::new();
+        create_guidance_only_roots(&sandbox);
+        let project = sandbox.project_dir("proj");
+
+        sandbox
+            .init()
+            .args(&args)
+            .current_dir(&project)
+            .assert()
+            .success();
+
+        assert_no_guidance_only_files(&sandbox);
+        for (name, root, _, _) in GUIDANCE_ONLY {
+            assert!(
+                snapshot_tree(&sandbox.home().join(root)).is_empty(),
+                "{name}: {root} changed under {args:?}"
+            );
+        }
+    }
+}
+
+/// The dry-run names one file per guidance-only agent and writes nothing.
+#[test]
+fn test_dry_run_names_each_guidance_only_file_and_writes_nothing() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    let before = snapshot_tree(sandbox.home());
+
+    let assert = sandbox
+        .init()
+        .args(["--yes", "--dry-run"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for (name, _, file, _) in GUIDANCE_ONLY {
+        let line = format!(
+            "[dry-run] Would inject guidance into {}",
+            guidance_only_file(&sandbox, file).display()
+        );
+        assert!(stdout.contains(&line), "{name}: no {line:?} in: {stdout}");
+    }
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// After an install, the dry-run says the files are already current.
+#[test]
+fn test_dry_run_of_a_current_guidance_only_file_says_it_is_current() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".roo");
+    sandbox.init().arg("--yes").assert().success();
+
+    sandbox
+        .init()
+        .args(["--yes", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is already current"))
+        .stdout(predicate::str::contains("Would inject guidance").not());
+}
+
+/// A second install leaves every guidance-only file byte-unchanged.
+#[test]
+fn test_init_twice_leaves_the_guidance_only_files_unchanged() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    let before = snapshot_tree(sandbox.home());
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Guidance already current"));
+
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// A file with the skim name that the user wrote is not touched, by init or by
+/// uninstall.
+#[test]
+fn test_a_guidance_only_file_without_skim_markers_is_left_alone() {
+    let sandbox = Sandbox::bare();
+    let steering = sandbox.config_dir(".kiro/steering");
+    let mine = steering.join("skim.md");
+    fs::write(&mine, "# My own steering\n").unwrap();
+
+    sandbox
+        .init()
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("holds no skim markers"));
+    assert_eq!(fs::read_to_string(&mine).unwrap(), "# My own steering\n");
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&mine).unwrap(), "# My own steering\n");
+}
+
+/// An uninstall with one agent detected removes the guidance-only files.
+#[test]
+fn test_uninstall_removes_each_guidance_only_file_with_one_agent_detected() {
+    let sandbox = Sandbox::new();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    assert_guidance_only_files_written(&sandbox);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed guidance from"));
+
+    assert_no_guidance_only_files(&sandbox);
+}
+
+/// An uninstall with no agent detected still removes the guidance-only files.
+#[test]
+fn test_uninstall_removes_each_guidance_only_file_with_no_agent_detected() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    assert_guidance_only_files_written(&sandbox);
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing to uninstall").not());
+
+    assert_no_guidance_only_files(&sandbox);
+    for (name, root, _, _) in GUIDANCE_ONLY {
+        assert!(
+            sandbox.home().join(root).is_dir(),
+            "{name}: the root folder stays"
+        );
+    }
+}
+
+/// An uninstall with two agents detected removes the guidance-only files.
+#[test]
+fn test_uninstall_removes_each_guidance_only_file_with_two_agents_detected() {
+    let sandbox = Sandbox::new();
+    sandbox.config_dir(".gemini");
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    assert_no_guidance_only_files(&sandbox);
+}
+
+/// The uninstall takes out only the block of a file that holds text of the user.
+#[test]
+fn test_uninstall_keeps_the_text_of_the_user_in_a_guidance_only_file() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".cline");
+    sandbox.init().arg("--yes").assert().success();
+    let file = sandbox.home().join(".cline/rules/skim.md");
+    let installed = fs::read_to_string(&file).unwrap();
+    fs::write(&file, format!("{installed}\n# My own rule\n")).unwrap();
+
+    sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    let after = fs::read_to_string(&file).unwrap();
+    assert!(after.contains("# My own rule"), "{after}");
+    assert!(!after.contains("skim-start"), "{after}");
+}
+
+/// `--agent`, `--project` and `--no-guidance` each leave the files alone on
+/// uninstall too.
+#[test]
+fn test_uninstall_skips_the_guidance_only_agents_under_agent_project_and_no_guidance() {
+    for args in [
+        vec!["--uninstall", "--yes", "--agent", "claude-code"],
+        vec!["--uninstall", "--yes", "--project"],
+        vec!["--uninstall", "--yes", "--no-guidance"],
+    ] {
+        let sandbox = Sandbox::new();
+        create_guidance_only_roots(&sandbox);
+        sandbox.init().arg("--yes").assert().success();
+        let project = sandbox.project_dir("proj");
+
+        sandbox
+            .init()
+            .args(&args)
+            .current_dir(&project)
+            .assert()
+            .success();
+
+        assert_guidance_only_files_written(&sandbox);
+    }
+}
+
+/// The uninstall dry-run names each file and removes nothing.
+#[test]
+fn test_uninstall_dry_run_names_each_guidance_only_file_and_removes_nothing() {
+    let sandbox = Sandbox::bare();
+    create_guidance_only_roots(&sandbox);
+    sandbox.init().arg("--yes").assert().success();
+    let before = snapshot_tree(sandbox.home());
+
+    let assert = sandbox
+        .init()
+        .args(["--uninstall", "--dry-run", "--yes"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    for (name, _, file, _) in GUIDANCE_ONLY {
+        let line = format!(
+            "[dry-run] Would remove guidance from {}",
+            guidance_only_file(&sandbox, file).display()
+        );
+        assert!(stdout.contains(&line), "{name}: no {line:?} in: {stdout}");
+    }
+    assert_eq!(snapshot_tree(sandbox.home()), before);
+}
+
+/// Without `--yes` the uninstall lists the files and asks. A "no" removes
+/// nothing.
+#[test]
+fn test_uninstall_asks_before_it_removes_guidance_only_files() {
+    let sandbox = Sandbox::bare();
+    sandbox.config_dir(".roo");
+    sandbox.init().arg("--yes").assert().success();
+    let file = sandbox.home().join(".roo/rules/skim.md");
+
+    sandbox
+        .init()
+        .arg("--uninstall")
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Remove guidance from"))
+        .stdout(predicate::str::contains("Cancelled."));
+    assert!(file.exists(), "a refused uninstall must keep the file");
+
+    sandbox
+        .init()
+        .arg("--uninstall")
+        .write_stdin("y\n")
+        .assert()
+        .success();
+    assert!(!file.exists());
+}
+
+/// With no agent and no skim file, the uninstall message lists the agents.
+#[test]
+fn test_uninstall_with_nothing_to_remove_lists_the_guidance_only_agents() {
+    let sandbox = Sandbox::bare();
+
+    let assert = sandbox
+        .init()
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("Nothing to uninstall"), "{stdout}");
+    for (name, ..) in GUIDANCE_ONLY {
+        assert!(stdout.contains(name), "{name} is not in: {stdout}");
+    }
+}
+
+/// A folder that is read-only while the value lives. The mode is restored on
+/// drop, also when a test panics.
+struct ReadOnlyFolder(std::path::PathBuf);
+
+impl ReadOnlyFolder {
+    /// `None` when the user can still write to the folder (root): nothing fails
+    /// there, so a test that needs a failing write cannot run.
+    fn lock(path: &std::path::Path) -> Option<Self> {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        let locked = Self(path.to_path_buf());
+        let probe = path.join("probe");
+        if fs::write(&probe, "x").is_ok() {
+            fs::remove_file(&probe).unwrap();
+            return None;
+        }
+        Some(locked)
+    }
+}
+
+impl Drop for ReadOnlyFolder {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A sandbox with no agent, one agent and two agents detected: the three ways
+/// the auto-detect flow can end.
+fn sandboxes_with_zero_one_and_two_agents() -> Vec<Sandbox> {
+    let two = Sandbox::new();
+    two.config_dir(".gemini");
+    vec![Sandbox::bare(), Sandbox::new(), two]
+}
+
+/// A failed target is reported, the other targets are still written and the exit
+/// code is not 0, whatever the number of detected agents.
+#[test]
+fn test_a_guidance_only_write_that_fails_is_reported_and_the_others_still_run() {
+    for sandbox in sandboxes_with_zero_one_and_two_agents() {
+        let kiro_steering = sandbox.config_dir(".kiro/steering");
+        sandbox.config_dir(".roo");
+        let Some(_locked) = ReadOnlyFolder::lock(&kiro_steering) else {
+            return;
+        };
+
+        let assert = sandbox.init().arg("--yes").assert().failure();
+
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(stderr.contains("Kiro: guidance failed"), "{stderr}");
+        assert!(sandbox.home().join(".roo/rules/skim.md").is_file());
+        assert!(!kiro_steering.join("skim.md").exists());
+    }
+}
+
+/// A removal that fails is reported, the other files are still removed and the
+/// exit code is not 0, whatever the number of detected agents.
+#[test]
+fn test_a_guidance_only_removal_that_fails_is_reported_and_the_others_still_run() {
+    for sandbox in sandboxes_with_zero_one_and_two_agents() {
+        let kiro_steering = sandbox.config_dir(".kiro/steering");
+        sandbox.config_dir(".roo");
+        sandbox.init().arg("--yes").assert().success();
+        let Some(_locked) = ReadOnlyFolder::lock(&kiro_steering) else {
+            return;
+        };
+
+        let assert = sandbox
+            .init()
+            .args(["--uninstall", "--yes"])
+            .assert()
+            .failure();
+
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(stderr.contains("Kiro: guidance removal failed"), "{stderr}");
+        assert!(kiro_steering.join("skim.md").is_file());
+        assert!(!sandbox.home().join(".roo/rules/skim.md").exists());
+    }
 }

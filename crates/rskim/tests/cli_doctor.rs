@@ -1217,3 +1217,461 @@ fn test_doctor_says_when_the_old_search_folder_cannot_be_read() {
         "an advisory note must not change the exit code"
     );
 }
+
+// ============================================================================
+// Guidance files
+// ============================================================================
+
+/// A skim block of a version that no binary has.
+const STALE_BLOCK: &str = "<!-- skim-start v0.0.1 -->\nold text\n<!-- skim-end -->\n";
+
+/// A block of this version with text that this skim does not write.
+fn changed_block() -> String {
+    format!(
+        "<!-- skim-start v{} -->\nedited by hand\n<!-- skim-end -->\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// A start marker with no end marker.
+const BROKEN_BLOCK: &str = "<!-- skim-start v0.0.1 -->\nno end marker\n";
+
+/// Upper bound for one `skim doctor` run. A healthy run takes well under a second.
+const DOCTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn write_file(path: &std::path::Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// Run `skim doctor` in the sandbox `home` with `cwd` as the working folder.
+/// Returns stdout and the exit code. The run fails when it does not finish.
+fn doctor_in(home: &std::path::Path, cwd: &std::path::Path) -> (String, i32) {
+    let output = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(cwd)
+        .env("PATH", common::hermetic_path())
+        .timeout(DOCTOR_TIMEOUT)
+        .output()
+        .expect("doctor must finish within the timeout");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+/// The lines under the Guidance heading, up to the blank line that ends them.
+fn guidance_section(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .skip_while(|line| !line.starts_with("Guidance"))
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .collect()
+}
+
+/// The output of doctor without the Guidance section and the blank line after it.
+fn without_guidance_section(stdout: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in stdout.lines() {
+        if line.starts_with("Guidance") {
+            skipping = true;
+        } else if skipping {
+            skipping = !line.is_empty();
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The one section line that holds `needle`. The run fails when none or several do.
+fn line_with<'a>(section: &[&'a str], needle: &str) -> &'a str {
+    let hits: Vec<&&str> = section
+        .iter()
+        .filter(|line| line.contains(needle))
+        .collect();
+    assert_eq!(hits.len(), 1, "one line must hold {needle:?}: {section:#?}");
+    hits[0]
+}
+
+/// Doctor prints one Guidance line for each file that holds a skim block, in the
+/// global and the project scope. Each line has a state, and each remedy names the
+/// scope. A file that two agents read is one line.
+#[test]
+fn test_doctor_lists_each_guidance_file_with_its_state_and_a_remedy_that_names_the_scope() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("proj");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    // A current global file, written by skim itself.
+    common::skim_sandboxed(home)
+        .args(["init", "--agent", "claude-code", "--no-wrappers"])
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .assert()
+        .success();
+    write_file(&home.join(".gemini/GEMINI.md"), STALE_BLOCK);
+    write_file(&project.join("GEMINI.md"), &changed_block());
+    write_file(&project.join("AGENTS.md"), STALE_BLOCK);
+    write_file(&project.join(".cursor/rules/skim.mdc"), BROKEN_BLOCK);
+
+    let (stdout, code) = doctor_in(home, &project);
+
+    let section = guidance_section(&stdout);
+    let version = env!("CARGO_PKG_VERSION");
+    let claude = home.join(".claude/CLAUDE.md");
+    assert_eq!(
+        line_with(&section, "claude-code"),
+        format!(
+            "  ✓ claude-code  {}  current (v{version})",
+            claude.display()
+        )
+    );
+    let gemini = home.join(".gemini/GEMINI.md");
+    assert_eq!(
+        line_with(&section, &gemini.display().to_string()),
+        format!(
+            "  ⚠ gemini  {}  stale (v0.0.1, binary v{version}) — run `skim init --agent gemini`",
+            gemini.display()
+        )
+    );
+    assert_eq!(
+        line_with(&section, "changed"),
+        format!(
+            "  ⚠ gemini  GEMINI.md  changed (v{version} marker, text differs from what this \
+             skim writes) — run `skim init --project --agent gemini` in this folder to \
+             replace it; review the diff before a commit"
+        )
+    );
+    assert_eq!(
+        line_with(&section, "AGENTS.md"),
+        format!(
+            "  ⚠ codex, crush  AGENTS.md  stale (v0.0.1, binary v{version}) \
+             — run `skim init --project --agent codex` in this folder"
+        )
+    );
+    assert_eq!(
+        line_with(&section, "skim.mdc"),
+        "  ⚠ cursor  .cursor/rules/skim.mdc  broken marker (skim-start without skim-end) \
+         — fix the markers by hand, then run `skim init --project --agent cursor` in this folder"
+    );
+    assert_eq!(section.len(), 5, "{section:#?}");
+    assert_eq!(code, 0, "{stdout}");
+}
+
+/// The section sits between the Hooks and the Wrappers sections.
+#[test]
+fn test_doctor_prints_the_guidance_section_after_hooks_and_before_wrappers() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+
+    let (stdout, _) = doctor_in(home, home);
+
+    let hooks = stdout.find("\nHooks\n").expect("hooks section");
+    let guidance = stdout
+        .find("\nGuidance  (notes only; they never change the exit code)\n")
+        .expect("guidance section");
+    let wrappers = stdout.find("\nWrappers").expect("wrappers section");
+    assert!(hooks < guidance && guidance < wrappers, "{stdout}");
+}
+
+/// With no hook and no guidance file, the section still prints and says so.
+#[test]
+fn test_doctor_says_when_it_finds_no_guidance_and_no_hook_exists() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+
+    let (stdout, code) = doctor_in(home, home);
+
+    assert_eq!(
+        guidance_section(&stdout),
+        vec!["  –  no skim guidance found"]
+    );
+    assert_eq!(code, 0, "{stdout}");
+}
+
+/// Stale, changed and broken guidance and a file that cannot be checked give
+/// the exit code and the rest of the output that no guidance gives. The section
+/// is a note.
+#[test]
+fn test_doctor_guidance_notes_change_neither_the_exit_code_nor_any_other_section() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("proj");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    do_sandboxed_init(home);
+    let (baseline, baseline_code) = doctor_in(home, &project);
+    assert_eq!(baseline_code, 0, "{baseline}");
+
+    write_file(&home.join(".claude/CLAUDE.md"), STALE_BLOCK);
+    write_file(&home.join(".gemini/GEMINI.md"), &changed_block());
+    write_file(&project.join("GEMINI.md"), BROKEN_BLOCK);
+    write_file(&project.join("AGENTS.md"), &"x".repeat(1_048_577));
+    let (with_notes, code) = doctor_in(home, &project);
+
+    assert!(
+        guidance_section(&with_notes).len() >= 4,
+        "the notes must print:\n{with_notes}"
+    );
+    assert_eq!(code, baseline_code, "{with_notes}");
+    assert!(
+        with_notes.contains("Status: HEALTHY — exit 0"),
+        "{with_notes}"
+    );
+    assert_eq!(
+        without_guidance_section(&with_notes),
+        without_guidance_section(&baseline),
+        "no other section may change"
+    );
+}
+
+/// A Codex file has no hook to install, and doctor still lists it.
+#[test]
+fn test_doctor_lists_the_guidance_file_of_an_agent_that_has_no_hook() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    write_file(&home.join(".codex/AGENTS.md"), STALE_BLOCK);
+
+    let (stdout, code) = doctor_in(home, home);
+
+    let section = guidance_section(&stdout);
+    assert_eq!(
+        line_with(&section, "codex"),
+        format!(
+            "  ⚠ codex  {}  stale (v0.0.1, binary v{}) — run `skim init --agent codex`",
+            home.join(".codex/AGENTS.md").display(),
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(code, 0, "{stdout}");
+}
+
+/// Each guidance-only agent file that skim wrote is listed. A stale one gets the
+/// plain `skim init` remedy, because a target has no `--agent` value.
+#[test]
+fn test_doctor_lists_each_guidance_only_target_file() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    for root in [".kiro", ".roo", ".cline", ".augment", ".devin"] {
+        std::fs::create_dir_all(home.join(root)).unwrap();
+    }
+    common::skim_sandboxed(home)
+        .args(["init", "--no-wrappers"])
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .assert()
+        .success();
+    write_file(&home.join(".roo/rules/skim.md"), STALE_BLOCK);
+
+    let (stdout, code) = doctor_in(home, home);
+
+    let section = guidance_section(&stdout);
+    let version = env!("CARGO_PKG_VERSION");
+    for (name, file) in [
+        ("Kiro", ".kiro/steering/skim.md"),
+        ("Cline", ".cline/rules/skim.md"),
+        ("Augment", ".augment/rules/skim.md"),
+        ("Windsurf", ".devin/rules/skim.md"),
+    ] {
+        assert_eq!(
+            line_with(&section, &format!("{name}  ")),
+            format!(
+                "  ✓ {name}  {}  current (v{version})",
+                home.join(file).display()
+            )
+        );
+    }
+    assert_eq!(
+        line_with(&section, "Roo Code"),
+        format!(
+            "  ⚠ Roo Code  {}  stale (v0.0.1, binary v{version}) — run `skim init`",
+            home.join(".roo/rules/skim.md").display()
+        )
+    );
+    assert_eq!(section.len(), 5, "{section:#?}");
+    assert_eq!(code, 0, "{stdout}");
+}
+
+/// A marker that is not a version prints as "unrecognized", filtered, and never
+/// as a version. A control byte in it does not reach the terminal.
+#[test]
+fn test_doctor_prints_a_marker_that_is_not_a_version_as_unrecognized_and_filtered() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    write_file(
+        &home.join(".gemini/GEMINI.md"),
+        "<!-- skim-start v3.0.1\u{1b}[2J -->\nold\n<!-- skim-end -->\n",
+    );
+    write_file(
+        &home.join(".claude/CLAUDE.md"),
+        &format!(
+            "<!-- skim-start v{} -->\nold\n<!-- skim-end -->\n",
+            "9".repeat(200)
+        ),
+    );
+
+    let (stdout, code) = doctor_in(home, home);
+
+    let section = guidance_section(&stdout);
+    let gemini = line_with(&section, "gemini");
+    assert!(
+        gemini.contains("unrecognized marker \"v3.0.1?[2J -->\" — run `skim init --agent gemini`"),
+        "{gemini}"
+    );
+    let claude = line_with(&section, "claude-code");
+    assert!(
+        claude.contains(&format!("unrecognized marker \"v{}\"", "9".repeat(63))),
+        "a marker of 200 characters must be cut to 64: {claude}"
+    );
+    assert!(
+        !section.iter().any(|line| line.contains("stale (")),
+        "{section:#?}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "no escape byte may reach stdout"
+    );
+    assert_eq!(code, 0, "{stdout}");
+}
+
+/// A FIFO at a project instruction path is skipped with no hang. Doctor says it
+/// did not check the file, and the FIFO stays a FIFO.
+#[cfg(unix)]
+#[test]
+fn test_doctor_skips_a_fifo_instruction_file_without_hanging() {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let fifo = project.join("CLAUDE.md");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: the path is NUL-terminated and the mode is valid for mkfifo.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+    let (stdout, code) = doctor_in(home, &project);
+
+    assert_eq!(
+        guidance_section(&stdout),
+        vec!["  ⚠ claude-code  CLAUDE.md  not checked (not a regular file)"]
+    );
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
+/// A project link that leaves the project is not followed. Doctor says it did
+/// not check the file, and the file outside the project is not changed.
+#[cfg(unix)]
+#[test]
+fn test_doctor_does_not_follow_a_project_link_that_leaves_the_project() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let outside = home.join("outside.md");
+    std::fs::write(&outside, STALE_BLOCK).unwrap();
+    std::os::unix::fs::symlink(&outside, project.join("CLAUDE.md")).unwrap();
+
+    let (stdout, code) = doctor_in(home, &project);
+
+    assert_eq!(
+        guidance_section(&stdout),
+        vec!["  ⚠ claude-code  CLAUDE.md  not checked (it leads outside this folder)"]
+    );
+    assert_eq!(code, 0, "{stdout}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), STALE_BLOCK);
+}
+
+/// A relative config-folder variable gives a "not checked" line that names the
+/// variable. Doctor does not read a file in the working folder instead.
+#[test]
+fn test_doctor_names_a_relative_config_folder_variable_it_did_not_check() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    write_file(&home.join("relative-claude/CLAUDE.md"), STALE_BLOCK);
+
+    let output = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("CLAUDE_CONFIG_DIR", "relative-claude")
+        .env("PATH", common::hermetic_path())
+        .timeout(DOCTOR_TIMEOUT)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    assert_eq!(
+        guidance_section(&stdout),
+        vec![
+            "  ⚠ claude-code  relative-claude/CLAUDE.md  \
+             not checked (CLAUDE_CONFIG_DIR is not an absolute path)"
+        ]
+    );
+}
+
+/// Doctor writes nothing. With stale, changed, broken and unchecked guidance in
+/// place, every file and folder under the home and the project keeps its bytes,
+/// and no file appears.
+#[test]
+fn test_doctor_leaves_every_instruction_file_and_folder_unchanged() {
+    fn snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(folder) = pending.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path
+                    .strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                if meta.is_dir() {
+                    out.insert(name, None);
+                    pending.push(path);
+                } else if meta.is_file() {
+                    out.insert(name, Some(std::fs::read(&path).unwrap()));
+                } else {
+                    out.insert(name, None);
+                }
+            }
+        }
+        out
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let project = home.join("proj");
+    std::fs::create_dir_all(home.join(".kiro")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    write_file(&home.join(".claude/CLAUDE.md"), STALE_BLOCK);
+    write_file(&home.join(".gemini/GEMINI.md"), &changed_block());
+    write_file(&home.join(".kiro/steering/skim.md"), STALE_BLOCK);
+    write_file(&project.join("GEMINI.md"), BROKEN_BLOCK);
+    write_file(&project.join("AGENTS.md"), STALE_BLOCK);
+    write_file(&project.join(".cursor/rules/skim.mdc"), STALE_BLOCK);
+    let before = snapshot(home);
+
+    let (stdout, _) = doctor_in(home, &project);
+
+    assert!(guidance_section(&stdout).len() >= 6, "{stdout}");
+    // The analytics and cache folders live under the home; doctor may read them.
+    let after = snapshot(home);
+    let changed: Vec<&String> = after
+        .keys()
+        .chain(before.keys())
+        .filter(|name| before.get(*name) != after.get(*name))
+        .collect();
+    assert!(changed.is_empty(), "doctor changed: {changed:?}");
+}

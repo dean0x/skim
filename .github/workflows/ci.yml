@@ -308,11 +308,12 @@ jobs:
           set -euo pipefail
           # Keep in sync with crates/rskim-bench/scoreboard/README.md ("CI").
           # Beyond cmd/search/: the rskim files it imports from (cmd/mod.rs,
-          # cmd/execution.rs, debug.rs, output/mod.rs, analytics/mod.rs and
-          # the analytics/schema.rs and tokens.rs that module compiles in),
+          # cmd/safe_fs.rs, cmd/execution.rs, debug.rs, output/mod.rs,
+          # analytics/mod.rs and the analytics/schema.rs and tokens.rs that module
+          # compiles in),
           # the dispatch (cmd/dispatch.rs and main.rs), the rskim manifest, and
           # the pinned Rust version (.github/actions/setup-rust/).
-          SEARCH_PATHS='^(crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/cmd/execution\.rs$|crates/rskim/src/cmd/dispatch\.rs$|crates/rskim/src/output/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-oracle/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$|\.github/actions/setup-rust/)'
+          SEARCH_PATHS='^(crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/cmd/safe_fs\.rs$|crates/rskim/src/cmd/execution\.rs$|crates/rskim/src/cmd/dispatch\.rs$|crates/rskim/src/output/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-oracle/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$|\.github/actions/setup-rust/)'
           case "$EVENT_NAME" in
             workflow_dispatch)
               search=true; reason="manual dispatch" ;;
