@@ -131,6 +131,17 @@ pub(super) enum PathRefusal {
     Unchecked { path: PathBuf, error: io::Error },
 }
 
+impl PathRefusal {
+    /// The file the refusal names, as the caller wrote it.
+    pub(super) fn path(&self) -> &Path {
+        match self {
+            Self::LeavesProject { path }
+            | Self::NotRegular { path }
+            | Self::Unchecked { path, .. } => path,
+        }
+    }
+}
+
 impl std::fmt::Display for PathRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

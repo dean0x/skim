@@ -1452,6 +1452,20 @@ fn test_hook_version_mismatch_warning() {
         log_content.contains("version mismatch"),
         "hook.log should contain version mismatch warning, got: {log_content}"
     );
+    // The remedy is the installed command, not a path in a build folder. The
+    // unset SKIM_HOOK_BINARY also makes the unpinned line.
+    assert!(
+        log_content.contains("(run `skim init` to update)"),
+        "the version line should name `skim init`, got: {log_content}"
+    );
+    assert!(
+        log_content.contains("run `skim init` to upgrade the hook script"),
+        "the unpinned line should name `skim init`, got: {log_content}"
+    );
+    assert!(
+        !log_content.contains("target/release") && !log_content.contains("--yes"),
+        "hook.log should not name a build path or --yes, got: {log_content}"
+    );
 }
 
 /// F6: When `SKIM_HOOK_BINARY` is set to a path that differs from the running
@@ -1516,6 +1530,14 @@ fn test_hook_binary_mismatch_warning() {
     assert!(
         log_content.contains("binary path mismatch") || log_content.contains("binary"),
         "hook.log should contain binary mismatch warning, got: {log_content}"
+    );
+    assert!(
+        log_content.contains("(run `skim init` to update)"),
+        "the binary line should name `skim init`, got: {log_content}"
+    );
+    assert!(
+        !log_content.contains("target/release") && !log_content.contains("--yes"),
+        "hook.log should not name a build path or --yes, got: {log_content}"
     );
 }
 

@@ -205,10 +205,8 @@ pub(super) fn kept_shared_note(shown: &Path, shared_with: &[AgentKind]) -> Strin
 /// skipped: too large, not a regular file, not UTF-8, or unreadable. A skip is
 /// a soft warning, not a hard error, and the file is left as it is.
 pub(super) fn read_existing_safely(path: &Path) -> anyhow::Result<Option<String>> {
-    let read = safe_fs::read_regular_bounded(path, MAX_INSTRUCTION_FILE_SIZE)
-        .and_then(safe_fs::BoundedFile::into_text);
-    match read {
-        Ok((text, _permissions)) => Ok(Some(text)),
+    match read_instruction_text(path) {
+        Ok(text) => Ok(Some(text)),
         Err(ReadFailure::Missing) => Ok(None),
         Err(failure) => {
             eprintln!(
@@ -219,6 +217,19 @@ pub(super) fn read_existing_safely(path: &Path) -> anyhow::Result<Option<String>
             Ok(None)
         }
     }
+}
+
+/// Read the instruction file at `path` as strict UTF-8, within
+/// [`MAX_INSTRUCTION_FILE_SIZE`], and say nothing.
+///
+/// This is the one read of an instruction file. The open follows no link at the
+/// file name and does not block on a FIFO, and the opened handle must be a
+/// regular file. The caller decides what a failure means: the installer warns
+/// and skips, `skim doctor` reports the file as not checked.
+pub(super) fn read_instruction_text(path: &Path) -> Result<String, ReadFailure> {
+    safe_fs::read_regular_bounded(path, MAX_INSTRUCTION_FILE_SIZE)
+        .and_then(safe_fs::BoundedFile::into_text)
+        .map(|(text, _permissions)| text)
 }
 
 /// The clause that says why a file is skipped.
@@ -515,9 +526,7 @@ pub(super) fn remove_from(
 /// It reads the file and prints nothing: a file that cannot be read, or that
 /// holds a broken block, is not one a removal changes.
 pub(super) fn holds_block(target: &GuidanceTarget) -> bool {
-    safe_fs::read_regular_bounded(&target.path, MAX_INSTRUCTION_FILE_SIZE)
-        .and_then(safe_fs::BoundedFile::into_text)
-        .is_ok_and(|(text, _permissions)| find_skim_section(&text).is_some())
+    read_instruction_text(&target.path).is_ok_and(|text| find_skim_section(&text).is_some())
 }
 
 /// `true` when the block in the file of `target` is what this binary writes for

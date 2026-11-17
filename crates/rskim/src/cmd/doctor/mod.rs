@@ -1,7 +1,7 @@
 //! `skim doctor` — installation health check and provenance report.
 //!
-//! Scans $PATH for all skim installations, checks hook state, wrapper dir,
-//! cache/analytics paths, and staleness vs. repository HEAD.
+//! Scans $PATH for all skim installations, checks hook state, guidance files,
+//! wrapper dir, cache/analytics paths, and staleness vs. repository HEAD.
 //!
 //! Exit codes:
 //!   0 = healthy (no drift detected)
@@ -79,6 +79,10 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     for note in old_search_hooks_notes(crate::cmd::init::old_search_hooks_finding().as_ref()) {
         println!("{note}");
     }
+    println!();
+
+    // 3b. Guidance files. Notes only: they never set the drift verdict.
+    print_guidance_section();
     println!();
 
     // 4. Wrappers
@@ -489,7 +493,7 @@ fn hook_status_line(
             true,
             append_advisory(format!(
                 "  ✗ {agent_cli_name}  installed (v{hook_version}){dev_note}  unpinned — \
-                 run `./target/release/skim init --yes` to pin"
+                 run `skim init` to pin"
             )),
         );
     }
@@ -514,7 +518,7 @@ fn hook_status_line(
             true,
             append_advisory(format!(
                 "  ✗ {agent_cli_name}  installed{dev_note}  pin: {pin}  [{reason}]  — \
-                 run `./target/release/skim init --yes` to update"
+                 run `skim init` to update"
             )),
         );
     }
@@ -531,7 +535,7 @@ fn hook_status_line(
             append_advisory(format!(
                 "  ⚠ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str}){dev_note}  pin: {pin}  \
                  [binary pin mismatch (hook: {pin}, running: {running})] — \
-                 run `./target/release/skim init --yes` to update"
+                 run `skim init` to update"
             )),
         );
     }
@@ -734,6 +738,137 @@ fn foreign_post_hook_notes(facts: &crate::cmd::init::HookFacts) -> Vec<String> {
         )
     }));
     notes
+}
+
+// ============================================================================
+// Guidance
+// ============================================================================
+
+/// Print the Guidance section: one line for each file that holds a skim block,
+/// with its state and the command that refreshes it.
+///
+/// Notes only. The section reads files and writes none, and it sets neither the
+/// drift verdict nor the exit code. It prints for every agent, with or without a
+/// hook (Codex and the guidance-only agents have none).
+fn print_guidance_section() {
+    println!("Guidance  (notes only; they never change the exit code)");
+    let env = crate::cmd::session::InstructionEnv::from_process();
+    let root = std::env::current_dir().ok();
+    let facts = crate::cmd::init::guidance_report(&env, root.as_deref());
+    for line in guidance_lines(&facts, env!("CARGO_PKG_VERSION"), root.is_some()) {
+        println!("{line}");
+    }
+}
+
+/// The lines of the Guidance section, one for each guidance file in `facts`.
+///
+/// `version` is the version of this binary. `project_checked` is `false` when the
+/// project folder could not be read, so the project files were not looked at.
+///
+/// A marker and a path come from files, so both go through
+/// [`crate::cmd::sanitize_for_display`] before they reach the terminal. A version
+/// prints as a version only when the report found `digits.digits.digits` with an
+/// optional ASCII tag; any other marker prints as "unrecognized".
+fn guidance_lines(
+    facts: &[crate::cmd::init::GuidanceFact],
+    version: &str,
+    project_checked: bool,
+) -> Vec<String> {
+    let mut lines: Vec<String> = facts
+        .iter()
+        .map(|fact| guidance_line(fact, version))
+        .collect();
+    if !project_checked {
+        lines.push(
+            "  ⚠  project files  not checked (could not read the current folder)".to_string(),
+        );
+    }
+    if lines.is_empty() {
+        lines.push("  –  no skim guidance found".to_string());
+    }
+    lines
+}
+
+/// The line for one guidance file.
+fn guidance_line(fact: &crate::cmd::init::GuidanceFact, version: &str) -> String {
+    use crate::cmd::init::{GuidanceState, Marker};
+
+    let readers = fact
+        .readers
+        .iter()
+        .map(|reader| reader.name())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let path = guidance_path_text(&fact.shown);
+    let remedy = guidance_remedy(fact);
+    let (glyph, detail) = match &fact.state {
+        GuidanceState::Current => ("✓", format!("current (v{version})")),
+        GuidanceState::Stale {
+            marker: Marker::Semver(found),
+        } => (
+            "⚠",
+            format!(
+                "stale (v{}, binary v{version}) — {remedy}",
+                crate::cmd::sanitize_for_display(found)
+            ),
+        ),
+        GuidanceState::Stale {
+            marker: Marker::Unrecognized(text),
+        } => (
+            "⚠",
+            format!(
+                "unrecognized marker \"{}\" — {remedy}",
+                crate::cmd::sanitize_for_display(text)
+            ),
+        ),
+        GuidanceState::Changed => (
+            "⚠",
+            format!(
+                "changed (v{version} marker, text differs from what this skim writes) \
+                 — {remedy} to replace it; review the diff before a commit"
+            ),
+        ),
+        GuidanceState::Broken => (
+            "⚠",
+            format!(
+                "broken marker (skim-start without skim-end) — fix the markers by hand, then {remedy}"
+            ),
+        ),
+        GuidanceState::NotChecked(why) => ("⚠", format!("not checked ({why})")),
+    };
+    format!("  {glyph} {readers}  {path}  {detail}")
+}
+
+/// The command that refreshes the file of `fact`, as a clause.
+///
+/// It names the scope and, for an agent, `--agent`, so the command does not write
+/// the hooks of every agent. A file read by several agents names the first. A
+/// guidance-only agent has no `--agent` value, so its remedy is plain `skim init`.
+fn guidance_remedy(fact: &crate::cmd::init::GuidanceFact) -> String {
+    use crate::cmd::init::{FileScope, Reader};
+
+    let agent = fact.readers.iter().find_map(|reader| match reader {
+        Reader::Agent(agent) => Some(agent.cli_name()),
+        Reader::Target(_) => None,
+    });
+    match (agent, fact.scope) {
+        (None, _) => "run `skim init`".to_string(),
+        (Some(agent), FileScope::Global) => format!("run `skim init --agent {agent}`"),
+        (Some(agent), FileScope::Project) => {
+            format!("run `skim init --project --agent {agent}` in this folder")
+        }
+    }
+}
+
+/// A path from the file system, safe to print. Each part goes through
+/// [`crate::cmd::sanitize_for_display`]. The cut is per part, not for the whole
+/// path, so a long path keeps its file name.
+fn guidance_path_text(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .split('/')
+        .map(crate::cmd::sanitize_for_display)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // ============================================================================
@@ -1220,6 +1355,9 @@ fn print_help() {
     println!("      Shows: path, version, commit, pinned binary, current/stale status");
     println!("      A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)`,");
     println!("      never as `✓` — `skim doctor | grep dev-pinned` is the CI guard");
+    println!("  Guidance files that hold a skim block (global, project and guidance-only agents)");
+    println!("      Shows: current, stale, changed or broken, and the command that refreshes it");
+    println!("      Notes only: guidance never sets drift or the exit code");
     println!("  Wrapper directory (~/.skim/bin) status and symlink count");
     println!("  Cache directory and analytics DB paths");
     println!("  Old search git hooks and old search index data, as advisory notes (never drift)");
@@ -2367,6 +2505,291 @@ mod tests {
         assert!(
             line.contains("binary pin mismatch"),
             "must report binary pin mismatch advisory, not commit mismatch: {line}"
+        );
+    }
+
+    /// The remedy in a drift or pin line is the installed command. It names no
+    /// path inside a build folder and no `--yes` flag.
+    #[test]
+    fn test_hook_status_line_remedies_name_skim_init_for_unpinned_stale_and_pin_mismatch() {
+        let verified = crate::cmd::integrity::ScriptIntegrity::Verified;
+        let mut unpinned = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        unpinned.hook_uses_pinned_binary = false;
+        let mut stale = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        stale.hook_is_current = false;
+        let mut moved = make_installed_facts(verified);
+        moved.pin_is_current = false;
+
+        for (facts, remedy) in [
+            (unpinned, "run `skim init` to pin"),
+            (stale, "run `skim init` to update"),
+            (moved, "run `skim init` to update"),
+        ] {
+            let (_, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+            assert!(line.ends_with(remedy), "{line}");
+            assert!(!line.contains("target/release"), "{line}");
+            assert!(!line.contains("--yes"), "{line}");
+        }
+    }
+
+    // ========================================================================
+    // Guidance section
+    // ========================================================================
+
+    use crate::cmd::init::{FileScope, GuidanceFact, GuidanceState, Marker, NotChecked, Reader};
+
+    fn fact(
+        readers: Vec<Reader>,
+        scope: FileScope,
+        shown: &str,
+        state: GuidanceState,
+    ) -> GuidanceFact {
+        GuidanceFact {
+            readers,
+            scope,
+            shown: PathBuf::from(shown),
+            state,
+        }
+    }
+
+    fn claude() -> Reader {
+        Reader::Agent(AgentKind::ClaudeCode)
+    }
+
+    fn stale(version: &str) -> GuidanceState {
+        GuidanceState::Stale {
+            marker: Marker::Semver(version.to_string()),
+        }
+    }
+
+    /// The one line a single fact gives.
+    fn line_of(fact: GuidanceFact) -> String {
+        let mut lines = guidance_lines(&[fact], "3.0.1", true);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.remove(0)
+    }
+
+    #[test]
+    fn test_guidance_lines_say_when_no_guidance_was_found() {
+        assert_eq!(
+            guidance_lines(&[], "3.0.1", true),
+            vec!["  –  no skim guidance found".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_show_a_current_global_file_with_a_check_mark() {
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Global,
+            "/home/u/.claude/CLAUDE.md",
+            GuidanceState::Current,
+        ));
+
+        assert_eq!(
+            line,
+            "  ✓ claude-code  /home/u/.claude/CLAUDE.md  current (v3.0.1)"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_name_the_scope_of_the_remedy_for_a_stale_global_file() {
+        let line = line_of(fact(
+            vec![Reader::Agent(AgentKind::GeminiCli)],
+            FileScope::Global,
+            "/home/u/.gemini/GEMINI.md",
+            stale("3.0.0"),
+        ));
+
+        assert_eq!(
+            line,
+            "  ⚠ gemini  /home/u/.gemini/GEMINI.md  stale (v3.0.0, binary v3.0.1) \
+             — run `skim init --agent gemini`"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_name_the_scope_and_the_first_agent_for_a_shared_project_file() {
+        let line = line_of(fact(
+            vec![
+                Reader::Agent(AgentKind::CodexCli),
+                Reader::Agent(AgentKind::Crush),
+            ],
+            FileScope::Project,
+            "AGENTS.md",
+            stale("3.0.0"),
+        ));
+
+        assert_eq!(
+            line,
+            "  ⚠ codex, crush  AGENTS.md  stale (v3.0.0, binary v3.0.1) \
+             — run `skim init --project --agent codex` in this folder"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_ask_for_a_review_when_the_text_changed() {
+        let line = line_of(fact(
+            vec![Reader::Agent(AgentKind::GeminiCli)],
+            FileScope::Global,
+            "/home/u/.gemini/GEMINI.md",
+            GuidanceState::Changed,
+        ));
+
+        assert_eq!(
+            line,
+            "  ⚠ gemini  /home/u/.gemini/GEMINI.md  changed (v3.0.1 marker, text differs \
+             from what this skim writes) — run `skim init --agent gemini` to replace it; \
+             review the diff before a commit"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_tell_the_user_to_fix_a_broken_marker_by_hand_first() {
+        let line = line_of(fact(
+            vec![Reader::Agent(AgentKind::Cursor)],
+            FileScope::Project,
+            ".cursor/rules/skim.mdc",
+            GuidanceState::Broken,
+        ));
+
+        assert_eq!(
+            line,
+            "  ⚠ cursor  .cursor/rules/skim.mdc  broken marker (skim-start without skim-end) \
+             — fix the markers by hand, then run `skim init --project --agent cursor` in this folder"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_give_a_target_the_plain_init_remedy() {
+        let line = line_of(fact(
+            vec![Reader::Target("Kiro")],
+            FileScope::Global,
+            "/home/u/.kiro/steering/skim.md",
+            stale("3.0.0"),
+        ));
+
+        assert_eq!(
+            line,
+            "  ⚠ Kiro  /home/u/.kiro/steering/skim.md  stale (v3.0.0, binary v3.0.1) \
+             — run `skim init`"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_give_a_file_that_was_not_checked_a_reason_and_no_remedy() {
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Project,
+            "CLAUDE.md",
+            GuidanceState::NotChecked(NotChecked::LeavesProject),
+        ));
+
+        assert_eq!(
+            line,
+            "  ⚠ claude-code  CLAUDE.md  not checked (it leads outside this folder)"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_name_the_variable_of_a_relative_config_folder() {
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Global,
+            "rel/CLAUDE.md",
+            GuidanceState::NotChecked(NotChecked::RelativeVariable("CLAUDE_CONFIG_DIR")),
+        ));
+
+        assert!(
+            line.ends_with("not checked (CLAUDE_CONFIG_DIR is not an absolute path)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_print_a_version_with_a_tag_as_it_is() {
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Global,
+            "/h/CLAUDE.md",
+            stale("3.0.0-rc.1"),
+        ));
+
+        assert!(
+            line.contains("stale (v3.0.0-rc.1, binary v3.0.1)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_filter_a_marker_that_is_not_a_version() {
+        let marker = Marker::Unrecognized("v1.x\u{1b}[2J\u{7}\u{202e}é".to_string());
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Global,
+            "/h/CLAUDE.md",
+            GuidanceState::Stale { marker },
+        ));
+
+        assert!(
+            line.contains(
+                "unrecognized marker \"v1.x?[2J???\" — run `skim init --agent claude-code`"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("stale ("), "{line}");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+
+    #[test]
+    fn test_guidance_lines_cut_a_long_marker_to_64_characters() {
+        let marker = Marker::Unrecognized("m".repeat(200));
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Global,
+            "/h/CLAUDE.md",
+            GuidanceState::Stale { marker },
+        ));
+
+        assert!(
+            line.contains(&format!("unrecognized marker \"{}\"", "m".repeat(64))),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn test_guidance_lines_filter_control_bytes_in_a_path() {
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Project,
+            "AGENTS\u{1b}[31m.md",
+            GuidanceState::Current,
+        ));
+
+        assert!(line.contains("AGENTS?[31m.md"), "{line}");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+
+    #[test]
+    fn test_guidance_lines_keep_the_file_name_of_a_long_path() {
+        let long = format!("/{}.claude/CLAUDE.md", "folder/".repeat(20));
+        let line = line_of(fact(
+            vec![claude()],
+            FileScope::Global,
+            &long,
+            GuidanceState::Current,
+        ));
+
+        assert!(line.contains(&long), "{line}");
+    }
+
+    #[test]
+    fn test_guidance_lines_say_when_the_project_files_were_not_checked() {
+        let lines = guidance_lines(&[], "3.0.1", false);
+
+        assert_eq!(
+            lines,
+            vec!["  ⚠  project files  not checked (could not read the current folder)".to_string()]
         );
     }
 }

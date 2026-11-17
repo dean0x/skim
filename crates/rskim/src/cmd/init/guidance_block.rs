@@ -100,7 +100,7 @@ pub(super) fn find_skim_section(content: &str) -> Option<(usize, usize)> {
 
 /// The version in a start marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Marker {
+pub(crate) enum Marker {
     /// `digits.digits.digits`, with an optional ASCII tag.
     Semver(String),
     /// Anything else: the marker text, cut to a fixed length.
