@@ -205,8 +205,9 @@ pub(crate) fn read_regular_bounded(path: &Path, max: u64) -> Result<BoundedFile,
 /// The rename replaces whatever is at `path`; a link at `path` is replaced, not
 /// followed.
 ///
-/// The file gets `permissions` when given. With `None` it keeps the tempfile
-/// default, mode 0600 on unix, so a new file is private to its owner.
+/// The file gets `permissions` when given, through the open handle rather than
+/// the temporary name. With `None` it keeps the tempfile default, mode 0600 on
+/// unix, so a new file is private to its owner.
 ///
 /// The data reaches the disk before the rename, so a power loss cannot leave
 /// the old content of the target as an empty file.
@@ -227,7 +228,7 @@ pub(crate) fn write_atomic(
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(content.as_bytes())?;
     if let Some(permissions) = permissions {
-        std::fs::set_permissions(tmp.path(), permissions)?;
+        tmp.as_file().set_permissions(permissions)?;
     }
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
@@ -495,6 +496,56 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    #[test]
+    fn write_atomic_changes_permissions_only_through_a_handle() {
+        use tree_sitter::{Query, QueryCursor, StreamingIterator as _};
+
+        // Check call nodes, not comments or strings. A path-based mode change
+        // must fail this test without a race or a test-only production hook.
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::Rust).unwrap();
+        let tree = parser.parse("").unwrap();
+        let query = Query::new(
+            &tree.language(),
+            r#"(call_expression
+                function: [
+                    (identifier) @name
+                    (scoped_identifier name: (identifier) @name)
+                ]
+                (#eq? @name "set_permissions"))"#,
+        )
+        .unwrap();
+        let mut has_path_based_mode_change = |source: &str| {
+            let tree = parser.parse(source).unwrap();
+            assert!(!tree.root_node().has_error(), "source must parse");
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+            matches.next().is_some()
+        };
+        for call in [
+            "std::fs::set_permissions(tmp.path(), permissions)",
+            "fs::set_permissions(tmp.path(), permissions)",
+            "set_permissions(tmp.path(), permissions)",
+        ] {
+            assert!(has_path_based_mode_change(&format!("fn f() {{ {call}; }}")));
+        }
+        assert!(!has_path_based_mode_change(
+            r#"fn f() {
+                // std::fs::set_permissions(tmp.path(), permissions);
+                let _ = "fs::set_permissions(tmp.path(), permissions)";
+                tmp.as_file().set_permissions(permissions);
+            }"#
+        ));
+
+        let (production, _) = include_str!("safe_fs.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("the test module must follow the production code");
+        assert!(production.contains("pub(crate) fn write_atomic("));
+        assert!(
+            !has_path_based_mode_change(production),
+            "apply permissions through the open handle, not a path"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_atomic_gives_the_file_the_permissions_it_is_given() {
@@ -513,14 +564,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_atomic_replaces_a_link_at_the_target_and_leaves_its_destination_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let dir = TempDir::new().unwrap();
         let outside = dir.path().join("outside.txt");
         fs::write(&outside, "outside\n").unwrap();
+        let permissions = fs::metadata(&outside).unwrap().permissions();
         let link = dir.path().join("CLAUDE.md");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
-        write_atomic(&link, "new\n", None).unwrap();
+        write_atomic(&link, "new\n", Some(Permissions::from_mode(0o755))).unwrap();
 
+        assert_eq!(
+            fs::metadata(&link).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::metadata(&outside).unwrap().permissions(), permissions);
         assert_eq!(fs::read_to_string(&outside).unwrap(), "outside\n");
         assert!(
             !fs::symlink_metadata(&link)
