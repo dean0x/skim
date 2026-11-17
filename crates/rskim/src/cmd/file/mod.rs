@@ -248,6 +248,9 @@ pub(crate) const MAX_DISPLAY_ENTRIES: usize = 100;
 /// Exceeding this bound never truncates: parsers return `None` so the caller
 /// degrades to lossless `Passthrough` (raw output is already bounded at the
 /// runner's 64 MiB cap). (#317)
+///
+/// The env handler does not use this bound: it parses every line, whatever
+/// the size of the listing.
 pub(crate) const MAX_INPUT_LINES: usize = 100_000;
 
 /// Entry point for `skim <tool> [args...]` (file handler).

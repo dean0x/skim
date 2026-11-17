@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **env view: mask every value.** `skim env` and `skim printenv` now apply the
+  value mask to every output form: a listing of any size, a value over several
+  lines, NUL-separated output, and the bare values of `printenv NAME`.
+
 ## [3.0.0] - 2026-11-13
 
 ### BREAKING

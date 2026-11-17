@@ -26,7 +26,6 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::MAX_INPUT_LINES;
 use crate::analytics::CommandType;
 use crate::cmd::{ToolRunConfig, run_tool};
 
@@ -102,11 +101,42 @@ const SENSITIVE_SUFFIXES: &[&str] = &[
 
 /// Run `skim env [args...]` or `skim printenv [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    let requested = requested_names(args);
+    run_tool(
+        CONFIG,
+        args,
+        ctx,
+        |_| {},
+        move |output| parse_impl(output, &requested),
+    )
+}
+
+/// The variable names that the caller asked `printenv` for (every argument
+/// that is not a flag).  With names, `printenv` prints bare values, one after
+/// the other, with no `KEY=` prefix, so the listing parse cannot see which
+/// line belongs to which name.
+fn requested_names(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .cloned()
+        .collect()
 }
 
 /// Three-tier parse function for env/printenv output.
-fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
+///
+/// Every path that can carry a value goes through a mask step: no input
+/// shape (a listing of any size, a value over several lines, NUL-separated
+/// records, or bare values for named variables) reaches stdout unmasked.
+/// Only an empty output, or a listing with no `KEY=` record and no requested
+/// name, passes through.
+fn parse_impl(output: &CommandOutput, requested: &[String]) -> ParseResult<FileResult> {
+    if !requested.is_empty() {
+        return match mask_named_values(&output.stdout, requested) {
+            Some(result) => ParseResult::Full(result),
+            None => ParseResult::Passthrough(output.stdout.clone()),
+        };
+    }
+
     if let Some(result) = try_parse_env(&output.stdout) {
         return ParseResult::Full(result);
     }
@@ -118,68 +148,171 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
 // Tier 1: env output parsing with redaction
 // ============================================================================
 
+/// Mask the bare values that `printenv NAME...` prints.
+///
+/// The output has no keys, and a value can span several lines, so a line
+/// cannot be mapped to its name.  When any requested name is sensitive,
+/// every line is masked (fail closed).  Otherwise each line only gets the
+/// URL-credential redaction that the listing applies to values.
+fn mask_named_values(stdout: &str, requested: &[String]) -> Option<FileResult> {
+    if stdout.trim().is_empty() {
+        return None;
+    }
+
+    let mask_all = requested.iter().any(|name| is_sensitive_key(name));
+    let entries: Vec<String> = stdout
+        .split(['\n', '\0'])
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            if mask_all {
+                "***".to_string()
+            } else {
+                redact_value(line)
+            }
+        })
+        .collect();
+
+    let count = entries.len();
+    Some(FileResult::new(
+        "env".to_string(),
+        count,
+        count,
+        entries,
+        None,
+    ))
+}
+
+/// Parse a `KEY=value` listing and mask the sensitive values.
+///
+/// Records are NUL-separated when the output holds a NUL byte (`printenv -0`),
+/// and newline-separated otherwise.  In the NUL form each record is one
+/// variable, so a value with newlines is exact.  In the newline form a line
+/// that does not start with a valid variable name and `=` is a continuation
+/// of the previous value: it is hidden when that value is masked, and shown
+/// as part of it otherwise.
+///
+/// There is no line cap: every record goes through the mask, whatever the
+/// size of the listing.  The listing is already in memory, and the parse is
+/// one linear pass over it.
 fn try_parse_env(stdout: &str) -> Option<FileResult> {
     if stdout.trim().is_empty() {
         return None;
     }
 
-    // Sibling-standard bound (#317, mod.rs:56-59): on very large env dumps return
-    // None so the caller degrades to lossless Passthrough.  A mid-loop `break`
-    // would leave `total_count` understated and cause the elision marker to
-    // misreport the loss — early-return is the safe choice here (per diff.rs
-    // precedent).
-    if stdout.lines().count() > MAX_INPUT_LINES {
-        return None;
+    if stdout.contains('\0') {
+        return parse_nul_records(stdout);
     }
 
-    // No display cap: every env variable is a unique, non-redundant datum.
-    // A 100-entry cap would silently drop variables whose keys sort late
-    // alphabetically (e.g. TOKEN_*, STRIPE_*) — precisely the high-value secrets
-    // redaction exists to protect.  MAX_INPUT_LINES already bounds pathological
-    // inputs; an additional per-entry display cap buys nothing here and actively
-    // harms completeness.
     let mut entries: Vec<String> = Vec::new();
     let mut total_count = 0usize;
+    // `None` before the first variable; `Some(masked)` for the current one.
+    let mut current_masked: Option<bool> = None;
+    // True while the lines after a masked value are continuation lines.
+    let mut in_masked_continuation = false;
 
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
         }
 
-        // Split on first `=` only
-        let Some(eq_pos) = line.find('=') else {
-            continue;
+        let variable = match line.split_once('=') {
+            // Inside a masked value over several lines, a line such as
+            // `abc==` (a padding tail) is part of that value, not a variable.
+            Some((key, value))
+                if is_variable_name(key)
+                    && !(in_masked_continuation && value.chars().all(|c| c == '=')) =>
+            {
+                Some((key, value))
+            }
+            // Outside a masked value, a sensitive key is always masked, also
+            // when it is not a portable name (for example a non-ASCII key).
+            Some((key, value)) if current_masked != Some(true) && is_sensitive_key(key) => {
+                Some((key, value))
+            }
+            _ => None,
         };
-        let key = &line[..eq_pos];
-        let value = &line[eq_pos + 1..];
 
-        total_count += 1;
-        let displayed_value = if is_sensitive_key(key) {
-            "***".to_string()
-        } else if value.contains("://") && value.contains('@') {
-            redact_url_credentials(value)
-        } else {
-            value.to_string()
-        };
-        entries.push(format!("{key}={displayed_value}"));
+        match variable {
+            Some((key, value)) => {
+                total_count += 1;
+                let masked = is_sensitive_key(key);
+                current_masked = Some(masked);
+                in_masked_continuation = false;
+                let displayed_value = if masked {
+                    "***".to_string()
+                } else {
+                    redact_value(value)
+                };
+                entries.push(format!("{key}={displayed_value}"));
+            }
+            None => match current_masked {
+                // Part of a masked value: it stays behind the mask.
+                Some(true) => in_masked_continuation = true,
+                // Part of a value that is not masked, or text before the
+                // first variable: shown, with the URL-credential redaction.
+                Some(false) | None => entries.push(redact_value(line)),
+            },
+        }
     }
 
     if total_count == 0 {
         return None;
     }
 
-    let shown_count = entries.len();
-    // elision_marker returns None when shown >= total, so no footer when all
-    // variables are shown (the common case now that the display cap is removed).
-    let footer = crate::output::elision_marker(shown_count, total_count, "variables");
-
     Some(FileResult::new(
         "env".to_string(),
         total_count,
-        shown_count,
+        total_count,
         entries,
-        footer,
+        None,
     ))
+}
+
+/// Parse NUL-separated `KEY=value` records (`printenv -0`).
+fn parse_nul_records(stdout: &str) -> Option<FileResult> {
+    let mut entries: Vec<String> = Vec::new();
+    for record in stdout.split('\0') {
+        if record.trim().is_empty() {
+            continue;
+        }
+        let entry = match record.split_once('=') {
+            Some((key, _)) if is_sensitive_key(key) => format!("{key}=***"),
+            Some((key, value)) => format!("{key}={}", redact_value(value)),
+            // A record with no `=` has no key to judge it by: fail closed.
+            None => "***".to_string(),
+        };
+        entries.push(entry);
+    }
+
+    let count = entries.len();
+    if count == 0 {
+        return None;
+    }
+    Some(FileResult::new(
+        "env".to_string(),
+        count,
+        count,
+        entries,
+        None,
+    ))
+}
+
+/// True when `key` is a portable variable name (`[A-Za-z_][A-Za-z0-9_]*`).
+fn is_variable_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The value as shown: URL credentials replaced, everything else unchanged.
+fn redact_value(value: &str) -> String {
+    if value.contains("://") && value.contains('@') {
+        redact_url_credentials(value)
+    } else {
+        value.to_string()
+    }
 }
 
 /// Return true if the key should have its value redacted.
@@ -495,21 +628,135 @@ mod tests {
         );
     }
 
-    // ISSUE 2: MAX_INPUT_LINES must cause `try_parse_env` to return None (lossless
-    // Passthrough) rather than break mid-loop and silently truncate.
-    #[test]
-    fn test_max_input_lines_returns_none() {
-        // Build a string with MAX_INPUT_LINES + 1 valid KEY=VALUE pairs.
-        let mut input = String::new();
-        for i in 0..=MAX_INPUT_LINES {
-            input.push_str(&format!("VAR_{i}=val_{i}\n"));
+    /// Render a parse result as the text that reaches stdout, for the
+    /// "no fake value anywhere" assertions below.
+    fn rendered(result: &ParseResult<FileResult>) -> String {
+        match result {
+            ParseResult::Full(r) | ParseResult::Degraded(r, _) => r.as_ref().to_string(),
+            ParseResult::Passthrough(raw) => raw.clone(),
+            ParseResult::RawPassthrough => panic!("the env handler never returns RawPassthrough"),
         }
-        let result = try_parse_env(&input);
+    }
+
+    // A listing above the shared input line cap is masked like any other
+    // listing: there is no size at which the raw text is served.
+    #[test]
+    fn test_large_listing_is_masked() {
+        let mut input = String::from("FAKE_TOKEN=fake-value-123\n");
+        for i in 0..=crate::cmd::file::MAX_INPUT_LINES {
+            input.push_str(&format!("VAR_{i}=x\n"));
+        }
+        let output = make_output_full(&input, "", Some(0));
+        let result = parse_impl(&output, &[]);
+        assert!(result.is_full(), "got {}", result.tier_name());
+        let text = rendered(&result);
+        assert!(text.contains("FAKE_TOKEN=***"));
+        assert!(!text.contains("fake-value-123"));
+        assert!(text.contains("VAR_0=x"), "plain values stay visible");
+    }
+
+    // A value over several lines: a continuation line that holds `=` stays
+    // behind the mask of its variable.
+    #[test]
+    fn test_continuation_with_equals_sign_stays_masked() {
+        let input = "FAKE_TOKEN=fake-part-one\nfake-part-two=fake-part-three\nPLAIN=ok\n";
+        let result = try_parse_env(input).unwrap();
+        let text = result.as_ref().to_string();
+        assert!(text.contains("FAKE_TOKEN=***"));
         assert!(
-            result.is_none(),
-            "try_parse_env must return None when input exceeds MAX_INPUT_LINES \
-             so the caller can degrade to lossless Passthrough (mod.rs:56-59)"
+            !text.contains("fake-part"),
+            "no part of the value shows: {text}"
         );
+        assert!(text.contains("PLAIN=ok"));
+        assert_eq!(result.total_count, 2);
+    }
+
+    // A padding tail such as `abc==` inside a masked value is part of it.
+    #[test]
+    fn test_padding_tail_of_masked_value_stays_masked() {
+        let input = "FAKE_PRIVATE_KEY=-----BEGIN FAKE-----\nZmFrZWZha2VmYWtl\nZmFrZQ==\n-----END FAKE-----\nPLAIN=ok\n";
+        let text = try_parse_env(input).unwrap().as_ref().to_string();
+        assert!(text.contains("FAKE_PRIVATE_KEY=***"));
+        assert!(!text.contains("ZmFrZ"), "no body line shows: {text}");
+        assert!(!text.contains("FAKE-----"), "no armour line shows: {text}");
+        assert!(text.contains("PLAIN=ok"));
+    }
+
+    // A value over several lines that is not sensitive stays visible.
+    #[test]
+    fn test_continuation_of_plain_value_is_shown() {
+        let input = "PLAIN=line-one\nline-two\nOTHER=ok\n";
+        let text = try_parse_env(input).unwrap().as_ref().to_string();
+        assert!(text.contains("PLAIN=line-one"));
+        assert!(text.contains("line-two"));
+        assert!(text.contains("OTHER=ok"));
+    }
+
+    // NUL-separated records (`printenv -0`): each record is masked by its key,
+    // and a record with no `=` is masked whole.
+    #[test]
+    fn test_nul_records_are_masked() {
+        let input = "PLAIN=1\0FAKE_TOKEN=fake-value-123\nfake-line-two\0fake-orphan\0";
+        let output = make_output_full(input, "", Some(0));
+        let result = parse_impl(&output, &[]);
+        assert!(result.is_full(), "got {}", result.tier_name());
+        let text = rendered(&result);
+        assert!(text.contains("PLAIN=1"));
+        assert!(text.contains("FAKE_TOKEN=***"));
+        assert!(!text.contains("fake-"), "no fake value shows: {text}");
+    }
+
+    // `printenv NAME`: bare values. A sensitive name masks every line.
+    #[test]
+    fn test_named_sensitive_value_is_masked() {
+        let output = make_output_full("fake-value-123\nfake-line-two\n", "", Some(0));
+        let requested = vec!["FAKE_TOKEN".to_string(), "PLAIN".to_string()];
+        let result = parse_impl(&output, &requested);
+        assert!(result.is_full(), "got {}", result.tier_name());
+        let text = rendered(&result);
+        assert!(!text.contains("fake-"), "no fake value shows: {text}");
+        assert!(text.contains("***"));
+    }
+
+    // `printenv NAME` for a name that is not sensitive: the value shows, with
+    // URL credentials replaced.
+    #[test]
+    fn test_named_plain_value_is_shown_with_url_redaction() {
+        let output = make_output_full("https://fakeuser:fakepass@example.invalid/x\n", "", Some(0));
+        let requested = vec!["PLAIN_URL".to_string()];
+        let text = rendered(&parse_impl(&output, &requested));
+        assert!(text.contains("example.invalid/x"));
+        assert!(!text.contains("fakeuser"));
+        assert!(!text.contains("fakepass"));
+    }
+
+    #[test]
+    fn test_requested_names_skip_flags() {
+        let args: Vec<String> = ["-0", "FAKE_TOKEN", "--null", "PLAIN"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(requested_names(&args), vec!["FAKE_TOKEN", "PLAIN"]);
+    }
+
+    #[test]
+    fn test_is_variable_name() {
+        assert!(is_variable_name("A_1"));
+        assert!(is_variable_name("_X"));
+        assert!(!is_variable_name("fake-part"));
+        assert!(!is_variable_name("1X"));
+        assert!(!is_variable_name(""));
+        assert!(!is_variable_name("cl\u{00e9}_TOKEN"));
+    }
+
+    // A key that is not a portable name but is sensitive is still masked,
+    // after a plain value too.
+    #[test]
+    fn test_sensitive_key_with_unusual_name_is_masked_after_plain_value() {
+        let input = "PLAIN=ok\nfake-app_TOKEN=fake-value-123\n";
+        let text = try_parse_env(input).unwrap().as_ref().to_string();
+        assert!(text.contains("fake-app_TOKEN=***"));
+        assert!(!text.contains("fake-value-123"), "{text}");
     }
 
     // ISSUE 3: All variables must be shown when count <= MAX_INPUT_LINES.
@@ -542,7 +789,7 @@ mod tests {
     #[test]
     fn test_tier3_empty_passthrough() {
         let output = make_output_full("", "", Some(1));
-        let result = parse_impl(&output);
+        let result = parse_impl(&output, &[]);
         assert!(
             result.is_passthrough(),
             "Empty output should be passthrough, got {}",
@@ -554,7 +801,7 @@ mod tests {
     fn test_parse_impl_produces_full() {
         let input = load_fixture("file", "env_basic.txt");
         let output = make_output_full(&input, "", Some(0));
-        let result = parse_impl(&output);
+        let result = parse_impl(&output, &[]);
         assert!(
             result.is_full(),
             "parse_impl with exit code 0 and valid env output should return Full, got {}",

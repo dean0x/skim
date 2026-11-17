@@ -447,6 +447,76 @@ mod env_redaction {
              got stdout={stdout:?}"
         );
     }
+
+    // =========================================================================
+    // Path 4 — every value shape is masked (named values, values over lines)
+    // =========================================================================
+
+    /// A `Command` for the explicit surface (`skim <tool> …`) with the same
+    /// sandboxed environment as the wrapper surface.
+    fn base_explicit_cmd(tool: &str) -> Command {
+        let mut c = Command::new(skim_bin());
+        c.arg(tool)
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .env_remove("SKIM_REWRITTEN_FROM");
+        c
+    }
+
+    /// `printenv NAME` prints a bare value with no key; a sensitive name must
+    /// still be masked, on the explicit and on the wrapper surface.
+    #[test]
+    fn printenv_named_sensitive_value_is_masked_on_both_surfaces() {
+        for (surface, mut cmd) in [
+            ("explicit", base_explicit_cmd("printenv")),
+            ("wrapper", base_wrapper_cmd("printenv")),
+        ] {
+            let output = cmd
+                .arg("SKIM_TEST_TOKEN")
+                .env("SKIM_TEST_TOKEN", "fake-named-value-xyz")
+                .stdin(Stdio::null())
+                .output()
+                .expect("skim binary must be spawnable");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("fake-named-value-xyz"),
+                "{surface}: printenv of a sensitive name must be masked; got {stdout:?}"
+            );
+            assert!(
+                stdout.contains("***"),
+                "{surface}: the masked value must be shown as ***; got {stdout:?}"
+            );
+        }
+    }
+
+    /// A listing on stdin with a sensitive value over several lines: no part
+    /// of the value reaches stdout, and the next plain variable still shows.
+    #[test]
+    fn env_listing_on_stdin_masks_value_over_several_lines() {
+        use std::io::Write as _;
+
+        let mut child = base_explicit_cmd("env")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("skim binary must be spawnable");
+        child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(
+                b"SKIM_TEST_TOKEN=fake-part-one\nfake-part-two=fake-part-three\nPLAIN_VAR=ok\n",
+            )
+            .expect("write the listing");
+        let output = child.wait_with_output().expect("skim must finish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("fake-part"), "got {stdout:?}");
+        assert!(stdout.contains("SKIM_TEST_TOKEN=***"), "got {stdout:?}");
+        assert!(stdout.contains("PLAIN_VAR=ok"), "got {stdout:?}");
+    }
 }
 
 // =========================================================================
