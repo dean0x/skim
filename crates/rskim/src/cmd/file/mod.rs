@@ -307,7 +307,7 @@ pub(crate) fn run(
         // `redaction_is_mandatory` and so covers BOTH spellings.
         "env" => match env::env_route(tool_args) {
             env::EnvRoute::View(view) => env::run_view(&view, &ctx),
-            env::EnvRoute::Exec => super::run_raw_passthrough("env", tool_args, &[]),
+            env::EnvRoute::Exec(exec_args) => super::run_raw_passthrough("env", &exec_args, &[]),
         },
         "printenv" => env::run(tool_args, &ctx),
         "find" => find::run(tool_args, &ctx),

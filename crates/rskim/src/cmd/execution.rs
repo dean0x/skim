@@ -2689,6 +2689,17 @@ mod tests {
     }
 
     #[test]
+    fn test_format_analytics_label_env_value_with_spaces_is_redacted_whole() {
+        // The argv is joined with spaces, so `FOO='fake a b'` arrives as three
+        // tokens; every token up to the child word goes.
+        let label = format_analytics_label("file", "env", "FOO=fake-one fake-two -x printenv NAME");
+        assert_eq!(
+            label,
+            "skim file env FOO=[REDACTED] [REDACTED] [REDACTED] printenv NAME"
+        );
+    }
+
+    #[test]
     fn test_format_analytics_label_other_family_keeps_unlisted_assignment() {
         // The total-assignment rule is scoped to redaction-mandatory programs.
         // The build family still redacts only names on the canonical secret list.

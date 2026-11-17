@@ -168,9 +168,11 @@ impl EnvRequest {
 pub(super) enum EnvRoute {
     /// The masked env view.
     View(EnvView),
-    /// The real `env` binary with the original arguments: it starts a child
-    /// program that is not an env view (`env FOO=1 npm test`).
-    Exec,
+    /// The real `env` binary with these arguments: it starts a child program
+    /// that is not an env view (`env FOO=1 npm test`).  The arguments are the
+    /// ones that the route read, with each `-S` line already split, so the
+    /// real `env` never splits a line in a different way.
+    Exec(Vec<String>),
 }
 
 /// One env view: `[env ENV_WORDS] CHILD PRINTENV_ARGS`.
@@ -294,7 +296,7 @@ pub(super) fn env_route(args: &[String]) -> EnvRoute {
                     _ if !grammar_used => {
                         return EnvRoute::View(EnvView::printenv(words[i..].to_vec()));
                     }
-                    _ => return EnvRoute::Exec,
+                    _ => return EnvRoute::Exec(words),
                 }
             }
             EnvWord::Option(option) => {
@@ -415,7 +417,8 @@ fn split_string_words(line: &str) -> Option<Vec<String>> {
                 in_word = true;
             }
             (None, '#') if !in_word => break,
-            (None, _) if c.is_whitespace() => {
+            // GNU `env -S` splits at ASCII white space only.
+            (None, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}') => {
                 if in_word {
                     words.push(std::mem::take(&mut word));
                     in_word = false;
@@ -676,6 +679,7 @@ fn mask_named_values(
 
     let terminator = if stdout.contains('\0') { '\0' } else { '\n' };
     let mut entries: Vec<String> = Vec::new();
+    let mut hidden = 0usize;
     let mut rest = stdout;
     if let Some(known) = known {
         for name in requested {
@@ -688,24 +692,27 @@ fn mask_named_values(
             if is_sensitive_key(name) {
                 entries.push("***".to_string());
             } else {
-                entries.extend(value.split('\n').map(display_line));
+                let mut mask = ValueMask::default();
+                entries.extend(value.split('\n').filter_map(|line| mask.line(line)));
+                hidden += mask.hidden;
             }
             rest = &rest[used..];
         }
     }
 
     let mask_all = requested.iter().any(|name| is_sensitive_key(name));
-    entries.extend(
-        rest.split(['\n', '\0'])
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                if mask_all {
-                    "***".to_string()
-                } else {
-                    display_line(line)
-                }
-            }),
-    );
+    let mut mask = ValueMask::default();
+    for line in rest
+        .split(['\n', '\0'])
+        .filter(|line| !line.trim().is_empty())
+    {
+        if mask_all {
+            entries.push("***".to_string());
+        } else {
+            entries.extend(mask.line(line));
+        }
+    }
+    hidden += mask.hidden;
 
     let count = entries.len();
     Some(FileResult::new(
@@ -713,7 +720,7 @@ fn mask_named_values(
         count,
         count,
         entries,
-        None,
+        hidden_footer(hidden),
     ))
 }
 
@@ -774,10 +781,17 @@ impl ListingView {
             self.entries.push(format!("{key}=***"));
             return;
         }
+        let mut mask = ValueMask::default();
         let mut lines = value.split('\n');
         let first = lines.next().unwrap_or_default();
-        self.entries.push(format!("{key}={}", display_line(first)));
-        self.entries.extend(lines.map(display_line));
+        let shown = mask.line(first).unwrap_or_default();
+        self.entries.push(format!("{key}={shown}"));
+        self.entries
+            .extend(lines.filter_map(|line| mask.line(line)));
+        self.hidden_lines += mask.hidden;
+        // Text after the record that no known record accounts for keeps the
+        // state of the value: hidden when the value ended inside a masked line.
+        self.current_masked = Some(mask.inside_masked);
     }
 
     /// One NUL-separated record whose edges are not known.  NUL marks the
@@ -805,7 +819,7 @@ impl ListingView {
             self.entries.push(format!("{key}=***"));
             return;
         }
-        self.current_masked = Some(false);
+        self.current_masked = Some(starts_masked_line(first));
         self.entries.push(format!("{key}={}", display_line(first)));
         for line in more.split('\n') {
             self.push_line(line);
@@ -839,7 +853,7 @@ impl ListingView {
             Some((key, value)) => {
                 self.variables += 1;
                 let masked = is_sensitive_key(key);
-                self.current_masked = Some(masked);
+                self.current_masked = Some(masked || starts_masked_line(value));
                 let shown = if masked {
                     "***".to_string()
                 } else {
@@ -858,11 +872,7 @@ impl ListingView {
         if self.variables == 0 {
             return None;
         }
-        let footer = match self.hidden_lines {
-            0 => None,
-            1 => Some("1 line after a masked value is hidden".to_string()),
-            n => Some(format!("{n} lines after a masked value are hidden")),
-        };
+        let footer = hidden_footer(self.hidden_lines);
         Some(FileResult::new(
             "env".to_string(),
             self.variables,
@@ -871,6 +881,53 @@ impl ListingView {
             footer,
         ))
     }
+}
+
+/// The footer that counts the hidden lines, if any.
+fn hidden_footer(hidden: usize) -> Option<String> {
+    match hidden {
+        0 => None,
+        1 => Some("1 line after a masked value is hidden".to_string()),
+        n => Some(format!("{n} lines after a masked value are hidden")),
+    }
+}
+
+/// The line mask for the lines of one value that is not masked.  A line
+/// `KEY=value` with a sensitive `KEY` shows as `KEY=***`, and the lines after
+/// it are hidden and counted up to the next line that starts a portable
+/// `NAME=`: the same line rule as for a listing.
+#[derive(Default)]
+struct ValueMask {
+    inside_masked: bool,
+    hidden: usize,
+}
+
+impl ValueMask {
+    /// The line as shown, or `None` when it is hidden.
+    fn line(&mut self, line: &str) -> Option<String> {
+        if let Some((key, value)) = line.split_once('=') {
+            if is_sensitive_key(key) {
+                self.inside_masked = true;
+                return Some(format!("{key}=***"));
+            }
+            if is_variable_name(key) && !(self.inside_masked && is_padding(value)) {
+                self.inside_masked = false;
+                return Some(redact_value(line));
+            }
+        }
+        if self.inside_masked {
+            self.hidden += 1;
+            None
+        } else {
+            Some(redact_value(line))
+        }
+    }
+}
+
+/// True when `line` starts with a sensitive `KEY=`.
+fn starts_masked_line(line: &str) -> bool {
+    line.split_once('=')
+        .is_some_and(|(key, _)| is_sensitive_key(key))
 }
 
 /// True when `value` is a non-empty run of `=` (the tail of base64 padding).
@@ -1689,7 +1746,7 @@ mod tests {
     fn view(args: &[&str]) -> EnvView {
         match env_route(&strings(args)) {
             EnvRoute::View(view) => view,
-            EnvRoute::Exec => panic!("env {args:?} must be an env view"),
+            EnvRoute::Exec(_) => panic!("env {args:?} must be an env view"),
         }
     }
 
@@ -1790,14 +1847,34 @@ mod tests {
 
     #[test]
     fn test_env_route_other_children_exec() {
-        let route = |args: &[&str]| env_route(&strings(args));
-        assert_eq!(route(&["FOO=1", "npm", "test"]), EnvRoute::Exec);
-        assert_eq!(route(&["-u", "printenv", "npm"]), EnvRoute::Exec);
-        assert_eq!(route(&["-S", "npm test"]), EnvRoute::Exec);
-        assert_eq!(route(&["-S", "FOO='fake a' npm"]), EnvRoute::Exec);
-        assert_eq!(route(&["env", "FOO=1", "npm"]), EnvRoute::Exec);
+        let exec = |args: &[&str]| match env_route(&strings(args)) {
+            EnvRoute::Exec(exec_args) => exec_args,
+            EnvRoute::View(view) => panic!("env {args:?} must run env, got {view:?}"),
+        };
+        assert_eq!(
+            exec(&["FOO=1", "npm", "test"]),
+            strings(&["FOO=1", "npm", "test"])
+        );
+        assert_eq!(
+            exec(&["-u", "printenv", "npm"]),
+            strings(&["-u", "printenv", "npm"])
+        );
+        // A `-S` line reaches the real `env` already split.
+        assert_eq!(exec(&["-S", "npm test"]), strings(&["npm", "test"]));
+        assert_eq!(
+            exec(&["-S", "FOO='fake a' npm"]),
+            strings(&["FOO=fake a", "npm"])
+        );
+        assert_eq!(
+            exec(&["-S", "npm\u{00a0}printenv"]),
+            strings(&["npm\u{00a0}printenv"])
+        );
+        assert_eq!(
+            exec(&["env", "FOO=1", "npm"]),
+            strings(&["env", "FOO=1", "npm"])
+        );
         // Known limit: skim cannot inspect what `sh -c` prints.
-        assert_eq!(route(&["FOO=1", "sh", "-c", "env"]), EnvRoute::Exec);
+        assert_eq!(exec(&["FOO=1", "sh", "-c", "env"]).len(), 4);
     }
 
     #[test]
@@ -1844,5 +1921,78 @@ mod tests {
         assert!(!text.contains("fake-part"), "{text}");
         assert!(text.contains("PLAIN=ok"), "{text}");
         assert!(file.footer.is_none(), "{text}");
+    }
+
+    // A plain variable whose value holds a sensitive `KEY=value` line: that
+    // line is masked, and the body lines after it are hidden and counted, on
+    // the exact-record path as on the line rule.
+    #[test]
+    fn test_plain_value_with_sensitive_line_hides_its_body() {
+        let value =
+            "fake-head\nX_PRIVATE_KEY=fake-begin\nfake-body-one\nfake-body-two\nNEXT_LINE=ok";
+        let stdout = format!("PLAIN_BLOB={value}\nPLAIN=ok\n");
+        let request = child_request(&[], &[("PLAIN_BLOB", value), ("PLAIN", "ok")]);
+        let result = parse_impl(&make_output_full(&stdout, "", Some(0)), &request);
+        let text = rendered(&result);
+        assert!(text.contains("PLAIN_BLOB=fake-head"), "{text}");
+        assert!(text.contains("X_PRIVATE_KEY=***"), "{text}");
+        assert!(!text.contains("fake-begin"), "{text}");
+        assert!(!text.contains("fake-body"), "{text}");
+        assert!(text.contains("NEXT_LINE=ok"), "{text}");
+        assert!(text.contains("PLAIN=ok"), "{text}");
+        assert!(
+            text.contains("2 lines after a masked value are hidden"),
+            "{text}"
+        );
+
+        // The same text on stdin, through the line rule.
+        let text = stdin_listing(&stdout).unwrap().as_ref().to_string();
+        assert!(!text.contains("fake-begin"), "{text}");
+        assert!(!text.contains("fake-body"), "{text}");
+    }
+
+    // `PLAIN=X_TOKEN=…` on stdin: the lines after it are hidden too.
+    #[test]
+    fn test_stdin_plain_value_that_starts_masked_hides_its_body() {
+        let input = "PLAIN=X_TOKEN=fake-begin\nfake-body\nOTHER=ok\n";
+        let text = stdin_listing(input).unwrap().as_ref().to_string();
+        assert!(text.contains("PLAIN=X_TOKEN=***"), "{text}");
+        assert!(!text.contains("fake-"), "{text}");
+        assert!(text.contains("OTHER=ok"), "{text}");
+    }
+
+    // `printenv NAME` for a plain name whose value holds a sensitive line.
+    #[test]
+    fn test_named_plain_value_with_sensitive_line_hides_its_body() {
+        let value = "fake-head\nX_PRIVATE_KEY=fake-begin\nfake-body";
+        let request = child_request(&["PLAIN_BLOB"], &[("PLAIN_BLOB", value)]);
+        let result = parse_impl(
+            &make_output_full(&format!("{value}\n"), "", Some(0)),
+            &request,
+        );
+        let ParseResult::Full(file) = &result else {
+            panic!("got {}", result.tier_name());
+        };
+        let text = rendered(&result);
+        assert!(text.contains("fake-head"), "{text}");
+        assert!(!text.contains("fake-begin"), "{text}");
+        assert!(!text.contains("fake-body"), "{text}");
+        assert_eq!(
+            file.footer.as_deref(),
+            Some("1 line after a masked value is hidden")
+        );
+    }
+
+    // The `-S` line splits at ASCII white space only, as GNU `env -S`.
+    #[test]
+    fn test_split_string_uses_ascii_white_space_only() {
+        assert_eq!(
+            split_string_words("a\u{00a0}b c\td"),
+            Some(strings(&["a\u{00a0}b", "c", "d"]))
+        );
+        assert_eq!(
+            split_string_words("a\u{3000}b\u{2028}c"),
+            Some(strings(&["a\u{3000}b\u{2028}c"]))
+        );
     }
 }

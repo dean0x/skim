@@ -579,6 +579,11 @@ mod env_redaction {
         assert!(!stdout.contains("fake-exit-value-xyz"), "got {stdout:?}");
         assert!(stdout.contains("***"), "got {stdout:?}");
         assert_eq!(output.status.code(), Some(1), "the child's exit code stays");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("SKIM_PASSTHROUGH"),
+            "no escape-hatch hint for the env view; got {stderr:?}"
+        );
     }
 
     /// `env` spellings that start an env view after options, after
@@ -594,6 +599,9 @@ mod env_redaction {
             &["-S", "FOO=1 printenv"],
             &["-S", "FOO='fake a' printenv"],
             &["-S", "pri''ntenv"],
+            &["-S", "FOO=1\u{00a0}printenv"],
+            &["-S", "npm\u{00a0}printenv"],
+            &["-S", "npm\u{3000}printenv"],
         ];
         for spelling in spellings {
             for (surface, mut cmd) in [
