@@ -1,10 +1,11 @@
 ---
 feature: cmd-search
 name: Search CLI (skim search subcommand, the scan engine)
-description: "Use when modifying the skim search CLI, adding or changing a search flag, changing how files are listed, read or left out, changing the labelled view, the word view, the roles, the ranking or the text and JSON output, changing the exit codes, changing project-root discovery, or changing the removal of old search hooks and old index data. Keywords: skim search, scan engine, labelled view, word view, roles, def, call, ref, import, partial, unlabelled, left_out, universe, Containment, sensitive_admission, SENSITIVE_PATH_POLICY, Limits, MAX_STORED_LINES, parse budget, count, label, Matcher, closed flag set, REMOVED_FLAGS, resolve_scan_root, RootRules, GIT_CEILING_DIRECTORIES, hooks.rs, legacy_cache.rs, LEGACY_ARTIFACTS, clear-cache, exit 141."
+description: "Use when changing skim search flags, file listing, the bounded read in safe_fs, views, roles, ranking, output, exit codes, root discovery or old hook cleanup. Keywords: skim search, universe, Containment, safe_fs."
 category: architecture
-directories: [crates/rskim/src/cmd/search/]
+directories: [crates/rskim/src/cmd/search/, crates/rskim/src/cmd/safe_fs.rs]
 referencedFiles:
+  - crates/rskim/src/cmd/safe_fs.rs
   - crates/rskim/src/cmd/search/mod.rs
   - crates/rskim/src/cmd/search/args.rs
   - crates/rskim/src/cmd/search/filter.rs
@@ -19,8 +20,8 @@ referencedFiles:
   - crates/rskim/src/cmd/search/hooks.rs
   - crates/rskim/src/cmd/search/legacy_cache.rs
 created: 2026-06-21
-updated: 2026-11-13
-version: 9
+updated: 2026-11-17
+version: 10
 ---
 
 # Search CLI (skim search subcommand, the scan engine)
@@ -41,10 +42,11 @@ version: 9
   (`Parser::parse_bounded` has no search caller); the parse budget counts files and bytes. A call is a hit in callee position. Calls are not split by
   definition: a name with two or more definitions gets a note.
 - **KB-INV-6** A tracked path and the work tree are untrusted. `Containment` canonicalizes each parent folder once, before
-  any file is read, and requires it to stay inside the canonical root. It then opens the file by that canonical parent
-  plus the file name. Only the last part of the path is opened with no link followed (`O_NOFOLLOW`) and no block on a
-  FIFO. The parent folders are checked before the open, not at the open: a folder that another process replaces with a
-  link after the check is followed (the README names this limit). The opened handle is checked before a byte is read.
+  any file is read, and requires it to stay inside the canonical root. It then reads the file by that canonical parent
+  plus the file name, through `safe_fs::read_regular_bounded` (see `KB-INV-10`). Only the last part of the path is opened
+  with no link followed (`O_NOFOLLOW`) and no block on a FIFO. The parent folders are checked before the open, not at the
+  open: a folder that another process replaces with a link after the check is followed (the README names this limit).
+  The opened handle is checked before a byte is read.
 - **KB-INV-7** Text output never prints a control byte or a bidi format control (U+202A to U+202E, U+2066 to U+2069) from
   a file name or a line (`render::quote_path`, `escape_text`). A file name that starts with a quote is C-quoted too, so no
   name looks like the quoted form of another. Letters of a right-to-left script print as they are. JSON keeps the serde
@@ -53,6 +55,11 @@ version: 9
   (`SENSITIVE_PATH_POLICY`) in `universe.rs`. Today every tracked file is listed.
 - **KB-INV-9** The old hook block and the old index data are removed only by `skim init`, `skim init --uninstall` and
   `skim --clear-cache`. A query never calls `hooks` or `legacy_cache`. `skim doctor` reports both and exits the same.
+- **KB-INV-10** The one copy of the contained read and the atomic write is `crates/rskim/src/cmd/safe_fs.rs`:
+  `read_regular_bounded` (`O_NOFOLLOW`, `O_NONBLOCK`, size check on the open handle, a read capped at the bound, text
+  step `BoundedFile::into_text` in strict UTF-8) and `write_atomic` (random exclusive temp name in the same folder, mode
+  set on the open handle, `sync_all`, then rename). Search uses them in `universe.rs` and `hooks.rs`. `skim init`
+  guidance and config writes use them too, so a change there changes both.
 - **KB-AP-1** Do not add a flag that starts a program or reads a file the query did not list. The closed flag set and the
   `Containment` open are the trust boundary.
 - **KB-AP-2** Do not decide a bound's behaviour in the output code, and do not infer the cause of a cut from sums. Phase A
@@ -66,6 +73,9 @@ version: 9
   with `SKIM_DEBUG=1`, through `crate::debug_log!`). Add no sub-qualifier. The one exception is the shared elision
   marker (`[skim] lines elided beyond N of M — ...`) that `output::elision_marker_with_remedy` gives a bound that hides
   lines.
+
+- **KB-AP-5** Do not open, read or write a file in search code with `std::fs` calls of your own. Go through `safe_fs`.
+  A private copy drops one of the checks (link, FIFO, size, temp name, mode) and the shared tests do not cover it.
 
 ## Overview
 
@@ -101,6 +111,9 @@ of stdout closed the pipe (`pipe_closed_exit`).
 | `gitdir.rs` | `RootRules`, `walk_up`, `find_repository`, `resolve_git_dir`, `resolve_repo_toplevel`, `resolve_common_dir`. |
 | `hooks.rs` | Removal of the search git hooks that skim 2.x wrote. |
 | `legacy_cache.rs` | Removal of the index data that skim 2.x cached. |
+
+Outside this folder, `crates/rskim/src/cmd/safe_fs.rs` holds `open_no_follow`, `read_regular_bounded` (with
+`ReadFailure`, `BoundedFile`) and `write_atomic`. Its tests sit in the same file. `universe.rs` and `hooks.rs` call it.
 
 Tests: `*_tests.rs` beside each module, `run_tests.rs` (root rule, query compile, output form), and the integration
 files `crates/rskim/tests/cli_search.rs` (the real binary on small git repositories), `cli_search_security.rs`
@@ -147,7 +160,8 @@ reader) and `cli_search_legacy.rs` (every removed flag exits 2 with nothing on s
   (above `MAX_FILE_BYTES` = 5 MiB), `unreadable` (an I/O error, a permission error, or a handle that is not a regular
   file), `vanished` (tracked but absent, or replaced by a folder), `outside_root` (the real path leaves the canonical root, or the index names a
   path that is not a plain relative path) and `symlink` (a tracked mode `120000` entry or a walked link, counted and
-  never read).
+  never read). `read_file` in `universe.rs` maps each `safe_fs::ReadFailure` to one reason (`left_out_for`) and does the
+  NUL probe and the UTF-8 check on the bytes itself.
 - **Policy A.** `SENSITIVE_PATH_POLICY = SensitivePolicy::List` and `sensitive_admission` admit every path. To leave
   hidden or secret-bearing tracked files out, add a variant, change the constant and the match in the function, and
   update the help text, README, CHANGELOG and the scoreboard text universe together. `-g '!NAME'` leaves one file out
@@ -249,8 +263,9 @@ plain repositories resolve the way git does). `resolve_repo_toplevel` is the sof
 - **`hooks.rs`**: `find_search_hooks` and `remove_search_hooks` handle the block between `# skim-search-start` and
   `# skim-search-end` in `post-commit`, `post-merge` and `post-checkout` (`HOOK_NAMES`). Removal deletes the lines from
   the start marker to the end marker and no other byte. A marker counts only as a whole line. A hook that is a link, is
-  not UTF-8 or is larger than `MAX_HOOK_BYTES` (1 MiB) is not skim's and stays. The rewrite keeps the file permissions
-  and flushes the new file (`sync_all`) before the rename. The three hooks are independent: a hook that cannot be
+  not UTF-8 or is larger than `MAX_HOOK_BYTES` (1 MiB) is not skim's and stays (`read_hook` reads through
+  `safe_fs::read_regular_bounded`). The rewrite goes through `safe_fs::write_atomic`: it keeps the file permissions and
+  flushes the new file (`sync_all`) before the rename. The three hooks are independent: a hook that cannot be
   inspected, read or rewritten is a `HookFailure` (path, step, error kind) and the other hooks are still handled.
   `remove_search_hooks` lists the failures in `HooksOutcome::failures` (it returns `Err` only for the subdirectory
   refusal). `find_search_hooks` gives a `HooksFinding` (`block_found` and `unreadable`): an unreadable hook is
@@ -286,6 +301,10 @@ plain repositories resolve the way git does). `resolve_repo_toplevel` is the sof
   Removing a row is a behaviour change.
 - The gate for this module is the search scoreboard. A change to a view, a role rule, a bound, the universe or an exit
   code needs the scoreboard to stay green (see `search-scoreboard`).
+- The CI filter that starts the search gate (`SEARCH_PATHS` in `.github/workflows/ci.yml`) lists `cmd/safe_fs.rs`, as do
+  the "CI" path list in the scoreboard README and the search gate paths in `CLAUDE.md`. A change to `safe_fs.rs` runs the
+  scoreboard even when it comes from an init change. Keep the three lists in step. A new shared file that search calls
+  needs a line in each.
 - `hooks.rs` and `legacy_cache.rs` keep the old marker text and artifact names on purpose: removal must recognise what
   skim 2.x wrote.
 
@@ -294,6 +313,9 @@ plain repositories resolve the way git does). `resolve_repo_toplevel` is the sof
 - `crates/rskim/src/cmd/search/mod.rs`: dispatch, `resolve_scan_root`, `emit`.
 - `crates/rskim/src/cmd/search/args.rs`: flags, `REMOVED_FLAGS`, `SEARCH_HELP_TEXT`.
 - `crates/rskim/src/cmd/search/universe.rs`: the file set, `Containment`, `LeftOut`, policy A.
+- `crates/rskim/src/cmd/safe_fs.rs`: the contained read and the atomic write, shared with init guidance.
+- `crates/rskim/src/cmd/init/helpers.rs`: the `skim init` guidance text on when to use `skim search` or `rg` (the search
+  section). It is not search code.
 - `crates/rskim/src/cmd/search/scan.rs`: phase A and phase B, `Limits`.
 - `crates/rskim/src/cmd/search/roles.rs`, `classifier.rs`: roles and fields.
 - `crates/rskim/src/cmd/search/rank.rs`, `render.rs`: order and output.
@@ -305,3 +327,4 @@ plain repositories resolve the way git does). `resolve_repo_toplevel` is the sof
 
 - Feature knowledge `search-scoreboard`: the gate that judges this module, and its independent oracles.
 - Feature knowledge `symbol-read`: the declaration rule that the `def` role reuses.
+- Feature knowledge `hook-binary-pinning`: the init guidance writes that share `safe_fs`.
