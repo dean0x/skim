@@ -117,11 +117,11 @@ pub(crate) fn load_or_create_settings(path: &Path) -> anyhow::Result<serde_json:
     })
 }
 
-/// Atomically write settings JSON to disk using tmp+rename.
+/// Atomically write settings JSON through the shared atomic writer.
 ///
-/// On Unix, the temporary file is created with mode 0o600 (owner read/write only)
-/// before the rename, so the settings file is never world-readable — regardless
-/// of the process umask.
+/// A private, exclusively created temporary file receives the data and syncs
+/// before rename. On Unix, mode 0600 replaces the mode of an existing settings
+/// file too, regardless of the process umask.
 ///
 /// `pub(crate)` so that the permissions writers (cmd/permissions/claude.rs) can
 /// reuse this helper without duplicating the atomic-write logic.
@@ -130,17 +130,11 @@ pub(crate) fn atomic_write_settings(
     path: &Path,
 ) -> anyhow::Result<()> {
     let pretty = serde_json::to_string_pretty(settings)?;
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, format!("{pretty}\n"))?;
     #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-    }
-    std::fs::rename(&tmp_path, path)?;
+    let permissions = Some(std::fs::Permissions::from_mode(0o600));
+    #[cfg(not(unix))]
+    let permissions = None;
+    safe_fs::write_atomic(path, &format!("{pretty}\n"), permissions)?;
     Ok(())
 }
 
@@ -427,17 +421,39 @@ pub(super) fn config_backup_name(agent: AgentKind) -> String {
 /// [`resolve_real_settings_path`], so a link here means the path changed after
 /// resolution. A regular file at `backup_path` is replaced. A link, a folder or
 /// any other file at `backup_path` stops the backup with an error, and nothing
-/// at that name is changed. The new backup is created exclusively with mode
-/// 0600, so no write goes through a name that appeared after the check.
+/// at that name is changed. A random temporary file in the same folder is
+/// created exclusively with mode 0600. The copy syncs before rename, so a failed
+/// copy leaves any previous backup intact and never publishes a partial file.
 /// Used for config files whose backup is not `settings.json.bak` (Cursor's
 /// `hooks.json`, Crush's `crush.json`, Copilot CLI's `permissions-config.json`).
 pub(crate) fn backup_config_file(real_path: &Path, backup_path: &Path) -> anyhow::Result<()> {
     let mut source = open_backup_source(real_path)?;
-    clear_regular_backup(backup_path)?;
-    let mut backup = create_new_private(backup_path)
+    copy_backup(&mut source, backup_path)
+}
+
+/// Publish a complete copy of an opened source. A read or write failure drops
+/// the temporary file and leaves the previous backup at its original name.
+fn copy_backup(source: &mut impl std::io::Read, backup_path: &Path) -> anyhow::Result<()> {
+    check_backup_path(backup_path)?;
+    let parent = backup_path.parent().with_context(|| {
+        format!(
+            "the backup path {} has no parent folder",
+            backup_path.display()
+        )
+    })?;
+    let mut backup = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("could not create the backup {}", backup_path.display()))?;
-    std::io::copy(&mut source, &mut backup)
+    std::io::copy(source, &mut backup)
         .with_context(|| format!("could not write the backup {}", backup_path.display()))?;
+    backup
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync the backup {}", backup_path.display()))?;
+    check_backup_path(backup_path)?;
+    backup
+        .persist(backup_path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("could not replace the backup {}", backup_path.display()))?;
     Ok(())
 }
 
@@ -470,12 +486,11 @@ fn open_backup_source(real_path: &Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Remove a regular file at `backup_path`. Stop on anything else that exists
-/// there, a link included.
-fn clear_regular_backup(backup_path: &Path) -> anyhow::Result<()> {
+/// Check without removal: a missing path or regular file can receive a backup.
+/// Stop on anything else that exists there, a link included.
+fn check_backup_path(backup_path: &Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(backup_path) {
-        Ok(meta) if meta.file_type().is_file() => std::fs::remove_file(backup_path)
-            .with_context(|| format!("could not replace the backup {}", backup_path.display())),
+        Ok(meta) if meta.file_type().is_file() => Ok(()),
         Ok(_) => anyhow::bail!(
             "the backup path {} is a link or not a regular file, so skim stops.\n\
              hint: remove it, then run the command again",
@@ -485,21 +500,6 @@ fn clear_regular_backup(backup_path: &Path) -> anyhow::Result<()> {
         Err(error) => Err(error)
             .with_context(|| format!("could not check the backup {}", backup_path.display())),
     }
-}
-
-/// Create `path` for writing, private to the owner (mode 0600 on unix).
-///
-/// The create fails when anything exists at `path`, a link included: it never
-/// writes through a link and never truncates a file.
-fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options.open(path)
 }
 
 /// Allow-list entries as one line of display text, separated by `, `.
@@ -1086,6 +1086,73 @@ mod tests {
         }
     }
 
+    // ---- atomic_write_settings ----
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_settings_write_leaves_a_fixed_temporary_file_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let fixed_tmp = path.with_extension("json.tmp");
+        std::fs::write(&path, b"old settings").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&fixed_tmp, b"keep this file").unwrap();
+        let settings = serde_json::json!({"hooks": {}});
+
+        atomic_write_settings(&settings, &path).unwrap();
+
+        assert_eq!(
+            std::fs::read(&fixed_tmp).unwrap_or_default(),
+            b"keep this file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\n  \"hooks\": {}\n}\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_settings_write_leaves_a_fixed_temporary_link_and_its_target_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let fixed_tmp = path.with_extension("json.tmp");
+        let target = dir.path().join("outside.txt");
+        std::fs::write(&target, b"keep these bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &fixed_tmp).unwrap();
+        let settings = serde_json::json!({"hooks": {}});
+
+        atomic_write_settings(&settings, &path).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep these bytes");
+        assert!(
+            std::fs::symlink_metadata(&fixed_tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\n  \"hooks\": {}\n}\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
     // ---- backup_settings_file ----
 
     #[test]
@@ -1105,7 +1172,55 @@ mod tests {
         );
     }
 
-    // ---- backup_config_file: exclusive create ----
+    // ---- backup_config_file ----
+
+    /// Serve some bytes, then fail: a copy must not publish that partial prefix.
+    struct FailedBackupRead {
+        prefix: std::io::Cursor<&'static [u8]>,
+    }
+
+    impl std::io::Read for FailedBackupRead {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = std::io::Read::read(&mut self.prefix, buffer)?;
+            if count == 0 {
+                Err(std::io::Error::other("backup read failed"))
+            } else {
+                Ok(count)
+            }
+        }
+    }
+
+    #[test]
+    fn failed_backup_copy_keeps_the_previous_backup_byte_for_byte() {
+        let (dir, _source, backup) = backup_fixture();
+        std::fs::write(&backup, b"previous complete backup").unwrap();
+        let mut source = FailedBackupRead {
+            prefix: std::io::Cursor::new(b"partial new backup"),
+        };
+
+        let result = copy_backup(&mut source, &backup);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"previous complete backup");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_backup_copy_leaves_no_partial_backup_at_a_new_name() {
+        let (dir, _source, backup) = backup_fixture();
+        let mut source = FailedBackupRead {
+            prefix: std::io::Cursor::new(b"partial new backup"),
+        };
+
+        let result = copy_backup(&mut source, &backup);
+
+        assert!(result.is_err());
+        assert!(
+            !backup.exists(),
+            "a partial copy must not reach the backup name"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// A source file and a backup path in a fresh folder.
     fn backup_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -1183,29 +1298,6 @@ mod tests {
 
         assert!(error.to_string().contains("became a symlink"), "{error}");
         assert!(!backup.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn create_new_private_refuses_a_file_a_link_and_a_dangling_link() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let existing = dir.path().join("existing");
-        std::fs::write(&existing, b"keep").unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&existing, &link).unwrap();
-        let dangling = dir.path().join("dangling");
-        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
-
-        for path in [&existing, &link, &dangling] {
-            assert!(
-                create_new_private(path).is_err(),
-                "an exclusive create must fail at {}",
-                path.display()
-            );
-        }
-
-        assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
-        assert!(!dir.path().join("nowhere").exists());
     }
 
     #[test]
