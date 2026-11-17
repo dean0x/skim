@@ -27,6 +27,7 @@ use super::guidance::{GuidanceTarget, block_is_current, holds_block, inject_into
 use super::guidance_block::{GuidanceFormat, GuidanceHooks};
 use super::guidance_path::{GuidanceScope, PathRefusal, resolve_guidance_path};
 use super::helpers::confirm_proceed;
+use crate::cmd::display_path;
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
 /// An agent that skim gives a guidance file and no hook.
@@ -197,7 +198,7 @@ fn install_with(
             }
         };
         if flags.dry_run {
-            let shown = target.shown.display();
+            let shown = display_path(&target.shown);
             if block_is_current(&target, version) {
                 println!("  [dry-run] Guidance in {shown} is already current");
             } else {
@@ -250,7 +251,7 @@ fn remove_with(
         println!("  skim init --uninstall");
         println!();
         for (_, target) in &found {
-            println!("    * Remove guidance from {}", target.shown.display());
+            println!("    * Remove guidance from {}", display_path(&target.shown));
         }
         println!();
         match confirm_proceed() {
@@ -271,7 +272,7 @@ fn remove_with(
         if flags.dry_run {
             println!(
                 "  [dry-run] Would remove guidance from {}",
-                target.shown.display()
+                display_path(&target.shown)
             );
         } else if let Err(error) = remove(target) {
             eprintln!("  ✗ {}: guidance removal failed — {error}", agent.name);

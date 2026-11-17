@@ -622,6 +622,17 @@ pub(crate) fn sanitize_for_display(input: &str) -> String {
         .collect()
 }
 
+/// A path from the file system, safe to print. Each part goes through
+/// [`sanitize_for_display`]. The cut is per part, not for the whole
+/// path, so a long path keeps its file name.
+pub(crate) fn display_path(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .split('/')
+        .map(sanitize_for_display)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

@@ -17,6 +17,7 @@ use super::guidance_path::{
     require_absolute_global, resolve_guidance_path,
 };
 use super::helpers::{check_mark, guidance_content, render_file};
+use crate::cmd::display_path;
 use crate::cmd::hooks::{HookSupport, protocol_for_agent};
 use crate::cmd::safe_fs::{self, ReadFailure};
 use crate::cmd::session::{AgentKind, InstructionEnv};
@@ -193,7 +194,7 @@ pub(super) fn kept_shared_note(shown: &Path, shared_with: &[AgentKind]) -> Strin
     };
     format!(
         "  Note: kept guidance in {}; {names} still {verb} it",
-        shown.display()
+        display_path(shown)
     )
 }
 
@@ -212,7 +213,7 @@ pub(super) fn read_existing_safely(path: &Path) -> anyhow::Result<Option<String>
         Err(failure) => {
             eprintln!(
                 "  warning: {} {} (skipping guidance)",
-                path.display(),
+                display_path(path),
                 skip_reason(&failure)
             );
             Ok(None)
@@ -301,7 +302,7 @@ impl UpdateOutcome {
     /// The line that tells the user what happened to the file shown as
     /// `shown`, or `None` when the caller prints the footer.
     pub(super) fn message(&self, shown: &Path, version: &str) -> Option<String> {
-        let shown = shown.display();
+        let shown = display_path(shown);
         match self {
             Self::AlreadyCurrent => Some(format!(
                 "  {} Guidance already current (v{version})",
@@ -422,14 +423,14 @@ pub(super) fn inject_into(target: &GuidanceTarget, global: bool) -> anyhow::Resu
     println!(
         "  {} Installed guidance in {}",
         check_mark(true),
-        target.shown.display()
+        display_path(&target.shown)
     );
 
     // For project scope, remind user to commit
     if !global {
         println!(
             "  Note: guidance added to {} — commit to share with your team.",
-            target.shown.display()
+            display_path(&target.shown)
         );
     }
 
@@ -567,7 +568,7 @@ fn strip_target(target: &GuidanceTarget, shared_with: &[AgentKind]) -> anyhow::R
         println!(
             "  {} Removed guidance from {}",
             check_mark(true),
-            target.shown.display()
+            display_path(&target.shown)
         );
     }
     Ok(())
@@ -586,11 +587,11 @@ pub(super) fn atomic_write_stripped(path: &Path, content: &str) -> anyhow::Resul
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             return Err(e)
-                .with_context(|| format!("could not read the mode of {}", path.display()));
+                .with_context(|| format!("could not read the mode of {}", display_path(path)));
         }
     };
     safe_fs::write_atomic(path, content, permissions)
-        .with_context(|| format!("could not write {}", path.display()))
+        .with_context(|| format!("could not write {}", display_path(path)))
 }
 
 /// Clean up skim markers from legacy `.cursorrules` during Cursor migration.

@@ -799,7 +799,7 @@ fn guidance_line(fact: &crate::cmd::init::GuidanceFact, version: &str) -> String
         .map(|reader| reader.name())
         .collect::<Vec<_>>()
         .join(", ");
-    let path = guidance_path_text(&fact.shown);
+    let path = crate::cmd::display_path(&fact.shown);
     let remedy = guidance_remedy(fact);
     let (glyph, detail) = match &fact.state {
         GuidanceState::Current => ("✓", format!("current (v{version})")),
@@ -858,17 +858,6 @@ fn guidance_remedy(fact: &crate::cmd::init::GuidanceFact) -> String {
             format!("run `skim init --project --agent {agent}` in this folder")
         }
     }
-}
-
-/// A path from the file system, safe to print. Each part goes through
-/// [`crate::cmd::sanitize_for_display`]. The cut is per part, not for the whole
-/// path, so a long path keeps its file name.
-fn guidance_path_text(path: &std::path::Path) -> String {
-    path.to_string_lossy()
-        .split('/')
-        .map(crate::cmd::sanitize_for_display)
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 // ============================================================================

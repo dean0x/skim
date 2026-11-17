@@ -13,6 +13,7 @@ use super::helpers::{
 };
 use super::state::{detect_state, has_skim_hook_entry, read_settings_json, skim_event_keys};
 use super::targets::{agent_names, remove_targets};
+use crate::cmd::display_path;
 use crate::cmd::hooks::protocol_for_agent;
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
@@ -406,7 +407,7 @@ fn uninstall_guidance_without_hook(
         println!();
         println!("  skim init --uninstall");
         println!();
-        println!("    * Remove guidance from {}", target.shown.display());
+        println!("    * Remove guidance from {}", display_path(&target.shown));
         println!();
         if !confirm_proceed()? {
             println!("  Cancelled.");
@@ -417,7 +418,7 @@ fn uninstall_guidance_without_hook(
     if flags.dry_run {
         println!(
             "  [dry-run] Would remove guidance from {}",
-            target.shown.display()
+            display_path(&target.shown)
         );
     } else {
         remove_from(&target, &still_using)?;

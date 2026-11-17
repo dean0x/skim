@@ -17,8 +17,8 @@ use super::state::{
 use super::targets::{agent_names, install_targets};
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
-use crate::cmd::sanitize_for_display;
 use crate::cmd::session::{AgentKind, InstructionEnv};
+use crate::cmd::{display_path, sanitize_for_display};
 
 // ============================================================================
 // The write-decision predicate
@@ -1748,7 +1748,7 @@ fn print_dry_run_guidance(
     match guidance_target(agent, &scope, env) {
         Ok(Some(target)) => println!(
             "  [dry-run] Would inject guidance into {}",
-            target.shown.display()
+            display_path(&target.shown)
         ),
         Ok(None) if global => println!("{}", no_global_file_note(agent)),
         Ok(None) => {}

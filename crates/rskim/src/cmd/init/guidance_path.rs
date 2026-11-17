@@ -21,6 +21,7 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use crate::cmd::display_path;
 use crate::cmd::session::{AgentKind, InstructionEnv, RelativeOverride};
 
 // ============================================================================
@@ -148,17 +149,17 @@ impl std::fmt::Display for PathRefusal {
             Self::LeavesProject { path } => write!(
                 f,
                 "{} leads outside this project folder. skim leaves it unchanged.",
-                path.display()
+                display_path(path)
             ),
             Self::NotRegular { path } => write!(
                 f,
                 "{} is a link that does not end at a regular file. skim leaves it unchanged.",
-                path.display()
+                display_path(path)
             ),
             Self::Unchecked { path, error } => write!(
                 f,
                 "skim could not check {} ({error}). It leaves it unchanged.",
-                path.display()
+                display_path(path)
             ),
         }
     }

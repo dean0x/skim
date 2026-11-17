@@ -1756,6 +1756,177 @@ fn test_init_dry_run_shows_guidance() {
         .stdout(predicate::str::contains("guidance"));
 }
 
+const GUIDANCE_PATH_WITH_CONTROL: &str = "AGENTS\u{1b}[31m.md";
+const GUIDANCE_PATH_DISPLAY: &str = "AGENTS?[31m.md";
+const STALE_GUIDANCE: &str =
+    "user rules\n<!-- skim-start v0.0.1 -->\nold guidance\n<!-- skim-end -->\n";
+
+fn link_guidance(project: &std::path::Path, name: &str, text: &str) -> std::path::PathBuf {
+    let file = project.join(GUIDANCE_PATH_WITH_CONTROL);
+    fs::write(&file, text).unwrap();
+    std::os::unix::fs::symlink(&file, project.join(name)).unwrap();
+    file
+}
+
+fn assert_guidance_path_display(assert: assert_cmd::assert::Assert, expected: &str) {
+    let assert = assert.success();
+    let output = assert.get_output();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    for text in [stdout, stderr] {
+        assert!(
+            text.chars().all(|c| !c.is_control() || c == '\n'),
+            "control character in {text:?}"
+        );
+    }
+    assert!(
+        stdout.contains(expected) || stderr.contains(expected),
+        "missing {expected:?} in stdout {stdout:?} and stderr {stderr:?}"
+    );
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_install_messages() {
+    let changed = format!(
+        "user rules\n<!-- skim-start v{} -->\nchanged guidance\n<!-- skim-end -->\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    for (text, dry_run, message) in [
+        ("user rules\n", false, "Installed guidance in"),
+        (STALE_GUIDANCE, false, "Updated guidance in"),
+        (changed.as_str(), false, "Replaced changed guidance in"),
+        ("<!-- skim-start v0.0.1 -->\n", false, "skim markers in"),
+        ("user rules\n", true, "Would inject guidance into"),
+    ] {
+        let sandbox = Sandbox::new();
+        let project = sandbox.project_dir("proj");
+        link_guidance(&project, "CLAUDE.md", text);
+        let mut command = sandbox.init();
+        command
+            .current_dir(&project)
+            .args(["--project", "--agent", "claude", "--yes"]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        assert_guidance_path_display(
+            command.assert(),
+            &format!("{message} {GUIDANCE_PATH_DISPLAY}"),
+        );
+    }
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_skipped_file_warnings() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("proj");
+    let file = link_guidance(&project, "CLAUDE.md", "");
+    fs::write(&file, [0xff]).unwrap();
+
+    assert_guidance_path_display(
+        sandbox
+            .init()
+            .current_dir(&project)
+            .args(["--project", "--agent", "claude", "--yes"])
+            .assert(),
+        "AGENTS?[31m.md is not valid UTF-8 (skipping guidance)",
+    );
+    assert_eq!(fs::read(file).unwrap(), [0xff]);
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_uninstall_and_prompt() {
+    for with_hook in [false, true] {
+        let sandbox = Sandbox::new();
+        let project = sandbox.project_dir("proj");
+        let file = link_guidance(&project, "CLAUDE.md", STALE_GUIDANCE);
+        if with_hook {
+            sandbox
+                .init()
+                .current_dir(&project)
+                .args(["--project", "--agent", "claude", "--yes"])
+                .assert()
+                .success();
+        }
+        let before = fs::read(&file).unwrap();
+        for (flags, message) in [
+            (vec!["--dry-run", "--yes"], "[dry-run]"),
+            (vec![], "Proceed?"),
+            (vec!["--yes"], "Removed guidance from AGENTS?[31m.md"),
+        ] {
+            let mut command = sandbox.init();
+            command
+                .current_dir(&project)
+                .args(["--uninstall", "--project", "--agent", "claude"])
+                .args(&flags)
+                .write_stdin("n\n");
+            let assert = command.assert();
+            if !with_hook && !flags.contains(&"--yes") {
+                assert_guidance_path_display(assert, "Remove guidance from AGENTS?[31m.md");
+            } else {
+                assert_guidance_path_display(assert, message);
+            }
+            if !flags.contains(&"--yes") || flags.contains(&"--dry-run") {
+                assert_eq!(fs::read(&file).unwrap(), before);
+            }
+        }
+        assert_eq!(fs::read_to_string(file).unwrap(), "user rules\n");
+    }
+}
+
+#[test]
+fn test_project_guidance_path_display_filters_shared_file_notes() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("proj");
+    let file = link_guidance(&project, "CLAUDE.md", STALE_GUIDANCE);
+    std::os::unix::fs::symlink(&file, project.join("AGENTS.md")).unwrap();
+    for agent in ["codex", "claude"] {
+        sandbox
+            .init()
+            .current_dir(&project)
+            .args(["--project", "--agent", agent, "--yes"])
+            .assert()
+            .success();
+    }
+    let before = fs::read(&file).unwrap();
+    // The first uninstall has a hook. The second has only shared guidance.
+    for _ in 0..2 {
+        assert_guidance_path_display(
+            sandbox
+                .init()
+                .current_dir(&project)
+                .args(["--uninstall", "--project", "--agent", "claude", "--yes"])
+                .assert(),
+            "kept guidance in AGENTS?[31m.md; Codex CLI still uses it",
+        );
+        assert_eq!(fs::read(&file).unwrap(), before);
+    }
+}
+
+#[test]
+fn test_global_guidance_path_display_filters_target_messages() {
+    let sandbox = Sandbox::bare();
+    let rules = sandbox.config_dir(".kiro/steering");
+    let file = link_guidance(&rules, "skim.md", STALE_GUIDANCE);
+    for (flags, message) in [
+        (vec!["--dry-run", "--yes"], "Would inject guidance into"),
+        (vec!["--yes"], "Updated guidance in"),
+        (vec!["--dry-run", "--yes"], "is already current"),
+        (
+            vec!["--uninstall", "--dry-run"],
+            "Would remove guidance from",
+        ),
+        (vec!["--uninstall"], "Proceed?"),
+        (vec!["--uninstall", "--yes"], "Removed guidance from"),
+    ] {
+        let assert = sandbox.init().args(&flags).write_stdin("n\n").assert();
+        assert_guidance_path_display(assert, message);
+        if !flags.contains(&"--uninstall") || !flags.contains(&"--yes") {
+            assert!(file.exists());
+        }
+    }
+    assert_eq!(fs::read_to_string(file).unwrap(), "user rules\n");
+}
+
 // ============================================================================
 // Cursor .mdc format
 // ============================================================================
