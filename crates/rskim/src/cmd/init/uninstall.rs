@@ -3,13 +3,19 @@
 use super::flags::{
     DetectionEnv, InitFlags, detect_installed_agents, resolve_agent, resolve_single_agent,
 };
+use super::guidance::{
+    agents_sharing_file, guidance_target, holds_block, kept_shared_note, remove_from,
+};
+use super::guidance_path::GuidanceScope;
 use super::helpers::{
     HOOK_SCRIPT_NAME, atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
     resolve_real_settings_path,
 };
-use super::state::{has_skim_hook_entry, read_settings_json, skim_event_keys};
+use super::state::{detect_state, has_skim_hook_entry, read_settings_json, skim_event_keys};
+use super::targets::{agent_names, remove_targets};
+use crate::cmd::display_path;
 use crate::cmd::hooks::protocol_for_agent;
-use crate::cmd::session::InstructionEnv;
+use crate::cmd::session::{AgentKind, InstructionEnv};
 
 /// Remove skim hook entries from a settings value.
 ///
@@ -50,10 +56,19 @@ fn run_uninstall_auto_detect(
     flags: &InitFlags,
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // The guidance-only agents come before both early returns below: a user who
+    // has only one of them, or only one other agent, still loses their files.
+    let targets = remove_targets(flags, &InstructionEnv::from_process());
+
     let agents = detect_installed_agents(det_env);
     if agents.is_empty() {
-        println!("  No supported agents found. Nothing to uninstall.");
-        return Ok(std::process::ExitCode::SUCCESS);
+        if targets.handled == 0 {
+            println!(
+                "  No supported agents found ({}). Nothing to uninstall.",
+                agent_names(flags)
+            );
+        }
+        return Ok(targets.exit_code_with(std::process::ExitCode::SUCCESS));
     }
 
     // Single-agent fast path: skip the loop overhead when only one agent is detected.
@@ -63,7 +78,8 @@ fn run_uninstall_auto_detect(
             agent: Some(agents[0]),
             ..*flags
         };
-        return run_uninstall_for_agent(&agent_flags, agents[0], det_env);
+        let code = run_uninstall_for_agent(&agent_flags, agents[0], det_env)?;
+        return Ok(targets.exit_code_with(code));
     }
 
     let mut any_failed = false;
@@ -89,11 +105,11 @@ fn run_uninstall_auto_detect(
         }
     }
 
-    Ok(if any_failed {
+    Ok(targets.exit_code_with(if any_failed {
         std::process::ExitCode::FAILURE
     } else {
         std::process::ExitCode::SUCCESS
-    })
+    }))
 }
 
 /// Uninstall skim for a single explicit agent (dispatched by `run_uninstall`).
@@ -107,9 +123,55 @@ fn run_uninstall_single(
 
 fn run_uninstall_for_agent(
     flags: &InitFlags,
-    agent: crate::cmd::session::AgentKind,
+    agent: AgentKind,
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
+    uninstall_agent(flags, agent, det_env, &InstructionEnv::from_process())
+}
+
+/// The agents that read the guidance file of `agent` and are still set up.
+///
+/// Fails toward keeping: an agent whose state cannot be read counts as set up.
+/// It returns no error, so the uninstall cannot stop after the hook is gone.
+fn agents_still_using_guidance(
+    agent: AgentKind,
+    project: bool,
+    env: &InstructionEnv,
+    det_env: &DetectionEnv,
+) -> Vec<AgentKind> {
+    let Ok(scope) = super::install::GuidanceScope::for_flag(!project) else {
+        return Vec::new();
+    };
+    agents_sharing_file(agent, &scope, env)
+        .into_iter()
+        .filter(|&other| {
+            counts_as_set_up(
+                detect_state(other, project, det_env).map(|state| state.hook_installed),
+            )
+        })
+        .collect()
+}
+
+/// Whether an agent is still set up, given what reading its state returned.
+///
+/// Codex has no hook to run, but `skim init` registers one entry for it like
+/// for every agent, so the hook state is the install state of both kinds. A
+/// state that cannot be read counts as set up.
+fn counts_as_set_up(hook_installed: anyhow::Result<bool>) -> bool {
+    hook_installed.unwrap_or(true)
+}
+
+fn uninstall_agent(
+    flags: &InitFlags,
+    agent: AgentKind,
+    det_env: &DetectionEnv,
+    env: &InstructionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    // Before any change: a relative guidance path is refused up front, so the
+    // uninstall does not stop half-done once the hook is gone.
+    if !flags.project {
+        super::install::check_global_target(agent, env)?;
+    }
     let protocol = protocol_for_agent(agent);
     let config_dir = det_env.resolve(agent, flags.project)?;
 
@@ -140,8 +202,7 @@ fn run_uninstall_for_agent(
     let script_exists = hook_script_path.exists();
 
     if !registration_exists && !script_exists {
-        println!("  skim hook not found. Nothing to uninstall.");
-        return Ok(std::process::ExitCode::SUCCESS);
+        return uninstall_guidance_without_hook(flags, agent, det_env, env);
     }
 
     // Integrity check (#57): warn if hook script has been modified since install
@@ -242,7 +303,7 @@ fn run_uninstall_for_agent(
 
     // Remove permissions sidecar and seeded entries (non-fatal).
     // Copilot CLI permissions live in hook_config_dir; all others in config_dir.
-    let perm_dir: &std::path::Path = if agent == crate::cmd::session::AgentKind::CopilotCli {
+    let perm_dir: &std::path::Path = if agent == AgentKind::CopilotCli {
         &hook_config_dir
     } else {
         &config_dir
@@ -277,10 +338,11 @@ fn run_uninstall_for_agent(
         }
     }
 
-    // Remove guidance from instruction file
+    // Remove guidance from instruction file. A file that another set-up agent
+    // still reads keeps its block.
     let global = !flags.project;
-    let env = InstructionEnv::from_process();
-    super::install::remove_guidance(agent, global, &env)?;
+    let still_using = agents_still_using_guidance(agent, flags.project, env, det_env);
+    super::install::remove_guidance(agent, global, env, &still_using)?;
 
     // Uninstall shell wrappers (global scope only).
     // Non-fatal: wrapper removal failure must not abort hook uninstall.
@@ -310,6 +372,57 @@ fn run_uninstall_for_agent(
     println!("  skim hook has been uninstalled.");
     println!();
 
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// Remove guidance left in this scope even when no hook exists there.
+///
+/// Use the same target policy and remover as a hook uninstall. A shared file
+/// keeps its block. As with guidance-only agents, a dry-run needs no prompt.
+fn uninstall_guidance_without_hook(
+    flags: &InitFlags,
+    agent: AgentKind,
+    det_env: &DetectionEnv,
+    env: &InstructionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    let scope = GuidanceScope::for_flag(!flags.project)?;
+    let target = match guidance_target(agent, &scope, env) {
+        Ok(target) => target.filter(holds_block),
+        Err(refusal) => {
+            refusal.report()?;
+            None
+        }
+    };
+    let Some(target) = target else {
+        println!("  skim hook not found. Nothing to uninstall.");
+        return Ok(std::process::ExitCode::SUCCESS);
+    };
+    let still_using = agents_still_using_guidance(agent, flags.project, env, det_env);
+    if !still_using.is_empty() {
+        println!("{}", kept_shared_note(&target.shown, &still_using));
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    if !flags.yes && !flags.dry_run {
+        println!();
+        println!("  skim init --uninstall");
+        println!();
+        println!("    * Remove guidance from {}", display_path(&target.shown));
+        println!();
+        if !confirm_proceed()? {
+            println!("  Cancelled.");
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+    }
+
+    if flags.dry_run {
+        println!(
+            "  [dry-run] Would remove guidance from {}",
+            display_path(&target.shown)
+        );
+    } else {
+        remove_from(&target, &still_using)?;
+    }
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -405,6 +518,58 @@ mod tests {
             settings["other"].as_str().unwrap(),
             "value",
             "unrelated keys must be untouched"
+        );
+    }
+
+    // ---- A shared guidance file ----
+
+    #[test]
+    fn an_agent_whose_state_cannot_be_read_counts_as_set_up() {
+        assert!(counts_as_set_up(Err(anyhow::anyhow!("unreadable"))));
+        assert!(counts_as_set_up(Ok(true)));
+        assert!(!counts_as_set_up(Ok(false)));
+    }
+
+    // ---- Refusal before any change ----
+
+    #[test]
+    fn a_relative_guidance_override_is_refused_before_the_hook_is_removed() {
+        use super::super::flags::PermissionsTier;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let claude = home.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = serde_json::json!({ "hooks": { "PreToolUse": [skim_entry()] } });
+        let settings_text = serde_json::to_string_pretty(&settings).unwrap();
+        std::fs::write(claude.join("settings.json"), &settings_text).unwrap();
+        let det_env = DetectionEnv {
+            claude_config_dir: Some(claude.clone()),
+            ..DetectionEnv::default()
+        };
+        let env = InstructionEnv::from_lookup(Some(home.path().to_path_buf()), |_| {
+            Some(std::ffi::OsString::from("relative-config-folder"))
+        });
+        let flags = InitFlags {
+            project: false,
+            yes: true,
+            dry_run: false,
+            uninstall: true,
+            force: false,
+            no_guidance: false,
+            dev: false,
+            agent: Some(AgentKind::ClaudeCode),
+            wrappers: None,
+            permissions: None,
+            permissions_tier: PermissionsTier::Seed,
+        };
+
+        let error = uninstall_agent(&flags, AgentKind::ClaudeCode, &det_env, &env).unwrap_err();
+
+        assert!(error.to_string().contains("CLAUDE_CONFIG_DIR"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.json")).unwrap(),
+            settings_text,
+            "a refused uninstall must leave the hook entry in place"
         );
     }
 

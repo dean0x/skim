@@ -82,6 +82,7 @@ mod pkg;
 #[cfg(feature = "proxy")]
 mod proxy;
 mod rewrite;
+mod safe_fs;
 mod search;
 mod session;
 pub(crate) mod session_sidecar;
@@ -114,7 +115,8 @@ pub(crate) use registry::{
 
 mod security;
 pub(crate) use security::{
-    redact_mandatory_assignments, sanitize_for_display, scrub_db_args, scrub_infra_args,
+    display_path, redact_mandatory_assignments, sanitize_for_display, scrub_db_args,
+    scrub_infra_args,
 };
 
 pub(crate) mod stream_pump;

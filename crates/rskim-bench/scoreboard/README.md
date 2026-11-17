@@ -299,7 +299,8 @@ Two jobs in `.github/workflows/ci.yml` run the gate: `changes` (**Detect Search 
   - `crates/rskim/src/cmd/search/`, `crates/rskim-core/`, `crates/rskim-bench/`, `crates/rskim-oracle/`,
     `crates/rskim-research/`;
   - the `rskim` files outside `cmd/search/` that it depends on: `crates/rskim/src/cmd/mod.rs`
-    (`is_repo_relative_safe`), `crates/rskim/src/cmd/execution.rs` (`StdoutStatus`, `pipe_closed_exit` and the stdout
+    (`is_repo_relative_safe`), `crates/rskim/src/cmd/safe_fs.rs` (`read_regular_bounded`, the bounded read of
+    every file, and `write_atomic`), `crates/rskim/src/cmd/execution.rs` (`StdoutStatus`, `pipe_closed_exit` and the stdout
     writers), `crates/rskim/src/cmd/dispatch.rs` (it dispatches `search`), `crates/rskim/src/debug.rs`
     (`is_debug_enabled`, `debug_log!`), `crates/rskim/src/output/mod.rs` (`elision_marker_with_remedy`),
     `crates/rskim/src/analytics/mod.rs` (`AnalyticsConfig`) with the `crates/rskim/src/analytics/schema.rs` and

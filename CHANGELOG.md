@@ -12,6 +12,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **env view: mask every value.** `skim env` and `skim printenv` now apply the
   value mask to every output form: a listing of any size, a value over several
   lines, NUL-separated output, and the bare values of `printenv NAME`.
+- Global Cursor installs and uninstalls leave project guidance and `.cursorrules` unchanged.
+- Cursor guidance upgrades keep user text without extra rule headers. Guidance updates keep existing file permissions.
+- Uninstall keeps shared guidance while another configured agent still uses it.
+- `skim init --uninstall` removes skim guidance even when no skim hook is installed in that scope.
+- Agent config backups use the config file name plus `.bak`, such as `hooks.json.bak` and `crush.json.bak`.
+
+### Added
+
+- Global guidance for Kiro, Roo Code, Cline, Augment and Windsurf when their root folders exist. These agents get no hooks.
+- A **Guidance** section in `skim doctor` with file states and scope-specific refresh commands. These notes do not change the exit code.
+
+### Changed
+
+- hook.log drift notes and `skim doctor` remedies name `skim init` as the refresh command.
+- Re-run `skim init` in the same scope after an upgrade to refresh guidance. The shorter guidance says when to use `skim search` or `rg`.
+- Guidance for agents without hooks makes no hook claims.
+- Empty agent config-folder variables count as unset. Skim refuses relative paths. Use absolute paths instead.
+- Cursor guidance needs `--project`. Earlier global installs can leave `.cursor/rules/skim.mdc` in folders where init ran.
+  In each affected folder, run `skim init --uninstall --project --agent cursor`.
 
 ## [3.0.0] - 2026-11-13
 
