@@ -1438,7 +1438,20 @@ where
     // output — compressing it would hide the very diagnostic the agent needs.
     // Forward raw stdout+stderr byte-faithfully (checked BEFORE ANSI
     // stripping) and record zero savings under the "raw" tier.
-    if classify_exit(output.exit_code, expected_exit_codes) == ExitDisposition::UnexpectedFailure {
+    //
+    // `never_passthrough` (PF-012) also closes this raw path: the parse is a
+    // security control there, and a failed child can still print values
+    // (GNU `printenv SET UNSET` prints the set value and exits 1).  The
+    // output goes through the parse, and the exit code below keeps the
+    // child's code (a signal kill reports 1).
+    let disposition = classify_exit(output.exit_code, expected_exit_codes);
+    if never_passthrough && disposition == ExitDisposition::UnexpectedFailure {
+        if output.exit_code.is_none() {
+            // Loss-bearing, so unconditional (ADR-011).  No remedy is named:
+            // the escape hatch is closed for this handler.
+            eprintln!("[skim] {program} killed by signal; output may be partial");
+        }
+    } else if disposition == ExitDisposition::UnexpectedFailure {
         match output.exit_code {
             Some(code) => {
                 // Lossless raw fallback (tool exited unexpectedly): the raw bytes

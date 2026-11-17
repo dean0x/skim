@@ -517,6 +517,133 @@ mod env_redaction {
         assert!(stdout.contains("SKIM_TEST_TOKEN=***"), "got {stdout:?}");
         assert!(stdout.contains("PLAIN_VAR=ok"), "got {stdout:?}");
     }
+
+    // =========================================================================
+    // Path 5 — every env form applies the same mask
+    // =========================================================================
+
+    /// `SKIM_PASSTHROUGH=1` does not open a raw path for `printenv NAME`, on
+    /// the explicit and on the wrapper surface.
+    #[test]
+    fn printenv_named_value_is_masked_under_passthrough_on_both_surfaces() {
+        for (surface, mut cmd) in [
+            ("explicit", base_explicit_cmd("printenv")),
+            ("wrapper", base_wrapper_cmd("printenv")),
+        ] {
+            let output = cmd
+                .arg("SKIM_TEST_TOKEN")
+                .env("SKIM_TEST_TOKEN", "fake-hatch-value-xyz")
+                .env("SKIM_PASSTHROUGH", "1")
+                .stdin(Stdio::null())
+                .output()
+                .expect("skim binary must be spawnable");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("fake-hatch-value-xyz"),
+                "{surface}: SKIM_PASSTHROUGH=1 must not unmask printenv NAME; got {stdout:?}"
+            );
+            assert!(stdout.contains("***"), "{surface}: got {stdout:?}");
+        }
+    }
+
+    /// A `printenv` child that prints a value and exits 1 (GNU `printenv`
+    /// does this when one of the names is not set): the value is masked,
+    /// and the exit code of the child stays.
+    #[test]
+    fn printenv_failed_child_output_is_masked() {
+        let stub_dir = tempfile::tempdir().unwrap();
+        let out_path = stub_dir.path().join("printenv.out");
+        fs::write(&out_path, "fake-exit-value-xyz\n").unwrap();
+        let script_path = stub_dir.path().join("printenv");
+        fs::write(
+            &script_path,
+            format!("#!/bin/sh\ncat '{}'\nexit 1\n", out_path.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            stub_dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let output = base_explicit_cmd("printenv")
+            .args(["SKIM_TEST_TOKEN", "SKIM_TEST_UNSET_NAME"])
+            .env("SKIM_TEST_TOKEN", "fake-exit-value-xyz")
+            .env_remove("SKIM_TEST_UNSET_NAME")
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("skim binary must be spawnable");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("fake-exit-value-xyz"), "got {stdout:?}");
+        assert!(stdout.contains("***"), "got {stdout:?}");
+        assert_eq!(output.status.code(), Some(1), "the child's exit code stays");
+    }
+
+    /// `env` spellings that start an env view after options, after
+    /// assignments, with a path, or with no child: none serves the raw
+    /// environment, on the explicit and on the wrapper surface.
+    #[test]
+    fn env_view_spellings_are_masked_on_both_surfaces() {
+        let spellings: &[&[&str]] = &[
+            &["-u", "SKIM_TEST_UNSET", "FOO=1", "printenv"],
+            &["FOO=1", "/usr/bin/printenv"],
+            &["FOO=1"],
+            &["-i", "FOO=1", "/usr/bin/env"],
+            &["-S", "FOO=1 printenv"],
+        ];
+        for spelling in spellings {
+            for (surface, mut cmd) in [
+                ("explicit", base_explicit_cmd("env")),
+                ("wrapper", base_wrapper_cmd("env")),
+            ] {
+                let output = cmd
+                    .args(*spelling)
+                    .env("SKIM_TEST_TOKEN", "fake-spelling-value-xyz")
+                    .stdin(Stdio::null())
+                    .output()
+                    .expect("skim binary must be spawnable");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    !stdout.contains("fake-spelling-value-xyz"),
+                    "{surface} env {spelling:?}: got {stdout:?}"
+                );
+            }
+        }
+    }
+
+    /// `env FOO=1 /usr/bin/printenv NAME` is the masked `printenv NAME` view.
+    #[test]
+    fn env_path_child_with_name_is_masked() {
+        let output = base_explicit_cmd("env")
+            .args(["FOO=1", "/usr/bin/printenv", "SKIM_TEST_TOKEN"])
+            .env("SKIM_TEST_TOKEN", "fake-path-value-xyz")
+            .stdin(Stdio::null())
+            .output()
+            .expect("skim binary must be spawnable");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("fake-path-value-xyz"), "got {stdout:?}");
+        assert!(stdout.contains("***"), "got {stdout:?}");
+    }
+
+    /// A help flag as the value of `-u` does not run the real `env`.
+    #[test]
+    fn env_help_flag_as_option_value_is_masked_on_wrapper() {
+        for spelling in [["-u", "-h"], ["-u", "--version"]] {
+            let output = base_wrapper_cmd("env")
+                .args(spelling)
+                .env("SKIM_TEST_TOKEN", "fake-help-value-xyz")
+                .stdin(Stdio::null())
+                .output()
+                .expect("skim binary must be spawnable");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("fake-help-value-xyz"),
+                "env {spelling:?}: got {stdout:?}"
+            );
+        }
+    }
 }
 
 // =========================================================================

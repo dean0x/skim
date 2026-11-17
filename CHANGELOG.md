@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **env view: mask every value.** `skim env` and `skim printenv` now apply the
-  value mask to every output form: a listing of any size, a value over several
-  lines, NUL-separated output, and the bare values of `printenv NAME`.
+- **env view: mask every value.** The env views apply the value mask to every
+  output form. Lines that the mask hides from text on stdin are counted in the
+  view. Known limit: for text on stdin, a line rule finds where each variable
+  starts, so the view can read one value over several lines as two variables.
 - Global Cursor installs and uninstalls leave project guidance and `.cursorrules` unchanged.
 - Cursor guidance upgrades keep user text without extra rule headers. Guidance updates keep existing file permissions.
 - Uninstall keeps shared guidance while another configured agent still uses it.

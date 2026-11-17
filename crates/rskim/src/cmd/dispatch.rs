@@ -1019,11 +1019,16 @@ impl Surface {
 /// to enforce the control.  It must be consulted by:
 /// - `main.rs` D2b — the `stdout_should_serve_raw() || force_raw_requested(…)`
 ///   branch that execs `run_inherited_passthrough`.
+/// - `dispatch_inner` D3 — the help gate, which for these tools fires only on
+///   a help flag in the first argument (elsewhere it can be an option value).
 /// - `dispatch_inner` D4 — the skip-flag gate that calls `run_raw_passthrough`.
+/// - `dispatch_inner` — the `SKIM_PASSTHROUGH=1` convergence gate, so the
+///   escape hatch acts the same for both spellings.
 ///
 /// The `never_passthrough: true` field in `cmd/file/env.rs` is the per-handler
-/// layer that guards `SKIM_PASSTHROUGH=1`; this predicate is the structural
-/// layer that guards every new raw-serve path added to the codebase.
+/// layer that guards `SKIM_PASSTHROUGH=1` and the unexpected-exit raw path in
+/// the execution layer; this predicate is the structural layer that guards
+/// every raw-serve path in dispatch.
 pub(crate) fn redaction_is_mandatory(name: &str) -> bool {
     matches!(name, "env" | "printenv")
 }
@@ -1089,11 +1094,18 @@ fn dispatch_inner(
         // `grep --help` is not rewritten (rewrite surface), it must not be
         // compressed on the wrapper surface either. The reader sees the real
         // tool's output in both cases.
-        if !is_meta
-            && pre_sep
-                .iter()
-                .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"))
-        {
+        //
+        // For `env` / `printenv` (`redaction_is_mandatory`) the help flag
+        // counts only as the FIRST argument: elsewhere it can be the value of
+        // an option (`env -u -h`), and the real tool then prints the whole
+        // environment with no mask.
+        let is_help = |a: &String| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V");
+        let help_requested = if redaction_is_mandatory(subcommand) {
+            args.first().is_some_and(is_help)
+        } else {
+            pre_sep.iter().any(is_help)
+        };
+        if !is_meta && help_requested {
             return run_raw_passthrough(subcommand, args, &[]);
         }
 
@@ -1192,8 +1204,9 @@ fn dispatch_inner(
     //   • meta subcommands — skim's own management commands; exec-ing them as OS
     //     binaries would fail or run an unrelated system program.  `log` and
     //     `proxy` are META and therefore carry their own checks.
-    //   • `env` — PF-012: credential redaction is a security control that must
-    //     hold on every branch, so it must not be reachable via the hatch.  The
+    //   • `env` and `printenv` (`redaction_is_mandatory`) — PF-012: credential
+    //     redaction is a security control that must hold on every branch, so
+    //     it must not be reachable via the hatch, for either spelling.  The
     //     execution-level `never_passthrough` flag in `cmd/file/env.rs` is the
     //     independent second layer; both are required (defense in depth).
     //
@@ -1211,7 +1224,7 @@ fn dispatch_inner(
     // used for the families that did honour the hatch.
     if super::is_passthrough_mode()
         && !super::registry::is_meta_subcommand(subcommand)
-        && subcommand != "env"
+        && !redaction_is_mandatory(subcommand)
         && !handler_reads_stdin(subcommand, args)
     {
         // C1 (ADR-011): strip skim-only flags (e.g. `--json`, `--mode`,

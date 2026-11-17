@@ -17,6 +17,7 @@
 //!
 //! URL credentials (scheme://user:pass@host) are replaced with `***:***` in values.
 
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -101,14 +102,314 @@ const SENSITIVE_SUFFIXES: &[&str] = &[
 
 /// Run `skim env [args...]` or `skim printenv [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    let requested = requested_names(args);
+    let request = EnvRequest::new(
+        args,
+        crate::cmd::should_read_stdin(args),
+        KnownEnv::from_process,
+    );
     run_tool(
         CONFIG,
         args,
         ctx,
         |_| {},
-        move |output| parse_impl(output, &requested),
+        move |output| parse_impl(output, &request),
     )
+}
+
+/// What the env view masks, and what it knows about the text.
+struct EnvRequest {
+    /// The names given to `printenv` (empty for a listing).
+    names: Vec<String>,
+    /// skim's own environment when the text comes from a `printenv` child
+    /// that skim started; `None` for text on stdin.
+    known: Option<KnownEnv>,
+}
+
+impl EnvRequest {
+    /// Build the request.  When the handler reads stdin, the arguments are
+    /// not `printenv` names (`run` is a routing word), and the text is not
+    /// from a child of skim, so no record is known.
+    fn new(args: &[String], reads_stdin: bool, known: impl FnOnce() -> KnownEnv) -> Self {
+        if reads_stdin {
+            Self {
+                names: Vec::new(),
+                known: None,
+            }
+        } else {
+            Self {
+                names: requested_names(args),
+                known: Some(known()),
+            }
+        }
+    }
+}
+
+/// How `skim env ARGS` is served.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EnvRoute {
+    /// The masked env view, with these arguments for `printenv`.
+    View(Vec<String>),
+    /// The real `env` binary with the original arguments: it starts a child
+    /// program that is not an env view (`env FOO=1 npm test`).
+    Exec,
+}
+
+/// `env` short options that take a value (GNU and BSD): the rest of the
+/// cluster, or the next argument.
+const ENV_SHORT_VALUE_OPTIONS: &[char] = &['u', 'P', 'C', 'S', 'a', 'L', 'U'];
+
+/// `env` long options (without `--`), and whether each one takes a value.
+const ENV_LONG_OPTIONS: &[(&str, bool)] = &[
+    ("argv0", true),
+    ("block-signal", false),
+    ("chdir", true),
+    ("debug", false),
+    ("default-signal", false),
+    ("help", false),
+    ("ignore-environment", false),
+    ("ignore-signal", false),
+    ("list-signal-handling", false),
+    ("null", false),
+    ("split-string", true),
+    ("unset", true),
+    ("version", false),
+];
+
+/// Decide how `skim env ARGS` is served, from the `env` grammar: options,
+/// then `NAME=VALUE` assignments, then the child program and its arguments.
+///
+/// A child whose file name is `env` or `printenv` (also as a path) is an env
+/// view, so it gets the mask.  With no child, `env` prints the listing, so
+/// that is the env view too.  The options and assignments are not applied
+/// to the view, because skim starts `printenv` directly.  The command line
+/// of `-S` is split at white space, with no quote or escape rules.  Only
+/// another child program goes to the real `env` binary.
+///
+/// Known limit: a child such as `sh -c env` runs a program that skim cannot
+/// inspect, so it goes to the real `env` binary.
+pub(super) fn env_route(args: &[String]) -> EnvRoute {
+    route_from(args, false)
+}
+
+/// [`env_route`] for `args`.  `grammar_used` is true when an option or an
+/// assignment came before `args`.
+fn route_from(args: &[String], mut grammar_used: bool) -> EnvRoute {
+    let mut rest = args;
+    let mut options_done = false;
+    let mut null = false;
+    // Bound: each pass removes at least one argument from `rest`, and a
+    // `-S` pass recurses on fewer bytes than it removes.
+    while let Some((arg, tail)) = rest.split_first() {
+        let word = if options_done {
+            plain_word(arg)
+        } else {
+            option_word(arg)
+        };
+        rest = match word {
+            EnvWord::Child => return child_route(arg, tail, grammar_used),
+            EnvWord::SplitString(inline) => {
+                let (value, after) = match (inline, tail.split_first()) {
+                    (Some(value), _) => (value, tail),
+                    (None, Some((value, after))) => (value.as_str(), after),
+                    (None, None) => ("", tail),
+                };
+                let mut words: Vec<String> = value
+                    .split_whitespace()
+                    .map(|word| word.trim_matches(['\'', '"']).to_string())
+                    .collect();
+                words.extend_from_slice(after);
+                return route_from(&words, true);
+            }
+            EnvWord::Option {
+                takes_next,
+                null: is_null,
+            } => {
+                null |= is_null;
+                grammar_used = true;
+                if takes_next {
+                    tail.get(1..).unwrap_or_default()
+                } else {
+                    tail
+                }
+            }
+            EnvWord::EndOfOptions | EnvWord::Assignment => {
+                options_done = true;
+                grammar_used = true;
+                tail
+            }
+        };
+    }
+    EnvRoute::View(if null {
+        vec!["-0".to_string()]
+    } else {
+        Vec::new()
+    })
+}
+
+/// The route for the child program `child` with `child_args`.
+fn child_route(child: &str, child_args: &[String], grammar_used: bool) -> EnvRoute {
+    let name = std::path::Path::new(child)
+        .file_name()
+        .and_then(|name| name.to_str());
+    match name {
+        Some("printenv") => EnvRoute::View(child_args.to_vec()),
+        Some("env") => route_from(child_args, true),
+        // `skim env NAME` with no option or assignment: the handler reads it
+        // as `printenv NAME`, as before.
+        _ if !grammar_used => {
+            let mut view_args = vec![child.to_string()];
+            view_args.extend_from_slice(child_args);
+            EnvRoute::View(view_args)
+        }
+        _ => EnvRoute::Exec,
+    }
+}
+
+/// The kind of one `env` argument.
+enum EnvWord<'a> {
+    /// `-S` / `--split-string`; the value is inline, or the next argument.
+    SplitString(Option<&'a str>),
+    /// An option; `takes_next` when its value is the next argument.
+    Option { takes_next: bool, null: bool },
+    /// `--`: the end of the options.
+    EndOfOptions,
+    /// `NAME=VALUE`.
+    Assignment,
+    /// The child program.
+    Child,
+}
+
+/// The kind of an argument after the options.
+fn plain_word(arg: &str) -> EnvWord<'_> {
+    if arg.contains('=') {
+        EnvWord::Assignment
+    } else {
+        EnvWord::Child
+    }
+}
+
+/// The kind of an argument while options can still come.
+fn option_word(arg: &str) -> EnvWord<'_> {
+    if arg == "--" {
+        return EnvWord::EndOfOptions;
+    }
+    // `-` alone is the old spelling of `-i`.
+    if arg == "-" {
+        return EnvWord::Option {
+            takes_next: false,
+            null: false,
+        };
+    }
+    if let Some(long) = arg.strip_prefix("--") {
+        return long_option_word(long);
+    }
+    if let Some(cluster) = arg.strip_prefix('-') {
+        let mut null = false;
+        for (i, c) in cluster.char_indices() {
+            null |= c == '0';
+            if ENV_SHORT_VALUE_OPTIONS.contains(&c) {
+                let attached = &cluster[i + c.len_utf8()..];
+                let inline = (!attached.is_empty()).then_some(attached);
+                if c == 'S' {
+                    return EnvWord::SplitString(inline);
+                }
+                return EnvWord::Option {
+                    takes_next: inline.is_none(),
+                    null,
+                };
+            }
+        }
+        return EnvWord::Option {
+            takes_next: false,
+            null,
+        };
+    }
+    plain_word(arg)
+}
+
+/// The kind of a long option (`long` is the text after `--`).  A unique
+/// prefix of a name is that option, as `getopt_long` reads it.  An unknown
+/// or ambiguous name makes `env` stop with an error, so it runs nothing.
+fn long_option_word(long: &str) -> EnvWord<'_> {
+    let (name, inline) = match long.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (long, None),
+    };
+    let exact = ENV_LONG_OPTIONS.iter().find(|(option, _)| *option == name);
+    let found = exact.or_else(|| {
+        let mut matches = ENV_LONG_OPTIONS
+            .iter()
+            .filter(|(option, _)| !name.is_empty() && option.starts_with(name));
+        let first = matches.next();
+        if matches.next().is_none() {
+            first
+        } else {
+            None
+        }
+    });
+    match found {
+        Some(("split-string", _)) => EnvWord::SplitString(inline),
+        Some((option, takes_value)) => EnvWord::Option {
+            takes_next: *takes_value && inline.is_none(),
+            null: *option == "null",
+        },
+        None => EnvWord::Option {
+            takes_next: false,
+            null: false,
+        },
+    }
+}
+
+/// skim's own environment.  A `printenv` child inherits it unchanged
+/// (`CONFIG.env_overrides` is empty), so it gives the exact records of the
+/// child's output: a value over several lines is one record, whatever its
+/// lines hold.
+struct KnownEnv {
+    values: HashMap<String, String>,
+}
+
+impl KnownEnv {
+    fn from_process() -> Self {
+        // Lossy like the child's stdout (`runner` decodes it lossily), so a
+        // non-UTF-8 value compares equal to the text that the parse sees.
+        Self::from_pairs(std::env::vars_os().map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        }))
+    }
+
+    fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            values: pairs.into_iter().collect(),
+        }
+    }
+
+    /// The known record `KEY=value` at the start of `text`, followed by
+    /// `terminator` or by the end of the text.  Returns the key, the value
+    /// and the length of the record with its terminator.
+    fn record_at<'k>(&'k self, text: &str, terminator: char) -> Option<(&'k str, &'k str, usize)> {
+        let key_end = text.find(['=', '\n', '\0'])?;
+        if !text[key_end..].starts_with('=') {
+            return None;
+        }
+        let (key, value) = self.values.get_key_value(&text[..key_end])?;
+        let value_start = key_end + 1;
+        let used = value_with_terminator(&text[value_start..], value, terminator)?;
+        Some((key.as_str(), value.as_str(), value_start + used))
+    }
+}
+
+/// The length of `value` and its terminator when `text` starts with exactly
+/// `value`, followed by `terminator` or by the end of the text.
+fn value_with_terminator(text: &str, value: &str, terminator: char) -> Option<usize> {
+    let after = text.strip_prefix(value)?;
+    match after.chars().next() {
+        None => Some(value.len()),
+        Some(c) if c == terminator => Some(value.len() + c.len_utf8()),
+        Some(_) => None,
+    }
 }
 
 /// The variable names that the caller asked `printenv` for (every argument
@@ -124,24 +425,27 @@ fn requested_names(args: &[String]) -> Vec<String> {
 
 /// Three-tier parse function for env/printenv output.
 ///
-/// Every path that can carry a value goes through a mask step: no input
-/// shape (a listing of any size, a value over several lines, NUL-separated
-/// records, or bare values for named variables) reaches stdout unmasked.
-/// Only an empty output, or a listing with no `KEY=` record and no requested
-/// name, passes through.
-fn parse_impl(output: &CommandOutput, requested: &[String]) -> ParseResult<FileResult> {
-    if !requested.is_empty() {
-        return match mask_named_values(&output.stdout, requested) {
-            Some(result) => ParseResult::Full(result),
-            None => ParseResult::Passthrough(output.stdout.clone()),
-        };
+/// Every path that can carry a value goes through a mask step.  For the
+/// output of a `printenv` child, the records come from skim's own
+/// environment, so each value is masked whole.  For text on stdin, a line
+/// rule finds the records, and the lines it puts inside a masked value are
+/// hidden with a counted footer.  Only an empty output, or a listing with no
+/// `KEY=` record and no requested name, passes through.
+///
+/// Known limit (stdin only): a line inside a masked value that has the
+/// shape of a new variable (`name=value`, with a portable name that is not
+/// sensitive) reads as a new variable and shows.
+fn parse_impl(output: &CommandOutput, request: &EnvRequest) -> ParseResult<FileResult> {
+    let known = request.known.as_ref();
+    let result = if request.names.is_empty() {
+        mask_listing(&output.stdout, known)
+    } else {
+        mask_named_values(&output.stdout, &request.names, known)
+    };
+    match result {
+        Some(result) => ParseResult::Full(result),
+        None => ParseResult::Passthrough(output.stdout.clone()),
     }
-
-    if let Some(result) = try_parse_env(&output.stdout) {
-        return ParseResult::Full(result);
-    }
-
-    ParseResult::Passthrough(output.stdout.clone())
 }
 
 // ============================================================================
@@ -150,27 +454,52 @@ fn parse_impl(output: &CommandOutput, requested: &[String]) -> ParseResult<FileR
 
 /// Mask the bare values that `printenv NAME...` prints.
 ///
-/// The output has no keys, and a value can span several lines, so a line
-/// cannot be mapped to its name.  When any requested name is sensitive,
-/// every line is masked (fail closed).  Otherwise each line only gets the
-/// URL-credential redaction that the listing applies to values.
-fn mask_named_values(stdout: &str, requested: &[String]) -> Option<FileResult> {
+/// The output has no keys.  When the names are known, each value is matched
+/// exactly, in the order of the names (a name that is not set prints
+/// nothing), and masked by its own name.  Text that no known value accounts
+/// for fails closed: every line of it is masked when any requested name is
+/// sensitive, and gets the line mask otherwise.
+fn mask_named_values(
+    stdout: &str,
+    requested: &[String],
+    known: Option<&KnownEnv>,
+) -> Option<FileResult> {
     if stdout.trim().is_empty() {
         return None;
     }
 
-    let mask_all = requested.iter().any(|name| is_sensitive_key(name));
-    let entries: Vec<String> = stdout
-        .split(['\n', '\0'])
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            if mask_all {
-                "***".to_string()
+    let terminator = if stdout.contains('\0') { '\0' } else { '\n' };
+    let mut entries: Vec<String> = Vec::new();
+    let mut rest = stdout;
+    if let Some(known) = known {
+        for name in requested {
+            let Some(value) = known.values.get(name) else {
+                continue;
+            };
+            let Some(used) = value_with_terminator(rest, value, terminator) else {
+                continue;
+            };
+            if is_sensitive_key(name) {
+                entries.push("***".to_string());
             } else {
-                redact_value(line)
+                entries.extend(value.split('\n').map(display_line));
             }
-        })
-        .collect();
+            rest = &rest[used..];
+        }
+    }
+
+    let mask_all = requested.iter().any(|name| is_sensitive_key(name));
+    entries.extend(
+        rest.split(['\n', '\0'])
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                if mask_all {
+                    "***".to_string()
+                } else {
+                    display_line(line)
+                }
+            }),
+    );
 
     let count = entries.len();
     Some(FileResult::new(
@@ -185,116 +514,171 @@ fn mask_named_values(stdout: &str, requested: &[String]) -> Option<FileResult> {
 /// Parse a `KEY=value` listing and mask the sensitive values.
 ///
 /// Records are NUL-separated when the output holds a NUL byte (`printenv -0`),
-/// and newline-separated otherwise.  In the NUL form each record is one
-/// variable, so a value with newlines is exact.  In the newline form a line
-/// that does not start with a valid variable name and `=` is a continuation
-/// of the previous value: it is hidden when that value is masked, and shown
-/// as part of it otherwise.
+/// and newline-separated otherwise.  A known record (see [`KnownEnv`]) is
+/// taken whole.  Other text goes through the line rule of [`ListingView`].
 ///
 /// There is no line cap: every record goes through the mask, whatever the
 /// size of the listing.  The listing is already in memory, and the parse is
 /// one linear pass over it.
-fn try_parse_env(stdout: &str) -> Option<FileResult> {
+fn mask_listing(stdout: &str, known: Option<&KnownEnv>) -> Option<FileResult> {
     if stdout.trim().is_empty() {
         return None;
     }
 
-    if stdout.contains('\0') {
-        return parse_nul_records(stdout);
-    }
-
-    let mut entries: Vec<String> = Vec::new();
-    let mut total_count = 0usize;
-    // `None` before the first variable; `Some(masked)` for the current one.
-    let mut current_masked: Option<bool> = None;
-    // True while the lines after a masked value are continuation lines.
-    let mut in_masked_continuation = false;
-
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
+    let terminator = if stdout.contains('\0') { '\0' } else { '\n' };
+    let mut view = ListingView::default();
+    let mut rest = stdout;
+    // Bound: each pass removes at least one byte from `rest`.
+    while !rest.is_empty() {
+        if let Some((key, value, used)) = known.and_then(|k| k.record_at(rest, terminator)) {
+            view.push_record(key, value);
+            rest = &rest[used..];
             continue;
         }
+        let (unit, tail) = rest.split_once(terminator).unwrap_or((rest, ""));
+        if terminator == '\0' {
+            view.push_nul_record(unit);
+        } else {
+            view.push_line(unit.strip_suffix('\r').unwrap_or(unit));
+        }
+        rest = tail;
+    }
+    view.finish()
+}
 
+/// The env view under construction.
+#[derive(Default)]
+struct ListingView {
+    entries: Vec<String>,
+    variables: usize,
+    /// `None` before the first variable; `Some(masked)` for the current one.
+    current_masked: Option<bool>,
+    /// Lines that the line rule put inside a masked value, so not shown.
+    hidden_lines: usize,
+}
+
+impl ListingView {
+    /// A record with known edges: the whole value is masked, or shown line
+    /// by line with the line mask.
+    fn push_record(&mut self, key: &str, value: &str) {
+        self.variables += 1;
+        let masked = is_sensitive_key(key);
+        self.current_masked = Some(masked);
+        if masked {
+            self.entries.push(format!("{key}=***"));
+            return;
+        }
+        let mut lines = value.split('\n');
+        let first = lines.next().unwrap_or_default();
+        self.entries.push(format!("{key}={}", display_line(first)));
+        self.entries.extend(lines.map(display_line));
+    }
+
+    /// One NUL-separated record whose edges are not known.  NUL marks the
+    /// start of a variable, so the line state does not carry over.  Lines
+    /// after the first go through the line rule, because a NUL byte on
+    /// stdin does not prove that the text is `printenv -0` output.
+    fn push_nul_record(&mut self, record: &str) {
+        self.current_masked = None;
+        if record.trim().is_empty() {
+            return;
+        }
+        let Some((key, value)) = record.split_once('=') else {
+            // A record with no `=` has no key to judge it by: fail closed.
+            self.variables += 1;
+            self.current_masked = Some(true);
+            self.entries.push("***".to_string());
+            return;
+        };
+        self.variables += 1;
+        if is_sensitive_key(key) {
+            self.current_masked = Some(true);
+            self.entries.push(format!("{key}=***"));
+            return;
+        }
+        self.current_masked = Some(false);
+        let mut lines = value.split('\n');
+        let first = lines.next().unwrap_or_default();
+        self.entries.push(format!("{key}={}", display_line(first)));
+        for line in lines {
+            self.push_line(line);
+        }
+    }
+
+    /// One line whose record is not known.  A line that does not start with
+    /// a portable name and `=` is a continuation of the previous value: it
+    /// is hidden (and counted) when that value is masked, and shown with the
+    /// line mask otherwise.
+    fn push_line(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        let inside_masked = self.current_masked == Some(true);
         let variable = match line.split_once('=') {
-            // Inside a masked value over several lines, a line such as
-            // `abc==` (a padding tail) is part of that value, not a variable.
+            // Inside a masked value, a line such as `abc==` (a padding
+            // tail) is part of that value, not a variable.
             Some((key, value))
-                if is_variable_name(key)
-                    && !(in_masked_continuation && value.chars().all(|c| c == '=')) =>
+                if is_variable_name(key) && !(inside_masked && is_padding(value)) =>
             {
                 Some((key, value))
             }
             // Outside a masked value, a sensitive key is always masked, also
             // when it is not a portable name (for example a non-ASCII key).
-            Some((key, value)) if current_masked != Some(true) && is_sensitive_key(key) => {
-                Some((key, value))
-            }
+            Some((key, value)) if !inside_masked && is_sensitive_key(key) => Some((key, value)),
             _ => None,
         };
 
         match variable {
             Some((key, value)) => {
-                total_count += 1;
+                self.variables += 1;
                 let masked = is_sensitive_key(key);
-                current_masked = Some(masked);
-                in_masked_continuation = false;
-                let displayed_value = if masked {
+                self.current_masked = Some(masked);
+                let shown = if masked {
                     "***".to_string()
                 } else {
-                    redact_value(value)
+                    display_line(value)
                 };
-                entries.push(format!("{key}={displayed_value}"));
+                self.entries.push(format!("{key}={shown}"));
             }
-            None => match current_masked {
-                // Part of a masked value: it stays behind the mask.
-                Some(true) => in_masked_continuation = true,
-                // Part of a value that is not masked, or text before the
-                // first variable: shown, with the URL-credential redaction.
-                Some(false) | None => entries.push(redact_value(line)),
-            },
+            None if inside_masked => self.hidden_lines += 1,
+            // Part of a value that is not masked, or text before the first
+            // variable: shown, with the line mask.
+            None => self.entries.push(display_line(line)),
         }
     }
 
-    if total_count == 0 {
-        return None;
+    fn finish(self) -> Option<FileResult> {
+        if self.variables == 0 {
+            return None;
+        }
+        let footer = match self.hidden_lines {
+            0 => None,
+            1 => Some("1 line after a masked value is hidden".to_string()),
+            n => Some(format!("{n} lines after a masked value are hidden")),
+        };
+        Some(FileResult::new(
+            "env".to_string(),
+            self.variables,
+            self.variables,
+            self.entries,
+            footer,
+        ))
     }
-
-    Some(FileResult::new(
-        "env".to_string(),
-        total_count,
-        total_count,
-        entries,
-        None,
-    ))
 }
 
-/// Parse NUL-separated `KEY=value` records (`printenv -0`).
-fn parse_nul_records(stdout: &str) -> Option<FileResult> {
-    let mut entries: Vec<String> = Vec::new();
-    for record in stdout.split('\0') {
-        if record.trim().is_empty() {
-            continue;
-        }
-        let entry = match record.split_once('=') {
-            Some((key, _)) if is_sensitive_key(key) => format!("{key}=***"),
-            Some((key, value)) => format!("{key}={}", redact_value(value)),
-            // A record with no `=` has no key to judge it by: fail closed.
-            None => "***".to_string(),
-        };
-        entries.push(entry);
-    }
+/// True when `value` is a non-empty run of `=` (the tail of base64 padding).
+fn is_padding(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c == '=')
+}
 
-    let count = entries.len();
-    if count == 0 {
-        return None;
+/// One line of a value that is not masked, as shown: a line `KEY=value`
+/// with a sensitive `KEY` becomes `KEY=***`, and URL credentials are
+/// replaced.
+fn display_line(line: &str) -> String {
+    match line.split_once('=') {
+        Some((key, _)) if is_sensitive_key(key) => format!("{key}=***"),
+        _ => redact_value(line),
     }
-    Some(FileResult::new(
-        "env".to_string(),
-        count,
-        count,
-        entries,
-        None,
-    ))
 }
 
 /// True when `key` is a portable variable name (`[A-Za-z_][A-Za-z0-9_]*`).
@@ -361,10 +745,40 @@ mod tests {
     use super::*;
     use crate::cmd::test_utils::{load_fixture, make_output_full};
 
+    /// A request for text on stdin: no names, no known records.
+    fn stdin_request() -> EnvRequest {
+        EnvRequest::new(&[], true, || panic!("stdin text has no known records"))
+    }
+
+    /// A request for `printenv NAME...` with no known records.
+    fn named_request(names: &[String]) -> EnvRequest {
+        EnvRequest {
+            names: names.to_vec(),
+            known: None,
+        }
+    }
+
+    /// A request for the output of a `printenv` child, with these records.
+    fn child_request(args: &[&str], records: &[(&str, &str)]) -> EnvRequest {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        EnvRequest::new(&args, false, || {
+            KnownEnv::from_pairs(records.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        })
+    }
+
+    /// The listing parse for text on stdin.
+    fn stdin_listing(input: &str) -> Option<FileResult> {
+        mask_listing(input, None)
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
     #[test]
     fn test_tier1_env_basic() {
         let input = load_fixture("file", "env_basic.txt");
-        let result = try_parse_env(&input);
+        let result = stdin_listing(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
         assert_eq!(result.total_count, 20, "20 variables in env_basic.txt");
@@ -378,21 +792,21 @@ mod tests {
     #[test]
     fn test_redacts_suffix_token() {
         let input = "MY_API_TOKEN=super-secret-value\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "MY_API_TOKEN=***");
     }
 
     #[test]
     fn test_redacts_suffix_secret() {
         let input = "APP_SECRET=very-secret\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "APP_SECRET=***");
     }
 
     #[test]
     fn test_redacts_suffix_password() {
         let input = "DB_PASSWORD=hunter2\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "DB_PASSWORD=***");
     }
 
@@ -400,21 +814,21 @@ mod tests {
     fn test_redacts_suffix_key() {
         // _KEY alone is no longer a sensitive suffix; _API_KEY and _SECRET_KEY are.
         let input = "SIGNING_API_KEY=abcdef1234\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "SIGNING_API_KEY=***");
     }
 
     #[test]
     fn test_redacts_secret_key_suffix() {
         let input = "MY_SECRET_KEY=abcdef1234\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "MY_SECRET_KEY=***");
     }
 
     #[test]
     fn test_redacts_private_key_suffix() {
         let input = "RSA_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "RSA_PRIVATE_KEY=***");
     }
 
@@ -423,7 +837,7 @@ mod tests {
         // REGISTRY_KEY ends with _KEY but NOT with _API_KEY, _SECRET_KEY, or _PRIVATE_KEY.
         // It must NOT be redacted.
         let input = "REGISTRY_KEY=HKLM\\\\Software\\\\Example\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert!(
             result.entries[0].starts_with("REGISTRY_KEY=HKLM"),
             "REGISTRY_KEY should NOT be redacted, got: {}",
@@ -434,14 +848,14 @@ mod tests {
     #[test]
     fn test_redacts_suffix_credential() {
         let input = "SERVICE_CREDENTIAL=cred-value\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "SERVICE_CREDENTIAL=***");
     }
 
     #[test]
     fn test_redacts_suffix_auth() {
         let input = "MY_CUSTOM_AUTH=bearer-token\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(result.entries[0], "MY_CUSTOM_AUTH=***");
     }
 
@@ -449,7 +863,7 @@ mod tests {
     fn test_redacts_exact_keys() {
         for key in SENSITIVE_EXACT {
             let input = format!("{key}=some-value\n");
-            let result = try_parse_env(&input).unwrap();
+            let result = stdin_listing(&input).unwrap();
             assert_eq!(
                 result.entries[0],
                 format!("{key}=***"),
@@ -461,7 +875,7 @@ mod tests {
     #[test]
     fn test_redacts_url_credentials() {
         let input = load_fixture("file", "env_url_creds.txt");
-        let result = try_parse_env(&input).unwrap();
+        let result = stdin_listing(&input).unwrap();
 
         // DATABASE_URL is an exact key match → fully redacted
         let db_entry = result
@@ -504,7 +918,7 @@ mod tests {
     #[test]
     fn test_preserves_safe_keys() {
         let input = "HOME=/home/dean\nSHELL=/bin/zsh\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert!(result.entries.iter().any(|e| e == "HOME=/home/dean"));
         assert!(result.entries.iter().any(|e| e == "SHELL=/bin/zsh"));
     }
@@ -515,7 +929,7 @@ mod tests {
         // BUT: MY_TOKEN_COUNT ends with _COUNT which is not a sensitive suffix.
         // The key MY_TOKEN_COUNT does NOT end with _TOKEN.
         let input = "MY_TOKEN_COUNT=5\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(
             result.entries[0], "MY_TOKEN_COUNT=5",
             "MY_TOKEN_COUNT should NOT be redacted (does not end with _TOKEN)"
@@ -526,7 +940,7 @@ mod tests {
     fn test_case_insensitive_key_match() {
         // Keys should be matched case-insensitively
         let input = "github_token=ghp_test\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(
             result.entries[0], "github_token=***",
             "Lowercase github_token should still be redacted"
@@ -539,7 +953,7 @@ mod tests {
         // "my_app_password" is not in SENSITIVE_EXACT, so it must be caught by the
         // suffix "_PASSWORD" even though the key is entirely lowercase.
         let input = "my_app_password=hunter2\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(
             result.entries[0], "my_app_password=***",
             "Lowercase suffix _password should be redacted via case-insensitive suffix match"
@@ -552,7 +966,7 @@ mod tests {
         // boundaries, which previously caused a panic in byte-slice indexing.
         // "clé_TOKEN" — "clé" contains a 2-byte UTF-8 sequence (é = U+00E9).
         let input = "cl\u{00e9}_TOKEN=secret\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(
             result.entries[0], "cl\u{00e9}_TOKEN=***",
             "Non-ASCII key ending with _TOKEN should be redacted without panic"
@@ -571,7 +985,7 @@ mod tests {
             ("APP_HMAC_KEY=hmac-val", "APP_HMAC_KEY=***"),
         ];
         for (input_line, expected) in &cases {
-            let result = try_parse_env(&format!("{input_line}\n")).unwrap();
+            let result = stdin_listing(&format!("{input_line}\n")).unwrap();
             assert_eq!(
                 result.entries[0], *expected,
                 "Expected {expected}, got {}",
@@ -588,9 +1002,9 @@ mod tests {
     // arithmetic.  Before the fix, `skip_net_savings_guard: false` caused the
     // net-savings guard to fall back to verbatim raw output when the redacted
     // form was no shorter — leaking secrets whose ciphertext is shorter than
-    // "***".  These tests exercise the `try_parse_env` layer directly; the
+    // "***".  These tests exercise the `mask_listing` layer directly; the
     // guard itself lives in execution.rs and is not reachable from a unit test.
-    // The unit tests confirm that `try_parse_env` always redacts regardless of
+    // The unit tests confirm that `mask_listing` always redacts regardless of
     // secret length.  An e2e test in crates/rskim/tests/ would be the honest
     // place to verify the guard is actually bypassed end-to-end — these unit
     // tests are the closest observable layer available without a running binary.
@@ -599,7 +1013,7 @@ mod tests {
         // 2-char secret: redacted form "***" is LONGER than "ab" in bytes.
         // Before the fix the guard rejected the compressed view and leaked "ab".
         let input = "GITHUB_TOKEN=ab\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(
             result.entries[0], "GITHUB_TOKEN=***",
             "Short GITHUB_TOKEN must be redacted regardless of byte length"
@@ -610,7 +1024,7 @@ mod tests {
     fn test_redacts_short_npm_token() {
         // 2-char secret: same guard-bypass scenario as GITHUB_TOKEN=ab.
         let input = "NPM_TOKEN=xy\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(
             result.entries[0], "NPM_TOKEN=***",
             "Short NPM_TOKEN must be redacted regardless of byte length"
@@ -621,7 +1035,7 @@ mod tests {
     fn test_redacts_medium_github_token() {
         // 8-char secret: previously verified to leak verbatim (issue evidence).
         let input = "GITHUB_TOKEN=abcd1234\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         assert_eq!(
             result.entries[0], "GITHUB_TOKEN=***",
             "8-char GITHUB_TOKEN must be redacted"
@@ -647,7 +1061,7 @@ mod tests {
             input.push_str(&format!("VAR_{i}=x\n"));
         }
         let output = make_output_full(&input, "", Some(0));
-        let result = parse_impl(&output, &[]);
+        let result = parse_impl(&output, &stdin_request());
         assert!(result.is_full(), "got {}", result.tier_name());
         let text = rendered(&result);
         assert!(text.contains("FAKE_TOKEN=***"));
@@ -660,7 +1074,7 @@ mod tests {
     #[test]
     fn test_continuation_with_equals_sign_stays_masked() {
         let input = "FAKE_TOKEN=fake-part-one\nfake-part-two=fake-part-three\nPLAIN=ok\n";
-        let result = try_parse_env(input).unwrap();
+        let result = stdin_listing(input).unwrap();
         let text = result.as_ref().to_string();
         assert!(text.contains("FAKE_TOKEN=***"));
         assert!(
@@ -675,7 +1089,7 @@ mod tests {
     #[test]
     fn test_padding_tail_of_masked_value_stays_masked() {
         let input = "FAKE_PRIVATE_KEY=-----BEGIN FAKE-----\nZmFrZWZha2VmYWtl\nZmFrZQ==\n-----END FAKE-----\nPLAIN=ok\n";
-        let text = try_parse_env(input).unwrap().as_ref().to_string();
+        let text = stdin_listing(input).unwrap().as_ref().to_string();
         assert!(text.contains("FAKE_PRIVATE_KEY=***"));
         assert!(!text.contains("ZmFrZ"), "no body line shows: {text}");
         assert!(!text.contains("FAKE-----"), "no armour line shows: {text}");
@@ -686,7 +1100,7 @@ mod tests {
     #[test]
     fn test_continuation_of_plain_value_is_shown() {
         let input = "PLAIN=line-one\nline-two\nOTHER=ok\n";
-        let text = try_parse_env(input).unwrap().as_ref().to_string();
+        let text = stdin_listing(input).unwrap().as_ref().to_string();
         assert!(text.contains("PLAIN=line-one"));
         assert!(text.contains("line-two"));
         assert!(text.contains("OTHER=ok"));
@@ -698,7 +1112,7 @@ mod tests {
     fn test_nul_records_are_masked() {
         let input = "PLAIN=1\0FAKE_TOKEN=fake-value-123\nfake-line-two\0fake-orphan\0";
         let output = make_output_full(input, "", Some(0));
-        let result = parse_impl(&output, &[]);
+        let result = parse_impl(&output, &stdin_request());
         assert!(result.is_full(), "got {}", result.tier_name());
         let text = rendered(&result);
         assert!(text.contains("PLAIN=1"));
@@ -711,7 +1125,7 @@ mod tests {
     fn test_named_sensitive_value_is_masked() {
         let output = make_output_full("fake-value-123\nfake-line-two\n", "", Some(0));
         let requested = vec!["FAKE_TOKEN".to_string(), "PLAIN".to_string()];
-        let result = parse_impl(&output, &requested);
+        let result = parse_impl(&output, &named_request(&requested));
         assert!(result.is_full(), "got {}", result.tier_name());
         let text = rendered(&result);
         assert!(!text.contains("fake-"), "no fake value shows: {text}");
@@ -724,7 +1138,7 @@ mod tests {
     fn test_named_plain_value_is_shown_with_url_redaction() {
         let output = make_output_full("https://fakeuser:fakepass@example.invalid/x\n", "", Some(0));
         let requested = vec!["PLAIN_URL".to_string()];
-        let text = rendered(&parse_impl(&output, &requested));
+        let text = rendered(&parse_impl(&output, &named_request(&requested)));
         assert!(text.contains("example.invalid/x"));
         assert!(!text.contains("fakeuser"));
         assert!(!text.contains("fakepass"));
@@ -754,7 +1168,7 @@ mod tests {
     #[test]
     fn test_sensitive_key_with_unusual_name_is_masked_after_plain_value() {
         let input = "PLAIN=ok\nfake-app_TOKEN=fake-value-123\n";
-        let text = try_parse_env(input).unwrap().as_ref().to_string();
+        let text = stdin_listing(input).unwrap().as_ref().to_string();
         assert!(text.contains("fake-app_TOKEN=***"));
         assert!(!text.contains("fake-value-123"), "{text}");
     }
@@ -769,7 +1183,7 @@ mod tests {
         for i in 0..count {
             input.push_str(&format!("MY_VAR_{i:03}=value_{i}\n"));
         }
-        let result = try_parse_env(&input).unwrap();
+        let result = stdin_listing(&input).unwrap();
         assert_eq!(
             result.total_count, count,
             "total_count must reflect all {count} variables"
@@ -789,7 +1203,7 @@ mod tests {
     #[test]
     fn test_tier3_empty_passthrough() {
         let output = make_output_full("", "", Some(1));
-        let result = parse_impl(&output, &[]);
+        let result = parse_impl(&output, &stdin_request());
         assert!(
             result.is_passthrough(),
             "Empty output should be passthrough, got {}",
@@ -801,11 +1215,303 @@ mod tests {
     fn test_parse_impl_produces_full() {
         let input = load_fixture("file", "env_basic.txt");
         let output = make_output_full(&input, "", Some(0));
-        let result = parse_impl(&output, &[]);
+        let result = parse_impl(&output, &stdin_request());
         assert!(
             result.is_full(),
             "parse_impl with exit code 0 and valid env output should return Full, got {}",
             result.tier_name()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Child output: exact records from skim's own environment
+    // ------------------------------------------------------------------
+
+    // A masked value over several lines whose second line has the shape of
+    // a variable: the known record holds both lines, so neither shows.
+    #[test]
+    fn test_child_value_with_name_shaped_line_stays_masked() {
+        let value = "fake-part-one\nfakeparttwo=fake-part-three";
+        let stdout = format!("FAKE_TOKEN={value}\nPLAIN=ok\n");
+        let request = child_request(&[], &[("FAKE_TOKEN", value), ("PLAIN", "ok")]);
+        let result = parse_impl(&make_output_full(&stdout, "", Some(0)), &request);
+        let text = rendered(&result);
+        assert!(text.contains("FAKE_TOKEN=***"), "{text}");
+        assert!(
+            !text.contains("fake-part"),
+            "no part of the value shows: {text}"
+        );
+        assert!(text.contains("PLAIN=ok"), "{text}");
+    }
+
+    // The same, for a value that starts with a newline.
+    #[test]
+    fn test_child_value_that_starts_with_newline_stays_masked() {
+        let value = "\nfakeparttwo=fake-part-three";
+        let stdout = format!("FAKE_TOKEN={value}\nPLAIN=ok\n");
+        let request = child_request(&[], &[("FAKE_TOKEN", value), ("PLAIN", "ok")]);
+        let text = rendered(&parse_impl(
+            &make_output_full(&stdout, "", Some(0)),
+            &request,
+        ));
+        assert!(!text.contains("fake-part"), "{text}");
+        assert!(text.contains("PLAIN=ok"), "{text}");
+    }
+
+    // A variable with a name that is not portable, and an exported shell
+    // function, after a masked variable: both are known records, so both
+    // show and are counted.
+    #[test]
+    fn test_child_variables_after_masked_value_are_shown() {
+        let function = "() {  echo fake-body\n}";
+        let stdout = format!(
+            "FAKE_TOKEN=fake-value-123\nfake-name=fake-visible\nBASH_FUNC_fakefn%%={function}\n"
+        );
+        let request = child_request(
+            &[],
+            &[
+                ("FAKE_TOKEN", "fake-value-123"),
+                ("fake-name", "fake-visible"),
+                ("BASH_FUNC_fakefn%%", function),
+            ],
+        );
+        let result = parse_impl(&make_output_full(&stdout, "", Some(0)), &request);
+        let ParseResult::Full(file) = &result else {
+            panic!("got {}", result.tier_name());
+        };
+        let text = rendered(&result);
+        assert!(!text.contains("fake-value-123"), "{text}");
+        assert!(text.contains("fake-name=fake-visible"), "{text}");
+        assert!(
+            text.contains("BASH_FUNC_fakefn%%=() {  echo fake-body"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n }"),
+            "the body of the function shows: {text}"
+        );
+        assert_eq!(file.total_count, 3);
+        assert!(file.footer.is_none(), "nothing is hidden: {text}");
+    }
+
+    // A real `printenv` child: the known records match its output exactly,
+    // also for a value over several lines and a name that is not portable.
+    #[cfg(unix)]
+    #[test]
+    fn test_real_printenv_child_records_are_exact() {
+        let pairs = [
+            ("FAKE_TOKEN", "fake-part-one\nfakeparttwo=fake-part-three"),
+            ("fake-name", "fake-visible"),
+            ("PLAIN", "ok"),
+        ];
+        let output = std::process::Command::new("printenv")
+            .env_clear()
+            .envs(pairs)
+            .output()
+            .expect("printenv is installed on unix");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let known = KnownEnv::from_pairs(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let result = mask_listing(&stdout, Some(&known)).expect("a listing");
+        let text = result.as_ref();
+        assert!(!text.contains("fake-part"), "{text}");
+        assert!(text.contains("FAKE_TOKEN=***"), "{text}");
+        assert!(text.contains("fake-name=fake-visible"), "{text}");
+        assert!(text.contains("PLAIN=ok"), "{text}");
+        assert_eq!(result.total_count, 3, "{text}");
+        assert!(result.footer.is_none(), "{text}");
+    }
+
+    // A line that no known record accounts for, after a masked record: it
+    // is hidden, and the footer counts it.
+    #[test]
+    fn test_child_unknown_line_after_masked_value_is_counted() {
+        let stdout = "FAKE_TOKEN=fake-value-123\nfake-unknown-line\nPLAIN=ok\n";
+        let request = child_request(&[], &[("FAKE_TOKEN", "fake-value-123"), ("PLAIN", "ok")]);
+        let result = parse_impl(&make_output_full(stdout, "", Some(0)), &request);
+        let text = rendered(&result);
+        assert!(!text.contains("fake-"), "{text}");
+        assert!(
+            text.contains("1 line after a masked value is hidden"),
+            "{text}"
+        );
+        assert!(text.contains("PLAIN=ok"), "{text}");
+    }
+
+    // NUL records from a child: a plain value over lines shows whole.
+    #[test]
+    fn test_child_nul_records_are_exact() {
+        let stdout = "PLAIN=line-one\nline-two\0FAKE_TOKEN=fake-a\nfake-b\0";
+        let request = child_request(
+            &["-0"],
+            &[
+                ("PLAIN", "line-one\nline-two"),
+                ("FAKE_TOKEN", "fake-a\nfake-b"),
+            ],
+        );
+        assert!(request.names.is_empty(), "-0 is a flag, not a name");
+        let text = rendered(&parse_impl(
+            &make_output_full(stdout, "", Some(0)),
+            &request,
+        ));
+        assert!(text.contains("PLAIN=line-one"), "{text}");
+        assert!(text.contains("line-two"), "{text}");
+        assert!(text.contains("FAKE_TOKEN=***"), "{text}");
+        assert!(!text.contains("fake-"), "{text}");
+    }
+
+    // `printenv NAME...` from a child: each value is matched and masked by
+    // its own name, also over several lines.
+    #[test]
+    fn test_child_named_values_are_masked_by_name() {
+        let stdout = "fake-plain\nfake-a\nfake-b\n";
+        let request = child_request(
+            &["PLAIN", "UNSET_NAME", "FAKE_TOKEN"],
+            &[("PLAIN", "fake-plain"), ("FAKE_TOKEN", "fake-a\nfake-b")],
+        );
+        let result = parse_impl(&make_output_full(stdout, "", Some(0)), &request);
+        let ParseResult::Full(file) = &result else {
+            panic!("got {}", result.tier_name());
+        };
+        assert_eq!(file.entries, vec!["fake-plain", "***"]);
+    }
+
+    // A failed child (exit 1) still goes through the mask.
+    #[test]
+    fn test_child_named_value_with_exit_one_is_masked() {
+        let request = child_request(
+            &["FAKE_TOKEN", "UNSET_NAME"],
+            &[("FAKE_TOKEN", "fake-value-123")],
+        );
+        let text = rendered(&parse_impl(
+            &make_output_full("fake-value-123\n", "", Some(1)),
+            &request,
+        ));
+        assert!(!text.contains("fake-value-123"), "{text}");
+    }
+
+    // A plain named value whose line has a sensitive key shape gets the
+    // line mask.
+    #[test]
+    fn test_named_plain_value_with_sensitive_line_is_masked() {
+        let value = "fake-head\nX_TOKEN=fake-inner";
+        let request = child_request(&["PLAIN_BLOB"], &[("PLAIN_BLOB", value)]);
+        let text = rendered(&parse_impl(
+            &make_output_full(&format!("{value}\n"), "", Some(0)),
+            &request,
+        ));
+        assert!(text.contains("fake-head"), "{text}");
+        assert!(text.contains("X_TOKEN=***"), "{text}");
+        assert!(!text.contains("fake-inner"), "{text}");
+    }
+
+    // ------------------------------------------------------------------
+    // Text on stdin: the line rule with a counted footer
+    // ------------------------------------------------------------------
+
+    // With stdin, `run` is a routing word, not a `printenv` name: the text
+    // is a listing and gets the key mask.
+    #[test]
+    fn test_run_word_with_stdin_is_a_listing() {
+        let request = EnvRequest::new(&strings(&["run"]), true, || {
+            panic!("stdin text has no known records")
+        });
+        assert!(request.names.is_empty());
+        let input = "FAKE_TOKEN=fake-value-123\nPLAIN=ok\n";
+        let text = rendered(&parse_impl(&make_output_full(input, "", Some(0)), &request));
+        assert!(text.contains("FAKE_TOKEN=***"), "{text}");
+        assert!(!text.contains("fake-value-123"), "{text}");
+    }
+
+    // A padding line right after a masked variable is part of its value.
+    #[test]
+    fn test_padding_first_line_of_masked_value_stays_masked() {
+        let input = "FAKE_PRIVATE_KEY=fake-part-one\nZmFrZQ==\nPLAIN=ok\n";
+        let text = stdin_listing(input).unwrap().as_ref().to_string();
+        assert!(!text.contains("ZmFrZQ"), "{text}");
+        assert!(text.contains("PLAIN=ok"), "{text}");
+        assert!(
+            text.contains("1 line after a masked value is hidden"),
+            "{text}"
+        );
+    }
+
+    // One NUL byte in a newline listing: the line mask still applies inside
+    // the record.
+    #[test]
+    fn test_stray_nul_keeps_the_line_mask() {
+        let input = "PLAIN=1\nFAKE_TOKEN=fake-value-123\n\0";
+        let text = rendered(&parse_impl(
+            &make_output_full(input, "", Some(0)),
+            &stdin_request(),
+        ));
+        assert!(text.contains("PLAIN=1"), "{text}");
+        assert!(text.contains("FAKE_TOKEN=***"), "{text}");
+        assert!(!text.contains("fake-value-123"), "{text}");
+    }
+
+    // A line hidden after a masked value on stdin is counted, never lost
+    // with no marker.
+    #[test]
+    fn test_stdin_hidden_line_is_counted() {
+        let input = "FAKE_TOKEN=fake-value-123\nfake-name=fake-visible\nfake-more\nPLAIN=ok\n";
+        let result = stdin_listing(input).unwrap();
+        assert_eq!(
+            result.footer.as_deref(),
+            Some("2 lines after a masked value are hidden")
+        );
+        assert!(result.as_ref().contains("PLAIN=ok"));
+    }
+
+    // An empty variable after a masked one is a variable, not padding.
+    #[test]
+    fn test_empty_variable_after_masked_value_is_shown() {
+        let input = "FAKE_TOKEN=fake-value-123\nEMPTY_VAR=\n";
+        let result = stdin_listing(input).unwrap();
+        assert!(
+            result.as_ref().contains("EMPTY_VAR="),
+            "{}",
+            result.as_ref()
+        );
+        assert_eq!(result.total_count, 2);
+        assert!(result.footer.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // The `env` grammar
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_env_route_env_views() {
+        let view = |args: &[&str]| env_route(&strings(args));
+        let empty = EnvRoute::View(Vec::new());
+        assert_eq!(view(&[]), empty);
+        assert_eq!(view(&["FOO=1"]), empty);
+        assert_eq!(view(&["FOO=1", "printenv"]), empty);
+        assert_eq!(view(&["-u", "FAKE_X", "FOO=1", "printenv"]), empty);
+        assert_eq!(view(&["-uFAKE_X", "printenv"]), empty);
+        assert_eq!(view(&["--uns", "FAKE_X", "printenv"]), empty);
+        assert_eq!(view(&["-i", "/usr/bin/env"]), empty);
+        assert_eq!(view(&["--", "FOO=1", "printenv"]), empty);
+        assert_eq!(view(&["-S", "FOO=1 printenv"]), empty);
+        assert_eq!(view(&["--split-string=printenv"]), empty);
+        assert_eq!(view(&["-S'printenv'"]), empty);
+        assert_eq!(view(&["env", "FOO=1", "printenv"]), empty);
+        assert_eq!(
+            view(&["FOO=1", "/usr/bin/printenv", "FAKE_TOKEN"]),
+            EnvRoute::View(strings(&["FAKE_TOKEN"]))
+        );
+        assert_eq!(view(&["-0"]), EnvRoute::View(strings(&["-0"])));
+        assert_eq!(view(&["PATH"]), EnvRoute::View(strings(&["PATH"])));
+    }
+
+    #[test]
+    fn test_env_route_other_children_exec() {
+        let route = |args: &[&str]| env_route(&strings(args));
+        assert_eq!(route(&["FOO=1", "npm", "test"]), EnvRoute::Exec);
+        assert_eq!(route(&["-u", "printenv", "npm"]), EnvRoute::Exec);
+        assert_eq!(route(&["-S", "npm test"]), EnvRoute::Exec);
+        assert_eq!(route(&["env", "FOO=1", "npm"]), EnvRoute::Exec);
+        // Known limit: skim cannot inspect what `sh -c` prints.
+        assert_eq!(route(&["FOO=1", "sh", "-c", "env"]), EnvRoute::Exec);
     }
 }
