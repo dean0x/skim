@@ -1846,6 +1846,223 @@ fn test_rewrite_help_mentions_agent_flag() {
 // Guidance upgrade bypass tests (issue 11)
 // ============================================================================
 
+fn project_init(sandbox: &Sandbox, project: &std::path::Path, agent: &str) -> String {
+    let output = sandbox
+        .init()
+        .args(["--project", "--agent", agent, "--yes", "--no-wrappers"])
+        .current_dir(project)
+        .timeout(std::time::Duration::from_secs(15))
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).unwrap()
+}
+
+const PROJECT_GUIDANCE: &[(&str, &str)] = &[
+    ("claude-code", "CLAUDE.md"),
+    ("codex", "AGENTS.md"),
+    ("gemini", "GEMINI.md"),
+    ("copilot", ".github/copilot-instructions.md"),
+    ("cursor", ".cursor/rules/skim.mdc"),
+];
+
+#[test]
+fn test_init_refreshes_each_stale_project_guidance_file_in_the_same_scope() {
+    for &(agent, file) in PROJECT_GUIDANCE {
+        let sandbox = Sandbox::new();
+        let project = sandbox.project_dir("project");
+        project_init(&sandbox, &project, agent);
+        let path = project.join(file);
+        let current = fs::read_to_string(&path).unwrap();
+        let stale = current.replace(
+            &format!("<!-- skim-start v{} -->", env!("CARGO_PKG_VERSION")),
+            "<!-- skim-start v0.0.1 -->",
+        );
+        assert_ne!(stale, current, "{agent}");
+        fs::write(&path, stale).unwrap();
+
+        let stdout = project_init(&sandbox, &project, agent);
+
+        assert!(!stdout.contains("Already up to date"), "{agent}: {stdout}");
+        assert!(stdout.contains("Updated guidance in"), "{agent}: {stdout}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), current, "{agent}");
+    }
+}
+
+#[test]
+fn test_init_keeps_a_broken_block_warns_and_skips_the_fast_path() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    project_init(&sandbox, &project, "claude-code");
+    let path = project.join("CLAUDE.md");
+    let broken = fs::read_to_string(&path)
+        .unwrap()
+        .replace("<!-- skim-end -->", "user text without an end marker");
+    fs::write(&path, &broken).unwrap();
+
+    for _ in 0..2 {
+        let output = sandbox
+            .init()
+            .args(["--project", "--agent", "claude-code", "--yes"])
+            .current_dir(&project)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stdout.contains("Already up to date"), "{stdout}");
+        assert!(
+            stderr.contains("warning: skim markers in CLAUDE.md"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+    }
+}
+
+#[test]
+fn test_project_init_and_uninstall_refuse_an_outside_instruction_file_and_dry_run_names_it() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    project_init(&sandbox, &project, "claude-code");
+    let path = project.join("CLAUDE.md");
+    let outside = sandbox.home().join("outside.md");
+    fs::rename(&path, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    let before = fs::read(&outside).unwrap();
+
+    let stdout = project_init(&sandbox, &project, "claude-code");
+    assert!(!stdout.contains("Already up to date"), "{stdout}");
+    assert!(
+        stdout.contains("Note: CLAUDE.md leads outside this project folder"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read(&outside).unwrap(), before);
+    let project_before = snapshot_tree(&project);
+
+    sandbox
+        .init()
+        .args(["--project", "--agent", "claude-code", "--yes", "--dry-run"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Note: CLAUDE.md leads outside this project folder",
+        ));
+    assert_eq!(snapshot_tree(&project), project_before);
+    sandbox
+        .init()
+        .args([
+            "--uninstall",
+            "--project",
+            "--agent",
+            "claude-code",
+            "--yes",
+        ])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "CLAUDE.md leads outside this project folder",
+        ));
+    assert_eq!(fs::read(&outside).unwrap(), before);
+    assert_eq!(fs::read_link(&path).unwrap(), outside);
+}
+
+#[test]
+fn test_project_init_refuses_cursor_guidance_in_a_folder_that_leads_outside() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    let outside = sandbox.project_dir("outside");
+    std::os::unix::fs::symlink(&outside, project.join(".cursor")).unwrap();
+    fs::write(outside.join("user.md"), "user instructions\n").unwrap();
+
+    let stdout = project_init(&sandbox, &project, "cursor");
+
+    assert!(
+        stdout.contains(".cursor/rules/skim.mdc leads outside this project folder"),
+        "{stdout}"
+    );
+    assert!(!outside.join("rules").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("user.md")).unwrap(),
+        "user instructions\n"
+    );
+    assert!(
+        fs::symlink_metadata(project.join(".cursor"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn test_project_claude_link_uses_the_shared_agents_file_and_stays_current_in_both_gates() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    let agents = project.join("AGENTS.md");
+    fs::write(&agents, "user instructions\n").unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", project.join("CLAUDE.md")).unwrap();
+    project_init(&sandbox, &project, "claude-code");
+    project_init(&sandbox, &project, "codex");
+    let current = fs::read_to_string(&agents).unwrap();
+    assert!(current.starts_with("user instructions\n"));
+    assert_eq!(current.matches("<!-- skim-start").count(), 1);
+    assert!(!current.contains("## Command wrapping"));
+    let before = snapshot_tree(&project);
+
+    for agent in ["claude-code", "codex"] {
+        let stdout = project_init(&sandbox, &project, agent);
+        assert!(stdout.contains("Already up to date"), "{agent}: {stdout}");
+        sandbox
+            .init()
+            .args(["--project", "--agent", agent, "--yes", "--dry-run"])
+            .current_dir(&project)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Already up to date"));
+        assert_eq!(snapshot_tree(&project), before, "{agent}");
+    }
+    assert_eq!(
+        fs::read_link(project.join("CLAUDE.md")).unwrap(),
+        std::path::Path::new("AGENTS.md")
+    );
+}
+
+#[test]
+fn test_project_cursor_keeps_an_outside_legacy_file_and_prints_its_refusal() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_dir("project");
+    let outside = sandbox.home().join("outside.md");
+    let text = "user text\n<!-- skim-start v0.0.1 -->\nold block\n<!-- skim-end -->\n";
+    fs::write(&outside, text).unwrap();
+    std::os::unix::fs::symlink(&outside, project.join(".cursorrules")).unwrap();
+
+    let stdout = project_init(&sandbox, &project, "cursor");
+
+    assert!(
+        stdout.contains("Note: .cursorrules leads outside this project folder"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), text);
+    sandbox
+        .init()
+        .args(["--uninstall", "--project", "--agent", "cursor", "--yes"])
+        .current_dir(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Note: .cursorrules leads outside this project folder",
+        ));
+    assert_eq!(fs::read_to_string(&outside).unwrap(), text);
+    assert_eq!(
+        fs::read_link(project.join(".cursorrules")).unwrap(),
+        outside
+    );
+}
+
 #[test]
 fn test_init_guidance_upgrade_updates_stale_version() {
     // Verifies that is_guidance_current returns false when the guidance section

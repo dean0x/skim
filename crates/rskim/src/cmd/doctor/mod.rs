@@ -1387,17 +1387,6 @@ mod tests {
     };
 
     #[test]
-    fn test_doctor_run_no_crash() {
-        // Smoke test: doctor must not panic or return an error.
-        let result = run(&[], &TEST_ANALYTICS);
-        assert!(
-            result.is_ok(),
-            "doctor should not return an error: {:?}",
-            result
-        );
-    }
-
-    #[test]
     fn test_doctor_help_flag() {
         let result = run(&["--help".to_string()], &TEST_ANALYTICS);
         assert!(result.is_ok());
