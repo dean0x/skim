@@ -1221,8 +1221,10 @@ const BENIGN_EXIT1_PROGRAMS: &[&str] = &["grep", "rg", "diff"];
 ///   those tools is a real error and still gets the hint.
 ///
 /// Unexpected failures (codes outside `expected_exit_codes`) raw-forward and
-/// return BEFORE reaching `record_and_report`, so a non-zero `code` seen here
-/// is always an EXPECTED failure the parser meaningfully compresses.
+/// return BEFORE reaching `record_and_report`, except for a `never_passthrough`
+/// handler, which parses them and never gets the hint (`hatch_open`).  So for
+/// every other handler a non-zero `code` seen here is an EXPECTED failure the
+/// parser meaningfully compresses.
 fn should_emit_compressed_hint(program: &str, code: i32, tier_name: &str) -> bool {
     let is_benign_exit1 = code == 1 && BENIGN_EXIT1_PROGRAMS.contains(&program);
     code != 0 && tier_name != "passthrough" && !is_benign_exit1
@@ -1244,6 +1246,9 @@ struct RecordReport<'a> {
     tier_name: &'static str,
     label: String,
     duration: std::time::Duration,
+    /// False when `never_passthrough` closes `SKIM_PASSTHROUGH=1` for this
+    /// handler, so the hint, which names it, would be false.
+    hatch_open: bool,
 }
 
 /// Record token savings and emit the analytics event for a completed command.
@@ -1261,6 +1266,7 @@ fn record_and_report(report: RecordReport<'_>) {
         tier_name,
         label,
         duration,
+        hatch_open,
     } = report;
 
     // Notice matrix (#317). Unexpected failures already raw-forwarded and
@@ -1275,7 +1281,7 @@ fn record_and_report(report: RecordReport<'_>) {
     // informational result.  Exit ≥ 2 is a real error and still shows the hint.
     // The decision lives in `should_emit_compressed_hint` so it is unit-tested
     // against the same code path (PF-007).
-    if should_emit_compressed_hint(program, code, tier_name) {
+    if hatch_open && should_emit_compressed_hint(program, code, tier_name) {
         eprintln!("{}", crate::output::compressed_output_hint(code));
     }
 
@@ -1439,11 +1445,11 @@ where
     // Forward raw stdout+stderr byte-faithfully (checked BEFORE ANSI
     // stripping) and record zero savings under the "raw" tier.
     //
-    // `never_passthrough` (PF-012) also closes this raw path: the parse is a
-    // security control there, and a failed child can still print values
-    // (GNU `printenv SET UNSET` prints the set value and exits 1).  The
-    // output goes through the parse, and the exit code below keeps the
-    // child's code (a signal kill reports 1).
+    // `never_passthrough` (PF-012) also closes this raw path.  A child with a
+    // non-zero exit can still print its normal output (GNU `printenv SET
+    // UNSET` prints the set value and exits 1), and that output gets the same
+    // parse.  The exit code below keeps the child's code (a signal kill
+    // reports 1).
     let disposition = classify_exit(output.exit_code, expected_exit_codes);
     if never_passthrough && disposition == ExitDisposition::UnexpectedFailure {
         if output.exit_code.is_none() {
@@ -1821,6 +1827,7 @@ where
         tier_name: effective_tier,
         label,
         duration: output.duration,
+        hatch_open: !never_passthrough,
     });
 
     Ok(ExitCode::from(code.clamp(0, 255) as u8))

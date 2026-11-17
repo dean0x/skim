@@ -100,16 +100,37 @@ const SENSITIVE_SUFFIXES: &[&str] = &[
     "_AUTH",
 ];
 
-/// Run `skim env [args...]` or `skim printenv [args...]`.
+/// The same handler when `env` options or assignments come before the
+/// child: the real `env` binary starts `printenv`, so the options and the
+/// assignments apply to the listing.
+const CONFIG_VIA_ENV: ToolRunConfig<'static> = ToolRunConfig {
+    program: "env",
+    install_hint: "env is typically pre-installed on Unix systems",
+    ..CONFIG
+};
+
+/// Run `skim printenv [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    let request = EnvRequest::new(
-        args,
-        crate::cmd::should_read_stdin(args),
-        KnownEnv::from_process,
-    );
+    run_view(&EnvView::printenv(args.to_vec()), ctx)
+}
+
+/// Run one env view (see [`env_route`]).
+pub(super) fn run_view(view: &EnvView, ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
+    let (config, args) = if view.env_words.is_empty() {
+        (CONFIG, view.printenv_args.clone())
+    } else {
+        let mut args = view.env_words.clone();
+        args.push(view.child.clone());
+        args.extend_from_slice(&view.printenv_args);
+        (CONFIG_VIA_ENV, args)
+    };
+    // The same decision as `run_tool` makes for these arguments.
+    let reads_stdin = crate::cmd::should_read_stdin(&args);
+    let known = KnownEnv::from_process().with_edits(&view.edits);
+    let request = EnvRequest::new(&view.printenv_args, reads_stdin, known);
     run_tool(
-        CONFIG,
-        args,
+        config,
+        &args,
         ctx,
         |_| {},
         move |output| parse_impl(output, &request),
@@ -120,39 +141,78 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
 struct EnvRequest {
     /// The names given to `printenv` (empty for a listing).
     names: Vec<String>,
-    /// skim's own environment when the text comes from a `printenv` child
-    /// that skim started; `None` for text on stdin.
-    known: Option<KnownEnv>,
+    /// The environment of the `printenv` child that skim starts.
+    known: KnownEnv,
 }
 
 impl EnvRequest {
-    /// Build the request.  When the handler reads stdin, the arguments are
-    /// not `printenv` names (`run` is a routing word), and the text is not
-    /// from a child of skim, so no record is known.
-    fn new(args: &[String], reads_stdin: bool, known: impl FnOnce() -> KnownEnv) -> Self {
-        if reads_stdin {
-            Self {
-                names: Vec::new(),
-                known: None,
-            }
+    /// Build the request.  When the handler can read stdin, the arguments
+    /// are not `printenv` names (`run` is a routing word).
+    ///
+    /// The known records apply to stdin text too: the handler starts the
+    /// child when stdin is empty, and on other stdin text an exact known
+    /// record only sets an edge that the line rule would also accept, or
+    /// hides more.
+    fn new(printenv_args: &[String], reads_stdin: bool, known: KnownEnv) -> Self {
+        let names = if reads_stdin {
+            Vec::new()
         } else {
-            Self {
-                names: requested_names(args),
-                known: Some(known()),
-            }
-        }
+            requested_names(printenv_args)
+        };
+        Self { names, known }
     }
 }
 
 /// How `skim env ARGS` is served.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum EnvRoute {
-    /// The masked env view, with these arguments for `printenv`.
-    View(Vec<String>),
+    /// The masked env view.
+    View(EnvView),
     /// The real `env` binary with the original arguments: it starts a child
     /// program that is not an env view (`env FOO=1 npm test`).
     Exec,
 }
+
+/// One env view: `[env ENV_WORDS] CHILD PRINTENV_ARGS`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct EnvView {
+    /// The `env` options, assignments and nested `env` words before the
+    /// child.  When there are some, the real `env` binary starts the child;
+    /// when there are none, skim starts `printenv` directly.
+    env_words: Vec<String>,
+    /// The child program as written (`printenv`, or a path to it).
+    child: String,
+    /// The arguments for `printenv`.
+    printenv_args: Vec<String>,
+    /// The changes that `env_words` make to the environment of the child.
+    edits: Vec<EnvEdit>,
+}
+
+impl EnvView {
+    /// `printenv ARGS`, started directly.
+    fn printenv(printenv_args: Vec<String>) -> Self {
+        Self {
+            env_words: Vec::new(),
+            child: "printenv".to_string(),
+            printenv_args,
+            edits: Vec::new(),
+        }
+    }
+}
+
+/// One change that `env` makes to the environment, in order.
+#[derive(Debug, PartialEq, Eq)]
+enum EnvEdit {
+    /// `-i`: start from an empty environment.
+    Clear,
+    /// `-u NAME`.
+    Unset(String),
+    /// `NAME=VALUE`.
+    Set(String, String),
+}
+
+/// The maximum number of `-S` command lines that one `env` route expands.
+const MAX_SPLIT_STRINGS: usize = 4;
 
 /// `env` short options that take a value (GNU and BSD): the rest of the
 /// cluster, or the next argument.
@@ -180,103 +240,234 @@ const ENV_LONG_OPTIONS: &[(&str, bool)] = &[
 ///
 /// A child whose file name is `env` or `printenv` (also as a path) is an env
 /// view, so it gets the mask.  With no child, `env` prints the listing, so
-/// that is the env view too.  The options and assignments are not applied
-/// to the view, because skim starts `printenv` directly.  The command line
-/// of `-S` is split at white space, with no quote or escape rules.  Only
-/// another child program goes to the real `env` binary.
+/// that is the env view too, with `printenv` as the child.  The `-S` command
+/// line is split with the GNU quote and escape rules.  A `-S` line that skim
+/// cannot read (a `${VAR}` expansion, an open quote, more than
+/// [`MAX_SPLIT_STRINGS`] lines) gives the plain listing view, which runs no
+/// other program.  Only another child program goes to the real `env` binary.
 ///
 /// Known limit: a child such as `sh -c env` runs a program that skim cannot
 /// inspect, so it goes to the real `env` binary.
 pub(super) fn env_route(args: &[String]) -> EnvRoute {
-    route_from(args, false)
-}
-
-/// [`env_route`] for `args`.  `grammar_used` is true when an option or an
-/// assignment came before `args`.
-fn route_from(args: &[String], mut grammar_used: bool) -> EnvRoute {
-    let mut rest = args;
+    let mut words: Vec<String> = args.to_vec();
+    let mut i = 0;
+    let mut grammar_used = false;
     let mut options_done = false;
     let mut null = false;
-    // Bound: each pass removes at least one argument from `rest`, and a
-    // `-S` pass recurses on fewer bytes than it removes.
-    while let Some((arg, tail)) = rest.split_first() {
+    let mut splits = 0;
+    let mut edits: Vec<EnvEdit> = Vec::new();
+    // Bound: each pass moves `i` forward, except a `-S` pass, and at most
+    // MAX_SPLIT_STRINGS of those occur.
+    while let Some(arg) = words.get(i) {
         let word = if options_done {
             plain_word(arg)
         } else {
             option_word(arg)
         };
-        rest = match word {
-            EnvWord::Child => return child_route(arg, tail, grammar_used),
-            EnvWord::SplitString(inline) => {
-                let (value, after) = match (inline, tail.split_first()) {
-                    (Some(value), _) => (value, tail),
-                    (None, Some((value, after))) => (value.as_str(), after),
-                    (None, None) => ("", tail),
-                };
-                let mut words: Vec<String> = value
-                    .split_whitespace()
-                    .map(|word| word.trim_matches(['\'', '"']).to_string())
-                    .collect();
-                words.extend_from_slice(after);
-                return route_from(&words, true);
-            }
-            EnvWord::Option {
-                takes_next,
-                null: is_null,
-            } => {
-                null |= is_null;
-                grammar_used = true;
-                if takes_next {
-                    tail.get(1..).unwrap_or_default()
-                } else {
-                    tail
+        match word {
+            EnvWord::Child => {
+                let name = std::path::Path::new(arg)
+                    .file_name()
+                    .and_then(|name| name.to_str());
+                match name {
+                    Some("printenv") => {
+                        let env_words = if grammar_used {
+                            words[..i].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        return EnvRoute::View(EnvView {
+                            env_words,
+                            child: arg.clone(),
+                            printenv_args: words[i + 1..].to_vec(),
+                            edits,
+                        });
+                    }
+                    Some("env") => {
+                        grammar_used = true;
+                        options_done = false;
+                        null = false;
+                        i += 1;
+                    }
+                    // `skim env NAME` with no option or assignment: the
+                    // handler reads it as `printenv NAME`, as before.
+                    _ if !grammar_used => {
+                        return EnvRoute::View(EnvView::printenv(words[i..].to_vec()));
+                    }
+                    _ => return EnvRoute::Exec,
                 }
             }
-            EnvWord::EndOfOptions | EnvWord::Assignment => {
+            EnvWord::Option(option) => {
+                grammar_used = true;
+                null |= option.null;
+                if option.clear {
+                    edits.push(EnvEdit::Clear);
+                }
+                let Some((kind, inline)) = option.valued else {
+                    i += 1;
+                    continue;
+                };
+                let (value, next) = match inline {
+                    Some(value) => (Some(value.to_string()), i + 1),
+                    None => (words.get(i + 1).cloned(), i + 2),
+                };
+                match kind {
+                    Valued::Unset => {
+                        edits.extend(value.map(EnvEdit::Unset));
+                        i = next;
+                    }
+                    Valued::Other => i = next,
+                    Valued::SplitString { alone } => {
+                        splits += 1;
+                        let tokens = value.as_deref().and_then(split_string_words);
+                        let Some(tokens) = tokens.filter(|_| alone && splits <= MAX_SPLIT_STRINGS)
+                        else {
+                            return EnvRoute::View(EnvView::printenv(Vec::new()));
+                        };
+                        let tail = words.split_off(next.min(words.len()));
+                        words.truncate(i);
+                        words.extend(tokens);
+                        words.extend(tail);
+                    }
+                }
+            }
+            EnvWord::Assignment => {
+                if let Some((name, value)) = arg.split_once('=') {
+                    edits.push(EnvEdit::Set(name.to_string(), value.to_string()));
+                }
                 options_done = true;
                 grammar_used = true;
-                tail
+                i += 1;
             }
-        };
+            EnvWord::EndOfOptions => {
+                options_done = true;
+                grammar_used = true;
+                i += 1;
+            }
+        }
     }
-    EnvRoute::View(if null {
-        vec!["-0".to_string()]
-    } else {
-        Vec::new()
+
+    // No child: `env` prints the listing.  `printenv` takes `-0`, and the
+    // real `env` refuses `-0` with a child, so it moves.
+    let env_words: Vec<String> = words
+        .into_iter()
+        .filter(|word| !(null && matches!(word.as_str(), "-0" | "--null")))
+        .collect();
+    EnvRoute::View(EnvView {
+        env_words,
+        child: "printenv".to_string(),
+        printenv_args: if null {
+            vec!["-0".to_string()]
+        } else {
+            Vec::new()
+        },
+        edits,
     })
 }
 
-/// The route for the child program `child` with `child_args`.
-fn child_route(child: &str, child_args: &[String], grammar_used: bool) -> EnvRoute {
-    let name = std::path::Path::new(child)
-        .file_name()
-        .and_then(|name| name.to_str());
-    match name {
-        Some("printenv") => EnvRoute::View(child_args.to_vec()),
-        Some("env") => route_from(child_args, true),
-        // `skim env NAME` with no option or assignment: the handler reads it
-        // as `printenv NAME`, as before.
-        _ if !grammar_used => {
-            let mut view_args = vec![child.to_string()];
-            view_args.extend_from_slice(child_args);
-            EnvRoute::View(view_args)
+/// The words of a `-S` command line, with the quote and escape rules of
+/// GNU `env -S`.  `None` when skim cannot know the words: a `${VAR}`
+/// expansion, an open quote, or an escape that `env` refuses.
+fn split_string_words(line: &str) -> Option<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    // Bound: each pass reads at least one character.
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), '\\') => match chars.peek() {
+                Some(&next @ ('\\' | '\'')) => {
+                    word.push(next);
+                    chars.next();
+                }
+                _ => word.push('\\'),
+            },
+            (Some('\''), _) => word.push(c),
+            (_, '\\') => {
+                let next = chars.next()?;
+                let was_in_word = in_word;
+                in_word = true;
+                match next {
+                    '_' if quote.is_none() => {
+                        if was_in_word {
+                            words.push(std::mem::take(&mut word));
+                        }
+                        in_word = false;
+                    }
+                    '_' => word.push(' '),
+                    'c' => break,
+                    'n' => word.push('\n'),
+                    't' => word.push('\t'),
+                    'r' => word.push('\r'),
+                    'f' => word.push('\u{0c}'),
+                    'v' => word.push('\u{0b}'),
+                    '\\' | '\'' | '"' | '$' | '#' => word.push(next),
+                    _ => return None,
+                }
+            }
+            (_, '$') if chars.peek() == Some(&'{') => return None,
+            (Some(_), _) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '#') if !in_word => break,
+            (None, _) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, _) => {
+                word.push(c);
+                in_word = true;
+            }
         }
-        _ => EnvRoute::Exec,
     }
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// The kind of one `env` argument.
 enum EnvWord<'a> {
-    /// `-S` / `--split-string`; the value is inline, or the next argument.
-    SplitString(Option<&'a str>),
-    /// An option; `takes_next` when its value is the next argument.
-    Option { takes_next: bool, null: bool },
+    Option(OptionWord<'a>),
     /// `--`: the end of the options.
     EndOfOptions,
     /// `NAME=VALUE`.
     Assignment,
     /// The child program.
     Child,
+}
+
+/// One option argument (a long option, or a short cluster).
+#[derive(Default)]
+struct OptionWord<'a> {
+    /// `-i`, `-` or `--ignore-environment`.
+    clear: bool,
+    /// `-0` or `--null`.
+    null: bool,
+    /// The option that takes a value, with its inline value (`None`: the
+    /// value is the next argument).
+    valued: Option<(Valued, Option<&'a str>)>,
+}
+
+/// An option that takes a value.
+#[derive(Clone, Copy)]
+enum Valued {
+    Unset,
+    /// `-S`; `alone` when no other option is in the same argument.
+    SplitString {
+        alone: bool,
+    },
+    Other,
 }
 
 /// The kind of an argument after the options.
@@ -295,42 +486,39 @@ fn option_word(arg: &str) -> EnvWord<'_> {
     }
     // `-` alone is the old spelling of `-i`.
     if arg == "-" {
-        return EnvWord::Option {
-            takes_next: false,
-            null: false,
-        };
+        return EnvWord::Option(OptionWord {
+            clear: true,
+            ..OptionWord::default()
+        });
     }
     if let Some(long) = arg.strip_prefix("--") {
-        return long_option_word(long);
+        return EnvWord::Option(long_option_word(long));
     }
-    if let Some(cluster) = arg.strip_prefix('-') {
-        let mut null = false;
-        for (i, c) in cluster.char_indices() {
-            null |= c == '0';
-            if ENV_SHORT_VALUE_OPTIONS.contains(&c) {
-                let attached = &cluster[i + c.len_utf8()..];
-                let inline = (!attached.is_empty()).then_some(attached);
-                if c == 'S' {
-                    return EnvWord::SplitString(inline);
-                }
-                return EnvWord::Option {
-                    takes_next: inline.is_none(),
-                    null,
-                };
-            }
+    let Some(cluster) = arg.strip_prefix('-') else {
+        return plain_word(arg);
+    };
+    let mut option = OptionWord::default();
+    for (i, c) in cluster.char_indices() {
+        option.clear |= c == 'i';
+        option.null |= c == '0';
+        if ENV_SHORT_VALUE_OPTIONS.contains(&c) {
+            let attached = &cluster[i + c.len_utf8()..];
+            let kind = match c {
+                'u' => Valued::Unset,
+                'S' => Valued::SplitString { alone: i == 0 },
+                _ => Valued::Other,
+            };
+            option.valued = Some((kind, (!attached.is_empty()).then_some(attached)));
+            break;
         }
-        return EnvWord::Option {
-            takes_next: false,
-            null,
-        };
     }
-    plain_word(arg)
+    EnvWord::Option(option)
 }
 
-/// The kind of a long option (`long` is the text after `--`).  A unique
-/// prefix of a name is that option, as `getopt_long` reads it.  An unknown
-/// or ambiguous name makes `env` stop with an error, so it runs nothing.
-fn long_option_word(long: &str) -> EnvWord<'_> {
+/// One long option (`long` is the text after `--`).  A unique prefix of a
+/// name is that option, as `getopt_long` reads it.  An unknown or ambiguous
+/// name makes `env` stop with an error, so it runs nothing.
+fn long_option_word(long: &str) -> OptionWord<'_> {
     let (name, inline) = match long.split_once('=') {
         Some((name, value)) => (name, Some(value)),
         None => (long, None),
@@ -347,23 +535,25 @@ fn long_option_word(long: &str) -> EnvWord<'_> {
             None
         }
     });
-    match found {
-        Some(("split-string", _)) => EnvWord::SplitString(inline),
-        Some((option, takes_value)) => EnvWord::Option {
-            takes_next: *takes_value && inline.is_none(),
-            null: *option == "null",
-        },
-        None => EnvWord::Option {
-            takes_next: false,
-            null: false,
-        },
+    let Some(&(option, takes_value)) = found else {
+        return OptionWord::default();
+    };
+    let kind = match option {
+        "unset" => Valued::Unset,
+        "split-string" => Valued::SplitString { alone: true },
+        _ => Valued::Other,
+    };
+    OptionWord {
+        clear: option == "ignore-environment",
+        null: option == "null",
+        valued: takes_value.then_some((kind, inline)),
     }
 }
 
-/// skim's own environment.  A `printenv` child inherits it unchanged
-/// (`CONFIG.env_overrides` is empty), so it gives the exact records of the
-/// child's output: a value over several lines is one record, whatever its
-/// lines hold.
+/// The environment of the `printenv` child: skim's own environment, with the
+/// `env` edits of the view applied (`CONFIG.env_overrides` is empty).  It gives
+/// the exact records of the child's output: a value over several lines is one
+/// record, whatever its lines hold.
 struct KnownEnv {
     values: HashMap<String, String>,
 }
@@ -384,6 +574,22 @@ impl KnownEnv {
         Self {
             values: pairs.into_iter().collect(),
         }
+    }
+
+    /// Apply the `env` edits, in order.
+    fn with_edits(mut self, edits: &[EnvEdit]) -> Self {
+        for edit in edits {
+            match edit {
+                EnvEdit::Clear => self.values.clear(),
+                EnvEdit::Unset(name) => {
+                    self.values.remove(name);
+                }
+                EnvEdit::Set(name, value) => {
+                    self.values.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        self
     }
 
     /// The known record `KEY=value` at the start of `text`, followed by
@@ -436,7 +642,7 @@ fn requested_names(args: &[String]) -> Vec<String> {
 /// shape of a new variable (`name=value`, with a portable name that is not
 /// sensitive) reads as a new variable and shows.
 fn parse_impl(output: &CommandOutput, request: &EnvRequest) -> ParseResult<FileResult> {
-    let known = request.known.as_ref();
+    let known = Some(&request.known);
     let result = if request.names.is_empty() {
         mask_listing(&output.stdout, known)
     } else {
@@ -583,8 +789,11 @@ impl ListingView {
         if record.trim().is_empty() {
             return;
         }
-        let Some((key, value)) = record.split_once('=') else {
-            // A record with no `=` has no key to judge it by: fail closed.
+        // The key comes from the first line only.
+        let (first_line, more) = record.split_once('\n').unwrap_or((record, ""));
+        let Some((key, first)) = first_line.split_once('=') else {
+            // A record whose first line has no `=` has no key to judge it by:
+            // fail closed.
             self.variables += 1;
             self.current_masked = Some(true);
             self.entries.push("***".to_string());
@@ -597,10 +806,8 @@ impl ListingView {
             return;
         }
         self.current_masked = Some(false);
-        let mut lines = value.split('\n');
-        let first = lines.next().unwrap_or_default();
         self.entries.push(format!("{key}={}", display_line(first)));
-        for line in lines {
+        for line in more.split('\n') {
             self.push_line(line);
         }
     }
@@ -747,23 +954,23 @@ mod tests {
 
     /// A request for text on stdin: no names, no known records.
     fn stdin_request() -> EnvRequest {
-        EnvRequest::new(&[], true, || panic!("stdin text has no known records"))
+        EnvRequest::new(&[], true, KnownEnv::from_pairs([]))
     }
 
     /// A request for `printenv NAME...` with no known records.
     fn named_request(names: &[String]) -> EnvRequest {
         EnvRequest {
             names: names.to_vec(),
-            known: None,
+            known: KnownEnv::from_pairs([]),
         }
     }
 
     /// A request for the output of a `printenv` child, with these records.
     fn child_request(args: &[&str], records: &[(&str, &str)]) -> EnvRequest {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-        EnvRequest::new(&args, false, || {
-            KnownEnv::from_pairs(records.iter().map(|(k, v)| (k.to_string(), v.to_string())))
-        })
+        let known =
+            KnownEnv::from_pairs(records.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        EnvRequest::new(&args, false, known)
     }
 
     /// The listing parse for text on stdin.
@@ -1412,9 +1619,7 @@ mod tests {
     // is a listing and gets the key mask.
     #[test]
     fn test_run_word_with_stdin_is_a_listing() {
-        let request = EnvRequest::new(&strings(&["run"]), true, || {
-            panic!("stdin text has no known records")
-        });
+        let request = EnvRequest::new(&strings(&["run"]), true, KnownEnv::from_pairs([]));
         assert!(request.names.is_empty());
         let input = "FAKE_TOKEN=fake-value-123\nPLAIN=ok\n";
         let text = rendered(&parse_impl(&make_output_full(input, "", Some(0)), &request));
@@ -1480,28 +1685,107 @@ mod tests {
     // The `env` grammar
     // ------------------------------------------------------------------
 
+    /// The env view of a route.
+    fn view(args: &[&str]) -> EnvView {
+        match env_route(&strings(args)) {
+            EnvRoute::View(view) => view,
+            EnvRoute::Exec => panic!("env {args:?} must be an env view"),
+        }
+    }
+
+    fn set(name: &str, value: &str) -> EnvEdit {
+        EnvEdit::Set(name.to_string(), value.to_string())
+    }
+
+    fn unset(name: &str) -> EnvEdit {
+        EnvEdit::Unset(name.to_string())
+    }
+
+    // No option or assignment: skim starts `printenv` directly.
     #[test]
-    fn test_env_route_env_views() {
-        let view = |args: &[&str]| env_route(&strings(args));
-        let empty = EnvRoute::View(Vec::new());
-        assert_eq!(view(&[]), empty);
-        assert_eq!(view(&["FOO=1"]), empty);
-        assert_eq!(view(&["FOO=1", "printenv"]), empty);
-        assert_eq!(view(&["-u", "FAKE_X", "FOO=1", "printenv"]), empty);
-        assert_eq!(view(&["-uFAKE_X", "printenv"]), empty);
-        assert_eq!(view(&["--uns", "FAKE_X", "printenv"]), empty);
-        assert_eq!(view(&["-i", "/usr/bin/env"]), empty);
-        assert_eq!(view(&["--", "FOO=1", "printenv"]), empty);
-        assert_eq!(view(&["-S", "FOO=1 printenv"]), empty);
-        assert_eq!(view(&["--split-string=printenv"]), empty);
-        assert_eq!(view(&["-S'printenv'"]), empty);
-        assert_eq!(view(&["env", "FOO=1", "printenv"]), empty);
+    fn test_env_route_direct_printenv_views() {
+        assert_eq!(view(&[]), EnvView::printenv(Vec::new()));
+        assert_eq!(view(&["PATH"]), EnvView::printenv(strings(&["PATH"])));
         assert_eq!(
-            view(&["FOO=1", "/usr/bin/printenv", "FAKE_TOKEN"]),
-            EnvRoute::View(strings(&["FAKE_TOKEN"]))
+            view(&["printenv", "FAKE_TOKEN"]),
+            EnvView::printenv(strings(&["FAKE_TOKEN"]))
         );
-        assert_eq!(view(&["-0"]), EnvRoute::View(strings(&["-0"])));
-        assert_eq!(view(&["PATH"]), EnvRoute::View(strings(&["PATH"])));
+        assert_eq!(view(&["-0"]), EnvView::printenv(strings(&["-0"])));
+    }
+
+    // Options and assignments stay, so the real `env` applies them.
+    #[test]
+    fn test_env_route_views_through_env() {
+        let v = view(&["-u", "FAKE_X", "FOO=1", "printenv"]);
+        assert_eq!(v.env_words, strings(&["-u", "FAKE_X", "FOO=1"]));
+        assert_eq!(v.child, "printenv");
+        assert_eq!(v.edits, vec![unset("FAKE_X"), set("FOO", "1")]);
+
+        let v = view(&["FOO=1", "/usr/bin/printenv", "FAKE_TOKEN"]);
+        assert_eq!(v.env_words, strings(&["FOO=1"]));
+        assert_eq!(v.child, "/usr/bin/printenv");
+        assert_eq!(v.printenv_args, strings(&["FAKE_TOKEN"]));
+
+        let v = view(&["-i", "FOO=fake-one", "printenv", "FOO"]);
+        assert_eq!(v.edits, vec![EnvEdit::Clear, set("FOO", "fake-one")]);
+
+        let v = view(&["FOO=1"]);
+        assert_eq!(v.env_words, strings(&["FOO=1"]));
+        assert_eq!(v.child, "printenv");
+        assert!(v.printenv_args.is_empty());
+
+        let v = view(&["-u", "FAKE_X", "--null"]);
+        assert_eq!(v.env_words, strings(&["-u", "FAKE_X"]));
+        assert_eq!(v.printenv_args, strings(&["-0"]));
+
+        let v = view(&["FOO=1", "env", "-u", "FAKE_X", "printenv"]);
+        assert_eq!(v.env_words, strings(&["FOO=1", "env", "-u", "FAKE_X"]));
+        assert_eq!(v.edits, vec![set("FOO", "1"), unset("FAKE_X")]);
+
+        assert_eq!(view(&["-uFAKE_X", "printenv"]).edits, vec![unset("FAKE_X")]);
+        assert_eq!(
+            view(&["--uns", "FAKE_X", "printenv"]).edits,
+            vec![unset("FAKE_X")]
+        );
+        assert_eq!(
+            view(&["--unset=FAKE_X", "printenv"]).edits,
+            vec![unset("FAKE_X")]
+        );
+        assert_eq!(
+            view(&["--", "FOO=1", "printenv"]).edits,
+            vec![set("FOO", "1")]
+        );
+        assert_eq!(view(&["-i", "/usr/bin/env"]).edits, vec![EnvEdit::Clear]);
+    }
+
+    // `-S` lines are split with the quote and escape rules.
+    #[test]
+    fn test_env_route_split_string() {
+        let v = view(&["-S", "FOO='fake a' printenv"]);
+        assert_eq!(v.env_words, strings(&["FOO=fake a"]));
+        assert_eq!(v.edits, vec![set("FOO", "fake a")]);
+        assert_eq!(view(&["-S", "pri''ntenv"]).child, "printenv");
+        assert_eq!(view(&["-S", "pri\"nt\"env"]).child, "printenv");
+        assert_eq!(view(&["--split-string=printenv"]).child, "printenv");
+        assert_eq!(view(&["-S'printenv'"]).child, "printenv");
+        assert_eq!(
+            view(&["-S", "printenv\\_FAKE_TOKEN"]).printenv_args,
+            strings(&["FAKE_TOKEN"])
+        );
+        assert_eq!(view(&["-S", "-S printenv"]).child, "printenv");
+    }
+
+    // A `-S` line that skim cannot read gives the plain listing view, which
+    // starts no other program.
+    #[test]
+    fn test_env_route_unreadable_split_string_is_the_listing() {
+        let listing = EnvView::printenv(Vec::new());
+        for line in ["${FAKE_CMD}", "'open", "printenv \\z"] {
+            assert_eq!(view(&["-S", line]), listing, "-S {line:?}");
+        }
+        assert_eq!(view(&["-iSprintenv"]), listing);
+        let nested = format!("{}printenv", "-S ".repeat(10));
+        assert_eq!(view(&["-S", &nested]), listing);
     }
 
     #[test]
@@ -1510,8 +1794,55 @@ mod tests {
         assert_eq!(route(&["FOO=1", "npm", "test"]), EnvRoute::Exec);
         assert_eq!(route(&["-u", "printenv", "npm"]), EnvRoute::Exec);
         assert_eq!(route(&["-S", "npm test"]), EnvRoute::Exec);
+        assert_eq!(route(&["-S", "FOO='fake a' npm"]), EnvRoute::Exec);
         assert_eq!(route(&["env", "FOO=1", "npm"]), EnvRoute::Exec);
         // Known limit: skim cannot inspect what `sh -c` prints.
         assert_eq!(route(&["FOO=1", "sh", "-c", "env"]), EnvRoute::Exec);
+    }
+
+    #[test]
+    fn test_known_env_with_edits() {
+        let pairs = [("A", "1"), ("B", "2")].map(|(k, v)| (k.to_string(), v.to_string()));
+        let known = KnownEnv::from_pairs(pairs).with_edits(&[unset("A"), set("C", "3")]);
+        let mut names: Vec<&str> = known.values.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["B", "C"]);
+        assert!(known.with_edits(&[EnvEdit::Clear]).values.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // More stdin and child cases
+    // ------------------------------------------------------------------
+
+    // A NUL record takes its key from its first line only.
+    #[test]
+    fn test_nul_record_key_comes_from_first_line() {
+        let input = "fake-head\nAWS_ACCESS_KEY_ID=fake-value-123\0PLAIN=ok\0";
+        let text = rendered(&parse_impl(
+            &make_output_full(input, "", Some(0)),
+            &stdin_request(),
+        ));
+        assert!(!text.contains("fake-value-123"), "{text}");
+        assert!(text.contains("PLAIN=ok"), "{text}");
+    }
+
+    // The handler starts the child when stdin is empty, so the known records
+    // apply also when the handler could read stdin.
+    #[test]
+    fn test_known_records_apply_when_the_handler_could_read_stdin() {
+        let value = "fake-part-one\nfakeparttwo=fake-part-three";
+        let known = KnownEnv::from_pairs(
+            [("FAKE_TOKEN", value), ("PLAIN", "ok")].map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let request = EnvRequest::new(&[], true, known);
+        let stdout = format!("FAKE_TOKEN={value}\nPLAIN=ok\n");
+        let result = parse_impl(&make_output_full(&stdout, "", Some(0)), &request);
+        let ParseResult::Full(file) = &result else {
+            panic!("got {}", result.tier_name());
+        };
+        let text = rendered(&result);
+        assert!(!text.contains("fake-part"), "{text}");
+        assert!(text.contains("PLAIN=ok"), "{text}");
+        assert!(file.footer.is_none(), "{text}");
     }
 }

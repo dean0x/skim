@@ -288,27 +288,25 @@ pub(crate) fn run(
         "df" => df::run(tool_args, &ctx),
         "diff" => diff::run(tool_args, &ctx),
         "du" => du::run(tool_args, &ctx),
-        // `env` starts a child program when it has one; the grammar parse in
-        // `env::env_route` decides whether that child is an env view.
+        // `env` starts a child program when it has one; `env::env_route`
+        // reads the `env` grammar and decides whether that child is an env
+        // view (PF-012).
         //
-        // SECURITY (PF-012): a child that is `env` or `printenv` (also as a
-        // path, and also after options or assignments), or no child at all,
-        // is an env view, so it goes to the masked handler.  Only another
-        // child program (`env FOO=1 npm test`) runs through the real `env`
-        // binary, so that the OS applies `VAR=val`.
+        // A child that is `env` or `printenv` (also as a path, and also after
+        // options or assignments), or no child at all, is an env view and
+        // goes to the env handler.  Only another child program
+        // (`env FOO=1 npm test`) runs through the real `env` binary.
         //
-        // ACCEPTED LIMITATION: `env FOO=1 sh -c env` still leaks because the
-        // child is `sh` and skim cannot inspect what an arbitrary child will
-        // print.  This shape is pinned in the regression test suite.
+        // ACCEPTED LIMITATION: for `env FOO=1 sh -c env` the child is `sh`,
+        // and skim cannot inspect what an arbitrary child prints.  This shape
+        // is pinned in the regression test suite.
         //
         // ROUTING is keyed on the `env` spelling ONLY: `printenv` never takes
-        // `VAR=val`, so sending that spelling to the real `env` binary would
-        // execute an unmediated environment dump.  The `printenv NAME=VALUE`
-        // LABEL leak this spelling used to cause is fixed in
+        // `VAR=val`.  The `printenv NAME=VALUE` label is handled in
         // `cmd::security::redact_mandatory_assignments`, which keys on
         // `redaction_is_mandatory` and so covers BOTH spellings.
         "env" => match env::env_route(tool_args) {
-            env::EnvRoute::View(view_args) => env::run(&view_args, &ctx),
+            env::EnvRoute::View(view) => env::run_view(&view, &ctx),
             env::EnvRoute::Exec => super::run_raw_passthrough("env", tool_args, &[]),
         },
         "printenv" => env::run(tool_args, &ctx),

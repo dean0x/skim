@@ -1097,8 +1097,8 @@ fn dispatch_inner(
         //
         // For `env` / `printenv` (`redaction_is_mandatory`) the help flag
         // counts only as the FIRST argument: elsewhere it can be the value of
-        // an option (`env -u -h`), and the real tool then prints the whole
-        // environment with no mask.
+        // an option (`env -u -h`), and the real tool would then print the
+        // listing instead of its help.
         let is_help = |a: &String| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V");
         let help_requested = if redaction_is_mandatory(subcommand) {
             args.first().is_some_and(is_help)

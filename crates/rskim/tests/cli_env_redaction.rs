@@ -592,6 +592,8 @@ mod env_redaction {
             &["FOO=1"],
             &["-i", "FOO=1", "/usr/bin/env"],
             &["-S", "FOO=1 printenv"],
+            &["-S", "FOO='fake a' printenv"],
+            &["-S", "pri''ntenv"],
         ];
         for spelling in spellings {
             for (surface, mut cmd) in [
@@ -625,6 +627,67 @@ mod env_redaction {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(!stdout.contains("fake-path-value-xyz"), "got {stdout:?}");
         assert!(stdout.contains("***"), "got {stdout:?}");
+    }
+
+    /// The bare listing with stdin that is not a terminal (the agent and CI
+    /// case): the child output gets the exact records, so a masked value
+    /// over several lines stays masked whole, on both surfaces.
+    #[test]
+    fn env_listing_from_child_masks_value_over_several_lines() {
+        for (surface, mut cmd) in [
+            ("explicit", base_explicit_cmd("env")),
+            ("wrapper", base_wrapper_cmd("env")),
+            ("explicit printenv", base_explicit_cmd("printenv")),
+        ] {
+            let output = cmd
+                .env(
+                    "SKIM_TEST_TOKEN",
+                    "fake-part-one\nfakeparttwo=fake-part-three",
+                )
+                .env("SKIM_TEST_PLAIN", "fake-plain-ok")
+                .stdin(Stdio::null())
+                .output()
+                .expect("skim binary must be spawnable");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("fake-part"), "{surface}: got {stdout:?}");
+            assert!(
+                stdout.contains("SKIM_TEST_TOKEN=***"),
+                "{surface}: got {stdout:?}"
+            );
+            assert!(
+                stdout.contains("SKIM_TEST_PLAIN=fake-plain-ok"),
+                "{surface}: got {stdout:?}"
+            );
+        }
+    }
+
+    /// The `env` options and assignments apply to the view.
+    #[test]
+    fn env_view_applies_options_and_assignments() {
+        let output = base_explicit_cmd("env")
+            .args([
+                "-i",
+                "SKIM_TEST_PLAIN=fake-one",
+                "printenv",
+                "SKIM_TEST_PLAIN",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("skim binary must be spawnable");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("fake-one"), "got {stdout:?}");
+        assert_eq!(output.status.code(), Some(0));
+
+        let output = base_explicit_cmd("env")
+            .args(["-u", "SKIM_TEST_PLAIN"])
+            .env("SKIM_TEST_PLAIN", "fake-unset-me")
+            .env("SKIM_TEST_OTHER", "fake-keep-me")
+            .stdin(Stdio::null())
+            .output()
+            .expect("skim binary must be spawnable");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("fake-unset-me"), "got {stdout:?}");
+        assert!(stdout.contains("fake-keep-me"), "got {stdout:?}");
     }
 
     /// A help flag as the value of `-u` does not run the real `env`.
