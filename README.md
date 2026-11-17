@@ -76,6 +76,43 @@ In auto permission mode, Claude Code runs a command without the PreToolUse rewri
 - **Limits:** a failed run stays raw, because Claude Code does not let a hook replace its output. Lint tools exit non-zero when they find problems, so only clean or warning-only lint runs can compress. Output of 29,000 characters or more, compound commands, pipes, redirects (including `2>&1`) and env-prefixed commands stay raw. `ruff check` in its default full format stays raw.
 - **Existing installs:** run `skim init` again to add the hook entry. `skim doctor` notes a missing entry.
 
+### Agent Guidance (`skim init`)
+
+`skim init` adds instructions for code reads and for when to use `skim search` or `rg`.
+Global scope is the default. With `--project`, guidance paths are relative to the current folder.
+
+| Agent | Default global file | Project file (`--project`) |
+|---|---|---|
+| Claude Code | `~/.claude/CLAUDE.md` | `CLAUDE.md` |
+| Codex | `~/.codex/AGENTS.md` | `AGENTS.md` |
+| Gemini | `~/.gemini/GEMINI.md` | `GEMINI.md` |
+| Copilot | `~/.copilot/copilot-instructions.md` | `.github/copilot-instructions.md` |
+| Crush | `~/.crush/AGENTS.md` | `AGENTS.md` |
+| Cursor | None | `.cursor/rules/skim.mdc` |
+
+Agent config-folder variables can change the global paths. Skim treats empty values as unset and refuses relative paths.
+Cursor needs project scope: in a repository, run `skim init --agent cursor --project`.
+
+Global auto-detect also adds guidance for these agents, without hooks, when their root folders exist under `HOME`:
+
+| Guidance-only agent | Global file |
+|---|---|
+| Kiro | `~/.kiro/steering/skim.md` |
+| Roo Code | `~/.roo/rules/skim.md` |
+| Cline | `~/.cline/rules/skim.md` |
+| Augment | `~/.augment/rules/skim.md` |
+| Windsurf | `~/.devin/rules/skim.md` |
+
+Skim never creates a missing agent root folder. Skim skips these guidance-only files with `--agent`, `--project` or `--no-guidance`.
+
+After an upgrade, run `skim init` again in the same scope to refresh the guidance.
+Keep the same `--agent` and `--project` options, if used. Hooks and wrappers do not refresh guidance.
+
+`skim doctor` has a **Guidance** section with file states and scope-specific refresh commands.
+Its notes do not change files or the exit code. Fix broken markers by hand before a refresh.
+
+`--dry-run` previews changes. `skim init --uninstall` also removes guidance-only files after confirmation; `--yes` skips that prompt.
+
 ### Test Output Compression
 - `skim cargo test`, `skim pytest`, `skim vitest`, `skim jest`, `skim go test`
 - Extracts failures, assertions, pass/fail counts while stripping noise
@@ -656,7 +693,9 @@ cargo bench
 - Three-tier degradation: Structured → Regex → Passthrough
 
 ✅ **Agent Integration:**
-- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush; optional consent-gated permission seeding (`--permissions`); dev-pinned installs for skim development (`--dev`)
+- `skim init` — setup for Claude Code, Cursor, Codex, Gemini, Copilot and Crush. See [Agent Guidance](#agent-guidance-skim-init) for files, scope and refresh commands
+- Guidance-only agents: Kiro, Roo Code, Cline, Augment and Windsurf
+- Optional init features: consent-gated permission setup (`--permissions`); dev-pinned installs for skim development (`--dev`)
 - `skim doctor` — install health check: which `skim` on `$PATH` wins, per-agent hook state (version, commit, binary pin, tamper verdict), wrapper targets, and staleness vs. repo HEAD. Exit 0 healthy / 1 on drift, so it works as a CI pre-flight. A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)` — never `✓` — printing both the commit the install froze and the commit the running binary was built from, so `skim doctor | grep dev-pinned` is a one-line guard against shipping a dev install. It also prints an advisory note (no change to the exit code) for each PostToolUse hook of another tool that can select Bash, found in either scope or in `settings.local.json`; Claude Code gives the model one PostToolUse result per call, so such a hook can cancel skim's output. Plugin hooks are not checked.
 - `skim rewrite` — command rewriting engine with `--hook` mode
 - MCP server mode for agent-native workflows
