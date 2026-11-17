@@ -2124,6 +2124,66 @@ fn test_cursor_uninstall_without_hook_asks_before_guidance_removal() {
     assert!(!file.exists());
 }
 
+/// A hookless uninstall must keep the exact bytes that another set-up agent uses.
+#[test]
+fn test_codex_uninstall_without_hook_keeps_guidance_while_crush_is_set_up() {
+    let sandbox = Sandbox::bare();
+    let project = sandbox.project_dir("proj");
+    let file = project.join("AGENTS.md");
+    fs::write(&file, "# User rules\nKeep this text.\n").unwrap();
+    // Crush counts as set up through its hook registration, not its folder alone.
+    sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--project", "--yes", "--agent", "crush"])
+        .assert()
+        .success();
+    assert!(!project.join(".codex").exists());
+    let before = fs::read(&file).unwrap();
+
+    let result = sandbox
+        .init()
+        .current_dir(&project)
+        .args(["--uninstall", "--project", "--yes", "--agent", "codex"])
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(&file).unwrap(), before);
+    result.stdout(predicate::str::contains(
+        "Note: kept guidance in AGENTS.md; Crush still uses it",
+    ));
+    assert!(!project.join(".codex").exists());
+}
+
+/// Global guidance removal must keep the exact user text on both sides of the block.
+#[test]
+fn test_global_gemini_uninstall_without_hook_removes_only_the_guidance_block() {
+    let sandbox = Sandbox::bare();
+    let config = sandbox.config_dir(".gemini");
+    let file = config.join("GEMINI.md");
+    fs::write(
+        &file,
+        "# User rules\nKeep this text.\n\n<!-- skim-start v0.0.1 -->\nold guidance\n<!-- skim-end -->\n\n# More user rules\nKeep these too.\n",
+    )
+    .unwrap();
+    assert!(!config.join("settings.json").exists());
+    assert!(!config.join("hooks").exists());
+
+    let result = sandbox
+        .init()
+        .args(["--uninstall", "--yes", "--agent", "gemini"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        b"# User rules\nKeep this text.\n\n# More user rules\nKeep these too.\n"
+    );
+    result
+        .stdout(predicate::str::contains("Removed guidance from"))
+        .stdout(predicate::str::contains("GEMINI.md"));
+}
+
 #[test]
 fn test_init_cursor_cleans_legacy_cursorrules() {
     let sandbox = Sandbox::new();
