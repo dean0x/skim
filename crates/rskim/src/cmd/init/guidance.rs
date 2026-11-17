@@ -532,13 +532,11 @@ pub(super) fn holds_block(target: &GuidanceTarget) -> bool {
 
 /// `true` when the block in the file of `target` is what this binary writes for
 /// `version`. A file that is missing or cannot be read is not current.
+/// This check stays silent; the writer reports any skipped file.
 pub(super) fn block_is_current(target: &GuidanceTarget, version: &str) -> bool {
-    read_existing_safely(&target.path)
-        .ok()
-        .flatten()
-        .is_some_and(|text| {
-            block_status(&text, &target.block(version), &target.format) == BlockStatus::Current
-        })
+    read_instruction_text(&target.path).is_ok_and(|text| {
+        block_status(&text, &target.block(version), &target.format) == BlockStatus::Current
+    })
 }
 
 /// Remove the skim section from the file of `target`.

@@ -1612,6 +1612,53 @@ fn test_init_creates_guidance() {
 }
 
 #[test]
+fn test_init_warns_once_and_keeps_fifo_guidance() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    for project in [true, false] {
+        let sandbox = Sandbox::new();
+        let cwd = sandbox.project_dir("proj");
+        let claude_md = if project {
+            cwd.join("CLAUDE.md")
+        } else {
+            sandbox.claude_config().join("CLAUDE.md")
+        };
+        let fifo_path = std::ffi::CString::new(claude_md.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo takes a NUL-terminated path and a mode; both are valid.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let before = fs::symlink_metadata(&claude_md).unwrap();
+
+        for _ in 0..2 {
+            let mut cmd = sandbox.init();
+            cmd.args(["--agent", "claude-code", "--yes", "--no-wrappers"])
+                .current_dir(&cwd)
+                .timeout(std::time::Duration::from_secs(15));
+            if project {
+                cmd.arg("--project");
+            }
+            let output = cmd.assert().success().get_output().clone();
+
+            let after = fs::symlink_metadata(&claude_md).unwrap();
+            assert!(after.file_type().is_fifo(), "init must keep the FIFO");
+            assert_eq!(before.ino(), after.ino(), "init must not replace the FIFO");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr
+                    .matches("is not a regular file (skipping guidance)")
+                    .count(),
+                1,
+                "init must warn once per file per run: {stderr}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("Already up to date"),
+                "unreadable guidance must not pass the current-block gate: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_init_no_guidance_flag() {
     let sandbox = Sandbox::new();
     let project_dir = sandbox.project_dir("proj");
