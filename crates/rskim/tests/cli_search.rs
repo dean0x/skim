@@ -1166,6 +1166,61 @@ fn a_word_query_lists_the_files_that_hold_all_the_words_by_prior_then_count() {
     assert!(run.stdout.contains("files: 4 hold all 3 words; 4 listed\n"));
 }
 
+/// skim#618: `-C`, `--all` and `--full` do not change the word view, so a
+/// word query with one of them exits 2 with no result instead of printing the
+/// same lines as the plain query.
+#[test]
+fn a_word_query_with_context_all_or_full_exits_2_and_prints_no_result() {
+    let repo = SearchRepo::new();
+    repo.write("src/a.rs", "fn one() {}\n// alpha beta\nfn two() {}\n");
+    repo.track_all();
+    let tail = "does not apply to the word view";
+    for (args, flag) in [
+        (&["-C", "2", "alpha beta"][..], "-C"),
+        (&["-C2", "alpha beta"][..], "-C"),
+        (&["--all", "alpha beta"][..], "--all"),
+        (&["--full", "alpha beta"][..], "--full"),
+    ] {
+        let run = repo.search(args);
+        assert_eq!(run.code, 2, "{args:?}");
+        assert_eq!(run.stdout, "", "{args:?}");
+        assert!(
+            run.stderr
+                .starts_with(&format!("skim search: {flag} {tail}")),
+            "{args:?}: {}",
+            run.stderr
+        );
+        let mut with_json = args.to_vec();
+        with_json.push("--json");
+        let run = repo.search(&with_json);
+        assert_json_error(&format!("{with_json:?}"), &run);
+        assert_eq!(
+            json_of(&run)["error"]
+                .as_str()
+                .map(|m| m.starts_with(&format!("{flag} {tail}"))),
+            Some(true),
+            "{with_json:?}: {}",
+            run.stdout
+        );
+    }
+}
+
+/// With `-F` the same words are one literal: the labelled view, where `-C`
+/// still prints the lines around the match.
+#[test]
+fn a_fixed_string_with_spaces_keeps_its_context_lines() {
+    let repo = SearchRepo::new();
+    repo.write("src/a.rs", "fn one() {}\n// alpha beta\nfn two() {}\n");
+    repo.track_all();
+    let plain = repo.search(&["alpha beta"]);
+    assert_eq!(plain.code, 0, "{}", plain.stderr);
+    assert!(!plain.stdout.contains("fn one()"), "{}", plain.stdout);
+    let run = repo.search(&["-F", "-C", "1", "alpha beta"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(run.stdout.contains("fn one()"), "{}", run.stdout);
+    assert!(run.stdout.contains("fn two()"), "{}", run.stdout);
+}
+
 #[test]
 fn a_word_query_lists_a_file_whose_name_holds_a_word_first_among_equals() {
     let repo = SearchRepo::new();
