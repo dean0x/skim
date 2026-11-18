@@ -411,15 +411,45 @@ mod tests {
     use crate::tokens;
 
     #[test]
+    fn character_walk_requires_measure_below_limit() {
+        let trunc = TruncationOptions {
+            char_budget: Some(10),
+            ..Default::default()
+        };
+        for (size, fits) in [(9, true), (10, false)] {
+            let outcome = select_for_char_budget(
+                &trunc,
+                Language::Rust,
+                |_| {
+                    Ok(Some(CharBudgetRung {
+                        text: "x".repeat(size),
+                        line_map: None,
+                        has_errors: false,
+                        degraded: false,
+                    }))
+                },
+                |_, rung| rung.text.chars().count(),
+            )
+            .unwrap();
+            match outcome {
+                RungWalk::Fits { mode, .. } if fits => assert_eq!(mode, Mode::Structure),
+                RungWalk::NoneFits { mode, .. } if !fits => assert_eq!(mode, Mode::Types),
+                other => panic!("unexpected outcome for measure {size}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn character_walk_uses_first_fit_and_last_nonempty_rung() {
         let trunc = TruncationOptions {
             char_budget: Some(10),
             ..Default::default()
         };
-        for (sizes, expected) in [
-            ([20, 5, 2], Mode::Signatures),
-            ([20, 15, 2], Mode::Types),
-            ([20, 0, 0], Mode::Structure),
+        for (sizes, fits, expected) in [
+            ([20, 5, 2], true, Mode::Signatures),
+            ([20, 15, 2], true, Mode::Types),
+            ([20, 0, 0], false, Mode::Structure),
+            ([20, 15, 12], false, Mode::Types),
         ] {
             let outcome = select_for_char_budget(
                 &trunc,
@@ -441,10 +471,9 @@ mod tests {
             )
             .unwrap();
             match outcome {
-                RungWalk::Fits { mode, .. } | RungWalk::NoneFits { mode, .. } => {
-                    assert_eq!(mode, expected)
-                }
-                other => panic!("unexpected outcome: {other:?}"),
+                RungWalk::Fits { mode, .. } if fits => assert_eq!(mode, expected),
+                RungWalk::NoneFits { mode, .. } if !fits => assert_eq!(mode, expected),
+                other => panic!("unexpected outcome for sizes {sizes:?}: {other:?}"),
             }
         }
     }
