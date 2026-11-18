@@ -300,7 +300,13 @@ fn plan_cut_inner(pieces: &[Piece], budget: RunBudget, count: &Counter<'_>) -> C
         };
     }
     let trailer = trailer_cost(pieces.len(), count).saturating_add(trailer_join);
-    let k = kept_prefix(pieces, n, trailer);
+    // Character floors add exactly. If they all fit, no trailer will print.
+    // Token joins do not have this property. Keep their existing reserve.
+    let k = if matches!(budget, RunBudget::Chars(_)) && kept_prefix(pieces, n, 0) == pieces.len() {
+        pieces.len()
+    } else {
+        kept_prefix(pieces, n, trailer)
+    };
     if k == 0 {
         return trailer_only(pieces.len());
     }
@@ -420,6 +426,18 @@ mod tests {
         assert_eq!(plan.output, expected);
         assert!(plan.bodies[0].cut);
         assert!(!plan.bodies[1].cut);
+    }
+
+    #[test]
+    fn char_cut_keeps_every_file_when_the_cut_bodies_fit_without_a_trailer() {
+        let chars = |s: &str| Some(s.chars().count());
+        let short = "fn small();\n";
+        let marker = "// ... (2 lines truncated)\n";
+        let input = [whole(&format!("{}\nlast\n", "x".repeat(200))), whole(short)];
+        let expected = format!("{marker}{short}");
+        let plan = plan_char_cut(&input, expected.chars().count(), &chars);
+        assert_eq!(plan.output, expected);
+        assert_eq!(plan.omitted, 0);
     }
 
     #[test]

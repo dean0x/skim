@@ -371,7 +371,7 @@ Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
 The same limit covers a directory, a glob or an explicit list of files as one run.
 A directory or glob with one match, or a list that resolves to one path, still uses the run limit.
 The limit counts all stdout and the view notice. This includes headers, line numbers and markers.
-`Error:`, `Processed` and `Warning:` lines, `--show-stats` and `SKIM_DEBUG` do not count.
+File errors, warnings, the `Processed` summary, `--show-stats` and `SKIM_DEBUG` do not count.
 
 Skim first tries structure, then signatures, then types for the run.
 If no view fits, skim cuts whole lines and can omit trailing files in path order.

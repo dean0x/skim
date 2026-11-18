@@ -58,13 +58,13 @@ Token runs use N for `fit`, `rung` and `cut`. Character runs subtract the strict
 - `rung` reserves the widest step-down notice with no cut, omission or path clauses.
 - `cut` reserves the widest notice with cut and omission counts and the two longest display paths.
 
-The limits saturate and satisfy `cut <= rung <= fit`. `seal_run` checks the exact stdout and notice before output. If needed, it uses only the trailer and removes path clauses from the notice. `Error:`, `Processed` and `Warning:` lines, stats and debug lines are outside the limit. Per-file stderr errors have no run count limit.
+The limits saturate and satisfy `cut <= rung <= fit`. `seal_run` checks the exact stdout and notice before output. If needed, it uses only the trailer and removes path clauses from the notice. File errors, warnings, the `Processed` summary, stats and debug lines are outside the limit. Per-file stderr errors have no run count limit.
 
 ## Planner rules (`run_budget.rs`)
 
 - **`Body`** has three forms. `Whole` can be cut. `PreCut` stores the worker's kept lines, its own marker, the total view lines and the marked count. `Fixed` keeps the body as-is, or the planner omits it.
 - **`set_fits`** is the one fit rule for pass 1 and every rung. A set whose bytes are at most N fits with no count. Otherwise it fails when a piece count is over N or the sum is over `RUN_SUM_STOP_FACTOR` times N. If neither fails, one exact count of the joined string decides.
-- **`kept_prefix`** is one linear pass over the floors. A `Fixed` floor is the full piece count. For other bodies, the floor is the lesser of the piece count and prefix plus the compact marker. The trailer cost uses the widest numbers. There is no binary search.
+- **`kept_prefix`** sums file floors in path order. A `Fixed` floor is the full piece count. Other floors use the lesser of the whole piece and its prefix plus the shortest available marker. If all character floors fit, no trailer reserve is necessary. Otherwise the planner reserves the trailer with its widest numbers and, for characters, its join newline. Token runs always reserve the trailer for prefix selection.
 - **Cuts** count hidden view lines (`ViewLines`). A `PreCut` body whose marked count fits its share keeps the worker marker as it is. Otherwise the core cuts `kept` again with `SourceTotal(total_view_lines)`.
 - **Retries.** If the exact count is over N, the planner drops the last kept file, at most `MAX_DROP_RETRIES` times. Then it returns the trailer only.
 - **Floor.** When N is below the trailer cost, stdout is the trailer line only. This is the one case where stdout can be over N. `--tokens 0` and values over `MAX_TOKEN_BUDGET` are still usage errors.
@@ -113,7 +113,7 @@ For token runs, the remedies are a larger `--tokens`, fewer files and `SKIM_PASS
 
 **KB-INV-8.** The trailer keeps the shared marker form, with a dash and "1 files" for one file. It also prints with `--no-header`. A body with no final newline gets a newline before the trailer.
 
-**KB-INV-10.** `--show-stats` totals come from the shown final bodies. The suffix says "across S file(s)" with S as the shown count. The original count comes from pass 1.
+**KB-INV-10.** `--show-stats` totals come from the shown final bodies. The suffix says "across S file(s)" with S as the shown count. The original count comes from pass 1. If headers alone force a character cut or omission, measured empty bodies still report zero tokens.
 
 **KB-INV-11.** A cache tamper test must target a batch rung entry. A one-match glob has that key. A single-file read can have another notice-cost key. `cli_cache` has the cold, warm, jobs and tamper tests.
 

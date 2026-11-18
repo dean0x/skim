@@ -519,6 +519,20 @@ fn stats_count_only_the_shown_bodies() {
 }
 
 #[test]
+fn stats_report_zero_tokens_when_only_the_headers_exceed_the_limit() {
+    let mut fixture = Fixture::new(0, 0);
+    for i in 0..40 {
+        fixture.add(format!("{}/empty.rs", deep_dir(i)), "");
+    }
+    let output = fixture.run(&["--show-stats"]);
+    let shown = stdout(&output).matches("/empty.rs\n").count();
+    assert_omissions(&fixture, &output, shown);
+    assert!(stderr(&output).contains(&format!(
+        "0 tokens → 0 tokens (0.0% reduction) across {shown} file(s)"
+    )));
+}
+
+#[test]
 fn analytics_store_only_shown_files_with_unmeasured_notices() {
     let fixture = cut_fixture();
     let output = run(fixture

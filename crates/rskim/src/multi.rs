@@ -953,6 +953,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
     let mut error_count = 0;
     let mut guardrail_count = 0usize;
     let mut view_differs_count = 0usize;
+    let mut measured_files = 0;
     let mut total_original_tokens = 0usize;
     let mut total_transformed_tokens = 0usize;
 
@@ -984,6 +985,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
                     process_result.original_tokens,
                     process_result.transformed_tokens,
                 ) {
+                    measured_files += 1;
                     total_original_tokens += orig;
                     total_transformed_tokens += trans;
                 }
@@ -1020,6 +1022,10 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         );
     }
 
+    // Headers can exceed the character limit even if all shown bodies have zero tokens.
+    let measured_char_run = matches!(budget, Some(RunBudget::Chars(_)))
+        && run.as_ref().is_some_and(|r| r.selection.changed())
+        && measured_files == success_count;
     let notice = match run {
         Some(run) => {
             debug_assert_eq!(run.differing, view_differs_count);
@@ -1037,7 +1043,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         let _ = write!(io::stderr().lock(), "{}", notice.line());
     }
 
-    if options.process.show_stats && total_original_tokens > 0 {
+    if options.process.show_stats && (total_original_tokens > 0 || measured_char_run) {
         let suffix = format!(" across {} file(s)", success_count);
         report_token_stats(
             Some(total_original_tokens),
@@ -1252,7 +1258,7 @@ fn resolve_explicit_paths(args: &[String], no_ignore: bool) -> anyhow::Result<Ve
 
     // Partial failures: warn on stderr but continue with resolved paths.
     for e in &errors {
-        eprintln!("Warning: {e}");
+        let _ = crate::cmd::execution::write_line_to_stderr(&format!("Warning: {e}"));
     }
 
     if paths.is_empty() {

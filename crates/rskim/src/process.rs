@@ -193,7 +193,10 @@ pub(crate) fn report_token_stats(
 ) {
     if let (Some(orig), Some(trans)) = (original_tokens, transformed_tokens) {
         let stats = tokens::TokenStats::new(orig, trans);
-        eprintln!("\n[skim] {}{}", stats.format(), suffix);
+        let _ = crate::cmd::execution::write_line_to_stderr(&format!(
+            "\n[skim] {}{suffix}",
+            stats.format()
+        ));
     }
 }
 
