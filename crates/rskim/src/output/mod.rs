@@ -1083,10 +1083,96 @@ pub(crate) struct BoundNotice {
     pub(crate) shape: BoundShape,
 }
 
+/// Facts for one run-scoped disclosure. `total` counts successful files only.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RunNoticeFacts<'a> {
+    pub(crate) budget: usize,
+    pub(crate) requested: rskim_core::Mode,
+    pub(crate) served: rskim_core::Mode,
+    pub(crate) differing: usize,
+    pub(crate) total: usize,
+    /// Only files cut by this run. Kept pass-1 bodies can carry source-line markers
+    /// and need not match the served view. They do not add to this count.
+    pub(crate) cut: usize,
+    pub(crate) omitted: usize,
+    #[allow(dead_code)] // Outcome metadata for the run executor, not another notice clause.
+    pub(crate) kept_pass_1: usize,
+    pub(crate) last_shown: Option<&'a std::path::Path>,
+    pub(crate) first_omitted: Option<&'a std::path::Path>,
+}
+
+/// One unconditional loss-bearing notice replaces the aggregate notice.
+/// Batch analytics rows do not charge this run-scoped notice.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn run_view_marker(facts: &RunNoticeFacts<'_>) -> EmittedNotice {
+    let mut middle = format!(
+        ": {}/{} files; the --tokens {} budget covers the whole output of the run",
+        facts.differing, facts.total, facts.budget,
+    );
+    if facts.served != facts.requested {
+        middle.push_str(&format!(
+            ", so the view stepped down from {}",
+            facts.requested.name()
+        ));
+    }
+    if facts.cut > 0 {
+        let subject = if facts.cut == 1 {
+            "file is"
+        } else {
+            "files are"
+        };
+        middle.push_str(&format!(
+            "; {} {subject} cut, and the last line of each counts its hidden view lines",
+            facts.cut
+        ));
+    }
+    if facts.omitted > 0 {
+        middle.push_str(&format!(
+            "; {} of {} files are omitted",
+            facts.omitted, facts.total
+        ));
+        if let Some(path) = facts.last_shown {
+            middle.push_str(&format!(" after {}", crate::cmd::display_path(path)));
+        }
+        if let Some(path) = facts.first_omitted {
+            middle.push_str(&format!(
+                ", first omitted {}",
+                crate::cmd::display_path(path)
+            ));
+        }
+        middle.push_str(", and the last stdout line counts them");
+    }
+    view_notice_line(
+        facts.served.name(),
+        &middle,
+        "a larger --tokens or fewer files",
+    )
+}
+
+/// Counts successful files only. The caller puts this on its own stdout line.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn run_trailer_line(shown: usize, total: usize) -> Option<String> {
+    elision_marker(shown, total, "files").map(|marker| format!("// {marker}\n"))
+}
+
+/// One builder owns both bounded notices, including their terminator and remedy.
+fn view_notice_line(mode: &str, middle: &str, selection: &str) -> EmittedNotice {
+    let class = mode_class_label(mode);
+    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
+        tool: "",
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: true,
+    });
+    EmittedNotice {
+        line: format!(
+            "[skim] {mode} view: {class}{middle}; use {selection} for more, or {remedy}\n"
+        ),
+    }
+}
+
 /// Unconditional class-1 notice for a changed or cut default view.
 pub(crate) fn bounded_view_marker(bound: BoundNotice) -> EmittedNotice {
-    let mode = bound.mode.name();
-    let class = mode_class_label(mode);
     let cut = if bound.cut {
         "; this view is cut to the limit, and the last stdout line counts the hidden lines"
     } else {
@@ -1096,17 +1182,14 @@ pub(crate) fn bounded_view_marker(bound: BoundNotice) -> EmittedNotice {
         BoundShape::File => "--symbol NAME or --max-lines N",
         BoundShape::Stdin => "--max-lines N",
     };
-    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
-        tool: "",
-        output_format: OutputFormat::Text,
-        passthrough_reproduces_argv: true,
-    });
-    EmittedNotice {
-        line: format!(
-            "[skim] {mode} view: {class}; the default view has {} characters, over the {MAX_STDOUT_CHARS}-character output limit{cut}; use {selection} for more, or {remedy}\n",
+    view_notice_line(
+        bound.mode.name(),
+        &format!(
+            "; the default view has {} characters, over the {MAX_STDOUT_CHARS}-character output limit{cut}",
             bound.default_view_chars,
         ),
-    }
+        selection,
+    )
 }
 
 /// Lossy-view marker for file reads (B3 / ADR-011 class 1 — unconditional).
@@ -1455,6 +1538,93 @@ mod lossy_json_view_marker_tests {
             !m.contains("SKIM_PASSTHROUGH=1"),
             "the narrow remedy must not be padded with the unreachable hatch; got: {m:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod run_view_marker_tests {
+    use super::*;
+    use rskim_core::Mode;
+    use std::path::Path;
+
+    fn facts() -> RunNoticeFacts<'static> {
+        RunNoticeFacts {
+            budget: 2000,
+            requested: Mode::Structure,
+            served: Mode::Signatures,
+            differing: 12,
+            total: 40,
+            cut: 3,
+            omitted: 28,
+            kept_pass_1: 0,
+            last_shown: Some(Path::new("src/b.rs")),
+            first_omitted: Some(Path::new("src/c.rs")),
+        }
+    }
+
+    #[test]
+    fn approved_run_notice_is_byte_exact() {
+        let notice = run_view_marker(&facts());
+        assert_eq!(
+            notice.line(),
+            "[skim] signatures view: all but signatures removed: 12/40 files; the --tokens 2000 budget covers the whole output of the run, so the view stepped down from structure; 3 files are cut, and the last line of each counts its hidden view lines; 28 of 40 files are omitted after src/b.rs, first omitted src/c.rs, and the last stdout line counts them; use a larger --tokens or fewer files for more, or SKIM_PASSTHROUGH=1 for full output\n"
+        );
+        assert!(!notice.line().contains(['\u{2014}', '\u{2013}']));
+    }
+
+    #[test]
+    fn zero_clauses_drop_out_and_only_run_cuts_count() {
+        let mut f = facts();
+        f.served = f.requested;
+        f.cut = 0;
+        f.omitted = 0;
+        f.kept_pass_1 = 9;
+        let notice = run_view_marker(&f);
+        assert_eq!(
+            notice.line(),
+            "[skim] structure view: bodies removed: 12/40 files; the --tokens 2000 budget covers the whole output of the run; use a larger --tokens or fewer files for more, or SKIM_PASSTHROUGH=1 for full output\n"
+        );
+        f.cut = 1;
+        assert!(
+            run_view_marker(&f).line().contains(
+                "; 1 file is cut, and the last line of each counts its hidden view lines"
+            )
+        );
+    }
+
+    #[test]
+    fn trailer_only_notice_has_no_last_shown_path() {
+        let mut f = facts();
+        f.last_shown = None;
+        f.omitted = f.total;
+        let notice = run_view_marker(&f);
+        assert!(notice.line().contains("40 of 40 files are omitted, first omitted src/c.rs, and the last stdout line counts them"));
+        assert!(!notice.line().contains("after "));
+    }
+
+    #[test]
+    fn path_controls_cannot_split_the_notice() {
+        let mut f = facts();
+        f.last_shown = Some(Path::new("a\n\r\u{1b}.rs"));
+        f.first_omitted = f.last_shown;
+        let notice = run_view_marker(&f);
+        assert_eq!(notice.line().lines().count(), 1);
+        assert!(!notice.line().trim_end().contains(['\n', '\r', '\u{1b}']));
+        assert!(
+            notice
+                .line()
+                .contains(&crate::cmd::display_path(f.last_shown.unwrap()))
+        );
+    }
+
+    #[test]
+    fn trailer_counts_files_and_keeps_the_shared_remedy() {
+        assert_eq!(
+            run_trailer_line(12, 40),
+            Some(format!("// {}\n", elision_marker(12, 40, "files").unwrap()))
+        );
+        assert_eq!(run_trailer_line(40, 40), None);
+        assert_eq!(run_trailer_line(0, 0), None);
     }
 }
 

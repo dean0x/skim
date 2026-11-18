@@ -18,6 +18,8 @@ mod format;
 mod multi;
 mod output;
 mod process;
+#[cfg_attr(not(test), allow(dead_code))]
+mod run_budget;
 mod runner;
 mod symbol;
 mod tokens;
