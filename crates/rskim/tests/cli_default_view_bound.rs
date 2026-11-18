@@ -166,7 +166,13 @@ fn line_prefixes_can_trigger_the_bound() {
     let plain = run(home.path(), &file, &["--mode=structure"]);
     assert!(plain.out.chars().count() + plain.err.chars().count() < LIMIT);
     over_structure(home.path(), &file, &source, &["-n"]);
-    bounded(&run(home.path(), &file, &["-n"]));
+    let view = run(home.path(), &file, &["-n"]);
+    bounded(&view);
+    assert!(view.err.starts_with("[skim] signatures view:"));
+    assert_eq!(
+        view.out,
+        run(home.path(), &file, &["--mode=signatures", "-n"]).out
+    );
 }
 
 #[test]
@@ -470,21 +476,23 @@ fn under_limit_default_streams_equal_typed_structure() {
 
 #[test]
 fn explicit_selections_keep_their_unbounded_contracts_and_valid_remedies() {
-    let source = functions(400, true);
+    let source = fields();
     let (home, file) = fixture("explicit.rs", &source);
     for args in [
         vec!["--mode=structure"],
-        vec!["--max-lines=8"],
-        vec!["--last-lines=8"],
+        vec!["--max-lines=100000"],
+        vec!["--last-lines=100000"],
         vec!["--tokens=100000"],
-        vec!["--symbol", "Small"],
+        vec!["--symbol", "Large"],
     ] {
         let view = run(home.path(), &file, &args);
         assert!(!view.err.contains("output limit"));
         assert!(!view.out.is_empty());
-        if args[0] == "--mode=structure" {
-            assert!(view.out.chars().count() > LIMIT);
-        }
+        assert!(
+            view.out.chars().count() > LIMIT,
+            "{args:?}: stdout has {} characters",
+            view.out.chars().count()
+        );
     }
     let output = skim_cmd(home.path())
         .arg(&file)
