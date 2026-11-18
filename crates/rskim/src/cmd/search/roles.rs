@@ -196,6 +196,21 @@ pub(super) enum Labelling {
     Unlabelled(Unlabelled),
 }
 
+/// A call shape that can support a same-file assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallShape {
+    Plain,
+    OwnMember,
+    Other,
+}
+
+/// The one callable declaration of the queried name.
+pub(super) struct SingleDef<'a> {
+    pub(super) name: &'a str,
+    pub(super) line: u32,
+    pub(super) is_method: bool,
+}
+
 /// What the rules read from one labelled file.
 pub(super) struct Labels {
     parts: Parts,
@@ -280,6 +295,87 @@ impl Labels {
                 names,
                 fields,
             },
+        })
+    }
+
+    /// Read the exact callee token at `start`. Only direct calls and one own
+    /// receiver wrapper support assignment. Generic and macro calls stay Other.
+    pub(super) fn call_shape<'a>(
+        &self,
+        source: &'a str,
+        start: usize,
+    ) -> (CallShape, Option<&'a str>) {
+        let Parts::Code { lang, tree, .. } = &self.parts else {
+            return (CallShape::Other, None);
+        };
+        let Some(node) = node_at(tree, start).filter(|n| is_identifier(*n) && is_callee(*n, *lang))
+        else {
+            return (CallShape::Other, None);
+        };
+        let name = source.get(node.byte_range());
+        if !assignment_language(*lang) {
+            return (CallShape::Other, name);
+        }
+        let mut current = node;
+        for _ in 0..MAX_CALLEE_HOPS {
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            if let Some((_, field)) = call_kinds(*lang)
+                .iter()
+                .find(|(kind, _)| *kind == parent.kind())
+            {
+                if matches!(parent.kind(), "macro_invocation" | "new_expression")
+                    || parent.child_by_field_name("type_arguments").is_some()
+                    || parent
+                        .child_by_field_name(field)
+                        .is_none_or(|n| n.id() != current.id())
+                {
+                    break;
+                }
+                let shape = if current.id() == node.id() {
+                    CallShape::Plain
+                } else if own_receiver(current, source, *lang) {
+                    CallShape::OwnMember
+                } else {
+                    CallShape::Other
+                };
+                return (shape, name);
+            }
+            // Exactly one member wrapper is eligible. In particular, a generic
+            // function wrapper or a nested receiver cannot widen this rule.
+            if current.id() != node.id() || !passes_through(parent, current) {
+                break;
+            }
+            current = parent;
+        }
+        (CallShape::Other, name)
+    }
+
+    /// Require one declaration, not just one callable declaration or def line.
+    /// A field or a second declaration on the same line still makes it ambiguous.
+    pub(super) fn single_callable_def(
+        &self,
+        is_name: impl Fn(&str) -> bool,
+    ) -> Option<SingleDef<'_>> {
+        let Parts::Code {
+            lang, tree, decls, ..
+        } = &self.parts
+        else {
+            return None;
+        };
+        if !assignment_language(*lang) {
+            return None;
+        }
+        let mut matching = decls.iter().filter(|decl| is_name(&decl.name));
+        let decl = matching.next()?;
+        if matching.next().is_some() || !callable_kind(decl, *lang, tree) {
+            return None;
+        }
+        Some(SingleDef {
+            name: &decl.name,
+            line: row_to_line(node_at(tree, decl.name_bytes.start)?.start_position().row),
+            is_method: is_method(decl, *lang, tree),
         })
     }
 
@@ -553,6 +649,79 @@ fn passes_through(wrapper: Node<'_>, child: Node<'_>) -> bool {
         "navigation_expression" => wrapper
             .named_child(wrapper.named_child_count().saturating_sub(1))
             .is_some_and(|last| last.id() == child.id()),
+        _ => false,
+    }
+}
+
+/// Assignment is deliberately narrower than the role classifier.
+fn assignment_language(lang: Language) -> bool {
+    matches!(
+        lang,
+        Language::Rust
+            | Language::TypeScript
+            | Language::JavaScript
+            | Language::Python
+            | Language::Go
+    )
+}
+
+fn own_receiver(wrapper: Node<'_>, source: &str, lang: Language) -> bool {
+    let (field, expected) = match (lang, wrapper.kind()) {
+        (Language::Rust, "field_expression") => ("value", "self"),
+        (Language::Rust, "scoped_identifier") => ("path", "Self"),
+        (Language::TypeScript | Language::JavaScript, "member_expression") => ("object", "this"),
+        (Language::Python, "attribute") => ("object", "self"),
+        _ => return false,
+    };
+    wrapper
+        .child_by_field_name(field)
+        .and_then(|n| source.get(n.byte_range()))
+        == Some(expected)
+}
+
+fn declaration_node<'a>(decl: &Declaration, tree: &'a Tree) -> Option<Node<'a>> {
+    tree.root_node()
+        .descendant_for_byte_range(decl.byte_range.start, decl.byte_range.end)
+}
+
+/// Callable subset of the declaration-kind tables in rskim-core/src/decl.rs.
+/// A variable declaration counts only when its value is a function expression.
+fn callable_kind(decl: &Declaration, lang: Language, tree: &Tree) -> bool {
+    match lang {
+        Language::Rust => matches!(decl.kind, "function_item" | "function_signature_item"),
+        Language::TypeScript | Language::JavaScript => match decl.kind {
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "method_definition" => true,
+            "variable_declarator" => declaration_node(decl, tree)
+                .and_then(|n| n.child_by_field_name("value"))
+                .is_some_and(|n| {
+                    matches!(
+                        n.kind(),
+                        "arrow_function" | "function_expression" | "generator_function"
+                    )
+                }),
+            _ => false,
+        },
+        Language::Python => decl.kind == "function_definition",
+        Language::Go => matches!(decl.kind, "function_declaration" | "method_declaration"),
+        _ => decl.kind.contains("function") || decl.kind.contains("method"),
+    }
+}
+
+/// Method subset of the declaration-kind tables in rskim-core/src/decl.rs.
+/// Rust modules are containers too, so the immediate impl/trait parent decides.
+fn is_method(decl: &Declaration, lang: Language, tree: &Tree) -> bool {
+    match lang {
+        Language::Rust => declaration_node(decl, tree)
+            .and_then(|n| n.parent())
+            .filter(|n| n.kind() == "declaration_list")
+            .and_then(|n| n.parent())
+            .is_some_and(|n| matches!(n.kind(), "impl_item" | "trait_item")),
+        Language::TypeScript | Language::JavaScript => decl.kind == "method_definition",
+        Language::Python => decl.container.is_some(),
+        Language::Go => decl.kind == "method_declaration",
         _ => false,
     }
 }

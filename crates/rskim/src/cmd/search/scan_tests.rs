@@ -113,6 +113,190 @@ fn rendered(out: &ScanOutput, needle: &str, limits: Limits, context: usize) -> R
     )
 }
 
+fn assignments(file: &FileScan) -> Vec<(u32, Option<u32>)> {
+    file.records
+        .iter()
+        .filter(|r| r.role == Role::Call)
+        .map(|r| (r.line, r.call_def))
+        .collect()
+}
+
+#[test]
+fn a_self_call_goes_to_the_one_method_and_a_plain_call_with_an_import_stays_not_split() {
+    let tree = Tree::new();
+    tree.write("a.rs", "use other::ping;\nimpl T {\n fn ping(&self) {}\n fn run(&self) {\n  self.ping();\n  self.ping();\n  self.ping();\n  self.ping();\n  ping();\n  ping();\n }\n}\n");
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.rs");
+    assert_eq!(
+        assignments(f),
+        [
+            (5, Some(3)),
+            (6, Some(3)),
+            (7, Some(3)),
+            (8, Some(3)),
+            (9, None),
+            (10, None)
+        ]
+    );
+    assert_eq!(f.assigned_calls, 4);
+    tree.write(
+        "a.rs",
+        "fn ping() {}\nfn run() {\n ping();\n}\nuse other::ping;\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    assert_eq!(assignments(file(&out, "a.rs")), [(3, None)]);
+}
+
+#[test]
+fn a_plain_call_goes_to_the_one_free_function_of_its_file() {
+    let tree = Tree::new();
+    for (path, source, line) in [
+        ("a.rs", "fn\nping() {}\nfn run() { ping(); }\n", 2),
+        ("a.ts", "const ping = () => 1;\nping();\n", 1),
+        ("a.js", "function ping() {}\nping();\n", 1),
+        ("a.py", "def ping(): pass\nping()\n", 1),
+        (
+            "a.go",
+            "package p\nfunc ping() {}\nfunc run() { ping() }\n",
+            2,
+        ),
+    ] {
+        tree.write(path, source);
+        let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+        let f = file(&out, path);
+        assert_eq!(f.assigned_calls, 1, "{path}");
+        assert_eq!(assignments(f)[0].1, Some(line), "{path}");
+    }
+    let out = scan(&tree, &pattern("ping", false), Limits::default(), 0);
+    assert!(
+        out.files
+            .iter()
+            .all(|f| f.assigned_calls == 0 && f.records.iter().all(|r| r.call_def.is_none()))
+    );
+    let out = scan(&tree, &words(&["ping", "run"]), Limits::default(), 0);
+    assert!(
+        out.files
+            .iter()
+            .all(|f| f.assigned_calls == 0 && f.records.iter().all(|r| r.call_def.is_none()))
+    );
+}
+
+#[test]
+fn qualified_receiver_macro_generic_and_two_definition_calls_stay_not_split() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn ping() {}\nfn run() {\n Type::ping();\n other.ping();\n ping!();\n ping::<u8>();\n wrap!(ping());\n}\n");
+    tree.write("b.rs", "fn ping() {}\nfn ping() {}\nfn run() { ping(); }\n");
+    tree.write("c.rs", "fn ping() {} fn ping() {}\nfn run() { ping(); }\n");
+    tree.write("d.rs", "type ping = u8;\nfn run() { ping(); }\n");
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    assert!(out.files.iter().all(|f| f.roles.get(Role::Call) > 0
+        && f.assigned_calls == 0
+        && f.records.iter().all(|r| r.call_def.is_none())));
+}
+
+#[test]
+fn a_call_in_another_case_under_ignore_case_is_not_assigned() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn ping() {}\nfn run() {\n PING();\n ping();\n}\n");
+    let query = ScanQuery {
+        plan: QueryPlan::Pattern(Box::new(
+            Matcher::new(MatcherSpec {
+                pattern: "ping",
+                kind: PatternKind::Literal,
+                case: CaseMode::Insensitive,
+                word: false,
+            })
+            .unwrap(),
+        )),
+        words: Vec::new(),
+        identifier: true,
+    };
+    let out = scan(&tree, &query, Limits::default(), 0);
+    assert_eq!(assignments(file(&out, "a.rs")), [(3, None), (4, Some(1))]);
+}
+
+#[test]
+fn the_assigned_count_is_exact_past_the_stored_line_cap() {
+    let tree = Tree::new();
+    tree.write(
+        "a.rs",
+        "fn ping() {}\nfn run() {\n ping(); ping();\n ping();\n ping();\n}\n",
+    );
+    let out = scan(
+        &tree,
+        &pattern("ping", true),
+        Limits {
+            max_stored_lines: 1,
+            ..Limits::default()
+        },
+        0,
+    );
+    let f = file(&out, "a.rs");
+    assert_eq!(
+        (f.records.len(), f.assigned_calls, f.roles.get(Role::Call)),
+        (1, 3, 3)
+    );
+    assert_eq!(assignments(f), [(3, Some(1))]);
+}
+
+#[test]
+fn an_unsupported_language_is_never_assigned() {
+    let tree = Tree::new();
+    tree.write(
+        "a.java",
+        "class T {\n void ping() {}\n void run() { ping(); }\n}\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.java");
+    assert_eq!(f.roles.get(Role::Def), 1);
+    assert_eq!(assignments(f), [(3, None)]);
+    assert_eq!(f.assigned_calls, 0);
+}
+
+#[test]
+fn a_line_with_a_second_call_of_another_shape_stays_not_split() {
+    let tree = Tree::new();
+    tree.write("a.rs", "impl T {\n fn ping(&self) {}\n fn run(&self) {\n  self.ping() == other.ping();\n  self.ping() == self.ping();\n }\n}\n");
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.rs");
+    assert_eq!(assignments(f), [(4, None), (5, Some(2))]);
+    assert_eq!(f.assigned_calls, 1);
+}
+
+#[test]
+fn the_all_files_definition_cap_clears_an_assignment_it_cuts() {
+    let tree = Tree::new();
+    for path in ["a.rs", "b.rs"] {
+        tree.write(path, "fn ping() {}\nfn run() { ping(); }\n");
+    }
+    let out = scan(
+        &tree,
+        &pattern("ping", true),
+        Limits {
+            max_def_sites: 1,
+            ..Limits::default()
+        },
+        0,
+    );
+    assert_eq!(assignments(file(&out, "a.rs")), [(2, Some(1))]);
+    assert_eq!(file(&out, "a.rs").assigned_calls, 1);
+    assert!(file(&out, "b.rs").defs.is_empty());
+    assert_eq!(assignments(file(&out, "b.rs")), [(2, None)]);
+    assert_eq!(file(&out, "b.rs").assigned_calls, 0);
+    let out = scan(
+        &tree,
+        &pattern("ping", true),
+        Limits {
+            max_def_sites_per_file: 0,
+            ..Limits::default()
+        },
+        0,
+    );
+    assert!(out.files.iter().all(|f| f.defs.is_empty()
+        && f.assigned_calls == 0
+        && f.records.iter().all(|r| r.call_def.is_none())));
+}
+
 // ============================================================================
 // Lines and clipping
 // ============================================================================

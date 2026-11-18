@@ -48,8 +48,8 @@ use super::rank::{
     FilePrior, WORD_VIEW_BEST_LINES, WordInput, file_name_hit, file_prior, rank_words,
 };
 use super::roles::{
-    Holder, Labelling, Labels, Role, RoleCounts, Unlabelled, declaration_keywords,
-    has_declaration_keyword,
+    CallShape, Holder, Labelling, Labels, Role, RoleCounts, SingleDef, Unlabelled,
+    declaration_keywords, has_declaration_keyword, is_partial,
 };
 use super::universe::{Candidate, Containment, LeftOut, LeftOutCounts, Listing, Read};
 
@@ -179,6 +179,8 @@ pub(super) struct Record {
     pub(super) holder: Option<Holder>,
     /// For a `def`: the 1-based first and last line of the declaration.
     pub(super) def_lines: Option<(u32, u32)>,
+    /// The name line of the assigned same-file definition, if any.
+    pub(super) call_def: Option<u32>,
     /// The line, clipped to [`LINE_WIDTH_CAP`] bytes, without a trailing `\r`.
     pub(super) text: String,
     /// Bytes clipped from the end of the line.
@@ -211,6 +213,8 @@ pub(super) struct FileScan {
     /// Exact role counts over all matching lines. Empty after a counts-only
     /// scan.
     pub(super) roles: RoleCounts,
+    /// Exact assigned call-line count, including lines without a stored record.
+    pub(super) assigned_calls: u32,
     /// Definition lines, up to [`Limits::max_def_sites_per_file`].
     pub(super) defs: Vec<Record>,
     /// Other stored lines, in line order.
@@ -220,6 +224,15 @@ pub(super) struct FileScan {
 }
 
 impl FileScan {
+    /// A cut that removes the only definition must also remove its assignments,
+    /// including the exact count of call lines beyond the stored-line quota.
+    fn clear_call_assignments(&mut self) {
+        for record in &mut self.records {
+            record.call_def = None;
+        }
+        self.assigned_calls = 0;
+    }
+
     /// The text of `line` if the file stored it as a record, a definition or a
     /// context line.
     #[cfg(test)]
@@ -745,6 +758,9 @@ impl Counted<'_> {
             if result.file.defs.len() > room {
                 caps.all_defs = true;
                 result.file.defs.truncate(room);
+                // Assignment already requires one stored definition. Any cut
+                // here removes that witness, after the per-file final check.
+                result.file.clear_call_assignments();
             }
             caps.merge(result.caps);
             defs_kept += result.file.defs.len();
@@ -786,6 +802,7 @@ fn file_scan(
         name_hit: m.name_hit,
         unlabelled,
         roles,
+        assigned_calls: 0,
         defs: Vec::new(),
         records: Vec::new(),
         context: Vec::new(),
@@ -906,6 +923,12 @@ fn collect_lines(
 ) -> CapsHit {
     let mut caps = CapsHit::default();
     let mut other_lines = 0usize;
+    let target = match (&query.plan, query.identifier, labelling) {
+        (QueryPlan::Pattern(matcher), true, Labelling::Labelled(labels)) => {
+            labels.single_callable_def(|name| matcher.matches(name).any(|r| r == (0..name.len())))
+        }
+        _ => None,
+    };
     for (number, start, line) in numbered_lines(text) {
         let (hit, distinct) = match &query.plan {
             QueryPlan::Pattern(matcher) => (
@@ -929,6 +952,17 @@ fn collect_lines(
             continue;
         };
         file.roles.add(hit.role);
+        let call_def = match (&target, &query.plan, labelling) {
+            (Some(target), QueryPlan::Pattern(matcher), Labelling::Labelled(labels))
+                if hit.role == Role::Call =>
+            {
+                assigned_call_line(text, line, start, matcher, labels, target)
+            }
+            _ => None,
+        };
+        if call_def.is_some() {
+            file.assigned_calls = file.assigned_calls.saturating_add(1);
+        }
         let is_def = hit.role == Role::Def;
         other_lines += usize::from(!is_def);
         let room = if is_def {
@@ -955,6 +989,7 @@ fn collect_lines(
             role: hit.role,
             holder: hit.holder,
             def_lines: hit.def_lines,
+            call_def,
             text,
             truncated_bytes,
             distinct_words: distinct,
@@ -978,7 +1013,47 @@ fn collect_lines(
         Select::BestWords => other_lines.min(WORD_VIEW_BEST_LINES),
     };
     caps.stored_lines = file.records.len() < wanted;
+    // Counts cover the whole file, not just its stored prefix. Imports can
+    // follow calls, and the per-file definition quota can remove the witness.
+    let valid = target.as_ref().is_some_and(|target| {
+        file.roles.get(Role::Def) == 1
+            && file.defs.len() == 1
+            && file.defs[0].line == target.line
+            && (target.is_method || file.roles.get(Role::Import) == 0)
+    });
+    if !valid {
+        file.clear_call_assignments();
+    }
     caps
+}
+
+/// Every call match on a line must fit the same exact-name declaration.
+/// Non-call matches on that line do not supply evidence for assignment.
+fn assigned_call_line(
+    source: &str,
+    line: &str,
+    start: usize,
+    matcher: &Matcher,
+    labels: &Labels,
+    target: &SingleDef<'_>,
+) -> Option<u32> {
+    let mut calls = 0usize;
+    for range in matcher.matches(line) {
+        let absolute = start + range.start..start + range.end;
+        if is_partial(line, &range) || labels.role(&absolute) != Role::Call {
+            continue;
+        }
+        calls += 1;
+        let (shape, name) = labels.call_shape(source, absolute.start);
+        let fits = matches!(
+            (shape, target.is_method),
+            (CallShape::Plain, false) | (CallShape::OwnMember, true)
+        );
+        if name != Some(target.name) || !fits {
+            return None;
+        }
+    }
+    (calls > 0).then_some(target.line)
 }
 
 /// Keep `record` among the best `quota` records of the word view: most distinct

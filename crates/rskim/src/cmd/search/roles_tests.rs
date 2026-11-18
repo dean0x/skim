@@ -24,6 +24,133 @@ use super::{
     Labelling, Labels, Role, Unlabelled, declaration_keywords, has_declaration_keyword, is_partial,
 };
 
+#[test]
+fn the_call_shape_is_plain_own_member_or_other_per_language() {
+    use super::CallShape::{Other, OwnMember, Plain};
+    let cases = [
+        (
+            Language::Rust,
+            "rs",
+            "fn run() { ping(); self.ping(); Self::ping(); Type::ping(); other.ping(); ping!(); ping::<u8>(); wrap!(ping()); }",
+            vec![
+                Plain, OwnMember, OwnMember, Other, Other, Other, Other, Other,
+            ],
+        ),
+        (
+            Language::TypeScript,
+            "ts",
+            "ping(); this.ping(); other.ping(); new ping(); ping<string>();",
+            vec![Plain, OwnMember, Other, Other, Other],
+        ),
+        (
+            Language::JavaScript,
+            "js",
+            "ping(); this.ping(); other.ping(); new ping();",
+            vec![Plain, OwnMember, Other, Other],
+        ),
+        (
+            Language::Python,
+            "py",
+            "ping()\nself.ping()\nother.ping()\n",
+            vec![Plain, OwnMember, Other],
+        ),
+        (
+            Language::Go,
+            "go",
+            "package p\nfunc run() { ping(); self.ping(); other.ping() }",
+            vec![Plain, Other, Other],
+        ),
+        (Language::C, "c", "void run() { ping(); }", vec![Other]),
+    ];
+    for (lang, ext, source, expected) in cases {
+        let labels = Labels::new(source, lang, ext).unwrap();
+        let actual: Vec<_> = source
+            .match_indices("ping")
+            .map(|(start, _)| {
+                let (shape, name) = labels.call_shape(source, start);
+                if shape != Other {
+                    assert_eq!(name, Some("ping"));
+                }
+                shape
+            })
+            .collect();
+        assert_eq!(actual, expected, "{lang:?}");
+    }
+}
+
+#[test]
+fn a_single_callable_definition_needs_exactly_one_declaration_of_the_name() {
+    for source in [
+        "fn ping() {}",
+        "trait T { fn ping(&self); }",
+        "fn\nping() {}",
+    ] {
+        let labels = Labels::new(source, Language::Rust, "rs").unwrap();
+        let def = labels.single_callable_def(|name| name == "ping").unwrap();
+        assert_eq!(def.name, "ping");
+        assert_eq!(def.line, if source.starts_with("fn\n") { 2 } else { 1 });
+    }
+    for source in [
+        "fn ping() {} fn ping() {}",
+        "fn ping() {} struct T { ping: u8 }",
+        "type ping = u8;",
+        "const ping: u8 = 1;",
+    ] {
+        let labels = Labels::new(source, Language::Rust, "rs").unwrap();
+        assert!(
+            labels.single_callable_def(|name| name == "ping").is_none(),
+            "{source}"
+        );
+    }
+    for (source, callable) in [
+        ("function ping() {}", true),
+        ("function* ping() {}", true),
+        ("declare function ping(): void;", true),
+        ("const ping = () => 1;", true),
+        ("const ping = function() {};", true),
+        ("const ping = function*() {};", true),
+        ("const ping = 1;", false),
+        ("type ping = string;", false),
+    ] {
+        let labels = Labels::new(source, Language::TypeScript, "ts").unwrap();
+        assert_eq!(
+            labels.single_callable_def(|name| name == "ping").is_some(),
+            callable,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn the_method_test_reads_impl_trait_class_and_method_kinds() {
+    let cases = [
+        (Language::Rust, "rs", "impl T { fn ping(&self) {} }", true),
+        (Language::Rust, "rs", "trait T { fn ping(&self); }", true),
+        (Language::Rust, "rs", "mod t { fn ping() {} }", false),
+        (Language::TypeScript, "ts", "class T { ping() {} }", true),
+        (Language::JavaScript, "js", "class T { ping() {} }", true),
+        (
+            Language::Python,
+            "py",
+            "class T:\n def ping(self): pass\n",
+            true,
+        ),
+        (Language::Go, "go", "package p\nfunc (t T) ping() {}", true),
+        (Language::Go, "go", "package p\nfunc ping() {}", false),
+    ];
+    for (lang, ext, source, expected) in cases {
+        let labels = Labels::new(source, lang, ext).unwrap();
+        assert_eq!(
+            labels
+                .single_callable_def(|name| name == "ping")
+                .unwrap()
+                .is_method,
+            expected,
+            "{source}"
+        );
+    }
+}
+
 // ============================================================================
 // Fixtures
 // ============================================================================
