@@ -1142,7 +1142,13 @@ fn stdin_passthrough_result(
         "[skim] notice: unknown language for stdin — degraded to lossless passthrough. \
          Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass."
     );
-    let (output, bound, view_differs) = if options.trunc.char_budget.is_some() {
+    // Unknown-language stdin has no line annotation or notice below the limit.
+    // Keep that legacy path intact; only an over-limit raw view needs the bound.
+    let needs_bound = options
+        .trunc
+        .char_budget
+        .is_some_and(|limit| buffer.chars().count() >= limit);
+    let (output, bound, view_differs) = if needs_bound {
         let view = default_view(
             &buffer,
             None,

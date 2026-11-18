@@ -915,7 +915,8 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize, source_total: usize
 pub enum TruncationCountSource<'a> {
     /// Legacy source-space rule: subtract the kept view-line count from this total.
     SourceTotal(usize),
-    /// Source-space count after the last kept line, using one-based source lines.
+    /// Source-space count after the last kept source line. Coordinates are
+    /// one-based; zero marks a synthetic line and does not advance the source cut.
     LineMap {
         map: &'a [usize],
         source_total: usize,
@@ -1002,16 +1003,18 @@ where
 
     let omitted_at = |kept: usize| match count_source {
         TruncationCountSource::SourceTotal(total) => total.saturating_sub(kept),
-        TruncationCountSource::LineMap { map, source_total } => {
-            if kept == 0 {
-                source_total
-            } else {
-                map.get(kept - 1).map_or_else(
-                    || lines.len().saturating_sub(kept),
-                    |&last_source_line| source_total.saturating_sub(last_source_line),
-                )
-            }
-        }
+        TruncationCountSource::LineMap { map, source_total } => map.get(..kept).map_or_else(
+            || lines.len().saturating_sub(kept),
+            |prefix| {
+                let last_source_line = prefix
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&line| line != 0)
+                    .unwrap_or(0);
+                source_total.saturating_sub(last_source_line)
+            },
+        ),
         TruncationCountSource::ViewLines => lines.len().saturating_sub(kept),
     };
     let make_marker = |kept: usize| {

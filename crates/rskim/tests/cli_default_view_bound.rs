@@ -7,7 +7,11 @@ use tempfile::TempDir;
 const LIMIT: usize = 29_000;
 
 fn skim_cmd(cache: &Path) -> Command {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("skim"));
+    Command::from_std(skim_std_cmd(cache))
+}
+
+fn skim_std_cmd(cache: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("skim"));
     cmd.env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_REWRITTEN_FROM")
         .env_remove("SKIM_DEBUG")
@@ -113,6 +117,25 @@ fn default_steps_to_signatures_with_one_exact_notice() {
     );
     assert!(!view.err.contains("probe_word_unique"));
     assert!(!view.err.contains("Documentation_"));
+}
+
+#[test]
+fn default_bound_also_applies_to_a_regular_file_destination() {
+    let source = functions(100, true);
+    let (home, file) = fixture("redirect.rs", &source);
+    over_structure(home.path(), &file, &source, &[]);
+    let piped = run(home.path(), &file, &["--no-cache"]);
+    bounded(&piped);
+    let destination = home.path().join("view.txt");
+    let output = skim_std_cmd(home.path())
+        .arg(&file)
+        .arg("--no-cache")
+        .stdout(fs::File::create(&destination).unwrap())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(destination).unwrap(), piped.out);
+    assert_eq!(output.stderr, piped.err.as_bytes());
 }
 
 #[test]
@@ -239,6 +262,35 @@ fn types_cut_counts_source_lines_after_the_last_kept_field() {
 }
 
 #[test]
+fn types_cut_after_a_synthetic_separator_counts_from_the_last_source_line() {
+    use rskim_core::{Language, Mode, TransformConfig, TruncationCountSource};
+    let source =
+        "type First = usize;\ntype Second = usize;\ntype Third = usize;\ntype Fourth = usize;\n";
+    let mut config = TransformConfig::with_mode(Mode::Types);
+    config.line_numbers = true;
+    let (text, _, map, degraded) =
+        rskim_core::transform_with_line_map(source, Language::Rust, &config).unwrap();
+    assert!(!degraded);
+    let map = map.unwrap();
+    assert_eq!(&map[..2], &[1, 0], "types insert an unmapped separator");
+    let cut = rskim_core::truncate_with_count_source(
+        &text,
+        Language::Rust,
+        3,
+        |candidate| candidate.lines().count(),
+        None,
+        None,
+        TruncationCountSource::LineMap {
+            map: &map,
+            source_total: source.lines().count(),
+        },
+    )
+    .unwrap();
+    assert_eq!(cut.lines().nth(1), Some(""));
+    assert_eq!(hidden_count(&cut), source.lines().skip(1).count());
+}
+
+#[test]
 fn numbered_types_cut_keeps_source_numbers_and_an_unnumbered_marker() {
     let source = fields();
     let (home, file) = fixture("fields.rs", &source);
@@ -322,6 +374,25 @@ fn unknown_file_and_stdin_cut_raw_with_exact_counts() {
             hidden_count(&view.out),
             source.lines().count() - (view.out.lines().count() - 1)
         );
+    }
+}
+
+#[test]
+fn unknown_stdin_below_the_limit_keeps_its_unannotated_raw_bytes() {
+    let home = TempDir::new().unwrap();
+    for source in [
+        "untyped raw line\n".repeat(4),
+        "界\n".repeat((LIMIT - 1) / 2),
+    ] {
+        assert!(source.chars().count() < LIMIT);
+        for args in [vec![], vec!["-n"]] {
+            let default = stdin(home.path(), &source, &args);
+            let mut explicit = args;
+            explicit.push("--mode=structure");
+            assert_eq!(default, stdin(home.path(), &source, &explicit));
+            assert_eq!(default.out, source);
+            assert!(default.err.is_empty());
+        }
     }
 }
 
