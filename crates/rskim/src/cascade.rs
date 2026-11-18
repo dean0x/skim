@@ -204,84 +204,144 @@ where
         );
     }
 
-    let cascade = starting_mode.cascade_from_here();
-    let mut last_output: Option<String> = None;
-    let mut last_mode = starting_mode;
-    let mut last_token_count: Option<usize> = None;
-    // Set to true when at least one mode returned Ok(Some("")) — an empty string is
-    // distinct from Ok(None): it means the transform ran and produced no structural
-    // content (e.g. a comment-only file, or an empty source file).
-    let mut saw_empty_output = false;
-
-    for &mode in cascade {
-        let config = build_config(mode, trunc);
-
-        let Some(output) = transform_fn(&config)? else {
-            continue;
-        };
-
-        // Treat empty output the same as Ok(None): the mode produced no usable content.
-        // A 0-token empty string would satisfy any budget ceiling and silently suppress
-        // the fallback truncation path — that violates #317 (compress-never-truncate).
-        if output.trim().is_empty() {
-            saw_empty_output = true;
-            continue;
-        }
-
-        let token_count = count_tokens_or_max(&output);
-
-        if token_count <= token_budget {
+    let mut last_token_count = None;
+    let walk = walk_rungs(
+        starting_mode.cascade_from_here(),
+        trunc,
+        &transform_fn,
+        |output: &String| output.trim().is_empty(),
+        |_, output| {
+            let count = count_tokens_or_max(output);
+            last_token_count = Some(count);
+            count <= token_budget
+        },
+    )?;
+    match walk {
+        RungWalk::Fits { mode, rung } => {
             if mode != starting_mode {
                 eprintln!(
                     "[skim] token budget: escalated from {} to {} mode ({} tokens)",
                     starting_mode.name(),
                     mode.name(),
-                    token_count,
+                    last_token_count.unwrap_or(0),
                 );
             }
-            return Ok((output, mode));
+            Ok((rung, mode))
         }
-
-        last_output = Some(output);
-        last_mode = mode;
-        last_token_count = Some(token_count);
-    }
-
-    // At least one mode returned Some("") but none returned non-empty content.
-    // Recover the raw source via Mode::Full so we can either return empty success
-    // (for an empty/whitespace-only source) or line-truncate the raw content
-    // (for a source that transforms to nothing, e.g. a comment-only file).
-    if last_output.is_none() && saw_empty_output {
-        let full_config = build_config(Mode::Full, trunc);
-        let raw = transform_fn(&full_config)?.unwrap_or_default();
-        if raw.trim().is_empty() {
-            // Empty or whitespace-only source: return an empty result with no marker —
-            // nothing was elided (#317: never truncate, and there is nothing to truncate).
-            return Ok((String::new(), starting_mode));
-        }
-        // Non-empty source where every structural mode produced empty output
-        // (e.g. a Rust file containing only comments, no fn/type declarations):
-        // line-truncate the raw source so the reader gets content.
-        return fallback_line_truncate(
-            &raw,
+        RungWalk::NoneFits { mode, rung } => fallback_line_truncate(
+            &rung,
             language,
             token_budget,
-            starting_mode,
-            None,
+            mode,
+            last_token_count,
             source_line_count,
-        );
+        ),
+        RungWalk::AllEmpty => {
+            let raw = transform_fn(&build_config(Mode::Full, trunc))?.unwrap_or_default();
+            if raw.trim().is_empty() {
+                return Ok((String::new(), starting_mode));
+            }
+            fallback_line_truncate(
+                &raw,
+                language,
+                token_budget,
+                starting_mode,
+                None,
+                source_line_count,
+            )
+        }
+        RungWalk::NoOutput => Err(anyhow::anyhow!(NO_OUTPUT_MSG)),
     }
+}
 
-    // Guard: no mode produced output at all (all returned Ok(None)).
-    let last_output = last_output.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
+/// Result of the common, print-free mode walk. Empty views never satisfy a budget.
+#[derive(Debug)]
+pub(crate) enum RungWalk<R> {
+    Fits { mode: Mode, rung: R },
+    NoneFits { mode: Mode, rung: R },
+    AllEmpty,
+    NoOutput,
+}
 
-    fallback_line_truncate(
-        &last_output,
-        language,
-        token_budget,
-        last_mode,
-        last_token_count,
-        source_line_count,
+fn walk_rungs<R>(
+    modes: &[Mode],
+    trunc: &TruncationOptions,
+    mut transform: impl FnMut(&TransformConfig) -> anyhow::Result<Option<R>>,
+    is_empty: impl Fn(&R) -> bool,
+    mut fits: impl FnMut(Mode, &R) -> bool,
+) -> anyhow::Result<RungWalk<R>> {
+    let mut last = None;
+    let mut saw_empty = false;
+    for &mode in modes {
+        let Some(rung) = transform(&build_config(mode, trunc))? else {
+            continue;
+        };
+        if is_empty(&rung) {
+            saw_empty = true;
+            continue;
+        }
+        if fits(mode, &rung) {
+            return Ok(RungWalk::Fits { mode, rung });
+        }
+        last = Some((mode, rung));
+    }
+    Ok(match last {
+        Some((mode, rung)) => RungWalk::NoneFits { mode, rung },
+        None if saw_empty => RungWalk::AllEmpty,
+        None => RungWalk::NoOutput,
+    })
+}
+
+/// A transform with its source coordinates and parse quality.
+#[derive(Debug)]
+pub(crate) struct CharBudgetRung {
+    pub(crate) text: String,
+    pub(crate) line_map: Option<Vec<usize>>,
+    pub(crate) has_errors: bool,
+    pub(crate) degraded: bool,
+}
+
+pub(crate) type CharBudgetOutcome = RungWalk<CharBudgetRung>;
+
+/// Serde structure, signatures and types produce the same view. Only a raw
+/// starting mode has a second distinct rung.
+fn serde_rungs(mode: Mode) -> &'static [Mode] {
+    match mode {
+        Mode::Full => &[Mode::Full, Mode::Structure],
+        Mode::Minimal => &[Mode::Minimal, Mode::Structure],
+        Mode::Pseudo => &[Mode::Pseudo, Mode::Structure],
+        Mode::Structure => &[Mode::Structure],
+        Mode::Signatures => &[Mode::Signatures],
+        Mode::Types => &[Mode::Types],
+    }
+}
+
+/// Select the first non-empty, non-degraded view that fits the measured limit.
+///
+/// Step-down can remove whole declaration kinds. It uses the mode order, not a
+/// size heuristic. The caller measures annotated characters and the exact notice.
+/// This path prints nothing and never counts tokens.
+pub(crate) fn select_for_char_budget(
+    trunc: &TruncationOptions,
+    language: Language,
+    mut transform: impl FnMut(&TransformConfig) -> anyhow::Result<Option<CharBudgetRung>>,
+    mut measure: impl FnMut(Mode, &CharBudgetRung) -> usize,
+) -> anyhow::Result<CharBudgetOutcome> {
+    let modes = if language.is_serde_based() {
+        serde_rungs(Mode::Structure)
+    } else {
+        Mode::Structure.cascade_from_here()
+    };
+    walk_rungs(
+        modes,
+        trunc,
+        |config| Ok(transform(config)?.filter(|rung| !rung.degraded)),
+        |rung| rung.text.trim().is_empty(),
+        |mode, rung| {
+            trunc
+                .char_budget
+                .is_some_and(|limit| measure(mode, rung) < limit)
+        },
     )
 }
 
@@ -310,7 +370,7 @@ where
     }
 
     // If starting at Full/Minimal/Pseudo, try structure-extracted (the only other distinct output)
-    if matches!(starting_mode, Mode::Full | Mode::Minimal | Mode::Pseudo) {
+    if serde_rungs(starting_mode).len() > 1 {
         let structure_config = build_config(Mode::Structure, trunc);
         if let Some(extracted) = transform_fn(&structure_config)? {
             let extracted_tokens = count_tokens_or_max(&extracted);
@@ -349,6 +409,151 @@ where
 mod tests {
     use super::*;
     use crate::tokens;
+
+    #[test]
+    fn character_walk_uses_first_fit_and_last_nonempty_rung() {
+        let trunc = TruncationOptions {
+            char_budget: Some(10),
+            ..Default::default()
+        };
+        for (sizes, expected) in [
+            ([20, 5, 2], Mode::Signatures),
+            ([20, 15, 2], Mode::Types),
+            ([20, 0, 0], Mode::Structure),
+        ] {
+            let outcome = select_for_char_budget(
+                &trunc,
+                Language::Rust,
+                |config| {
+                    let index = Mode::Structure
+                        .cascade_from_here()
+                        .iter()
+                        .position(|&m| m == config.mode)
+                        .unwrap();
+                    Ok(Some(CharBudgetRung {
+                        text: "x".repeat(sizes[index]),
+                        line_map: None,
+                        has_errors: false,
+                        degraded: false,
+                    }))
+                },
+                |_, rung| rung.text.chars().count(),
+            )
+            .unwrap();
+            match outcome {
+                RungWalk::Fits { mode, .. } | RungWalk::NoneFits { mode, .. } => {
+                    assert_eq!(mode, expected)
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn character_walk_skips_degraded_views_and_distinguishes_empty_from_absent() {
+        let trunc = TruncationOptions {
+            char_budget: Some(10),
+            ..Default::default()
+        };
+        for degraded in [false, true] {
+            let outcome = select_for_char_budget(
+                &trunc,
+                Language::Rust,
+                |_| {
+                    Ok(Some(CharBudgetRung {
+                        text: String::new(),
+                        line_map: None,
+                        has_errors: false,
+                        degraded,
+                    }))
+                },
+                |_, _| 0,
+            )
+            .unwrap();
+            assert!(if degraded {
+                matches!(outcome, RungWalk::NoOutput)
+            } else {
+                matches!(outcome, RungWalk::AllEmpty)
+            });
+        }
+    }
+
+    #[test]
+    fn serde_character_walk_runs_only_structure() {
+        let trunc = TruncationOptions {
+            char_budget: Some(10),
+            ..Default::default()
+        };
+        let mut calls = Vec::new();
+        let outcome = select_for_char_budget(
+            &trunc,
+            Language::Json,
+            |config| {
+                calls.push(config.mode);
+                Ok(Some(CharBudgetRung {
+                    text: "x".repeat(20),
+                    line_map: None,
+                    has_errors: false,
+                    degraded: false,
+                }))
+            },
+            |_, rung| rung.text.len(),
+        )
+        .unwrap();
+        assert_eq!(calls, [Mode::Structure]);
+        assert!(matches!(
+            outcome,
+            RungWalk::NoneFits {
+                mode: Mode::Structure,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn token_and_character_walks_select_the_same_mock_rung() {
+        for sizes in [[20, 5, 2], [20, 15, 2], [0, 0, 0]] {
+            let transform = |config: &TransformConfig| {
+                let size = if config.mode == Mode::Full {
+                    0
+                } else {
+                    sizes[Mode::Structure
+                        .cascade_from_here()
+                        .iter()
+                        .position(|&m| m == config.mode)
+                        .unwrap()]
+                };
+                Ok(Some("word ".repeat(size)))
+            };
+            let trunc = TruncationOptions {
+                char_budget: Some(10),
+                ..Default::default()
+            };
+            let (_, token_mode) =
+                cascade_for_token_budget(Mode::Structure, &trunc, 9, Language::Rust, 1, transform)
+                    .unwrap();
+            let chars = select_for_char_budget(
+                &trunc,
+                Language::Rust,
+                |config| {
+                    Ok(transform(config)?.map(|text| CharBudgetRung {
+                        text,
+                        line_map: None,
+                        has_errors: false,
+                        degraded: false,
+                    }))
+                },
+                |_, rung| rung.text.split_whitespace().count(),
+            )
+            .unwrap();
+            let char_mode = match chars {
+                RungWalk::Fits { mode, .. } => mode,
+                RungWalk::AllEmpty => Mode::Structure,
+                other => panic!("unexpected outcome: {other:?}"),
+            };
+            assert_eq!(token_mode, char_mode);
+        }
+    }
 
     /// Mock transform: returns the first N words from source for the matching mode.
     fn mock_transform<'a>(
