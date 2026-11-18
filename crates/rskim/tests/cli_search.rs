@@ -971,9 +971,71 @@ fn two_rust_definitions_of_one_name_print_both_and_the_clash_note() {
         run.stdout
     );
     assert!(lines.contains(&"def b/two.rs:1-1: pub fn dup() {}"));
-    assert!(lines.contains(&"note: 2 definitions of dup; calls are not split by definition"));
+    assert!(lines.contains(&"b/two.rs:2: [t] (def 1) fn t() { dup(); }"));
+    assert!(lines.contains(&"note: 2 definitions of dup; call lines assigned to the one definition in their file: 1; call lines not split by definition: 0"));
     let json = json_of(&repo.search(&["dup", "--json"]));
     assert_eq!(json["definitions"]["count"], 2);
+}
+
+#[test]
+fn a_method_and_an_imported_free_function_of_one_name_split_only_the_self_calls() {
+    let repo = SearchRepo::new();
+    repo.write(
+        "a/method.rs",
+        "use crate::free::dup;\nstruct Bag;\nimpl Bag {\n    fn\n    dup(&self) {}\n    fn run(&self) {\n        self.dup();\n        self.dup(); self.dup();\n        self.dup();\n        Self::dup(self);\n        dup();\n        dup();\n    }\n}\n",
+    );
+    repo.write("b/free.rs", "pub fn dup() {}\n");
+    repo.track_all();
+
+    for flags in [vec!["dup"], vec!["dup", "-C", "1"]] {
+        let run = repo.search(&flags);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert!(run.lines().contains(&"note: 2 definitions of dup; call lines assigned to the one definition in their file: 4; call lines not split by definition: 2"), "{}", run.stdout);
+        assert!(
+            run.stdout
+                .contains("a/method.rs:7: [run] (def 5) self.dup();\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout
+                .contains("a/method.rs:10: [run] (def 5) Self::dup(self);\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("a/method.rs:11: [run] dup();\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("a/method.rs:12: [run] dup();\n"),
+            "{}",
+            run.stdout
+        );
+    }
+    let json = json_of(&repo.search(&["dup", "--json"]));
+    let method = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "a/method.rs")
+        .unwrap();
+    let calls: Vec<&Value> = method["occurrences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|occurrence| occurrence["role"] == "call")
+        .collect();
+    assert_eq!(calls.len(), 6, "{json}");
+    for occurrence in calls {
+        let line = occurrence["line"].as_u64().unwrap();
+        if (7..=10).contains(&line) {
+            assert_eq!(occurrence["def_line"], 5, "{json}");
+        } else {
+            assert!(occurrence.get("def_line").is_none(), "{json}");
+        }
+    }
 }
 
 #[test]

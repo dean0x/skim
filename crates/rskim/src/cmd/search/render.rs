@@ -734,10 +734,32 @@ fn holder_prefix(record: &Record) -> String {
     }
 }
 
-/// `path:line: [holder] text`.
-fn match_line(quoted_path: &str, record: &Record) -> String {
+/// The exact definition count covers all files, not just the displayed page.
+fn definition_count(scan: &ScanOutput) -> u64 {
+    scan.files
+        .iter()
+        .map(|file| u64::from(file.roles.get(Role::Def)))
+        .sum()
+}
+
+/// Only call records expose an assignment, under the shared output gate.
+/// The scan keeps the evidence; a view with fewer than two definitions needs
+/// no split, and the word view never shows one.
+fn call_definition(record: &Record, assignments: bool) -> Option<u32> {
+    if assignments && record.role == Role::Call {
+        record.call_def
+    } else {
+        None
+    }
+}
+
+/// `path:line: [holder] (def N) text`; omit `(def N)` without an assignment.
+fn match_line(quoted_path: &str, record: &Record, assignments: bool) -> String {
+    let definition = call_definition(record, assignments)
+        .map(|line| format!("(def {line}) "))
+        .unwrap_or_default();
     format!(
-        "{quoted_path}:{}: {}{}",
+        "{quoted_path}:{}: {}{definition}{}",
         record.line,
         holder_prefix(record),
         shown_text(&record.text, record.truncated_bytes, true)
@@ -790,21 +812,45 @@ fn section_name(role: Role) -> &'static str {
     }
 }
 
-/// `path:10,22,31`: the stored lines of one role in one file.
-fn compact_line(file: &FileScan, role: Role) -> Option<String> {
-    let numbers: Vec<String> = file
-        .records
-        .iter()
-        .filter(|r| r.role == role)
-        .map(|r| r.line.to_string())
-        .collect();
-    (!numbers.is_empty()).then(|| format!("{}:{}", quote_path(&file.path), numbers.join(",")))
+/// Split assigned and other call lines without a repeated line number.
+/// One file has at most one assignment target. Wholly unsplit groups keep the
+/// existing `path:10,22,31` form; split groups use `path (def N): 10,22` and
+/// `path: 31`, with either empty group omitted.
+fn compact_line(file: &FileScan, role: Role, assignments: bool) -> Option<String> {
+    let mut assigned = Vec::new();
+    let mut other = Vec::new();
+    let mut target = None;
+    for record in file.records.iter().filter(|r| r.role == role) {
+        if let Some(line) = call_definition(record, assignments) {
+            target = Some(line);
+            assigned.push(record.line.to_string());
+        } else {
+            other.push(record.line.to_string());
+        }
+    }
+    let path = quote_path(&file.path);
+    let mut lines = Vec::new();
+    if let Some(line) = target {
+        lines.push(format!("{path} (def {line}): {}", assigned.join(",")));
+    }
+    if !other.is_empty() {
+        let space = if target.is_some() { " " } else { "" };
+        lines.push(format!("{path}:{space}{}", other.join(",")));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The lines of one role in one file with `context` lines around each, as
 /// blocks. A block that touches the one before it joins it; any other block
 /// follows a `--` line.
-fn context_blocks(out: &mut Text, file: &FileScan, role: Role, context: usize, first: &mut bool) {
+fn context_blocks(
+    out: &mut Text,
+    file: &FileScan,
+    role: Role,
+    context: usize,
+    first: &mut bool,
+    assignments: bool,
+) {
     let matches: BTreeMap<u32, &Record> = file
         .records
         .iter()
@@ -836,7 +882,7 @@ fn context_blocks(out: &mut Text, file: &FileScan, role: Role, context: usize, f
         *first = false;
         for number in from..=to {
             if let Some(record) = matches.get(&number) {
-                out.line(&match_line(&path, record));
+                out.line(&match_line(&path, record, assignments));
             } else if let Some((text, truncated)) = lookup.get(&number) {
                 out.line(&format!(
                     "{path}-{number}-{}",
@@ -848,7 +894,7 @@ fn context_blocks(out: &mut Text, file: &FileScan, role: Role, context: usize, f
 }
 
 /// One section of the labelled view.
-fn section(out: &mut Text, report: &Report<'_>, ranked: &[Ranked], role: Role) {
+fn section(out: &mut Text, report: &Report<'_>, ranked: &[Ranked], role: Role, assignments: bool) {
     let files = &report.scan.files;
     let in_section: Vec<&Ranked> = ranked
         .iter()
@@ -880,15 +926,22 @@ fn section(out: &mut Text, report: &Report<'_>, ranked: &[Ranked], role: Role) {
     for ranked_file in page {
         let file = &files[ranked_file.index];
         if compact {
-            if let Some(line) = compact_line(file, role) {
+            if let Some(line) = compact_line(file, role, assignments) {
                 out.line(&line);
             }
         } else if layout.context > 0 {
-            context_blocks(out, file, role, layout.context, &mut first_block);
+            context_blocks(
+                out,
+                file,
+                role,
+                layout.context,
+                &mut first_block,
+                assignments,
+            );
         } else {
             let path = quote_path(&file.path);
             for record in file.records.iter().filter(|r| r.role == role) {
-                out.line(&match_line(&path, record));
+                out.line(&match_line(&path, record, assignments));
             }
         }
     }
@@ -921,13 +974,19 @@ fn other_line(scan: &ScanOutput) -> Option<String> {
     (!parts.is_empty()).then(|| format!("other: {} lines (--all lists them)", parts.join(", ")))
 }
 
-/// The note about a name with several definitions.
-fn clash_note(query: &QueryInfo, count: u64, unlabelled_files: u64) -> String {
+/// The note about a name with several definitions. Counts measure call lines,
+/// not calls or stored records, so a stored-line cap cannot change the split.
+fn clash_note(
+    query: &QueryInfo,
+    count: u64,
+    unlabelled_files: u64,
+    assigned: u64,
+    calls: u64,
+) -> String {
     let name = escape_text(&query.text);
-    if unlabelled_files > 0 {
+    let mut note = if unlabelled_files > 0 {
         format!(
-            "note: at least {count} definitions of {name} \
-             ({} no labels); calls are not split by definition",
+            "note: at least {count} definitions of {name} ({} no labels)",
             if unlabelled_files == 1 {
                 "1 matched file has".to_owned()
             } else {
@@ -935,8 +994,18 @@ fn clash_note(query: &QueryInfo, count: u64, unlabelled_files: u64) -> String {
             }
         )
     } else {
-        format!("note: {count} definitions of {name}; calls are not split by definition")
+        format!("note: {count} definitions of {name}")
+    };
+    if assigned == 0 {
+        note.push_str("; calls are not split by definition");
+    } else {
+        note.push_str(&format!(
+            "; call lines assigned to the one definition in their file: {assigned}; \
+             call lines not split by definition: {}",
+            calls.saturating_sub(assigned)
+        ));
     }
+    note
 }
 
 fn labelled_text(report: &Report<'_>) -> Rendered {
@@ -962,18 +1031,22 @@ fn labelled_text(report: &Report<'_>) -> Rendered {
     }
 
     // The clash note.
-    let def_count: u64 = scan
-        .files
-        .iter()
-        .map(|f| u64::from(f.roles.get(Role::Def)))
-        .sum();
+    let def_count = definition_count(scan);
     if def_count == 0 {
         out.line("def: none in labelled files");
     } else if def_count >= 2 {
+        let (assigned, calls) = scan.files.iter().fold((0, 0), |(assigned, calls), file| {
+            (
+                assigned + u64::from(file.assigned_calls),
+                calls + u64::from(file.roles.get(Role::Call)),
+            )
+        });
         out.line(&clash_note(
             report.query,
             def_count,
             scan.parse.unlabelled_files,
+            assigned,
+            calls,
         ));
     }
 
@@ -984,7 +1057,7 @@ fn labelled_text(report: &Report<'_>) -> Rendered {
         &DEFAULT_SECTIONS
     };
     for role in sections {
-        section(&mut out, report, &ranked, *role);
+        section(&mut out, report, &ranked, *role, def_count >= 2);
     }
     if !layout.all
         && let Some(line) = other_line(scan)
@@ -1076,7 +1149,7 @@ fn words_text(report: &Report<'_>) -> Rendered {
             best.len() as u64,
         );
         for record in best {
-            out.line(&match_line(&path, record));
+            out.line(&match_line(&path, record, false));
         }
     }
     if hidden > 0 {
@@ -1154,8 +1227,8 @@ fn insert_path(map: &mut Map<String, Value>, path: &Path) {
     }
 }
 
-fn occurrence_json(record: &Record) -> Value {
-    json!({
+fn occurrence_json(record: &Record, assignments: bool) -> Value {
+    let mut occurrence = json!({
         "line": record.line,
         "column": record.column,
         "role": record.role.key(),
@@ -1163,7 +1236,11 @@ fn occurrence_json(record: &Record) -> Value {
         "holder_range": record.holder.as_ref().map(|h| [h.first_line, h.last_line]),
         "text": record.text,
         "text_truncated_bytes": record.truncated_bytes,
-    })
+    });
+    if let Some(line) = call_definition(record, assignments) {
+        occurrence["def_line"] = json!(line);
+    }
+    occurrence
 }
 
 fn roles_json(file: &FileScan) -> Value {
@@ -1179,7 +1256,13 @@ fn rounded(score: f64) -> f64 {
     (score * 10.0).round() / 10.0
 }
 
-fn file_json(report: &Report<'_>, file: &FileScan, rank: usize, score: f64) -> Value {
+fn file_json(
+    report: &Report<'_>,
+    file: &FileScan,
+    rank: usize,
+    score: f64,
+    assignments: bool,
+) -> Value {
     let view = report.query.view();
     let mut map = Map::new();
     insert_path(&mut map, &file.path);
@@ -1216,7 +1299,12 @@ fn file_json(report: &Report<'_>, file: &FileScan, rank: usize, score: f64) -> V
     let elided = u64::from(file.lines).saturating_sub(listed.len() as u64);
     map.insert(
         "occurrences".to_owned(),
-        Value::Array(listed.iter().map(|r| occurrence_json(r)).collect()),
+        Value::Array(
+            listed
+                .iter()
+                .map(|r| occurrence_json(r, assignments))
+                .collect(),
+        ),
     );
     map.insert("occurrences_elided".to_owned(), json!(elided));
     Value::Object(map)
@@ -1224,11 +1312,7 @@ fn file_json(report: &Report<'_>, file: &FileScan, rank: usize, score: f64) -> V
 
 fn definitions_json(report: &Report<'_>, ranked: &[Ranked]) -> Value {
     let scan = report.scan;
-    let count: u64 = scan
-        .files
-        .iter()
-        .map(|f| u64::from(f.roles.get(Role::Def)))
-        .sum();
+    let count = definition_count(scan);
     let mut sites = Vec::new();
     for ranked_file in ranked {
         let file = &scan.files[ranked_file.index];
@@ -1261,12 +1345,19 @@ fn json_line(report: &Report<'_>) -> String {
     let list = candidates(report, &ranked);
     let (page, _) = Page::of(&report.layout, view).take(list);
     let offset = report.layout.offset.min(list.len());
+    let assignments = view == View::Labelled && definition_count(scan) >= 2;
 
     let files: Vec<Value> = page
         .iter()
         .enumerate()
         .map(|(position, r)| {
-            file_json(report, &scan.files[r.index], offset + position + 1, r.score)
+            file_json(
+                report,
+                &scan.files[r.index],
+                offset + position + 1,
+                r.score,
+                assignments,
+            )
         })
         .collect();
     let has_more = offset + page.len() < list.len();

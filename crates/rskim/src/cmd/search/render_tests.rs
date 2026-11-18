@@ -60,7 +60,7 @@ fn file(path: impl Into<PathBuf>, prior: FilePrior, records: Vec<Record>) -> Fil
         name_hit: false,
         unlabelled: None,
         roles,
-        assigned_calls: 0,
+        assigned_calls: rest.iter().filter(|r| r.call_def.is_some()).count() as u32,
         defs,
         records: rest,
         context: Vec::new(),
@@ -124,6 +124,38 @@ fn call_file(path: &str, prior: FilePrior, numbers: &[u32]) -> FileScan {
         .map(|n| record(*n, Role::Call, Some("run"), &format!("call{n}()")))
         .collect();
     file(path, prior, records)
+}
+
+/// Two assigned call lines, one other call line, and one reference.
+fn assigned_file() -> FileScan {
+    file(
+        "a.rs",
+        FilePrior::Source,
+        vec![
+            definition(12, 10, 15, "dup", "fn dup("),
+            Record {
+                call_def: Some(12),
+                ..record(20, Role::Call, Some("run"), "  self.dup();")
+            },
+            record(21, Role::Call, Some("run"), "  other.dup();"),
+            Record {
+                call_def: Some(12),
+                ..record(22, Role::Call, Some("run"), "  self.dup(); self.dup();")
+            },
+            record(23, Role::Ref, Some("run"), "  let f = dup;"),
+        ],
+    )
+}
+
+fn assignment_scan() -> ScanOutput {
+    scan_of(vec![
+        assigned_file(),
+        file(
+            "b.rs",
+            FilePrior::Source,
+            vec![definition(1, 1, 1, "dup", "fn dup() {}")],
+        ),
+    ])
 }
 
 // ============================================================================
@@ -287,6 +319,193 @@ fn a_spent_parse_budget_turns_the_clash_note_into_an_at_least_note() {
         ),
         "{output}"
     );
+}
+
+#[test]
+fn an_assigned_call_line_names_its_definition_line() {
+    let output = text(&pattern("dup"), &assignment_scan());
+
+    assert!(
+        output.contains("a.rs:20: [run] (def 12) self.dup();\n"),
+        "{output}"
+    );
+    assert!(output.contains("a.rs:21: [run] other.dup();\n"), "{output}");
+    assert!(
+        output.contains("a.rs:22: [run] (def 12) self.dup(); self.dup();\n"),
+        "{output}"
+    );
+    assert!(output.contains("a.rs:23: [run] let f = dup;\n"), "{output}");
+}
+
+#[test]
+fn context_lines_keep_the_definition_line_of_an_assigned_call() {
+    let mut scan = assignment_scan();
+    scan.files[0].context = vec![ContextLine {
+        line: 19,
+        text: "  before();".to_owned(),
+        truncated_bytes: 0,
+    }];
+    let layout = Layout {
+        context: 1,
+        ..Layout::default()
+    };
+
+    let output = render_with(&pattern("dup"), &scan, layout, Format::Text).stdout;
+
+    assert!(
+        output.contains(
+            "a.rs-19-  before();\na.rs:20: [run] (def 12) self.dup();\n\
+         a.rs:21: [run] other.dup();\na.rs:22: [run] (def 12) self.dup(); self.dup();\n"
+        ),
+        "{output}"
+    );
+    assert!(output.contains("a.rs-23-  let f = dup;\n"), "{output}");
+}
+
+#[test]
+fn a_compact_section_splits_assigned_and_other_line_numbers() {
+    let mut scan = assignment_scan();
+    // Exact counts include call lines beyond the stored prefix.
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls += 32;
+    scan.caps.stored_lines = true;
+    scan.files.push(call_file("c.rs", FilePrior::Source, &[7]));
+
+    let output = text(&pattern("dup"), &scan);
+
+    assert!(
+        output.contains("a.rs (def 12): 20,22\na.rs: 21\n"),
+        "{output}"
+    );
+    assert!(output.contains("c.rs:7\n"), "{output}");
+    assert!(!output.contains("self.dup()"), "{output}");
+
+    scan.files[0]
+        .records
+        .retain(|record| record.call_def.is_some());
+    let assigned_only = text(&pattern("dup"), &scan);
+    assert!(
+        assigned_only.contains("a.rs (def 12): 20,22\n"),
+        "{assigned_only}"
+    );
+    assert!(!assigned_only.contains("\na.rs:"), "{assigned_only}");
+}
+
+#[test]
+fn assigned_compact_lines_quote_paths_with_control_bytes() {
+    let mut scan = assignment_scan();
+    scan.files[0].path = "a\n.rs".into();
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls += 32;
+    scan.caps.stored_lines = true;
+
+    let output = text(&pattern("dup"), &scan);
+
+    assert!(
+        output.contains("\"a\\n.rs\" (def 12): 20,22\n\"a\\n.rs\": 21\n"),
+        "{output}"
+    );
+    assert!(!output.contains("\na\n.rs"), "{output}");
+}
+
+#[test]
+fn the_clash_note_counts_assigned_and_not_split_calls() {
+    let mut scan = assignment_scan();
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls = 33;
+    scan.caps.stored_lines = true;
+    for unlabelled in [0, 1] {
+        scan.parse.unlabelled_files = unlabelled;
+        let output = text(&pattern("dup"), &scan);
+        let prefix = if unlabelled == 0 {
+            "note: 2 definitions of dup"
+        } else {
+            "note: at least 2 definitions of dup (1 matched file has no labels)"
+        };
+        assert!(
+            output.contains(&format!(
+                "{prefix}; call lines assigned to the one definition in their file: 33; \
+             call lines not split by definition: 2\n"
+            )),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn one_definition_over_all_files_prints_no_assignment() {
+    let mut scan = scan_of(vec![assigned_file()]);
+    let query = pattern("dup");
+    for layout in [
+        Layout::default(),
+        Layout {
+            full: true,
+            ..Layout::default()
+        },
+        Layout {
+            context: 1,
+            ..Layout::default()
+        },
+    ] {
+        let output = render_with(&query, &scan, layout, Format::Text).stdout;
+        assert!(!output.contains("(def "), "{output}");
+        assert!(output.contains("a.rs:20: [run] self.dup();\n"), "{output}");
+    }
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls += 32;
+    scan.caps.stored_lines = true;
+    let compact = text(&query, &scan);
+    assert!(compact.contains("a.rs:20,21,22\n"), "{compact}");
+    assert!(!compact.contains("(def "), "{compact}");
+    let json = json_of(&query, &scan, Layout::default());
+    for occurrence in json["files"][0]["occurrences"].as_array().unwrap() {
+        assert!(occurrence.get("def_line").is_none(), "{json}");
+    }
+}
+
+#[test]
+fn json_occurrences_carry_def_line_only_when_assigned() {
+    let scan = assignment_scan();
+    // A page can hide the second definition; the gate still counts all files.
+    for limit in [None, Some(1)] {
+        let json = json_of(
+            &pattern("dup"),
+            &scan,
+            Layout {
+                limit,
+                ..Layout::default()
+            },
+        );
+        let a = json["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "a.rs")
+            .unwrap();
+        for occurrence in a["occurrences"].as_array().unwrap() {
+            let line = occurrence["line"].as_u64().unwrap();
+            if [20, 22].contains(&line) {
+                assert_eq!(occurrence["def_line"], 12, "{json}");
+                assert_eq!(occurrence["role"], "call");
+            } else {
+                assert!(occurrence.get("def_line").is_none(), "{json}");
+            }
+        }
+    }
+    let word_json = json_of(&words(&["dup", "run"]), &scan, Layout::default());
+    assert!(!word_json.to_string().contains("def_line"), "{word_json}");
 }
 
 #[test]
