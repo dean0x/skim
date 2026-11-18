@@ -3,7 +3,9 @@
 mod common;
 
 use std::fs;
+use std::path::PathBuf;
 use std::process::Output;
+use std::time::SystemTime;
 use tempfile::TempDir;
 
 const LIMIT: usize = 29_000;
@@ -432,11 +434,60 @@ fn file_errors_and_missing_paths_do_not_change_the_run_counts() {
     assert!(!err.contains(RUN_NOTICE), "{err}");
 }
 
+fn cache_entries(home: &TempDir) -> Vec<PathBuf> {
+    let cache_dir = common::sandbox_var_path(home.path(), ".cache/skim");
+    let mut entries: Vec<_> = fs::read_dir(cache_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    entries.sort_unstable();
+    for path in &entries {
+        let entry: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let content = entry["content"].as_str().expect("cache entry has content");
+        assert!(
+            !content.contains("lines truncated"),
+            "cached run cut: {path:?}"
+        );
+    }
+    entries
+}
+
 #[test]
 fn jobs_and_warm_cache_keep_the_run_bytes_without_caching_cuts() {
     let fixture = cut_fixture();
+    let rungs = ["--mode=structure", "--mode=signatures", "--mode=types"];
     let cold = run(fixture.command().args(["--jobs", "1"]).args(&fixture.paths));
-    assert!(bounded_notice(&cold).contains("files are cut"));
+    let notice = bounded_notice(&cold);
+    assert!(notice.starts_with("[skim] types view:") && notice.contains("files are cut"));
+    let cold_entries = cache_entries(&fixture.home);
+    // The run visits every rung for every file before it cuts the types view.
+    assert_eq!(
+        cold_entries.len(),
+        fixture.paths.len() * rungs.len(),
+        "cold cache must contain one entry per file per rung"
+    );
+    // A miss can rewrite the same key with identical bytes. Mark the cache files
+    // (not the source files) so the test can detect a rewrite.
+    for path in &cold_entries {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+    }
+    let assert_cache_unchanged = || {
+        assert_eq!(cache_entries(&fixture.home), cold_entries);
+        for path in &cold_entries {
+            assert_eq!(
+                fs::metadata(path).unwrap().modified().unwrap(),
+                SystemTime::UNIX_EPOCH,
+                "cache entry was rewritten: {path:?}"
+            );
+        }
+    };
     for args in [
         &["--jobs", "8"][..],
         &["--jobs", "8", "--no-cache"],
@@ -446,11 +497,13 @@ fn jobs_and_warm_cache_keep_the_run_bytes_without_caching_cuts() {
             &run(fixture.command().args(args).args(&fixture.paths)),
             &cold,
         );
+        assert_cache_unchanged();
     }
-    for mode in ["--mode=structure", "--mode=signatures", "--mode=types"] {
+    for mode in rungs {
         let cached = run(fixture.command().arg(mode).args(&fixture.paths));
         assert_same_streams(&cached, &fixture.run(&[mode]));
         assert!(!stdout(&cached).contains("lines truncated"));
+        assert_cache_unchanged();
     }
 }
 
