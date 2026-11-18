@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output form. Lines that the mask hides from text on stdin are counted in the
   view. Known limit: for text on stdin, a line rule finds where each variable
   starts, so the view can read one value over several lines as two variables.
+- `SKIM_PASSTHROUGH=1` now gives the full output for an explicit list of files.
 - `--tokens N -n` keeps the cut view and its elision marker with source line numbers.
 - `skim search` explains a repeated subcommand before a second pattern. It exits 2 and says to drop the extra `search`.
 - Global Cursor installs and uninstalls leave project guidance and `.cursorrules` unchanged.

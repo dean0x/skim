@@ -429,12 +429,32 @@ pub(crate) fn process_explicit_files(
     args: &[String],
     options: MultiFileOptions,
 ) -> anyhow::Result<()> {
+    process_files(resolve_explicit_paths(args, options.no_ignore)?, options)
+}
+
+/// Serve the explicit list as raw bytes, in the same path order as the transform.
+/// Directory and glob arguments use the same collectors and ignore rules.
+/// Write errors keep their source so a closed stdout pipe exits 141.
+#[allow(clippy::disallowed_methods)] // File-list output needs one stdout lock for the raw byte stream
+pub(crate) fn passthrough_explicit_files(args: &[String], no_ignore: bool) -> anyhow::Result<()> {
+    let paths = resolve_explicit_paths(args, no_ignore)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    for path in paths {
+        let contents = std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", path.display()))?;
+        out.write_all(&contents)?;
+    }
+    Ok(())
+}
+
+/// Resolve a mixed explicit list once for both transformed and raw output.
+/// Keep partial-failure warnings, the all-fail error, path order and deduplication.
+fn resolve_explicit_paths(args: &[String], no_ignore: bool) -> anyhow::Result<Vec<PathBuf>> {
     debug_assert!(
         !args.is_empty(),
-        "BUG: process_explicit_files called with empty args"
+        "BUG: resolve_explicit_paths called with empty args"
     );
-
-    let no_ignore = options.no_ignore;
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
@@ -494,7 +514,7 @@ pub(crate) fn process_explicit_files(
     paths.sort();
     paths.dedup();
 
-    process_files(paths, options)
+    Ok(paths)
 }
 
 /// Expand a glob pattern to a list of matching paths.

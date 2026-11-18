@@ -1746,6 +1746,10 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         );
     }
 
+    if cmd::is_passthrough_mode() {
+        return multi::passthrough_explicit_files(&args.files, args.no_ignore);
+    }
+
     // Expand each argument: glob pattern → expand, directory → collect,
     // plain file → add directly.  All results are gathered into a single Vec
     // and processed together via process_files.
@@ -1778,15 +1782,10 @@ fn process_single_arg(
     // detect `EPIPE` and exit 141 rather than 1.  Wrapping with `anyhow::anyhow!`
     // produces a `Message` error with no source, which `chain()` cannot walk.
     //
-    // consistency-3: the remedy line in the multi-file marker says
-    // "SKIM_PASSTHROUGH=1 for full output" — `lossy_view_marker` resolves its
-    // remedy through `fidelity::remedy_for` with
-    // `passthrough_reproduces_argv: true`, which returns the canonical
-    // `output::ELISION_HINT` (pinned whole by
-    // `cli_transparency::test_multi_file_aggregate_marker_emitted_once`).
-    // Either way the marker names a hatch, so every shape it can fire for must
-    // also work in passthrough mode.  Directories and globs are handled here so
-    // the remedy is literally reachable from any invocation that prints it.
+    // The aggregate marker names SKIM_PASSTHROUGH=1 for full output. Every
+    // multi-file shape must accept that remedy: directories and globs here,
+    // explicit lists in run_file_operation via passthrough_explicit_files.
+    // Both paths use the transform collectors and the same no_ignore value.
     if cmd::is_passthrough_mode() {
         use std::io::Write as _;
         let stdout = std::io::stdout();
