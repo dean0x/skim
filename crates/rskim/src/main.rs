@@ -1662,8 +1662,18 @@ fn main() -> ExitCode {
     exit_code
 }
 
-/// Build input options from clap's explicit-mode state, not the default mode value.
-/// Batch reads and every typed view selection keep their existing unbounded behavior.
+/// A transformed read is default only if the user did not select a view or limit.
+/// `mode_given` comes from clap's value source, not from the mode value.
+fn default_read(args: &Args, mode_given: bool) -> bool {
+    !mode_given
+        && args.max_lines.is_none()
+        && args.last_lines.is_none()
+        && args.tokens.is_none()
+        && args.symbol.is_none()
+}
+
+/// The per-input character budget applies only to a default single file or stdin.
+/// Batch options leave the character budget to the run.
 fn file_process_options(args: &Args, mode_given: bool, batch: bool) -> process::ProcessOptions {
     process::ProcessOptions {
         mode: Mode::from(args.mode),
@@ -1674,13 +1684,8 @@ fn file_process_options(args: &Args, mode_given: bool, batch: bool) -> process::
             max_lines: args.max_lines,
             last_lines: args.last_lines,
             token_budget: args.tokens,
-            char_budget: (!batch
-                && !mode_given
-                && args.max_lines.is_none()
-                && args.last_lines.is_none()
-                && args.tokens.is_none()
-                && args.symbol.is_none())
-            .then_some(output::MAX_STDOUT_CHARS),
+            char_budget: (!batch && default_read(args, mode_given))
+                .then_some(output::MAX_STDOUT_CHARS),
         },
         line_numbers: args.line_numbers,
         batch,
@@ -1726,6 +1731,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
 
     let multi_options = multi::MultiFileOptions {
         process: file_process_options(&args, mode_given, true),
+        char_run: default_read(&args, mode_given),
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,
@@ -2269,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn default_character_budget_applies_only_to_default_single_inputs() {
+    fn view_selection_controls_default_read_and_single_input_char_budget() {
         use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
         let cases: &[(&[&str], Option<usize>)] = &[
             (&["a.rs"], Some(output::MAX_STDOUT_CHARS)),
@@ -2278,6 +2284,7 @@ mod tests {
                 Some(output::MAX_STDOUT_CHARS),
             ),
             (&["a.rs", "--show-stats"], Some(output::MAX_STDOUT_CHARS)),
+            (&["a.rs", "--no-header"], Some(output::MAX_STDOUT_CHARS)),
             (&["a.rs", "--mode", "structure"], None),
             (&["a.rs", "--mode=full"], None),
             (&["a.rs", "--max-lines", "10"], None),
@@ -2291,6 +2298,11 @@ mod tests {
                 .unwrap();
             let args = Args::from_arg_matches(&matches).unwrap();
             let mode_given = matches.value_source("mode") == Some(ValueSource::CommandLine);
+            assert_eq!(
+                default_read(&args, mode_given),
+                expected.is_some(),
+                "{argv:?}"
+            );
             let single = file_process_options(&args, mode_given, false);
             assert_eq!(single.trunc.char_budget, *expected, "{argv:?}");
             let multi = file_process_options(&args, mode_given, true);

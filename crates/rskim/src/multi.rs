@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cascade::{RungWalk, serde_rungs, walk_rungs};
 use crate::cmd::{FileCopyError, copy_file_raw, display_path};
-use crate::output::ELISION_HINT;
+use crate::output::{ELISION_HINT, MAX_STDOUT_CHARS, RunBudget};
 use crate::process::{
     ProcessOptions, ProcessResult, process_file, report_token_stats, run_budget_applies,
 };
@@ -28,6 +28,8 @@ use crate::run_budget::{Body, Piece, PlannedBody, RUN_SUM_STOP_FACTOR, plan_cut}
 #[derive(Debug, Clone)]
 pub(crate) struct MultiFileOptions {
     pub(crate) process: ProcessOptions,
+    /// The caller did not select a view or limit. Raw reads bypass this stage.
+    pub(crate) char_run: bool,
     pub(crate) no_header: bool,
     pub(crate) jobs: Option<usize>,
     pub(crate) no_ignore: bool,
@@ -571,7 +573,7 @@ fn final_results<'a>(
 
 struct RunReport {
     selection: RunSelection,
-    budget: usize,
+    budget: RunBudget,
     total: usize,
     last_shown: Option<PathBuf>,
     first_omitted: Option<PathBuf>,
@@ -584,32 +586,28 @@ fn prepare_results<'a>(
     paths: &'a [PathBuf],
     opts: ProcessOptions,
     show_headers: bool,
+    budget: Option<RunBudget>,
     count: &Counter<'_>,
 ) -> anyhow::Result<(FileResults<'a>, Option<RunReport>)> {
-    let budget = opts
-        .trunc
-        .token_budget
-        .filter(|_| run_budget_applies(&opts));
     let mut processed: Vec<_> = paths
         .par_iter()
         .enumerate()
         .map(|(idx, path)| {
             let result = process_file(path, opts);
-            let piece = budget.and_then(|_| {
-                result.as_ref().ok().map(|pr| {
-                    make_piece(
-                        piece_prefix(idx, path, show_headers),
-                        pr.output.clone(),
-                        None,
-                        true,
-                        count,
-                    )
-                })
-            });
+            let piece = match (budget, &result) {
+                (Some(RunBudget::Tokens(_)), Ok(pr)) => Some(make_piece(
+                    piece_prefix(idx, path, show_headers),
+                    pr.output.clone(),
+                    None,
+                    true,
+                    count,
+                )),
+                _ => None,
+            };
             (path, result, piece)
         })
         .collect();
-    let Some(n) = budget else {
+    let Some(budget @ RunBudget::Tokens(n)) = budget else {
         return Ok((
             processed
                 .into_iter()
@@ -666,7 +664,7 @@ fn prepare_results<'a>(
         results,
         Some(RunReport {
             selection,
-            budget: n,
+            budget,
             total,
             last_shown,
             first_omitted,
@@ -689,13 +687,22 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
     );
     let total_paths = paths.len();
     let process_options = options.process;
+    let budget = process_options
+        .trunc
+        .token_budget
+        .filter(|_| run_budget_applies(&process_options))
+        .map(RunBudget::Tokens)
+        .or_else(|| {
+            (options.char_run && process_options.batch)
+                .then_some(RunBudget::Chars(MAX_STDOUT_CHARS))
+        });
     let show_headers = !options.no_header && paths.len() > 1;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.jobs.unwrap_or(0))
         .build()?;
     let count = |s: &str| crate::tokens::count_tokens(s).ok();
     let (results, run) =
-        pool.install(|| prepare_results(&paths, process_options, show_headers, &count))?;
+        pool.install(|| prepare_results(&paths, process_options, show_headers, budget, &count))?;
 
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
