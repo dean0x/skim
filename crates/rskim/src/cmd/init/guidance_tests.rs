@@ -899,7 +899,8 @@ fn a_block_of_another_version_is_replaced_even_when_one_version_starts_with_the_
 fn a_changed_block_is_replaced_and_the_note_names_the_file() {
     let root = tempfile::TempDir::new().unwrap();
     let target = claude_target(&root);
-    let edited = new_block().replace("Skim earns its cost", "Skim earns its keep");
+    // Insert a line after the start marker so the test does not depend on the guidance text.
+    let edited = new_block().replacen('\n', "\nEdited guidance.\n", 1);
 
     let (outcome, after) = update(&target, &format!("# Mine\n\n{edited}\n"));
 
