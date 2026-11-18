@@ -1084,6 +1084,38 @@ fn a_word_query_lists_the_files_that_hold_all_the_words_by_prior_then_count() {
 }
 
 #[test]
+fn a_word_query_lists_a_file_whose_name_holds_a_word_first_among_equals() {
+    let repo = SearchRepo::new();
+    repo.write("src/a.rs", "// alpha beta\n".repeat(20));
+    repo.write("src/withAlpha.rs", "// alpha beta\n");
+    repo.write("src/z.rs", "// alpha beta\n");
+    repo.write("src/beta.rs", "// alpha\n");
+    repo.write("src/alpha.rs", "// neither word\n");
+    repo.track_all();
+
+    let run = repo.search(&["alpha beta"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        word_headers(&run.stdout),
+        ["src/withAlpha.rs", "src/a.rs", "src/z.rs"],
+        "the name tier precedes hit counts but adds no candidate: {}",
+        run.stdout
+    );
+    let json = json_of(&repo.search(&["alpha beta", "--json"]));
+    assert_eq!(json["files_with_all_words"], 3);
+    assert_eq!(json["total_files"], 3);
+    assert_eq!(json["files"][0]["path"], "src/withAlpha.rs");
+    assert_eq!(json["files"][0]["words_matched"], 2);
+    let scores: Vec<f64> = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["score"].as_f64().unwrap())
+        .collect();
+    assert!(scores.windows(2).all(|pair| pair[0] >= pair[1]));
+}
+
+#[test]
 fn a_word_query_with_fewer_than_three_full_files_adds_files_with_fewer_words() {
     let repo = SearchRepo::new();
     repo.write("src/a.rs", "alpha beta gamma\n");

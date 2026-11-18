@@ -339,6 +339,35 @@ fn a_path_that_is_not_utf8_prints_with_octal_escapes_and_is_marked_lossy_in_json
     assert!(lossy["path"].as_str().unwrap().starts_with("bad"));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_word_query_with_a_tracked_name_that_is_not_utf8_exits_0_and_marks_the_path_lossy() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let repo = SearchRepo::new();
+    let name = OsStr::from_bytes(b"bad\xff-alpha.rs");
+    if let Err(error) = fs::write(repo.root().join(name), "// alpha beta\n") {
+        eprintln!("file system rejects non-UTF-8 names: {error}");
+        return;
+    }
+    repo.write("a.rs", "// alpha beta\n".repeat(20));
+    repo.track_all();
+
+    let text = repo.search(&["alpha beta"]);
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    let lossy_at = text.stdout.find("\"bad\\377-alpha.rs\"  ").unwrap();
+    let other_at = text.stdout.find("\na.rs  ").unwrap();
+    assert!(lossy_at < other_at, "{}", text.stdout);
+    let run = repo.search(&["alpha beta", "--json"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let json = json_of(&run);
+    assert_eq!(json["files"][0]["path"], "bad\u{fffd}-alpha.rs");
+    assert_eq!(json["files"][0]["path_lossy"], true);
+    assert_eq!(json["files"][0]["words_matched"], 2);
+    assert_eq!(json["files_with_all_words"], 2);
+}
+
 // ============================================================================
 // The root walk
 // ============================================================================
