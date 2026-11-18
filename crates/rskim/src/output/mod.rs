@@ -1091,8 +1091,8 @@ pub(crate) struct RunNoticeFacts<'a> {
     pub(crate) served: rskim_core::Mode,
     pub(crate) differing: usize,
     pub(crate) total: usize,
-    /// Only files cut by this run. Kept pass-1 bodies can carry source-line markers
-    /// and need not match the served view. They do not add to this count.
+    /// Shown files with a run cut. Retained pass-1 bodies are never cut again,
+    /// so their source-line markers do not add to this count.
     pub(crate) cut: usize,
     pub(crate) omitted: usize,
     #[allow(dead_code)] // Outcome metadata for the run executor, not another notice clause.

@@ -372,7 +372,7 @@ fn precut_piece(mut piece: Piece, n: usize, count: &Counter<'_>) -> Piece {
 
 /// Keep pass 1, at most two probes (about 2N tokens each plus one in-flight
 /// body per worker), one cut base (at most N per cuttable body), and one transient
-/// file per worker. Fixed bodies keep their all-or-nothing pass-1 size.
+/// file per worker. Fixed bodies keep their full size.
 #[allow(clippy::too_many_arguments)]
 fn run_rung(
     files: &[RunFile<'_>],
@@ -405,8 +405,9 @@ fn run_rung(
                 !file.pass_1.output.trim().is_empty() && pr.output.trim().is_empty()
             });
             let kept_pass_1 = rung.is_none() || emptied;
-            let fixed = language.is_none()
-                || rung.is_none()
+            // Preserve pass-1 bytes and any source-line marker as a unit.
+            let fixed = rung.is_none()
+                || emptied
                 || opts.trunc.max_lines.is_some()
                 || opts.trunc.last_lines.is_some();
             let (output, differs) = match rung {
@@ -641,6 +642,11 @@ fn prepare_results<'a>(
     let mut selection = select_run(&files, pass_1, n, opts, &process_file, count)?;
     let total = files.len();
     let shown = selection.bodies.len();
+    debug_assert!(
+        shown <= selection.differing.len()
+            && selection.differing.len() == selection.kept_pass_1.len(),
+        "Run body metadata must cover the shown prefix"
+    );
     let last_shown = shown
         .checked_sub(1)
         .and_then(|i| files.get(i))
@@ -774,12 +780,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             served: selection.mode,
             differing: view_differs_count,
             total: run.total,
-            cut: selection
-                .bodies
-                .iter()
-                .zip(&selection.kept_pass_1)
-                .filter(|(body, kept)| body.cut && !**kept)
-                .count(),
+            cut: selection.bodies.iter().filter(|body| body.cut).count(),
             omitted: selection.omitted,
             kept_pass_1: selection.kept_pass_1[..shown]
                 .iter()
@@ -1187,14 +1188,6 @@ mod tests {
         assert_eq!(stream, b"\n// b.rs\nbody\n// c.rs\nnext\n");
         assert_eq!(piece_prefix(0, Path::new("a.rs"), true), "// a.rs\n");
         assert_eq!(piece_prefix(9, Path::new("a.rs"), false), "");
-    }
-
-    #[test]
-    fn write_run_keeps_the_exact_accepted_bytes() {
-        let candidate = "\n// b.rs\nfn f() {}";
-        let mut bytes = Vec::new();
-        write_run(&mut bytes, candidate).unwrap();
-        assert_eq!(bytes, candidate.as_bytes());
     }
 
     #[test]

@@ -813,3 +813,43 @@ fn partly_empty_signatures_keep_the_const_body_and_fit() {
     assert_eq!(stdout(&output), expected);
     assert!(notice(&output).starts_with("[skim] signatures view:"));
 }
+
+#[test]
+fn partly_empty_cut_keeps_the_exact_pass_one_body_or_omits_it() {
+    let home = rust_home(3);
+    let constants: String = (0..100)
+        .map(|i| format!("pub const LIMIT_{i}: usize = {i};\n"))
+        .collect();
+    fs::write(home.path().join("input/z.rs"), constants).unwrap();
+
+    for n in [300, 500] {
+        let budget = n.to_string();
+        let pass_one = run(&home, &["input/z.rs", "--tokens", &budget]);
+        let pass_one = stdout(&pass_one);
+        assert!(pass_one.contains("lines truncated"));
+        let output = run(&home, &["input/*.rs", "--tokens", &budget]);
+        bounded(&output, n);
+        let shown = blocks(stdout(&output));
+        if let Some((_, body)) = stdout(&output).split_once("// input/z.rs\n") {
+            assert_eq!(body, pass_one, "changed pass-1 body at {n} tokens");
+        } else {
+            assert!(stdout(&output).ends_with(&trailer(shown.len(), 4)));
+        }
+
+        // Only the unchanged z.rs body can carry a pass-1 marker.
+        let cut = shown
+            .iter()
+            .filter(|(path, body)| {
+                body.contains("lines truncated")
+                    && (*path, *body) != ("input/z.rs", pass_one.trim_end_matches('\n'))
+            })
+            .count();
+        assert!(cut > 0, "expected run cuts at {n} tokens");
+        let report = notice(&output);
+        assert!(report.starts_with("[skim] types view:"), "{report}");
+        assert!(
+            report.contains(&format!("; {cut} files are cut,")),
+            "{report}"
+        );
+    }
+}

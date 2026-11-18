@@ -26,7 +26,7 @@ updated: 2026-11-18
 - **KB-INV-12** Budget arithmetic saturates. A missing count means over budget (`usize::MAX`). No content candidate leaves the planner without an exact count or a byte bound.
 - **KB-AP-1** Do not print a candidate that the exact count did not accept. The planner returns the trailer only after the retries fail.
 - **KB-AP-2** Do not add a per-file cascade stderr line to a multi-file `--tokens` run. Pass 1 uses `CascadeLines::Quiet`. The run notice carries the remedy.
-- **KB-AP-3** Do not cut a body that is `Fixed`. A file with no language, a rung error, or a line-bound run (`--max-lines`, `--last-lines`) is shown whole or omitted.
+- **KB-AP-3** Do not cut a body that is `Fixed`. Retained pass-1 bodies and line-bound bodies (`--max-lines`, `--last-lines`) stay whole or are omitted.
 - **KB-AP-4** Do not add a second notice type. The run notice shares one line builder with the default bounded notice. Do not charge it to an analytics row.
 - **KB-AP-5** Do not change the empty rule back to "any emptied body skips the rung". A partly empty rung keeps the affected pass-1 bodies and can still fit.
 - **KB-AP-6** Do not run a test of this feature with `SKIM_PASSTHROUGH` in the parent environment. The binary under test reads it and fails every compression assertion.
@@ -44,17 +44,17 @@ A run goes through these steps. Pass 1 runs the old per-file code and counts eac
 1. **Pass 1.** `process_file` runs for each path with the real options. Each success gets a `Fixed` piece with prefix, count and floor.
 2. **Fit test.** `select_run` calls `set_fits` on the pass-1 set. A set that fits goes out unchanged, with the aggregate notice as before.
 3. **Rung walk.** `walk_rungs` (from `cascade.rs`) goes over the modes after the start mode. For each rung, `run_rung` with `RungKind::Probe` transforms every file with `token_budget: None`. It stops counting when one piece is over N or the running sum is over 2N. Workers still transform after the stop, because the empty test needs every body.
-4. **Cut base.** When no rung fits, the last non-empty rung is run again with `RungKind::CutBase`. Each body over N is pre-cut in its worker. A complete probe set is reused when it exists.
-5. **Plan.** `plan_cut` in `run_budget.rs` chooses how many files stay (`kept_prefix`), splits the budget with `shares` (max-min), cuts each over-share body once, then counts the joined string.
+4. **Cut base.** When no rung fits, reuse the last non-empty probe if it is complete. If it is incomplete, rebuild that rung with `RungKind::CutBase`. If no probe gives a cut base, use the start mode. Each worker pre-cuts only cuttable bodies over N.
+5. **Plan.** `plan_cut` in `run_budget.rs` chooses how many files stay (`kept_prefix`). It splits the budget with `shares` (max-min). It cuts over-share bodies that permit cuts, then counts the joined string.
 6. **Write.** `write_run` writes the accepted string. Error lines, the notice, stats and analytics follow, from the final bodies.
 
 `final_results` replaces each shown output with the final body and clears the cached token counts when the run changed. Omitted successes get no analytics row.
 
 ## Planner rules (`run_budget.rs`)
 
-- **`Body`** has three forms. `Whole` can be cut. `PreCut` stores the worker's kept lines, its own marker, the total view lines and the marked count. `Fixed` is all-or-nothing.
+- **`Body`** has three forms. `Whole` can be cut. `PreCut` stores the worker's kept lines, its own marker, the total view lines and the marked count. `Fixed` keeps the body as-is, or the planner omits it.
 - **`set_fits`** is the one fit rule for pass 1 and every rung. A set whose bytes are at most N fits with no count. Otherwise it fails when a piece count is over N or the sum is over `RUN_SUM_STOP_FACTOR` times N. If neither fails, one exact count of the joined string decides.
-- **`kept_prefix`** is one linear pass over the floors. A floor is the lesser of the piece count and prefix plus the compact marker. The trailer cost uses the widest numbers. There is no binary search.
+- **`kept_prefix`** is one linear pass over the floors. A `Fixed` floor is the full piece count. For other bodies, the floor is the lesser of the piece count and prefix plus the compact marker. The trailer cost uses the widest numbers. There is no binary search.
 - **Cuts** count hidden view lines (`ViewLines`). A `PreCut` body whose marked count fits its share keeps the worker marker as it is. Otherwise the core cuts `kept` again with `SourceTotal(total_view_lines)`.
 - **Retries.** If the exact count is over N, the planner drops the last kept file, at most `MAX_DROP_RETRIES` times. Then it returns the trailer only.
 - **Floor.** When N is below the trailer cost, stdout is the trailer line only. This is the one case where stdout can be over N. `--tokens 0` and values over `MAX_TOKEN_BUDGET` are still usage errors.
@@ -63,7 +63,7 @@ A run goes through these steps. Pass 1 runs the old per-file code and counts eac
 
 `RunNoticeFacts` holds the budget, requested and served modes, differing and total counts, cut and omitted counts, and the last shown and first omitted paths. `run_view_marker` builds the line. `view_notice_line` is the shared builder, and the default bounded notice uses it too. Each clause drops out when its count is zero: the step-down clause, the cut clause and the omitted clause. Paths go through `display_path`, so the notice stays on one line. The notice names only remedies that a multi-file run accepts: a larger `--tokens`, fewer files, `SKIM_PASSTHROUGH=1`.
 
-`cut` counts only files that the run cut. A file that keeps its pass-1 body is not in `cut`. That body can carry a source-line marker and can differ from the served view.
+`cut` counts each shown file with a run cut. The planner never cuts a retained pass-1 body. Its source-line marker stays intact and does not add to `cut`.
 
 `run_trailer_line` reuses the shared elision marker. It counts successful files only, and it starts on its own line.
 
@@ -77,7 +77,7 @@ A run goes through these steps. Pass 1 runs the old per-file code and counts eac
 
 **KB-AP-2.** `cascade_for_token_budget` prints in its fit arm, in `fallback_line_truncate` and in the serde cascade. A multi-file pass 1 calls it, so the call must be quiet. Stdout bytes and the returned mode are equal for `Print` and `Quiet`. The cascade tests cover each arm. The count-failure warning always prints.
 
-**KB-AP-3.** `run_rung` marks a body `Fixed` when the file has no language (`explicit_lang` or the path extension, never the shebang), when the transform returns an error, or when `max_lines` or `last_lines` is set. A rung error adds no stderr line. Omission is a path-order suffix, so a large `Fixed` body ends the shown prefix.
+**KB-AP-3.** `run_rung` keeps the pass-1 body if it has no language, the transform fails, or the rung empties the body. Language comes from `explicit_lang` or the path extension, not the shebang. These bodies and line-bound bodies are `Fixed`. A rung error adds no stderr line. Omission is a path-order suffix, so a large `Fixed` body can end the shown prefix. `partly_empty_cut_keeps_the_exact_pass_one_body_or_omits_it` checks this rule.
 
 **KB-AP-4.** Batch analytics rows are unmeasured by design. See the long comment in `multi.rs` and the `analytics` knowledge base. The rows carry the requested mode and a null notice.
 
