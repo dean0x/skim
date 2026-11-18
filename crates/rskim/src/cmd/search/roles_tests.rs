@@ -68,7 +68,7 @@ fn called_names_keep_every_callee_shape_whose_name_holds_a_word() {
             let labels = Labels::new(&one, lang, ext).unwrap();
             let names = labels.called_names(
                 &one,
-                |n| n == "readLock",
+                |n| super::super::matcher::name_holds_word(n, "lock"),
                 super::NameCap {
                     count: 32,
                     bytes: 256,
@@ -99,6 +99,33 @@ fn called_names_keep_every_callee_shape_whose_name_holds_a_word() {
             .kept
             .is_empty()
     );
+}
+
+#[test]
+fn qualified_calls_share_the_bare_name_quota_and_ignore_scope_words() {
+    let scope = "A".repeat(300);
+    let source = format!(
+        "fn run() {{\n Self::readLock();\n Type::readLock();\n Type::readLock();\n readLock();\n Module::Type::readLock();\n {scope}::readLock();\n Other::writeLock();\n Lock::unrelated();\n}}"
+    );
+    let labels = Labels::new(&source, Language::Rust, "rs").unwrap();
+    let names = labels.called_names(
+        &source,
+        |n| super::super::matcher::name_holds_word(n, "lock"),
+        super::NameCap {
+            count: 2,
+            bytes: 256,
+        },
+    );
+    assert_eq!(
+        names
+            .kept
+            .iter()
+            .map(|name| (name.name.as_str(), name.line))
+            .collect::<Vec<_>>(),
+        [("readLock", 2), ("writeLock", 8)]
+    );
+    assert_eq!(names.dropped, 0);
+    assert_eq!(names.long_names, 0);
 }
 
 #[test]

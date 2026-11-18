@@ -368,7 +368,13 @@ impl Labels {
                 "Labels::new refuses a depth-capped declaration walk"
             );
             let node = item.node;
-            if !is_identifier(node) {
+            // A scoped identifier wraps its name token. The walk visits both;
+            // only the token supplies a name link and consumes the name quota.
+            if !is_identifier(node)
+                || node
+                    .child_by_field_name("name")
+                    .is_some_and(|child| passes_through(node, child))
+            {
                 continue;
             }
             let Some(name) = source.get(node.byte_range()) else {
