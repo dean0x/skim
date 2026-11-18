@@ -967,9 +967,9 @@ where
 /// The binary search converges on a line count, not on a syntactic boundary, so
 /// the converged cut is afterwards pulled **back** out of any multi-line string
 /// literal (or Markdown fenced code block) it landed in — the same rule
-/// [`simple_line_truncate`] applies to `--max-lines`. The pull-back only ever
-/// removes content lines, so the budget the search established still holds and
-/// no candidate is re-counted.
+/// [`simple_line_truncate`] applies to `--max-lines`. A pull-back can add digits
+/// to the omission count. Measure the new candidate and remove more whole lines
+/// until one fits or no content remains.
 pub(crate) fn truncate_with_count_source<F>(
     text: &str,
     language: Language,
@@ -1039,9 +1039,18 @@ where
         byte_end.push(pos);
     }
 
-    // #511: one forward pass over `text`, run ONCE — before the search, never
-    // per candidate. The binary search is free to probe cuts that land inside a
-    // literal; only the converged `best` is snapped, below.
+    let make_candidate = |kept: usize| {
+        let marker = make_marker(kept);
+        let content_slice = &joined[..byte_end[kept - 1]];
+        let mut candidate = String::with_capacity(content_slice.len() + 1 + marker.len());
+        candidate.push_str(content_slice);
+        candidate.push('\n');
+        candidate.push_str(&marker);
+        candidate
+    };
+
+    // #511: scan `text` once, before the search, never per candidate.
+    // The search can probe cuts inside a literal; snap the final cut below.
     let scan = literal_scan::scan(text, language);
 
     // Binary search for max content lines that fit within budget (including marker).
@@ -1054,14 +1063,7 @@ where
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
 
-        // Build candidate: mid content lines + omission marker
-        // Slice from pre-joined string instead of per-iteration join
-        let marker = make_marker(mid);
-        let content_slice = &joined[..byte_end[mid - 1]];
-        let mut candidate = String::with_capacity(content_slice.len() + 1 + marker.len());
-        candidate.push_str(content_slice);
-        candidate.push('\n');
-        candidate.push_str(&marker);
+        let candidate = make_candidate(mid);
 
         if count_tokens(&candidate) <= token_budget {
             best = mid;
@@ -1071,12 +1073,10 @@ where
         }
     }
 
-    // #511: pull the converged cut back out of a multi-line literal / Markdown
-    // fence, exactly as `simple_line_truncate` does for `--max-lines`.  `open`
-    // is the opener's 0-based index and therefore also the count of lines
-    // before it, so `best` only ever DECREASES — the candidate shrinks and the
-    // budget invariant established by the search still holds, with no
-    // re-counting.
+    // #511: pull the cut back before the literal or Markdown fence opener.
+    // `open` is the opener's zero-based index and the count of lines before it.
+    // Fewer content lines can mean more marker digits, especially with sparse
+    // source coordinates. Measure the candidate again after the pull-back.
     //
     // rust-4: guard the snap so it never reduces `best` to 0 when the binary
     // search found content lines that fit (best > 0). A top-of-file literal
@@ -1087,19 +1087,32 @@ where
     let open_at_cut = best
         .checked_sub(1)
         .and_then(|last_retained| scan.open_after(last_retained));
-    let snapped_to_zero = open_at_cut == Some(0);
+    let mut snapped_to_zero = open_at_cut == Some(0);
     // When open == 0, keep `best` unchanged; `snapped_to_zero` is true so the
     // compact_side below carries the cut-inside disclosure.
     if let Some(open) = open_at_cut.filter(|&o| o > 0) {
         best = open;
+        // Each failed check removes at least one line. At most `open` checks
+        // reach either a prefix that fits or the marker-only fallback.
+        for _ in 0..open {
+            if count_tokens(&make_candidate(best)) <= token_budget {
+                break;
+            }
+            best -= 1;
+            if best == 0 {
+                break;
+            }
+            let open_at_cut = scan.open_after(best - 1);
+            snapped_to_zero = open_at_cut == Some(0);
+            if let Some(open) = open_at_cut.filter(|&o| o > 0) {
+                best = open;
+            }
+        }
     }
 
     if let TruncationCountSource::LineMap { map, .. } = count_source {
         debug_assert!(map.len() >= best, "line map must cover the kept view lines");
     }
-
-    // Count after literal pull-back, in the selected coordinate space.
-    let marker = make_marker(best);
 
     // ADR-011 class 1 / #317: elision markers are unconditional — never suppress them
     // even when the marker alone exceeds the token budget. Returning an empty string
@@ -1122,12 +1135,7 @@ where
         ElidedSide::Truncated
     };
     let mut output = if best > 0 {
-        let content_slice = &joined[..byte_end[best - 1]];
-        let mut s = String::with_capacity(content_slice.len() + 1 + marker.len() + 1);
-        s.push_str(content_slice);
-        s.push('\n');
-        s.push_str(&marker);
-        s
+        make_candidate(best)
     } else {
         elision_marker_line(Some(language), omitted_at(0), compact_side, None)
     };
@@ -1176,6 +1184,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "first\nsecond\n// ... (80 lines truncated)\n");
+    }
+
+    #[test]
+    fn test_truncate_count_source_line_map_zero_keeps_the_previous_source_cut() {
+        let out = truncate_with_count_source(
+            "first\n\nsecond\n\n",
+            Language::Rust,
+            3,
+            |s| s.lines().count(),
+            None,
+            None,
+            TruncationCountSource::LineMap {
+                map: &[1, 0, 2, 0],
+                source_total: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "first\n\n// ... (1 line truncated)\n");
+    }
+
+    #[test]
+    fn test_truncate_count_source_line_map_pull_back_rechecks_a_larger_marker() {
+        let out = truncate_with_count_source(
+            "x\ny\n`\nlong literal body that exceeds the budget\n`",
+            Language::TypeScript,
+            32,
+            |s| s.chars().count(),
+            None,
+            None,
+            TruncationCountSource::LineMap {
+                map: &[1, 2, 9_999, 10_000, 10_001],
+                source_total: 10_001,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "x\n// ... (10000 lines truncated)");
+        assert_eq!(out.chars().count(), 32);
+    }
+
+    #[test]
+    fn test_truncate_count_source_line_map_pull_back_keeps_marker_when_no_prefix_fits() {
+        let out = truncate_with_count_source(
+            "x\ny\n`\nlong literal body that exceeds the budget\n`",
+            Language::TypeScript,
+            32,
+            |s| s.chars().count(),
+            None,
+            None,
+            TruncationCountSource::LineMap {
+                map: &[1, 2, 999_999, 1_000_000, 1_000_001],
+                source_total: 1_000_001,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "// ... (1000001 lines truncated)");
     }
 
     #[test]
@@ -3031,11 +3094,9 @@ mod tests {
     // #511 / E6.5 — `--tokens` snaps the converged cut out of a literal
     // ========================================================================
 
-    /// The token binary search converges on a line count, not on a syntactic
-    /// boundary, so it happily stops in the middle of a template literal. The
-    /// converged `best` is snapped back to the opener afterwards; because that
-    /// only ever DECREASES `best`, the budget the search established still
-    /// holds without re-counting a single candidate.
+    /// The token search converges on a line count, not a syntax boundary.
+    /// Pull the cut back before the template literal opener, then check that
+    /// the new candidate still fits the budget.
     ///
     /// The whole fixture is 15 words, so the budget has to sit below that or the
     /// `full_count <= token_budget` fast path returns the text untouched and
@@ -3067,7 +3128,7 @@ mod tests {
         );
         assert!(
             word_count(&out) <= budget,
-            "snapping only shrinks the output, so the budget still holds: {} > {budget}\n{out}",
+            "the output after the pull-back must fit: {} > {budget}\n{out}",
             word_count(&out)
         );
         assert_eq!(
