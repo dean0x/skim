@@ -277,7 +277,8 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
 /// v3 (ADR-001 amendment 2026-09-24): the ADR-001 net-savings guard now charges
 /// the stderr lossy-view disclosure, so stdout bytes depend on `notice_bytes`
 /// as well. Every v2 entry was written by a guard that priced the body only.
-const CACHE_SCHEMA_VERSION: u32 = 3;
+/// v4: token-budget cuts with line numbers retain their cut and unnumbered marker.
+const CACHE_SCHEMA_VERSION: u32 = 4;
 
 /// Generate the cache key for the entry `p` identifies, as of `mtime`.
 ///
@@ -900,6 +901,11 @@ mod tests {
         // Production key — uses `cache_schema_v{CACHE_SCHEMA_VERSION}|...`
         let key_production = cache_key(&key_params(path, Mode::Structure, trunc), mtime).unwrap();
 
+        assert_eq!(
+            CACHE_SCHEMA_VERSION, 4,
+            "token cuts with -n need fresh entries"
+        );
+
         // Simulate the pre-A1 hash: same inputs, NO version prefix.
         // If `key_production == key_legacy`, CACHE_SCHEMA_VERSION is absent
         // from hash_input and the invalidation guarantee is broken.
@@ -1128,7 +1134,7 @@ mod tests {
         assert_eq!(
             plain,
             sha(&format!(
-                "cache_schema_v3|{}|{mtime_secs}|Structure|none|none|none|0|0",
+                "cache_schema_v4|{}|{mtime_secs}|Structure|none|none|none|0|0",
                 canonical.display()
             ))
         );
@@ -1153,7 +1159,7 @@ mod tests {
         assert_eq!(
             busy,
             sha(&format!(
-                "cache_schema_v3|{}|{mtime_secs}|Pseudo|50|none|500|1|162",
+                "cache_schema_v4|{}|{mtime_secs}|Pseudo|50|none|500|1|162",
                 canonical.display()
             ))
         );

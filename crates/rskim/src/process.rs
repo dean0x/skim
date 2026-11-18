@@ -577,7 +577,6 @@ fn run_transform(
                 // escalation is impossible, but line-level truncation to fit the
                 // budget is both possible and correct. ADR-017: the text is raw at
                 // this point, so line counts are in source space.
-                let source_line_count = contents.lines().count();
                 // Step 1: apply explicit max-lines / last-lines bounds.
                 let bounded = passthrough_with_truncation(
                     contents,
@@ -592,27 +591,11 @@ fn run_transform(
                 // explicit bound" (log2(N)+1 ≤ 64 for any realistic file size).
                 let final_output = match tokens::count_tokens(&bounded) {
                     Ok(tok) if tok <= budget => bounded,
-                    _ => {
-                        let mut lo = 1usize;
-                        let mut hi = source_line_count;
-                        for _ in 0..64 {
-                            if lo >= hi {
-                                break;
-                            }
-                            let mid = lo + (hi - lo).div_ceil(2);
-                            let candidate =
-                                passthrough_with_truncation(contents, None, Some(mid), None);
-                            let fits = tokens::count_tokens(&candidate)
-                                .map(|c| c <= budget)
-                                .unwrap_or(false);
-                            if fits {
-                                lo = mid;
-                            } else {
-                                hi = mid.saturating_sub(1);
-                            }
-                        }
-                        passthrough_with_truncation(contents, None, Some(lo), None)
-                    }
+                    _ => raw_line_cut(contents, None, 1, |candidate| {
+                        tokens::count_tokens(candidate)
+                            .map(|c| c <= budget)
+                            .unwrap_or(false)
+                    }),
                 };
                 return Ok((final_output, options.mode, false, None, true)); // degraded=true
             };
@@ -631,18 +614,16 @@ fn run_transform(
                 transform_file,
             )?;
 
-            // If line numbers requested, re-run the selected mode WITH line_numbers.
-            // Use the re-run output directly as the final output (avoids double transform).
-            let (final_output, line_map) = if options.line_numbers {
+            // Re-run for source coordinates, but keep the cascade's token cut.
+            let line_map = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
                 let (rerun_output, _has_errors, map, _degraded) =
                     transform_with_line_map(contents, language, &config)?;
-                (rerun_output, map)
+                map.map(|map| cut_line_map(&output, &rerun_output, &map))
             } else {
-                (output, None)
+                None
             };
-
-            Ok((final_output, mode, false, line_map, false)) // cascade path: degraded signal N/A
+            Ok((output, mode, false, line_map, false)) // cascade path: degraded signal N/A
         }
         None => {
             let language = explicit_lang.or_else(|| detect_language_from_path(path));
@@ -695,6 +676,42 @@ fn run_transform(
 /// pattern used across the processing pipeline.
 fn detect_language_from_shebang(text: &str) -> Option<Language> {
     text.lines().next().and_then(Language::from_shebang)
+}
+
+/// Keep source entries only for the common line prefix. A cut marker has no entry.
+pub(crate) fn cut_line_map(cut: &str, full: &str, full_map: &[usize]) -> Vec<usize> {
+    cut.lines()
+        .zip(full.lines())
+        .zip(full_map)
+        .take_while(|((cut_line, full_line), _)| cut_line == full_line)
+        .map(|(_, &source_line)| source_line)
+        .collect()
+}
+
+/// Cut raw text on whole lines. `min_lines` selects the smallest line-bound probe.
+/// A floor of one keeps the token path's one-content-line carve-out.
+pub(crate) fn raw_line_cut(
+    text: &str,
+    language: Option<Language>,
+    min_lines: usize,
+    mut fits: impl FnMut(&str) -> bool,
+) -> String {
+    assert!(min_lines <= 1, "raw line-cut floor must be zero or one");
+    let mut lo = min_lines;
+    let mut hi = text.lines().count();
+    for _ in 0..64 {
+        if lo >= hi {
+            break;
+        }
+        let mid = lo + (hi - lo).div_ceil(2);
+        let candidate = passthrough_with_truncation(text, language, Some(mid), None);
+        if fits(&candidate) {
+            lo = mid;
+        } else {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    passthrough_with_truncation(text, language, Some(lo), None)
 }
 
 /// Apply optional line-count truncation to a raw view for the unknown-language path.
@@ -984,16 +1001,16 @@ pub(crate) fn process_stdin(
                 source_line_count,
                 |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
             )?;
-            // Use the re-run output directly as the final output (avoids double transform).
-            let (cascade_output, line_map) = if options.line_numbers {
+            // Re-run for source coordinates, but keep the cascade's token cut.
+            let line_map = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
                 let (rerun, _errs, map, _degraded) =
                     transform_with_line_map(&buffer, language, &config)?;
-                (rerun, map)
+                map.map(|map| cut_line_map(&output, &rerun, &map))
             } else {
-                (output, None)
+                None
             };
-            (cascade_output, false, line_map, false) // cascade path: degraded signal N/A
+            (output, false, line_map, false) // cascade path: degraded signal N/A
         }
         None => {
             let config =
@@ -1540,6 +1557,60 @@ pub(crate) fn read_source(path: &std::path::Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_line_map_keeps_only_the_common_prefix_and_leaves_the_marker_unnumbered() {
+        let full = "type A = string;\n\ntype B = number;\n";
+        let cut = "type A = string;\n\n// ... (8 lines truncated)";
+        let map = cut_line_map(cut, full, &[3, 0, 9]);
+        assert_eq!(map, [3, 0]);
+        assert_eq!(
+            apply_line_numbers(cut.into(), true, false, Some(map)),
+            "3\ttype A = string;\n\n// ... (8 lines truncated)"
+        );
+    }
+
+    #[test]
+    fn cut_line_map_stops_at_a_changed_line_and_accepts_a_short_map() {
+        assert_eq!(
+            cut_line_map("same\nchanged\n", "same\noriginal\n", &[7, 8]),
+            [7]
+        );
+        assert_eq!(cut_line_map("same\nnext\n", "same\nnext\n", &[7]), [7]);
+        assert!(cut_line_map("marker\n", "content\n", &[7]).is_empty());
+    }
+
+    #[test]
+    fn raw_line_cut_zero_floor_serves_only_the_source_count_marker_when_no_line_fits() {
+        let source = "éééééééééé\r\nsecond\r\nthird";
+        for language in [None, Some(Language::Rust)] {
+            let marker =
+                elision_marker_line(language, 3, ElidedSide::Truncated, Some(ELISION_HINT));
+            assert_eq!(
+                raw_line_cut(source, language, 0, |_| false),
+                format!("{marker}\n")
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "raw line-cut floor must be zero or one")]
+    fn raw_line_cut_rejects_a_floor_other_than_zero_or_one() {
+        raw_line_cut("first\nsecond\n", None, 2, |_| true);
+    }
+
+    #[test]
+    fn raw_line_cut_one_floor_preserves_the_token_carve_out_and_crlf() {
+        let source = "éééééééééé\r\nsecond\r\nthird";
+        assert_eq!(
+            raw_line_cut(source, None, 1, |_| false),
+            passthrough_with_truncation(source, None, Some(1), None)
+        );
+        assert_eq!(raw_line_cut(source, None, 1, |_| true), source);
+        let cut = raw_line_cut(source, None, 0, |candidate| candidate.lines().count() <= 2);
+        assert!(cut.starts_with("éééééééééé\r\n"), "{cut}");
+        assert!(cut.contains("2 lines truncated"), "{cut}");
+    }
 
     // ========================================================================
     // report_token_stats tests

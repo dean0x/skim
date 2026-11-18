@@ -910,21 +910,56 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize, source_total: usize
 // Token budget truncation (dependency-injected token counting)
 // ============================================================================
 
-/// Internal implementation of token-budget truncation.
+/// Coordinate space for the omission count of a whole-line cut.
+#[derive(Debug, Clone, Copy)]
+pub enum TruncationCountSource<'a> {
+    /// Legacy source-space rule: subtract the kept view-line count from this total.
+    SourceTotal(usize),
+    /// Source-space count after the last kept line, using one-based source lines.
+    LineMap {
+        map: &'a [usize],
+        source_total: usize,
+    },
+    /// View-space count: subtract kept view lines from the total view lines.
+    ViewLines,
+}
+
+/// Keep the token API's legacy count rule and output bytes.
+pub(crate) fn truncate_to_token_budget<F>(
+    text: &str,
+    language: Language,
+    token_budget: usize,
+    count_tokens: F,
+    known_token_count: Option<usize>,
+    elision_hint: Option<&str>,
+    source_line_count: Option<usize>,
+) -> Result<String>
+where
+    F: Fn(&str) -> usize,
+{
+    let count_source = source_line_count.map_or(
+        TruncationCountSource::ViewLines,
+        TruncationCountSource::SourceTotal,
+    );
+    truncate_with_count_source(
+        text,
+        language,
+        token_budget,
+        count_tokens,
+        known_token_count,
+        elision_hint,
+        count_source,
+    )
+}
+
+/// Shared implementation of measured whole-line truncation.
 ///
-/// Public API surface is [`crate::truncate_to_token_budget`].
-///
-/// `elision_hint` is appended to the truncation marker when `Some`
-/// (B5 / ADR-011 class 1 remedy clause). `None` keeps the library CLI-agnostic.
-///
-/// # Source-space counts (reliability-8)
-///
-/// When `source_line_count` is `Some(k)`, the marker reports `k - best`
-/// lines omitted — the count in **source** space. `None` falls back to
-/// `text.lines().count() - best` (output-space count). Callers should pass
-/// the original source-file line count so that a stacked `--tokens N --max-lines M`
-/// invocation correctly reports how many source lines the agent cannot see,
-/// rather than mis-counting the synthetic marker line from the `--max-lines` pass.
+/// Both public truncation APIs use this search, marker builder and literal scan.
+/// `SourceTotal` preserves the legacy source-total minus kept-view-lines rule.
+/// `LineMap` counts source lines after the final retained source coordinate.
+/// `ViewLines` counts only view lines. A short map uses view space, never a
+/// source total with a view-space coordinate.
+/// `elision_hint` adds the caller's remedy to the marker when `Some`.
 ///
 /// # Literal boundaries (#511)
 ///
@@ -934,14 +969,14 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize, source_total: usize
 /// [`simple_line_truncate`] applies to `--max-lines`. The pull-back only ever
 /// removes content lines, so the budget the search established still holds and
 /// no candidate is re-counted.
-pub(crate) fn truncate_to_token_budget<F>(
+pub(crate) fn truncate_with_count_source<F>(
     text: &str,
     language: Language,
     token_budget: usize,
     count_tokens: F,
     known_token_count: Option<usize>,
     elision_hint: Option<&str>,
-    source_line_count: Option<usize>,
+    count_source: TruncationCountSource<'_>,
 ) -> Result<String>
 where
     F: Fn(&str) -> usize,
@@ -965,17 +1000,24 @@ where
         return Ok(String::new());
     }
 
-    // reliability-8: use source_line_count (the true source size) when
-    // provided so the marker is accurate in source space.  Falls back to
-    // lines.len() when None — same as the previous behaviour.
-    let source_total = source_line_count.unwrap_or(lines.len());
-
-    // B5: elision_hint must be captured by the closure to append the remedy clause.
-    // The marker count is `source_total - kept` — source-space omitted lines.
+    let omitted_at = |kept: usize| match count_source {
+        TruncationCountSource::SourceTotal(total) => total.saturating_sub(kept),
+        TruncationCountSource::LineMap { map, source_total } => {
+            if kept == 0 {
+                source_total
+            } else {
+                map.get(kept - 1).map_or_else(
+                    || lines.len().saturating_sub(kept),
+                    |&last_source_line| source_total.saturating_sub(last_source_line),
+                )
+            }
+        }
+        TruncationCountSource::ViewLines => lines.len().saturating_sub(kept),
+    };
     let make_marker = |kept: usize| {
         elision_marker_line(
             Some(language),
-            source_total.saturating_sub(kept),
+            omitted_at(kept),
             ElidedSide::Truncated,
             elision_hint,
         )
@@ -1049,7 +1091,11 @@ where
         best = open;
     }
 
-    // Build final output from pre-joined string
+    if let TruncationCountSource::LineMap { map, .. } = count_source {
+        debug_assert!(map.len() >= best, "line map must cover the kept view lines");
+    }
+
+    // Count after literal pull-back, in the selected coordinate space.
     let marker = make_marker(best);
 
     // ADR-011 class 1 / #317: elision markers are unconditional — never suppress them
@@ -1080,7 +1126,7 @@ where
         s.push_str(&marker);
         s
     } else {
-        elision_marker_line(Some(language), source_total, compact_side, None)
+        elision_marker_line(Some(language), omitted_at(0), compact_side, None)
     };
 
     // Trailing-newline contract, both marker forms alike: the output mirrors
@@ -1108,6 +1154,127 @@ where
 #[allow(clippy::unwrap_used, clippy::panic)] // Unwrapping and panics are acceptable in tests
 mod tests {
     use super::*;
+    use crate::truncate_with_count_source;
+
+    #[test]
+    fn test_truncate_count_source_line_map_counts_after_the_last_kept_source_line() {
+        let text = "first\nsecond\nthird\nfourth\n";
+        let out = truncate_with_count_source(
+            text,
+            Language::Rust,
+            3,
+            |s| s.lines().count(),
+            None,
+            None,
+            TruncationCountSource::LineMap {
+                map: &[3, 20, 40, 60],
+                source_total: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "first\nsecond\n// ... (80 lines truncated)\n");
+    }
+
+    #[test]
+    fn test_truncate_count_source_line_map_uses_the_cut_after_literal_pull_back() {
+        let text = "alpha one\nbeta two\nconst s = `\ninside one\ninside two\n`;\ngamma three\n";
+        let out = truncate_with_count_source(
+            text,
+            Language::TypeScript,
+            14,
+            word_count,
+            None,
+            None,
+            TruncationCountSource::LineMap {
+                map: &[10, 20, 30, 40, 50, 60, 70],
+                source_total: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "alpha one\nbeta two\n// ... (80 lines truncated)\n");
+    }
+
+    #[test]
+    fn test_truncate_count_source_view_lines_and_legacy_rule_keep_their_own_space() {
+        let text = "first\nsecond\nthird\nfourth\n";
+        for (count_source, omitted) in [
+            (TruncationCountSource::ViewLines, 2),
+            (TruncationCountSource::SourceTotal(100), 98),
+        ] {
+            let out = truncate_with_count_source(
+                text,
+                Language::Rust,
+                3,
+                |s| s.lines().count(),
+                None,
+                None,
+                count_source,
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                format!("first\nsecond\n// ... ({omitted} lines truncated)\n")
+            );
+        }
+        let legacy = truncate_to_token_budget(
+            text,
+            Language::Rust,
+            3,
+            |s| s.lines().count(),
+            None,
+            None,
+            Some(100),
+        )
+        .unwrap();
+        assert_eq!(legacy, "first\nsecond\n// ... (98 lines truncated)\n");
+    }
+
+    #[test]
+    fn test_truncate_count_source_line_map_with_no_content_counts_all_source_lines() {
+        let out = truncate_with_count_source(
+            "first\nsecond",
+            Language::Rust,
+            0,
+            |s| s.chars().count(),
+            None,
+            None,
+            TruncationCountSource::LineMap {
+                map: &[],
+                source_total: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "// ... (100 lines truncated)");
+    }
+
+    #[test]
+    fn test_truncate_count_source_short_map_asserts_or_uses_only_view_lines() {
+        let result = std::panic::catch_unwind(|| {
+            truncate_with_count_source(
+                "first\nsecond\nthird\nfourth\n",
+                Language::Rust,
+                3,
+                |s| s.lines().count(),
+                None,
+                None,
+                TruncationCountSource::LineMap {
+                    map: &[10],
+                    source_total: 100,
+                },
+            )
+        });
+        if cfg!(debug_assertions) {
+            assert!(
+                result.is_err(),
+                "debug builds must detect an incomplete map"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap().unwrap(),
+                "first\nsecond\n// ... (2 lines truncated)\n"
+            );
+        }
+    }
 
     #[test]
     fn test_no_truncation_when_within_budget() {

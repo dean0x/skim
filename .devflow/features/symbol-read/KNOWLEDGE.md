@@ -12,7 +12,7 @@ updated: 2026-11-12
 
 ## Rules
 
-- **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. A whole-file read keeps the exact hash input it had before, so no warm entry is orphaned.
+- **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. Apart from schema changes, a whole-file read keeps its hash input. Schema 4 invalidates old entries because token cuts with line numbers now keep their cut and marker.
 - **KB-INV-2** A successful symbol read prints its stderr notice on every run, warm or cold, because the reader sees part of the file. The notice is stored in the cache entry, and the read records no analytics row.
 - **KB-INV-3** A variable declared in a function body (TypeScript, JavaScript, Go) is a local and is not a declaration. A variable at the top level is a declaration.
 - **KB-INV-4** The search engine reuses `Declaration.name_bytes`, `enclosing_declaration`, `DeclScan.truncated` and `Parser::new_for_extension`. Keep their signatures and meaning. Search parses with plain `parse` and has no time bound.

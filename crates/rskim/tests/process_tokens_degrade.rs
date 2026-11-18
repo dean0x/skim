@@ -76,6 +76,26 @@ fn extensionless_shebang_script_transforms_with_token_budget() {
 }
 
 #[test]
+fn unknown_language_token_cut_keeps_one_raw_line_even_when_it_exceeds_the_budget() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("notes");
+    let first = "é".repeat(200);
+    let source = format!("{first}\r\n{}", "second raw line\r\n".repeat(20));
+    std::fs::write(&file, &source).unwrap();
+    let output = skim_cmd()
+        .arg(&file)
+        .args(["--mode", "full", "--tokens", "1", "--no-cache"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{first}\r\n# ... (20 lines truncated) — SKIM_PASSTHROUGH=1 for full output\n")
+    );
+}
+
+#[test]
 fn extensionless_unknown_file_degrades_with_token_budget() {
     // No extension AND no shebang → no detectable language. The Some(budget)
     // branch must degrade to a lossless passthrough (ADR-002), exit 0, and emit

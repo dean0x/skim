@@ -23,6 +23,17 @@ use crate::tokens;
 /// this via `use crate::output::ELISION_HINT` rather than defining their own.
 pub(crate) const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
+/// Strict output ceiling in Unicode scalar values, not bytes.
+/// Claude Code persists output at about 30,000 characters and exposes a prefix.
+/// This margin assumes scalar-value counts; a UTF-16 limit consumes two units
+/// per non-BMP character, so the margin covers about 1,000 such characters.
+pub(crate) const MAX_STDOUT_CHARS: usize = 29_000;
+
+/// Accept only complete output strictly below the shared character ceiling.
+pub(crate) fn within_output_limit(chars: usize) -> bool {
+    chars < MAX_STDOUT_CHARS
+}
+
 // ============================================================================
 // ParseResult<T> — three-tier parse degradation
 // ============================================================================
@@ -1881,6 +1892,14 @@ impl FilterTransparencyHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_limit_is_strict_and_stays_at_29000_characters() {
+        assert_eq!(MAX_STDOUT_CHARS, 29_000);
+        assert!(within_output_limit(28_999));
+        assert!(!within_output_limit(29_000));
+        assert!(!within_output_limit(29_001));
+    }
 
     // ========================================================================
     // elision_marker tests
