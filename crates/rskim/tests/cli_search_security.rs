@@ -389,6 +389,36 @@ fn a_called_name_with_bidi_and_del_prints_escaped() {
 }
 
 #[test]
+fn a_javascript_called_name_with_bidi_and_del_prints_escaped() {
+    let repo = SearchRepo::new();
+    let name = "alpha_\u{202e}\u{7f}";
+    repo.write("src/main.js", format!("// alpha beta\n{name}();\n"));
+    repo.write("src/defs.js", format!("function {name}() {{}}\n"));
+    repo.track_all();
+
+    let run = repo.search(&["alpha beta", "--limit", "1"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        run.lines()
+            .contains(&"def src/defs.js:1-1: alpha_\\u{202e}\\x7F, called from src/main.js:2"),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains(['\u{202e}', '\u{7f}']));
+
+    let json = repo.search(&["alpha beta", "--limit", "1", "--json"]);
+    assert_eq!(json.code, 0, "{}", json.stderr);
+    let value = json_of(&json);
+    assert_eq!(
+        value["called_definitions"],
+        serde_json::json!([
+            {"name":name, "path":"src/defs.js", "line":1, "first_line":1, "end_line":1,
+             "caller":{"path":"src/main.js", "line":2}}
+        ])
+    );
+}
+
+#[test]
 fn a_called_name_of_two_thousand_bytes_is_counted_not_printed() {
     let repo = SearchRepo::new();
     let name = format!("alpha_{}", "x".repeat(1994));
