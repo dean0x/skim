@@ -1796,46 +1796,40 @@ fn process_single_arg(
     // detect `EPIPE` and exit 141 rather than 1.  Wrapping with `anyhow::anyhow!`
     // produces a `Message` error with no source, which `chain()` cannot walk.
     //
-    // The aggregate marker names SKIM_PASSTHROUGH=1 for full output. Every
-    // multi-file shape must accept that remedy: directories and globs here,
-    // explicit lists in run_file_operation via passthrough_explicit_files.
-    // Both paths use the transform collectors and the same no_ignore value.
+    // Directories, globs and explicit lists share the raw multi-file writer.
+    // All three use the transform collectors and the same no_ignore value.
     if cmd::is_passthrough_mode() {
-        use std::io::Write as _;
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        let path = std::path::Path::new(file);
         if file == "-" {
-            // Stdin passthrough: copy bounded stdin → stdout.
+            use std::io::Write as _;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
             let buf = cmd::read_stdin_bounded()?;
             out.write_all(buf.as_bytes())?;
             return Ok(());
         }
-        let mut copy = |path: &std::path::Path| -> anyhow::Result<()> {
-            match cmd::copy_file_raw(path, &mut out) {
-                Ok(()) => Ok(()),
-                Err(cmd::FileCopyError::Input(error)) => {
-                    anyhow::bail!("passthrough read {}: {error}", path.display())
-                }
-                Err(cmd::FileCopyError::Output(error)) => Err(error)?,
-            }
-        };
+        let path = std::path::Path::new(file);
         if path.is_dir() {
-            // Directory passthrough: collect all skim-supported files and
-            // print their raw bytes concatenated (mirrors process_directory).
-            for path in multi::collect_passthrough_paths_dir(path, args.no_ignore) {
-                copy(&path)?;
-            }
-        } else if multi::has_glob_pattern(file) {
-            // Glob passthrough: expand, then print raw bytes of each match.
-            for path in multi::collect_passthrough_paths_glob(file, args.no_ignore)? {
-                copy(&path)?;
-            }
-        } else {
-            // Stream the raw bytes without a size limit or UTF-8 check.
-            copy(path)?;
+            return multi::passthrough_paths(&multi::collect_passthrough_paths_dir(
+                path,
+                args.no_ignore,
+            ));
         }
-        return Ok(());
+        if multi::has_glob_pattern(file) {
+            return multi::passthrough_paths(&multi::collect_passthrough_paths_glob(
+                file,
+                args.no_ignore,
+            )?);
+        }
+        // Stream one file without a size limit or UTF-8 check.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        return match cmd::copy_file_raw(path, &mut out) {
+            Ok(()) => Ok(()),
+            Err(cmd::FileCopyError::Input(error)) => {
+                anyhow::bail!("passthrough read {}: {error}", path.display())
+            }
+            Err(cmd::FileCopyError::Output(error)) => Err(error)?,
+        };
     }
 
     if let Some(name) = args.symbol.as_deref() {

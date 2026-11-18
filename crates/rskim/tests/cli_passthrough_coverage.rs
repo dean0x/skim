@@ -400,27 +400,45 @@ fn explicit_list_passthrough_rejects_stdin_mixed_with_files() {
 }
 
 #[cfg(unix)]
-#[test]
-fn explicit_list_passthrough_broken_pipe_exits_141() {
+fn assert_passthrough_broken_pipe_exits_141(args: &[&str], tag: &str) {
     use std::process::Stdio;
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("a.ts"), STRUCTURE_FIXTURE.repeat(3_000)).unwrap();
     fs::write(dir.path().join("b.ts"), STRUCTURE_FIXTURE).unwrap();
     let mut child = std::process::Command::new(common::skim_bin())
         .current_dir(dir.path())
-        .args(["a.ts", "b.ts"])
+        .args(args)
         .env("SKIM_PASSTHROUGH", "1")
         .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_REWRITTEN_FROM")
         .env_remove("SKIM_DEBUG")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    assert!(!read_one_line_then_close(&mut child, "explicit-list").is_empty());
     assert_eq!(
-        wait_for_child(&mut child, "explicit-list").code(),
-        Some(141)
+        read_one_line_then_close(&mut child, tag),
+        STRUCTURE_FIXTURE.lines().next().unwrap()
     );
+    assert_eq!(wait_for_child(&mut child, tag).code(), Some(141), "{tag}");
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_broken_pipe_exits_141() {
+    assert_passthrough_broken_pipe_exits_141(&["a.ts", "b.ts"], "explicit-list");
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_passthrough_broken_pipe_exits_141() {
+    assert_passthrough_broken_pipe_exits_141(&["."], "directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn glob_passthrough_broken_pipe_exits_141() {
+    assert_passthrough_broken_pipe_exits_141(&["*.ts"], "glob");
 }
 
 /// `SKIM_PASSTHROUGH=1 skim -` (stdin) must copy stdin to stdout unchanged.
@@ -1583,23 +1601,13 @@ fn test_directory_passthrough_exits_zero_with_content() {
     let ts_file = dir.path().join("lib.ts");
     fs::write(&ts_file, content).unwrap();
 
-    let out = passthrough_skim()
-        .arg(dir.path().to_str().unwrap())
-        .output()
-        .unwrap();
-
-    assert!(
-        out.status.success(),
-        "SKIM_PASSTHROUGH=1 skim <dir> must exit 0; got {:?}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("export const x"),
-        "passthrough of a directory must emit the raw file content;\
-         pre-fix this path failed with 'Is a directory'.\nGot: {stdout:?}"
-    );
+    common::skim_sandboxed(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(content)
+        .stderr(predicate::str::is_empty());
 }
 
 /// `SKIM_PASSTHROUGH=1 skim '<glob>'` must exit 0 and produce the raw file bytes.
@@ -1613,22 +1621,83 @@ fn test_glob_passthrough_exits_zero_with_content() {
     let ts_file = dir.path().join("app.ts");
     fs::write(&ts_file, content).unwrap();
 
-    let glob = format!("{}/*.ts", dir.path().display());
+    common::skim_sandboxed(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .arg("*.ts")
+        .assert()
+        .success()
+        .stdout(content)
+        .stderr(predicate::str::is_empty());
+}
 
-    let out = passthrough_skim().arg(&glob).output().unwrap();
+#[test]
+fn empty_directory_passthrough_succeeds_without_output() {
+    let dir = TempDir::new().unwrap();
+    common::skim_sandboxed(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .arg(".")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+}
 
-    assert!(
-        out.status.success(),
-        "SKIM_PASSTHROUGH=1 skim '<glob>' must exit 0; got {:?}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("export const y"),
-        "passthrough of a glob must emit the raw file content;\
-         pre-fix this path failed with 'No such file or directory'.\nGot: {stdout:?}"
-    );
+#[cfg(unix)]
+fn make_unreadable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::write(path, STRUCTURE_FIXTURE).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    match fs::File::open(path) {
+        // Root can still read this file.
+        Ok(_) => false,
+        Err(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            true
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_and_glob_passthrough_keep_readable_files() {
+    let dir = TempDir::new().unwrap();
+    if !make_unreadable(&dir.path().join("bad.ts")) {
+        return;
+    }
+    let raw = b"const x = 1;\r\n\xff";
+    fs::write(dir.path().join("good.ts"), raw).unwrap();
+
+    for arg in [".", "*.ts"] {
+        common::skim_sandboxed(dir.path())
+            .env("SKIM_PASSTHROUGH", "1")
+            .arg(arg)
+            .assert()
+            .success()
+            .stdout(raw.as_slice())
+            .stderr(predicate::str::contains("Error processing ./bad.ts:").count(1));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_and_glob_passthrough_fail_if_no_file_is_readable() {
+    let dir = TempDir::new().unwrap();
+    if !make_unreadable(&dir.path().join("a.ts")) || !make_unreadable(&dir.path().join("b.ts")) {
+        return;
+    }
+
+    for arg in [".", "*.ts"] {
+        common::skim_sandboxed(dir.path())
+            .env("SKIM_PASSTHROUGH", "1")
+            .arg(arg)
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("Error processing ./a.ts:").count(1))
+            .stderr(predicate::str::contains("Error processing ./b.ts:").count(1))
+            .stderr(predicate::str::contains("All 2 file(s) failed to process"));
+    }
 }
 
 // ============================================================================

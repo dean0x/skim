@@ -1170,18 +1170,24 @@ fn report_file_error(path: impl std::fmt::Display, error: impl std::fmt::Display
     let _ = writeln!(io::stderr().lock(), "Error processing {path}: {error}");
 }
 
-/// Stream the explicit list as raw bytes, in the same path order as the transform.
-/// Directory and glob arguments use the same collectors and ignore rules.
-/// Report each input error and continue, even if part of that file reached stdout.
-/// The run succeeds if at least one file reaches EOF without an error.
-/// A write error stops the run at once. A closed stdout pipe exits 141.
-#[allow(clippy::disallowed_methods)] // File-list output needs one stdout lock for the raw byte stream
+/// Resolve the explicit list with the same path order and ignore rules as the transform.
 pub(crate) fn passthrough_explicit_files(args: &[String], no_ignore: bool) -> anyhow::Result<()> {
-    let paths = resolve_explicit_paths(args, no_ignore)?;
+    passthrough_paths(&resolve_explicit_paths(args, no_ignore)?)
+}
+
+/// Stream resolved paths as raw bytes in the given order.
+/// Report each input error and continue, even if part of that file reached stdout.
+/// An empty set succeeds. A non-empty set needs at least one complete file.
+/// Keep the write error so the CLI can return 141 for a closed pipe.
+#[allow(clippy::disallowed_methods)] // Multi-file output needs one stdout lock for the raw byte stream
+pub(crate) fn passthrough_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut successes = 0;
-    for path in &paths {
+    for path in paths {
         match copy_file_raw(path, &mut out) {
             Ok(()) => successes += 1,
             Err(FileCopyError::Input(error)) => report_file_error(display_path(path), error),
@@ -1363,7 +1369,7 @@ pub(crate) fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow
 /// Mirrors `collect_files_from_directory` but is `pub(crate)` so the passthrough
 /// gate in `process_single_arg` can enumerate files without running the transform
 /// pipeline.  Returns an empty `Vec` when the directory is empty or has no
-/// skim-supported files (the caller is responsible for handling that case).
+/// skim-supported files.
 pub(crate) fn collect_passthrough_paths_dir(dir: &Path, no_ignore: bool) -> Vec<PathBuf> {
     collect_files_from_directory(dir, no_ignore)
 }
