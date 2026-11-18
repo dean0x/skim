@@ -19,9 +19,13 @@
 
 mod flags;
 mod guidance;
+mod guidance_block;
+mod guidance_path;
+mod guidance_report;
 mod helpers;
 mod install;
 mod state;
+mod targets;
 mod uninstall;
 pub(super) mod wrappers;
 
@@ -35,6 +39,8 @@ use uninstall::run_uninstall;
 
 pub(crate) use flags::DetectionEnv;
 pub(crate) use flags::PermissionsTier;
+pub(crate) use guidance_block::Marker;
+pub(crate) use guidance_report::{FileScope, GuidanceFact, GuidanceState, Reader, guidance_report};
 pub(crate) use helpers::atomic_write_settings;
 pub(crate) use helpers::backup_config_file;
 pub(crate) use helpers::backup_settings_file;
@@ -48,6 +54,9 @@ pub(crate) use state::has_skim_hook_entry;
 // Only doctor's unit tests build a hook by hand; production code reads them off `HookFacts`.
 #[cfg(test)]
 pub(crate) use state::ForeignPostHook;
+// Only doctor's unit tests build a "not checked" state by hand; production code only prints it.
+#[cfg(test)]
+pub(crate) use guidance_report::NotChecked;
 
 // ============================================================================
 // B4: HookFacts DTO seam — cross-module hook state projection for `skim doctor`

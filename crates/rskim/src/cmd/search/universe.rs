@@ -31,13 +31,13 @@
 //! file, within the size bound) before a byte is read from it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::File;
-use std::io::{self, Read as _};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
 use super::gitdir::{RepoLookup, Repository, RootRules, find_repository};
+use crate::cmd::safe_fs::{self, ReadFailure};
 
 /// The number of leading bytes searched for a NUL byte. A NUL byte there makes
 /// the file binary.
@@ -494,45 +494,16 @@ fn parent_of(rel: &Path) -> &Path {
     rel.parent().unwrap_or(Path::new(""))
 }
 
-/// Open `path` without following a link at the last component and without
-/// blocking, check the handle, then read it within the size bound.
+/// Read one file within the size bound (see [`safe_fs::read_regular_bounded`]:
+/// no link is followed at the last component, a FIFO does not block, and the
+/// handle is checked before a byte is read), then classify the bytes.
 fn read_file(path: &Path) -> Read {
-    let file = match open_no_follow(path) {
-        Ok(file) => file,
-        Err(OpenFailure::Symlink) => return Read::LeftOut(LeftOut::Symlink),
-        Err(OpenFailure::Missing) => return Read::LeftOut(LeftOut::Vanished),
-        Err(OpenFailure::Other) => return Read::LeftOut(LeftOut::Unreadable),
-    };
-    let meta = match file.metadata() {
-        Ok(meta) => meta,
-        Err(_) => return Read::LeftOut(LeftOut::Unreadable),
-    };
-    // A folder where the listing named a file: the file is gone from that path.
-    // Gitlinks are dropped from the index listing, and the walk lists no
-    // folders, so only a changed work tree gives this.
-    if meta.is_dir() {
-        return Read::LeftOut(LeftOut::Vanished);
-    }
-    // A FIFO or a device is not text; reading it could block.
-    if !meta.is_file() {
-        return Read::LeftOut(LeftOut::Unreadable);
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Read::LeftOut(LeftOut::TooLarge);
-    }
     // A bounded read: a file that grew since the metadata call is cut at the
     // bound, then refused.
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-    if file
-        .take(MAX_FILE_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return Read::LeftOut(LeftOut::Unreadable);
-    }
-    if !u64::try_from(bytes.len()).is_ok_and(|n| n <= MAX_FILE_BYTES) {
-        return Read::LeftOut(LeftOut::TooLarge);
-    }
+    let bytes = match safe_fs::read_regular_bounded(path, MAX_FILE_BYTES) {
+        Ok(file) => file.bytes,
+        Err(failure) => return Read::LeftOut(left_out_for(&failure)),
+    };
     if bytes[..bytes.len().min(BINARY_PROBE_BYTES)].contains(&0) {
         return Read::LeftOut(LeftOut::Binary);
     }
@@ -542,51 +513,22 @@ fn read_file(path: &Path) -> Read {
     }
 }
 
-/// Why an open failed, in the terms the universe counts.
-enum OpenFailure {
-    /// The last component is a link.
-    Symlink,
-    /// The path is gone.
-    Missing,
-    Other,
-}
-
-/// Open for reading. On unix the open refuses a link at the last component
-/// (`O_NOFOLLOW`) and does not block on a FIFO (`O_NONBLOCK`); the caller
-/// checks the handle with `fstat` before it reads. `O_NONBLOCK` has no effect
-/// on a regular file, so no read of a checked handle is non-blocking.
-#[cfg(unix)]
-fn open_no_follow(path: &Path) -> Result<File, OpenFailure> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    File::options()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| match e.raw_os_error() {
-            Some(code) if code == libc::ELOOP => OpenFailure::Symlink,
-            _ if e.kind() == io::ErrorKind::NotFound => OpenFailure::Missing,
-            _ => OpenFailure::Other,
-        })
-}
-
-/// Open for reading where `O_NOFOLLOW` does not exist: check the link status
-/// first, then open, then let the caller check the handle.
-#[cfg(not(unix))]
-fn open_no_follow(path: &Path) -> Result<File, OpenFailure> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => return Err(OpenFailure::Symlink),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(OpenFailure::Missing),
-        Err(_) => return Err(OpenFailure::Other),
+/// The reason a failed read is counted under.
+fn left_out_for(failure: &ReadFailure) -> LeftOut {
+    match failure {
+        ReadFailure::Symlink => LeftOut::Symlink,
+        // A folder where the listing named a file: the file is gone from that
+        // path. Gitlinks are dropped from the index listing, and the walk lists
+        // no folders, so only a changed work tree gives this.
+        ReadFailure::Missing | ReadFailure::Folder => LeftOut::Vanished,
+        ReadFailure::TooLarge => LeftOut::TooLarge,
+        ReadFailure::NotUtf8 => LeftOut::NotUtf8,
+        // A FIFO or a device is not text; reading it could block.
+        ReadFailure::NotRegular
+        | ReadFailure::Open(_)
+        | ReadFailure::Inspect(_)
+        | ReadFailure::Read(_) => LeftOut::Unreadable,
     }
-    File::open(path).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            OpenFailure::Missing
-        } else {
-            OpenFailure::Other
-        }
-    })
 }
 
 #[cfg(test)]

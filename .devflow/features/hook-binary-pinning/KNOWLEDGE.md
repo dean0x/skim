@@ -1,11 +1,11 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
-description: "Use when changing hook install, binary pinning, wrapper flag zone, rewrite dispatch, force-raw sidecar, doctor integrity, permissions seeding or the after-run hook. Keywords: hook, PostToolUse, wrapper_flag_zone."
+description: "Use when changing hook install, pinning, rewrite dispatch, force-raw, doctor, agent guidance files, guidance-only agents or safe_fs writes. Keywords: hook, PostToolUse, wrapper_flag_zone, guidance, display_path."
 category: domain-knowledge
-directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/doctor, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions, crates/rskim/src/main.rs, crates/rskim/src/runner.rs]
+directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/doctor, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions, crates/rskim/src/cmd/session, crates/rskim/src/cmd/safe_fs.rs, crates/rskim/src/cmd/security.rs, crates/rskim/src/main.rs, crates/rskim/src/runner.rs]
 created: 2026-07-04
-updated: 2026-11-12
+updated: 2026-11-17
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
@@ -20,12 +20,23 @@ updated: 2026-11-12
 - **KB-INV-3** `scan_foreign_post_hooks` never counts skim's own entry (skipped under every event key), scans a directory named twice once, and reports a settings file it cannot read in `unreadable`; doctor prints the findings as notes only, never a drift or exit-code change, and only when the skim hook is installed.
 - **KB-AP-4** Do not print another tool's hook command raw: init and doctor go through `ForeignPostHook::describe` (`sanitize_for_display`: 64-character cut, non-ASCII to `?`), or a settings file can write control bytes to the terminal.
 - **KB-AP-5** Do not measure the after-run size gate in bytes (`len()`): `MAX_STDOUT_CHARS` is a character limit (`chars().count()`), pinned by `the_char_limit_counts_characters_not_bytes`; and do not turn analytics off in the post-hook E2E harness, or its empty-cache-dir check cannot see `analytics.db`.
+- **KB-INV-4** Guidance path policy (`guidance_path.rs`): a global path must be absolute and a relative config-folder variable is refused by name (a stop, before init or uninstall writes anything); in project scope the file and its folders stay inside the project root, a `..` step is refused, and a link at the file name is followed only when it ends inside the root at a regular file. Any other refusal is one `Note:` line, exit code unchanged.
+- **KB-INV-5** One predicate, `block_status` in `guidance_block.rs`, decides whether a guidance block is current: the install gate (`is_guidance_current`), the writer, the remover and doctor all call it. Current means byte-equal to what this binary writes for that file; the version in the `<!-- skim-start vX.Y.Z -->` marker is compared as a whole string.
+- **KB-INV-6** Every guidance file (agent file or guidance-only target) is written by `inject_into`, removed by `remove_from` and read by `read_instruction_text`; do not add a second writer, remover or reader.
+- **KB-INV-7** Files skim does not own are read and written through `cmd/safe_fs.rs`: reads open with `O_NOFOLLOW` and `O_NONBLOCK`, check the open handle (regular file, size bound) and decode strict UTF-8; `write_atomic` uses a random exclusive temp name in the target folder, sets the mode on the open handle, syncs, then renames, and a new file is mode 0600. Settings writes use it with mode 0600. Config backups use a synced temp file and a rename. Pinned by the `write_atomic_*` and `read_regular_bounded_*` tests in `safe_fs.rs` and the backup tests in `helpers.rs`.
+- **KB-AP-6** Do not print a guidance path raw: every guidance path that init, uninstall or doctor prints goes through `display_path` in `cmd/security.rs` (each `/` part filtered to printable ASCII and cut at the `sanitize_for_display` limit, so a long path keeps its file name), or a file name can write control bytes to the terminal.
+- **KB-AP-7** Do not remove a guidance block that another set-up agent still reads (Codex and Crush share one `AGENTS.md`; a project `CLAUDE.md` link to `AGENTS.md` is the same file). The check is on the resolved path and fails toward keeping; the hookless uninstall path obeys it too.
+- **KB-AP-8** Do not add a guidance-only agent row (`targets.rs`) for a file the agent reads before its other instruction files (`AGENTS.md`, `global_rules.md`), and do not create the agent's `root` folder: skim writes only into an installed agent's rules folder.
+- **KB-AP-9** Do not write or back up a config or guidance file with a fixed temp name, `fs::copy`, or a chmod after the write; use `safe_fs::write_atomic` or `backup_config_file`, so no earlier link or file at a known name is followed and no partial file is published.
+- **KB-INV-8** The doctor Guidance section is notes only: it never changes the drift verdict or the exit code, it lists a file only when it holds a skim block or cannot be checked, and it covers agents with no hook (Codex) and the guidance-only agents.
 
 ## Overview
 
 This feature area covers how skim installs itself as a PreToolUse hook into AI agent runtimes (Claude Code, Cursor, Gemini CLI, Copilot CLI, Crush) and as awareness-only files into Codex CLI. The central problem it solves is the **wrong-clone hazard**: multiple skim clones on different branches can report identical semver strings. Without binary pinning, the installed hook might silently exec the wrong clone.
 
 The solution is a pinned-binary hook script format (F6 / PR #421) embedding the canonicalized absolute path plus a git short SHA. A SHA-256 manifest sidecar enables tamper detection independent of the script's own content.
+
+Beside the hook, `skim init` writes a guidance block (a marked section of an instruction file) for each agent, and a guidance-only file for five agents that have no hook skim can install (Kiro, Roo Code, Cline, Augment, Windsurf). See "Agent Guidance Files" below.
 
 **Post-run surface (Claude Code only).** The same script and `skim rewrite --hook` argv also serve the `PostToolUse` event. `hook.rs` `route_stdin` routes on `hook_event_name`: a `PostToolUse` input goes to `post_hook.rs` `run_post_hook`, every other input keeps the Pre path unchanged. The post path is pure: it spawns no process, reads no file, writes no analytics row, no force-raw marker and no sidecar, and skips the drift/integrity block. It replaces `tool_response.stdout` for an allow-listed, successful, auto-mode Bash call and returns no permission decision. `skim init` installs both event keys (`hook_event_keys()`); `missing_hook_events` in the detected state makes a Pre-only install fall off the fast path, and `skim doctor` notes the gap without drift.
 
@@ -162,13 +173,14 @@ On macOS, `/tmp → /private/tmp`. On Homebrew installs, the binary sits behind 
 
 **`pin_is_current()`**: compares `hook_binary_pin` against `resolve_skim_binary()`. Used only by `hook_status_line` in `skim doctor` — it is **not a fast-path gate** (the pin is advisory: doctor reports a mismatch, and it never gates install or sets exit 1).
 
-**Fast-path** (6 conditions):
+**Fast-path** (every condition must hold; `run_install_single`):
 ```
-state.hook_installed && state.hook_is_current()
-&& guidance_current && !permissions_blocked
-&& !flags.force && integrity_verified
+state.hook_installed && state.matches_request(dev_requested)   // hook_is_current() plus the install mode
+&& state.missing_hook_events.is_empty()
+&& guidance_current                                             // is_guidance_current: block_status, KB-INV-5
+&& !permissions_blocked && !flags.force && integrity_verified
 ```
-Wrappers are handled INSIDE the fast-path block (`maybe_install_wrappers` called before `print_already_up_to_date()`).
+`is_guidance_current` returns true for `--no-guidance` and for an agent with no file in the scope, and false when the path policy refuses the file (so the writer runs and prints the note). Wrappers are handled INSIDE the fast-path block (`maybe_install_wrappers` called before `print_already_up_to_date()`). A relative global guidance path is refused at the top of `run_install_single`, before `detect_state` and before any hook write.
 
 ### ScriptIntegrity: Manifest, Not Script Text
 
@@ -218,6 +230,24 @@ The `proxy` subcommand is compiled out of default builds (default builds never l
 
 `PermissionsProtocol` is a format-agnostic trait. Seeded list is always `READ_ONLY_SUBCOMMANDS ∩ wrapper_targets()` — exactly 8 tools. `confirm_grant()` is TTY-gated; `--yes` is uninstall-only and does NOT bypass it. Three tiers: `Seed`, `Mirror`, `Blanket`.
 
+## Agent Guidance Files
+
+**Two layers, no overlap.** `guidance_path.rs` looks at paths only. `guidance_block.rs` is pure text (no file read, no print). `guidance.rs` does the file work. `guidance_report.rs` (doctor) and `targets.rs` (guidance-only agents) reuse them, so install, uninstall and doctor agree on which file is meant and what its block is.
+
+**Path policy (`KB-INV-4`).** `GuidanceScope` is `Global` or `Project { root }` (the current folder). Global: `require_absolute_global` runs first and calls `InstructionEnv::checked_override`, so a relative `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CRUSH_CONFIG_DIR`, `GEMINI_CONFIG_DIR` or `COPILOT_CONFIG_DIR` is refused by variable name; an empty value counts as unset. That refusal is `TargetRefusal::Stop` (an error). The deepest existing folder above a project file is canonicalized and must lie inside the root; a `..` step is refused outright because it could climb out in a part that does not exist yet. Those refusals are `TargetRefusal::Skip` (one `Note:` line, file untouched, command goes on). The folder check happens before the open, not at it: a folder swapped for a link after the check is followed.
+
+**Block format (`KB-INV-5`).** A block runs from `<!-- skim-start vX.Y.Z -->` to the first `<!-- skim-end -->` after it. `BlockStatus` is `Absent`, `Current`, `Stale { marker }` (another version, or a marker that is not `digits.digits.digits` with an optional ASCII tag, shown as unrecognized and cut), `Changed` (same version, different text: replaced with a "review the diff" note) or `Broken` (start without end: left alone, warned on stderr). A file skim owns (Cursor `.mdc`, every guidance-only file) starts with fixed frontmatter; a skim-shaped owned file (only frontmatter copies, one block, blank lines) is compared and rewritten whole, and deleted on removal. An owned file with other text gets only its block replaced, and an owned file with no markers is never filled in.
+
+**Hook text follows readers, not installs.** `hooks_for_file` gives the no-hook text (`GuidanceHooks::NoHook`) when any agent whose guidance file resolves to the same path has awareness-only support (Codex). So Codex and Crush share one `AGENTS.md` and never rewrite each other's block, whatever is installed.
+
+**Guidance-only agents (`targets.rs`).** The `TARGETS` table holds name, `root` (shows the agent is installed), rules `dir` and file `skim.md`, plus optional frontmatter (Kiro `inclusion: always`, Windsurf `trigger: always_on` under `.devin`). Paths come from the home folder only; no variable moves them. A target runs only for auto-detect `skim init` and `skim init --uninstall`: not under `--agent`, `--project` or `--no-guidance`. They run before the "no agents found" early returns, so a user with only one of them still gets the file. A failed write or removal prints a line, counts in `TargetsRun.failed`, and makes the exit code FAILURE; the next target still runs. A policy refusal is a note, not a failure.
+
+**Hookless uninstall.** When no hook registration or script exists for an agent in the scope, `uninstall_agent` goes to `uninstall_guidance_without_hook`: the same target policy and remover, and a shared file keeps its block (`KB-AP-7`). Without a block it prints "skim hook not found. Nothing to uninstall." A hook uninstall calls `remove_guidance` with the agents that still use the file; "still set up" is read from each agent's hook state, and a state that cannot be read counts as set up.
+
+**Doctor report (`KB-INV-8`).** `guidance_report` visits the global file of each agent, then each installed target, then the project file of each agent (when the current folder is readable). It keys files by the canonical path of the deepest existing ancestor, so two agents or two config folders that name one file give one fact with several readers. States: `Current`, `Stale`, `Changed`, `Broken`, `NotChecked(reason)` (leaves the project, not regular, too large, not UTF-8, unreadable, relative variable, relative home). The remedy names the scope and the first agent reader (`skim init --agent X`, or `--project --agent X` in the folder); a guidance-only reader has plain `skim init`.
+
+**Safe file layer.** `safe_fs.rs` is shared by init, doctor and `cmd/search`. `read_capped` stops one byte past the bound, so an endless reader costs a bounded read. The instruction file bound is `MAX_INSTRUCTION_FILE_SIZE`. `write_atomic` takes `Option<Permissions>`; `None` keeps the tempfile default, 0600 on unix. `atomic_write_stripped` (guidance) passes the existing file's mode, so a user file keeps its mode. `backup_config_file` opens the source without following a link, refuses a link, folder or other non-regular file at the backup name (checked before and after the copy), copies into a random 0600 temp file in the backup folder, syncs, then renames, so a failed copy leaves the old backup whole. `config_backup_name` gives each agent the backup name of its own config file (`hooks.json.bak` for Cursor, `crush.json.bak` for Crush).
+
 ## State Transitions
 
 ```
@@ -226,13 +256,15 @@ detect_state()
   └─ DetectedState::hook_is_current() = version && pinned format && commit
   └─ DetectedState::pin_is_current() = canonical binary path matches (advisory)
         │
-        ├─ all 6 fast-path conditions true:
+        ├─ every fast-path condition true:
         │    → maybe_install_wrappers (inside fast path, before early return)
         │    → print "Already up to date", return
-        └─ any false → create_hook_script()
+        └─ any false → execute_install():
+                  create_hook_script()
                   → atomic_write_executable() → write_hash_manifest (? propagated)
-                  → patch_settings() → inject_guidance()
+                  → patch_settings() (backup_config_file, then atomic_write_settings, mode 0600)
                   → [if --permissions] confirm_grant() → seed()
+                  → [unless --no-guidance] inject_guidance() → inject_into()
 ```
 
 ## Anti-Patterns
@@ -240,6 +272,14 @@ detect_state()
 **KB-AP-4 — printing another tool's hook command raw.** The command text comes from a settings file skim does not own. `sanitize_for_display` keeps printable ASCII, cuts at 64 characters and turns anything else into `?`; `ForeignPostHook::describe` applies it, and the collision warning for Pre hooks in `install.rs` applies it too. Tests `test_doctor_filters_a_foreign_hooks_command_text_before_printing_it` and `test_foreign_post_hook_describe_filters_control_bytes_and_newlines` pin it.
 
 **KB-AP-5 — a byte count or an analytics-off harness in the after-run checks.** A byte count rejects multi-byte output that is under the limit in characters, and so declines a call that should compress. The post-hook E2E harness (`cli_e2e_post_hook.rs`) clears the environment and keeps analytics on on purpose: the default `analytics.db` would land in the private cache dir, so the helper's "cache dir is empty" check covers it. Its pre-run test shows the same check can fail when something writes. Setting `SKIM_DISABLE_ANALYTICS` there would hide an analytics write from that check.
+
+**KB-AP-6 — printing a guidance path raw.** A path comes from the file system, and a name can hold escape bytes. `display_path` filters each part, so `test_project_guidance_path_display_filters_install_messages` and its uninstall, prompt, shared-note and global-target siblings in `cli_init.rs` pin every message. `PathRefusal`'s `Display` uses it too. A new message that names a guidance path needs the same call.
+
+**KB-AP-7 — removing a block that another agent reads.** The remover would take the guidance from the other agent. Sharing is decided on the resolved path (`guidance_file_key`), not on the file name, and the agent list is built from hook state. Pinned by `test_codex_uninstall_without_hook_keeps_guidance_while_crush_is_set_up`.
+
+**KB-AP-8 — a target row that can hide the user's own file.** A file the agent reads ahead of its other instruction files could shadow what the user wrote, so each row names a file that only skim owns (`skim.md`, in a rules folder). Skim creates the rules folder inside `root`, never `root`: no `root`, no write. `test_a_guidance_only_file_without_skim_markers_is_left_alone` pins that an owned file without markers is not filled in.
+
+**KB-AP-9 — a hand-rolled write or backup.** A fixed `.tmp` name is followed or replaced if an attacker or an earlier run left a link there; `fs::copy` and a later chmod leave a window with the wrong mode. Pinned by `write_atomic_uses_no_fixed_temporary_name`, `atomic_settings_write_leaves_a_fixed_temporary_file_untouched` and `a_link_at_the_backup_name_stops_the_backup_and_its_target_stays_unchanged`.
 
 **Calling `dispatch_inner()` directly on the wrapper surface.** It silently bypasses the D3 help/version passthrough, D4 tool skip flags, and D5 require-flag passthrough that `dispatch_for_wrapper()` applies. The wrapper entry point in `main.rs` is `dispatch_for_wrapper`.
 
@@ -272,6 +312,18 @@ detect_state()
 ## Gotchas
 
 **KB-INV-3 — what the foreign PostToolUse scan does not see.** Plugin hooks are not scanned, so "no note" means no competing hook in the settings files, not none at all. `init` shows only `found`; a file in `unreadable` is shown by doctor alone ("could not read ...; its PostToolUse hooks are not checked"). Skim's own entry can sit under any event key, so the skip is by `is_skim_entry`, not by event name. The Bash matcher test errs toward a warning: an invalid regex counts as a match, since a wrong answer costs one extra line. Doctor tests in `cli_doctor.rs` cover the local-settings file, the other scope, skim's own entry (no note), a matcher that cannot select Bash (no note) and text filtering.
+
+**KB-INV-4 — what the path policy does not check.** A global path has no folder check above the file; only a final link must end at a regular file. A link whose target is gone is refused as not regular. In project scope `CLAUDE.md -> AGENTS.md` keeps working (the link ends inside the root). Cursor has no global file: global install prints a note that names `skim init --agent cursor --project`, and a global uninstall never touches the legacy `.cursorrules` in the current folder.
+
+**KB-INV-5 — what counts as the same version.** `v3.0.1` and `v3.0.10` are two versions. A marker that is not a plain semver is `Unrecognized` and is replaced like a stale one. A `Changed` block is replaced, with a note to review the diff; the text around the block stays byte for byte, except for copies of skim frontmatter in front of the block in an owned file.
+
+**KB-INV-6 / KB-INV-7 — the hook script is the exception.** `atomic_write_executable` still writes the hook script through a fixed `skim-rewrite.sh.tmp` name with `fs::write`; only settings, guidance and backups use `safe_fs`. Reads skip with a warning on stderr (installer) or become `NotChecked` (doctor); the installer never fails on an unreadable instruction file.
+
+**KB-AP-6 — only guidance paths are filtered.** Messages for the hook script, settings file and hook registration still print `path.display()` unfiltered. Do not assume `display_path` covers all of init.
+
+**KB-INV-8 — doctor and the report.** A missing file and a file with no block give no fact, so "no skim guidance found" means no block, not no file. A path from `InstructionEnv` that is relative gives a `NotChecked` row that names the variable, not an error. Doctor tests for guidance: `test_doctor_lists_each_guidance_only_target_file`, `test_doctor_lists_the_guidance_file_of_an_agent_that_has_no_hook`.
+
+**Drift lines in `hook.log` name `skim init`.** `drift_log_entry` in `rewrite/hook.rs` builds the stamp kind and message for each drift in one place, and every remedy is `skim init` (it finds the installed agents), not a path to a build output.
 
 **`WRAPPER_TARGETS` is derived, not maintained.** Adding a tool to `KNOWN_SUBCOMMANDS` automatically adds it to wrapper_targets (if it is not in `META_SUBCOMMANDS`). The only routing key for the golangci linter is `golangci-lint`; the bare `golangci` alias is absent from `dispatch_inner`.
 
@@ -316,10 +368,19 @@ detect_state()
 - `crates/rskim/src/main.rs` — `wrapper_flag_zone` (empty) and `skim_flag_zone`; `plan_wrapper_path` / `demote_self_dirs` (wrapper-surface PATH order and the self-check; the scan stops at the first other executable `<tool>`), `enter_skim_level` (`SKIM_DEPTH`, `SKIM_WRAPPER_PARENT`, exit 126), `find_refusal_line` (the exact refusal line that the latch reads); `dispatch_for_wrapper` call site; `dispatch_explicit` call site; `stdout_should_serve_raw()` (`isatty(1)`, not `is_char_device()`); `force_raw_requested()`
 - `crates/rskim/src/cmd/integrity.rs` — `ScriptIntegrity` enum; `classify_script_integrity()`; `verify_script_integrity`; `compute_file_hash()`; `write_hash_manifest()`
 - `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch; `script_has_pinned_marker()`; `HookFacts`; `hook_facts()`
-- `crates/rskim/src/cmd/init/helpers.rs` — `resolve_skim_binary()` (single canonical path source); `confirm_grant()` (TTY-gated consent gate)
-- `crates/rskim/src/cmd/init/install.rs` — `run_install_single()` (fast path: 6 gates; wrappers inside fast path); `create_hook_script()`; `atomic_write_executable()`; `maybe_install_wrappers()`
+- `crates/rskim/src/cmd/init/helpers.rs` — `resolve_skim_binary()` (single canonical path source); `confirm_grant()` (TTY-gated consent gate); `atomic_write_settings()` (via `safe_fs::write_atomic`, mode 0600); `backup_config_file()`, `config_backup_name()`; `guidance_content()`, `render_file()`
+- `crates/rskim/src/cmd/init/install.rs` — `run_install_single()` (fast path; wrappers inside fast path; relative-guidance-path check first); `run_install_auto_detect()` (guidance-only targets before the early returns); `execute_install()`; `is_guidance_current()`; `create_hook_script()`; `atomic_write_executable()` (fixed `.tmp` name, not `safe_fs`); `patch_settings()`; `maybe_install_wrappers()`
+- `crates/rskim/src/cmd/init/uninstall.rs` — `run_uninstall_auto_detect()` (targets first); `uninstall_agent()`; `uninstall_guidance_without_hook()` (hookless path); `agents_still_using_guidance()`, `counts_as_set_up()` (fail toward keeping)
+- `crates/rskim/src/cmd/init/guidance.rs` — `GuidanceTarget`, `guidance_target()`, `TargetRefusal` (`Stop` / `Skip`); `inject_into()` (the one writer), `remove_from()` (the one remover), `read_instruction_text()`; `hooks_for_file()`, `agents_sharing_file()`, `kept_shared_note()`; `atomic_write_stripped()`; `MAX_INSTRUCTION_FILE_SIZE`
+- `crates/rskim/src/cmd/init/guidance_path.rs` — `GuidanceScope`, `resolve_guidance_path()`, `require_absolute_global()`, `check_global_target()`, `guidance_file_key()`; typed refusals `GlobalPathRefusal`, `PathRefusal`
+- `crates/rskim/src/cmd/init/guidance_block.rs` — `GuidanceFormat`, `block_status()` / `BlockStatus`, `Marker`, `find_skim_section()`, `splice()`, `strip_section()`, `skim_shaped()`; pure text
+- `crates/rskim/src/cmd/init/guidance_report.rs` — `guidance_report()`, `GuidanceFact`, `GuidanceState`, `NotChecked`, `Reader`; read-only, feeds doctor
+- `crates/rskim/src/cmd/init/targets.rs` — `TARGETS` table, `GuidanceOnlyAgent::resolve()`, `targets_apply()`, `install_targets()`, `remove_targets()`, `TargetsRun`
+- `crates/rskim/src/cmd/safe_fs.rs` — `open_no_follow()`, `read_regular_bounded()`, `read_capped()`, `BoundedFile::into_text()`, `write_atomic()`; shared with `cmd/search`
+- `crates/rskim/src/cmd/security.rs` — `display_path()` (path-safe printing), `sanitize_for_display()`
+- `crates/rskim/src/cmd/session/types.rs` — `AgentKind::instruction_file()`, `InstructionEnv` (`from_process`, `from_lookup`, `checked_override`), `RelativeOverride`; the config-folder variable names
 - `crates/rskim/src/cmd/init/state.rs` — `detect_state()`; `hook_is_current()`; `pin_is_current()`; `parse_version_from_script`; `scan_foreign_post_hooks()`, `ForeignPostHooks`, `ForeignPostHook::describe()` (both scopes plus `settings.local.json`; plugin hooks not scanned)
-- `crates/rskim/src/cmd/doctor/mod.rs` — `hook_status_line()` (manifest-first; "binary pin mismatch" terminal; uses `version_ok` to distinguish version vs. commit mismatch; commit check derived from `hook_is_current`); `print_hook_section()`; `foreign_post_hook_notes()` (advisory notes, no exit-code change, installed hook only)
+- `crates/rskim/src/cmd/doctor/mod.rs` — `hook_status_line()` (manifest-first; "binary pin mismatch" terminal; uses `version_ok` to distinguish version vs. commit mismatch; commit check derived from `hook_is_current`); `print_hook_section()`; `foreign_post_hook_notes()` (advisory notes, no exit-code change, installed hook only); `print_guidance_section()`, `guidance_lines()`, `guidance_remedy()` (Guidance section, notes only)
 - `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait
 - `crates/rskim/tests/common/mod.rs` — `skim_sandboxed_with_bin(home, bin)` (authoritative sandbox); `skim_sandboxed(home)` (delegates to above)
 - `crates/rskim/tests/cli_cross_surface_conformance.rs` — (tool × arg set) matrix across both surfaces; SKIM_CACHE_DIR per-test temp dir; pinned divergences
@@ -330,7 +391,9 @@ detect_state()
 - `crates/rskim/tests/cli_wrapper_path_loop.rs` — links and copies outside the wrappers folder: the real tool is reached once, a self-only `PATH` or a same-tool parent exits 126, the `SKIM_DEPTH` limit and the depth that a child inherits, a shim that runs `skim git` again starts git once per level, a tool that exits 126 for its own reason is no refusal; private `PATH`, `common::run_bounded`
 - `crates/rskim/tests/cli_npx_local_bin.rs` — `skim <tool> --via-npx` handler paths (argv, exit 127 when the bin is gone, raw npm failure) and the PreToolUse probe for the ten npx rules; stub `npx`, private `PATH`
 - `crates/rskim/tests/cli_wrapper_argv0.rs` — D5 tests with fake psql/mysql on PATH; env controls
-- `crates/rskim/tests/cli_doctor.rs` — `hermetic_path()`; `test_doctor_exits_0_on_binary_pin_mismatch` (copy-binary technique; exit 0 because pin mismatch is advisory, not drift)
+- `crates/rskim/tests/cli_doctor.rs` — `hermetic_path()`; `test_doctor_exits_0_on_binary_pin_mismatch` (copy-binary technique; exit 0 because pin mismatch is advisory, not drift); guidance tests such as `test_doctor_guidance_notes_change_neither_the_exit_code_nor_any_other_section`
+- `crates/rskim/tests/cli_init.rs` — guidance path-display, hookless uninstall (`test_codex_uninstall_without_hook_keeps_guidance_while_crush_is_set_up`), shared project link and guidance-only agent tests (`test_init_skips_the_guidance_only_agents_under_agent_project_and_no_guidance`)
+- `crates/rskim/tests/cli_init_guidance_env.rs` — relative config-folder variable stops install and uninstall before any write; empty variable counts as unset
 
 ## Related
 
