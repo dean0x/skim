@@ -294,18 +294,10 @@ fn the_name_links_add_no_parse_and_no_read() {
     tree.write("b.rs", "fn lockRead() {}\n");
     let query = words(&["lock", "none"]);
     let on = scan(&tree, &query, Limits::default(), 0);
-    let off = scan(
-        &tree,
-        &query,
-        Limits {
-            max_called_names_per_file: 0,
-            max_word_defs_per_file: 0,
-            ..Limits::default()
-        },
-        0,
-    );
+    let off = scan(&tree, &pattern("lock", false), Limits::default(), 0);
     assert!(!file(&on, "a.ts").links.called.is_empty());
     assert!(!file(&on, "b.rs").links.defs.is_empty());
+    assert!(off.files.iter().all(|f| f.links == NameLinks::default()));
     assert_eq!(on.cost, off.cost);
     assert_eq!(on.parse, off.parse);
     assert_eq!(on.cost.files_read, 2);
@@ -394,6 +386,45 @@ fn a_self_call_goes_to_the_one_method_and_a_plain_call_with_an_import_stays_not_
     );
     let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
     assert_eq!(assignments(file(&out, "a.rs")), [(3, None)]);
+}
+
+#[test]
+fn a_typescript_this_call_goes_to_the_method_and_a_plain_call_stays_not_split() {
+    let tree = Tree::new();
+    tree.write(
+        "a.ts",
+        "class T {\n ping() {}\n run() {\n  this.ping();\n  ping();\n }\n}\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.ts");
+    assert_eq!(assignments(f), [(4, Some(2)), (5, None)]);
+    assert_eq!(f.assigned_calls, 1);
+}
+
+#[test]
+fn a_javascript_this_call_goes_to_the_method_and_a_plain_call_stays_not_split() {
+    let tree = Tree::new();
+    tree.write(
+        "a.js",
+        "class T {\n ping() {}\n run() {\n  this.ping();\n  ping();\n }\n}\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.js");
+    assert_eq!(assignments(f), [(4, Some(2)), (5, None)]);
+    assert_eq!(f.assigned_calls, 1);
+}
+
+#[test]
+fn a_python_self_call_goes_to_the_method_and_a_plain_call_stays_not_split() {
+    let tree = Tree::new();
+    tree.write(
+        "a.py",
+        "class T:\n def ping(self): pass\n def run(self):\n  self.ping()\n  ping()\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.py");
+    assert_eq!(assignments(f), [(4, Some(2)), (5, None)]);
+    assert_eq!(f.assigned_calls, 1);
 }
 
 #[test]

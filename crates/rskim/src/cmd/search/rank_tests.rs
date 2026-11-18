@@ -400,6 +400,20 @@ fn the_word_score_never_increases_down_the_list_and_follows_its_formula() {
 }
 
 #[test]
+fn a_name_hit_has_a_fixed_word_score() {
+    let ranked = rank_words(&[WordInput {
+        name_hit: true,
+        ..word_input(Path::new("tests/alpha.rs"), FilePrior::Test, &[1, 3, 0])
+    }]);
+
+    assert!(
+        (ranked[0].score - 2_702.079_441_541_68).abs() < 1e-9,
+        "{}",
+        ranked[0].score
+    );
+}
+
+#[test]
 fn files_holding_all_the_words_are_counted() {
     let paths: Vec<PathBuf> = ["a", "b", "c"].iter().map(PathBuf::from).collect();
     let counts = [[1u32, 2], [0, 4], [3, 3]];

@@ -330,12 +330,22 @@ fn the_method_test_reads_impl_trait_class_and_method_kinds() {
         (Language::Rust, "rs", "trait T { fn ping(&self); }", true),
         (Language::Rust, "rs", "mod t { fn ping() {} }", false),
         (Language::TypeScript, "ts", "class T { ping() {} }", true),
+        (Language::TypeScript, "ts", "function ping() {}", false),
         (Language::JavaScript, "js", "class T { ping() {} }", true),
+        (Language::JavaScript, "js", "function ping() {}", false),
         (
             Language::Python,
             "py",
             "class T:\n def ping(self): pass\n",
             true,
+        ),
+        (Language::Python, "py", "def ping(): pass", false),
+        // A function scope gives a nested declaration no class container.
+        (
+            Language::Python,
+            "py",
+            "def outer():\n def ping(): pass\n",
+            false,
         ),
         (Language::Go, "go", "package p\nfunc (t T) ping() {}", true),
         (Language::Go, "go", "package p\nfunc ping() {}", false),
