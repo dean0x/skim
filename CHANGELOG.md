@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Uninstall keeps shared guidance while another configured agent still uses it.
 - `skim init --uninstall` removes skim guidance even when no skim hook is installed in that scope.
 - Agent config backups use the config file name plus `.bak`, such as `hooks.json.bak` and `crush.json.bak`.
+- `skim search` exits 2 when a word query (several words in one argument) has `-C`, `--all` or `--full`. Before, these flags had no effect on the word view. With `-F` or `-E`, the flags apply as before.
 
 ### Added
 
