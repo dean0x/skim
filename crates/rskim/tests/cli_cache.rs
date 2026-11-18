@@ -718,6 +718,94 @@ fn replace_stored_lines(home: &TempDir, cold: &Streams, stored: &str) {
 }
 
 #[test]
+fn default_and_typed_structure_keep_separate_cache_entries_in_both_orders() {
+    let default = ["two.rs"].as_slice();
+    let explicit = ["two.rs", "--mode", "structure"].as_slice();
+    for order in [[default, explicit], [explicit, default]] {
+        let home = symbol_home("two.rs", TWO_FUNCTIONS);
+        let first = read_ok(&home, order[0]);
+        replace_stored_lines(&home, &first, "first entry\n");
+        let second = read_ok(&home, order[1]);
+        assert_eq!(second, first, "the second key must miss the first entry");
+        replace_stored_lines(&home, &second, "second entry\n");
+        assert_eq!(cache_entries(&home).len(), 2);
+        for (args, expected, cold) in [
+            (order[0], "first entry\n", &first),
+            (order[1], "second entry\n", &second),
+        ] {
+            let warm = read_ok(&home, args);
+            assert_eq!(warm.stdout, expected);
+            assert_eq!(warm.stderr, cold.stderr);
+        }
+        let entries: Vec<serde_json::Value> = cache_entries(&home)
+            .iter()
+            .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry["bound"] == "NotFired")
+                .count(),
+            1
+        );
+        assert!(entries.iter().all(|entry| entry.get("notice").is_none()));
+    }
+}
+
+#[test]
+fn budgeted_entries_with_missing_or_invalid_bound_state_run_cold() {
+    let home = symbol_home("two.rs", TWO_FUNCTIONS);
+    let cold = read_ok(&home, &["two.rs"]);
+    let valid = serde_json::json!({"Fired": {
+        "served_mode": "signatures", "default_view_chars": 34001, "cut": false,
+    }});
+    for (state, effective_mode) in [
+        (None, Some("signatures")),
+        (
+            Some(serde_json::json!({"Fired": {
+                "served_mode": "invalid", "default_view_chars": 34001, "cut": false,
+            }})),
+            Some("signatures"),
+        ),
+        (Some(valid.clone()), Some("invalid")),
+        (Some(valid.clone()), Some("types")),
+        (Some(valid), None),
+    ] {
+        edit_entry_of(&home, &cold, |entry| {
+            entry["content"] = serde_json::json!("must not serve this entry\n");
+            entry.as_object_mut().unwrap().remove("bound");
+            entry.as_object_mut().unwrap().remove("effective_mode");
+            if let Some(state) = state {
+                entry["bound"] = state;
+            }
+            if let Some(mode) = effective_mode {
+                entry["effective_mode"] = serde_json::json!(mode);
+            }
+        });
+        assert_eq!(read_ok(&home, &["two.rs"]), cold);
+    }
+}
+
+#[test]
+fn budgeted_warm_read_rebuilds_one_direct_notice_from_the_served_state() {
+    let home = symbol_home("two.rs", TWO_FUNCTIONS);
+    let cold = read_ok(&home, &["two.rs"]);
+    edit_entry_of(&home, &cold, |entry| {
+        entry["content"] = serde_json::json!("stored cut\n");
+        entry["effective_mode"] = serde_json::json!("Full");
+        entry["bound"] = serde_json::json!({"Fired": {
+            "served_mode": "full", "default_view_chars": 52000, "cut": true,
+        }});
+    });
+    let warm = read_ok(&home, &["two.rs"]);
+    assert_eq!(warm.stdout, "stored cut\n");
+    assert_eq!(
+        warm.stderr,
+        "[skim] full view: lines outside range omitted; the default view has 52000 characters, over the 29000 character output limit; this view is cut to the limit, and the last stdout line counts the hidden lines; use --symbol NAME or --max-lines N for more, or SKIM_PASSTHROUGH=1 for full output\n"
+    );
+}
+
+#[test]
 fn a_full_read_and_two_symbol_reads_of_one_file_keep_three_different_cached_outputs() {
     // TP-41
     let home = symbol_home("two.rs", TWO_FUNCTIONS);

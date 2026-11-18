@@ -31,7 +31,7 @@ pub(crate) struct ProcessOptions {
     pub(crate) use_cache: bool,
     /// Whether to compute token statistics (for --show-stats)
     pub(crate) show_stats: bool,
-    /// Truncation options (max_lines, last_lines, token_budget)
+    /// Line, token and default-character limits
     pub(crate) trunc: TruncationOptions,
     /// Whether to annotate output with source line numbers (`--line-numbers` / `-n`)
     pub(crate) line_numbers: bool,
@@ -98,6 +98,8 @@ pub(crate) struct ProcessResult {
     /// marker layer to emit a stderr notice on hook-rewritten file reads.
     /// Always `false` when the origin env var is absent (non-hook invocations).
     pub(crate) view_differs: bool,
+    /// Served outcome when the default character bound changes or cuts the view.
+    pub(crate) bound: Option<crate::output::BoundNotice>,
 }
 
 /// Which view the ADR-001 guard served, from its own verdict.
@@ -222,7 +224,7 @@ pub(crate) fn write_result_and_stats(
     // terminator is part of the measured line). `record_file_analytics` calls
     // the same constructor with the same inputs, so the cost it stores is the
     // cost this line put on the wire rather than a second estimate of it.
-    if let Some(notice) = single_file_notice(mode_str, result.view_differs) {
+    if let Some(notice) = single_file_notice(mode_str, result.view_differs, result.bound) {
         eprint!("{}", notice.line());
     }
 
@@ -233,13 +235,18 @@ pub(crate) fn write_result_and_stats(
 ///
 /// The single constructor for that line, shared by the site that PRINTS it
 /// ([`write_result_and_stats`]) and the site that CHARGES it
-/// (`main::record_file_analytics`). Both pass the same three inputs — process
-/// environment, mode spelling, and whether the view differed — so the two
-/// cannot disagree without this function being wrong for both.
+/// (`main::record_file_analytics`). Both pass the same served bound outcome,
+/// requested mode spelling and byte-difference flag. A bound outcome replaces
+/// the legacy disclosure, never adds a second line. Without one, the legacy
+/// constructor keeps its exact text and process-environment rules.
 pub(crate) fn single_file_notice(
     mode_str: &str,
     view_differs: bool,
+    bound: Option<crate::output::BoundNotice>,
 ) -> Option<crate::output::EmittedNotice> {
+    if let Some(bound) = bound {
+        return Some(crate::output::bounded_view_marker(bound));
+    }
     crate::output::emitted_notice_cost(
         crate::output::rewrite_origin().as_deref(),
         mode_str,
@@ -269,13 +276,11 @@ pub(crate) fn single_file_notice(
 ///
 /// # Built once, threaded down
 ///
-/// Built ONCE per read, at the top of [`process_file`] / [`process_stdin`],
-/// and threaded down from there. Three sites need this value — the cache READ
-/// key, the ADR-001 guard charge, and the cache WRITE key — and they must
-/// agree on it: a read key and a write key that disagree do not error, they
-/// serve another invocation's stdout (see [`crate::cache::CacheKeyParams`]).
-/// One value threaded down makes that agreement structural; three derivations
-/// made it a coincidence of three identical expressions.
+/// Built once before the transform in [`process_file`] / [`process_stdin`].
+/// The cache read key, guard charge and cache write key share this value.
+/// The requested mode, character budget and this prospective notice size form
+/// the pre-transform identity. A served bound outcome belongs in the entry
+/// body only: it is not known when the read key is built.
 fn view_notice_absolute(options: &ProcessOptions) -> Option<String> {
     // Ordered so the batch hot path returns before reading the environment.
     // Do not hoist `rewrite_origin` above this check: it scans `environ`, and
@@ -352,14 +357,14 @@ fn prospective_view_notice<'a>(
 /// can never produce a collision. Using the absolute length can at worst split
 /// one output across two keys — extra work, never wrong bytes.
 ///
-/// Keying on LENGTH rather than on the text covers origin, batch-ness and mode
-/// in one field, and makes a future label edit self-invalidating: change the
-/// marker wording and every warm entry whose verdict could move misses.
+/// This length describes the prospective legacy notice, not a bound outcome.
+/// It covers origin, batch state and requested mode before the transform.
+/// The separate character-budget key distinguishes default reads from typed
+/// modes. A fired bound stores typed state, not notice text, so warm reads
+/// rebuild the same disclosure through [`single_file_notice`].
 ///
 /// Measures the marker [`view_notice_absolute`] already built for this read.
-/// The cache READ key, the guard charge and the cache WRITE key are then the
-/// same number because they are the same value — not because three call sites
-/// happen to rebuild it identically.
+/// The read key, guard charge and write key share this exact value.
 fn view_notice_cache_bytes(absolute: Option<&str>) -> usize {
     absolute.map_or(0, str::len)
 }
@@ -464,6 +469,7 @@ fn try_cached_result(
         language: cache_lang,
         stdin_raw: None,
         view_differs,
+        bound: hit.bound,
     }))
 }
 
@@ -924,6 +930,7 @@ fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> Process
         language: None,
         stdin_raw,
         view_differs: false, // passthrough output is byte-identical to input
+        bound: None,
     }
 }
 
@@ -1160,6 +1167,7 @@ pub(crate) fn process_stdin(
         language: Some(language),
         stdin_raw,
         view_differs,
+        bound: None,
     })
 }
 
@@ -1346,6 +1354,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             // cache-hit path does not have to re-derive it from the mode.
             view_differs,
             notice: None,
+            bound: None,
         });
     }
 
@@ -1361,6 +1370,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         language,
         stdin_raw: None,
         view_differs,
+        bound: None,
     })
 }
 
@@ -1446,6 +1456,7 @@ pub(crate) fn process_symbol_file(
             parse_tier: None,
             view_differs: true,
             notice: Some(&selected.notice),
+            bound: None,
         });
     }
 
@@ -1557,6 +1568,89 @@ pub(crate) fn read_source(path: &std::path::Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_notice_replaces_the_legacy_notice_even_for_a_raw_cut() {
+        let bound = crate::output::BoundNotice {
+            mode: Mode::Full,
+            default_view_chars: 52000,
+            cut: true,
+            shape: crate::output::BoundShape::Stdin,
+        };
+        for differs in [false, true] {
+            assert_eq!(
+                single_file_notice("structure", differs, Some(bound)),
+                Some(crate::output::bounded_view_marker(bound)),
+            );
+        }
+    }
+
+    #[test]
+    fn cached_result_rebuilds_the_cold_bound_notice_from_typed_state() {
+        let source = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
+        fs::write(source.path(), "fn original() {}\n").unwrap();
+        let options = ProcessOptions {
+            use_cache: true,
+            trunc: TruncationOptions {
+                char_budget: Some(crate::output::MAX_STDOUT_CHARS),
+                ..Default::default()
+            },
+            ..notice_opts(Mode::Structure, TruncationOptions::default(), false)
+        };
+        for (mode, cut) in [(Mode::Signatures, false), (Mode::Full, true)] {
+            let bound = crate::output::BoundNotice {
+                mode,
+                default_view_chars: 52000,
+                cut,
+                shape: crate::output::BoundShape::File,
+            };
+            cache::write_cache(&cache::CacheWriteParams {
+                key: cache::CacheKeyParams {
+                    path: source.path(),
+                    mode: options.mode,
+                    trunc: options.trunc,
+                    line_numbers: false,
+                    notice_bytes: 0,
+                    symbol: None,
+                },
+                content: "served output\n",
+                original_tokens: None,
+                transformed_tokens: None,
+                effective_mode: None,
+                parse_tier: None,
+                view_differs: true,
+                notice: None,
+                bound: Some(bound),
+            })
+            .unwrap();
+            let warm = try_cached_result(source.path(), &options, 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(warm.output, "served output\n");
+            assert_eq!(warm.bound, Some(bound));
+            assert_eq!(
+                single_file_notice("structure", warm.view_differs, warm.bound),
+                single_file_notice("structure", true, Some(bound)),
+            );
+        }
+    }
+
+    #[test]
+    fn no_bound_keeps_the_exact_legacy_notice_and_silent_raw_path() {
+        for mode in ["structure", "pseudo", "full"] {
+            for differs in [false, true] {
+                assert_eq!(
+                    single_file_notice(mode, differs, None),
+                    crate::output::emitted_notice_cost(
+                        crate::output::rewrite_origin().as_deref(),
+                        mode,
+                        usize::from(differs),
+                        1,
+                    ),
+                );
+            }
+        }
+    }
 
     #[test]
     fn cut_line_map_keeps_only_the_common_prefix_and_leaves_the_marker_unnumbered() {

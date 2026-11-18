@@ -1654,6 +1654,31 @@ fn main() -> ExitCode {
     exit_code
 }
 
+/// Build input options from clap's explicit-mode state, not the default mode value.
+/// Batch reads and every typed view selection keep their existing unbounded behavior.
+fn file_process_options(args: &Args, mode_given: bool, batch: bool) -> process::ProcessOptions {
+    process::ProcessOptions {
+        mode: Mode::from(args.mode),
+        explicit_lang: args.language.map(Language::from),
+        use_cache: !args.no_cache,
+        show_stats: args.show_stats,
+        trunc: cascade::TruncationOptions {
+            max_lines: args.max_lines,
+            last_lines: args.last_lines,
+            token_budget: args.tokens,
+            char_budget: (!batch
+                && !mode_given
+                && args.max_lines.is_none()
+                && args.last_lines.is_none()
+                && args.tokens.is_none()
+                && args.symbol.is_none())
+            .then_some(output::MAX_STDOUT_CHARS),
+        },
+        line_numbers: args.line_numbers,
+        batch,
+    }
+}
+
 /// File/directory/glob/stdin processing pipeline.
 ///
 /// Parses CLI args via clap, validates constraints, then routes to
@@ -1689,29 +1714,10 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
     }
     validate_symbol_args(&args, mode_given)?;
 
-    let process_options = process::ProcessOptions {
-        mode: Mode::from(args.mode),
-        explicit_lang: args.language.map(Language::from),
-        use_cache: !args.no_cache,
-        show_stats: args.show_stats,
-        trunc: cascade::TruncationOptions {
-            max_lines: args.max_lines,
-            last_lines: args.last_lines,
-            token_budget: args.tokens,
-        },
-        line_numbers: args.line_numbers,
-        // Single-input default. The multi-file shapes below opt in, because
-        // `multi.rs` emits ONE aggregate lossy-view marker per run rather than
-        // one per file (ADR-001 amendment: the guard charges the disclosure a
-        // file's own verdict causes, and in a batch that is none).
-        batch: false,
-    };
+    let process_options = file_process_options(&args, mode_given, false);
 
     let multi_options = multi::MultiFileOptions {
-        process: process::ProcessOptions {
-            batch: true,
-            ..process_options
-        },
+        process: file_process_options(&args, mode_given, true),
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,
@@ -1920,7 +1926,7 @@ fn run_symbol_read(
 ///
 /// The disclosure charged here is rebuilt by `process::single_file_notice` —
 /// the same constructor `write_result_and_stats` just used to PRINT it, from
-/// the same mode spelling and the same `view_differs` — so the recorded cost is
+/// the same mode spelling, `view_differs` and bound outcome, so the recorded cost is
 /// the emitted cost by construction. It is not re-derived from a per-mode table
 /// or re-estimated from the mode name; those agree until the marker text
 /// changes and then disagree silently.
@@ -1939,7 +1945,7 @@ fn record_file_analytics(
     file_path: Option<PathBuf>,
 ) {
     // Read before `result` is partially moved below.
-    let notice = process::single_file_notice(&mode_str, result.view_differs);
+    let notice = process::single_file_notice(&mode_str, result.view_differs, result.bound);
     let served = result.served;
 
     // Determine counts variant: Known when both token counts are already computed
@@ -2244,6 +2250,37 @@ mod tests {
 
     fn symbol_args(argv: &[&str]) -> Args {
         Args::try_parse_from(std::iter::once("skim").chain(argv.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn default_character_budget_applies_only_to_default_single_inputs() {
+        use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
+        let cases: &[(&[&str], Option<usize>)] = &[
+            (&["a.rs"], Some(output::MAX_STDOUT_CHARS)),
+            (
+                &["-", "-n", "--language", "rust"],
+                Some(output::MAX_STDOUT_CHARS),
+            ),
+            (&["a.rs", "--show-stats"], Some(output::MAX_STDOUT_CHARS)),
+            (&["a.rs", "--mode", "structure"], None),
+            (&["a.rs", "--mode=full"], None),
+            (&["a.rs", "--max-lines", "10"], None),
+            (&["a.rs", "--last-lines", "10"], None),
+            (&["a.rs", "--tokens", "10"], None),
+            (&["a.rs", "--symbol", "a"], None),
+        ];
+        for (argv, expected) in cases {
+            let matches = Args::command()
+                .try_get_matches_from(std::iter::once("skim").chain(argv.iter().copied()))
+                .unwrap();
+            let args = Args::from_arg_matches(&matches).unwrap();
+            let mode_given = matches.value_source("mode") == Some(ValueSource::CommandLine);
+            let single = file_process_options(&args, mode_given, false);
+            assert_eq!(single.trunc.char_budget, *expected, "{argv:?}");
+            let multi = file_process_options(&args, mode_given, true);
+            assert_eq!(multi.trunc.char_budget, None, "batch {argv:?}");
+            assert!(multi.batch);
+        }
     }
 
     #[test]

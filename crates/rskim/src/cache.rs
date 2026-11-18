@@ -96,6 +96,18 @@ pub(crate) fn cache_root() -> Option<PathBuf> {
     cache_root_from(read_cache_dir_env())
 }
 
+/// Stored state distinguishes an unchanged default view from an absent result.
+/// The served name stays text on disk and must pass `Mode::parse` on a read.
+#[derive(Debug, Serialize, Deserialize)]
+enum BoundState {
+    NotFired,
+    Fired {
+        served_mode: String,
+        default_view_chars: usize,
+        cut: bool,
+    },
+}
+
 /// Cache entry with metadata for validation.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
@@ -113,10 +125,8 @@ struct CacheEntry {
     /// Transformed token count (optional for backward compatibility).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transformed_tokens: Option<usize>,
-    /// Diagnostic metadata: records the effective mode when cascade selected a
-    /// different mode than the one requested.  Written for post-hoc inspection
-    /// of cache entries (e.g. `jq .effective_mode ~/.cache/skim/*.json`) but
-    /// intentionally not returned by [`read_cache`].
+    /// Served mode after a cascade. A fired bound requires this to agree with
+    /// its stored mode. Reads validate both names before they rebuild the notice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effective_mode: Option<String>,
     /// Parse quality tier at transform time: "full", "degraded", or "passthrough".
@@ -142,6 +152,9 @@ struct CacheEntry {
     /// this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notice: Option<String>,
+    /// Required for a budgeted entry, including a bound that did not fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound: Option<BoundState>,
 }
 
 /// Data returned on a successful cache lookup.
@@ -160,6 +173,8 @@ pub(crate) struct CacheHit {
     pub(crate) view_differs: Option<bool>,
     /// The stderr notice stored with the entry (see [`CacheWriteParams::notice`]).
     pub(crate) notice: Option<String>,
+    /// Parsed served outcome for a fired character bound. Never cached prose.
+    pub(crate) bound: Option<crate::output::BoundNotice>,
 }
 
 /// Everything that identifies a cache entry.
@@ -185,7 +200,7 @@ pub(crate) struct CacheKeyParams<'a> {
     pub(crate) path: &'a Path,
     /// Transformation mode.
     pub(crate) mode: Mode,
-    /// Truncation options (max_lines, last_lines, token_budget).
+    /// Line, token and default-character limits. Only requested inputs form the key.
     pub(crate) trunc: TruncationOptions,
     /// Whether line numbers were applied.
     ///
@@ -217,7 +232,7 @@ pub(crate) struct CacheWriteParams<'a> {
     pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if computed).
     pub(crate) transformed_tokens: Option<usize>,
-    /// Effective mode after cascade (diagnostic metadata only).
+    /// Effective mode after cascade. A fired bound supplies its served mode.
     pub(crate) effective_mode: Option<Mode>,
     /// Parse quality tier: "full", "degraded", or "passthrough" (diagnostic metadata).
     pub(crate) parse_tier: Option<String>,
@@ -232,6 +247,8 @@ pub(crate) struct CacheWriteParams<'a> {
     /// A cache hit skips the work that built the notice, so a read whose notice
     /// is unconditional must store it or lose it on the second run.
     pub(crate) notice: Option<&'a str>,
+    /// Served outcome of the default bound; `None` stores `NotFired` when budgeted.
+    pub(crate) bound: Option<crate::output::BoundNotice>,
 }
 
 /// Returns the skim cache directory, creating it with owner-only permissions if it does not
@@ -302,6 +319,10 @@ const CACHE_SCHEMA_VERSION: u32 = 4;
 /// collapses origin, batch-ness and mode into one field, and it makes a future
 /// marker-wording edit self-invalidating.
 ///
+/// `char_budget` has a tagged suffix when present. Default and typed-mode
+/// reads cannot share an entry. Unbudgeted inputs keep their existing hashes.
+/// The served mode and bound state belong in the body, never in this identity.
+///
 /// `symbol` is included because a `--symbol` read prints other lines than the
 /// whole file and than every other name. It is length-prefixed and placed
 /// before the path, so no name can be read as part of another input.
@@ -334,8 +355,14 @@ fn cache_key(p: &CacheKeyParams<'_>, mtime: SystemTime) -> Result<String> {
     // Bound out because inline format args take an identifier, not a field
     // access.
     let mode = p.mode;
+    // The tagged suffix names the budget without changing unbudgeted keys,
+    // including the length-prefixed symbol family.
+    let char_budget = p
+        .trunc
+        .char_budget
+        .map_or_else(String::new, |n| format!("|char_budget:{n}"));
     let hash_input = format!(
-        "cache_schema_v{}|{}{}|{}|{:?}|{}|{}|{}|{}|{}",
+        "cache_schema_v{}|{}{}|{}|{:?}|{}|{}|{}|{}|{}{char_budget}",
         CACHE_SCHEMA_VERSION,
         symbol_part,
         canonical_path.display(),
@@ -366,6 +393,35 @@ pub(crate) fn read_cache(p: &CacheKeyParams<'_>) -> Option<CacheHit> {
 
     let cache_content = fs::read_to_string(&cache_file).ok()?;
     let entry: CacheEntry = serde_json::from_str(&cache_content).ok()?;
+    // A partial budgeted entry cannot reproduce the cold disclosure. Miss
+    // rather than serve bytes without their bound state or a valid mode.
+    let bound = if p.trunc.char_budget.is_some() {
+        let effective_mode = match entry.effective_mode.as_deref() {
+            Some(name) => Some(Mode::parse(name)?),
+            None => None,
+        };
+        match entry.bound? {
+            BoundState::NotFired => None,
+            BoundState::Fired {
+                served_mode,
+                default_view_chars,
+                cut,
+            } => {
+                let mode = Mode::parse(&served_mode)?;
+                if effective_mode != Some(mode) {
+                    return None;
+                }
+                Some(crate::output::BoundNotice {
+                    mode,
+                    default_view_chars,
+                    cut,
+                    shape: crate::output::BoundShape::File,
+                })
+            }
+        }
+    } else {
+        None
+    };
 
     // Belt-and-suspenders validation: verify mtime/mode match even though
     // they are already encoded in the cache key hash (guards against collisions).
@@ -380,6 +436,7 @@ pub(crate) fn read_cache(p: &CacheKeyParams<'_>) -> Option<CacheHit> {
             transformed_tokens: entry.transformed_tokens,
             view_differs: entry.view_differs,
             notice: entry.notice,
+            bound,
         })
     } else {
         // Stale entry: best-effort cleanup.
@@ -407,10 +464,23 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
         content: params.content.to_string(),
         original_tokens: params.original_tokens,
         transformed_tokens: params.transformed_tokens,
-        effective_mode: params.effective_mode.map(|m| format!("{m:?}")),
+        effective_mode: params
+            .bound
+            .map(|b| b.mode)
+            .or(params.effective_mode)
+            .map(|m| format!("{m:?}")),
         parse_tier: params.parse_tier.clone(),
         view_differs: Some(params.view_differs),
         notice: params.notice.map(str::to_string),
+        bound: params.key.trunc.char_budget.map(|_| {
+            params
+                .bound
+                .map_or(BoundState::NotFired, |bound| BoundState::Fired {
+                    served_mode: bound.mode.name().to_string(),
+                    default_view_chars: bound.default_view_chars,
+                    cut: bound.cut,
+                })
+        }),
     };
 
     let json = serde_json::to_string(&entry)?;
@@ -684,6 +754,30 @@ mod tests {
     }
 
     #[test]
+    fn character_budget_separates_default_explicit_and_different_limits() {
+        let source = NamedTempFile::new().unwrap();
+        let path = source.path();
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        let key = |char_budget| {
+            cache_key(
+                &key_params(
+                    path,
+                    Mode::Structure,
+                    TruncationOptions {
+                        char_budget,
+                        ..Default::default()
+                    },
+                ),
+                mtime,
+            )
+            .unwrap()
+        };
+        assert_ne!(key(Some(29000)), key(None));
+        assert_ne!(key(Some(29000)), key(Some(28000)));
+        assert_eq!(key(Some(29000)), key(Some(29000)));
+    }
+
+    #[test]
     fn test_cache_read_write() {
         let mut temp_file = NamedTempFile::new().unwrap();
         write!(temp_file, "test content").unwrap();
@@ -704,6 +798,7 @@ mod tests {
             parse_tier: None,
             view_differs: false,
             notice: None,
+            bound: None,
         })
         .unwrap();
 
@@ -762,6 +857,7 @@ mod tests {
             parse_tier: None,
             view_differs: false,
             notice: None,
+            bound: None,
         })
         .unwrap();
 
@@ -787,6 +883,55 @@ mod tests {
     }
 
     #[test]
+    fn budgeted_cache_rejects_missing_bound_state_and_invalid_served_modes() {
+        let source = NamedTempFile::new().unwrap();
+        let path = source.path();
+        let trunc = TruncationOptions {
+            char_budget: Some(crate::output::MAX_STDOUT_CHARS),
+            ..Default::default()
+        };
+        let key = || key_params(path, Mode::Structure, trunc);
+        write_cache(&CacheWriteParams {
+            key: key(),
+            content: "bounded output",
+            original_tokens: None,
+            transformed_tokens: None,
+            effective_mode: Some(Mode::Signatures),
+            parse_tier: None,
+            view_differs: true,
+            notice: None,
+            bound: None,
+        })
+        .unwrap();
+        let hash = cache_key(&key(), fs::metadata(path).unwrap().modified().unwrap()).unwrap();
+        let entry_path = get_cache_dir().unwrap().join(format!("{hash}.json"));
+        let mut entry: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&entry_path).unwrap()).unwrap();
+        entry.as_object_mut().unwrap().remove("bound");
+        fs::write(&entry_path, serde_json::to_vec(&entry).unwrap()).unwrap();
+        assert!(
+            read_cache(&key()).is_none(),
+            "a bound with no stored state must miss"
+        );
+
+        entry["bound"] = serde_json::json!({"Fired": {
+            "served_mode": "signatures", "default_view_chars": 34001, "cut": false,
+        }});
+        fs::write(&entry_path, serde_json::to_vec(&entry).unwrap()).unwrap();
+        assert!(read_cache(&key()).is_some(), "valid stored state must hit");
+        for field in ["served_mode", "effective_mode"] {
+            let mut invalid = entry.clone();
+            if field == "served_mode" {
+                invalid["bound"]["Fired"][field] = serde_json::json!("not-a-mode");
+            } else {
+                invalid[field] = serde_json::json!("not-a-mode");
+            }
+            fs::write(&entry_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(read_cache(&key()).is_none(), "invalid {field} must miss");
+        }
+    }
+
+    #[test]
     fn test_cache_stores_effective_mode() {
         let mut temp_file = NamedTempFile::new().unwrap();
         write!(temp_file, "effective mode test content").unwrap();
@@ -807,6 +952,7 @@ mod tests {
             parse_tier: None,
             view_differs: true,
             notice: None,
+            bound: None,
         })
         .unwrap();
 
@@ -856,6 +1002,7 @@ mod tests {
             parse_tier: None,
             view_differs: false,
             notice: None,
+            bound: None,
         })
         .unwrap();
         let hit = read_cache(&key_params(&path, Mode::Structure, default_trunc)).unwrap();
@@ -1036,6 +1183,7 @@ mod tests {
             parse_tier: None,
             view_differs: true,
             notice: Some("[skim] --symbol \"a\": lines 1-1 of 2 shown"),
+            bound: None,
         });
         let plain_written = write_cache(&CacheWriteParams {
             key: for_symbol(None),
@@ -1046,6 +1194,7 @@ mod tests {
             parse_tier: None,
             view_differs: false,
             notice: None,
+            bound: None,
         });
         let hit_a = read_cache(&for_symbol(Some("a")));
         let hit_b = read_cache(&for_symbol(Some("b")));
@@ -1150,6 +1299,7 @@ mod tests {
                         max_lines: Some(50),
                         last_lines: None,
                         token_budget: Some(500),
+                        char_budget: None,
                     },
                 )
             },

@@ -11,7 +11,7 @@ use rskim_core::{Language, Mode, TransformConfig, truncate_to_token_budget};
 use crate::output::ELISION_HINT;
 use crate::tokens;
 
-/// Groups the three optional truncation parameters that frequently travel
+/// Groups the optional truncation parameters that frequently travel
 /// together through cascade and cache functions.  Prevents accidental
 /// transposition of same-typed `Option<usize>` positional parameters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub(crate) struct TruncationOptions {
     pub(crate) last_lines: Option<usize>,
     /// Token budget for cascade mode.
     pub(crate) token_budget: Option<usize>,
+    /// Strict character limit for a default single-input view, including its notice.
+    pub(crate) char_budget: Option<usize>,
 }
 
 /// Error message when no transformation mode produces output.
