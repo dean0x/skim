@@ -199,6 +199,7 @@ into direct skim reads (example: `cat file.ts` becomes
 `skim file.ts --mode=pseudo`), so the output is a structured view, not
 raw file contents; seeing `skim` run in place of the original command
 is expected.
+Hook file rewrites select modes or line limits, so the default character bound does not apply.
 
 Compression changes how results are presented, and rewritten file reads
 show a structured view rather than exact file contents; skim prints a
@@ -253,10 +254,7 @@ pub(super) fn guidance_content(version: &str, hooks: GuidanceHooks) -> String {
 
 ### What skim does
 
-Skim shows you the **structure** of a file — signatures, types, headings,
-definitions — while stripping implementation details and body content.
-It works on code files (functions/classes) and prose files (headings/sections).
-Use `-n` / `--line-numbers` to enrich the output with original source line numbers.
+Skim shows code and prose **structure**: signatures, types, headings and definitions. Use `-n` / `--line-numbers` for source line numbers.
 
 {notes}### When to use skim
 
@@ -264,11 +262,10 @@ Use `-n` / `--line-numbers` to enrich the output with original source line numbe
 If your next step requires the actual content (editing, understanding logic,
 debugging), go straight to Read — don't skim first.
 
-Skim earns its cost when you want to **orient** — understand what exists in a
-file or across files without committing to reading all the content. Examples:
-- Understanding what a module defines before deciding what to read in detail
-- Surveying a directory of files to build a mental model of a codebase area
-- Checking what sections a spec or config file contains
+Skim earns its cost when you **orient** before a detailed read:
+- Check definitions in a module.
+- Survey files in a directory.
+- Check spec or config sections.
 
 Skim wastes tokens when you already know you need the content — most commonly
 when you're about to edit a file. Read it directly.
@@ -285,7 +282,7 @@ to orient, then Read the one you actually need in detail.
 ### Quick Reference
 
 ```
-skim <file>                      # structural overview (default mode)
+skim <file>                      # structural overview, kept under about 29,000 characters
 skim -n <file>                   # structural overview with source line numbers
 skim 'src/**/*.ts'               # multi-file scan (glob)
 skim file1.ts file2.ts           # multi-file scan (explicit files)
@@ -299,6 +296,18 @@ skim <file> --mode=types         # type definitions only
 skim <file> --mode=signatures    # function/method signatures only
 skim <file> --mode=pseudo        # logic without syntactic noise
 ```
+
+### Default single-input limit
+
+Default `skim FILE` and `skim -` keep stdout plus its view notice below 29,000 characters (Unicode scalar values, not bytes). Source line numbers count.
+The bound applies to terminals, pipes and file redirects.
+Skim tries structure, signatures, then types and skips empty views.
+JSON/YAML/TOML skip step-down. If none fits, skim cuts whole lines with a hidden-line count.
+
+The notice names the served view and any cut.
+Use `--symbol NAME` (file only) or `--max-lines N` for more.
+Use typed `--mode` for that mode, or `SKIM_PASSTHROUGH=1` for raw output.
+Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol` and multi-file runs have no default character bound. Other agents' limits are not known.
 
 ### Search and read
 
@@ -321,18 +330,12 @@ skim <file> --mode=pseudo        # logic without syntactic noise
 
 ### Heatmap — Git History Risk Analysis
 
-`skim heatmap` analyzes git history to surface risk hotspots: high-churn files,
-tightly coupled file pairs, fix-after-touch patterns, module boundary violations,
-and bus-factor concentration. Run it when you need to understand where risk lives
-in a codebase before starting work.
+Use `skim heatmap` for git-history risk.
 
 **When to use heatmap:**
-- Before you edit a file — `skim heatmap <file>` shows its co-change partners
-  (tests first), recent fix commits and owners
-- Before a refactoring task — identify which files are risky to change
-- When triaging bugs — find files with high fix density
-- Explore a new codebase — find coupling and ownership patterns
-- Before code review — check if the changed files are high-risk hotspots
+- Before an edit, use `skim heatmap <file>` for co-change partners, tests, recent fixes and owners.
+- Before a refactor or review, check high-churn files.
+- For bugs, check fix-after-touch risk.
 
 ```
 skim heatmap                     # short ranked view of the default window
@@ -772,9 +775,8 @@ mod tests {
         assert!(content.contains("--mode=types"));
         // No prescriptive decision table
         assert!(!content.contains("Choose ONE tool per file"));
-        // SKIM_PASSTHROUGH is NOT documented in guidance — agents learn about it
-        // from stderr hints emitted on compressed non-zero exits (shared.rs, mod.rs).
-        assert!(!content.contains("SKIM_PASSTHROUGH"));
+        // The default view limit needs an explicit raw-output remedy.
+        assert!(content.contains("`SKIM_PASSTHROUGH=1` for raw output"));
         // The after-run view of auto mode points at its stderr line for raw output.
         assert!(
             content.contains("In Claude Code auto mode")
@@ -842,6 +844,40 @@ mod tests {
             )
         );
         assert!(!content.contains("uncapped"));
+    }
+
+    #[test]
+    fn test_guidance_explains_the_default_character_bound_in_every_render() {
+        for (name, content) in all_renders() {
+            for fact in [
+                "structural overview, kept under about 29,000 characters",
+                "`skim FILE` and `skim -` keep stdout plus its view notice below 29,000",
+                "characters (Unicode scalar values, not bytes)",
+                "Source line numbers count",
+                "terminals, pipes and file redirects",
+                "structure, signatures, then types",
+                "skips empty views",
+                "JSON/YAML/TOML skip step-down",
+                "skim cuts whole lines with a hidden-line count",
+                "notice names the served view and any cut",
+                "`--symbol NAME`",
+                "`--max-lines N`",
+                "typed `--mode`",
+                "`SKIM_PASSTHROUGH=1` for raw output",
+                "`--max-lines`, `--last-lines`, `--tokens`, `--symbol`",
+                "multi-file runs have no default character bound",
+                "Other agents' limits are not known",
+            ] {
+                assert!(
+                    content.contains(fact),
+                    "the {name} render must say {fact:?}"
+                );
+            }
+        }
+        assert!(
+            guidance_content("3.0.0", GuidanceHooks::Hook)
+                .contains("Hook file rewrites select modes or line limits")
+        );
     }
 
     /// documentation-14: the guidance's mode ordering is the one output claim in

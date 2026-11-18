@@ -78,7 +78,10 @@ fn a_block_with_the_same_version_and_the_same_text_is_current() {
 
 #[test]
 fn a_block_with_the_same_version_and_other_text_is_changed() {
-    let edited = block("3.0.1").replace("Skim earns its cost", "Skim earns its keep");
+    let edited = block("3.0.1").replace(
+        "structural overview, kept under about 29,000 characters",
+        "structural overview (default mode)",
+    );
     let text = format!("# Mine\n\n{edited}\n");
 
     assert_eq!(

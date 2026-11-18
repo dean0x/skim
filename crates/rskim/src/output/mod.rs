@@ -23,6 +23,17 @@ use crate::tokens;
 /// this via `use crate::output::ELISION_HINT` rather than defining their own.
 pub(crate) const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
+/// Strict output ceiling in Unicode scalar values, not bytes.
+/// Claude Code persists output at about 30,000 characters and exposes a prefix.
+/// This margin assumes scalar-value counts; a UTF-16 limit consumes two units
+/// per non-BMP character, so the margin covers about 1,000 such characters.
+pub(crate) const MAX_STDOUT_CHARS: usize = 29_000;
+
+/// Accept only complete output strictly below the shared character ceiling.
+pub(crate) fn within_output_limit(chars: usize) -> bool {
+    chars < MAX_STDOUT_CHARS
+}
+
 // ============================================================================
 // ParseResult<T> — three-tier parse degradation
 // ============================================================================
@@ -1054,6 +1065,50 @@ pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
     }
 }
 
+/// Input shape controls which bounded remedies can work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundShape {
+    File,
+    Stdin,
+}
+
+/// Served outcome of the default character bound, shared by emission and cost.
+///
+/// The original view count includes its notice. No source text enters this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundNotice {
+    pub(crate) mode: rskim_core::Mode,
+    pub(crate) default_view_chars: usize,
+    pub(crate) cut: bool,
+    pub(crate) shape: BoundShape,
+}
+
+/// Unconditional class-1 notice for a changed or cut default view.
+pub(crate) fn bounded_view_marker(bound: BoundNotice) -> EmittedNotice {
+    let mode = bound.mode.name();
+    let class = mode_class_label(mode);
+    let cut = if bound.cut {
+        "; this view is cut to the limit, and the last stdout line counts the hidden lines"
+    } else {
+        ""
+    };
+    let selection = match bound.shape {
+        BoundShape::File => "--symbol NAME or --max-lines N",
+        BoundShape::Stdin => "--max-lines N",
+    };
+    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
+        tool: "",
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: true,
+    });
+    EmittedNotice {
+        line: format!(
+            "[skim] {mode} view: {class}; the default view has {} characters, over the {MAX_STDOUT_CHARS}-character output limit{cut}; use {selection} for more, or {remedy}\n",
+            bound.default_view_chars,
+        ),
+    }
+}
+
 /// Lossy-view marker for file reads (B3 / ADR-011 class 1 — unconditional).
 ///
 /// Fires whenever the served view differs from raw bytes, regardless of whether
@@ -1400,6 +1455,52 @@ mod lossy_json_view_marker_tests {
             !m.contains("SKIM_PASSTHROUGH=1"),
             "the narrow remedy must not be padded with the unreachable hatch; got: {m:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_view_marker_tests {
+    use super::*;
+    use rskim_core::Mode;
+
+    #[test]
+    fn bounded_notice_names_the_served_view_and_only_shape_valid_remedies() {
+        for (shape, remedies) in [
+            (BoundShape::File, "--symbol NAME or --max-lines N"),
+            (BoundShape::Stdin, "--max-lines N"),
+        ] {
+            for (mode, class) in [
+                (Mode::Signatures, "all but signatures removed"),
+                (Mode::Types, "all but types removed"),
+                (Mode::Full, "lines outside range omitted"),
+            ] {
+                for cut in [false, true] {
+                    let notice = bounded_view_marker(BoundNotice {
+                        mode,
+                        default_view_chars: 34001,
+                        cut,
+                        shape,
+                    });
+                    let cut_clause = if cut {
+                        "; this view is cut to the limit, and the last stdout line counts the hidden lines"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(
+                        notice.line(),
+                        format!(
+                            "[skim] {} view: {class}; the default view has 34001 characters, over the 29000-character output limit{cut_clause}; use {remedies} for more, or SKIM_PASSTHROUGH=1 for full output\n",
+                            mode.name(),
+                        )
+                    );
+                    assert_eq!(notice.line().lines().count(), 1);
+                    assert_eq!(notice.bytes(), notice.line().len());
+                    assert!(!notice.line().contains(['\u{2014}', '\u{2013}']));
+                    assert!(!notice.line().contains(" - "));
+                    assert!(!notice.line().contains("token"));
+                }
+            }
+        }
     }
 }
 
@@ -1881,6 +1982,14 @@ impl FilterTransparencyHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_limit_is_strict_and_stays_at_29000_characters() {
+        assert_eq!(MAX_STDOUT_CHARS, 29_000);
+        assert!(within_output_limit(28_999));
+        assert!(!within_output_limit(29_000));
+        assert!(!within_output_limit(29_001));
+    }
 
     // ========================================================================
     // elision_marker tests
