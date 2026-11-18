@@ -13,7 +13,7 @@ updated: 2026-11-18
 ## Rules
 
 - **KB-INV-1** One `--tokens N` budget covers the exact final stdout of a multi-file run: headers, `-n` numbers and markers. stderr is not counted. `cli_tokens_run_budget` counts the captured stdout with the same cl100k counter.
-- **KB-INV-2** `run_budget_applies` is the one predicate. It is true when `batch` is set and a token budget is set. It starts the run stage and it makes the stage own the `--tokens` stderr lines.
+- **KB-INV-2** `run_budget_applies` is token-only: it is true when `batch` and a token budget are set. It selects `RunBudget::Tokens` and gives the run stage the `--tokens` stderr lines. A default batch selects `RunBudget::Chars` instead. `process_files` resolves the budget once; `RunBudget` lives in `output/mod.rs`.
 - **KB-INV-3** Only the multi-file options set `batch`. Single-file and stdin reads keep the per-file cascade and its stderr lines. They never take the run stage.
 - **KB-INV-4** A run that fits N writes the same stdout bytes as before the run stage. `RUN_SUM_STOP_FACTOR` and `MAX_DROP_RETRIES` bound the extra work. The goldens in `tests/fixtures/tokens_run_budget/` pin the bytes.
 - **KB-INV-5** Step-down follows the cascade order from the start mode, one mode for the whole run. The walk skips a rung only when that rung empties every body that pass 1 left non-empty.
@@ -21,21 +21,21 @@ updated: 2026-11-18
 - **KB-INV-7** A changed run prints exactly one run notice on stderr, and it replaces the aggregate notice. A run that fits prints the aggregate notice as before.
 - **KB-INV-8** The trailer is the last stdout line. Its numbers come from plan state, never from file text. It is a `// ` comment line with the omitted count, the shown-of-total count and the `SKIM_PASSTHROUGH=1` hint.
 - **KB-INV-9** Exit is 0 for a cut or an omission. The run fails only when every file fails. The notice total counts successes only.
-- **KB-INV-10** Output is the same for any `--jobs` value. Files keep path order. All token work runs in one rayon pool that `process_files` builds.
+- **KB-INV-10** Output is the same for any `--jobs` value. Files keep path order. `process_files` uses one rayon pool for plan and stats counts.
 - **KB-INV-11** A run-level cut is never cached. Only plain `--mode m` rung results enter the cache. A warm run gives the same stdout and stderr as the cold run.
 - **KB-INV-12** Budget arithmetic saturates. A missing count means over budget (`usize::MAX`). No content candidate leaves the planner without an exact count or a byte bound.
 - **KB-AP-1** Do not print a candidate that the exact count did not accept. The planner returns the trailer only after the retries fail.
 - **KB-AP-2** Do not add a per-file cascade stderr line to a multi-file `--tokens` run. Pass 1 uses `CascadeLines::Quiet`. The run notice carries the remedy.
-- **KB-AP-3** Do not cut a body that is `Fixed`. Retained pass-1 bodies and line-bound bodies (`--max-lines`, `--last-lines`) stay whole or are omitted.
+- **KB-AP-3** Do not cut a `Fixed` body. In a token run, retained pass-1 bodies and line-bound bodies stay whole or are omitted. A character run can cut retained pass-1 bodies.
 - **KB-AP-4** Do not add a second notice type. The run notice shares one line builder with the default bounded notice. Do not charge it to an analytics row.
 - **KB-AP-5** Do not change the empty rule back to "any emptied body skips the rung". A partly empty rung keeps the affected pass-1 bodies and can still fit.
 - **KB-AP-6** Do not run a test of this feature with `SKIM_PASSTHROUGH` in the parent environment. The binary under test reads it and fails every compression assertion.
 
 ## Overview
 
-`--tokens N` used to apply to each file of a multi-file read. The combined output had no bound. Now one budget bounds the whole output of a glob, a directory or an explicit file list. A glob or directory that matches one file takes the same path.
+A glob, directory or explicit file list uses one budget for the whole run. `--tokens N` counts stdout in tokens. A default run counts stdout and its view notice in Unicode scalar values. The total must be below `MAX_STDOUT_CHARS`. A one-match glob or directory, or a list that dedups to one path, still uses the run path.
 
-A run goes through these steps. Pass 1 runs the old per-file code and counts each piece. If the set fits N, the run writes it. If not, the run steps down through the cascade modes. If no mode fits, the planner cuts each over-share file on whole lines and omits trailing files. One stderr notice then tells the reader what changed.
+Pass 1 runs the per-file code and counts each piece. If the set fits, the run writes it. If not, the run tries smaller views. If no mode fits, the planner cuts whole lines or omits trailing files. One stderr notice states what changed.
 
 ## Run stage in `process_files`
 
@@ -48,7 +48,17 @@ A run goes through these steps. Pass 1 runs the old per-file code and counts eac
 5. **Plan.** `plan_cut` in `run_budget.rs` chooses how many files stay (`kept_prefix`). It splits the budget with `shares` (max-min). It cuts over-share bodies that permit cuts, then counts the joined string.
 6. **Write.** `write_run` writes the accepted string. Error lines, the notice, stats and analytics follow, from the final bodies.
 
-`final_results` replaces each shown output with the final body and clears the cached token counts when the run changed. Omitted successes get no analytics row.
+`final_results` uses the final bodies and clears stale token counts for a changed run. Stats and analytics still count tokens. Omitted files get no row, and both notice columns stay NULL for shown files.
+
+### Run limits
+
+Token runs use N for `fit`, `rung` and `cut`. Character runs subtract the strict margin and a notice reserve from `MAX_STDOUT_CHARS`:
+
+- `fit` reserves the aggregate notice for pass 1.
+- `rung` reserves the widest step-down notice with no cut, omission or path clauses.
+- `cut` reserves the widest notice with cut and omission counts and the two longest display paths.
+
+The limits saturate and satisfy `cut <= rung <= fit`. `seal_run` checks the exact stdout and notice before output. If needed, it uses only the trailer and removes path clauses from the notice. `Error:`, `Processed` and `Warning:` lines, stats and debug lines are outside the limit. Per-file stderr errors have no run count limit.
 
 ## Planner rules (`run_budget.rs`)
 
@@ -61,17 +71,19 @@ A run goes through these steps. Pass 1 runs the old per-file code and counts eac
 
 ## Run notice and trailer (`output/mod.rs`)
 
-`RunNoticeFacts` holds the budget, requested and served modes, differing and total counts, cut and omitted counts, and the last shown and first omitted paths. `run_view_marker` builds the line. `view_notice_line` is the shared builder, and the default bounded notice uses it too. Each clause drops out when its count is zero: the step-down clause, the cut clause and the omitted clause. Paths go through `display_path`, so the notice stays on one line. The notice names only remedies that a multi-file run accepts: a larger `--tokens`, fewer files, `SKIM_PASSTHROUGH=1`.
+`run_view_marker` builds the line from `RunNoticeFacts`. The single-input bound shares the `view_notice_line` builder. The notice names the served mode and run limit. It adds the step-down, cut and omission clauses only when they apply. Paths go through `display_path`.
 
-`cut` counts each shown file with a run cut. The planner never cuts a retained pass-1 body. Its source-line marker stays intact and does not add to `cut`.
+For token runs, the remedies are a larger `--tokens`, fewer files and `SKIM_PASSTHROUGH=1`. For character runs, they are `--tokens N`, a typed `--mode` and `SKIM_PASSTHROUGH=1`. The character notice suggests fewer files only when at least two files succeeded.
+
+`cut` counts shown files with a run cut, not files with a per-file marker only. A cut of a retained pass-1 body uses the requested view, although the notice names one served view for the run.
 
 `run_trailer_line` reuses the shared elision marker. It counts successful files only, and it starts on its own line.
 
-## Passthrough for an explicit list
+## Multi-file passthrough
 
-`SKIM_PASSTHROUGH=1` streams raw bytes in sorted path order, with no headers or size limit. It does this with or without `--tokens`. `resolve_explicit_paths` shares the path order, duplicate removal and path-resolution diagnostics with the transform path. The gate sits in `main.rs` after the stdin-mix check.
+`SKIM_PASSTHROUGH=1` or `--passthrough` serves raw bytes in path order with no headers, view notice or size limit. It bypasses the run budget. `resolve_explicit_paths` shares path order, duplicate removal and path diagnostics with the transform path for a list.
 
-For an explicit list, `passthrough_explicit_files` reports each input error with `display_path` and continues to the next file. Bytes already sent to stdout stay in the output. If at least one file succeeds, the exit code is 0. If every file fails, the exit code is 1. An output error stops the run at once. A closed stdout pipe exits 141.
+`passthrough_paths` serves the resolved paths for a list, directory or glob. It reports each input error and continues. If at least one file succeeds, the exit code is 0. A non-empty set in which every file fails exits 1. An empty set exits 0; a glob with no matches still fails during path resolution. An output error stops the run. A closed stdout pipe exits 141 on Unix.
 
 ## Anti-Patterns
 
@@ -79,7 +91,7 @@ For an explicit list, `passthrough_explicit_files` reports each input error with
 
 **KB-AP-2.** `cascade_for_token_budget` prints in its fit arm, in `fallback_line_truncate` and in the serde cascade. A multi-file pass 1 calls it, so the call must be quiet. Stdout bytes and the returned mode are equal for `Print` and `Quiet`. The cascade tests cover each arm. The count-failure warning always prints.
 
-**KB-AP-3.** `run_rung` keeps the pass-1 body if it has no language, the transform fails, or the rung empties the body. Language comes from `explicit_lang` or the path extension, not the shebang. These bodies and line-bound bodies are `Fixed`. A rung error adds no stderr line. Omission is a path-order suffix, so a large `Fixed` body can end the shown prefix. `partly_empty_cut_keeps_the_exact_pass_one_body_or_omits_it` checks this rule.
+**KB-AP-3.** `run_rung` keeps the pass-1 body if it has no language, the transform fails, or the rung empties the body. Language comes from `explicit_lang` or the path extension, not the shebang. For tokens, these bodies and line-bound bodies are `Fixed`. A large `Fixed` body can end the shown prefix. For characters, retained bodies can be cut, including raw bodies with no language. A rung error adds no stderr line. Omission is a path-order suffix in both cases.
 
 **KB-AP-4.** Batch analytics rows are unmeasured by design. See the long comment in `multi.rs` and the `analytics` knowledge base. The rows carry the requested mode and a null notice.
 
@@ -89,7 +101,7 @@ For an explicit list, `passthrough_explicit_files` reports each input error with
 
 ## Gotchas
 
-**KB-INV-1.** With `-n`, the run cuts annotated text. `process_file` returns annotated text only, so the fence and heredoc pull-back can miss. The count stays exact. Without a cut line map, the marker counts view lines.
+**KB-INV-1.** With `-n`, both budgets count the text after `process_file` adds numbers. A run cut counts hidden view lines, not hidden source lines. Number prefixes can prevent the cut from detecting a fence or heredoc.
 
 **KB-INV-2, KB-INV-3.** `multi_options` in `main.rs` and its test twin are the only places that set `batch`. Add a new batch caller there, or the run stage will not start.
 
@@ -105,7 +117,7 @@ For an explicit list, `passthrough_explicit_files` reports each input error with
 
 **KB-INV-11.** A cache tamper test must target a batch rung entry. A one-match glob has that key. A single-file read can have another notice-cost key. `cli_cache` has the cold, warm, jobs and tamper tests.
 
-**Cost.** Over N, every rung transforms every file, and one cut-base re-run can follow (cache hits). Memory holds the pass-1 set, at most two probe sets, the cut base and one transient file per worker. The cost was measured once in the PR and is not gated.
+**Cost.** A cold over-limit run can make about three transform passes. In a 239-file measurement, the cache grew from 239 to 717 entries. Each rung uses its typed-mode keys; no run cut enters the cache. Pass 1 copies every successful output to make owned pieces. Memory also holds up to two probe sets, the cut base and one transient file per worker. `raw_line_cut` makes about `log2(lines)` passes, or roughly 1 GB of work near the 50 MiB read limit.
 
 **Other limits.** `display_path` replaces non-ASCII characters with `?`. A count failure inside the run prints no new line and fails closed.
 
@@ -119,9 +131,9 @@ For an explicit list, `passthrough_explicit_files` reports each input error with
 
 ## Key Files
 
-- `crates/rskim/src/multi.rs`: `prepare_results`, `select_run`, `run_rung`, `make_piece`, `precut_piece`, `final_results`, `piece_prefix`, `write_run`, `resolve_explicit_paths`, `passthrough_explicit_files`.
-- `crates/rskim/src/run_budget.rs`: `Body`, `Piece`, `set_fits`, `plan_cut`, `RUN_SUM_STOP_FACTOR`, `MAX_DROP_RETRIES`.
-- `crates/rskim/src/output/mod.rs`: `RunNoticeFacts`, `run_view_marker`, `run_trailer_line`, `view_notice_line`.
+- `crates/rskim/src/multi.rs`: `prepare_results`, `select_run`, `run_rung`, `char_limits`, `seal_run`, `final_results`, `piece_prefix`, `write_run`, `resolve_explicit_paths`, `passthrough_paths`.
+- `crates/rskim/src/run_budget.rs`: `Body`, `Piece`, `set_fits`, `plan_cut`, `plan_char_cut`, `RUN_SUM_STOP_FACTOR`, `MAX_DROP_RETRIES`.
+- `crates/rskim/src/output/mod.rs`: `RunBudget`, `RunNoticeFacts`, `run_view_marker`, `run_trailer_line`, `view_notice_line`.
 - `crates/rskim/src/cascade.rs`: `CascadeLines`, `walk_rungs`, `serde_rungs`.
 - `crates/rskim/src/process.rs`: `run_budget_applies`, the `run_transform` choice of `Quiet` or `Print`.
 - `crates/rskim/src/main.rs`: `--tokens` help text, `MAX_TOKEN_BUDGET`, the explicit-list passthrough gate, `multi_options`.
