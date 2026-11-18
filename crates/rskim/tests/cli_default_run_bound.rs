@@ -223,21 +223,21 @@ fn default_limits_directory_glob_and_explicit_list() {
     let fixture = Fixture::new(3, 250);
     assert!(total_chars(&fixture.run(&["--mode=structure"])) > LIMIT);
     let explicit = fixture.run(&[]);
-    assert!(!stdout(&explicit).is_empty());
+    let count_functions = |output: &Output| {
+        stdout(output)
+            .lines()
+            .filter(|line| line.contains("pub fn"))
+            .count()
+    };
+    let explicit_count = count_functions(&explicit);
+    assert!(explicit_count > 0, "no functions for the explicit list");
     bounded_notice(&explicit);
     for input in [".", "*.rs"] {
         let batch = run(fixture.command().arg("--no-cache").arg(input));
         bounded_notice(&batch);
-        assert_eq!(
-            stdout(&batch)
-                .lines()
-                .filter(|l| l.contains("pub fn"))
-                .count(),
-            stdout(&explicit)
-                .lines()
-                .filter(|l| l.contains("pub fn"))
-                .count()
-        );
+        let batch_count = count_functions(&batch);
+        assert!(batch_count > 0, "no functions for {input:?}");
+        assert_eq!(batch_count, explicit_count, "{input:?}");
     }
 }
 

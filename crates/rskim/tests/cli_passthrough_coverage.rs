@@ -1663,6 +1663,9 @@ fn make_unreadable(path: &std::path::Path) -> bool {
 fn directory_and_glob_passthrough_keep_readable_files() {
     let dir = TempDir::new().unwrap();
     if !make_unreadable(&dir.path().join("bad.ts")) {
+        eprintln!(
+            "Skip directory_and_glob_passthrough_keep_readable_files: mode 000 file remains readable"
+        );
         return;
     }
     let raw = b"const x = 1;\r\n\xff";
@@ -1684,6 +1687,9 @@ fn directory_and_glob_passthrough_keep_readable_files() {
 fn directory_and_glob_passthrough_fail_if_no_file_is_readable() {
     let dir = TempDir::new().unwrap();
     if !make_unreadable(&dir.path().join("a.ts")) || !make_unreadable(&dir.path().join("b.ts")) {
+        eprintln!(
+            "Skip directory_and_glob_passthrough_fail_if_no_file_is_readable: a mode 000 file remains readable"
+        );
         return;
     }
 
