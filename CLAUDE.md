@@ -73,9 +73,17 @@ A machine-global `~/.cargo/config.toml` caps every cargo invocation at `jobs = 4
 - **Never run two release/LTO builds concurrently**, and never kick off a heavy build in both clones at the same time.
 - **Defer the full `--all-features` regression** to the main loop or a human, run when the machine is otherwise idle.
 
-Modes are set via `--mode` only (no config file): `structure` (default), `signatures`, `types`, `minimal`, `pseudo`, `full`.
+Modes are set via `--mode` only (no config file): `structure` (default starting mode), `signatures`, `types`, `minimal`, `pseudo`, `full`. An explicit mode has no default character bound.
 
-### Bounded output (`--max-lines`, `--last-lines`, `--tokens`)
+### Bounded output (default single input, `--max-lines`, `--last-lines`, `--tokens`)
+
+**Default single-input bound.** With no typed `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol`, `skim FILE` and `skim -` start with structure. Final stdout plus its view notice stays strictly below 29,000 characters (Unicode scalar values, not bytes). Source line numbers and the stdout marker count toward the bound. It applies to every sink: terminals, pipes and file redirects. Skim tries structure, signatures, then types and skips empty or degraded views. JSON/YAML/TOML skip step-down.
+
+This is the fourth bound, owned by `MAX_STDOUT_CHARS` and `within_output_limit` in `crates/rskim/src/output/mod.rs`. It uses `select_for_char_budget` in `crates/rskim/src/cascade.rs` for the rung walk, `default_view` in `crates/rskim/src/process.rs` for assembly, and rskim-core's `truncate_with_count_source` for cut counts.
+
+If no view fits, skim cuts the last non-empty view on whole lines. Over-limit raw text gets whole-line cuts and the `full` label. The marker counts hidden source lines with a complete source map, or hidden view lines without one. One unconditional notice names the served view, the limit, the replaced default count and any cut. Warm reads keep the cold stdout and notice; default and explicit structure reads have separate cache keys. Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
+
+Use `--symbol NAME` for one declaration in a file. Use `--max-lines N` for a line limit on files or stdin. Use a typed `--mode` for that mode without the bound, or `SKIM_PASSTHROUGH=1` for raw file or stdin output. Explicit modes, line limits, `--tokens`, `--symbol`, hook file rewrites and multi-file runs have no default character bound. Other agents' limits are not known. `--tokens N -n` keeps its cut and marker; the token count precedes source line numbers.
 
 `--max-lines N` emits at most N lines total, elision marker included — this is what the rewrite hook turns `head -N` into, so a bound the tool can exceed is not a bound (ADR-016). The sole exception is N=1: one content line plus the marker (2 lines), because spending the only slot on the marker returns a view with no code, and silently dropping the marker is the defect this flag exists to prevent. `--last-lines N` is the tail mirror: at most N lines total including the leading marker. For N=1 the same carve-out applies — 1 content line + 1 marker = 2 lines total. For `--tokens N`, the cascade escalates modes until the output fits; on tight budgets the exact elided count appears on stdout (compact marker) and the `SKIM_PASSTHROUGH=1` remedy is emitted to stderr per the ADR-011 class-1 obligation — the intended mechanism fires on every mode-cascade that elides content, but the 9-cell `{full, structure, pseudo} × {3, 5, 10}` matrix is the empirical check for this claim. The rewrite hook maps `head -N` / `tail -N` on code files to `--mode=full --max-lines N` / `--last-lines N` (verbatim slice), while `cat` stays on pseudo/structure (ADR-007); bare `head`/`tail` get the POSIX default bound of 10; signed counts (`+N`, `-N`) are never rewritten.
 

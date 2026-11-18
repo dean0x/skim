@@ -22,6 +22,8 @@ Before creating a bug report:
 - Expected vs actual behavior
 - Error messages (if any)
 
+Maintainers and agents check each report with [docs/report-triage.md](docs/report-triage.md).
+
 ### Suggesting Features
 
 Before suggesting a feature:

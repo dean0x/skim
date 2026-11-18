@@ -12,7 +12,7 @@ updated: 2026-11-12
 
 ## Rules
 
-- **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. A whole-file read keeps the exact hash input it had before, so no warm entry is orphaned.
+- **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. Unbudgeted reads keep their hash input apart from schema changes. A default whole-file read adds `|char_budget:<limit>`; a typed mode and `--symbol` have no character budget. Schema 4 invalidates old entries because token cuts with line numbers now keep their cut and marker.
 - **KB-INV-2** A successful symbol read prints its stderr notice on every run, warm or cold, because the reader sees part of the file. The notice is stored in the cache entry, and the read records no analytics row.
 - **KB-INV-3** A variable declared in a function body (TypeScript, JavaScript, Go) is a local and is not a declaration. A variable at the top level is a declaration.
 - **KB-INV-4** The search engine reuses `Declaration.name_bytes`, `enclosing_declaration`, `DeclScan.truncated` and `Parser::new_for_extension`. Keep their signatures and meaning. Search parses with plain `parse` and has no time bound.
@@ -100,7 +100,7 @@ For `Language::TypeScript` and the extension `tsx` (any case) it loads the TSX g
 
 ### Cache identity (`cache.rs`)
 
-`CacheKeyParams` has a `symbol: Option<&str>` field. The same record serves `read_cache`, `write_cache` and `cache_key`, so a component is in the key on both paths or on neither. The hash input is `cache_schema_v{N}|{symbol_part}{canonical path}|{mtime secs}|{mode}|...`. `symbol_part` is empty for a whole-file read.
+`CacheKeyParams` has a `symbol: Option<&str>` field. The same record serves `read_cache`, `write_cache` and `cache_key`, so a component is in the key on both paths or on neither. The hash input is `cache_schema_v{N}|{symbol_part}{canonical path}|{mtime secs}|{mode}|...`. `symbol_part` is empty for a whole-file read. `TruncationOptions.char_budget` adds a tagged suffix only when present, so default and typed-mode reads have separate entries. A budgeted entry must carry `NotFired` or a valid `Fired` state. Whole-file notices use typed bound state, not stored prose; symbol notices still use `CacheEntry.notice`.
 
 Why the name goes first and has a length prefix: the name is free text. If it came last, a file whose own name spells the trailing numeric fields could make a whole-file input read exactly like a symbol input, and the two reads would share an entry (silent wrong stdout). With the name first, a whole-file input has an absolute path after the version, and that never begins with `symbol:`. Inside the symbol family the length prefix fixes where the name ends. Tests: `test_cache_key_symbol_cannot_collide_with_a_file_name_that_spells_it`, `test_cache_key_without_symbol_is_unchanged`, `test_cache_key_separates_symbol_reads`.
 

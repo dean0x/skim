@@ -1101,6 +1101,8 @@ fn test_cli_stdin_large_input_streaming() {
     let output = common::skim()
         .arg("-")
         .arg("--language=typescript")
+        // A typed mode keeps the complete view without the default output bound.
+        .arg("--mode=structure")
         .write_stdin(input)
         .assert()
         .success()
@@ -1120,7 +1122,7 @@ fn test_cli_stdin_large_input_streaming() {
         "Last function should appear in output"
     );
 
-    // Verify bodies are stripped (structure mode is default)
+    // Verify bodies are stripped by the explicit structure mode.
     assert!(
         output_str.contains("{...}"),
         "Function bodies should be replaced with placeholder"

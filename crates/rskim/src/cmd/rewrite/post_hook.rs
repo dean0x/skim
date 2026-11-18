@@ -38,14 +38,12 @@ use crate::cmd::test::{cargo, pytest};
 use crate::output::fidelity::{FidelityDecision, decide_with_notice};
 use crate::output::{
     POST_VIEW_MARKER_PREFIXES, ParseResult, REWRITE_ORIGIN_ENV, lossy_view_marker,
-    post_parsed_view_marker, strip_ansi_cow,
+    post_parsed_view_marker, strip_ansi_cow, within_output_limit,
 };
 use crate::runner::CommandOutput;
 
-/// Most characters of captured stdout the post path accepts. Claude Code keeps
-/// output of about 30,000 characters or more in a file and gives the hook a
-/// prefix, so a text this long is never the whole output.
-const MAX_STDOUT_CHARS: usize = 29_000;
+#[cfg(test)]
+use crate::output::MAX_STDOUT_CHARS;
 
 /// `tool_response` keys whose presence means the run is not a plain foreground
 /// run whose `stdout` is the whole output.
@@ -255,7 +253,7 @@ fn captured_stdout(response: &Map<String, Value>) -> Option<&str> {
     };
     let clean = !stdout.trim().is_empty()
         && !stdout.contains(['\0', '\u{FFFD}'])
-        && stdout.chars().count() < MAX_STDOUT_CHARS;
+        && within_output_limit(stdout.chars().count());
     (finished && clean && !has_marker(stdout) && !has_marker(stderr)).then_some(stdout)
 }
 

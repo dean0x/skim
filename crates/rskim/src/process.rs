@@ -31,7 +31,7 @@ pub(crate) struct ProcessOptions {
     pub(crate) use_cache: bool,
     /// Whether to compute token statistics (for --show-stats)
     pub(crate) show_stats: bool,
-    /// Truncation options (max_lines, last_lines, token_budget)
+    /// Line, token and default-character limits
     pub(crate) trunc: TruncationOptions,
     /// Whether to annotate output with source line numbers (`--line-numbers` / `-n`)
     pub(crate) line_numbers: bool,
@@ -61,11 +61,10 @@ pub(crate) struct ProcessResult {
     /// Which view the ADR-001 guard actually served — the analytics-facing
     /// reading of [`Self::guardrail_triggered`].
     ///
-    /// `Some` only where a guard decision was genuinely taken. `None` on the
-    /// three paths where `guardrail_triggered: false` is a constructor default
-    /// rather than a verdict: a cache hit (the guard ran at write time, not
-    /// now), `Mode::Full` (the guard is skipped outright), and the
-    /// unknown-language passthrough degrade (ADR-002 returns before the guard).
+    /// `Some` only where a guard decision selected the final view. `None` for
+    /// cache hits, `Mode::Full`, unknown-language passthrough and a fired default
+    /// bound. Bounded reads have no delivered-cost verdict: their character
+    /// selection can replace step A's guard decision.
     /// Recording `Transformed` on those would claim a measurement nobody took —
     /// and would rebuild, in a new column, the same confusion `parse_tier`
     /// already causes by being computed before the decision it appears to
@@ -98,6 +97,8 @@ pub(crate) struct ProcessResult {
     /// marker layer to emit a stderr notice on hook-rewritten file reads.
     /// Always `false` when the origin env var is absent (non-hook invocations).
     pub(crate) view_differs: bool,
+    /// Served outcome when the default character bound changes or cuts the view.
+    pub(crate) bound: Option<crate::output::BoundNotice>,
 }
 
 /// Which view the ADR-001 guard served, from its own verdict.
@@ -222,7 +223,7 @@ pub(crate) fn write_result_and_stats(
     // terminator is part of the measured line). `record_file_analytics` calls
     // the same constructor with the same inputs, so the cost it stores is the
     // cost this line put on the wire rather than a second estimate of it.
-    if let Some(notice) = single_file_notice(mode_str, result.view_differs) {
+    if let Some(notice) = single_file_notice(mode_str, result.view_differs, result.bound) {
         eprint!("{}", notice.line());
     }
 
@@ -233,13 +234,18 @@ pub(crate) fn write_result_and_stats(
 ///
 /// The single constructor for that line, shared by the site that PRINTS it
 /// ([`write_result_and_stats`]) and the site that CHARGES it
-/// (`main::record_file_analytics`). Both pass the same three inputs — process
-/// environment, mode spelling, and whether the view differed — so the two
-/// cannot disagree without this function being wrong for both.
+/// (`main::record_file_analytics`). Both pass the same served bound outcome,
+/// requested mode spelling and byte-difference flag. A bound outcome replaces
+/// the legacy disclosure, never adds a second line. Without one, the legacy
+/// constructor keeps its exact text and process-environment rules.
 pub(crate) fn single_file_notice(
     mode_str: &str,
     view_differs: bool,
+    bound: Option<crate::output::BoundNotice>,
 ) -> Option<crate::output::EmittedNotice> {
+    if let Some(bound) = bound {
+        return Some(crate::output::bounded_view_marker(bound));
+    }
     crate::output::emitted_notice_cost(
         crate::output::rewrite_origin().as_deref(),
         mode_str,
@@ -269,13 +275,11 @@ pub(crate) fn single_file_notice(
 ///
 /// # Built once, threaded down
 ///
-/// Built ONCE per read, at the top of [`process_file`] / [`process_stdin`],
-/// and threaded down from there. Three sites need this value — the cache READ
-/// key, the ADR-001 guard charge, and the cache WRITE key — and they must
-/// agree on it: a read key and a write key that disagree do not error, they
-/// serve another invocation's stdout (see [`crate::cache::CacheKeyParams`]).
-/// One value threaded down makes that agreement structural; three derivations
-/// made it a coincidence of three identical expressions.
+/// Built once before the transform in [`process_file`] / [`process_stdin`].
+/// The cache read key, guard charge and cache write key share this value.
+/// The requested mode, character budget and this prospective notice size form
+/// the pre-transform identity. A served bound outcome belongs in the entry
+/// body only: it is not known when the read key is built.
 fn view_notice_absolute(options: &ProcessOptions) -> Option<String> {
     // Ordered so the batch hot path returns before reading the environment.
     // Do not hoist `rewrite_origin` above this check: it scans `environ`, and
@@ -352,14 +356,14 @@ fn prospective_view_notice<'a>(
 /// can never produce a collision. Using the absolute length can at worst split
 /// one output across two keys — extra work, never wrong bytes.
 ///
-/// Keying on LENGTH rather than on the text covers origin, batch-ness and mode
-/// in one field, and makes a future label edit self-invalidating: change the
-/// marker wording and every warm entry whose verdict could move misses.
+/// This length describes the prospective legacy notice, not a bound outcome.
+/// It covers origin, batch state and requested mode before the transform.
+/// The separate character-budget key distinguishes default reads from typed
+/// modes. A fired bound stores typed state, not notice text, so warm reads
+/// rebuild the same disclosure through [`single_file_notice`].
 ///
 /// Measures the marker [`view_notice_absolute`] already built for this read.
-/// The cache READ key, the guard charge and the cache WRITE key are then the
-/// same number because they are the same value — not because three call sites
-/// happen to rebuild it identically.
+/// The read key, guard charge and write key share this exact value.
 fn view_notice_cache_bytes(absolute: Option<&str>) -> usize {
     absolute.map_or(0, str::len)
 }
@@ -446,6 +450,16 @@ fn try_cached_result(
         )
     };
 
+    // A stored outcome is not an authority for the output limit. Validate the
+    // final cached bytes and rebuilt notice before a default read can serve them.
+    if let Some(limit) = options.trunc.char_budget {
+        let count =
+            hit.content.chars().count() + notice_chars(options.mode, view_differs, hit.bound);
+        if count >= limit || !crate::output::within_output_limit(count) {
+            return Ok(None);
+        }
+    }
+
     // Effective language for a cache hit: explicit override wins, else detect from path.
     let cache_lang = options
         .explicit_lang
@@ -464,6 +478,7 @@ fn try_cached_result(
         language: cache_lang,
         stdin_raw: None,
         view_differs,
+        bound: hit.bound,
     }))
 }
 
@@ -577,7 +592,6 @@ fn run_transform(
                 // escalation is impossible, but line-level truncation to fit the
                 // budget is both possible and correct. ADR-017: the text is raw at
                 // this point, so line counts are in source space.
-                let source_line_count = contents.lines().count();
                 // Step 1: apply explicit max-lines / last-lines bounds.
                 let bounded = passthrough_with_truncation(
                     contents,
@@ -592,27 +606,11 @@ fn run_transform(
                 // explicit bound" (log2(N)+1 ≤ 64 for any realistic file size).
                 let final_output = match tokens::count_tokens(&bounded) {
                     Ok(tok) if tok <= budget => bounded,
-                    _ => {
-                        let mut lo = 1usize;
-                        let mut hi = source_line_count;
-                        for _ in 0..64 {
-                            if lo >= hi {
-                                break;
-                            }
-                            let mid = lo + (hi - lo).div_ceil(2);
-                            let candidate =
-                                passthrough_with_truncation(contents, None, Some(mid), None);
-                            let fits = tokens::count_tokens(&candidate)
-                                .map(|c| c <= budget)
-                                .unwrap_or(false);
-                            if fits {
-                                lo = mid;
-                            } else {
-                                hi = mid.saturating_sub(1);
-                            }
-                        }
-                        passthrough_with_truncation(contents, None, Some(lo), None)
-                    }
+                    _ => raw_line_cut(contents, None, 1, |candidate| {
+                        tokens::count_tokens(candidate)
+                            .map(|c| c <= budget)
+                            .unwrap_or(false)
+                    }),
                 };
                 return Ok((final_output, options.mode, false, None, true)); // degraded=true
             };
@@ -631,18 +629,16 @@ fn run_transform(
                 transform_file,
             )?;
 
-            // If line numbers requested, re-run the selected mode WITH line_numbers.
-            // Use the re-run output directly as the final output (avoids double transform).
-            let (final_output, line_map) = if options.line_numbers {
+            // Re-run for source coordinates, but keep the cascade's token cut.
+            let line_map = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
                 let (rerun_output, _has_errors, map, _degraded) =
                     transform_with_line_map(contents, language, &config)?;
-                (rerun_output, map)
+                map.map(|map| cut_line_map(&output, &rerun_output, &map))
             } else {
-                (output, None)
+                None
             };
-
-            Ok((final_output, mode, false, line_map, false)) // cascade path: degraded signal N/A
+            Ok((output, mode, false, line_map, false)) // cascade path: degraded signal N/A
         }
         None => {
             let language = explicit_lang.or_else(|| detect_language_from_path(path));
@@ -652,7 +648,7 @@ fn run_transform(
                 let config = cascade::build_config_with_opts(
                     options.mode,
                     &options.trunc,
-                    options.line_numbers,
+                    options.line_numbers || options.trunc.char_budget.is_some(),
                 );
                 let (output, has_errors, line_map, degraded) =
                     transform_with_line_map(contents, lang, &config)?;
@@ -665,7 +661,7 @@ fn run_transform(
                     let config = cascade::build_config_with_opts(
                         options.mode,
                         &options.trunc,
-                        options.line_numbers,
+                        options.line_numbers || options.trunc.char_budget.is_some(),
                     );
                     let (output, has_errors, line_map, degraded) =
                         transform_with_line_map(contents, lang, &config)?;
@@ -695,6 +691,42 @@ fn run_transform(
 /// pattern used across the processing pipeline.
 fn detect_language_from_shebang(text: &str) -> Option<Language> {
     text.lines().next().and_then(Language::from_shebang)
+}
+
+/// Keep source entries only for the common line prefix. A cut marker has no entry.
+pub(crate) fn cut_line_map(cut: &str, full: &str, full_map: &[usize]) -> Vec<usize> {
+    cut.lines()
+        .zip(full.lines())
+        .zip(full_map)
+        .take_while(|((cut_line, full_line), _)| cut_line == full_line)
+        .map(|(_, &source_line)| source_line)
+        .collect()
+}
+
+/// Cut raw text on whole lines. `min_lines` selects the smallest line-bound probe.
+/// A floor of one keeps the token path's one-content-line carve-out.
+pub(crate) fn raw_line_cut(
+    text: &str,
+    language: Option<Language>,
+    min_lines: usize,
+    mut fits: impl FnMut(&str) -> bool,
+) -> String {
+    assert!(min_lines <= 1, "raw line-cut floor must be zero or one");
+    let mut lo = min_lines;
+    let mut hi = text.lines().count();
+    for _ in 0..64 {
+        if lo >= hi {
+            break;
+        }
+        let mid = lo + (hi - lo).div_ceil(2);
+        let candidate = passthrough_with_truncation(text, language, Some(mid), None);
+        if fits(&candidate) {
+            lo = mid;
+        } else {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    passthrough_with_truncation(text, language, Some(lo), None)
 }
 
 /// Apply optional line-count truncation to a raw view for the unknown-language path.
@@ -867,36 +899,290 @@ fn build_annotation_map_by_matching(source: &str, truncated: &str) -> Vec<usize>
         .collect()
 }
 
-/// Build the [`ProcessResult`] for the unknown-language stdin passthrough (ADR-002).
-///
-/// Extracted from [`process_stdin`] to collapse the duplicated passthrough
-/// `ProcessResult` construction and `stdin_raw` retention. Emits the single
-/// SKIM_DEBUG degrade notice, then returns a lossless windowed passthrough.
-///
-/// The caller must first rule out the `--filename` hard-error case (an explicit
-/// but unrecognised extension); this path is only reached when no language is
-/// detectable *and* no `--filename` hint was given.
-///
-/// `stdin_raw` follows the main-path invariant: `Some(buffer)` iff `!show_stats`
-/// (stdin cannot be re-read, so the buffer must travel with the result for
-/// background tokenization).
-fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> ProcessResult {
+/// Final single-input view. Bounded reads have no delivered-cost guard verdict;
+/// their analytics rows retain the requested mode, but `served` stays absent.
+struct DefaultView {
+    parse_tier: Option<&'static str>,
+    output: String,
+    guardrail_triggered: bool,
+    served: Option<crate::output::Served>,
+    view_differs: bool,
+    bound: Option<crate::output::BoundNotice>,
+}
+
+fn notice_chars(mode: Mode, differs: bool, bound: Option<crate::output::BoundNotice>) -> usize {
+    single_file_notice(mode.name(), differs, bound)
+        .map_or(0, |notice| notice.line().chars().count())
+}
+
+fn annotated_chars(text: &str, options: &ProcessOptions, map: Option<&[usize]>) -> usize {
+    if options.line_numbers
+        && let Some(map) = map
+    {
+        return crate::format::format_with_line_numbers(text, map)
+            .chars()
+            .count();
+    }
+    text.chars().count()
+}
+
+/// Release-shaped final check. A bad assembly fails closed without a panic.
+fn enforce_default_assembly(
+    output: String,
+    raw: &str,
+    language: Option<Language>,
+    bound: &mut crate::output::BoundNotice,
+    limit: usize,
+) -> String {
+    let count = output.chars().count() + notice_chars(bound.mode, true, Some(*bound));
+    let output = if count >= limit || !crate::output::within_output_limit(count) {
+        bound.cut = true;
+        format!(
+            "{}\n",
+            elision_marker_line(
+                language,
+                raw.lines().count(),
+                ElidedSide::Truncated,
+                Some(ELISION_HINT)
+            )
+        )
+    } else {
+        output
+    };
+    debug_assert!(output.chars().count() + notice_chars(bound.mode, true, Some(*bound)) < limit);
+    output
+}
+
+/// Keep today's guard and notice below the limit. Above it, bypass the guard:
+/// raw may fit, else the character-bound walk selects or cuts a view. Step-down
+/// can remove whole declaration kinds. No token measurement occurs after step A.
+fn default_view(
+    raw: &str,
+    language: Option<Language>,
+    options: &ProcessOptions,
+    initial: cascade::CharBudgetRung,
+    shape: crate::output::BoundShape,
+) -> anyhow::Result<DefaultView> {
+    let limit = options
+        .trunc
+        .char_budget
+        .unwrap_or(crate::output::MAX_STDOUT_CHARS);
+    let cascade::CharBudgetRung {
+        text,
+        line_map,
+        has_errors,
+        degraded,
+    } = initial;
+    let view_notice = view_notice_absolute(options);
+    // Step A charges the same structure notice as the legacy path. The bound
+    // path below does not consult the guard again.
+    let charged = prospective_view_notice(view_notice.as_deref(), &options.trunc, raw);
+    let outcome =
+        crate::output::guardrail::apply_to_stderr_with_notice(raw.to_owned(), text, charged)?;
+    let triggered = outcome.was_triggered();
+    let text = outcome.into_output();
+    let raw_map = options
+        .line_numbers
+        .then(|| crate::format::identity_line_map(raw));
+    let map = if triggered {
+        raw_map.as_deref()
+    } else {
+        line_map.as_deref()
+    };
+    let differs = text != raw;
+    let default_view_chars =
+        annotated_chars(&text, options, map) + notice_chars(options.mode, differs, None);
+    if default_view_chars < limit {
+        return Ok(DefaultView {
+            parse_tier: Some(parse_tier_from(options.mode, has_errors, degraded)),
+            output: apply_line_numbers(
+                text,
+                options.line_numbers,
+                triggered,
+                if triggered { raw_map } else { line_map },
+            ),
+            guardrail_triggered: triggered,
+            served: served_from_guard(options.mode, triggered),
+            view_differs: differs,
+            bound: None,
+        });
+    }
+    if annotated_chars(raw, options, raw_map.as_deref()) < limit {
+        return Ok(DefaultView {
+            parse_tier: Some("passthrough"),
+            output: apply_line_numbers(raw.to_owned(), options.line_numbers, false, raw_map),
+            guardrail_triggered: true,
+            served: None,
+            view_differs: false,
+            bound: None,
+        });
+    }
+    let make_bound = |mode, cut| crate::output::BoundNotice {
+        mode,
+        default_view_chars,
+        cut,
+        shape,
+    };
+    let mut initial = (!triggered).then_some(cascade::CharBudgetRung {
+        text,
+        line_map,
+        has_errors,
+        degraded,
+    });
+    let selection = if let Some(language) = language.filter(|_| !degraded) {
+        cascade::select_for_char_budget(
+            &options.trunc,
+            language,
+            |config| {
+                if config.mode == options.mode
+                    && let Some(rung) = initial.take()
+                {
+                    return Ok(Some(rung));
+                }
+                // Always retain source coordinates for an exact cut count, even
+                // when the caller did not request displayed line numbers.
+                let mut config = config.clone();
+                config.line_numbers = true;
+                let (text, has_errors, line_map, degraded) =
+                    transform_with_line_map(raw, language, &config)?;
+                Ok(Some(cascade::CharBudgetRung {
+                    text,
+                    line_map,
+                    has_errors,
+                    degraded,
+                }))
+            },
+            |mode, rung| {
+                annotated_chars(&rung.text, options, rung.line_map.as_deref())
+                    + notice_chars(mode, true, Some(make_bound(mode, false)))
+            },
+        )?
+    } else {
+        cascade::RungWalk::NoOutput
+    };
+    let (rung, mut bound) = match selection {
+        cascade::RungWalk::Fits { mode, rung } => (rung, make_bound(mode, false)),
+        cascade::RungWalk::NoneFits { mode, mut rung } => {
+            let bound = make_bound(mode, true);
+            // The core measures content plus marker, then adds the input's final
+            // newline. Reserve that newline apart from the strict-limit margin.
+            let trailing = usize::from(rung.text.ends_with('\n'));
+            let budget = limit.saturating_sub(1 + trailing + notice_chars(mode, true, Some(bound)));
+            let prefix_width = if options.line_numbers && rung.line_map.is_some() {
+                raw.lines().count().max(1).ilog10() as usize + 2
+            } else {
+                0
+            };
+            let count_source = match rung.line_map.as_deref() {
+                Some(map) if map.len() >= rung.text.lines().count() => {
+                    rskim_core::TruncationCountSource::LineMap {
+                        map,
+                        source_total: raw.lines().count(),
+                    }
+                }
+                _ => rskim_core::TruncationCountSource::ViewLines,
+            };
+            let cut = rskim_core::truncate_with_count_source(
+                &rung.text,
+                language.unwrap_or(Language::Rust),
+                budget,
+                |text| text.chars().count() + text.lines().count() * prefix_width,
+                None,
+                Some(ELISION_HINT),
+                count_source,
+            )?;
+            rung.line_map = rung
+                .line_map
+                .map(|map| cut_line_map(&cut, &rung.text, &map));
+            rung.text = cut;
+            (rung, bound)
+        }
+        cascade::RungWalk::AllEmpty | cascade::RungWalk::NoOutput => {
+            let bound = make_bound(Mode::Full, true);
+            let budget = limit.saturating_sub(1 + notice_chars(Mode::Full, true, Some(bound)));
+            let prefix_width = if options.line_numbers {
+                raw.lines().count().max(1).ilog10() as usize + 2
+            } else {
+                0
+            };
+            let cut = raw_line_cut(raw, language, 0, |text| {
+                text.chars().count() + text.lines().count() * prefix_width <= budget
+            });
+            let line_map = raw_map.map(|map| cut_line_map(&cut, raw, &map));
+            (
+                cascade::CharBudgetRung {
+                    text: cut,
+                    line_map,
+                    has_errors,
+                    degraded,
+                },
+                bound,
+            )
+        }
+    };
+    let parse_tier = Some(parse_tier_from(bound.mode, rung.has_errors, rung.degraded));
+    let output = apply_line_numbers(rung.text, options.line_numbers, false, rung.line_map);
+    let output = enforce_default_assembly(output, raw, language, &mut bound, limit);
+    let view_differs = output != raw;
+    Ok(DefaultView {
+        parse_tier,
+        output,
+        guardrail_triggered: false,
+        served: None,
+        view_differs,
+        bound: Some(bound),
+    })
+}
+
+/// Build an unknown-language stdin result after the caller rules out a bad
+/// filename hint. Apply the selected bounds to raw text. Retain `stdin_raw`
+/// exactly when stats are absent, since stdin cannot be read again.
+fn stdin_passthrough_result(
+    buffer: String,
+    options: &ProcessOptions,
+) -> anyhow::Result<ProcessResult> {
     crate::debug_log!(
         "[skim] notice: unknown language for stdin — degraded to lossless passthrough. \
          Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass."
     );
-    let output = passthrough_with_truncation(
-        &buffer,
-        None,
-        options.trunc.max_lines,
-        options.trunc.last_lines,
-    );
+    // Unknown-language stdin has no line annotation or notice below the limit.
+    // Keep that legacy path intact; only an over-limit raw view needs the bound.
+    let needs_bound = options
+        .trunc
+        .char_budget
+        .is_some_and(|limit| buffer.chars().count() >= limit);
+    let (output, bound, view_differs) = if needs_bound {
+        let view = default_view(
+            &buffer,
+            None,
+            options,
+            cascade::CharBudgetRung {
+                text: buffer.clone(),
+                line_map: None,
+                has_errors: false,
+                degraded: true,
+            },
+            crate::output::BoundShape::Stdin,
+        )?;
+        (view.output, view.bound, view.view_differs)
+    } else {
+        (
+            passthrough_with_truncation(
+                &buffer,
+                None,
+                options.trunc.max_lines,
+                options.trunc.last_lines,
+            ),
+            None,
+            false,
+        )
+    };
     let stdin_raw = if !options.show_stats {
         Some(buffer)
     } else {
         None
     };
-    ProcessResult {
+    Ok(ProcessResult {
         output,
         original_tokens: None,
         transformed_tokens: None,
@@ -906,8 +1192,9 @@ fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> Process
         parse_tier: Some("passthrough"),
         language: None,
         stdin_raw,
-        view_differs: false, // passthrough output is byte-identical to input
-    }
+        view_differs,
+        bound,
+    })
 }
 
 /// Process stdin input and return transformed content with optional token statistics.
@@ -964,45 +1251,46 @@ pub(crate) fn process_stdin(
             );
         }
         // No --filename, no --language, no shebang — degrade to lossless passthrough.
-        return Ok(stdin_passthrough_result(buffer, &options));
+        return stdin_passthrough_result(buffer, &options);
     };
 
-    let (transformed, stdin_has_errors, stdin_line_map, stdin_degraded) = match options
-        .trunc
-        .token_budget
-    {
-        Some(budget) => {
-            // AC-10: Cascade mode selection without line numbers, then re-run with line numbers.
-            // reliability-8: pass the source line count so fallback_line_truncate can
-            // report a source-space omission count rather than an output-space count.
-            let source_line_count = buffer.lines().count();
-            let (output, mode) = cascade::cascade_for_token_budget(
-                options.mode,
-                &options.trunc,
-                budget,
-                language,
-                source_line_count,
-                |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
-            )?;
-            // Use the re-run output directly as the final output (avoids double transform).
-            let (cascade_output, line_map) = if options.line_numbers {
-                let config = cascade::build_config_with_opts(mode, &options.trunc, true);
-                let (rerun, _errs, map, _degraded) =
+    let (transformed, stdin_has_errors, stdin_line_map, stdin_degraded) =
+        match options.trunc.token_budget {
+            Some(budget) => {
+                // AC-10: Cascade mode selection without line numbers, then re-run with line numbers.
+                // reliability-8: pass the source line count so fallback_line_truncate can
+                // report a source-space omission count rather than an output-space count.
+                let source_line_count = buffer.lines().count();
+                let (output, mode) = cascade::cascade_for_token_budget(
+                    options.mode,
+                    &options.trunc,
+                    budget,
+                    language,
+                    source_line_count,
+                    |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
+                )?;
+                // Re-run for source coordinates, but keep the cascade's token cut.
+                let line_map = if options.line_numbers {
+                    let config = cascade::build_config_with_opts(mode, &options.trunc, true);
+                    let (rerun, _errs, map, _degraded) =
+                        transform_with_line_map(&buffer, language, &config)?;
+                    map.map(|map| cut_line_map(&output, &rerun, &map))
+                } else {
+                    None
+                };
+                (output, false, line_map, false) // cascade path: degraded signal N/A
+            }
+            None => {
+                let config = cascade::build_config_with_opts(
+                    options.mode,
+                    &options.trunc,
+                    options.line_numbers || options.trunc.char_budget.is_some(),
+                );
+                let (output, has_errors, line_map, degraded) =
                     transform_with_line_map(&buffer, language, &config)?;
-                (rerun, map)
-            } else {
-                (output, None)
-            };
-            (cascade_output, false, line_map, false) // cascade path: degraded signal N/A
-        }
-        None => {
-            let config =
-                cascade::build_config_with_opts(options.mode, &options.trunc, options.line_numbers);
-            let (output, has_errors, line_map, degraded) =
-                transform_with_line_map(&buffer, language, &config)?;
-            (output, has_errors, line_map, degraded)
-        }
-    };
+                (output, has_errors, line_map, degraded)
+            }
+        };
 
     // Emit notice when debug output is enabled and the transform degraded to passthrough
     // due to a structural safety cap. The notice goes to stderr to avoid polluting stdout.
@@ -1021,85 +1309,115 @@ pub(crate) fn process_stdin(
         stdin_degraded,
     ));
 
-    // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
-    // Same protection as process_file; token counting happens after so stats reflect
-    // the final output. Guardrail comparison uses UN-annotated output.
-    //
-    // ADR-001: the guardrail also runs when --tokens is set (the cascade path above
-    // may have selected a mode that, after elision markers, is still larger than raw).
-    // The clone is intentional: disclosure affects view selection and we need `buffer`
-    // intact as the raw baseline for view_differs and the transparency marker.
-    //
-    // ADR-001 amendment 2026-09-24: the guard is charged the stderr disclosure
-    // that keeping the compressed view would cost the reader, so a view that
-    // cannot pay for its own marker serves raw instead.
-    let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
-        // Built once, as in `process_file`. stdin has no cache, so the guard
-        // charge is this value's only consumer — the construction stays the
-        // same so the two paths cannot price the same disclosure differently.
-        let view_notice = view_notice_absolute(&options);
-        let charged = prospective_view_notice(view_notice.as_deref(), &options.trunc, &buffer);
-        let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
-            buffer.clone(),
-            transformed,
-            charged,
-        )?;
-        let triggered = outcome.was_triggered();
-        (outcome.into_output(), triggered)
-    } else {
-        (transformed, false)
-    };
-
-    // What the reader actually receives, read off the verdict that decided it.
-    // `None` for Mode::Full: the branch above skips the guard entirely, so
-    // there is no decision to record (and a full-mode label can cost context
-    // without ever having moved a guard verdict — ADR-001, 2026-09-24).
-    let served = served_from_guard(options.mode, guardrail_triggered);
-
-    // consistency-7: apply --max-lines / --last-lines to stdin when the guardrail
-    // served raw (the compressed path already applies the bound via the core
-    // transform; the raw path does not — PF-033 / ADR-016).
-    //
-    // enforce_line_bounds also returns the source-space line map for -n annotation
-    // (PF-019 / complexity-2: the identity map used for guardrail-triggered paths
-    // is wrong after --last-lines truncation, labelling tail lines as 1..N instead
-    // of their actual source positions).
-    let (final_output, post_trunc_map) = if guardrail_triggered
-        && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
-    {
-        enforce_line_bounds(&final_output, Some(language), &options.trunc, &buffer)
-    } else {
-        (final_output, None)
-    };
-
-    // Transparency marker: did the transformation produce a different view?
-    // Computed AFTER post-guardrail truncation so a bound that cuts makes the
-    // view lossy (view_differs = true), triggering the ADR-011 class-1 marker.
-    // When the guardrail served raw and no truncation was applied,
-    // final_output == buffer and view_differs is correctly false.
-    //
-    // B3 / ADR-011 class 1: view_differs is unconditional — does NOT require
-    // SKIM_REWRITTEN_FROM to be set.
-    let view_differs = final_output != buffer;
-
-    // Apply line number formatting AFTER guardrail and post-guardrail truncation,
-    // BEFORE token stats.
-    // When the guardrail served raw output, stdin_line_map (computed for the
-    // compressed view) has the wrong entry count for the raw text and must not be
-    // used.  Mirror the file-path logic: only use stdin_line_map when the guardrail
-    // did NOT trigger; for the guardrail path fall back to post_trunc_map or None
-    // (apply_line_numbers uses the identity map when combined_map is None).
-    let combined_map = if guardrail_triggered {
-        post_trunc_map
-    } else {
-        post_trunc_map.or(stdin_line_map)
-    };
-    let final_output = apply_line_numbers(
-        final_output,
-        options.line_numbers,
+    let DefaultView {
+        output: final_output,
         guardrail_triggered,
-        combined_map,
-    );
+        served,
+        view_differs,
+        bound,
+        parse_tier,
+    } = if options.trunc.char_budget.is_some() {
+        default_view(
+            &buffer,
+            Some(language),
+            &options,
+            cascade::CharBudgetRung {
+                text: transformed,
+                line_map: stdin_line_map,
+                has_errors: stdin_has_errors,
+                degraded: stdin_degraded,
+            },
+            crate::output::BoundShape::Stdin,
+        )?
+    } else {
+        // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
+        // Same protection as process_file; token counting happens after so stats reflect
+        // the final output. Guardrail comparison uses UN-annotated output.
+        //
+        // ADR-001: the guardrail also runs when --tokens is set (the cascade path above
+        // may have selected a mode that, after elision markers, is still larger than raw).
+        // The clone is intentional: disclosure affects view selection and we need `buffer`
+        // intact as the raw baseline for view_differs and the transparency marker.
+        //
+        // ADR-001 amendment 2026-09-24: the guard is charged the stderr disclosure
+        // that keeping the compressed view would cost the reader, so a view that
+        // cannot pay for its own marker serves raw instead.
+        let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
+            // Built once, as in `process_file`. stdin has no cache, so the guard
+            // charge is this value's only consumer — the construction stays the
+            // same so the two paths cannot price the same disclosure differently.
+            let view_notice = view_notice_absolute(&options);
+            let charged = prospective_view_notice(view_notice.as_deref(), &options.trunc, &buffer);
+            let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
+                buffer.clone(),
+                transformed,
+                charged,
+            )?;
+            let triggered = outcome.was_triggered();
+            (outcome.into_output(), triggered)
+        } else {
+            (transformed, false)
+        };
+
+        // What the reader actually receives, read off the verdict that decided it.
+        // `None` for Mode::Full: the branch above skips the guard entirely, so
+        // there is no decision to record (and a full-mode label can cost context
+        // without ever having moved a guard verdict — ADR-001, 2026-09-24).
+        let served = served_from_guard(options.mode, guardrail_triggered);
+
+        // consistency-7: apply --max-lines / --last-lines to stdin when the guardrail
+        // served raw (the compressed path already applies the bound via the core
+        // transform; the raw path does not — PF-033 / ADR-016).
+        //
+        // enforce_line_bounds also returns the source-space line map for -n annotation
+        // (PF-019 / complexity-2: the identity map used for guardrail-triggered paths
+        // is wrong after --last-lines truncation, labelling tail lines as 1..N instead
+        // of their actual source positions).
+        let (final_output, post_trunc_map) = if guardrail_triggered
+            && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
+        {
+            enforce_line_bounds(&final_output, Some(language), &options.trunc, &buffer)
+        } else {
+            (final_output, None)
+        };
+
+        // Transparency marker: did the transformation produce a different view?
+        // Computed AFTER post-guardrail truncation so a bound that cuts makes the
+        // view lossy (view_differs = true), triggering the ADR-011 class-1 marker.
+        // When the guardrail served raw and no truncation was applied,
+        // final_output == buffer and view_differs is correctly false.
+        //
+        // B3 / ADR-011 class 1: view_differs is unconditional — does NOT require
+        // SKIM_REWRITTEN_FROM to be set.
+        let view_differs = final_output != buffer;
+
+        // Apply line number formatting AFTER guardrail and post-guardrail truncation,
+        // BEFORE token stats.
+        // When the guardrail served raw output, stdin_line_map (computed for the
+        // compressed view) has the wrong entry count for the raw text and must not be
+        // used.  Mirror the file-path logic: only use stdin_line_map when the guardrail
+        // did NOT trigger; for the guardrail path fall back to post_trunc_map or None
+        // (apply_line_numbers uses the identity map when combined_map is None).
+        let combined_map = if guardrail_triggered {
+            post_trunc_map
+        } else {
+            post_trunc_map.or(stdin_line_map)
+        };
+        let final_output = apply_line_numbers(
+            final_output,
+            options.line_numbers,
+            guardrail_triggered,
+            combined_map,
+        );
+        DefaultView {
+            output: final_output,
+            guardrail_triggered,
+            served,
+            view_differs,
+            bound: None,
+            parse_tier,
+        }
+    };
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
@@ -1143,6 +1461,7 @@ pub(crate) fn process_stdin(
         language: Some(language),
         stdin_raw,
         view_differs,
+        bound,
     })
 }
 
@@ -1200,101 +1519,132 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // but the parse tier reflects the transformation, not the final selection).
     let parse_tier = Some(parse_tier_from(options.mode, has_errors, degraded));
 
-    // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
-    // Token counting happens AFTER this decision so stats reflect the final output.
-    // Guardrail comparison uses UN-annotated output (before line number formatting).
-    //
-    // ADR-001: the guardrail also runs when --tokens is set (the cascade may have
-    // selected a mode that, after elision markers, is still larger than raw).
-    // The clone is intentional: disclosure affects view selection and we need
-    // `contents` intact as the raw baseline for view_differs and the transparency
-    // marker below.
-    //
-    // ADR-001 amendment 2026-09-24: the guard is charged the stderr disclosure
-    // that keeping the compressed view would cost the reader, so a view that
-    // cannot pay for its own marker serves raw instead.
-    let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
-        let charged = prospective_view_notice(view_notice.as_deref(), &options.trunc, &contents);
-        let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
-            contents.clone(),
-            result,
-            charged,
-        )?;
-        let triggered = outcome.was_triggered();
-        (outcome.into_output(), triggered)
-    } else {
-        (result, false)
-    };
-
-    // See `served_from_guard`: recorded from the verdict, never inferred from
-    // `parse_tier`, which is computed above — before this decision exists.
-    let served = served_from_guard(options.mode, guardrail_triggered);
-
-    // Post-guardrail line-bound enforcement (#317 / ADR-002 / PF-033).
-    //
-    // The guardrail may return raw `contents` when the compressed output (with
-    // elision markers) exceeded raw in tokens.  Raw contents are still subject to
-    // `--max-lines` / `--last-lines`; apply the bound here ONLY when the guardrail
-    // fired so that raw is capped.
-    //
-    // When the guardrail did NOT fire (compressed output selected), the core
-    // transform already applied the bound correctly via `simple_line_truncate` /
-    // `simple_last_line_truncate_with_start`.  The outer pass must NOT re-apply on
-    // already-bounded output: PF-033 shows that re-applying over text that already
-    // has a synthetic marker line counts the marker as a source line (wrong
-    // coordinate space — ADR-017) and undoes the ADR-016 N=1 carve-out (the inner
-    // pass emits 2 lines for N=1 but the outer pass then sees 2 > 1 and keeps
-    // only the marker alone with zero content lines).
-    //
-    // enforce_line_bounds also returns the source-space line map for -n annotation
-    // (complexity-2 / PF-019): using the identity map on a tail-truncated view
-    // labels retained lines as 1..N instead of their actual source positions.
-    let (final_output, post_trunc_map) = if guardrail_triggered
-        && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
-    {
-        enforce_line_bounds(&final_output, language, &options.trunc, &contents)
-    } else {
-        (final_output, None)
-    };
-
-    // Transparency marker: did transformation produce a different view than raw bytes?
-    // Computed AFTER post-guardrail truncation so a bound that cuts the raw view
-    // correctly makes view_differs true (ADR-011 class 1: the truncation is lossy,
-    // so the marker must fire).  When the guardrail served raw and no truncation was
-    // applied, final_output == contents and view_differs is correctly false.
-    //
-    // B3 / ADR-011 class 1: unconditional — does NOT require SKIM_REWRITTEN_FROM.
-    let view_differs = final_output != contents;
-
-    // Apply line number formatting AFTER guardrail and post-guardrail truncation,
-    // BEFORE cache write and token stats.
-    // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
-    //
-    // When the guardrail served raw output (guardrail_triggered = true), the
-    // transform's line_map was computed for the *compressed* view and has fewer
-    // entries than the raw text.  Using it to annotate the raw output produces a
-    // misaligned map (leading blank lines get the wrong source numbers, and later
-    // lines shift by however many entries were dropped — #476 / PF-019 regression).
-    //
-    // Correct logic:
-    //   - guardrail triggered + truncation applied → use post_trunc_map (it was
-    //     built from the raw text by enforce_line_bounds, so entry count matches)
-    //   - guardrail triggered + no truncation    → pass None; apply_line_numbers
-    //     falls back to the identity map, which is correct for the raw text
-    //   - guardrail NOT triggered               → use post_trunc_map (from
-    //     --max-lines/--last-lines on the compressed view) or line_map (from the
-    //     transform), whichever is set
-    let combined_map = if guardrail_triggered {
-        post_trunc_map // None unless truncation was also applied
-    } else {
-        post_trunc_map.or(line_map)
-    };
-    let final_output = apply_line_numbers(
-        final_output,
-        options.line_numbers,
+    let DefaultView {
+        output: final_output,
         guardrail_triggered,
-        combined_map,
-    );
+        served,
+        view_differs,
+        bound,
+        parse_tier,
+    } = if options.trunc.char_budget.is_some() {
+        default_view(
+            &contents,
+            language,
+            &options,
+            cascade::CharBudgetRung {
+                text: result,
+                line_map,
+                has_errors,
+                degraded,
+            },
+            crate::output::BoundShape::File,
+        )?
+    } else {
+        // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
+        // Token counting happens AFTER this decision so stats reflect the final output.
+        // Guardrail comparison uses UN-annotated output (before line number formatting).
+        //
+        // ADR-001: the guardrail also runs when --tokens is set (the cascade may have
+        // selected a mode that, after elision markers, is still larger than raw).
+        // The clone is intentional: disclosure affects view selection and we need
+        // `contents` intact as the raw baseline for view_differs and the transparency
+        // marker below.
+        //
+        // ADR-001 amendment 2026-09-24: the guard is charged the stderr disclosure
+        // that keeping the compressed view would cost the reader, so a view that
+        // cannot pay for its own marker serves raw instead.
+        let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
+            let charged =
+                prospective_view_notice(view_notice.as_deref(), &options.trunc, &contents);
+            let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
+                contents.clone(),
+                result,
+                charged,
+            )?;
+            let triggered = outcome.was_triggered();
+            (outcome.into_output(), triggered)
+        } else {
+            (result, false)
+        };
+
+        // See `served_from_guard`: recorded from the verdict, never inferred from
+        // `parse_tier`, which is computed above — before this decision exists.
+        let served = served_from_guard(options.mode, guardrail_triggered);
+
+        // Post-guardrail line-bound enforcement (#317 / ADR-002 / PF-033).
+        //
+        // The guardrail may return raw `contents` when the compressed output (with
+        // elision markers) exceeded raw in tokens.  Raw contents are still subject to
+        // `--max-lines` / `--last-lines`; apply the bound here ONLY when the guardrail
+        // fired so that raw is capped.
+        //
+        // When the guardrail did NOT fire (compressed output selected), the core
+        // transform already applied the bound correctly via `simple_line_truncate` /
+        // `simple_last_line_truncate_with_start`.  The outer pass must NOT re-apply on
+        // already-bounded output: PF-033 shows that re-applying over text that already
+        // has a synthetic marker line counts the marker as a source line (wrong
+        // coordinate space — ADR-017) and undoes the ADR-016 N=1 carve-out (the inner
+        // pass emits 2 lines for N=1 but the outer pass then sees 2 > 1 and keeps
+        // only the marker alone with zero content lines).
+        //
+        // enforce_line_bounds also returns the source-space line map for -n annotation
+        // (complexity-2 / PF-019): using the identity map on a tail-truncated view
+        // labels retained lines as 1..N instead of their actual source positions.
+        let (final_output, post_trunc_map) = if guardrail_triggered
+            && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
+        {
+            enforce_line_bounds(&final_output, language, &options.trunc, &contents)
+        } else {
+            (final_output, None)
+        };
+
+        // Transparency marker: did transformation produce a different view than raw bytes?
+        // Computed AFTER post-guardrail truncation so a bound that cuts the raw view
+        // correctly makes view_differs true (ADR-011 class 1: the truncation is lossy,
+        // so the marker must fire).  When the guardrail served raw and no truncation was
+        // applied, final_output == contents and view_differs is correctly false.
+        //
+        // B3 / ADR-011 class 1: unconditional — does NOT require SKIM_REWRITTEN_FROM.
+        let view_differs = final_output != contents;
+
+        // Apply line number formatting AFTER guardrail and post-guardrail truncation,
+        // BEFORE cache write and token stats.
+        // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
+        //
+        // When the guardrail served raw output (guardrail_triggered = true), the
+        // transform's line_map was computed for the *compressed* view and has fewer
+        // entries than the raw text.  Using it to annotate the raw output produces a
+        // misaligned map (leading blank lines get the wrong source numbers, and later
+        // lines shift by however many entries were dropped — #476 / PF-019 regression).
+        //
+        // Correct logic:
+        //   - guardrail triggered + truncation applied → use post_trunc_map (it was
+        //     built from the raw text by enforce_line_bounds, so entry count matches)
+        //   - guardrail triggered + no truncation    → pass None; apply_line_numbers
+        //     falls back to the identity map, which is correct for the raw text
+        //   - guardrail NOT triggered               → use post_trunc_map (from
+        //     --max-lines/--last-lines on the compressed view) or line_map (from the
+        //     transform), whichever is set
+        let combined_map = if guardrail_triggered {
+            post_trunc_map // None unless truncation was also applied
+        } else {
+            post_trunc_map.or(line_map)
+        };
+        let final_output = apply_line_numbers(
+            final_output,
+            options.line_numbers,
+            guardrail_triggered,
+            combined_map,
+        );
+        DefaultView {
+            output: final_output,
+            guardrail_triggered,
+            served,
+            view_differs,
+            bound: None,
+            parse_tier,
+        }
+    };
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
@@ -1329,6 +1679,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             // cache-hit path does not have to re-derive it from the mode.
             view_differs,
             notice: None,
+            bound,
         });
     }
 
@@ -1344,6 +1695,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         language,
         stdin_raw: None,
         view_differs,
+        bound,
     })
 }
 
@@ -1429,6 +1781,7 @@ pub(crate) fn process_symbol_file(
             parse_tier: None,
             view_differs: true,
             notice: Some(&selected.notice),
+            bound: None,
         });
     }
 
@@ -1540,6 +1893,678 @@ pub(crate) fn read_source(path: &std::path::Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_shebang_transform_keeps_source_map_without_displayed_numbers() {
+        let source = "#!/usr/bin/env python3\ndef sample():\n    return 42\n";
+        let options = notice_opts(
+            Mode::Structure,
+            TruncationOptions {
+                char_budget: Some(crate::output::MAX_STDOUT_CHARS),
+                ..Default::default()
+            },
+            false,
+        );
+        let (text, _, _, map, degraded) =
+            run_transform(source, Path::new("script"), &options).unwrap();
+        assert!(!degraded);
+        assert!(map.is_some());
+        let unbudgeted = ProcessOptions {
+            trunc: TruncationOptions::default(),
+            ..options
+        };
+        assert_eq!(
+            text,
+            run_transform(source, Path::new("script"), &unbudgeted)
+                .unwrap()
+                .0
+        );
+    }
+
+    #[test]
+    fn bound_outcomes_measure_print_and_charge_one_notice() {
+        use crate::output::{BoundNotice, BoundShape};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Outcome {
+            Unchanged,
+            Raw,
+            StepDown,
+            Cut,
+            AssemblyFallback,
+            NumberedCut,
+        }
+
+        for outcome in [
+            Outcome::Unchanged,
+            Outcome::Raw,
+            Outcome::StepDown,
+            Outcome::Cut,
+            Outcome::AssemblyFallback,
+            Outcome::NumberedCut,
+        ] {
+            let limit = 600;
+            let numbered = matches!(outcome, Outcome::NumberedCut);
+            let mut options = ProcessOptions {
+                line_numbers: numbered,
+                ..notice_opts(
+                    Mode::Structure,
+                    TruncationOptions {
+                        char_budget: Some(limit),
+                        ..Default::default()
+                    },
+                    false,
+                )
+            };
+            let (raw, text, language, map) = match outcome {
+                Outcome::Unchanged | Outcome::AssemblyFallback => {
+                    ("x".repeat(5000), "kept view\n".to_owned(), None, None)
+                }
+                Outcome::Raw => ("界".repeat(limit - 1), "a".repeat(limit - 20), None, None),
+                Outcome::StepDown => {
+                    let raw = format!(
+                        "pub struct Kept {{ pub value: usize }}\n{}",
+                        (0..40)
+                            .map(|n| format!(
+                                "pub fn item{n}() {{ let value = {n}; println!(\"{{value}}\"); }}\n"
+                            ))
+                            .collect::<String>()
+                    );
+                    let mut config = cascade::build_config(Mode::Structure, &options.trunc);
+                    config.line_numbers = true;
+                    let (text, _, map, _) =
+                        transform_with_line_map(&raw, Language::Rust, &config).unwrap();
+                    (raw, text, Some(Language::Rust), map)
+                }
+                Outcome::Cut | Outcome::NumberedCut => (
+                    format!("{}\n", vec!["x".repeat(500); 10].join("\n")),
+                    format!("{}\n", vec!["a".repeat(100); 10].join("\n")),
+                    Some(Language::Json),
+                    Some((1..=10).collect()),
+                ),
+            };
+            if matches!(outcome, Outcome::Cut | Outcome::NumberedCut) {
+                let bound = BoundNotice {
+                    mode: Mode::Structure,
+                    default_view_chars: annotated_chars(&text, &options, map.as_deref())
+                        + notice_chars(options.mode, true, None),
+                    cut: true,
+                    shape: BoundShape::File,
+                };
+                let candidate = format!(
+                    "{}\n{}\n{}",
+                    "a".repeat(100),
+                    "a".repeat(100),
+                    elision_marker_line(
+                        Some(Language::Json),
+                        8,
+                        ElidedSide::Truncated,
+                        Some(ELISION_HINT)
+                    )
+                );
+                // Two plain lines fit exactly. Number prefixes must reduce that
+                // selection, not turn the final assembly into a bare marker.
+                options.trunc.char_budget = Some(
+                    candidate.chars().count() + notice_chars(options.mode, true, Some(bound)) + 2,
+                );
+            }
+            let limit = options.trunc.char_budget.unwrap();
+            let mut view = default_view(
+                &raw,
+                language,
+                &options,
+                cascade::CharBudgetRung {
+                    text,
+                    line_map: map,
+                    has_errors: false,
+                    degraded: false,
+                },
+                BoundShape::File,
+            )
+            .unwrap();
+            if matches!(outcome, Outcome::AssemblyFallback) {
+                // Exercise the final check with an oversized assembly. Valid
+                // rung estimates normally prevent this fail-closed path.
+                let mut bound = BoundNotice {
+                    mode: Mode::Structure,
+                    default_view_chars: 52000,
+                    cut: false,
+                    shape: BoundShape::File,
+                };
+                let oversized = "x".repeat(limit - notice_chars(bound.mode, true, Some(bound)));
+                view.output =
+                    enforce_default_assembly(oversized, &raw, language, &mut bound, limit);
+                view.bound = Some(bound);
+                view.view_differs = true;
+                view.served = None;
+            }
+            match outcome {
+                Outcome::Unchanged => {
+                    assert_eq!(view.output, "kept view\n");
+                    assert_eq!(view.bound, None);
+                }
+                Outcome::Raw => {
+                    assert_eq!(view.output, raw);
+                    assert!(!view.view_differs);
+                    assert_eq!(view.bound, None);
+                }
+                Outcome::StepDown => {
+                    let bound = view.bound.unwrap();
+                    assert_eq!(bound.mode, Mode::Types);
+                    assert!(!bound.cut);
+                    assert!(view.output.contains("Kept"));
+                }
+                Outcome::Cut | Outcome::NumberedCut => {
+                    assert!(view.bound.unwrap().cut);
+                    assert!(view.output.contains(&"a".repeat(100)));
+                    assert!(
+                        view.output
+                            .lines()
+                            .last()
+                            .unwrap()
+                            .contains("lines truncated")
+                    );
+                    assert_eq!(view.output.lines().count(), if numbered { 2 } else { 3 });
+                    if numbered {
+                        assert!(view.output.starts_with("1\t"));
+                        assert!(!view.output.lines().last().unwrap().contains('\t'));
+                    }
+                }
+                Outcome::AssemblyFallback => {
+                    assert!(view.bound.unwrap().cut);
+                    assert_eq!(view.output.lines().count(), 1);
+                    assert!(view.output.contains("1 line truncated"));
+                }
+            }
+
+            let result = ProcessResult {
+                output: view.output,
+                original_tokens: None,
+                transformed_tokens: None,
+                guardrail_triggered: view.guardrail_triggered,
+                served: view.served,
+                parse_tier: view.parse_tier,
+                language,
+                stdin_raw: None,
+                view_differs: view.view_differs,
+                bound: view.bound,
+            };
+            // The final fit check measures annotated stdout. The cut's prefix
+            // estimate reserves space; it does not add a second notice cost.
+            let measured = result.output.chars().count()
+                + notice_chars(options.mode, result.view_differs, result.bound);
+            let printed =
+                single_file_notice(options.mode.name(), result.view_differs, result.bound);
+            let printed_chars = printed
+                .as_ref()
+                .map_or(0, |notice| notice.line().chars().count());
+            assert_eq!(
+                measured,
+                result.output.chars().count() + printed_chars,
+                "{outcome:?}"
+            );
+            assert!(measured < limit, "{outcome:?}: {measured}");
+            let charged = crate::file_analytics_notice(&result, options.mode.name());
+            assert_eq!(charged, printed, "{outcome:?}");
+            if let Some(notice) = charged {
+                assert_eq!(notice.bytes(), printed.as_ref().unwrap().line().len());
+            }
+        }
+    }
+
+    #[test]
+    fn cut_rung_reserves_the_final_newline_at_an_exact_candidate_boundary() {
+        use crate::output::{BoundNotice, BoundShape};
+        for trailing in ["\n", ""] {
+            let text = format!("{}{trailing}", vec!["a".repeat(100); 10].join("\n"));
+            let raw = "x".repeat(5000);
+            let bound = BoundNotice {
+                mode: Mode::Structure,
+                default_view_chars: text.chars().count()
+                    + notice_chars(Mode::Structure, true, None),
+                cut: true,
+                shape: BoundShape::File,
+            };
+            let candidate = format!(
+                "{}\n{}\n{}",
+                "a".repeat(100),
+                "a".repeat(100),
+                elision_marker_line(
+                    Some(Language::Json),
+                    8,
+                    ElidedSide::Truncated,
+                    Some(ELISION_HINT)
+                )
+            );
+            for extra in [0, 1] {
+                let limit = candidate.chars().count()
+                    + notice_chars(Mode::Structure, true, Some(bound))
+                    + 1
+                    + extra;
+                let options = notice_opts(
+                    Mode::Structure,
+                    TruncationOptions {
+                        char_budget: Some(limit),
+                        ..Default::default()
+                    },
+                    false,
+                );
+                let view = default_view(
+                    &raw,
+                    Some(Language::Json),
+                    &options,
+                    cascade::CharBudgetRung {
+                        text: text.clone(),
+                        line_map: None,
+                        has_errors: false,
+                        degraded: false,
+                    },
+                    BoundShape::File,
+                )
+                .unwrap();
+                let kept = if trailing.is_empty() { 2 } else { 1 + extra };
+                let expected = format!(
+                    "{}\n{}{trailing}",
+                    vec!["a".repeat(100); kept].join("\n"),
+                    elision_marker_line(
+                        Some(Language::Json),
+                        10 - kept,
+                        ElidedSide::Truncated,
+                        Some(ELISION_HINT)
+                    )
+                );
+                assert_eq!(view.output, expected, "extra={extra}");
+                assert_eq!(view.bound, Some(bound));
+                assert!(
+                    view.output.chars().count() + notice_chars(options.mode, true, view.bound)
+                        < limit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_character_check_keeps_output_one_character_below_the_limit() {
+        use crate::output::{BoundNotice, BoundShape};
+        let limit = 600;
+        let mut bound = BoundNotice {
+            mode: Mode::Full,
+            default_view_chars: 52000,
+            cut: false,
+            shape: BoundShape::File,
+        };
+        let output = "界".repeat(limit - 1 - notice_chars(Mode::Full, true, Some(bound)));
+        let result =
+            enforce_default_assembly(output.clone(), "first\nsecond\n", None, &mut bound, limit);
+        assert_eq!(result, output);
+        assert!(!bound.cut);
+        assert_eq!(
+            result.chars().count() + notice_chars(Mode::Full, true, Some(bound)),
+            limit - 1
+        );
+    }
+
+    #[test]
+    fn unchanged_default_view_keeps_only_totals_below_the_limit() {
+        let limit = 600;
+        let options = notice_opts(
+            Mode::Structure,
+            TruncationOptions {
+                char_budget: Some(limit),
+                ..Default::default()
+            },
+            false,
+        );
+        let raw = "x".repeat(5000);
+        for shortfall in [1, 0] {
+            let text = "a".repeat(limit - shortfall - notice_chars(options.mode, true, None));
+            let view = default_view(
+                &raw,
+                None,
+                &options,
+                cascade::CharBudgetRung {
+                    text: text.clone(),
+                    line_map: None,
+                    has_errors: false,
+                    degraded: false,
+                },
+                crate::output::BoundShape::File,
+            )
+            .unwrap();
+            if shortfall == 1 {
+                assert_eq!(view.output, text);
+                assert_eq!(view.bound, None);
+                assert_eq!(view.served, Some(crate::output::Served::Transformed));
+            } else {
+                assert_ne!(view.output, text);
+                assert!(view.bound.unwrap().cut);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_default_view_keeps_only_totals_below_the_limit() {
+        let limit = 600;
+        let options = notice_opts(
+            Mode::Structure,
+            TruncationOptions {
+                char_budget: Some(limit),
+                ..Default::default()
+            },
+            false,
+        );
+        for shortfall in [1, 0] {
+            // Unicode makes raw larger in bytes. The guard keeps the candidate,
+            // but its notice makes it too large in characters.
+            let raw = "界".repeat(limit - shortfall);
+            let text = "a".repeat(limit - 20);
+            let view = default_view(
+                &raw,
+                None,
+                &options,
+                cascade::CharBudgetRung {
+                    text,
+                    line_map: None,
+                    has_errors: false,
+                    degraded: false,
+                },
+                crate::output::BoundShape::File,
+            )
+            .unwrap();
+            if shortfall == 1 {
+                assert_eq!(view.output, raw);
+                assert_eq!(view.bound, None);
+                assert!(!view.view_differs);
+                assert!(view.guardrail_triggered);
+                assert_eq!(view.served, None);
+            } else {
+                assert_ne!(view.output, raw);
+                assert!(view.bound.unwrap().cut);
+            }
+        }
+    }
+
+    #[test]
+    fn final_character_check_fails_closed_at_and_above_the_limit() {
+        use crate::output::{BoundNotice, BoundShape, MAX_STDOUT_CHARS};
+        for extra in [0, 1] {
+            let mut bound = BoundNotice {
+                mode: Mode::Full,
+                default_view_chars: 52000,
+                cut: false,
+                shape: BoundShape::File,
+            };
+            let notice = notice_chars(Mode::Full, true, Some(bound));
+            let output = "x".repeat(MAX_STDOUT_CHARS - notice + extra);
+            let raw = "first\nsecond\nthird\n";
+            let result = enforce_default_assembly(output, raw, None, &mut bound, MAX_STDOUT_CHARS);
+            assert_eq!(
+                result,
+                format!(
+                    "{}\n",
+                    elision_marker_line(None, 3, ElidedSide::Truncated, Some(ELISION_HINT))
+                )
+            );
+            assert!(bound.cut);
+            assert!(crate::output::within_output_limit(
+                result.chars().count() + notice_chars(Mode::Full, true, Some(bound))
+            ));
+        }
+    }
+
+    #[test]
+    fn over_limit_default_view_serves_unlabelled_raw_when_raw_fits() {
+        let options = ProcessOptions {
+            trunc: TruncationOptions {
+                char_budget: Some(crate::output::MAX_STDOUT_CHARS),
+                ..Default::default()
+            },
+            ..notice_opts(Mode::Structure, TruncationOptions::default(), false)
+        };
+        let raw = "界".repeat(28900);
+        let text = "a".repeat(28950);
+        assert!(
+            text.chars().count() + notice_chars(Mode::Structure, true, None)
+                >= crate::output::MAX_STDOUT_CHARS
+        );
+        let view = default_view(
+            &raw,
+            None,
+            &options,
+            cascade::CharBudgetRung {
+                text,
+                line_map: None,
+                has_errors: false,
+                degraded: false,
+            },
+            crate::output::BoundShape::File,
+        )
+        .unwrap();
+        assert_eq!(view.output, raw);
+        assert_eq!(view.bound, None);
+        assert!(!view.view_differs);
+        assert_eq!(view.served, None);
+    }
+
+    #[test]
+    fn bound_notice_replaces_the_legacy_notice_even_for_a_raw_cut() {
+        let bound = crate::output::BoundNotice {
+            mode: Mode::Full,
+            default_view_chars: 52000,
+            cut: true,
+            shape: crate::output::BoundShape::Stdin,
+        };
+        for differs in [false, true] {
+            assert_eq!(
+                single_file_notice("structure", differs, Some(bound)),
+                Some(crate::output::bounded_view_marker(bound)),
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn budgeted_cached_output_keeps_only_totals_below_the_limit() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let old_cache_dir = std::env::var_os("SKIM_CACHE_DIR");
+        // SAFETY: test-only, serial-gated. Restore the prior value below.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_dir.path()) };
+        let source = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
+        fs::write(source.path(), "fn original() {}\n").unwrap();
+        let options = ProcessOptions {
+            use_cache: true,
+            trunc: TruncationOptions {
+                char_budget: Some(crate::output::MAX_STDOUT_CHARS),
+                ..Default::default()
+            },
+            ..notice_opts(Mode::Structure, TruncationOptions::default(), false)
+        };
+        for bound in [
+            None,
+            Some(crate::output::BoundNotice {
+                mode: Mode::Types,
+                default_view_chars: 52000,
+                cut: true,
+                shape: crate::output::BoundShape::File,
+            }),
+        ] {
+            for shortfall in [1, 0] {
+                let content = "界".repeat(
+                    crate::output::MAX_STDOUT_CHARS
+                        - shortfall
+                        - notice_chars(Mode::Structure, true, bound),
+                );
+                cache::write_cache(&cache::CacheWriteParams {
+                    key: cache::CacheKeyParams {
+                        path: source.path(),
+                        mode: options.mode,
+                        trunc: options.trunc,
+                        line_numbers: false,
+                        notice_bytes: 0,
+                        symbol: None,
+                    },
+                    content: &content,
+                    original_tokens: None,
+                    transformed_tokens: None,
+                    effective_mode: None,
+                    parse_tier: None,
+                    view_differs: true,
+                    notice: None,
+                    bound,
+                })
+                .unwrap();
+                let hit = try_cached_result(source.path(), &options, 0).unwrap();
+                if shortfall == 1 {
+                    let hit = hit.expect("a total one character below the limit is a hit");
+                    assert_eq!(hit.output, content);
+                    assert_eq!(hit.bound, bound);
+                    assert_eq!(
+                        hit.output.chars().count()
+                            + notice_chars(options.mode, hit.view_differs, hit.bound),
+                        crate::output::MAX_STDOUT_CHARS - 1
+                    );
+                } else {
+                    assert!(hit.is_none(), "a total at the limit is a miss");
+                }
+            }
+        }
+        // SAFETY: test-only, serial-gated.
+        unsafe {
+            match old_cache_dir {
+                Some(value) => std::env::set_var("SKIM_CACHE_DIR", value),
+                None => std::env::remove_var("SKIM_CACHE_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_result_preserves_output_and_typed_bound_state() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let old_cache_dir = std::env::var_os("SKIM_CACHE_DIR");
+        // SAFETY: test-only, serial-gated. Restore the prior value below.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_dir.path()) };
+        let source = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
+        fs::write(source.path(), "fn original() {}\n").unwrap();
+        let options = ProcessOptions {
+            use_cache: true,
+            trunc: TruncationOptions {
+                char_budget: Some(crate::output::MAX_STDOUT_CHARS),
+                ..Default::default()
+            },
+            ..notice_opts(Mode::Structure, TruncationOptions::default(), false)
+        };
+        for (mode, cut) in [(Mode::Signatures, false), (Mode::Full, true)] {
+            let bound = crate::output::BoundNotice {
+                mode,
+                default_view_chars: 52000,
+                cut,
+                shape: crate::output::BoundShape::File,
+            };
+            cache::write_cache(&cache::CacheWriteParams {
+                key: cache::CacheKeyParams {
+                    path: source.path(),
+                    mode: options.mode,
+                    trunc: options.trunc,
+                    line_numbers: false,
+                    notice_bytes: 0,
+                    symbol: None,
+                },
+                content: "served output\n",
+                original_tokens: None,
+                transformed_tokens: None,
+                effective_mode: None,
+                parse_tier: None,
+                view_differs: true,
+                notice: None,
+                bound: Some(bound),
+            })
+            .unwrap();
+            let warm = try_cached_result(source.path(), &options, 0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(warm.output, "served output\n");
+            assert_eq!(warm.bound, Some(bound));
+        }
+        // SAFETY: test-only, serial-gated.
+        unsafe {
+            match old_cache_dir {
+                Some(value) => std::env::set_var("SKIM_CACHE_DIR", value),
+                None => std::env::remove_var("SKIM_CACHE_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_bound_keeps_the_exact_legacy_notice_and_silent_raw_path() {
+        for mode in ["structure", "pseudo", "full"] {
+            for differs in [false, true] {
+                assert_eq!(
+                    single_file_notice(mode, differs, None),
+                    crate::output::emitted_notice_cost(
+                        crate::output::rewrite_origin().as_deref(),
+                        mode,
+                        usize::from(differs),
+                        1,
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cut_line_map_keeps_only_the_common_prefix_and_leaves_the_marker_unnumbered() {
+        let full = "type A = string;\n\ntype B = number;\n";
+        let cut = "type A = string;\n\n// ... (8 lines truncated)";
+        let map = cut_line_map(cut, full, &[3, 0, 9]);
+        assert_eq!(map, [3, 0]);
+        assert_eq!(
+            apply_line_numbers(cut.into(), true, false, Some(map)),
+            "3\ttype A = string;\n\n// ... (8 lines truncated)"
+        );
+    }
+
+    #[test]
+    fn cut_line_map_stops_at_a_changed_line_and_accepts_a_short_map() {
+        assert_eq!(
+            cut_line_map("same\nchanged\n", "same\noriginal\n", &[7, 8]),
+            [7]
+        );
+        assert_eq!(cut_line_map("same\nnext\n", "same\nnext\n", &[7]), [7]);
+        assert!(cut_line_map("marker\n", "content\n", &[7]).is_empty());
+    }
+
+    #[test]
+    fn raw_line_cut_zero_floor_serves_only_the_source_count_marker_when_no_line_fits() {
+        let source = "éééééééééé\r\nsecond\r\nthird";
+        for language in [None, Some(Language::Rust)] {
+            let marker =
+                elision_marker_line(language, 3, ElidedSide::Truncated, Some(ELISION_HINT));
+            assert_eq!(
+                raw_line_cut(source, language, 0, |_| false),
+                format!("{marker}\n")
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "raw line-cut floor must be zero or one")]
+    fn raw_line_cut_rejects_a_floor_other_than_zero_or_one() {
+        raw_line_cut("first\nsecond\n", None, 2, |_| true);
+    }
+
+    #[test]
+    fn raw_line_cut_one_floor_preserves_the_token_carve_out_and_crlf() {
+        let source = "éééééééééé\r\nsecond\r\nthird";
+        assert_eq!(
+            raw_line_cut(source, None, 1, |_| false),
+            passthrough_with_truncation(source, None, Some(1), None)
+        );
+        assert_eq!(raw_line_cut(source, None, 1, |_| true), source);
+        let cut = raw_line_cut(source, None, 0, |candidate| candidate.lines().count() <= 2);
+        assert!(cut.starts_with("éééééééééé\r\n"), "{cut}");
+        assert!(cut.contains("2 lines truncated"), "{cut}");
+    }
 
     // ========================================================================
     // report_token_stats tests
@@ -1805,7 +2830,7 @@ mod tests {
     #[test]
     fn stdin_passthrough_result_retains_buffer_when_no_stats() {
         let src = "line one\nline two\n";
-        let result = stdin_passthrough_result(src.to_string(), &passthrough_opts(false));
+        let result = stdin_passthrough_result(src.to_string(), &passthrough_opts(false)).unwrap();
 
         assert_eq!(result.parse_tier, Some("passthrough"));
         assert_eq!(result.language, None);
@@ -1823,7 +2848,7 @@ mod tests {
     #[test]
     fn stdin_passthrough_result_drops_buffer_when_stats() {
         let src = "alpha\nbeta\n";
-        let result = stdin_passthrough_result(src.to_string(), &passthrough_opts(true));
+        let result = stdin_passthrough_result(src.to_string(), &passthrough_opts(true)).unwrap();
 
         assert_eq!(result.stdin_raw, None);
         assert_eq!(result.output, src);
@@ -1837,7 +2862,7 @@ mod tests {
         let mut opts = passthrough_opts(false);
         opts.trunc.max_lines = Some(2);
 
-        let result = stdin_passthrough_result(src.to_string(), &opts);
+        let result = stdin_passthrough_result(src.to_string(), &opts).unwrap();
 
         assert!(
             result
