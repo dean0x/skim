@@ -25,10 +25,12 @@
 //! file that could not be labelled gives `unlabelled`. A line takes the best
 //! role among its matches, in the tier order of [`Role`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-use rskim_core::{Declaration, Language, Parser, declarations, enclosing_declaration};
+use rskim_core::{
+    AstWalkConfig, AstWalkIter, Declaration, Language, Parser, declarations, enclosing_declaration,
+};
 use tree_sitter::{Node, Tree};
 
 use super::classifier::{classify_data_format, classify_tree};
@@ -211,6 +213,46 @@ pub(super) struct SingleDef<'a> {
     pub(super) is_method: bool,
 }
 
+/// Count and byte bounds for name evidence from one labelled file.
+#[derive(Clone, Copy)]
+pub(super) struct NameCap {
+    pub(super) count: usize,
+    pub(super) bytes: usize,
+}
+
+/// A distinct callee name and its first call line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CalledName {
+    pub(super) name: String,
+    pub(super) line: u32,
+}
+
+/// A callable declaration whose name holds a query word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WordDeclaration {
+    pub(super) name: String,
+    pub(super) line: u32,
+    pub(super) first_line: u32,
+    pub(super) end_line: u32,
+}
+
+/// Kept name evidence and exact counts at the cuts.
+pub(super) struct NameScan<T> {
+    pub(super) kept: Vec<T>,
+    pub(super) dropped: u64,
+    pub(super) long_names: u64,
+}
+
+impl<T> Default for NameScan<T> {
+    fn default() -> Self {
+        Self {
+            kept: Vec::new(),
+            dropped: 0,
+            long_names: 0,
+        }
+    }
+}
+
 /// What the rules read from one labelled file.
 pub(super) struct Labels {
     parts: Parts,
@@ -296,6 +338,96 @@ impl Labels {
                 fields,
             },
         })
+    }
+
+    /// Read distinct callees in source order without another parse.
+    ///
+    /// The default walk is complete only because `Labels::new` refuses a capped
+    /// declaration walk over this same tree. The distinct-name set borrows from
+    /// the bounded source and includes dropped names, so repeats count once.
+    /// Overlong names never enter that set; `long_names` counts their occurrences.
+    pub(super) fn called_names(
+        &self,
+        source: &str,
+        test: impl Fn(&str) -> bool,
+        cap: NameCap,
+    ) -> NameScan<CalledName> {
+        let mut result = NameScan::default();
+        let Parts::Code { tree, lang, .. } = &self.parts else {
+            return result;
+        };
+        let walk_cap = AstWalkConfig::default();
+        debug_assert!(
+            tree.root_node().descendant_count() <= walk_cap.max_nodes as usize,
+            "Labels::new refuses a capped declaration walk"
+        );
+        let mut seen = HashSet::new();
+        for item in AstWalkIter::new(tree.walk(), walk_cap) {
+            debug_assert!(
+                item.depth.saturating_add(1) < walk_cap.max_depth || item.node.child_count() == 0,
+                "Labels::new refuses a depth-capped declaration walk"
+            );
+            let node = item.node;
+            if !is_identifier(node) {
+                continue;
+            }
+            let Some(name) = source.get(node.byte_range()) else {
+                continue;
+            };
+            if !test(name) || !is_callee(node, *lang) {
+                continue;
+            }
+            if name.len() > cap.bytes {
+                result.long_names += 1;
+            } else if seen.insert(name) {
+                if result.kept.len() < cap.count {
+                    result.kept.push(CalledName {
+                        name: name.to_owned(),
+                        line: row_to_line(node.start_position().row),
+                    });
+                } else {
+                    result.dropped += 1;
+                }
+            }
+        }
+        result
+    }
+
+    /// Read callable declarations from the complete declaration scan.
+    /// Byte and site cuts are separate; a long name consumes no site quota.
+    pub(super) fn word_declarations(
+        &self,
+        test: impl Fn(&str) -> bool,
+        cap: NameCap,
+    ) -> NameScan<WordDeclaration> {
+        let mut result = NameScan::default();
+        let Parts::Code {
+            tree, lang, decls, ..
+        } = &self.parts
+        else {
+            return result;
+        };
+        for decl in decls {
+            if !callable_kind(decl, *lang, tree) || !test(&decl.name) {
+                continue;
+            }
+            if decl.name.len() > cap.bytes {
+                result.long_names += 1;
+            } else if result.kept.len() < cap.count {
+                let Some(name_node) = node_at(tree, decl.name_bytes.start) else {
+                    continue;
+                };
+                result.kept.push(WordDeclaration {
+                    name: decl.name.clone(),
+                    line: row_to_line(name_node.start_position().row),
+                    first_line: row_to_line(decl.first_row),
+                    end_line: row_to_line(decl.last_row),
+                });
+            } else {
+                result.dropped += 1;
+            }
+        }
+        result
     }
 
     /// Read the exact callee token at `start`. Only direct calls and one own

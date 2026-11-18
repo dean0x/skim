@@ -113,6 +113,255 @@ fn rendered(out: &ScanOutput, needle: &str, limits: Limits, context: usize) -> R
     )
 }
 
+#[test]
+fn the_name_link_defaults_match_the_named_bounds() {
+    let limits = Limits::default();
+    assert_eq!(
+        (
+            limits.max_called_names_per_file,
+            limits.max_word_defs_per_file,
+            limits.max_word_defs,
+            limits.max_name_bytes,
+            limits.max_called_shown
+        ),
+        (32, 64, 5_000, 256, 10)
+    );
+}
+
+#[test]
+fn the_word_view_stores_called_names_of_source_files_up_to_the_per_file_cap() {
+    let tree = Tree::new();
+    let source = "fn run() {\n readLock(); readLock();\n readLock();\n writeLock();\n closeLock(); closeLock();\n}\n";
+    for path in [
+        "src/a.rs",
+        "tests/a.rs",
+        "docs/a.rs",
+        "README.md",
+        "data.json",
+    ] {
+        tree.write(path, source);
+    }
+    let limits = Limits {
+        max_called_names_per_file: 2,
+        max_stored_lines: 0,
+        ..Limits::default()
+    };
+    let out = scan(&tree, &words(&["lock", "read"]), limits, 0);
+    let links = &file(&out, "src/a.rs").links;
+    assert_eq!(
+        links
+            .called
+            .iter()
+            .map(|c| (c.name.as_str(), c.line))
+            .collect::<Vec<_>>(),
+        [("readLock", 2), ("writeLock", 4)]
+    );
+    assert_eq!(links.called_dropped, 1);
+    assert!(out.caps.called_names);
+    for path in ["tests/a.rs", "docs/a.rs", "README.md", "data.json"] {
+        assert!(file(&out, path).links.called.is_empty(), "{path}");
+    }
+}
+
+#[test]
+fn repeated_calls_of_one_name_do_not_fill_the_callee_cap() {
+    let tree = Tree::new();
+    tree.write(
+        "a.rs",
+        format!(
+            "fn run() {{\n{}writeLock();\n}}",
+            "readLock();\n".repeat(40)
+        ),
+    );
+    let out = scan(
+        &tree,
+        &words(&["lock", "read"]),
+        Limits {
+            max_called_names_per_file: 2,
+            ..Limits::default()
+        },
+        0,
+    );
+    let links = &file(&out, "a.rs").links;
+    assert_eq!(
+        links
+            .called
+            .iter()
+            .map(|c| (c.name.as_str(), c.line))
+            .collect::<Vec<_>>(),
+        [("readLock", 2), ("writeLock", 42)]
+    );
+    assert_eq!(links.called_dropped, 0);
+    assert!(!out.caps.called_names);
+}
+
+#[test]
+fn the_word_view_stores_callable_definitions_up_to_the_per_file_and_all_files_caps() {
+    let tree = Tree::new();
+    tree.write(
+        "src/a.rs",
+        "fn lockOne() {}\nfn lockTwo() {}\nfn lockThree() {}\n",
+    );
+    tree.write(
+        "src/lock.rs",
+        "fn lockFour() {}\nfn lockFive() {}\nfn lockSix() {}\n",
+    );
+    tree.write("tests/b.rs", "fn lockSeven() {}\n");
+    let limits = Limits {
+        max_word_defs_per_file: 2,
+        max_word_defs: 3,
+        max_stored_lines: 0,
+        ..Limits::default()
+    };
+    let out = scan(&tree, &words(&["lock", "none"]), limits, 0);
+    // The name tier parses src/lock.rs before the path-earlier src/a.rs.
+    assert_eq!(
+        file(&out, "src/lock.rs")
+            .links
+            .defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockFour", "lockFive"]
+    );
+    assert_eq!(file(&out, "src/lock.rs").links.defs_dropped, 1);
+    assert_eq!(
+        file(&out, "src/a.rs")
+            .links
+            .defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockOne"]
+    );
+    assert_eq!(file(&out, "src/a.rs").links.defs_dropped, 2);
+    assert_eq!(file(&out, "tests/b.rs").links.defs_dropped, 1);
+    assert!(out.caps.file_word_defs);
+    assert!(out.caps.all_word_defs);
+    let mut no_cuts = limits;
+    no_cuts.max_word_defs_per_file = 3;
+    no_cuts.max_word_defs = 7;
+    let out = scan(&tree, &words(&["lock", "none"]), no_cuts, 0);
+    assert_eq!(file(&out, "tests/b.rs").links.defs[0].name, "lockSeven");
+    assert!(!out.caps.file_word_defs);
+    assert!(!out.caps.all_word_defs);
+}
+
+#[test]
+fn a_name_above_the_name_cap_is_counted_and_not_stored() {
+    let tree = Tree::new();
+    let long = format!("lock_{}", "x".repeat(1995));
+    tree.write(
+        "a.ts",
+        format!("function {long}() {{}}\n{long}();\nlockOk();\nfunction lockOk() {{}}\n"),
+    );
+    let out = scan(
+        &tree,
+        &words(&["lock", "none"]),
+        Limits {
+            max_called_names_per_file: 1,
+            max_word_defs_per_file: 1,
+            ..Limits::default()
+        },
+        0,
+    );
+    let links = &file(&out, "a.ts").links;
+    assert_eq!(
+        links
+            .called
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockOk"]
+    );
+    assert_eq!(
+        links
+            .defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockOk"]
+    );
+    assert_eq!(links.long_names, 2);
+    assert_eq!((links.called_dropped, links.defs_dropped), (0, 0));
+    assert!(out.caps.name_bytes);
+}
+
+#[test]
+fn the_name_links_add_no_parse_and_no_read() {
+    let tree = Tree::new();
+    tree.write("a.ts", "function lockRun() {}\nlockRun();\n");
+    tree.write("b.rs", "fn lockRead() {}\n");
+    let query = words(&["lock", "none"]);
+    let on = scan(&tree, &query, Limits::default(), 0);
+    let off = scan(
+        &tree,
+        &query,
+        Limits {
+            max_called_names_per_file: 0,
+            max_word_defs_per_file: 0,
+            ..Limits::default()
+        },
+        0,
+    );
+    assert!(!file(&on, "a.ts").links.called.is_empty());
+    assert!(!file(&on, "b.rs").links.defs.is_empty());
+    assert_eq!(on.cost, off.cost);
+    assert_eq!(on.parse, off.parse);
+    assert_eq!(on.cost.files_read, 2);
+    assert_eq!(on.cost.files_parsed, 2);
+}
+
+#[test]
+fn a_pattern_query_stores_no_name_links() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn lockRun() {}\nfn run() { lockRun(); }\n");
+    let mut query = pattern("lock", true);
+    // Test the query-plan gate itself, not the usual empty word list.
+    query.words = vec!["lock".to_owned()];
+    let out = scan(&tree, &query, Limits::default(), 0);
+    assert_eq!(file(&out, "a.rs").links, NameLinks::default());
+    assert!(
+        !out.caps.called_names
+            && !out.caps.file_word_defs
+            && !out.caps.all_word_defs
+            && !out.caps.name_bytes
+    );
+}
+
+#[test]
+fn unlabelled_and_non_code_files_keep_no_name_links() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn lockRun() {}\nfn run() { lockRun(); }\n");
+    for (path, source) in [
+        ("b.md", "# lock\nreadLock() lockRun\n"),
+        ("c.json", r#"{"lock":"readLock()"}"#),
+        ("d.yaml", "lock: readLock()\n"),
+        ("e.toml", "lock = \"readLock()\"\n"),
+        ("f.txt", "lock readLock() lockRun\n"),
+    ] {
+        tree.write(path, source);
+    }
+    let out = scan(
+        &tree,
+        &words(&["lock", "read"]),
+        Limits {
+            parse_files: 0,
+            ..Limits::default()
+        },
+        0,
+    );
+    assert!(file(&out, "a.rs").unlabelled.is_some());
+    assert!(out.files.iter().all(|f| f.links == NameLinks::default()));
+    let out = scan(&tree, &words(&["lock", "read"]), Limits::default(), 0);
+    assert!(
+        out.files
+            .iter()
+            .filter(|f| f.path != Path::new("a.rs"))
+            .all(|f| f.links == NameLinks::default())
+    );
+}
+
 fn assignments(file: &FileScan) -> Vec<(u32, Option<u32>)> {
     file.records
         .iter()

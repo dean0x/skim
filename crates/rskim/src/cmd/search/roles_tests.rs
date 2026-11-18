@@ -25,6 +25,181 @@ use super::{
 };
 
 #[test]
+fn called_names_keep_every_callee_shape_whose_name_holds_a_word() {
+    let cases = [
+        (
+            Language::Rust,
+            "rs",
+            "fn run() { readLock(); self.readLock(); Self::readLock(); Type::readLock(); other.readLock(); readLock!(); readLock::<u8>(); }",
+        ),
+        (
+            Language::TypeScript,
+            "ts",
+            "readLock(); this.readLock(); other.readLock(); new readLock(); readLock<string>();",
+        ),
+        (
+            Language::JavaScript,
+            "js",
+            "readLock(); this.readLock(); other.readLock(); new readLock();",
+        ),
+        (
+            Language::Python,
+            "py",
+            "readLock()\nself.readLock()\nother.readLock()\n",
+        ),
+        (
+            Language::Go,
+            "go",
+            "package p\nfunc run() { readLock(); self.readLock(); other.readLock() }",
+        ),
+        (Language::C, "c", "void run() { readLock(); }"),
+    ];
+    for (lang, ext, source) in cases {
+        // Select each shape in isolation, so deduplication cannot hide a miss.
+        let starts: Vec<_> = source.match_indices("readLock").map(|(i, _)| i).collect();
+        for start in starts {
+            let mut one = source.to_owned();
+            for (i, _) in source
+                .match_indices("readLock")
+                .filter(|(i, _)| *i != start)
+            {
+                one.replace_range(i..i + 8, "readElse");
+            }
+            let labels = Labels::new(&one, lang, ext).unwrap();
+            let names = labels.called_names(
+                &one,
+                |n| n == "readLock",
+                super::NameCap {
+                    count: 32,
+                    bytes: 256,
+                },
+            );
+            assert_eq!(
+                names.kept,
+                [super::CalledName {
+                    name: "readLock".into(),
+                    line: 1 + source[..start].bytes().filter(|b| *b == b'\n').count() as u32
+                }],
+                "{lang:?}: {one}"
+            );
+        }
+    }
+    let source = "const readLock = 1; readLock; holder.readLock; readLockArg(readLock); // readLock()\n\"readLock()\";";
+    let labels = Labels::new(source, Language::JavaScript, "js").unwrap();
+    assert!(
+        labels
+            .called_names(
+                source,
+                |n| n == "readLock",
+                super::NameCap {
+                    count: 32,
+                    bytes: 256
+                }
+            )
+            .kept
+            .is_empty()
+    );
+}
+
+#[test]
+fn word_declarations_keep_callable_kinds_only() {
+    let cases = [
+        (
+            Language::Rust,
+            "rs",
+            "type LockAlias = u8; enum LockEnum { LockVariant } struct LockType { lockField: u8 } trait T { fn lockSignature(&self); } fn lockRun() {}",
+            vec!["lockSignature", "lockRun"],
+        ),
+        (
+            Language::TypeScript,
+            "ts",
+            "type LockAlias = string; enum LockEnum { LockVariant } class LockClass { lockField = 1; lockMethod() {} } function lockRun() {} function* lockGenerator() {} declare function lockSignature(): void;",
+            vec!["lockMethod", "lockRun", "lockGenerator", "lockSignature"],
+        ),
+        (
+            Language::JavaScript,
+            "js",
+            "class LockClass { lockField = 1; lockMethod() {} } function lockRun() {} function* lockGenerator() {}",
+            vec!["lockMethod", "lockRun", "lockGenerator"],
+        ),
+        (
+            Language::Python,
+            "py",
+            "class LockClass:\n def lockMethod(self): pass\ndef lockRun(): pass\nlockValue = 1\n",
+            vec!["lockMethod", "lockRun"],
+        ),
+        (
+            Language::Go,
+            "go",
+            "package p\ntype LockType struct { lockField int }\nfunc lockRun() {}\nfunc (t LockType) lockMethod() {}",
+            vec!["lockRun", "lockMethod"],
+        ),
+        (
+            Language::Java,
+            "java",
+            "class LockClass { int lockField; void lockMethod() {} }",
+            vec!["lockMethod"],
+        ),
+    ];
+    for (lang, ext, source, expected) in cases {
+        let labels = Labels::new(source, lang, ext).unwrap();
+        let defs = labels.word_declarations(
+            |n| super::super::matcher::name_holds_word(n, "lock"),
+            super::NameCap {
+                count: 64,
+                bytes: 256,
+            },
+        );
+        assert_eq!(
+            defs.kept
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{lang:?}"
+        );
+    }
+}
+
+#[test]
+fn an_arrow_function_const_is_callable_and_a_plain_const_is_not() {
+    let source = "const lockArrow = () => 1;\nconst lockFunction = function() {};\nconst lockGenerator = function*() {};\nconst lockPlain = 1;\nfunction\nlockRun() {\n return 1;\n}\n";
+    let labels = Labels::new(source, Language::TypeScript, "ts").unwrap();
+    let defs = labels.word_declarations(
+        |n| super::super::matcher::name_holds_word(n, "lock"),
+        super::NameCap {
+            count: 64,
+            bytes: 256,
+        },
+    );
+    assert_eq!(
+        defs.kept
+            .iter()
+            .map(|d| (d.name.as_str(), d.line, d.first_line, d.end_line))
+            .collect::<Vec<_>>(),
+        [
+            ("lockArrow", 1, 1, 1),
+            ("lockFunction", 2, 2, 2),
+            ("lockGenerator", 3, 3, 3),
+            ("lockRun", 6, 5, 8)
+        ]
+    );
+}
+
+#[test]
+fn a_capped_declaration_walk_refuses_labels_before_name_links() {
+    let source = format!(
+        "fn run() {{ {}readLock();{} }}",
+        "{".repeat(510),
+        "}".repeat(510)
+    );
+    assert!(matches!(
+        Labels::new(&source, Language::Rust, "rs"),
+        Err(Unlabelled::WalkCap)
+    ));
+}
+
+#[test]
 fn the_call_shape_is_plain_own_member_or_other_per_language() {
     use super::CallShape::{Other, OwnMember, Plain};
     let cases = [

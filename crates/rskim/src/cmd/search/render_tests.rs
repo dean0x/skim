@@ -61,6 +61,7 @@ fn file(path: impl Into<PathBuf>, prior: FilePrior, records: Vec<Record>) -> Fil
         unlabelled: None,
         roles,
         assigned_calls: rest.iter().filter(|r| r.call_def.is_some()).count() as u32,
+        links: Default::default(),
         defs,
         records: rest,
         context: Vec::new(),
@@ -966,6 +967,18 @@ fn definitions_the_per_file_cap_left_out_get_a_note_naming_the_cap_and_a_marker_
 }
 
 #[test]
+fn name_link_caps_do_not_claim_that_matching_lines_were_cut() {
+    let caps = CapsHit {
+        called_names: true,
+        file_word_defs: true,
+        all_word_defs: true,
+        name_bytes: true,
+        ..CapsHit::default()
+    };
+    assert!(caps_reached(&caps, &Limits::default()).is_empty());
+}
+
+#[test]
 fn every_cap_that_cut_lines_is_named_and_the_marker_joins_their_remedies() {
     let mut a = call_file("a.rs", FilePrior::Source, &[1]);
     a.lines = 5;
@@ -977,6 +990,7 @@ fn every_cap_that_cut_lines_is_named_and_the_marker_joins_their_remedies() {
         stored_lines: true,
         file_defs: true,
         all_defs: true,
+        ..CapsHit::default()
     };
     let mut layout = Layout::default();
     layout.limits.max_stored_lines = 1;
