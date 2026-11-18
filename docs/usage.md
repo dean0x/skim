@@ -44,10 +44,23 @@ Use `--symbol NAME` for one declaration in a file.
 Use `--max-lines N` for a line limit on files or stdin.
 Use a typed `--mode`, such as `--mode structure`, to keep that mode without the character bound.
 Use `SKIM_PASSTHROUGH=1` for raw file or stdin output.
-Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol`, hook file rewrites and multi-file runs have no default character bound.
 Limits in other agents are not known.
-
 Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
+
+#### Default multi-file limit
+
+A default directory, glob or file list uses the same limit for the whole run.
+A directory or glob with one match, or a list that resolves to one path, still uses the run limit.
+The limit counts stdout, including headers, line numbers and markers, plus the view notice.
+`Error:`, `Processed` and `Warning:` lines, `--show-stats` and `SKIM_DEBUG` do not count.
+
+Skim tries structure, signatures and types for the run. If none fits, skim cuts whole lines and can omit trailing files.
+Cut markers count hidden view lines. The last stdout line counts omitted files, even with `--no-header`.
+Use `--tokens N`, a typed `--mode`, or fewer files for more content.
+Use `SKIM_PASSTHROUGH=1` or `--passthrough` for raw output.
+
+Typed modes, `--max-lines`, `--last-lines`, `--tokens` and `--symbol` do not use the default character limit.
+`--max-lines` and `--last-lines` apply per file. Hook file rewrites select a mode or a line limit.
 
 **Examples:**
 ```bash

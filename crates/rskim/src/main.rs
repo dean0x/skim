@@ -1672,8 +1672,8 @@ fn default_read(args: &Args, mode_given: bool) -> bool {
         && args.symbol.is_none()
 }
 
-/// The per-input character budget applies only to a default single file or stdin.
-/// Batch options leave the character budget to the run.
+/// Set the per-input character budget for default single-file and stdin reads.
+/// A default batch has a separate character budget for the whole run.
 fn file_process_options(args: &Args, mode_given: bool, batch: bool) -> process::ProcessOptions {
     process::ProcessOptions {
         mode: Mode::from(args.mode),

@@ -23,7 +23,7 @@ Skim offers six transformation modes, each with different levels of aggressivene
 
 **Token reduction: 60-80%** — the only measured figure is 60.3%, on the production TypeScript codebase in README's reduction tables, and the range is stated wide enough to contain it. No CI gate defends the range: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
-Default single-input reads start with structure. An explicit `--mode structure` keeps that mode without the default character bound.
+Default reads start with structure. An explicit `--mode structure` keeps that mode without the default character bound.
 
 With no `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol`, `skim FILE` and `skim -` have a default bound.
 Stdout plus its view notice stays strictly below **29,000 characters** (Unicode scalar values, not bytes).
@@ -41,9 +41,16 @@ A warm cache read keeps the cold read's output and notice.
 Use `--symbol NAME` for one declaration in a file.
 Use `--max-lines N` for a line limit on files or stdin.
 Use a typed `--mode` to keep that mode, or `SKIM_PASSTHROUGH=1` for raw file or stdin output.
-Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol`, hook file rewrites and multi-file runs have no default character bound.
 Limits in other agents are not known.
 Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
+
+A default directory, glob or file list uses the same limit for the whole run, even if it resolves to one file.
+Headers, line numbers, markers and the view notice count. Other stderr lines do not count.
+Skim tries structure, signatures and types for the run before it cuts whole lines or omits trailing files.
+Cut markers count hidden view lines. The last stdout line counts omitted files.
+
+Typed modes, `--max-lines`, `--last-lines`, `--tokens` and `--symbol` do not use the default character limit.
+`--max-lines` and `--last-lines` apply per file. Hook file rewrites select a mode or a line limit.
 
 ### What's Preserved
 
