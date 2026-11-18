@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "golden_sha256": "412b60292840532ecd073e2b1bca7515fddd59a51d477ac45df3668ab22619d2",
+  "golden_sha256": "1f4abedbc5580644ab8b60d3848406887a118a1f76cf924dd196fc9cd023f8e4",
   "corpora": {
     "flask": {
       "commit": "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392",
-      "golden_sha256": "026ee3cdf85733e88ee46b9a70ef04f62944caf3e273d9b340198d384562c608",
+      "golden_sha256": "ac924454ff0164975aee452ffd199de4adaec8a68b0d1991298420a6729a015e",
       "hard": {
         "flask-C01": {
           "lexical.precision": "pass",
@@ -68,6 +68,7 @@
           "clash.calls_recall": "pass",
           "clash.def_count": "pass",
           "clash.defs_complete": "pass",
+          "clash.split_right": "pass",
           "results.unique_paths": "pass"
         },
         "flask-F004": {
@@ -544,8 +545,8 @@
         "bytes.rg_text_median": 951.0,
         "bytes.rg_text_p90": 7886.0,
         "bytes.text_median": 810.0,
-        "bytes.text_p90": 2607.0,
-        "concept.p10": 0.65,
+        "bytes.text_p90": 2817.0,
+        "concept.p10": 0.6625,
         "concept.p10.baseline_alpha": 0.6625,
         "concept.p10.baseline_count": 0.8,
         "concept.p5": 0.7,
@@ -571,7 +572,7 @@
     },
     "ripgrep": {
       "commit": "4519153e5e461527f4bca45b042fff45c4ec6fb9",
-      "golden_sha256": "ffb3e13c5b8f18b193d255d88a9503104ba25f7ecb0f9b680792df1852182c4d",
+      "golden_sha256": "c5c5e87225bae143a3bf469fda933167c330dcc1fe9b977cad71fa80a694c506",
       "hard": {
         "ripgrep-C01": {
           "lexical.precision": "pass",
@@ -642,6 +643,7 @@
           "clash.calls_recall": "pass",
           "clash.def_count": "pass",
           "clash.defs_complete": "pass",
+          "clash.split_right": "pass",
           "results.unique_paths": "pass"
         },
         "ripgrep-F004": {
@@ -1093,8 +1095,9 @@
         "bytes.rg_first_correct_median": 622.0,
         "bytes.rg_text_median": 1765.0,
         "bytes.rg_text_p90": 16252.0,
-        "bytes.text_median": 1204.0,
-        "bytes.text_p90": 2786.0,
+        "bytes.text_median": 1250.0,
+        "bytes.text_p90": 3210.0,
+        "clash.split_assigned": 4.0,
         "concept.p10": 0.9037,
         "concept.p10.baseline_alpha": 0.8148,
         "concept.p10.baseline_count": 0.9481,
@@ -1121,7 +1124,7 @@
     },
     "skim": {
       "commit": "b8a0a79463382347820f1c2572bde37b68e87c76",
-      "golden_sha256": "1f0c9059eb9edc5382f1d14b50c682b2d2289c2f4f631d618edaa1cdb2168d38",
+      "golden_sha256": "d4d995180f78e729fc5c547c878d2a11a9c04eadcf3973d7fa3fe32aa139f4b3",
       "hard": {
         "skim-C01": {
           "lexical.precision": "pass",
@@ -1192,6 +1195,7 @@
           "clash.calls_recall": "pass",
           "clash.def_count": "pass",
           "clash.defs_complete": "pass",
+          "clash.split_right": "pass",
           "results.unique_paths": "pass"
         },
         "skim-F004": {
@@ -1727,11 +1731,11 @@
         "bytes.rg_text_median": 2179.0,
         "bytes.rg_text_p90": 21854.0,
         "bytes.text_median": 1430.0,
-        "bytes.text_p90": 3526.0,
-        "concept.p10": 0.6827,
+        "bytes.text_p90": 4064.0,
+        "concept.p10": 0.6938,
         "concept.p10.baseline_alpha": 0.6716,
         "concept.p10.baseline_count": 0.7827,
-        "concept.p5": 0.7556,
+        "concept.p5": 0.7778,
         "concept.p5.baseline_alpha": 0.6444,
         "concept.p5.baseline_count": 0.8222,
         "cost.bytes_parsed_median": 929183.0,
@@ -1754,7 +1758,7 @@
     },
     "zod": {
       "commit": "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5",
-      "golden_sha256": "d6c41a71c8cf2466d280724f272820c40f3787ddf82e638d58cf5b15c0b46be8",
+      "golden_sha256": "96be044d678b6d970a505f8b09a9427baae5aabd5ca60b003eb205b50f0f6fb2",
       "hard": {
         "zod-C01": {
           "lexical.precision": "pass",
@@ -1818,6 +1822,7 @@
           "clash.calls_recall": "pass",
           "clash.def_count": "pass",
           "clash.defs_complete": "pass",
+          "clash.split_right": "pass",
           "results.unique_paths": "pass"
         },
         "zod-F004": {
@@ -2286,8 +2291,9 @@
         "bytes.rg_text_median": 2016.0,
         "bytes.rg_text_p90": 26252.0,
         "bytes.text_median": 1213.0,
-        "bytes.text_p90": 2921.0,
-        "concept.p10": 0.7875,
+        "bytes.text_p90": 3529.0,
+        "clash.split_assigned": 6.0,
+        "concept.p10": 0.8,
         "concept.p10.baseline_alpha": 0.5875,
         "concept.p10.baseline_count": 0.825,
         "concept.p5": 0.85,
@@ -2319,11 +2325,12 @@
     "bytes.rg_text_median": 1696.0,
     "bytes.rg_text_p90": 17802.0,
     "bytes.text_median": 1198.0,
-    "bytes.text_p90": 3041.0,
-    "concept.p10": 0.7582,
+    "bytes.text_p90": 3534.0,
+    "clash.split_assigned": 10.0,
+    "concept.p10": 0.767,
     "concept.p10.baseline_alpha": 0.6876,
     "concept.p10.baseline_count": 0.8405,
-    "concept.p5": 0.8235,
+    "concept.p5": 0.8294,
     "concept.p5.baseline_alpha": 0.6765,
     "concept.p5.baseline_count": 0.8941,
     "cost.bytes_parsed_median": 399340.0,
@@ -3105,6 +3112,16 @@
         "flask/concept.p5: 0.775 -> 0.7",
         "zod/concept.p10: 0.8625 -> 0.7875",
         "zod/concept.p5: 0.875 -> 0.85"
+      ]
+    },
+    {
+      "reason": "ripgrep/bytes.text_median rises because the word view lists called definitions and assigned calls show their definition line. flask/bytes.text_p90 rises because the word view lists called definitions. ripgrep/bytes.text_p90 rises because the word view lists called definitions and assigned calls show their definition line. skim/bytes.text_p90 rises because the word view lists called definitions. zod/bytes.text_p90 rises because the word view lists called definitions and assigned calls show their definition line.",
+      "regressions": [
+        "skim/bytes.text_p90: 3526 -> 4064",
+        "ripgrep/bytes.text_median: 1204 -> 1250",
+        "ripgrep/bytes.text_p90: 2786 -> 3210",
+        "flask/bytes.text_p90: 2607 -> 2817",
+        "zod/bytes.text_p90: 2921 -> 3529"
       ]
     }
   ]

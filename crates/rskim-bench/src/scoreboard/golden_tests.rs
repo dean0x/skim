@@ -381,7 +381,7 @@ fn clash_violations(body: &str) -> Vec<IntegrityViolation> {
 }
 
 #[test]
-fn a_clash_needs_two_defs_a_call_def_in_range_and_no_split() {
+fn a_clash_needs_two_defs_and_a_call_def_in_range() {
     let one_def = clash_violations(&clash(
         "skim-D1",
         "run",
@@ -405,15 +405,31 @@ fn a_clash_needs_two_defs_a_call_def_in_range_and_no_split() {
         message_of(&out_of_range, "skim-D2").contains("out of range"),
         "{out_of_range:?}"
     );
+}
 
-    let exact = clash_violations(&clash(
-        "skim-D3",
-        "run",
-        &[("a.rs", 1), ("b.rs", 1)],
-        &[("a.rs", 2, "0")],
-        "exact",
-    ));
-    assert!(message_of(&exact, "skim-D3").contains("split"), "{exact:?}");
+#[test]
+fn an_exact_clash_accepts_only_indexed_calls_in_range() {
+    let check = |calls: &[(&str, u32, &str)]| {
+        clash_violations(&clash(
+            "skim-D3",
+            "run",
+            &[("a.rs", 1), ("b.rs", 4)],
+            calls,
+            "exact",
+        ))
+    };
+    let valid = check(&[("a.rs", 2, "0"), ("b.rs", 5, "1")]);
+    assert!(valid.is_empty(), "{valid:?}");
+    let unassigned = check(&[("a.rs", 2, "0"), ("b.rs", 5, "\"unassigned\"")]);
+    assert!(
+        message_of(&unassigned, "skim-D3").contains("every call"),
+        "{unassigned:?}"
+    );
+    let out_of_range = check(&[("a.rs", 2, "2")]);
+    assert!(
+        message_of(&out_of_range, "skim-D3").contains("out of range"),
+        "{out_of_range:?}"
+    );
 }
 
 #[test]

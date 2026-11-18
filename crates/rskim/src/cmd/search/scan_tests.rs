@@ -49,6 +49,7 @@ fn matcher(pattern: &str) -> Matcher {
 fn pattern(p: &str, identifier: bool) -> ScanQuery {
     ScanQuery {
         plan: QueryPlan::Pattern(Box::new(matcher(p))),
+        words: Vec::new(),
         identifier,
     }
 }
@@ -56,6 +57,7 @@ fn pattern(p: &str, identifier: bool) -> ScanQuery {
 fn words(ws: &[&str]) -> ScanQuery {
     ScanQuery {
         plan: QueryPlan::Words(ws.iter().map(|w| matcher(w)).collect()),
+        words: ws.iter().map(|w| (*w).to_owned()).collect(),
         identifier: false,
     }
 }
@@ -109,6 +111,470 @@ fn rendered(out: &ScanOutput, needle: &str, limits: Limits, context: usize) -> R
         },
         Format::Text,
     )
+}
+
+#[test]
+fn the_name_link_defaults_match_the_named_bounds() {
+    let limits = Limits::default();
+    assert_eq!(
+        (
+            limits.max_called_names_per_file,
+            limits.max_word_defs_per_file,
+            limits.max_word_defs,
+            limits.max_name_bytes,
+            limits.max_called_shown
+        ),
+        (32, 64, 5_000, 256, 10)
+    );
+}
+
+#[test]
+fn the_word_view_stores_called_names_of_source_files_up_to_the_per_file_cap() {
+    let tree = Tree::new();
+    let source = "fn run() {\n readLock(); readLock();\n readLock();\n writeLock();\n closeLock(); closeLock();\n}\n";
+    for path in [
+        "src/a.rs",
+        "tests/a.rs",
+        "docs/a.rs",
+        "README.md",
+        "data.json",
+    ] {
+        tree.write(path, source);
+    }
+    let limits = Limits {
+        max_called_names_per_file: 2,
+        max_stored_lines: 0,
+        ..Limits::default()
+    };
+    let out = scan(&tree, &words(&["lock", "read"]), limits, 0);
+    let links = &file(&out, "src/a.rs").links;
+    assert_eq!(
+        links
+            .called
+            .iter()
+            .map(|c| (c.name.as_str(), c.line))
+            .collect::<Vec<_>>(),
+        [("readLock", 2), ("writeLock", 4)]
+    );
+    assert_eq!(links.called_dropped, 1);
+    assert!(out.caps.called_names);
+    for path in ["tests/a.rs", "docs/a.rs", "README.md", "data.json"] {
+        assert!(file(&out, path).links.called.is_empty(), "{path}");
+    }
+}
+
+#[test]
+fn repeated_calls_of_one_name_do_not_fill_the_callee_cap() {
+    let tree = Tree::new();
+    tree.write(
+        "a.rs",
+        format!(
+            "fn run() {{\n{}writeLock();\n}}",
+            "readLock();\n".repeat(40)
+        ),
+    );
+    let out = scan(
+        &tree,
+        &words(&["lock", "read"]),
+        Limits {
+            max_called_names_per_file: 2,
+            ..Limits::default()
+        },
+        0,
+    );
+    let links = &file(&out, "a.rs").links;
+    assert_eq!(
+        links
+            .called
+            .iter()
+            .map(|c| (c.name.as_str(), c.line))
+            .collect::<Vec<_>>(),
+        [("readLock", 2), ("writeLock", 42)]
+    );
+    assert_eq!(links.called_dropped, 0);
+    assert!(!out.caps.called_names);
+}
+
+#[test]
+fn the_word_view_stores_callable_definitions_up_to_the_per_file_and_all_files_caps() {
+    let tree = Tree::new();
+    tree.write(
+        "src/a.rs",
+        "fn lockOne() {}\nfn lockTwo() {}\nfn lockThree() {}\n",
+    );
+    tree.write(
+        "src/lock.rs",
+        "fn lockFour() {}\nfn lockFive() {}\nfn lockSix() {}\n",
+    );
+    tree.write("tests/b.rs", "fn lockSeven() {}\n");
+    let limits = Limits {
+        max_word_defs_per_file: 2,
+        max_word_defs: 3,
+        max_stored_lines: 0,
+        ..Limits::default()
+    };
+    let out = scan(&tree, &words(&["lock", "none"]), limits, 0);
+    // The name tier parses src/lock.rs before the path-earlier src/a.rs.
+    assert_eq!(
+        file(&out, "src/lock.rs")
+            .links
+            .defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockFour", "lockFive"]
+    );
+    assert_eq!(file(&out, "src/lock.rs").links.defs_dropped, 1);
+    assert_eq!(
+        file(&out, "src/a.rs")
+            .links
+            .defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockOne"]
+    );
+    assert_eq!(file(&out, "src/a.rs").links.defs_dropped, 2);
+    assert_eq!(file(&out, "tests/b.rs").links.defs_dropped, 1);
+    assert!(out.caps.file_word_defs);
+    assert!(out.caps.all_word_defs);
+    let mut no_cuts = limits;
+    no_cuts.max_word_defs_per_file = 3;
+    no_cuts.max_word_defs = 7;
+    let out = scan(&tree, &words(&["lock", "none"]), no_cuts, 0);
+    assert_eq!(file(&out, "tests/b.rs").links.defs[0].name, "lockSeven");
+    assert!(!out.caps.file_word_defs);
+    assert!(!out.caps.all_word_defs);
+}
+
+#[test]
+fn a_name_above_the_name_cap_is_counted_and_not_stored() {
+    let tree = Tree::new();
+    let long = format!("lock_{}", "x".repeat(1995));
+    tree.write(
+        "a.ts",
+        format!("function {long}() {{}}\n{long}();\nlockOk();\nfunction lockOk() {{}}\n"),
+    );
+    let out = scan(
+        &tree,
+        &words(&["lock", "none"]),
+        Limits {
+            max_called_names_per_file: 1,
+            max_word_defs_per_file: 1,
+            ..Limits::default()
+        },
+        0,
+    );
+    let links = &file(&out, "a.ts").links;
+    assert_eq!(
+        links
+            .called
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockOk"]
+    );
+    assert_eq!(
+        links
+            .defs
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["lockOk"]
+    );
+    assert_eq!(links.long_names, 2);
+    assert_eq!((links.called_dropped, links.defs_dropped), (0, 0));
+    assert!(out.caps.name_bytes);
+}
+
+#[test]
+fn the_name_links_add_no_parse_and_no_read() {
+    let tree = Tree::new();
+    tree.write("a.ts", "function lockRun() {}\nlockRun();\n");
+    tree.write("b.rs", "fn lockRead() {}\n");
+    let query = words(&["lock", "none"]);
+    let on = scan(&tree, &query, Limits::default(), 0);
+    let off = scan(&tree, &pattern("lock", false), Limits::default(), 0);
+    assert!(!file(&on, "a.ts").links.called.is_empty());
+    assert!(!file(&on, "b.rs").links.defs.is_empty());
+    assert!(off.files.iter().all(|f| f.links == NameLinks::default()));
+    assert_eq!(on.cost, off.cost);
+    assert_eq!(on.parse, off.parse);
+    assert_eq!(on.cost.files_read, 2);
+    assert_eq!(on.cost.files_parsed, 2);
+}
+
+#[test]
+fn a_pattern_query_stores_no_name_links() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn lockRun() {}\nfn run() { lockRun(); }\n");
+    let mut query = pattern("lock", true);
+    // Test the query-plan gate itself, not the usual empty word list.
+    query.words = vec!["lock".to_owned()];
+    let out = scan(&tree, &query, Limits::default(), 0);
+    assert_eq!(file(&out, "a.rs").links, NameLinks::default());
+    assert!(
+        !out.caps.called_names
+            && !out.caps.file_word_defs
+            && !out.caps.all_word_defs
+            && !out.caps.name_bytes
+    );
+}
+
+#[test]
+fn unlabelled_and_non_code_files_keep_no_name_links() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn lockRun() {}\nfn run() { lockRun(); }\n");
+    for (path, source) in [
+        ("b.md", "# lock\nreadLock() lockRun\n"),
+        ("c.json", r#"{"lock":"readLock()"}"#),
+        ("d.yaml", "lock: readLock()\n"),
+        ("e.toml", "lock = \"readLock()\"\n"),
+        ("f.txt", "lock readLock() lockRun\n"),
+    ] {
+        tree.write(path, source);
+    }
+    let out = scan(
+        &tree,
+        &words(&["lock", "read"]),
+        Limits {
+            parse_files: 0,
+            ..Limits::default()
+        },
+        0,
+    );
+    assert!(file(&out, "a.rs").unlabelled.is_some());
+    assert!(out.files.iter().all(|f| f.links == NameLinks::default()));
+    let out = scan(&tree, &words(&["lock", "read"]), Limits::default(), 0);
+    assert!(
+        out.files
+            .iter()
+            .filter(|f| f.path != Path::new("a.rs"))
+            .all(|f| f.links == NameLinks::default())
+    );
+}
+
+fn assignments(file: &FileScan) -> Vec<(u32, Option<u32>)> {
+    file.records
+        .iter()
+        .filter(|r| r.role == Role::Call)
+        .map(|r| (r.line, r.call_def))
+        .collect()
+}
+
+#[test]
+fn a_self_call_goes_to_the_one_method_and_a_plain_call_with_an_import_stays_not_split() {
+    let tree = Tree::new();
+    tree.write("a.rs", "use other::ping;\nimpl T {\n fn ping(&self) {}\n fn run(&self) {\n  self.ping();\n  self.ping();\n  self.ping();\n  self.ping();\n  ping();\n  ping();\n }\n}\n");
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.rs");
+    assert_eq!(
+        assignments(f),
+        [
+            (5, Some(3)),
+            (6, Some(3)),
+            (7, Some(3)),
+            (8, Some(3)),
+            (9, None),
+            (10, None)
+        ]
+    );
+    assert_eq!(f.assigned_calls, 4);
+    tree.write(
+        "a.rs",
+        "fn ping() {}\nfn run() {\n ping();\n}\nuse other::ping;\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    assert_eq!(assignments(file(&out, "a.rs")), [(3, None)]);
+}
+
+#[test]
+fn a_typescript_this_call_goes_to_the_method_and_a_plain_call_stays_not_split() {
+    let tree = Tree::new();
+    tree.write(
+        "a.ts",
+        "class T {\n ping() {}\n run() {\n  this.ping();\n  ping();\n }\n}\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.ts");
+    assert_eq!(assignments(f), [(4, Some(2)), (5, None)]);
+    assert_eq!(f.assigned_calls, 1);
+}
+
+#[test]
+fn a_javascript_this_call_goes_to_the_method_and_a_plain_call_stays_not_split() {
+    let tree = Tree::new();
+    tree.write(
+        "a.js",
+        "class T {\n ping() {}\n run() {\n  this.ping();\n  ping();\n }\n}\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.js");
+    assert_eq!(assignments(f), [(4, Some(2)), (5, None)]);
+    assert_eq!(f.assigned_calls, 1);
+}
+
+#[test]
+fn a_python_self_call_goes_to_the_method_and_a_plain_call_stays_not_split() {
+    let tree = Tree::new();
+    tree.write(
+        "a.py",
+        "class T:\n def ping(self): pass\n def run(self):\n  self.ping()\n  ping()\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.py");
+    assert_eq!(assignments(f), [(4, Some(2)), (5, None)]);
+    assert_eq!(f.assigned_calls, 1);
+}
+
+#[test]
+fn a_plain_call_goes_to_the_one_free_function_of_its_file() {
+    let tree = Tree::new();
+    for (path, source, line) in [
+        ("a.rs", "fn\nping() {}\nfn run() { ping(); }\n", 2),
+        ("a.ts", "const ping = () => 1;\nping();\n", 1),
+        ("a.js", "function ping() {}\nping();\n", 1),
+        ("a.py", "def ping(): pass\nping()\n", 1),
+        (
+            "a.go",
+            "package p\nfunc ping() {}\nfunc run() { ping() }\n",
+            2,
+        ),
+    ] {
+        tree.write(path, source);
+        let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+        let f = file(&out, path);
+        assert_eq!(f.assigned_calls, 1, "{path}");
+        assert_eq!(assignments(f)[0].1, Some(line), "{path}");
+    }
+    let out = scan(&tree, &pattern("ping", false), Limits::default(), 0);
+    assert!(
+        out.files
+            .iter()
+            .all(|f| f.assigned_calls == 0 && f.records.iter().all(|r| r.call_def.is_none()))
+    );
+    let out = scan(&tree, &words(&["ping", "run"]), Limits::default(), 0);
+    assert!(
+        out.files
+            .iter()
+            .all(|f| f.assigned_calls == 0 && f.records.iter().all(|r| r.call_def.is_none()))
+    );
+}
+
+#[test]
+fn qualified_receiver_macro_generic_and_two_definition_calls_stay_not_split() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn ping() {}\nfn run() {\n Type::ping();\n other.ping();\n ping!();\n ping::<u8>();\n wrap!(ping());\n}\n");
+    tree.write("b.rs", "fn ping() {}\nfn ping() {}\nfn run() { ping(); }\n");
+    tree.write("c.rs", "fn ping() {} fn ping() {}\nfn run() { ping(); }\n");
+    tree.write("d.rs", "type ping = u8;\nfn run() { ping(); }\n");
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    assert!(out.files.iter().all(|f| f.roles.get(Role::Call) > 0
+        && f.assigned_calls == 0
+        && f.records.iter().all(|r| r.call_def.is_none())));
+}
+
+#[test]
+fn a_call_in_another_case_under_ignore_case_is_not_assigned() {
+    let tree = Tree::new();
+    tree.write("a.rs", "fn ping() {}\nfn run() {\n PING();\n ping();\n}\n");
+    let query = ScanQuery {
+        plan: QueryPlan::Pattern(Box::new(
+            Matcher::new(MatcherSpec {
+                pattern: "ping",
+                kind: PatternKind::Literal,
+                case: CaseMode::Insensitive,
+                word: false,
+            })
+            .unwrap(),
+        )),
+        words: Vec::new(),
+        identifier: true,
+    };
+    let out = scan(&tree, &query, Limits::default(), 0);
+    assert_eq!(assignments(file(&out, "a.rs")), [(3, None), (4, Some(1))]);
+}
+
+#[test]
+fn the_assigned_count_is_exact_past_the_stored_line_cap() {
+    let tree = Tree::new();
+    tree.write(
+        "a.rs",
+        "fn ping() {}\nfn run() {\n ping(); ping();\n ping();\n ping();\n}\n",
+    );
+    let out = scan(
+        &tree,
+        &pattern("ping", true),
+        Limits {
+            max_stored_lines: 1,
+            ..Limits::default()
+        },
+        0,
+    );
+    let f = file(&out, "a.rs");
+    assert_eq!(
+        (f.records.len(), f.assigned_calls, f.roles.get(Role::Call)),
+        (1, 3, 3)
+    );
+    assert_eq!(assignments(f), [(3, Some(1))]);
+}
+
+#[test]
+fn an_unsupported_language_is_never_assigned() {
+    let tree = Tree::new();
+    tree.write(
+        "a.java",
+        "class T {\n void ping() {}\n void run() { ping(); }\n}\n",
+    );
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.java");
+    assert_eq!(f.roles.get(Role::Def), 1);
+    assert_eq!(assignments(f), [(3, None)]);
+    assert_eq!(f.assigned_calls, 0);
+}
+
+#[test]
+fn a_line_with_a_second_call_of_another_shape_stays_not_split() {
+    let tree = Tree::new();
+    tree.write("a.rs", "impl T {\n fn ping(&self) {}\n fn run(&self) {\n  self.ping() == other.ping();\n  self.ping() == self.ping();\n }\n}\n");
+    let out = scan(&tree, &pattern("ping", true), Limits::default(), 0);
+    let f = file(&out, "a.rs");
+    assert_eq!(assignments(f), [(4, None), (5, Some(2))]);
+    assert_eq!(f.assigned_calls, 1);
+}
+
+#[test]
+fn the_all_files_definition_cap_clears_an_assignment_it_cuts() {
+    let tree = Tree::new();
+    for path in ["a.rs", "b.rs"] {
+        tree.write(path, "fn ping() {}\nfn run() { ping(); }\n");
+    }
+    let out = scan(
+        &tree,
+        &pattern("ping", true),
+        Limits {
+            max_def_sites: 1,
+            ..Limits::default()
+        },
+        0,
+    );
+    assert_eq!(assignments(file(&out, "a.rs")), [(2, Some(1))]);
+    assert_eq!(file(&out, "a.rs").assigned_calls, 1);
+    assert!(file(&out, "b.rs").defs.is_empty());
+    assert_eq!(assignments(file(&out, "b.rs")), [(2, None)]);
+    assert_eq!(file(&out, "b.rs").assigned_calls, 0);
+    let out = scan(
+        &tree,
+        &pattern("ping", true),
+        Limits {
+            max_def_sites_per_file: 0,
+            ..Limits::default()
+        },
+        0,
+    );
+    assert!(out.files.iter().all(|f| f.defs.is_empty()
+        && f.assigned_calls == 0
+        && f.records.iter().all(|r| r.call_def.is_none())));
 }
 
 // ============================================================================
@@ -875,6 +1341,75 @@ fn the_word_view_stores_two_lines_per_file_in_rank_order_up_to_the_cap() {
 
     assert_eq!(file(&out, "src/a.rs").records.len(), 2);
     assert_eq!(file(&out, "docs/b.md").records.len(), 1);
+}
+
+#[test]
+fn the_word_view_parses_files_in_list_order_with_the_name_tier() {
+    use crate::cmd::search::args::{SearchAction, parse_flags};
+    use crate::cmd::search::build_query;
+
+    let tree = Tree::new();
+    tree.write("a.rs", "// alpha beta\n".repeat(3));
+    tree.write("z_alpha.rs", "// alpha beta\n");
+    tree.write("docs/beta.md", "alpha beta\n".repeat(5));
+    tree.write("beta.rs", "// unrelated\n");
+    let SearchAction::Query(flags) = parse_flags(&["alpha beta".into()]).unwrap() else {
+        panic!("expected a word query");
+    };
+    let (query, info) = build_query(&flags).unwrap();
+    let limits = Limits {
+        parse_files: 1,
+        max_stored_lines: 2,
+        ..Limits::default()
+    };
+    let config = config(&tree.root, &query, limits, 0);
+    let counted = count(&config, list_universe(&tree.root).unwrap()).unwrap();
+    let (jobs, _) = plan_jobs(&counted);
+    let parse_order: Vec<_> = jobs
+        .iter()
+        .map(|job| {
+            counted.candidates[counted.matched[job.matched].candidate]
+                .rel
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        parse_order,
+        ["z_alpha.rs", "a.rs", "docs/beta.md"].map(PathBuf::from)
+    );
+
+    let out = counted.label();
+    assert_eq!(out.searched_files, 4);
+    assert_eq!(out.files.len(), 3, "a name alone admits no file");
+    assert_eq!(file(&out, "z_alpha.rs").unlabelled, None);
+    assert_eq!(file(&out, "a.rs").unlabelled, Some(Unlabelled::Budget));
+    assert_eq!(file(&out, "z_alpha.rs").word_lines, [1, 1]);
+    assert_eq!(file(&out, "a.rs").word_lines, [3, 3]);
+    assert_eq!(file(&out, "z_alpha.rs").records.len(), 1);
+    assert_eq!(file(&out, "a.rs").records.len(), 1);
+    assert!(file(&out, "docs/beta.md").records.is_empty());
+    let output = render(
+        &Report {
+            query: &info,
+            scan: &out,
+            layout: Layout {
+                limits,
+                ..Layout::default()
+            },
+            duration_ms: 0,
+        },
+        Format::Json,
+    );
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    let list_order: Vec<_> = value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| PathBuf::from(file["path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(list_order, parse_order);
+    assert_eq!(value["files_with_all_words"], 3);
+    assert_eq!(value["files"][0]["words_matched"], 2);
 }
 
 // ============================================================================

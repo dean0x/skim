@@ -103,6 +103,9 @@ pub struct Occurrence {
     /// 1-based line number.
     pub line: u32,
     pub role: Option<Role>,
+    /// 1-based name line of the assigned definition in this occurrence's
+    /// file. Absent when the engine leaves the call unassigned.
+    pub def_line: Option<u32>,
 }
 
 /// One definition site of the queried name.
@@ -333,6 +336,7 @@ fn parse_file(value: &Value) -> anyhow::Result<FileEntry> {
                 path: path.clone(),
                 line: o.line,
                 role: Some(o.role),
+                def_line: o.def_line,
             })
             .collect(),
     })
@@ -343,6 +347,7 @@ struct ListedLine {
     line: u32,
     role: Role,
     text: String,
+    def_line: Option<u32>,
 }
 
 fn parse_occurrence(path: &str, value: &Value) -> anyhow::Result<ListedLine> {
@@ -354,6 +359,12 @@ fn parse_occurrence(path: &str, value: &Value) -> anyhow::Result<ListedLine> {
         line: req(obj, "line", as_line, "a line number")?,
         role,
         text: opt_str(obj, "text")?.unwrap_or_default().to_string(),
+        def_line: opt(
+            obj,
+            "def_line",
+            |v| as_line(v).filter(|n| *n > 0),
+            "a positive line number",
+        )?,
     })
 }
 
@@ -521,6 +532,9 @@ pub enum CheckId {
     /// `[[clash]]`: every frozen call site of either definition is an
     /// occurrence with the role `call`.
     ClashCallsRecall,
+    /// `[[clash]]`: every assigned occurrence is a frozen call and names its
+    /// definition in the same file; `split = "none"` forbids assignments.
+    ClashSplitRight,
     /// `[[lexical]]`: every file of the text universe (no language
     /// allow-list) that holds the query is returned.
     LexicalRecallTracked,
@@ -564,6 +578,7 @@ impl CheckId {
         CheckId::ClashDefsComplete,
         CheckId::ClashDefCount,
         CheckId::ClashCallsRecall,
+        CheckId::ClashSplitRight,
         CheckId::LexicalRecallTracked,
         CheckId::UniverseAccounted,
         CheckId::IdentDefFirst,
@@ -592,6 +607,7 @@ impl CheckId {
             CheckId::ClashDefsComplete => "clash.defs_complete",
             CheckId::ClashDefCount => "clash.def_count",
             CheckId::ClashCallsRecall => "clash.calls_recall",
+            CheckId::ClashSplitRight => "clash.split_right",
             CheckId::LexicalRecallTracked => "lexical.recall_tracked",
             CheckId::UniverseAccounted => "universe.accounted",
             CheckId::IdentDefFirst => "ident.def_first",
@@ -633,9 +649,10 @@ impl CheckId {
             CheckId::RefsRecall | CheckId::RefsCallsRecall | CheckId::UniverseAccounted => {
                 kind == EntryKind::Refs
             }
-            CheckId::ClashDefsComplete | CheckId::ClashDefCount | CheckId::ClashCallsRecall => {
-                kind == EntryKind::Clash
-            }
+            CheckId::ClashDefsComplete
+            | CheckId::ClashDefCount
+            | CheckId::ClashCallsRecall
+            | CheckId::ClashSplitRight => kind == EntryKind::Clash,
             CheckId::LexicalRecallTracked => kind == EntryKind::Lexical,
             CheckId::IdentDefFirst => kind == EntryKind::Ident,
             CheckId::ConceptFirstRightTop5 => kind == EntryKind::Concept,
@@ -827,6 +844,40 @@ mod tests {
     }
 
     #[test]
+    fn an_occurrence_keeps_its_optional_definition_line_and_call_role() {
+        let mut f = file(
+            "src/a.rs",
+            1,
+            1,
+            &[(20, "call"), (21, "call"), (22, "call")],
+        );
+        f["occurrences"][0]["def_line"] = json!(7);
+        f["occurrences"][2]["def_line"] = Value::Null;
+        let p = page(&envelope(vec![f])).unwrap();
+        assert_eq!(
+            p.occurrences.iter().map(|o| o.def_line).collect::<Vec<_>>(),
+            [Some(7), None, None]
+        );
+        assert!(p.occurrences.iter().all(|o| o.role == Some(Role::Call)));
+    }
+
+    #[test]
+    fn an_occurrence_rejects_a_def_line_that_is_not_a_positive_u32() {
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("7"),
+            json!(4294967296u64),
+        ] {
+            let mut f = file("src/a.rs", 1, 1, &[(20, "call")]);
+            f["occurrences"][0]["def_line"] = invalid;
+            let result = page(&envelope(vec![f]));
+            assert!(result.is_err(), "accepted invalid def_line: {result:?}");
+        }
+    }
+
+    #[test]
     fn a_file_with_no_occurrence_has_no_line() {
         let p = page(&envelope(vec![file("a.rs", 1, 1, &[])])).unwrap();
         assert_eq!(p.rows[0].line, None);
@@ -953,7 +1004,7 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", check.as_str()));
             assert_eq!(serde_json::from_str::<CheckId>(&json).unwrap(), *check);
         }
-        assert_eq!(CheckId::ALL.len(), 23);
+        assert_eq!(CheckId::ALL.len(), 24);
         assert!("lexical.recal".parse::<CheckId>().is_err());
     }
 
@@ -1022,7 +1073,7 @@ mod tests {
 
     #[test]
     fn the_new_checks_have_the_dotted_names_of_the_plan_and_run_on_their_own_kind_only() {
-        let table: [(CheckId, &str, EntryKind); 13] = [
+        let table: [(CheckId, &str, EntryKind); 14] = [
             (CheckId::RefsRecall, "refs.recall", EntryKind::Refs),
             (
                 CheckId::RefsCallsRecall,
@@ -1038,6 +1089,11 @@ mod tests {
             (
                 CheckId::ClashCallsRecall,
                 "clash.calls_recall",
+                EntryKind::Clash,
+            ),
+            (
+                CheckId::ClashSplitRight,
+                "clash.split_right",
                 EntryKind::Clash,
             ),
             (

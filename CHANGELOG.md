@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `skim search` explains a repeated subcommand before a second pattern. It exits 2 and says to drop the extra `search`.
 - Global Cursor installs and uninstalls leave project guidance and `.cursorrules` unchanged.
 - Cursor guidance upgrades keep user text without extra rule headers. Guidance updates keep existing file permissions.
 - Uninstall keeps shared guidance while another configured agent still uses it.
@@ -18,11 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The word view lists called definitions by name when a listed source file calls them and their name holds a query word. It uses only files already parsed and skips definitions in listed files. These are name links, not resolved calls.
+- With several definitions, identifier call lines can show `(def N)`, the definition's name line. Every call match on a line must fit the one definition of the name in its file. A plain call needs a free function and no import of that name. A `self`, `this` or `Self` call needs a method. This rule covers Rust, TypeScript, JavaScript, Python and Go only. If any call line is assigned, the clash note counts assigned and other call lines.
 - Global guidance for Kiro, Roo Code, Cline, Augment and Windsurf when their root folders exist. These agents get no hooks.
 - A **Guidance** section in `skim doctor` with file states and scope-specific refresh commands. These notes do not change the exit code.
 
 ### Changed
 
+- Word-view rank uses file kind, then a file name that holds a query word, then the hit count. The name test ignores case and matches whole tokens. The matched files and the fewer-word fallback stay the same.
 - hook.log drift notes and `skim doctor` remedies name `skim init` as the refresh command.
 - Re-run `skim init` in the same scope after an upgrade to refresh guidance. The shorter guidance says when to use `skim search` or `rg`.
 - Guidance for agents without hooks makes no hook claims.

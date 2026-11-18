@@ -29,8 +29,8 @@ text universe), or the answer is frozen in the golden file from a hand read.
 
 | Class | Checks | Rule |
 |---|---|---|
-| **HARD** (per query) | `lexical.recall`, `lexical.precision` (skim's full list = the oracle's files that hold every word of the query) · `lexical.silent_fn` (a ground-truth file is missing) · `pagination.complete` / `.disjoint` / `.ordered` / `.has_more_honest` · `order.prefix_consistent` · `order.score_monotone` · `results.unique_paths` (no path twice in one list: the full list, a `--limit` list, or one page) · the frozen-answer checks `refs.recall`, `refs.calls_recall`, `clash.defs_complete`, `clash.def_count`, `clash.calls_recall`, `lexical.recall_tracked`, `universe.accounted`, `ident.def_first`, `concept.first_right_top5`, `stakes.lines`, `stakes.files`, `stakes.counts`, `stakes.exit` ([Frozen answers](#frozen-answers-refs-clash-stakes-and-the-text-universe)) | Tolerance 0. A failure passes only if it is ledgered (XFAIL). |
-| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `refs.call_precision`, `roles.precision.<lang>` (`rust`, `python`, `typescript`, `tsx`, `javascript`, `go`) and the three cost counters `cost.files_parsed_median`, `cost.bytes_parsed_median`, `cost.bytes_read_median` (a row the search output cannot state has no value: it is absent, fails nothing and is not blessed) | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
+| **HARD** (per query) | `lexical.recall`, `lexical.precision` (skim's full list = the oracle's files that hold every word of the query) · `lexical.silent_fn` (a ground-truth file is missing) · `pagination.complete` / `.disjoint` / `.ordered` / `.has_more_honest` · `order.prefix_consistent` · `order.score_monotone` · `results.unique_paths` (no path twice in one list: the full list, a `--limit` list, or one page) · the frozen-answer checks `refs.recall`, `refs.calls_recall`, `clash.defs_complete`, `clash.def_count`, `clash.calls_recall`, `clash.split_right`, `lexical.recall_tracked`, `universe.accounted`, `ident.def_first`, `concept.first_right_top5`, `stakes.lines`, `stakes.files`, `stakes.counts`, `stakes.exit` ([Frozen answers](#frozen-answers-refs-clash-stakes-and-the-text-universe)) | Tolerance 0. A failure passes only if it is ledgered (XFAIL). |
+| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `refs.call_precision`, `clash.split_assigned`, `roles.precision.<lang>` (`rust`, `python`, `typescript`, `tsx`, `javascript`, `go`) and the three cost counters `cost.files_parsed_median`, `cost.bytes_parsed_median`, `cost.bytes_read_median` (a row the search output cannot state has no value: it is absent, fails nothing and is not blessed) | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
 | **INFO** (never gated) | Latency: p50/p95 of the golden entries' own skim calls (wall time, and `duration_ms` from the envelope) · the "beats baseline" column · the `rg -nw` reference rows `bytes.rgw_text_median` and `bytes.rgw_first_correct_median`, and `bytes.first_relevant_median`, in `info.reference` of each corpus in `report.json`: they are never gated and not in `baseline.json` | none |
 
 A changed golden file, corpus pin, or HARD outcome (for example `xfail -> pass`) also means "bless required". A HARD
@@ -45,7 +45,8 @@ Manual adversarial dog-food (SEARCH-ADR-007) is still required for these:
   The checks read the JSON envelope, the `-l` and `-c` output and the exit code.
 - Role precision outside the frozen names. `refs.call_precision` covers the names in `[[refs]]` entries only, and
   `roles.precision.<lang>` covers the names of `[[refs]]` and `[[clash]]` entries only.
-- Calls split by definition. A name with several definitions gets a note, and the calls are not split (`split = "none"`).
+- Call assignment outside the frozen clash entries. `clash.split_right` checks assignment precision; `clash.split_assigned` counts assigned frozen calls.
+- The word-view `called_definitions` block. No check reads it; the links are by name, not resolved.
 - Latency. It is INFO, because shared CI runners are noisy. The cost counters (`cost.*`) are the RATCHET.
 - A corpus outside the four, and a file count above the largest corpus.
 - Any new query flag, until it has golden entries here.
@@ -223,9 +224,15 @@ a change to the oracle.
 | Table | Holds | Integrity (exit 2 when broken) |
 |---|---|---|
 | `[[refs]]` | `id`, `query` (a bare identifier), `def {path, line}`, `sites [{path, line, role}]`, `origin`. Every line that holds the name as a whole word, with its role: `def`, `call`, `ref`, `import`, `comment`, `string` or `text`. | The `sites` equal the whole-word line set of the query over the text universe at the pin, `def` is one of them, and at least one site has the role `call`. |
-| `[[clash]]` | `id`, `query`, `defs [{path, line}]` (2 or more), `calls [{path, line, def}]`, `split`, `origin`. A name with two or more definitions. `def` of a call is an index into `defs` or `"unassigned"`. | At least 2 `defs` and at least 1 call; each call index is in range; every def and call line holds the name as a whole word; `split = "none"` (the value `"exact"` is refused until calls are split by definition). |
+| `[[clash]]` | `id`, `query`, `defs [{path, line}]` (2 or more), `calls [{path, line, def}]`, `split`, `origin`. A name with two or more definitions. `def` of a call is an index into `defs` or `"unassigned"`. | At least 2 `defs` and at least 1 call; each call index is in range; every def and call line holds the name as a whole word; `split` is `"none"` or `"exact"`. With `"exact"`, every call must have a definition index. With `"none"`, calls can be `"unassigned"`. |
 | `[[stakes]]` | `id`, `query`, `flags` (rg-style, from a closed list), `expect` (`lines`, `files`, `counts` or `exit`) and `exit` for `expect = "exit"`. A plain-text query judged against the regex oracle. | `exit` is present exactly when `expect = "exit"`, and it is `0`, `1` or `2`. `1` needs no matching line in the text universe, `0` needs one, and `2` needs a query or flag set that the oracle rejects. A `lines`, `files` or `counts` entry needs at least one matching line, because an empty oracle answer passes any output. |
 | `[[concept]]` `first` | An optional list of paths: the files that hold the answer to a plain-word question. A concept entry without `first` still loads. | Each path is a file of the text universe at the pin. |
+
+The `ripgrep-D01` and `zod-D01` clash entries use `split = "exact"` from a hand read at their pins.
+The `flask-D01` and `skim-D01` entries keep `split = "none"`.
+A frozen definition index states a call target, not a requirement that the search assign every call.
+The search can assign a call to the one callable definition in its file when the call shape fits.
+The other calls are not split. The search adds `def_line` only to assigned occurrences, with the definition's name line.
 
 The stakes flags are `-g`, `-t`, `-l`, `-c`, `-E`, `-F`, `-i`, `-S`, `-w` and `-C`. The runner sets `--json`, `--limit`,
 `--offset`, `--root` and `-h` itself, so an entry must not repeat them. `-l` and `-c` cannot be combined with `--json`,
@@ -238,7 +245,9 @@ a bare multi-word query as a list of words, which the line oracle cannot judge.
 | `refs.calls_recall` | HARD | `[[refs]]` | every frozen `call` site is an occurrence labelled `call` |
 | `clash.defs_complete` | HARD | `[[clash]]` | every frozen definition is among `definitions.sites` |
 | `clash.def_count` | HARD | `[[clash]]` | `definitions.count` equals the number of frozen definitions; an `at_least` count passes only as a valid lower bound (not above the frozen number, and within the files the parse budget left unlabelled) |
-| `clash.calls_recall` | HARD | `[[clash]]` | every frozen call site of either definition is an occurrence labelled `call` (calls are not split by definition) |
+| `clash.calls_recall` | HARD | `[[clash]]` | every frozen call site of either definition is an occurrence labelled `call`, with or without an assignment |
+| `clash.split_right` | HARD | `[[clash]]` | every assigned occurrence is a frozen `call` and names its frozen definition in its own file; `split = "none"` forbids every assignment. Missing assignments pass this precision check. |
+| `clash.split_assigned` | RATCHET | `[[clash]]` with `split = "exact"` | sum of unique assigned frozen call sites, per corpus and aggregate; zero if all assignments disappear, absent for `none` |
 | `lexical.recall_tracked` | HARD | `[[lexical]]` | every file of the text universe that holds the query is returned (no language allow-list) |
 | `universe.accounted` | HARD | `[[refs]]` | `searched_files` plus each `left_out` reason count equal the oracle's counts for the text universe, reason by reason |
 | `ident.def_first` | HARD | `[[ident]]` | `definitions.sites[0]` has the path and the line of the frozen `def` |
