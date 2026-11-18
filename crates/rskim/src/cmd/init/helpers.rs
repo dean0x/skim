@@ -302,23 +302,22 @@ skim <file> --mode=pseudo        # logic without syntactic noise
 
 ### Search and read
 
-`skim search NAME` finds where a name is defined and where it is used. It reads
-the files at query time: there is no index to build.
+`skim search NAME` reads files per query; no index.
 
 {search_when}
-- One identifier: the definition comes first, with its line range. The calls
-  follow, each with the function that holds it. Imports, strings, comments,
-  text and partial matches are counted by role (`--all` lists them).
-- Several words in one quoted argument: the files that hold all the words come
-  first, ranked. Files with fewer words follow when fewer than 3 files hold all.
-- `-E 'regex'` reads a regex. `-i`, `-S`, `-w`, `-g GLOB`, `-t TYPE`, `-C N`, `-l`
-  and `-c` work as in `rg`. The pattern is a literal and case sensitive by default.
-- Roles come from syntax, not types. A name with several definitions gets a
-  note, and its calls are not split by definition.
-- `skim FILE --symbol NAME` prints the raw source lines of one declaration.
+- One identifier: definition range, then calls with their function.
+  Other roles: counts (`--all` lists them).
+- Quoted words: all-word files first. Rank: file kind, file-name word, count.
+  Name tests ignore case and match whole tokens. Fewer-word files follow if fewer than 3 hold all words.
+  It lists, by name, callable definitions that listed source files call if their names hold a query word.
+- `-E 'regex'`, `-i`, `-S`, `-w`, `-g GLOB`, `-t TYPE`, `-C N`, `-l`, `-c`: as in `rg`.
+  Default: literal, case sensitive.
+- Roles use syntax, not types. With several definitions, calls that fit the one definition in their file show `(def N)`.
+  N is the definition's name line. Plain calls: free function, no import of that name; `self`/`this`/`Self`: method.
+  Rust, TypeScript, JavaScript, Python and Go only. If assigned, the note counts assigned and other call lines.
+- `skim FILE --symbol NAME`: raw source lines of one declaration.
 - Exit codes: 0 a line matched, 1 no match, 2 an error.
-- Tracked hidden and secret-bearing files (`.env`, key files) are searched and
-  listed. Use `-g '!NAME'` to leave one out.
+- Tracked hidden and secret-bearing files are searched. Use `-g '!NAME'` to omit one.
 
 ### Heatmap — Git History Risk Analysis
 
@@ -909,6 +908,31 @@ mod tests {
             assert!(
                 text.contains(SEARCH_WHEN),
                 "the section of the {name} render must hold the lines on when to search"
+            );
+        }
+    }
+
+    #[test]
+    fn test_guidance_search_describes_name_links_rank_and_call_assignments() {
+        for (name, content) in all_renders() {
+            let text = search_section(&content).join("\n");
+            let missing: Vec<_> = [
+                "file kind, file-name word, count",
+                "Name tests ignore case and match whole tokens",
+                "lists, by name, callable definitions",
+                "(def N)",
+                "N is the definition's name line",
+                "Plain calls: free function, no import of that name",
+                "`self`/`this`/`Self`: method",
+                "Rust, TypeScript, JavaScript, Python and Go only",
+                "If assigned, the note counts assigned and other call lines",
+            ]
+            .into_iter()
+            .filter(|needle| !text.contains(needle))
+            .collect();
+            assert!(
+                missing.is_empty(),
+                "the search section of the {name} render must mention {missing:?}"
             );
         }
     }
