@@ -320,8 +320,8 @@ limits = [5, 20]
 # comment, string and text. A [[refs]] entry lists every whole-word line of its
 # name, so its sites add up to the grep count.
 #
-# [[clash]] names have 2 or more definitions. Calls are not split by definition
-# (split = "none"), so every call is "unassigned".
+# [[clash]] names have 2 or more definitions. An exact entry indexes every call.
+# Output may leave exact calls unassigned. A none entry forbids output assignments.
 
 [[refs]]
 id = "ripgrep-R01"
@@ -385,15 +385,16 @@ defs = [
     { path = "crates/printer/src/standard.rs", line = 1582 },
     { path = "crates/printer/src/util.rs", line = 452 },
 ]
+# Receiver calls name defs[0]; plain calls use the imported helper at defs[1].
 calls = [
-    { path = "crates/printer/src/standard.rs", line = 1053, def = "unassigned" },
-    { path = "crates/printer/src/standard.rs", line = 1075, def = "unassigned" },
-    { path = "crates/printer/src/standard.rs", line = 1137, def = "unassigned" },
-    { path = "crates/printer/src/standard.rs", line = 1198, def = "unassigned" },
-    { path = "crates/printer/src/standard.rs", line = 1231, def = "unassigned" },
-    { path = "crates/printer/src/standard.rs", line = 1587, def = "unassigned" },
+    { path = "crates/printer/src/standard.rs", line = 1053, def = 0 },
+    { path = "crates/printer/src/standard.rs", line = 1075, def = 0 },
+    { path = "crates/printer/src/standard.rs", line = 1137, def = 0 },
+    { path = "crates/printer/src/standard.rs", line = 1198, def = 1 },
+    { path = "crates/printer/src/standard.rs", line = 1231, def = 0 },
+    { path = "crates/printer/src/standard.rs", line = 1587, def = 1 },
 ]
-split = "none"
+split = "exact"
 origin = "curated"
 
 # Plain-word queries with the file that holds the answer. The relevance regex was
