@@ -18,7 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cascade::{RungWalk, serde_rungs, walk_rungs};
 use crate::cmd::{FileCopyError, copy_file_raw, display_path};
-use crate::output::{ELISION_HINT, MAX_STDOUT_CHARS, RunBudget};
+use crate::output::{
+    ELISION_HINT, EmittedNotice, MAX_STDOUT_CHARS, RunBudget, RunNoticeFacts, emitted_notice_cost,
+    run_trailer_line, run_view_marker, within_output_limit,
+};
 use crate::process::{
     ProcessOptions, ProcessResult, process_file, report_token_stats, run_budget_applies,
 };
@@ -637,12 +640,183 @@ fn final_results<'a>(
     }
 }
 
+fn notice_chars(notice: Option<&EmittedNotice>) -> usize {
+    notice.map_or(0, |notice| notice.line().chars().count())
+}
+
+fn widest_run_notice(modes: &[Mode], facts: RunNoticeFacts<'_>) -> usize {
+    modes
+        .iter()
+        .map(|&served| {
+            run_view_marker(&RunNoticeFacts { served, ..facts })
+                .line()
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A cut can occur between any two files. Use the two widest display paths,
+/// not the raw filesystem paths, to reserve the path clauses.
+fn longest_display_paths<'a>(files: &[RunFile<'a>]) -> [Option<&'a Path>; 2] {
+    let mut longest = [(0, None); 2];
+    for file in files {
+        let chars = display_path(file.path).chars().count();
+        if chars >= longest[0].0 {
+            longest[1] = longest[0];
+            longest[0] = (chars, Some(file.path));
+        } else if chars >= longest[1].0 {
+            longest[1] = (chars, Some(file.path));
+        }
+    }
+    longest.map(|(_, path)| path)
+}
+
+/// Pass 1 charges its exact aggregate notice. Rungs do not reserve the cut
+/// clauses: a long path must not force a cheaper rung if the rung fits as is.
+fn char_limits(
+    origin: Option<&str>,
+    mode: Mode,
+    pass_1_differing: usize,
+    total_paths: usize,
+    files: &[RunFile<'_>],
+    limit: usize,
+) -> Limits {
+    let available = limit.saturating_sub(1);
+    let aggregate = emitted_notice_cost(origin, mode.name(), pass_1_differing, total_paths);
+    let fit = available.saturating_sub(notice_chars(aggregate.as_ref()));
+    let total = files.len();
+    let facts = RunNoticeFacts {
+        budget: RunBudget::Chars(limit),
+        requested: mode,
+        served: mode,
+        differing: total,
+        total,
+        cut: 0,
+        omitted: 0,
+        kept_pass_1: 0,
+        last_shown: None,
+        first_omitted: None,
+    };
+    let rungs = mode.cascade_from_here();
+    let rung = available
+        .saturating_sub(widest_run_notice(&rungs[1..], facts))
+        .min(fit);
+    let [first_omitted, last_shown] = longest_display_paths(files);
+    let cut_facts = RunNoticeFacts {
+        cut: total,
+        omitted: total,
+        last_shown,
+        first_omitted,
+        ..facts
+    };
+    let cut = available
+        .saturating_sub(widest_run_notice(rungs, cut_facts))
+        .min(rung);
+    Limits { fit, rung, cut }
+}
+
+/// A run notice replaces the aggregate notice. Neither is charged to a batch row.
+fn printed_notice(
+    changed_run: Option<RunNoticeFacts<'_>>,
+    origin: Option<&str>,
+    mode: Mode,
+    differing: usize,
+    total_paths: usize,
+) -> Option<EmittedNotice> {
+    match changed_run {
+        Some(facts) => Some(run_view_marker(&facts)),
+        None => emitted_notice_cost(origin, mode.name(), differing, total_paths),
+    }
+}
+
+fn run_notice_facts<'a>(
+    selection: &RunSelection,
+    files: &[RunFile<'a>],
+    budget: RunBudget,
+) -> RunNoticeFacts<'a> {
+    let shown = selection.bodies.len();
+    debug_assert!(
+        shown <= selection.differing.len()
+            && selection.differing.len() == selection.kept_pass_1.len(),
+        "Run body metadata must cover the shown prefix"
+    );
+    RunNoticeFacts {
+        budget,
+        requested: selection.requested,
+        served: selection.mode,
+        differing: selection
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(idx, body)| selection.differing[*idx] || body.cut)
+            .count(),
+        total: files.len(),
+        cut: selection.bodies.iter().filter(|body| body.cut).count(),
+        omitted: selection.omitted,
+        kept_pass_1: selection.kept_pass_1[..shown]
+            .iter()
+            .filter(|&&kept| kept)
+            .count(),
+        last_shown: shown
+            .checked_sub(1)
+            .and_then(|idx| files.get(idx))
+            .map(|f| f.path),
+        first_omitted: files.get(shown).map(|f| f.path),
+    }
+}
+
+fn run_fits(stdout: &str, notice: Option<&EmittedNotice>) -> bool {
+    within_output_limit(stdout.chars().count().saturating_add(notice_chars(notice)))
+}
+
 struct RunReport {
     selection: RunSelection,
-    budget: RunBudget,
+    notice: Option<EmittedNotice>,
     total: usize,
-    last_shown: Option<PathBuf>,
-    first_omitted: Option<PathBuf>,
+    differing: usize,
+}
+
+/// Seal the exact output and notice before either is written. If a character
+/// plan exceeds its reserve, keep the omitted-file count and fail closed.
+fn seal_run(
+    mut selection: RunSelection,
+    files: &[RunFile<'_>],
+    budget: RunBudget,
+    origin: Option<&str>,
+    total_paths: usize,
+) -> RunReport {
+    let requested = selection.requested;
+    let render = |facts: RunNoticeFacts<'_>, changed: bool| {
+        printed_notice(
+            changed.then_some(facts),
+            origin,
+            requested,
+            facts.differing,
+            total_paths,
+        )
+    };
+    let mut facts = run_notice_facts(&selection, files, budget);
+    let mut notice = render(facts, selection.changed());
+    if matches!(budget, RunBudget::Chars(_)) && !run_fits(&selection.output, notice.as_ref()) {
+        selection.bodies.clear();
+        selection.omitted = files.len();
+        selection.mode = requested;
+        selection.output = run_trailer_line(0, files.len()).unwrap_or_default();
+        facts = run_notice_facts(&selection, files, budget);
+        notice = render(facts, selection.changed());
+        if !run_fits(&selection.output, notice.as_ref()) {
+            facts.first_omitted = None;
+            notice = render(facts, selection.changed());
+        }
+    }
+    RunReport {
+        selection,
+        notice,
+        total: facts.total,
+        differing: facts.differing,
+    }
 }
 
 /// All counts for pass 1, rungs, cuts and final stats stay in this pool.
@@ -653,6 +827,7 @@ fn prepare_results<'a>(
     opts: ProcessOptions,
     show_headers: bool,
     budget: Option<RunBudget>,
+    origin: Option<&str>,
     plan_count: &Counter<'_>,
     stats_count: &Counter<'_>,
 ) -> anyhow::Result<(FileResults<'a>, Option<RunReport>)> {
@@ -662,7 +837,7 @@ fn prepare_results<'a>(
         .map(|(idx, path)| {
             let result = process_file(path, opts);
             let piece = match (budget, &result) {
-                (Some(budget @ RunBudget::Tokens(_)), Ok(pr)) => Some(make_piece(
+                (Some(budget), Ok(pr)) => Some(make_piece(
                     piece_prefix(idx, path, show_headers),
                     pr.output.clone(),
                     None,
@@ -675,7 +850,7 @@ fn prepare_results<'a>(
             (path, result, piece)
         })
         .collect();
-    let Some(budget @ RunBudget::Tokens(_)) = budget else {
+    let Some(budget) = budget else {
         return Ok((
             processed
                 .into_iter()
@@ -706,39 +881,22 @@ fn prepare_results<'a>(
         complete: true,
         is_empty: false,
     };
-    let stage = RunStage::new(budget, Limits::uniform);
-    let mut selection = select_run(&files, pass_1, stage, opts, &process_file, plan_count)?;
-    let total = files.len();
-    let shown = selection.bodies.len();
-    debug_assert!(
-        shown <= selection.differing.len()
-            && selection.differing.len() == selection.kept_pass_1.len(),
-        "Run body metadata must cover the shown prefix"
-    );
-    let last_shown = shown
-        .checked_sub(1)
-        .and_then(|i| files.get(i))
-        .map(|f| f.path.to_path_buf());
-    let first_omitted = files.get(shown).map(|f| f.path.to_path_buf());
+    let stage = RunStage::new(budget, |limit| {
+        let differing = pass_1.differing.iter().filter(|&&differs| differs).count();
+        char_limits(origin, opts.mode, differing, paths.len(), &files, limit)
+    });
+    let selection = select_run(&files, pass_1, stage, opts, &process_file, plan_count)?;
+    let mut report = seal_run(selection, &files, budget, origin, paths.len());
     let results = final_results(
         processed
             .into_iter()
             .map(|(path, result, _)| (path, result))
             .collect(),
-        &mut selection,
+        &mut report.selection,
         opts,
         stats_count,
     );
-    Ok((
-        results,
-        Some(RunReport {
-            selection,
-            budget,
-            total,
-            last_shown,
-            first_omitted,
-        }),
-    ))
+    Ok((results, Some(report)))
 }
 
 /// Process multiple files with parallel processing via rayon.
@@ -775,12 +933,14 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         Some(RunBudget::Chars(_)) => &char_count,
         _ => &token_count,
     };
+    let origin = crate::output::rewrite_origin();
     let (results, run) = pool.install(|| {
         prepare_results(
             &paths,
             process_options,
             show_headers,
             budget,
+            origin.as_deref(),
             plan_count,
             &token_count,
         )
@@ -860,37 +1020,20 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         );
     }
 
-    // One unconditional notice discloses a changed view. The run notice
-    // replaces the aggregate notice. Neither is charged to a batch row.
-    let mode_str = options.process.mode.name().to_string();
-    if let Some(run) = run.as_ref().filter(|r| r.selection.changed()) {
-        let selection = &run.selection;
-        let shown = selection.bodies.len();
-        let facts = crate::output::RunNoticeFacts {
-            budget: run.budget,
-            requested: process_options.mode,
-            served: selection.mode,
-            differing: view_differs_count,
-            total: run.total,
-            cut: selection.bodies.iter().filter(|body| body.cut).count(),
-            omitted: selection.omitted,
-            kept_pass_1: selection.kept_pass_1[..shown]
-                .iter()
-                .filter(|&&kept| kept)
-                .count(),
-            last_shown: run.last_shown.as_deref(),
-            first_omitted: run.first_omitted.as_deref(),
-        };
-        let notice = crate::output::run_view_marker(&facts);
-        let _ = write!(io::stderr().lock(), "{}", notice.line());
-    } else if view_differs_count > 0
-        && let Some(notice) = crate::output::emitted_notice_cost(
-            crate::output::rewrite_origin().as_deref(),
-            &mode_str,
+    let notice = match run {
+        Some(run) => {
+            debug_assert_eq!(run.differing, view_differs_count);
+            run.notice
+        }
+        None => printed_notice(
+            None,
+            origin.as_deref(),
+            process_options.mode,
             view_differs_count,
             total_paths,
-        )
-    {
+        ),
+    };
+    if let Some(notice) = notice {
         let _ = write!(io::stderr().lock(), "{}", notice.line());
     }
 
@@ -994,7 +1137,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             .collect();
 
         let common = crate::analytics::FileOpCommon {
-            mode: Some(mode_str),
+            mode: Some(process_options.mode.name().to_owned()),
             project_path: cwd,
             session_id: options.session_id.clone(),
         };
@@ -1276,6 +1419,109 @@ mod tests {
             path: Path::new(path),
             prefix: String::new(),
             pass_1: pr,
+        }
+    }
+
+    #[test]
+    fn run_fits_uses_the_strict_character_limit_with_the_notice() {
+        let notice = emitted_notice_cost(None, "structure", 1, 1).unwrap();
+        let last_fit = MAX_STDOUT_CHARS - notice.line().chars().count() - 1;
+        assert!(run_fits(&"é".repeat(last_fit), Some(&notice)));
+        assert!(!run_fits(&"é".repeat(last_fit + 1), Some(&notice)));
+    }
+
+    #[test]
+    fn char_limits_charge_the_exact_aggregate_notice_to_pass_one() {
+        let pr = result("view\n");
+        let files = [run_file("a.rs", &pr)];
+        // The second path failed. The aggregate still uses both paths.
+        let limits = char_limits(Some("cat"), Mode::Structure, 1, 2, &files, MAX_STDOUT_CHARS);
+        let notice = emitted_notice_cost(Some("cat"), "structure", 1, 2).unwrap();
+        assert_eq!(
+            limits.fit + notice.line().chars().count(),
+            MAX_STDOUT_CHARS - 1
+        );
+        assert!(limits.cut <= limits.rung && limits.rung <= limits.fit);
+    }
+
+    #[test]
+    fn only_the_cut_reserve_charges_the_two_longest_display_paths() {
+        let pr = result("view\n");
+        let long = "component/".repeat(90) + "a.rs";
+        let longer = "component/".repeat(100) + "b.rs";
+        let short = [
+            run_file("a.rs", &pr),
+            run_file("b.rs", &pr),
+            run_file("c.rs", &pr),
+        ];
+        let deep = [
+            run_file(&long, &pr),
+            run_file("c.rs", &pr),
+            run_file(&longer, &pr),
+        ];
+        let limits = |files: &[RunFile<'_>]| {
+            char_limits(None, Mode::Structure, 3, 3, files, MAX_STDOUT_CHARS)
+        };
+        let short_limits = limits(&short);
+        let deep_limits = limits(&deep);
+        assert_eq!(deep_limits.rung, short_limits.rung);
+        assert_eq!(
+            short_limits.cut - deep_limits.cut,
+            long.len() + longer.len() - 8
+        );
+    }
+
+    #[test]
+    fn printed_notice_chooses_the_run_notice_instead_of_the_aggregate() {
+        let facts = RunNoticeFacts {
+            budget: RunBudget::Chars(MAX_STDOUT_CHARS),
+            requested: Mode::Structure,
+            served: Mode::Signatures,
+            differing: 1,
+            total: 1,
+            cut: 0,
+            omitted: 0,
+            kept_pass_1: 0,
+            last_shown: None,
+            first_omitted: None,
+        };
+        let origin = Some("cat");
+        let aggregate = printed_notice(None, origin, Mode::Structure, 1, 2).unwrap();
+        assert_eq!(
+            aggregate.line(),
+            emitted_notice_cost(origin, "structure", 1, 2)
+                .unwrap()
+                .line()
+        );
+        let changed = printed_notice(Some(facts), origin, Mode::Structure, 1, 2).unwrap();
+        assert_eq!(changed.line(), run_view_marker(&facts).line());
+    }
+
+    #[test]
+    fn seal_run_uses_the_trailer_and_drops_a_path_only_if_needed() {
+        let pr = result("view\n");
+        for (parts, show_path) in [(500, true), (3000, false)] {
+            let path = "component/".repeat(parts) + "a.rs";
+            let files = [run_file(&path, &pr), run_file("b.rs", &pr)];
+            let selected = pass_one_set(&files, &|s| Some(s.chars().count())).accept(
+                "x".repeat(MAX_STDOUT_CHARS),
+                Mode::Signatures,
+                Mode::Structure,
+            );
+            let report = seal_run(
+                selected,
+                &files,
+                RunBudget::Chars(MAX_STDOUT_CHARS),
+                None,
+                2,
+            );
+            let notice = report.notice.unwrap();
+            assert_eq!(report.selection.output, run_trailer_line(0, 2).unwrap());
+            assert!(report.selection.bodies.is_empty());
+            assert!(run_fits(&report.selection.output, Some(&notice)));
+            assert!(notice.line().contains("[skim] structure view"));
+            assert!(notice.line().contains("0/2 files"));
+            assert_eq!(notice.line().contains("first omitted"), show_path);
         }
     }
 

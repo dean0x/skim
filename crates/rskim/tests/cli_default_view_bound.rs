@@ -49,7 +49,7 @@ fn stdin(cache: &Path, source: &str, args: &[&str]) -> Streams {
     }
 }
 
-fn bounded(view: &Streams) {
+fn bounded_streams(view: &Streams) {
     assert!(
         view.out.chars().count() + view.err.chars().count() < LIMIT,
         "stdout: {} characters; stderr: {}",
@@ -62,6 +62,10 @@ fn bounded(view: &Streams) {
         "{}",
         view.err
     );
+}
+
+fn bounded(view: &Streams) {
+    bounded_streams(view);
     assert!(!view.err.contains("token"), "{}", view.err);
     assert!(!view.err.contains(['\u{2013}', '\u{2014}']));
     assert!(!view.err.contains(" - "));
@@ -509,7 +513,7 @@ fn explicit_selections_keep_their_unbounded_contracts_and_valid_remedies() {
 }
 
 #[test]
-fn directory_glob_and_explicit_file_list_stay_unbounded() {
+fn directory_glob_and_explicit_file_list_are_bounded() {
     let home = TempDir::new().unwrap();
     let inputs = home.path().join("inputs");
     fs::create_dir(&inputs).unwrap();
@@ -530,9 +534,15 @@ fn directory_glob_and_explicit_file_list_stay_unbounded() {
             .output()
             .unwrap();
         assert!(default.status.success() && typed.status.success());
-        assert_eq!(default.stdout, typed.stdout);
-        assert_eq!(default.stderr, typed.stderr);
-        assert!(String::from_utf8(default.stdout).unwrap().chars().count() > LIMIT);
+        assert!(String::from_utf8(typed.stdout).unwrap().chars().count() > LIMIT);
+        let view = Streams {
+            out: String::from_utf8(default.stdout).unwrap(),
+            err: String::from_utf8(default.stderr).unwrap(),
+        };
+        bounded_streams(&view);
+        assert!(view.err.contains("covers the whole output of the run"));
+        assert!(view.err.contains("stepped down from structure"));
+        assert_eq!(view.out.matches("function_99").count(), 2);
     }
 }
 
