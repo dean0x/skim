@@ -11,10 +11,9 @@ mod common;
 
 /// Get a command for the skim binary
 fn skim_cmd() -> Command {
-    let mut cmd = common::skim();
-    cmd.env_remove("SKIM_PASSTHROUGH");
-    cmd.env_remove("SKIM_DEBUG");
-    cmd
+    static HOME: std::sync::LazyLock<TempDir> =
+        std::sync::LazyLock::new(|| TempDir::new().unwrap());
+    common::skim_sandboxed(HOME.path())
 }
 
 /// Resolve path to a test fixture file relative to the workspace root
@@ -382,7 +381,7 @@ fn test_tokens_with_stdin() {
 
 #[test]
 fn test_tokens_with_glob() {
-    // Per-file budget: each file independently limited
+    // Headers and both bodies share one budget.
     let dir = TempDir::new().unwrap();
 
     std::fs::write(
@@ -398,6 +397,16 @@ fn test_tokens_with_glob() {
     )
     .unwrap();
 
+    let plain = skim_cmd()
+        .args(["*.ts", "--mode", "structure", "--no-cache"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let counter = rskim_tokens::Counter::new(rskim_tokens::Encoding::Cl100k).unwrap();
+    assert!(counter.count(std::str::from_utf8(&plain.stdout).unwrap()) > 50);
+
     let output = skim_cmd()
         .arg("*.ts")
         .arg("--tokens")
@@ -411,6 +420,12 @@ fn test_tokens_with_glob() {
         output.status.success(),
         "Glob with --tokens should succeed. stderr: {:?}",
         String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    assert!(counter.count(stdout) <= 50, "{stdout}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("budget covers the whole output of the run")
     );
 }
 

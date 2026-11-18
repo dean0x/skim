@@ -192,6 +192,42 @@ pub(crate) fn read_regular_bounded(path: &Path, max: u64) -> Result<BoundedFile,
     })
 }
 
+/// Distinguish a file open or read error from an error at the output sink.
+#[derive(Debug)]
+pub(crate) enum FileCopyError {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+struct CopySource {
+    file: File,
+    failed: bool,
+}
+
+impl Read for CopySource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf).inspect_err(|error| {
+            // io::copy retries interrupted reads.
+            self.failed = error.kind() != io::ErrorKind::Interrupted;
+        })
+    }
+}
+
+/// Stream raw file bytes through a fixed buffer, with no size or text check.
+/// Keep the original error so the caller can report input errors and handle
+/// output errors such as a closed pipe separately.
+pub(crate) fn copy_file_raw(path: &Path, out: &mut impl io::Write) -> Result<(), FileCopyError> {
+    let mut source = CopySource {
+        file: File::open(path).map_err(FileCopyError::Input)?,
+        failed: false,
+    };
+    match io::copy(&mut source, out) {
+        Ok(_) => Ok(()),
+        Err(error) if source.failed => Err(FileCopyError::Input(error)),
+        Err(error) => Err(FileCopyError::Output(error)),
+    }
+}
+
 // ============================================================================
 // Atomic write
 // ============================================================================

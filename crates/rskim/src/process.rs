@@ -46,6 +46,14 @@ pub(crate) struct ProcessOptions {
     pub(crate) batch: bool,
 }
 
+/// Whether a multi-file run owns the token budget and the cascade lines.
+///
+/// Only `file_process_options(.., true)` for `multi_options` in the file dispatcher
+/// and its test twin set `batch`. Single-file and stdin options leave it false.
+pub(crate) fn run_budget_applies(options: &ProcessOptions) -> bool {
+    options.batch && options.trunc.token_budget.is_some()
+}
+
 /// Result of processing a file
 #[derive(Debug)]
 #[must_use]
@@ -626,6 +634,11 @@ fn run_transform(
                 budget,
                 language,
                 source_line_count,
+                if run_budget_applies(options) {
+                    cascade::CascadeLines::Quiet
+                } else {
+                    cascade::CascadeLines::Print
+                },
                 transform_file,
             )?;
 
@@ -1267,6 +1280,7 @@ pub(crate) fn process_stdin(
                     budget,
                     language,
                     source_line_count,
+                    cascade::CascadeLines::Print,
                     |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
                 )?;
                 // Re-run for source coordinates, but keep the cascade's token cut.

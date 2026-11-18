@@ -31,7 +31,7 @@ updated: 2026-11-18
 
 ## Overview
 
-A default read of one input (`skim FILE` or `skim -`) must not print more than the limit that Claude Code can show. The limit counts what the reader sees: stdout plus the stderr notice. Typed modes, multi-file runs, directories, globs, `--symbol`, `--max-lines`, `--last-lines`, `--tokens` and hook file rewrites keep their old unbounded behavior. `SKIM_PASSTHROUGH=1` gives raw output.
+A default read of one input (`skim FILE` or `skim -`) must not print more than the limit that Claude Code can show. The limit counts what the reader sees: stdout plus the stderr notice. Typed modes, multi-file runs, directories, globs, `--symbol`, `--max-lines`, `--last-lines`, `--tokens` and hook file rewrites have no default character limit. A multi-file run with `--tokens N` is not unbounded: one token budget covers its whole stdout (see `tokens-run-budget`). `SKIM_PASSTHROUGH=1` gives raw output.
 
 The code has four layers. `main.rs` decides if a read is bounded. `process.rs` (`default_view`) chooses the view. `cascade.rs` (`walk_rungs`, `select_for_char_budget`) walks the modes. `rskim-core` `truncate_with_count_source` cuts whole lines. `cache.rs` stores and replays the outcome.
 
@@ -91,5 +91,5 @@ The first rung is reused from the caller when its mode matches the requested mod
 
 ## Related
 
-- Feature knowledge: `symbol-read` (`--symbol` is unbounded and has its own cache key), `file-wrapper-fidelity` (notice and fidelity rules), `analytics` (cost charge).
+- Feature knowledge: `symbol-read` (`--symbol` is unbounded and has its own cache key), `file-wrapper-fidelity` (notice and fidelity rules), `analytics` (cost charge), `tokens-run-budget` (the whole-run `--tokens` budget for multi-file reads; shares the rung walk and the notice line builder).
 - Source: `crates/rskim/src/cmd/rewrite/post_hook.rs` (shares `within_output_limit`), `docs/modes.md`, `docs/usage.md`.

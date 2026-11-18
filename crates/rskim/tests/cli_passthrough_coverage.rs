@@ -137,6 +137,292 @@ fn test_read_path_passthrough_outputs_raw_bytes() {
         .stderr(predicate::str::is_empty());
 }
 
+/// A batch owns cascade notices, but keeps each file's selected bytes.
+#[test]
+fn tokens_batch_keeps_selected_bytes_without_per_file_lines() {
+    let dir = TempDir::new().unwrap();
+    let source = format!(
+        "pub struct User {{ pub id: u64 }}\n{}",
+        (0..30)
+            .map(|i| format!(
+                "pub fn item_{i}(id: u64) -> u64 {{\n    let value = id + {i};\n    value * 2\n}}\n"
+            ))
+            .collect::<String>()
+    );
+    for file in ["a.rs", "b.rs"] {
+        fs::write(dir.path().join(file), &source).unwrap();
+    }
+    let single = skim()
+        .current_dir(dir.path())
+        .args(["a.rs", "--tokens", "100", "--no-cache"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&single.stderr).contains("escalated"));
+    skim()
+        .args(["-", "--filename", "a.rs", "--tokens", "100", "--no-cache"])
+        .write_stdin(source)
+        .assert()
+        .success()
+        .stdout(single.stdout.clone())
+        .stderr(single.stderr);
+    let counter = rskim_tokens::Counter::new(rskim_tokens::Encoding::Cl100k).unwrap();
+    let expected = single.stdout.repeat(2);
+    assert!(counter.count(std::str::from_utf8(&expected).unwrap()) <= 100);
+
+    skim()
+        .current_dir(dir.path())
+        .args([
+            "b.rs",
+            "a.rs",
+            "--tokens",
+            "100",
+            "--no-cache",
+            "--no-header",
+        ])
+        .assert()
+        .success()
+        .stdout(expected)
+        .stderr(predicate::str::contains("token budget:").not())
+        .stderr(predicate::str::contains("SKIM_PASSTHROUGH=1"));
+}
+
+/// A one-file glob uses the run floor and one remedy, including serde files.
+#[test]
+fn tokens_batch_floor_uses_one_run_remedy() {
+    let dir = TempDir::new().unwrap();
+    for (file, source) in [
+        (
+            "data.rs",
+            "pub struct User { pub id: u64, pub name: String }\n",
+        ),
+        (
+            "data.json",
+            "{\"users\": {\"id\": 1, \"name\": \"sample\"}}\n",
+        ),
+    ] {
+        fs::write(dir.path().join(file), source).unwrap();
+        let single = skim()
+            .current_dir(dir.path())
+            .args([file, "--tokens", "5", "--no-cache"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let single_stderr = String::from_utf8_lossy(&single.stderr);
+        assert!(
+            single_stderr.contains("all modes exceeded"),
+            "{single_stderr}"
+        );
+        assert!(
+            single_stderr.contains("output truncated to the --tokens budget"),
+            "{single_stderr}"
+        );
+        skim()
+            .args(["-", "--filename", file, "--tokens", "5", "--no-cache"])
+            .write_stdin(source)
+            .assert()
+            .success()
+            .stdout(single.stdout)
+            .stderr(single.stderr);
+        let pattern = format!("*.{}", file.rsplit('.').next().unwrap());
+        skim()
+            .current_dir(dir.path())
+            .args([&pattern, "--tokens", "5", "--no-cache"])
+            .assert()
+            .success()
+            .stdout(predicate::eq(
+                "// [skim] 1 files omitted (0 of 1 shown) — SKIM_PASSTHROUGH=1 for full output\n",
+            ))
+            .stderr(predicate::str::contains(
+                "the --tokens 5 budget covers the whole output of the run",
+            ))
+            .stderr(predicate::str::contains("token budget:").not())
+            .stderr(predicate::str::contains("output truncated to the --tokens budget").not())
+            .stderr(predicate::str::contains("SKIM_PASSTHROUGH=1").count(1));
+    }
+}
+
+#[test]
+fn explicit_list_passthrough_prints_sorted_raw_bytes_with_or_without_tokens() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.ts"), STRUCTURE_FIXTURE).unwrap();
+    let second = b"// raw bytes\r\n\xff\x00no final newline";
+    fs::write(dir.path().join("b.ts"), second).unwrap();
+    let expected = [STRUCTURE_FIXTURE.as_bytes(), second].concat();
+    for flags in [vec![], vec!["--tokens", "50"]] {
+        passthrough_skim()
+            .current_dir(dir.path())
+            .args(["b.ts", "a.ts", "a.ts"])
+            .args(flags)
+            .assert()
+            .success()
+            .stdout(expected.clone())
+            .stderr(predicate::str::is_empty());
+    }
+}
+
+#[test]
+fn explicit_list_passthrough_uses_the_same_mixed_path_set() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::create_dir(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join(".gitignore"), "ignored.ts\n").unwrap();
+    for file in [
+        "src/a.ts",
+        "src/.hidden.ts",
+        "src/ignored.ts",
+        "b.ts",
+        "z.ts",
+    ] {
+        fs::write(
+            dir.path().join(file),
+            format!("// {file}\n{STRUCTURE_FIXTURE}"),
+        )
+        .unwrap();
+    }
+    let args = ["z.ts", "src", "src/*.ts", "src/a.ts", "b.ts"];
+    skim()
+        .current_dir(dir.path())
+        .args(args)
+        .args(["--mode", "full", "--no-header", "--no-cache"])
+        .assert()
+        .success()
+        .stdout(
+            ["b.ts", "src/a.ts", "z.ts"]
+                .map(|file| fs::read(dir.path().join(file)).unwrap())
+                .concat(),
+        );
+    for no_ignore in [false, true] {
+        let files: &[&str] = if no_ignore {
+            &[
+                "b.ts",
+                "src/.hidden.ts",
+                "src/a.ts",
+                "src/ignored.ts",
+                "z.ts",
+            ]
+        } else {
+            &["b.ts", "src/a.ts", "z.ts"]
+        };
+        let mut command = passthrough_skim();
+        command.current_dir(dir.path()).args(args);
+        if no_ignore {
+            command.arg("--no-ignore");
+        }
+        command
+            .assert()
+            .success()
+            .stdout(
+                files
+                    .iter()
+                    .flat_map(|file| fs::read(dir.path().join(file)).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .stderr(predicate::str::is_empty());
+    }
+}
+
+#[test]
+fn explicit_list_passthrough_warns_for_missing_paths_and_fails_if_all_are_missing() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.ts"), STRUCTURE_FIXTURE).unwrap();
+    passthrough_skim()
+        .current_dir(dir.path())
+        .args(["missing.ts", "a.ts"])
+        .assert()
+        .success()
+        .stdout(STRUCTURE_FIXTURE)
+        .stderr("Warning: File not found: 'missing.ts'\n");
+    passthrough_skim()
+        .current_dir(dir.path())
+        .args(["missing.ts", "absent.ts"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr("Error: File not found: 'missing.ts'\nFile not found: 'absent.ts'\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_continues_after_an_input_error() {
+    let dir = TempDir::new().unwrap();
+    let first = b"a\r\n";
+    let last = b"c\0\xff";
+    fs::write(dir.path().join("a.ts"), first).unwrap();
+    fs::write(dir.path().join("c.ts"), last).unwrap();
+    // The socket exists, but cannot be opened as a file, even by root.
+    let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("b\nbad.ts")).unwrap();
+
+    common::skim_sandboxed(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .args(["a.ts", "b\nbad.ts", "c.ts"])
+        .assert()
+        .stdout([&first[..], &last[..]].concat())
+        .success()
+        .stderr(predicate::str::contains("Error processing b?bad.ts:"))
+        .stderr(predicate::str::contains("b\nbad.ts").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_uses_the_transform_exit_code_if_all_inputs_fail() {
+    let dir = TempDir::new().unwrap();
+    let args = ["a.ts", "b.ts"];
+    let _sockets =
+        args.map(|path| std::os::unix::net::UnixListener::bind(dir.path().join(path)).unwrap());
+    let transform = common::skim_sandboxed(dir.path())
+        .args(args)
+        .output()
+        .unwrap();
+    let code = transform.status.code().filter(|&code| code != 0).unwrap();
+
+    common::skim_sandboxed(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .args(args)
+        .assert()
+        .code(code)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("Error processing a.ts:"))
+        .stderr(predicate::str::contains("Error processing b.ts:"))
+        .stderr(predicate::str::contains("All 2 file(s) failed to process"));
+}
+
+#[test]
+fn explicit_list_passthrough_rejects_stdin_mixed_with_files() {
+    passthrough_skim()
+        .args(["-", "unused.ts"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("stdin ('-') cannot be combined"));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_broken_pipe_exits_141() {
+    use std::process::Stdio;
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.ts"), STRUCTURE_FIXTURE.repeat(3_000)).unwrap();
+    fs::write(dir.path().join("b.ts"), STRUCTURE_FIXTURE).unwrap();
+    let mut child = std::process::Command::new(common::skim_bin())
+        .current_dir(dir.path())
+        .args(["a.ts", "b.ts"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_DEBUG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(!read_one_line_then_close(&mut child, "explicit-list").is_empty());
+    assert_eq!(
+        wait_for_child(&mut child, "explicit-list").code(),
+        Some(141)
+    );
+}
+
 /// `SKIM_PASSTHROUGH=1 skim -` (stdin) must copy stdin to stdout unchanged.
 #[test]
 fn test_stdin_passthrough_copies_raw_bytes() {
@@ -1117,6 +1403,70 @@ fn wait_for_child(child: &mut std::process::Child, tag: &str) -> std::process::E
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     }
+}
+
+#[cfg(unix)]
+fn assert_passthrough_writes_before_eof(args: &[&str]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::process::{Command, Stdio};
+
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.ts");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&input)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(dir.path().join("z.ts"), b"").unwrap();
+    let mut child = Command::new(common::skim_bin())
+        .current_dir(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Open the writer only after skim opens the FIFO. Keep it open until stdout has a line.
+    let options = fs::File::options()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .clone();
+    let writer = (0..200).find_map(|_| match options.open(&input) {
+        Ok(writer) => Some(writer),
+        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            None
+        }
+        Err(error) => panic!("open FIFO: {error}"),
+    });
+    let Some(mut writer) = writer else {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("skim did not open the FIFO");
+    };
+    writer.write_all(b"first line\n").unwrap();
+    assert_eq!(
+        read_one_line_then_close(&mut child, "raw stream"),
+        "first line"
+    );
+    drop(writer);
+    assert!(wait_for_child(&mut child, "raw stream").success());
+}
+
+#[cfg(unix)]
+#[test]
+fn single_file_passthrough_writes_before_eof() {
+    assert_passthrough_writes_before_eof(&["input.ts"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_writes_before_eof() {
+    assert_passthrough_writes_before_eof(&["input.ts", "z.ts"]);
 }
 
 /// `SKIM_PASSTHROUGH=1 skim <file> | head -1` must exit 141, not 1.

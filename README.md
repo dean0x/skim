@@ -334,7 +334,7 @@ skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 - `-n, --line-numbers` - Annotate output with original source line numbers (prefix `{line}\t{content}`)
 - `--max-lines N` - Emit at most N lines total; when content is elided, one slot goes to the elision marker. One documented exception at `N=1`: 1 content line **plus** the marker (2 lines), because spending the only slot on the marker returns a view containing no code, and dropping the marker to fit is silent loss
 - `--last-lines N` - Emit at most N lines from the tail; when content is elided, one slot goes to the elision marker. The same `N=1` exception applies — the carve-out is a property of the bound, not of the direction
-- `--tokens N` - Fit output within N tokens by escalating through modes, then line-truncating with a marker
+- `--tokens N` - One budget covers the whole output of a run, including headers, line numbers and markers
 - `--symbol NAME` - Print the raw source lines of one named declaration of one file. `Type::name` or `Type.name` selects a declaration inside one container. If two or more declarations have the name, skim prints all of them, each after a header line. One stderr notice line states how many lines are not shown. `--max-lines`, `--last-lines` and `--line-numbers` apply to the selected lines. Exit code 1: no declaration has the name. Exit code 2: the command is not a symbol read (stdin, two or more files, a glob, a directory, an empty name, `--tokens`, or a `--mode` other than `full`). Exit code 3: Markdown, JSON, YAML, TOML, or a file with no detected language. Known limits: raw source only. Functions in C and C++ files are not found, because their name is inside the declarator. Attributes, doc comments and decorators above a declaration are not in the printed range. The structure mode still parses `.tsx` files with the TypeScript grammar. See the [usage guide](docs/usage.md#symbol-read)
 - `--passthrough` - Bypass compression and exec the real tool with raw argv (equivalent to `SKIM_PASSTHROUGH=1`). **Not universal:** `env`/`printenv` keep credential redaction regardless of passthrough state, and the multi-level dispatchers (`cargo`, `dotnet`, `go`, `swift`) still serve the compressed summary whenever stdin is not a TTY — which is every agent harness, CI job, and pipeline. Run the tool directly when you need raw bytes from a build tool
 - `--debug` - Enable raw-fallback diagnostic banners on stderr (loss-bearing elision markers are always emitted regardless)
@@ -367,6 +367,29 @@ Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol`, hook file
 Limits in other agents are not known.
 
 Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
+
+### Whole-run token budget
+
+With `--tokens N`, one budget covers the whole output of a run, not each file.
+This applies to an explicit list of files, a glob and a directory.
+The budget counts stdout, including headers, source line numbers and markers, but not stderr.
+
+```bash
+skim src/ --tokens 1000
+skim 'src/**/*.ts' --tokens 1000
+skim first.ts second.ts --tokens 1000
+```
+
+The mode order is **full → minimal → pseudo → structure → signatures → types**.
+Skim starts at `--mode` if set, else structure.
+If the run is too large, skim tries smaller views, then cuts whole lines with exact counts.
+It can omit trailing files and count them on the last stdout line.
+A changed run gets one stderr notice.
+
+For a tiny multi-file budget, only the omitted-files line prints.
+That line can exceed N; this is the minimum output floor.
+Use a larger `--tokens` value or fewer files for more content.
+`SKIM_PASSTHROUGH=1` gives the full output for an explicit list of files, a glob or a directory.
 
 ## Transformation Modes
 

@@ -18,6 +18,7 @@ mod format;
 mod multi;
 mod output;
 mod process;
+mod run_budget;
 mod runner;
 mod symbol;
 mod tokens;
@@ -450,18 +451,25 @@ struct Args {
     )]
     symbol: Option<String>,
 
-    /// Token budget - cascade through modes until output fits within N tokens
+    /// One budget covers the whole output of a run, with headers and markers.
     ///
-    /// Progressively applies more aggressive modes (full -> minimal -> structure
-    /// -> signatures -> types) until the output fits within the specified token
-    /// budget. If --mode is also specified, cascade starts at that mode.
-    /// Final fallback: line-based truncation of the most aggressive mode's output.
+    /// The budget counts stdout, not stderr.
+    /// Modes: full -> minimal -> pseudo -> structure -> signatures -> types.
+    /// Start at --mode if set, else structure. If no view fits, cut whole lines
+    /// with exact counts, then omit trailing files.
+    ///
+    /// For tiny multi-file budgets, the omitted-files line can exceed N; no file
+    /// content prints. For tiny single-file or stdin budgets, the count stays on
+    /// stdout and the SKIM_PASSTHROUGH=1 remedy prints on stderr.
     #[arg(
         long,
         value_name = "N",
-        help = "Fit the output within N tokens by escalating modes, then line-truncating \
-                with a marker; on very small budgets the count stays on stdout and the \
-                SKIM_PASSTHROUGH=1 remedy is printed to stderr"
+        help = "One budget covers the whole output of a run, with headers and markers. \
+                The budget counts stdout, not stderr. \
+                Modes: full -> minimal -> pseudo -> structure -> signatures -> types. \
+                Cut whole lines, then omit trailing files. For tiny multi-file budgets, \
+                the omitted-files line can exceed N; no file content prints. \
+                Use SKIM_PASSTHROUGH=1 for full output"
     )]
     tokens: Option<usize>,
 
@@ -1746,6 +1754,10 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         );
     }
 
+    if cmd::is_passthrough_mode() {
+        return multi::passthrough_explicit_files(&args.files, args.no_ignore);
+    }
+
     // Expand each argument: glob pattern → expand, directory → collect,
     // plain file → add directly.  All results are gathered into a single Vec
     // and processed together via process_files.
@@ -1778,15 +1790,10 @@ fn process_single_arg(
     // detect `EPIPE` and exit 141 rather than 1.  Wrapping with `anyhow::anyhow!`
     // produces a `Message` error with no source, which `chain()` cannot walk.
     //
-    // consistency-3: the remedy line in the multi-file marker says
-    // "SKIM_PASSTHROUGH=1 for full output" — `lossy_view_marker` resolves its
-    // remedy through `fidelity::remedy_for` with
-    // `passthrough_reproduces_argv: true`, which returns the canonical
-    // `output::ELISION_HINT` (pinned whole by
-    // `cli_transparency::test_multi_file_aggregate_marker_emitted_once`).
-    // Either way the marker names a hatch, so every shape it can fire for must
-    // also work in passthrough mode.  Directories and globs are handled here so
-    // the remedy is literally reachable from any invocation that prints it.
+    // The aggregate marker names SKIM_PASSTHROUGH=1 for full output. Every
+    // multi-file shape must accept that remedy: directories and globs here,
+    // explicit lists in run_file_operation via passthrough_explicit_files.
+    // Both paths use the transform collectors and the same no_ignore value.
     if cmd::is_passthrough_mode() {
         use std::io::Write as _;
         let stdout = std::io::stdout();
@@ -1796,30 +1803,31 @@ fn process_single_arg(
             // Stdin passthrough: copy bounded stdin → stdout.
             let buf = cmd::read_stdin_bounded()?;
             out.write_all(buf.as_bytes())?;
-        } else if path.is_dir() {
+            return Ok(());
+        }
+        let mut copy = |path: &std::path::Path| -> anyhow::Result<()> {
+            match cmd::copy_file_raw(path, &mut out) {
+                Ok(()) => Ok(()),
+                Err(cmd::FileCopyError::Input(error)) => {
+                    anyhow::bail!("passthrough read {}: {error}", path.display())
+                }
+                Err(cmd::FileCopyError::Output(error)) => Err(error)?,
+            }
+        };
+        if path.is_dir() {
             // Directory passthrough: collect all skim-supported files and
             // print their raw bytes concatenated (mirrors process_directory).
-            let paths = multi::collect_passthrough_paths_dir(path, args.no_ignore);
-            for p in &paths {
-                let contents = std::fs::read(p)
-                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
-                out.write_all(&contents)?;
+            for path in multi::collect_passthrough_paths_dir(path, args.no_ignore) {
+                copy(&path)?;
             }
         } else if multi::has_glob_pattern(file) {
             // Glob passthrough: expand, then print raw bytes of each match.
-            let paths = multi::collect_passthrough_paths_glob(file, args.no_ignore)?;
-            for p in &paths {
-                let contents = std::fs::read(p)
-                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
-                out.write_all(&contents)?;
+            for path in multi::collect_passthrough_paths_glob(file, args.no_ignore)? {
+                copy(&path)?;
             }
         } else {
-            // File passthrough: read raw bytes and copy to stdout.
-            // Skip validation (size limits, UTF-8) — the point of passthrough
-            // is byte-faithful forwarding without skim's transform guards.
-            let contents =
-                std::fs::read(file).map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
-            out.write_all(&contents)?;
+            // Stream the raw bytes without a size limit or UTF-8 check.
+            copy(path)?;
         }
         return Ok(());
     }

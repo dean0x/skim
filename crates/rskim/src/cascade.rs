@@ -118,6 +118,18 @@ fn count_tokens_or_max(text: &str) -> usize {
     })
 }
 
+/// Control per-file cascade lines without a change to the output or selected mode.
+///
+/// The character-budget walk is print-free. A batch token run still uses
+/// `cascade_for_token_budget` for its first pass to preserve fitting stdout bytes.
+/// That path can print in its fit arm, line fallback and serde cascade. The run
+/// owns those notices, so its first pass must use `Quiet`. Count warnings always print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CascadeLines {
+    Print,
+    Quiet,
+}
+
 /// Apply line-based truncation as a final fallback when all modes exceed the budget.
 ///
 /// Emits a diagnostic to stderr and delegates to `truncate_to_token_budget`.
@@ -133,11 +145,14 @@ fn fallback_line_truncate(
     mode: Mode,
     known_token_count: Option<usize>,
     source_line_count: usize,
+    lines: CascadeLines,
 ) -> anyhow::Result<(String, Mode)> {
-    eprintln!(
-        "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
-        mode.name(),
-    );
+    if lines == CascadeLines::Print {
+        eprintln!(
+            "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
+            mode.name(),
+        );
+    }
     // B5: pass the CLI-level remedy hint so the token-budget truncation marker
     // carries the SKIM_PASSTHROUGH=1 remedy clause (ADR-011 class 1).
     // reliability-8: pass source_line_count so the elision count is in source
@@ -159,7 +174,7 @@ fn fallback_line_truncate(
     // regression-6: use writeln! on the locked handle instead of eprintln! to
     // avoid panicking when fd 2 is broken (e.g. `2>&1 | head`); discard the
     // error — if stderr is closed there is nobody to disclose to.
-    if compact_marker_without_hint(&truncated, ELISION_HINT) {
+    if lines == CascadeLines::Print && compact_marker_without_hint(&truncated, ELISION_HINT) {
         let _ = writeln!(
             std::io::stderr().lock(),
             "[skim] output truncated to the --tokens budget — {ELISION_HINT}"
@@ -184,6 +199,7 @@ pub(crate) fn cascade_for_token_budget<F>(
     token_budget: usize,
     language: Language,
     source_line_count: usize,
+    lines: CascadeLines,
     transform_fn: F,
 ) -> anyhow::Result<(String, Mode)>
 where
@@ -200,6 +216,7 @@ where
             token_budget,
             language,
             source_line_count,
+            lines,
             &transform_fn,
         );
     }
@@ -218,7 +235,7 @@ where
     )?;
     match walk {
         RungWalk::Fits { mode, rung } => {
-            if mode != starting_mode {
+            if lines == CascadeLines::Print && mode != starting_mode {
                 eprintln!(
                     "[skim] token budget: escalated from {} to {} mode ({} tokens)",
                     starting_mode.name(),
@@ -235,6 +252,7 @@ where
             mode,
             last_token_count,
             source_line_count,
+            lines,
         ),
         RungWalk::AllEmpty => {
             let raw = transform_fn(&build_config(Mode::Full, trunc))?.unwrap_or_default();
@@ -248,6 +266,7 @@ where
                 starting_mode,
                 None,
                 source_line_count,
+                lines,
             )
         }
         RungWalk::NoOutput => Err(anyhow::anyhow!(NO_OUTPUT_MSG)),
@@ -263,7 +282,7 @@ pub(crate) enum RungWalk<R> {
     NoOutput,
 }
 
-fn walk_rungs<R>(
+pub(crate) fn walk_rungs<R>(
     modes: &[Mode],
     trunc: &TruncationOptions,
     mut transform: impl FnMut(&TransformConfig) -> anyhow::Result<Option<R>>,
@@ -305,7 +324,7 @@ pub(crate) type CharBudgetOutcome = RungWalk<CharBudgetRung>;
 
 /// Serde structure, signatures and types produce the same view. Only a raw
 /// starting mode has a second distinct rung.
-fn serde_rungs(mode: Mode) -> &'static [Mode] {
+pub(crate) fn serde_rungs(mode: Mode) -> &'static [Mode] {
     match mode {
         Mode::Full => &[Mode::Full, Mode::Structure],
         Mode::Minimal => &[Mode::Minimal, Mode::Structure],
@@ -356,6 +375,7 @@ fn cascade_serde<F>(
     token_budget: usize,
     language: Language,
     source_line_count: usize,
+    lines: CascadeLines,
     transform_fn: &F,
 ) -> anyhow::Result<(String, Mode)>
 where
@@ -375,11 +395,13 @@ where
         if let Some(extracted) = transform_fn(&structure_config)? {
             let extracted_tokens = count_tokens_or_max(&extracted);
             if extracted_tokens <= token_budget {
-                eprintln!(
-                    "[skim] token budget: escalated from {} to structure mode ({} tokens)",
-                    starting_mode.name(),
-                    extracted_tokens,
-                );
+                if lines == CascadeLines::Print {
+                    eprintln!(
+                        "[skim] token budget: escalated from {} to structure mode ({} tokens)",
+                        starting_mode.name(),
+                        extracted_tokens,
+                    );
+                }
                 return Ok((extracted, Mode::Structure));
             }
             return fallback_line_truncate(
@@ -389,6 +411,7 @@ where
                 Mode::Structure,
                 Some(extracted_tokens),
                 source_line_count,
+                lines,
             );
         }
     }
@@ -402,6 +425,7 @@ where
         starting_mode,
         Some(first_tokens),
         source_line_count,
+        lines,
     )
 }
 
@@ -558,9 +582,16 @@ mod tests {
                 char_budget: Some(10),
                 ..Default::default()
             };
-            let (_, token_mode) =
-                cascade_for_token_budget(Mode::Structure, &trunc, 9, Language::Rust, 1, transform)
-                    .unwrap();
+            let (_, token_mode) = cascade_for_token_budget(
+                Mode::Structure,
+                &trunc,
+                9,
+                Language::Rust,
+                1,
+                CascadeLines::Print,
+                transform,
+            )
+            .unwrap();
             let chars = select_for_char_budget(
                 &trunc,
                 Language::Rust,
@@ -600,6 +631,69 @@ mod tests {
         }
     }
 
+    /// Notice control must not change bytes, modes, or errors in any cascade arm.
+    #[test]
+    fn quiet_and_print_preserve_every_cascade_outcome() {
+        use Mode::{Full, Signatures, Structure, Types};
+        type Case = (Language, Mode, &'static [(Mode, usize)]);
+        let cases: &[Case] = &[
+            (Language::Rust, Structure, &[(Structure, 1)]),
+            (Language::Rust, Structure, &[(Signatures, 1)]),
+            (
+                Language::Rust,
+                Structure,
+                &[(Structure, 30), (Signatures, 1)],
+            ),
+            (
+                Language::Rust,
+                Structure,
+                &[(Structure, 30), (Signatures, 30), (Types, 30)],
+            ),
+            (Language::Rust, Structure, &[(Structure, 0), (Full, 30)]),
+            (Language::Rust, Structure, &[(Structure, 0), (Full, 0)]),
+            (Language::Rust, Structure, &[(Structure, 0)]),
+            (Language::Rust, Structure, &[]),
+            (Language::Json, Full, &[(Full, 1)]),
+            (Language::Json, Full, &[(Full, 30), (Structure, 1)]),
+            (Language::Json, Full, &[(Full, 30), (Structure, 30)]),
+            (Language::Json, Full, &[(Full, 30)]),
+            (Language::Yaml, Structure, &[(Structure, 30)]),
+            (Language::Toml, Full, &[]),
+            (Language::Json, Full, &[(Full, 0)]),
+        ];
+        let source = "word ".repeat(40);
+        let trunc = TruncationOptions::default();
+        for &(language, start, sizes) in cases {
+            let run = |lines| {
+                cascade_for_token_budget(
+                    start,
+                    &trunc,
+                    5,
+                    language,
+                    100,
+                    lines,
+                    mock_transform(&source, sizes),
+                )
+                .map_err(|error| error.to_string())
+            };
+            assert_eq!(
+                run(CascadeLines::Quiet),
+                run(CascadeLines::Print),
+                "{language:?} {start:?} {sizes:?}"
+            );
+        }
+        for language in [Language::Rust, Language::Json] {
+            let run = |lines| {
+                cascade_for_token_budget(Structure, &trunc, 5, language, 100, lines, |_| {
+                    Err(anyhow::anyhow!("transform failed"))
+                })
+                .map_err(|error| error.to_string())
+            };
+            assert_eq!(run(CascadeLines::Quiet), Err("transform failed".to_owned()));
+            assert_eq!(run(CascadeLines::Quiet), run(CascadeLines::Print));
+        }
+    }
+
     #[test]
     fn test_cascade_returns_first_mode_when_within_budget() {
         // Structure output = 3 tokens, budget = 10 → no escalation
@@ -619,6 +713,7 @@ mod tests {
             10,
             Language::TypeScript,
             100,
+            CascadeLines::Print,
             transform,
         )
         .unwrap();
@@ -645,6 +740,7 @@ mod tests {
             10,
             Language::TypeScript,
             100,
+            CascadeLines::Print,
             transform,
         )
         .unwrap();
@@ -670,6 +766,7 @@ mod tests {
             5,
             Language::TypeScript,
             100,
+            CascadeLines::Print,
             transform,
         )
         .unwrap();
@@ -705,6 +802,7 @@ mod tests {
             10,
             Language::TypeScript,
             100,
+            CascadeLines::Print,
             transform,
         )
         .unwrap();
@@ -726,6 +824,7 @@ mod tests {
             100,
             Language::TypeScript,
             100,
+            CascadeLines::Print,
             transform,
         );
 
@@ -749,9 +848,16 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Full,
+            &trunc,
+            10,
+            Language::Json,
+            100,
+            CascadeLines::Print,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Full);
         assert_eq!(output, "a b c d e");
@@ -765,9 +871,16 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
         let trunc = TruncationOptions::default();
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Full,
+            &trunc,
+            10,
+            Language::Json,
+            100,
+            CascadeLines::Print,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "a b c d e");
@@ -782,9 +895,16 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 5, Language::Json, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Full,
+            &trunc,
+            5,
+            Language::Json,
+            100,
+            CascadeLines::Print,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         // ADR-011 class 1 / #317: compact elision marker always emitted when no content
@@ -807,9 +927,16 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Yaml, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            &trunc,
+            5,
+            Language::Yaml,
+            100,
+            CascadeLines::Print,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         // ADR-011 class 1 / #317: compact elision marker always emitted when no content
@@ -830,8 +957,15 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let result =
-            cascade_for_token_budget(Mode::Full, &trunc, 100, Language::Toml, 100, transform);
+        let result = cascade_for_token_budget(
+            Mode::Full,
+            &trunc,
+            100,
+            Language::Toml,
+            100,
+            CascadeLines::Print,
+            transform,
+        );
 
         assert!(result.is_err());
         assert!(
@@ -948,9 +1082,16 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let (output, _mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, 100, transform)
-                .unwrap();
+        let (output, _mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            &trunc,
+            5,
+            Language::Rust,
+            100,
+            CascadeLines::Print,
+            transform,
+        )
+        .unwrap();
 
         // #317 / ADR-011: result must be non-empty and carry the elision marker.
         assert!(
@@ -984,8 +1125,15 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         // Budget of 5 tokens — the raw source exceeds it, so line-truncation applies.
-        let result =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, 100, transform);
+        let result = cascade_for_token_budget(
+            Mode::Structure,
+            &trunc,
+            5,
+            Language::Rust,
+            100,
+            CascadeLines::Print,
+            transform,
+        );
 
         let (output, _mode_used) = result.expect("should not error when raw source is available");
         assert!(
@@ -1015,9 +1163,16 @@ mod tests {
 
         // Budget of 10 tokens: Structure exceeds it, Signatures is empty (skipped),
         // Types ("type Foo = u32;" ≈ 6 tokens) fits.
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::Rust, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            &trunc,
+            10,
+            Language::Rust,
+            100,
+            CascadeLines::Print,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(
             mode_used,
