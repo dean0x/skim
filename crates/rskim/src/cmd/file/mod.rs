@@ -248,6 +248,9 @@ pub(crate) const MAX_DISPLAY_ENTRIES: usize = 100;
 /// Exceeding this bound never truncates: parsers return `None` so the caller
 /// degrades to lossless `Passthrough` (raw output is already bounded at the
 /// runner's 64 MiB cap). (#317)
+///
+/// The env handler does not use this bound: it parses every line, whatever
+/// the size of the listing.
 pub(crate) const MAX_INPUT_LINES: usize = 100_000;
 
 /// Entry point for `skim <tool> [args...]` (file handler).
@@ -285,54 +288,28 @@ pub(crate) fn run(
         "df" => df::run(tool_args, &ctx),
         "diff" => diff::run(tool_args, &ctx),
         "du" => du::run(tool_args, &ctx),
-        "env" | "printenv" => {
-            // D2: when any arg contains '=' this is a VAR=value assignment invocation:
-            //   env FOO=1 npm test  →  exec the real `env` binary unchanged (B2)
-            // The env handler (CONFIG.program = "printenv") cannot understand VAR=val
-            // syntax — it would forward the tokens as file arguments to printenv.
-            // (Consistent with skip_if_middle_contains_eq on the rewrite surface.)
-            //
-            // SECURITY (PF-012 / testing-14): when the child program is itself
-            // `env` or `printenv` (e.g. `env FOO=1 printenv`), routing to the
-            // real `env` binary would execute `printenv` unmediated — leaking
-            // the environment including redaction-mandatory keys.  Route those
-            // shapes to the skim env handler instead.
-            //
-            // ACCEPTED LIMITATION: `env FOO=1 sh -c env` still leaks because
-            // the child is `sh` and skim cannot inspect what an arbitrary child
-            // will print.  This shape is pinned in the regression test suite.
-            // ROUTING is keyed on the `env` spelling ONLY, and deliberately so:
-            // `printenv` never takes `VAR=val`, so sending that spelling to the
-            // real `env` binary would execute an unmediated environment dump —
-            // the redaction bypass `redaction_is_mandatory` exists to prevent.
-            // The `printenv NAME=VALUE` LABEL leak this spelling used to cause
-            // is fixed where it occurs instead, in
-            // `cmd::security::redact_mandatory_assignments`, which keys on
-            // `redaction_is_mandatory` and so covers BOTH spellings.  Routing
-            // membership and label membership are different questions; see that
-            // function's docs for why the four controls are not merged.
-            if tool_name.as_str() == "env" && tool_args.iter().any(|a| a.contains('=')) {
-                // Find the first non-assignment arg (the child program name).
-                let child_idx = tool_args.iter().position(|a| !a.contains('='));
-                let child_prog = child_idx.and_then(|i| tool_args.get(i)).map(String::as_str);
-                if matches!(child_prog, Some("env") | Some("printenv")) {
-                    // Child is env/printenv: pass the args AFTER the child name
-                    // to the redacting handler.  The VAR=val overrides are not
-                    // applied (skim calls `printenv` directly, not via `env`),
-                    // but the output is fully redacted — the security property.
-                    let after_child: Vec<String> = child_idx
-                        .map(|i| tool_args[i + 1..].to_vec())
-                        .unwrap_or_default();
-                    env::run(&after_child, &ctx)
-                } else {
-                    // General case (e.g. `env FOO=1 npm test`): exec the real
-                    // `env` binary unchanged so VAR=val is honoured by the OS.
-                    super::run_raw_passthrough("env", tool_args, &[])
-                }
-            } else {
-                env::run(tool_args, &ctx)
-            }
-        }
+        // `env` starts a child program when it has one; `env::env_route`
+        // reads the `env` grammar and decides whether that child is an env
+        // view (PF-012).
+        //
+        // A child that is `env` or `printenv` (also as a path, and also after
+        // options or assignments), or no child at all, is an env view and
+        // goes to the env handler.  Only another child program
+        // (`env FOO=1 npm test`) runs through the real `env` binary.
+        //
+        // ACCEPTED LIMITATION: for `env FOO=1 sh -c env` the child is `sh`,
+        // and skim cannot inspect what an arbitrary child prints.  This shape
+        // is pinned in the regression test suite.
+        //
+        // ROUTING is keyed on the `env` spelling ONLY: `printenv` never takes
+        // `VAR=val`.  The `printenv NAME=VALUE` label is handled in
+        // `cmd::security::redact_mandatory_assignments`, which keys on
+        // `redaction_is_mandatory` and so covers BOTH spellings.
+        "env" => match env::env_route(tool_args) {
+            env::EnvRoute::View(view) => env::run_view(&view, &ctx),
+            env::EnvRoute::Exec(exec_args) => super::run_raw_passthrough("env", &exec_args, &[]),
+        },
+        "printenv" => env::run(tool_args, &ctx),
         "find" => find::run(tool_args, &ctx),
         "grep" => grep::run(tool_args, &ctx),
         "ls" => ls::run(tool_args, &ctx, "ls"),

@@ -571,19 +571,21 @@ pub(crate) fn scrub_infra_args(args: &str) -> String {
 /// keeps the name-list rule, which is why this is keyed on the program and not
 /// folded into [`classify_infra_token`].
 ///
-/// # This is a fourth site, not a duplicate of the other three
+/// # This is a further site, not a duplicate of the others
 ///
-/// [`redaction_is_mandatory`] is consulted here, by `main.rs` D2b, and by
-/// `dispatch_inner` D4; `cmd/file/env.rs`'s `never_passthrough` flag and the
-/// convergence gate's literal `subcommand != "env"` are two further, DIFFERENT
-/// controls. They are deliberately distinct concepts — an output-path raw-serve
-/// gate, a per-handler passthrough refusal, a literal-name gate, and (here) a
-/// label-content rule — and they do not have the same membership: the
-/// convergence gate names only `env`, while this rule and
-/// [`redaction_is_mandatory`] name `printenv` too. Do not merge them into one
-/// predicate; the `printenv` spelling leaking its assignment values into the
-/// analytics label is exactly what happens when one site's membership is
-/// assumed to match another's.
+/// [`redaction_is_mandatory`] is consulted here, by `main.rs` D2b, by the
+/// `SKIM_PASSTHROUGH=1` convergence gate, and by `dispatch_inner` D3 and D4;
+/// `cmd/file/env.rs`'s `never_passthrough` flag is a further, DIFFERENT
+/// control. They are deliberately distinct concepts — output-path raw-serve
+/// gates, a per-handler passthrough refusal, and (here) a label-content rule.
+/// Do not merge them into one predicate.
+///
+/// # Values with white space
+///
+/// The label is the argv joined with spaces, so a value with white space
+/// (`FOO='a b'`) reaches this function as more than one token.  After an
+/// assignment, every token is therefore redacted up to the next `env` or
+/// `printenv` child word, because skim cannot tell where the value ended.
 ///
 /// Returns [`Cow::Borrowed`] when nothing matched (the overwhelmingly common
 /// case), so non-env programs pay no allocation.
@@ -592,11 +594,26 @@ pub(crate) fn redact_mandatory_assignments<'a>(program: &str, args: &'a str) -> 
         return Cow::Borrowed(args);
     }
 
+    let mut after_assignment = false;
     let redacted: Vec<String> = args
         .split_whitespace()
-        .map(|tok| match tok.find('=') {
-            Some(eq_pos) => format!("{}=[REDACTED]", &tok[..eq_pos]),
-            None => tok.to_string(),
+        .map(|tok| {
+            if let Some(eq_pos) = tok.find('=') {
+                after_assignment = true;
+                return format!("{}=[REDACTED]", &tok[..eq_pos]);
+            }
+            let child = std::path::Path::new(tok)
+                .file_name()
+                .and_then(|name| name.to_str());
+            if matches!(child, Some("env" | "printenv")) {
+                after_assignment = false;
+                return tok.to_string();
+            }
+            if after_assignment {
+                "[REDACTED]".to_string()
+            } else {
+                tok.to_string()
+            }
         })
         .collect();
 
