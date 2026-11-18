@@ -22,7 +22,9 @@ use crate::output::{ELISION_HINT, MAX_STDOUT_CHARS, RunBudget};
 use crate::process::{
     ProcessOptions, ProcessResult, process_file, report_token_stats, run_budget_applies,
 };
-use crate::run_budget::{Body, Piece, PlannedBody, RUN_SUM_STOP_FACTOR, plan_cut};
+use crate::run_budget::{
+    Body, Piece, PlannedBody, RUN_SUM_STOP_FACTOR, core_cut_share, plan_char_cut, plan_cut,
+};
 
 /// Options for multi-file processing
 #[derive(Debug, Clone)]
@@ -197,6 +199,41 @@ struct RunFile<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct Limits {
+    fit: usize,
+    rung: usize,
+    cut: usize,
+}
+
+impl Limits {
+    fn uniform(n: usize) -> Self {
+        Self {
+            fit: n,
+            rung: n,
+            cut: n,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RunStage {
+    budget: RunBudget,
+    limits: Limits,
+}
+
+impl RunStage {
+    /// Only character runs reserve different amounts at each stage.
+    fn new(budget: RunBudget, char_limits: impl FnOnce(usize) -> Limits) -> Self {
+        let limits = match budget {
+            RunBudget::Tokens(n) => Limits::uniform(n),
+            RunBudget::Chars(limit) => char_limits(limit),
+        };
+        debug_assert!(limits.cut <= limits.rung && limits.rung <= limits.fit);
+        Self { budget, limits }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum RungKind {
     Probe,
     CutBase,
@@ -304,18 +341,25 @@ fn make_piece(
     output: String,
     language: Option<Language>,
     fixed: bool,
+    budget: RunBudget,
     count: &Counter<'_>,
 ) -> Piece {
     let cost = count(&(prefix.clone() + &output)).unwrap_or(usize::MAX);
     let floor = if fixed {
         cost
     } else {
-        let marker = elision_marker_line(
+        let chars = matches!(budget, RunBudget::Chars(_));
+        let raw = chars && language.is_none();
+        // Raw cuts keep the hint and always end the marker with a newline.
+        let mut marker = elision_marker_line(
             language,
             output.lines().count(),
             ElidedSide::Truncated,
-            None,
+            raw.then_some(ELISION_HINT),
         );
+        if chars && (raw || output.ends_with('\n')) {
+            marker.push('\n');
+        }
         cost.min(count(&(prefix.clone() + &marker)).unwrap_or(usize::MAX))
     };
     Piece {
@@ -332,7 +376,7 @@ fn make_piece(
 }
 
 /// A pre-cut is transient. Only the plain transform above it can enter cache.
-fn precut_piece(mut piece: Piece, n: usize, count: &Counter<'_>) -> Piece {
+fn precut_piece(mut piece: Piece, n: usize, budget: RunBudget, count: &Counter<'_>) -> Piece {
     if let (Body::Whole(text), Some(language)) = (&piece.body, piece.cut_language) {
         let body_count = count(text).unwrap_or(usize::MAX);
         if body_count > n {
@@ -340,7 +384,7 @@ fn precut_piece(mut piece: Piece, n: usize, count: &Counter<'_>) -> Piece {
             let mut kept = truncate_with_count_source(
                 text,
                 language,
-                n,
+                core_cut_share(budget, text, n),
                 |s| count(s).unwrap_or(usize::MAX),
                 Some(body_count),
                 Some(ELISION_HINT),
@@ -373,19 +417,25 @@ fn precut_piece(mut piece: Piece, n: usize, count: &Counter<'_>) -> Piece {
     piece
 }
 
-/// Keep pass 1, at most two probes (about 2N tokens each plus one in-flight
-/// body per worker), one cut base (at most N per cuttable body), and one transient
-/// file per worker. Fixed bodies keep their full size.
-#[allow(clippy::too_many_arguments)]
+/// Keep pass 1, at most two probes (about 2N each plus one in-flight body per
+/// worker), one cut base, and one transient file per worker. Fixed bodies and
+/// cut-base bodies without a language keep their full size in this stage.
 fn run_rung(
     files: &[RunFile<'_>],
     mode: Mode,
     kind: RungKind,
-    n: usize,
+    stage: RunStage,
     opts: ProcessOptions,
     transform: &Transform<'_>,
     count: &Counter<'_>,
 ) -> RungSet {
+    let n = match kind {
+        RungKind::Probe => stage.limits.rung,
+        RungKind::CutBase => stage.limits.cut,
+    };
+    let has_line_bound = opts.trunc.max_lines.is_some() || opts.trunc.last_lines.is_some();
+    let tokens = matches!(stage.budget, RunBudget::Tokens(_));
+    debug_assert!(tokens || !has_line_bound);
     let stop = AtomicBool::new(false);
     let sum = AtomicUsize::new(0);
     let workers: Vec<_> = files
@@ -408,11 +458,8 @@ fn run_rung(
                 !file.pass_1.output.trim().is_empty() && pr.output.trim().is_empty()
             });
             let kept_pass_1 = rung.is_none() || emptied;
-            // Preserve pass-1 bytes and any source-line marker as a unit.
-            let fixed = rung.is_none()
-                || emptied
-                || opts.trunc.max_lines.is_some()
-                || opts.trunc.last_lines.is_some();
+            // Token runs preserve retained pass-1 bytes and source-line markers as a unit.
+            let fixed = tokens && (kept_pass_1 || has_line_bound);
             let (output, differs) = match rung {
                 Some(pr) if !emptied => (pr.output, pr.view_differs),
                 _ => (file.pass_1.output.clone(), file.pass_1.view_differs),
@@ -423,14 +470,21 @@ fn run_rung(
             if matches!(kind, RungKind::Probe) && stop.load(Ordering::Relaxed) {
                 return (None, differs, kept_pass_1, is_empty);
             }
-            let mut piece = make_piece(file.prefix.clone(), output, language, fixed, count);
+            let mut piece = make_piece(
+                file.prefix.clone(),
+                output,
+                language,
+                fixed,
+                stage.budget,
+                count,
+            );
             if matches!(kind, RungKind::Probe) {
                 note_probe_count(piece.count, n, &sum, &stop);
                 if stop.load(Ordering::Relaxed) {
                     return (None, differs, kept_pass_1, is_empty);
                 }
             } else {
-                piece = precut_piece(piece, n, count);
+                piece = precut_piece(piece, n, stage.budget, count);
             }
             (Some(piece), differs, kept_pass_1, is_empty)
         })
@@ -458,12 +512,13 @@ fn run_rung(
 fn select_run(
     files: &[RunFile<'_>],
     pass_1: RungSet,
-    n: usize,
+    stage: RunStage,
     opts: ProcessOptions,
     transform: &Transform<'_>,
     count: &Counter<'_>,
 ) -> anyhow::Result<RunSelection> {
-    if let Some(output) = pass_1.fitting(n, count) {
+    let Limits { fit, rung, cut } = stage.limits;
+    if let Some(output) = pass_1.fitting(fit, count) {
         return Ok(pass_1.accept(output, opts.mode, opts.mode));
     }
     drop(pass_1);
@@ -476,7 +531,7 @@ fn select_run(
                 files,
                 cfg.mode,
                 RungKind::Probe,
-                n,
+                stage,
                 opts,
                 transform,
                 count,
@@ -484,7 +539,7 @@ fn select_run(
         },
         |set| set.is_empty,
         |_, set| {
-            accepted = set.fitting(n, count);
+            accepted = set.fitting(rung, count);
             accepted.is_some()
         },
     )?;
@@ -498,7 +553,15 @@ fn select_run(
         RungWalk::NoneFits { mode, rung } if rung.complete => (mode, rung),
         RungWalk::NoneFits { mode, .. } => (
             mode,
-            run_rung(files, mode, RungKind::CutBase, n, opts, transform, count),
+            run_rung(
+                files,
+                mode,
+                RungKind::CutBase,
+                stage,
+                opts,
+                transform,
+                count,
+            ),
         ),
         RungWalk::AllEmpty | RungWalk::NoOutput => (
             opts.mode,
@@ -506,14 +569,17 @@ fn select_run(
                 files,
                 opts.mode,
                 RungKind::CutBase,
-                n,
+                stage,
                 opts,
                 transform,
                 count,
             ),
         ),
     };
-    let plan = plan_cut(&base.pieces, n, count);
+    let plan = match stage.budget {
+        RunBudget::Tokens(_) => plan_cut(&base.pieces, cut, count),
+        RunBudget::Chars(_) => plan_char_cut(&base.pieces, cut, count),
+    };
     Ok(RunSelection {
         output: plan.output,
         bodies: plan.bodies,
@@ -579,7 +645,7 @@ struct RunReport {
     first_omitted: Option<PathBuf>,
 }
 
-/// All token work for pass 1, rungs, cuts and final stats stays in this pool.
+/// All counts for pass 1, rungs, cuts and final stats stay in this pool.
 /// Analytics without stats still tokenizes after the stdout flush, in its
 /// registered background thread.
 fn prepare_results<'a>(
@@ -587,7 +653,8 @@ fn prepare_results<'a>(
     opts: ProcessOptions,
     show_headers: bool,
     budget: Option<RunBudget>,
-    count: &Counter<'_>,
+    plan_count: &Counter<'_>,
+    stats_count: &Counter<'_>,
 ) -> anyhow::Result<(FileResults<'a>, Option<RunReport>)> {
     let mut processed: Vec<_> = paths
         .par_iter()
@@ -595,19 +662,20 @@ fn prepare_results<'a>(
         .map(|(idx, path)| {
             let result = process_file(path, opts);
             let piece = match (budget, &result) {
-                (Some(RunBudget::Tokens(_)), Ok(pr)) => Some(make_piece(
+                (Some(budget @ RunBudget::Tokens(_)), Ok(pr)) => Some(make_piece(
                     piece_prefix(idx, path, show_headers),
                     pr.output.clone(),
                     None,
                     true,
-                    count,
+                    budget,
+                    plan_count,
                 )),
                 _ => None,
             };
             (path, result, piece)
         })
         .collect();
-    let Some(budget @ RunBudget::Tokens(n)) = budget else {
+    let Some(budget @ RunBudget::Tokens(_)) = budget else {
         return Ok((
             processed
                 .into_iter()
@@ -638,7 +706,8 @@ fn prepare_results<'a>(
         complete: true,
         is_empty: false,
     };
-    let mut selection = select_run(&files, pass_1, n, opts, &process_file, count)?;
+    let stage = RunStage::new(budget, Limits::uniform);
+    let mut selection = select_run(&files, pass_1, stage, opts, &process_file, plan_count)?;
     let total = files.len();
     let shown = selection.bodies.len();
     debug_assert!(
@@ -658,7 +727,7 @@ fn prepare_results<'a>(
             .collect(),
         &mut selection,
         opts,
-        count,
+        stats_count,
     );
     Ok((
         results,
@@ -700,9 +769,22 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.jobs.unwrap_or(0))
         .build()?;
-    let count = |s: &str| crate::tokens::count_tokens(s).ok();
-    let (results, run) =
-        pool.install(|| prepare_results(&paths, process_options, show_headers, budget, &count))?;
+    let token_count = |s: &str| crate::tokens::count_tokens(s).ok();
+    let char_count = |s: &str| Some(s.chars().count());
+    let plan_count: &Counter<'_> = match budget {
+        Some(RunBudget::Chars(_)) => &char_count,
+        _ => &token_count,
+    };
+    let (results, run) = pool.install(|| {
+        prepare_results(
+            &paths,
+            process_options,
+            show_headers,
+            budget,
+            plan_count,
+            &token_count,
+        )
+    })?;
 
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
@@ -1224,7 +1306,7 @@ mod tests {
             &files,
             Mode::Types,
             RungKind::Probe,
-            100,
+            RunStage::new(RunBudget::Tokens(100), Limits::uniform),
             opts,
             &|_, got| {
                 assert_eq!(got.mode, Mode::Structure);
@@ -1249,7 +1331,7 @@ mod tests {
         let selected = select_run(
             &files,
             pass_one_set(&files, &|s| Some(s.len())),
-            100,
+            RunStage::new(RunBudget::Tokens(100), Limits::uniform),
             run_options(),
             &|_, opts| {
                 Ok(result(&if opts.mode == Mode::Types {
@@ -1275,7 +1357,7 @@ mod tests {
         let selected = select_run(
             &files,
             pass_one_set(&files, &|s| Some(s.len())),
-            30,
+            RunStage::new(RunBudget::Tokens(30), Limits::uniform),
             run_options(),
             &|path, opts| {
                 Ok(result(
@@ -1304,7 +1386,7 @@ mod tests {
             &files,
             Mode::Types,
             RungKind::CutBase,
-            100,
+            RunStage::new(RunBudget::Tokens(100), Limits::uniform),
             run_options(),
             &|_, _| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1323,6 +1405,77 @@ mod tests {
     }
 
     #[test]
+    fn char_rung_keeps_empty_and_unknown_pass_one_bodies_cuttable() {
+        let pr = result("pass 1\n");
+        let files = [run_file("a.rs", &pr), run_file("script", &pr)];
+        let rung = run_rung(
+            &files,
+            Mode::Types,
+            RungKind::Probe,
+            RunStage::new(RunBudget::Chars(100), Limits::uniform),
+            run_options(),
+            &|_, _| Ok(result("\n")),
+            &|s| Some(s.chars().count()),
+        );
+        assert!(rung.pieces.iter().all(|p| matches!(p.body, Body::Whole(_))));
+        assert_eq!(rung.pieces[0].cut_language, Some(Language::Rust));
+        assert_eq!(rung.pieces[1].cut_language, None);
+    }
+
+    #[test]
+    fn char_run_cuts_a_retained_structure_body_in_a_types_run() {
+        let structure = result(&"const A: u8 = 1;\n".repeat(100));
+        let typed = result(&"struct B;\n".repeat(100));
+        let files = [run_file("a.rs", &structure), run_file("b.rs", &typed)];
+        let count = |s: &str| Some(s.chars().count());
+        let selected = select_run(
+            &files,
+            pass_one_set(&files, &count),
+            RunStage::new(RunBudget::Chars(200), Limits::uniform),
+            run_options(),
+            &|path, opts| {
+                Ok(if path == Path::new("a.rs") {
+                    result("\n")
+                } else if opts.mode == Mode::Types {
+                    result("struct B;\n")
+                } else {
+                    result(&"struct B;\n".repeat(100))
+                })
+            },
+            &count,
+        )
+        .unwrap();
+        assert_eq!(selected.mode, Mode::Types);
+        assert_eq!(selected.omitted, 0);
+        assert_eq!(selected.bodies[1].output, "struct B;\n");
+        assert!(selected.bodies[0].cut && selected.output.starts_with("const A: u8 = 1;\n"));
+        assert!(selected.output.chars().count() <= 200);
+    }
+
+    #[test]
+    fn char_run_accepts_a_rung_above_the_cut_limit() {
+        let pr = result(&"structure\n".repeat(100));
+        let files = [run_file("a.rs", &pr)];
+        let signatures = "// résumé\n".repeat(10);
+        let count = |s: &str| Some(s.chars().count());
+        let selected = select_run(
+            &files,
+            pass_one_set(&files, &count),
+            RunStage::new(RunBudget::Chars(150), |limit| Limits {
+                fit: limit,
+                rung: signatures.chars().count(),
+                cut: 80,
+            }),
+            run_options(),
+            &|_, _| Ok(result(&signatures)),
+            &count,
+        )
+        .unwrap();
+        assert_eq!(selected.mode, Mode::Signatures);
+        assert_eq!(selected.output, signatures);
+    }
+
+    #[test]
     fn line_bound_rung_bodies_stay_fixed() {
         let pr = result("pass 1\n");
         let files = [run_file("a.rs", &pr)];
@@ -1337,7 +1490,7 @@ mod tests {
                 &files,
                 Mode::Types,
                 RungKind::CutBase,
-                10,
+                RunStage::new(RunBudget::Tokens(10), Limits::uniform),
                 opts,
                 &|_, _| Ok(result("bounded body\n")),
                 &|s| Some(s.len()),
@@ -1361,7 +1514,7 @@ mod tests {
                         &files,
                         Mode::Types,
                         RungKind::Probe,
-                        100,
+                        RunStage::new(RunBudget::Tokens(100), Limits::uniform),
                         run_options(),
                         &|_, _| {
                             calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1394,7 +1547,7 @@ mod tests {
             &files,
             Mode::Types,
             RungKind::CutBase,
-            100,
+            RunStage::new(RunBudget::Tokens(100), Limits::uniform),
             run_options(),
             &|_, _| Ok(result(&"type A = u64;\n".repeat(100))),
             &|s| Some(s.len()),
@@ -1422,7 +1575,7 @@ mod tests {
         let selected = select_run(
             &files,
             pass_one_set(&files, &|_| None),
-            1,
+            RunStage::new(RunBudget::Tokens(1), Limits::uniform),
             run_options(),
             &|_, _| Ok(result("rung\n")),
             &|_| None,
@@ -1440,7 +1593,7 @@ mod tests {
         let selected = select_run(
             &files,
             pass_one_set(&files, &|s| Some(s.len())),
-            100,
+            RunStage::new(RunBudget::Tokens(100), Limits::uniform),
             run_options(),
             &|_, _| panic!("fitting pass one must not transform"),
             &|s| Some(s.len()),
