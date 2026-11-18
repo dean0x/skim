@@ -1056,6 +1056,27 @@ fn two_typescript_definitions_of_one_name_print_the_same_note() {
     assert!(lines.contains(&"note: 2 definitions of dup; calls are not split by definition"));
 }
 
+#[test]
+fn a_typescript_call_names_the_exported_arrow_definition_in_its_file() {
+    let repo = SearchRepo::new();
+    repo.write("a/one.ts", "export function dup(): void {}\n");
+    repo.write("b/two.ts", "export const dup = () => 1;\ndup();\n");
+    repo.track_all();
+
+    let run = repo.search(&["dup"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        run.lines().contains(&"b/two.ts:2: [top] (def 1) dup();"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.lines().contains(&"note: 2 definitions of dup; call lines assigned to the one definition in their file: 1; call lines not split by definition: 0"),
+        "{}",
+        run.stdout
+    );
+}
+
 /// One file per language, each with a definition that spans several lines.
 const SYMBOL_FIXTURES: [(&str, &str, &str); 6] = [
     (
@@ -1208,6 +1229,39 @@ fn a_word_query_lists_the_definitions_that_listed_files_call_by_name() {
         2
     );
     assert_eq!(value["parse"]["files"], 2);
+}
+
+#[test]
+fn a_word_query_links_a_typescript_camel_case_call_to_an_exported_arrow_definition() {
+    let repo = SearchRepo::new();
+    repo.write("src/main.ts", "// beta\nreadAlpha();\n");
+    repo.write("src/defs.ts", "export const readAlpha = () => 1;\n");
+    repo.track_all();
+
+    // The line match must admit the camel-case name before the name join.
+    let text = repo.search(&["alpha beta", "-i", "--limit", "1"]);
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    assert_eq!(word_headers(&text.stdout), ["src/main.ts"]);
+    assert!(
+        text.lines()
+            .contains(&"def src/defs.ts:1-1: readAlpha, called from src/main.ts:2"),
+        "{}",
+        text.stdout
+    );
+
+    let run = repo.search(&["alpha beta", "-i", "--limit", "1", "--json"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let value = json_of(&run);
+    assert_eq!(
+        value["called_definitions"],
+        serde_json::json!([
+            {"name":"readAlpha", "path":"src/defs.ts", "line":1, "first_line":1, "end_line":1,
+             "caller":{"path":"src/main.ts", "line":2}}
+        ])
+    );
+    assert_eq!(value["view"], "words");
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+    assert_eq!(value["files"][0]["path"], "src/main.ts");
 }
 
 #[test]
