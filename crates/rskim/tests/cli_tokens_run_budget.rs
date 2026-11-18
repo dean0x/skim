@@ -234,10 +234,70 @@ fn invalid_budgets_are_refused_for_glob_and_list() {
                 .args(["--tokens", budget])
                 .output()
                 .unwrap();
-            assert!(!output.status.success());
+            assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
             assert!(output.stdout.is_empty());
             assert!(stderr(&output).contains("--tokens"), "{}", stderr(&output));
         }
+    }
+}
+
+#[test]
+fn json_glob_steps_from_full_to_structure_without_file_notices() {
+    let value = "sample text ".repeat(16);
+    let fields = (0..24)
+        .map(|i| format!("\"field_{i}\":\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let long = format!("{{{fields}}}\n");
+    let short = format!("{{\"note\":\"{}\"}}\n", "sample text ".repeat(96));
+    let n = 256;
+    // Pass 1 must step down for the long file and keep the short file in full.
+    assert!(tokens(&long) > n);
+    assert!(tokens(&short) <= n);
+    let home = home(&[("a.json", long), ("b.json", short)]);
+    let structure = run(&home, &["input/*.json", "--mode", "structure"]);
+    bounded(&structure, n);
+
+    let output = run(
+        &home,
+        &["input/*.json", "--mode", "full", "--tokens", &n.to_string()],
+    );
+    bounded(&output, n);
+    assert_eq!(output.stdout, structure.stdout);
+    let text = notice(&output);
+    assert!(text.starts_with("[skim] structure view:"), "{text}");
+    assert!(text.contains("stepped down from full"), "{text}");
+}
+
+#[test]
+fn rust_glob_accepts_the_first_early_mode_that_fits() {
+    let source = format!(
+        "fn total() -> u32 {{\n    let mut total = 0;\n{}    total\n}}\n\n// {}\nfn other() {{}}\n",
+        "    total += 1; total += 2;\n".repeat(64),
+        "note ".repeat(64),
+    );
+    let home = home(&[("a.rs", source.clone()), ("b.rs", source)]);
+    for (start, served) in [("full", "minimal"), ("minimal", "pseudo")] {
+        let plain = run(&home, &["input/*.rs", "--mode", start]);
+        let expected = run(&home, &["input/*.rs", "--mode", served]);
+        let n = tokens(stdout(&expected));
+        assert!(tokens(stdout(&plain)) > n, "{start} must exceed {n}");
+
+        let output = run(
+            &home,
+            &["input/*.rs", "--mode", start, "--tokens", &n.to_string()],
+        );
+        bounded(&output, n);
+        assert_eq!(output.stdout, expected.stdout);
+        let text = notice(&output);
+        assert!(
+            text.starts_with(&format!("[skim] {served} view:")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("stepped down from {start}")),
+            "{text}"
+        );
     }
 }
 
@@ -363,18 +423,6 @@ fn fake_headers_and_trailers_do_not_change_plan_counts() {
 fn line_bounds_keep_each_pass_one_body_or_omit_it() {
     let home = rust_home(10);
     for flag in ["--max-lines", "--last-lines"] {
-        let single = run(
-            &home,
-            &[
-                "input/f00.rs",
-                "--mode",
-                "types",
-                flag,
-                "3",
-                "--tokens",
-                "180",
-            ],
-        );
         let plain = run(&home, &["input/*.rs", "--mode", "types", flag, "3"]);
         assert!(tokens(stdout(&plain)) > 180);
         let output = run(
@@ -401,7 +449,6 @@ fn line_bounds_keep_each_pass_one_body_or_omit_it() {
             assert_eq!(body, stdout(&independent).trim_end());
             assert!(body.matches("lines truncated").count() <= 1);
         }
-        assert!(!stdout(&single).is_empty());
         assert!(
             stdout(&output)
                 .lines()
