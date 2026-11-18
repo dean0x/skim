@@ -317,7 +317,7 @@ skim <file> --mode=pseudo        # logic without syntactic noise
   Rust, TypeScript, JavaScript, Python and Go only. If assigned, the note counts assigned and other call lines.
 - `skim FILE --symbol NAME`: raw source lines of one declaration.
 - Exit codes: 0 a line matched, 1 no match, 2 an error.
-- Tracked hidden and secret-bearing files are searched. Use `-g '!NAME'` to omit one.
+- Tracked hidden and secret-bearing files (`.env`, key files) are searched and listed. `-g '!NAME'` omits one.
 
 ### Heatmap — Git History Risk Analysis
 
@@ -331,7 +331,7 @@ in a codebase before starting work.
   (tests first), recent fix commits and owners
 - Before a refactoring task — identify which files are risky to change
 - When triaging bugs — find files with high fix density
-- Exploring an unfamiliar codebase — understand coupling and ownership patterns
+- Explore a new codebase — find coupling and ownership patterns
 - Before code review — check if the changed files are high-risk hotspots
 
 ```
@@ -386,7 +386,7 @@ pub(super) const SEARCH_SECTION_NEEDLES: [&str; 8] = [
     "-E",
     "--symbol",
     "Exit codes: 0",
-    "hidden and secret-bearing",
+    "Tracked hidden and secret-bearing files (`.env`, key files) are searched and listed.",
     "-g '!NAME'",
 ];
 
