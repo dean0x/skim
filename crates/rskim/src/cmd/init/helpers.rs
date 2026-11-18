@@ -302,16 +302,14 @@ skim <file> --mode=pseudo        # logic without syntactic noise
 
 ### Search and read
 
-`skim search NAME` reads files per query; no index.
+No index; each query reads files.
 
 {search_when}
-- One identifier: definition range, then calls with their function.
-  Other roles: counts (`--all` lists them).
-- Quoted words: all-word files first. Rank: file kind, file-name word, count.
+- One identifier: definition range, then calls with their function. Other roles: counts (`--all` lists them).
+- Quoted words: all-word files first; no `-C`/`--all`/`--full`. Rank: file kind, file-name word, count.
   Name tests ignore case and match whole tokens. Fewer-word files follow if fewer than 3 hold all words.
-  It lists, by name, callable definitions that listed source files call if their names hold a query word.
-- `-E 'regex'`, `-i`, `-S`, `-w`, `-g GLOB`, `-t TYPE`, `-C N`, `-l`, `-c`: as in `rg`.
-  Default: literal, case sensitive.
+  It lists, by name, callable definitions that listed source files call whose names hold a query word.
+- `-E 'regex'`, `-i`, `-S`, `-w`, `-g GLOB`, `-t TYPE`, `-C N`, `-l`, `-c`: as in `rg`. Default: literal, case sensitive.
 - Roles use syntax, not types. With several definitions, calls that fit the one definition in their file show `(def N)`.
   N is the definition's name line. Plain calls: free function, no import of that name; `self`/`this`/`Self`: method.
   Rust, TypeScript, JavaScript, Python and Go only. If assigned, the note counts assigned and other call lines.
@@ -926,6 +924,7 @@ mod tests {
                 "`self`/`this`/`Self`: method",
                 "Rust, TypeScript, JavaScript, Python and Go only",
                 "If assigned, the note counts assigned and other call lines",
+                "Quoted words: all-word files first; no `-C`/`--all`/`--full`.",
             ]
             .into_iter()
             .filter(|needle| !text.contains(needle))
