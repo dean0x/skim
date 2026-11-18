@@ -644,15 +644,30 @@ fn name_link_notices(report: &Report<'_>, called: &CalledDefinitions<'_>, notes:
     if scan.caps.name_bytes {
         let dropped: u64 = scan.files.iter().map(|f| f.links.long_names).sum();
         notes.push(format!(
-            "{dropped} names are not stored (name-byte cap {}); \
+            "{dropped} name occurrences are not stored (name-byte cap {}); \
              read the files with skim FILE --mode=full",
             limits.max_name_bytes
         ));
     }
-    if scan.parse.unlabelled_files > 0 {
+    if called.unmatched > 0 && scan.parse.unlabelled_files > 0 {
+        let definition = if scan.caps.file_word_defs || scan.caps.all_word_defs {
+            "stored definition"
+        } else {
+            "definition"
+        };
+        let verb = if scan.parse.unlabelled_files == 1 {
+            "file has"
+        } else {
+            "files have"
+        };
+        let remedy = if scan.parse.by_reason.contains_key(&Unlabelled::Budget) {
+            "; narrow the pattern to label more files"
+        } else {
+            ""
+        };
         notes.push(format!(
-            "{} called names have no definition in the parsed files; \
-             {} matched files have no labels; narrow the pattern to label more files",
+            "{} called names have no {definition} in the parsed files; \
+             {} matched {verb} no labels{remedy}",
             called.unmatched, scan.parse.unlabelled_files
         ));
     }

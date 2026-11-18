@@ -400,8 +400,7 @@ fn a_called_name_of_two_thousand_bytes_is_counted_not_printed() {
     repo.track_all();
     let run = repo.search(&["alpha beta", "--limit", "1"]);
     assert_eq!(run.code, 0, "{}", run.stderr);
-    let note =
-        "2 names are not stored (name-byte cap 256); read the files with skim FILE --mode=full";
+    let note = "2 name occurrences are not stored (name-byte cap 256); read the files with skim FILE --mode=full";
     assert!(
         run.stdout.contains(&format!("note: {note}\n")),
         "{}",

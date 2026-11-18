@@ -81,6 +81,13 @@ fn scan_of(mut files: Vec<FileScan>) -> ScanOutput {
     }
 }
 
+fn file_named_mut<'a>(scan: &'a mut ScanOutput, path: &str) -> &'a mut FileScan {
+    scan.files
+        .iter_mut()
+        .find(|file| file.path == Path::new(path))
+        .expect("fixture file exists")
+}
+
 fn pattern(text: &str) -> QueryInfo {
     QueryInfo {
         text: text.to_owned(),
@@ -1719,7 +1726,7 @@ fn the_name_link_caps_print_a_note_with_exact_counts_in_text_and_json() {
     let notes = [
         "5 called names are not stored (per-file called-name cap 32); narrow the pattern or read the source files with skim FILE --mode=full",
         "9 callable definitions are not stored (per-file word-definition cap 64, word-definition cap 5000); narrow the pattern or read the files with skim FILE --mode=signatures",
-        "6 names are not stored (name-byte cap 256); read the files with skim FILE --mode=full",
+        "6 name occurrences are not stored (name-byte cap 256); read the files with skim FILE --mode=full",
     ];
     let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
     let json = json_of(&query, &scan, called_layout());
@@ -1744,22 +1751,41 @@ fn the_name_link_caps_print_a_note_with_exact_counts_in_text_and_json() {
     }
 }
 
-#[test]
-fn called_names_with_no_definition_and_unlabelled_files_get_a_note() {
-    let mut scan = called_scan();
-    scan.files[3].unlabelled = Some(Unlabelled::Budget);
+fn unlabel_called_file(scan: &mut ScanOutput, reason: Unlabelled) {
+    let file = file_named_mut(scan, "c.rs");
+    file.unlabelled = Some(reason);
+    file.links = Default::default();
     scan.parse.unlabelled_files = 1;
-    scan.parse.by_reason.insert(Unlabelled::Budget, 1);
-    scan.files[3].links.defs.clear();
-    scan.files[0]
+    scan.parse.by_reason.insert(reason, 1);
+}
+
+fn call_gamma(scan: &mut ScanOutput) {
+    file_named_mut(scan, "a.rs")
         .links
         .called
         .push(crate::cmd::search::roles::CalledName {
-            name: "readMissing".to_owned(),
+            name: "readGamma".to_owned(),
             line: 50,
         });
+}
+
+#[test]
+fn called_names_with_no_definition_and_one_unlabelled_file_get_a_singular_note() {
+    let mut scan = called_scan();
+    file_named_mut(&mut scan, "c.rs").links.defs[0].name = "readGamma".to_owned();
+    call_gamma(&mut scan);
     let query = words(&["read", "other"]);
-    let note = "1 called names have no definition in the parsed files; 1 matched files have no labels; narrow the pattern to label more files";
+    let parsed = json_of(&query, &scan, called_layout());
+    assert!(
+        parsed["called_definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|site| site["path"] == "c.rs" && site["name"] == "readGamma"),
+        "{parsed}"
+    );
+    unlabel_called_file(&mut scan, Unlabelled::Budget);
+    let note = "1 called names have no definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
     let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
     assert!(output.contains(&format!("note: {note}\n")), "{output}");
     assert!(
@@ -1768,6 +1794,71 @@ fn called_names_with_no_definition_and_unlabelled_files_get_a_note() {
             .unwrap()
             .contains(&json!(note))
     );
+}
+
+#[test]
+fn called_names_with_definitions_get_no_unlabelled_name_note() {
+    let mut scan = called_scan();
+    unlabel_called_file(&mut scan, Unlabelled::Budget);
+    let query = words(&["read", "other"]);
+    let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+    assert!(output.contains("1 matched file has no labels"), "{output}");
+    assert!(!output.contains("called names have no"), "{output}");
+    let value = json_of(&query, &scan, called_layout());
+    assert!(
+        value["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|note| !note.as_str().unwrap().contains("called names have no")),
+        "{value}"
+    );
+}
+
+#[test]
+fn called_names_with_a_parse_cap_get_no_budget_remedy() {
+    let mut scan = called_scan();
+    unlabel_called_file(&mut scan, Unlabelled::ParseCap);
+    call_gamma(&mut scan);
+    let query = words(&["read", "other"]);
+    let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+    assert!(
+        output.contains("1 called names have no definition"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("narrow the pattern to label more files"),
+        "{output}"
+    );
+    let value = json_of(&query, &scan, called_layout());
+    assert!(
+        value["notices"].as_array().unwrap().iter().all(|note| !note
+            .as_str()
+            .unwrap()
+            .contains("narrow the pattern to label more files")),
+        "{value}"
+    );
+}
+
+#[test]
+fn called_names_with_word_definition_caps_say_no_stored_definition() {
+    let mut scan = called_scan();
+    unlabel_called_file(&mut scan, Unlabelled::Budget);
+    call_gamma(&mut scan);
+    file_named_mut(&mut scan, "b.rs").links.defs_dropped = 1;
+    let query = words(&["read", "other"]);
+    for (file_cap, all_cap) in [(true, false), (false, true)] {
+        scan.caps.file_word_defs = file_cap;
+        scan.caps.all_word_defs = all_cap;
+        let note = "1 called names have no stored definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
+        let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+        assert!(output.contains(&format!("note: {note}\n")), "{output}");
+        let value = json_of(&query, &scan, called_layout());
+        assert!(
+            value["notices"].as_array().unwrap().contains(&json!(note)),
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -1826,19 +1917,29 @@ fn json_called_definitions_match_the_text_block_and_add_no_file_row() {
 #[test]
 fn called_definitions_use_only_source_callers_on_the_current_page_and_exact_names() {
     let mut scan = called_scan();
-    scan.files[0].links.called[0].name = "READALPHA".to_owned();
-    scan.files[3].links.called[0].name = "readBeta".to_owned();
     let mut layout = called_layout();
     layout.offset = 1;
     layout.limit = Some(1);
-    let value = json_of(&words(&["read", "other"]), &scan, layout);
+    let query = words(&["read", "other"]);
+    let value = json_of(&query, &scan, layout);
+    assert_eq!(
+        value["called_definitions"],
+        json!([
+            {"name":"readAlpha", "path":"b.rs", "line":10, "first_line":9, "end_line":12, "caller":{"path":"a.rs", "line":2}},
+            {"name":"readAlpha", "path":"c.rs", "line":40, "first_line":39, "end_line":42, "caller":{"path":"a.rs", "line":2}},
+        ]),
+        "the caller on this page supplies both definitions; {value}"
+    );
+    file_named_mut(&mut scan, "a.rs").links.called[0].name = "READALPHA".to_owned();
+    let value = json_of(&query, &scan, layout);
     assert_eq!(
         value["called_definitions"],
         json!([]),
         "exact names only; {value}"
     );
-    scan.files[0].links.called[0].name = "readAlpha".to_owned();
-    scan.files[0].prior = FilePrior::Test;
+    let caller = file_named_mut(&mut scan, "a.rs");
+    caller.links.called[0].name = "readAlpha".to_owned();
+    caller.prior = FilePrior::Test;
     let value = json_of(&words(&["read", "other"]), &scan, layout);
     assert_eq!(
         value["called_definitions"],

@@ -207,7 +207,9 @@ Word-view name links use only files phase B already parsed. They add no file rea
 `MAX_NAME_BYTES` = 256 bounds stored name bytes; `MAX_CALLED_SHOWN` = 10 bounds the displayed definitions.
 `CapsHit.called_names`, `.file_word_defs`, `.all_word_defs` and `.name_bytes` record each scan cut where it occurs.
 Text notes and JSON `notices` give exact counts and remedies. Display cuts say `not listed:` with the exact count.
-When matched files have no labels, a note counts those files and called names with no definition in the parsed files.
+When unmatched called names and unlabelled matched files both exist, a note counts them.
+The note says `no stored definition` when a word-definition cap fired.
+Only an unlabelled `budget` reason adds the remedy to narrow the pattern for more labels.
 
 ## Roles (`roles.rs`)
 
