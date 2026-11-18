@@ -1103,7 +1103,7 @@ pub(crate) fn bounded_view_marker(bound: BoundNotice) -> EmittedNotice {
     });
     EmittedNotice {
         line: format!(
-            "[skim] {mode} view: {class}; the default view has {} characters, over the {MAX_STDOUT_CHARS} character output limit{cut}; use {selection} for more, or {remedy}\n",
+            "[skim] {mode} view: {class}; the default view has {} characters, over the {MAX_STDOUT_CHARS}-character output limit{cut}; use {selection} for more, or {remedy}\n",
             bound.default_view_chars,
         ),
     }
@@ -1489,7 +1489,7 @@ mod bounded_view_marker_tests {
                     assert_eq!(
                         notice.line(),
                         format!(
-                            "[skim] {} view: {class}; the default view has 34001 characters, over the 29000 character output limit{cut_clause}; use {remedies} for more, or SKIM_PASSTHROUGH=1 for full output\n",
+                            "[skim] {} view: {class}; the default view has 34001 characters, over the 29000-character output limit{cut_clause}; use {remedies} for more, or SKIM_PASSTHROUGH=1 for full output\n",
                             mode.name(),
                         )
                     );

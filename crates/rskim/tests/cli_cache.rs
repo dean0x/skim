@@ -801,7 +801,7 @@ fn budgeted_warm_read_rebuilds_one_direct_notice_from_the_served_state() {
     assert_eq!(warm.stdout, "stored cut\n");
     assert_eq!(
         warm.stderr,
-        "[skim] full view: lines outside range omitted; the default view has 52000 characters, over the 29000 character output limit; this view is cut to the limit, and the last stdout line counts the hidden lines; use --symbol NAME or --max-lines N for more, or SKIM_PASSTHROUGH=1 for full output\n"
+        "[skim] full view: lines outside range omitted; the default view has 52000 characters, over the 29000-character output limit; this view is cut to the limit, and the last stdout line counts the hidden lines; use --symbol NAME or --max-lines N for more, or SKIM_PASSTHROUGH=1 for full output\n"
     );
 }
 
