@@ -737,6 +737,29 @@ fn a_usage_error_under_json_prints_an_error_object_and_exits_2() {
     assert!(run.stderr.contains("-l and -c cannot be combined"));
 }
 
+#[test]
+fn the_subcommand_word_as_first_pattern_exits_2_with_one_json_error() {
+    let repo = SearchRepo::new();
+    let message = "one pattern only; \"search\" is the subcommand, drop it";
+    for parts in [
+        vec!["search", "foo"],
+        vec!["search", "--", "foo"],
+        vec!["search", "line\n\u{1b}[31m"],
+    ] {
+        let run = repo.search(&parts);
+        assert_eq!(run.code, 2, "{parts:?}");
+        assert_eq!(run.stdout, "", "{parts:?}");
+        assert_eq!(run.stderr, format!("skim search: {message}\n"));
+
+        let mut json_parts = vec!["--json"];
+        json_parts.extend_from_slice(&parts);
+        let run = repo.search(&json_parts);
+        assert_json_error("a repeated subcommand", &run);
+        assert_eq!(json_of(&run), serde_json::json!({"error": message}));
+        assert_eq!(run.stderr, format!("skim search: {message}\n"));
+    }
+}
+
 /// An exit-2 run under `--json` prints one object that holds only the error
 /// message, and the same message on stderr behind the program prefix.
 fn assert_json_error(case: &str, run: &Run) {

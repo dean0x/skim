@@ -568,6 +568,34 @@ fn a_second_pattern_exits_2() {
 }
 
 #[test]
+fn the_subcommand_word_as_first_pattern_gets_a_fixed_message() {
+    for parts in [
+        vec!["search", "foo"],
+        vec!["search", "--", "foo"],
+        vec!["search", "line\n\u{1b}[31m"],
+    ] {
+        assert_eq!(
+            error(&parts),
+            "one pattern only; \"search\" is the subcommand, drop it",
+            "{parts:?}"
+        );
+    }
+}
+
+#[test]
+fn a_second_word_after_another_pattern_keeps_the_generic_message() {
+    assert_eq!(
+        error(&["foo", "search"]),
+        "one pattern only; quote words as one argument; use -g to filter paths"
+    );
+}
+
+#[test]
+fn search_alone_is_a_query() {
+    assert_eq!(pattern_of(&query(&["search"])), ("search", true));
+}
+
+#[test]
 fn a_number_after_the_old_limit_flag_gets_its_own_message() {
     assert_eq!(
         error(&["foo", "-n", "5"]),

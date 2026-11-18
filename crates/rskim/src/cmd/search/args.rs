@@ -340,7 +340,8 @@ fn parse_number(flag: &str, raw: &str, min: u64, max: u64) -> Result<u64, UsageE
 }
 
 impl Draft {
-    /// Record a positional argument: the pattern.
+    /// Record a positional argument: the pattern. A repeated subcommand gets a
+    /// fixed remedy that never echoes the next argument.
     fn positional(&mut self, arg: &str, previous: Option<&str>) -> Result<(), UsageError> {
         if self.pattern.is_none() {
             self.pattern = Some(arg.to_owned());
@@ -349,6 +350,11 @@ impl Draft {
         if previous == Some("-n") && !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) {
             return Err(UsageError::new(
                 "-n no longer sets the limit; use --limit N",
+            ));
+        }
+        if self.pattern.as_deref() == Some("search") {
+            return Err(UsageError::new(
+                "one pattern only; \"search\" is the subcommand, drop it",
             ));
         }
         Err(UsageError::new(
