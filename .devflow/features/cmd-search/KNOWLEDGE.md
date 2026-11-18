@@ -20,8 +20,8 @@ referencedFiles:
   - crates/rskim/src/cmd/search/hooks.rs
   - crates/rskim/src/cmd/search/legacy_cache.rs
 created: 2026-06-21
-updated: 2026-11-17
-version: 10
+updated: 2026-11-18
+version: 11
 ---
 
 # Search CLI (skim search subcommand, the scan engine)
@@ -39,8 +39,9 @@ version: 10
   Nothing is dropped without a count.
 - **KB-INV-5** Roles come from syntax. The `def` role reuses the `rskim-core` declaration rule (`Declaration.name_bytes`,
   `DeclScan.truncated`, `enclosing_declaration`). The parse is a plain `parse` with no time bound
-  (`Parser::parse_bounded` has no search caller); the parse budget counts files and bytes. A call is a hit in callee position. Calls are not split by
-  definition: a name with two or more definitions gets a note.
+  (`Parser::parse_bounded` has no search caller); the parse budget counts files and bytes. A call is a hit in callee position.
+  In the identifier view, a call can name the one definition in its own file when the call shape fits (see Roles).
+  The other calls are not split; a name with two or more definitions gets a note that counts both groups.
 - **KB-INV-6** A tracked path and the work tree are untrusted. `Containment` canonicalizes each parent folder once, before
   any file is read, and requires it to stay inside the canonical root. It then reads the file by that canonical parent
   plus the file name, through `safe_fs::read_regular_bounded` (see `KB-INV-10`). Only the last part of the path is opened
@@ -87,7 +88,8 @@ index to build and nothing is cached or written. Two views answer two kinds of q
   other roles as counts (`--all` lists them, `--full` prints long sections whole).
 - **Word view** (a quoted argument with several words): `files: N hold all M words; K listed`, then per file one line with
   the word counts and the best lines. Files that hold all words come first. If fewer than `FALLBACK_MIN_FILES` (3) files
-  hold all words, files with fewer words follow.
+  hold all words, files with fewer words follow. A `called: N definitions that the listed files call hold a query word (by name)` block lists callable definitions.
+  Each definition name must hold a query word. These are name links, not resolved calls. Definitions in listed files are skipped.
 
 Exit codes of a query: `0` a line matched, `1` no line matched, `2` a usage or input error, `141` on unix when the reader
 of stdout closed the pipe (`pipe_closed_exit`).
@@ -199,6 +201,14 @@ stored-line cap, the per-file definition cap and the definition cap over all fil
 fired. The per-file cap has its own remedy, `read the file with skim FILE --mode=signatures`, because `-c`, `-l` and a
 narrower pattern do not show the cut definitions of one file.
 
+Word-view name links use only files phase B already parsed. They add no file read or parse.
+`MAX_CALLED_NAMES_PER_FILE` = 32 bounds distinct called names per file; each keeps its first call line.
+`MAX_WORD_DEFS_PER_FILE` = 64 and `MAX_WORD_DEFS` = 5,000 bound callable definitions per file and across files in parse order.
+`MAX_NAME_BYTES` = 256 bounds stored name bytes; `MAX_CALLED_SHOWN` = 10 bounds the displayed definitions.
+`CapsHit.called_names`, `.file_word_defs`, `.all_word_defs` and `.name_bytes` record each scan cut where it occurs.
+Text notes and JSON `notices` give exact counts and remedies. Display cuts say `not listed:` with the exact count.
+When matched files have no labels, a note counts those files and called names with no definition in the parsed files.
+
 ## Roles (`roles.rs`)
 
 `Role` is in tier order: `def`, `call`, `ref`, `unlabelled`, `import`, `string`, `comment`, `text`, `partial`. A line takes
@@ -212,11 +222,32 @@ A Rust macro argument is a flat token tree with no call node. There `is_macro_ar
 `call` when the next token is a parenthesised group and the token before it is not a definition keyword (`fn`,
 `struct`, `enum`, `union`, `trait`, `type`). Every other identifier in the token tree is `ref`.
 
+**Identifier-view call assignment** is narrower than the `call` role. It applies to Rust, TypeScript, JavaScript, Python and Go only.
+The file must have exactly one definition-role line, its retained definition record, and exactly one declaration of the name.
+The callee text must equal that name byte for byte, and the declaration must be callable.
+A plain call needs a non-method and no import-role line for the name in the file.
+A `self.`, `this.` or `Self::` call needs a method. Every call match on a line must fit the same definition.
+Macros, macro arguments, generic calls, `Type::name` and other receivers stay not split.
+Any cut that removes the definition record clears the file's assignments. Counts cover all call lines, past the stored-line cap.
+There is no scope or container check: another class or impl in the file, or an unseen local name, can make the assignment wrong.
+
+**Word-view name links** use `name_holds_word`: whole tokens, compared with `eq_ignore_ascii_case`.
+Separators, lower-to-upper case, acronym ends and letter/digit boundaries split tokens. There is no plural rule or substring match.
+`called_names` collects any `is_callee` shape; `word_declarations` keeps only callable declarations whose name holds a query word.
+Callable kinds include Rust functions and signatures; TS/JS functions, generators, methods and function-valued variable declarations;
+Python functions; Go functions and methods; and function or method kinds in other languages. Fields, variants and type aliases do not count.
+The link is by name, not import or type resolution. A renamed import can be missed; a same-name definition can be unrelated.
+A file with no content match is not parsed. A file left unparsed by a bound cannot supply a definition.
+
 ## Rank (`rank.rs`)
 
 - **Labelled view** key: best-role tier ascending, file prior ascending, matched lines descending, path ascending.
-- **Word view** key: words matched descending, file prior ascending, the sum of `ln(1 + count)` over the words
-  descending, path ascending. The default is `WORD_VIEW_DEFAULT_LIMIT` = 10 files, `WORD_VIEW_BEST_LINES` = 2 lines each.
+- **Word view** key: words matched descending, file prior ascending, file-stem word match descending,
+  the sum of `ln(1 + count)` over the words descending, path ascending. `name_holds_word` tests the stem without regard to case.
+  The score is `1000*w + 200*(4-p) + 100*h + min(sum,99)`; `word_rank` makes the key and score together.
+  The candidate set, word counts and fallback do not change; a file-name match alone cannot admit a file.
+  Phase B parses in the same rank order. Non-UTF-8 stems use `to_string_lossy`.
+  The default is `WORD_VIEW_DEFAULT_LIMIT` = 10 files, `WORD_VIEW_BEST_LINES` = 2 lines each.
 - `FilePrior` (source, test, docs, changelog, generated) is decided by the first rule that fits: generated markers
   (the first `GENERATED_PROBE_LINES` lines or file names), changelog names, docs folders and extensions, test folders,
   then source.
@@ -231,6 +262,13 @@ A Rust macro argument is a flat token tree with no call node. There `is_macro_ar
   `definitions` (`count`, `at_least`, `sites`), `files` (`path`, `rank`, `score`, `prior`, `labelled`, `words_matched`,
   `words_total`, `line_count`, `roles`, `occurrences`), `searched_files`, `left_out` (the seven keys), `parse`, `cost`,
   `notices` and `duration_ms`. An error is `{"error": "…"}`.
+- Call assignments show only when the total definition count is at least two. Normal and `-C` call lines add `(def N)`.
+  The compact layout separates assigned and other line numbers. An assigned JSON occurrence alone gets `def_line`; its role stays `call`.
+  With no assignment, the clash note stays unchanged. Otherwise it adds `; call lines assigned to the one definition in their file: A; call lines not split by definition: U`.
+  These are exact call-line counts, not counts of individual calls.
+- Word-view `called_definitions` rows hold `name`, `path`, `line`, `first_line`, `end_line` and `caller: {path, line}`.
+  Paths can also have `path_lossy`. Text and JSON show the same set once each, apart from definitions in listed files.
+  No row joins `files[]`, and `occurrences` do not change. Names use `escape_text`, text paths use `quote_path`, and JSON paths use `insert_path`.
 - Bounds print notes with the remedy: `CAP_REMEDY` ("use -c or -l for every file, or narrow the pattern") and
   `CONTEXT_REMEDY` ("use a smaller -C, or narrow the pattern").
 - `--limit` and `--offset` page the files in rank order; `has_more` states whether more files follow.
