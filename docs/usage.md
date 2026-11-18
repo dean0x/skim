@@ -13,7 +13,7 @@ skim [FILE|DIRECTORY] [OPTIONS]
 - **Single file**: `skim file.ts` (auto-detects language from extension)
 - **Directory**: `skim src/` (recursively processes all supported files)
 - **Glob pattern**: `skim 'src/**/*.ts'` (processes matching files)
-- **Stdin**: `skim -` (requires `--language` flag)
+- **Stdin**: `skim -` (`--language` recommended; else skim tries a shebang, then raw text within the default bound)
 
 ## Options
 
@@ -23,7 +23,41 @@ skim [FILE|DIRECTORY] [OPTIONS]
 -m, --mode <MODE>
 ```
 
-Transformation mode [default: structure]
+Transformation mode [default starting mode: structure]
+
+#### Default single-input limit
+
+With no `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol`, `skim FILE` and `skim -` have a default bound.
+Stdout plus its view notice stays strictly below **29,000 characters** (Unicode scalar values, not bytes).
+The count includes source line numbers and the elision marker.
+The bound applies to every output destination: terminals, pipes and file redirects.
+Skim tries **structure → signatures → types** and serves the first non-empty view that fits.
+JSON, YAML and TOML keep their structure view instead of this step-down.
+
+If no view fits, skim cuts the last non-empty view on whole lines.
+Over-limit raw text also gets whole-line cuts.
+The last stdout line counts hidden source lines with a complete source map, or hidden view lines without one.
+One stderr notice names the served mode, the limit and any cut.
+A warm cache read keeps the cold read's output and notice.
+
+Use `--symbol NAME` for one declaration in a file.
+Use `--max-lines N` for a line limit on files or stdin.
+Use a typed `--mode`, such as `--mode structure`, to keep that mode without the character bound.
+Use `SKIM_PASSTHROUGH=1` for raw file or stdin output.
+Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol`, hook file rewrites and multi-file runs have no default character bound.
+Limits in other agents are not known.
+
+Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
+
+**Examples:**
+```bash
+skim file.ts                       # Default bound
+skim - --language typescript       # Same bound on stdin
+skim file.ts --max-lines 50         # Explicit line limit
+skim file.ts --symbol parse         # One declaration (files only)
+skim file.ts --mode structure       # Explicit mode; no character bound
+SKIM_PASSTHROUGH=1 skim file.ts      # Raw file bytes
+```
 
 **Values:**
 - `structure` - Keep structure only (60-80% reduction)
@@ -54,19 +88,19 @@ See [Transformation Modes](./modes.md) for detailed information.
 -l, --language <LANGUAGE>
 ```
 
-Override language detection (required for stdin, optional fallback otherwise)
+Override language detection (recommended for stdin; skim also checks a shebang)
 
 **Values:** `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `c`, `cpp`, `csharp`, `ruby`, `sql`, `kotlin`, `swift`, `markdown`, `json`, `yaml`, `toml`
 
 **Auto-detection:** Language is automatically detected from file extensions by default
 
 **Use when:**
-- Reading from stdin (required)
+- Stdin without a shebang
 - Processing files with unusual extensions (fallback)
 
 **Examples:**
 ```bash
-# Required for stdin
+# Select the language for stdin
 cat file.ts | skim - --language=typescript
 
 # JSON from stdin

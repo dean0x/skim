@@ -23,7 +23,27 @@ Skim offers six transformation modes, each with different levels of aggressivene
 
 **Token reduction: 60-80%** — the only measured figure is 60.3%, on the production TypeScript codebase in README's reduction tables, and the range is stated wide enough to contain it. No CI gate defends the range: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
-Structure mode is the default and most balanced mode. It keeps enough information to understand the codebase architecture while removing implementation details.
+Default single-input reads start with structure. An explicit `--mode structure` keeps that mode without the default character bound.
+
+With no `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol`, `skim FILE` and `skim -` have a default bound.
+Stdout plus its view notice stays strictly below **29,000 characters** (Unicode scalar values, not bytes).
+The count includes source line numbers and the elision marker.
+The bound applies to every output destination: terminals, pipes and file redirects.
+Skim tries **structure → signatures → types** and serves the first non-empty view that fits.
+JSON, YAML and TOML keep their structure view instead of this step-down.
+
+If no view fits, skim cuts the last non-empty view on whole lines.
+Over-limit raw text also gets whole-line cuts.
+The last stdout line counts hidden source lines with a complete source map, or hidden view lines without one.
+One stderr notice names the served mode, the limit and any cut.
+A warm cache read keeps the cold read's output and notice.
+
+Use `--symbol NAME` for one declaration in a file.
+Use `--max-lines N` for a line limit on files or stdin.
+Use a typed `--mode` to keep that mode, or `SKIM_PASSTHROUGH=1` for raw file or stdin output.
+Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol`, hook file rewrites and multi-file runs have no default character bound.
+Limits in other agents are not known.
+Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
 
 ### What's Preserved
 
@@ -47,7 +67,7 @@ Structure mode is the default and most balanced mode. It keeps enough informatio
 ```bash
 skim file.ts --mode structure
 
-# Or simply (structure is default)
+# Start with structure; apply the default character bound
 skim file.ts
 ```
 

@@ -59,6 +59,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 ### Command Rewriting (`skim init`)
 - PreToolUse hook rewrites `ls`, `grep`, `gh`, `cargo test`, `vitest`, `git diff` into skim equivalents
 - File reads (`cat`, `head`, `tail` on code files) are rewritten into direct skim reads (e.g. `cat file.ts` → `skim file.ts --mode=pseudo`); output is a structured view, not raw bytes — skim emits a one-line stderr notice whenever the served view differs from raw file contents. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20` (verbatim lines; when the file is longer, one slot goes to the elision marker, so the bound is N lines *total* — with one documented exception at `N=1`, which emits 1 content line plus the marker), and `tail -5 file.ts` likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines
+- Hook file rewrites select explicit modes or line limits. The [default character bound](#default-single-input-limit) does not apply.
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 - Round-trip safe: commands with newlines, heredocs, or command substitution are never rewritten, and neither is a command whose target binary skim cannot resolve on `PATH` (a shell function or alias is invisible to a `PATH` probe by construction, so the real command runs untouched); piped commands are refused too, with one exception — `<cmd> | cat` (bare `cat`, sole consumer, no redirects) rewrites its source, because bare `cat` renders a stream for a reader rather than consuming its bytes
@@ -267,7 +268,7 @@ skim README.md --mode structure
 # Pipe to other tools
 skim src/app.ts | bat -l typescript
 
-# Read from stdin (--language recommended; shebang auto-detected, else lossless passthrough)
+# Read from stdin (--language recommended; shebang auto-detected, else raw text within the default bound)
 cat app.ts | skim - --language=typescript
 
 # Override language detection for unusual file extensions
@@ -298,8 +299,8 @@ skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 ```
 
 **Common options:**
-- `-m, --mode` - Transformation mode: `structure` (default), `signatures`, `types`, `full`, `minimal`, `pseudo`
-- `-l, --language` - Override auto-detection (recommended for stdin; else shebang is tried, then lossless passthrough)
+- `-m, --mode` - Transformation mode: `structure` (default starting mode), `signatures`, `types`, `full`, `minimal`, `pseudo`
+- `-l, --language` - Override auto-detection (recommended for stdin; else skim tries a shebang, then raw text within the default bound)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
 - `-n, --line-numbers` - Annotate output with original source line numbers (prefix `{line}\t{content}`)
 - `--max-lines N` - Emit at most N lines total; when content is elided, one slot goes to the elision marker. One documented exception at `N=1`: 1 content line **plus** the marker (2 lines), because spending the only slot on the marker returns a view containing no code, and dropping the marker to fit is silent loss
@@ -313,6 +314,30 @@ skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 - `--disable-analytics` - Disable analytics recording
 
 📖 **[Full Usage Guide →](docs/usage.md)**
+
+### Default single-input limit
+
+With no `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol`, `skim FILE` and `skim -` start with structure.
+Stdout plus its view notice stays strictly below **29,000 characters** (Unicode scalar values, not bytes).
+The count includes source line numbers and the elision marker.
+The bound applies to every output destination: terminals, pipes and file redirects.
+Skim tries **structure → signatures → types** and serves the first non-empty view that fits.
+JSON, YAML and TOML keep their structure view instead of this step-down.
+
+If no view fits, skim cuts the last non-empty view on whole lines.
+Over-limit raw text also gets whole-line cuts.
+The last stdout line counts hidden lines; one stderr notice names the served mode, the limit and any cut.
+The marker counts hidden source lines with a complete source map, or hidden view lines without one.
+A warm cache read keeps the cold read's output and notice.
+
+Use `--symbol NAME` for one declaration in a file.
+Use `--max-lines N` for a line limit on files or stdin.
+Use a typed `--mode`, such as `--mode structure`, to keep that mode without the character bound.
+Use `SKIM_PASSTHROUGH=1` for raw file or stdin output.
+Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol`, hook file rewrites and multi-file runs have no default character bound.
+Limits in other agents are not known.
+
+Optional `--show-stats` and `SKIM_DEBUG` lines are outside the count.
 
 ## Transformation Modes
 
@@ -332,7 +357,7 @@ Skim offers six modes with different levels of aggressiveness:
 ‡ **Measured basis: 60.3%.** Structure mode's only measured figure is the 60.3% in the reduction table at the top of this README and in the Real-World Token Reduction table under Performance — both on the same production TypeScript codebase. The range on this row is stated wide enough to contain it. No CI gate defends the range either way: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
 ```bash
-skim file.ts --mode structure   # Default
+skim file.ts --mode structure   # Explicit structure; no default character bound
 skim file.ts --mode pseudo      # Pseudocode (preserves return types, parameter types for TS/Rust; strips decorators)
 skim file.ts --mode signatures  # More aggressive
 skim file.ts --mode types       # Most aggressive
