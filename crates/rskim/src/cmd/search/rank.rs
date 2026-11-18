@@ -5,8 +5,9 @@
 //! - The **labelled view** (one pattern): key (best-role tier ascending, prior
 //!   ascending, matched lines descending, path ascending).
 //! - The **word view** (several plain words): key (words matched descending,
-//!   prior ascending, sum of `ln(1 + count)` over the words descending, path
-//!   ascending).
+//!   prior ascending, file stem holds a query word first, sum of `ln(1 + count)`
+//!   over the words descending, path ascending). The prior stays above the
+//!   name tier.
 //!
 //! One function per view computes the key and the score together, so the score
 //! never increases down the ranked list.
@@ -16,6 +17,7 @@ use std::path::{Component, Path};
 
 use memchr::memmem;
 
+use super::matcher::name_holds_word;
 use super::roles::Role;
 
 /// Lines at the top of a file searched for a generated-file marker.
@@ -233,6 +235,17 @@ pub(super) struct WordInput<'a> {
     pub(super) prior: FilePrior,
     /// Matching lines of each word, in word order.
     pub(super) counts: &'a [u32],
+    /// The file stem holds a query word as a whole name token.
+    pub(super) name_hit: bool,
+}
+
+/// Whether the file stem holds any query word as a whole name token.
+/// Convert only the stem with `to_string_lossy`, so non-UTF-8 paths remain
+/// eligible. Phase A computes this once; parse and list order share the flag.
+pub(super) fn file_name_hit(path: &Path, words: &[String]) -> bool {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy())
+        .is_some_and(|stem| words.iter().any(|word| name_holds_word(&stem, word)))
 }
 
 impl WordInput<'_> {
@@ -243,9 +256,10 @@ impl WordInput<'_> {
 }
 
 /// The key and the score of one file of the word view, from one place.
-/// `score = 1000 * words + 100 * (4 - prior) + min(sum, 99)` with
-/// `sum = sum over the words of ln(1 + count)`.
-fn word_rank(input: &WordInput<'_>) -> ((Reverse<usize>, u32), f64, f64) {
+/// The name tier precedes hit counts but stays below the prior and word count.
+/// `score = 1000 * words + 200 * (4 - prior) + 100 * name_hit + min(sum, 99)`
+/// with `sum = sum over the words of ln(1 + count)`.
+fn word_rank(input: &WordInput<'_>) -> ((Reverse<usize>, u32, Reverse<bool>), f64, f64) {
     debug_assert!(
         input.counts.len() <= MAX_WORDS,
         "a word query has at most {MAX_WORDS} words"
@@ -253,8 +267,11 @@ fn word_rank(input: &WordInput<'_>) -> ((Reverse<usize>, u32), f64, f64) {
     let words = input.words_matched();
     let prior = input.prior.level();
     let sum: f64 = input.counts.iter().map(|&c| f64::from(c).ln_1p()).sum();
-    let score = 1000.0 * words as f64 + 100.0 * f64::from(4 - prior) + sum.min(WORD_SCORE_CAP);
-    ((Reverse(words), prior), sum, score)
+    let score = 1000.0 * words as f64
+        + 200.0 * f64::from(4 - prior)
+        + 100.0 * f64::from(input.name_hit)
+        + sum.min(WORD_SCORE_CAP);
+    ((Reverse(words), prior, Reverse(input.name_hit)), sum, score)
 }
 
 /// Rank files of the word view, best first.

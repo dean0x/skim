@@ -240,6 +240,7 @@ fn build_query(flags: &QueryFlags) -> Result<(ScanQuery, QueryInfo), UsageError>
             };
             let query = ScanQuery {
                 plan: QueryPlan::Pattern(Box::new(matcher)),
+                words: Vec::new(),
                 identifier: *identifier,
             };
             Ok((query, info))
@@ -272,6 +273,7 @@ fn build_query(flags: &QueryFlags) -> Result<(ScanQuery, QueryInfo), UsageError>
             };
             let query = ScanQuery {
                 plan: QueryPlan::Words(matchers),
+                words: words.clone(),
                 identifier: false,
             };
             Ok((query, info))

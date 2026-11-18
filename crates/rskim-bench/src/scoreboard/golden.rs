@@ -214,8 +214,8 @@ pub struct RefsEntry {
 }
 
 /// The definition a `[[clash]]` call belongs to: the index into
-/// [`ClashEntry::defs`], or `"unassigned"` when the call is not split by
-/// definition.
+/// [`ClashEntry::defs`], or `"unassigned"` when the frozen answer does not
+/// assign it. An exact entry requires an index on every call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum CallDef {
@@ -243,10 +243,10 @@ pub struct ClashCall {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClashSplit {
-    /// Calls are not split by definition (the only value v1 accepts).
+    /// No output occurrence may assign a call to a definition.
     None,
-    /// Every call carries the index of its definition. Reserved for a later
-    /// version; golden integrity refuses it today.
+    /// Every frozen call carries the index of its definition. Output calls
+    /// may stay unassigned; the HARD check judges assignment precision.
     Exact,
 }
 
@@ -739,7 +739,8 @@ impl Violations {
 /// non-blank paths; a `[[refs]]` or `[[clash]]` query is a bare identifier; a
 /// `[[refs]]` entry has distinct sites that include its `def` and at least
 /// one call site; a `[[clash]]` has 2 or more distinct defs, one or more
-/// distinct calls, every call `def` index in range and `split = "none"`; a
+/// distinct calls, every call `def` index in range, and an index on every
+/// call when `split = "exact"`; a
 /// `[[stakes]]` entry uses only flags of
 /// [`STAKES_FLAGS`] and none the runner sets itself, reads as a regex-oracle
 /// query (or, for `exit = 2`, as a query the search rejects), pairs `-l` with
@@ -989,8 +990,8 @@ fn check_clash(e: &ClashEntry, universe: Option<&TextUniverse>) -> anyhow::Resul
         "entry has no calls; the call check would pass on nothing"
     );
     anyhow::ensure!(
-        e.split == ClashSplit::None,
-        "split = \"exact\" is not accepted in v1; use split = \"none\""
+        e.split != ClashSplit::Exact || e.calls.iter().all(|c| matches!(c.def, CallDef::Index(_))),
+        "split = \"exact\" needs a def index on every call"
     );
     anyhow::ensure!(
         e.defs.iter().all(|d| d.line >= 1) && e.calls.iter().all(|c| c.line >= 1),

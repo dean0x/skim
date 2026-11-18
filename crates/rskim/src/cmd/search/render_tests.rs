@@ -26,6 +26,7 @@ fn record(line: u32, role: Role, holder: Option<&str>, text: &str) -> Record {
             last_line: line,
         }),
         def_lines: None,
+        call_def: None,
         text: text.to_owned(),
         truncated_bytes: 0,
         distinct_words: 1,
@@ -56,8 +57,11 @@ fn file(path: impl Into<PathBuf>, prior: FilePrior, records: Vec<Record>) -> Fil
         prior,
         lines: (defs.len() + rest.len()) as u32,
         word_lines: Vec::new(),
+        name_hit: false,
         unlabelled: None,
         roles,
+        assigned_calls: rest.iter().filter(|r| r.call_def.is_some()).count() as u32,
+        links: Default::default(),
         defs,
         records: rest,
         context: Vec::new(),
@@ -75,6 +79,13 @@ fn scan_of(mut files: Vec<FileScan>) -> ScanOutput {
         caps: CapsHit::default(),
         context_hidden: 0,
     }
+}
+
+fn file_named_mut<'a>(scan: &'a mut ScanOutput, path: &str) -> &'a mut FileScan {
+    scan.files
+        .iter_mut()
+        .find(|file| file.path == Path::new(path))
+        .expect("fixture file exists")
 }
 
 fn pattern(text: &str) -> QueryInfo {
@@ -121,6 +132,38 @@ fn call_file(path: &str, prior: FilePrior, numbers: &[u32]) -> FileScan {
         .map(|n| record(*n, Role::Call, Some("run"), &format!("call{n}()")))
         .collect();
     file(path, prior, records)
+}
+
+/// Two assigned call lines, one other call line, and one reference.
+fn assigned_file() -> FileScan {
+    file(
+        "a.rs",
+        FilePrior::Source,
+        vec![
+            definition(12, 10, 15, "dup", "fn dup("),
+            Record {
+                call_def: Some(12),
+                ..record(20, Role::Call, Some("run"), "  self.dup();")
+            },
+            record(21, Role::Call, Some("run"), "  other.dup();"),
+            Record {
+                call_def: Some(12),
+                ..record(22, Role::Call, Some("run"), "  self.dup(); self.dup();")
+            },
+            record(23, Role::Ref, Some("run"), "  let f = dup;"),
+        ],
+    )
+}
+
+fn assignment_scan() -> ScanOutput {
+    scan_of(vec![
+        assigned_file(),
+        file(
+            "b.rs",
+            FilePrior::Source,
+            vec![definition(1, 1, 1, "dup", "fn dup() {}")],
+        ),
+    ])
 }
 
 // ============================================================================
@@ -284,6 +327,193 @@ fn a_spent_parse_budget_turns_the_clash_note_into_an_at_least_note() {
         ),
         "{output}"
     );
+}
+
+#[test]
+fn an_assigned_call_line_names_its_definition_line() {
+    let output = text(&pattern("dup"), &assignment_scan());
+
+    assert!(
+        output.contains("a.rs:20: [run] (def 12) self.dup();\n"),
+        "{output}"
+    );
+    assert!(output.contains("a.rs:21: [run] other.dup();\n"), "{output}");
+    assert!(
+        output.contains("a.rs:22: [run] (def 12) self.dup(); self.dup();\n"),
+        "{output}"
+    );
+    assert!(output.contains("a.rs:23: [run] let f = dup;\n"), "{output}");
+}
+
+#[test]
+fn context_lines_keep_the_definition_line_of_an_assigned_call() {
+    let mut scan = assignment_scan();
+    scan.files[0].context = vec![ContextLine {
+        line: 19,
+        text: "  before();".to_owned(),
+        truncated_bytes: 0,
+    }];
+    let layout = Layout {
+        context: 1,
+        ..Layout::default()
+    };
+
+    let output = render_with(&pattern("dup"), &scan, layout, Format::Text).stdout;
+
+    assert!(
+        output.contains(
+            "a.rs-19-  before();\na.rs:20: [run] (def 12) self.dup();\n\
+         a.rs:21: [run] other.dup();\na.rs:22: [run] (def 12) self.dup(); self.dup();\n"
+        ),
+        "{output}"
+    );
+    assert!(output.contains("a.rs-23-  let f = dup;\n"), "{output}");
+}
+
+#[test]
+fn a_compact_section_splits_assigned_and_other_line_numbers() {
+    let mut scan = assignment_scan();
+    // Exact counts include call lines beyond the stored prefix.
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls += 32;
+    scan.caps.stored_lines = true;
+    scan.files.push(call_file("c.rs", FilePrior::Source, &[7]));
+
+    let output = text(&pattern("dup"), &scan);
+
+    assert!(
+        output.contains("a.rs (def 12): 20,22\na.rs: 21\n"),
+        "{output}"
+    );
+    assert!(output.contains("c.rs:7\n"), "{output}");
+    assert!(!output.contains("self.dup()"), "{output}");
+
+    scan.files[0]
+        .records
+        .retain(|record| record.call_def.is_some());
+    let assigned_only = text(&pattern("dup"), &scan);
+    assert!(
+        assigned_only.contains("a.rs (def 12): 20,22\n"),
+        "{assigned_only}"
+    );
+    assert!(!assigned_only.contains("\na.rs:"), "{assigned_only}");
+}
+
+#[test]
+fn assigned_compact_lines_quote_paths_with_control_bytes() {
+    let mut scan = assignment_scan();
+    scan.files[0].path = "a\n.rs".into();
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls += 32;
+    scan.caps.stored_lines = true;
+
+    let output = text(&pattern("dup"), &scan);
+
+    assert!(
+        output.contains("\"a\\n.rs\" (def 12): 20,22\n\"a\\n.rs\": 21\n"),
+        "{output}"
+    );
+    assert!(!output.contains("\na\n.rs"), "{output}");
+}
+
+#[test]
+fn the_clash_note_counts_assigned_and_not_split_calls() {
+    let mut scan = assignment_scan();
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls = 33;
+    scan.caps.stored_lines = true;
+    for unlabelled in [0, 1] {
+        scan.parse.unlabelled_files = unlabelled;
+        let output = text(&pattern("dup"), &scan);
+        let prefix = if unlabelled == 0 {
+            "note: 2 definitions of dup"
+        } else {
+            "note: at least 2 definitions of dup (1 matched file has no labels)"
+        };
+        assert!(
+            output.contains(&format!(
+                "{prefix}; call lines assigned to the one definition in their file: 33; \
+             call lines not split by definition: 2\n"
+            )),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn one_definition_over_all_files_prints_no_assignment() {
+    let mut scan = scan_of(vec![assigned_file()]);
+    let query = pattern("dup");
+    for layout in [
+        Layout::default(),
+        Layout {
+            full: true,
+            ..Layout::default()
+        },
+        Layout {
+            context: 1,
+            ..Layout::default()
+        },
+    ] {
+        let output = render_with(&query, &scan, layout, Format::Text).stdout;
+        assert!(!output.contains("(def "), "{output}");
+        assert!(output.contains("a.rs:20: [run] self.dup();\n"), "{output}");
+    }
+    for _ in 0..32 {
+        scan.files[0].roles.add(Role::Call);
+    }
+    scan.files[0].lines += 32;
+    scan.files[0].assigned_calls += 32;
+    scan.caps.stored_lines = true;
+    let compact = text(&query, &scan);
+    assert!(compact.contains("a.rs:20,21,22\n"), "{compact}");
+    assert!(!compact.contains("(def "), "{compact}");
+    let json = json_of(&query, &scan, Layout::default());
+    for occurrence in json["files"][0]["occurrences"].as_array().unwrap() {
+        assert!(occurrence.get("def_line").is_none(), "{json}");
+    }
+}
+
+#[test]
+fn json_occurrences_carry_def_line_only_when_assigned() {
+    let scan = assignment_scan();
+    // A page can hide the second definition; the gate still counts all files.
+    for limit in [None, Some(1)] {
+        let json = json_of(
+            &pattern("dup"),
+            &scan,
+            Layout {
+                limit,
+                ..Layout::default()
+            },
+        );
+        let a = json["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "a.rs")
+            .unwrap();
+        for occurrence in a["occurrences"].as_array().unwrap() {
+            let line = occurrence["line"].as_u64().unwrap();
+            if [20, 22].contains(&line) {
+                assert_eq!(occurrence["def_line"], 12, "{json}");
+                assert_eq!(occurrence["role"], "call");
+            } else {
+                assert!(occurrence.get("def_line").is_none(), "{json}");
+            }
+        }
+    }
+    let word_json = json_of(&words(&["dup", "run"]), &scan, Layout::default());
+    assert!(!word_json.to_string().contains("def_line"), "{word_json}");
 }
 
 #[test]
@@ -744,6 +974,18 @@ fn definitions_the_per_file_cap_left_out_get_a_note_naming_the_cap_and_a_marker_
 }
 
 #[test]
+fn name_link_caps_do_not_claim_that_matching_lines_were_cut() {
+    let caps = CapsHit {
+        called_names: true,
+        file_word_defs: true,
+        all_word_defs: true,
+        name_bytes: true,
+        ..CapsHit::default()
+    };
+    assert!(caps_reached(&caps, &Limits::default()).is_empty());
+}
+
+#[test]
 fn every_cap_that_cut_lines_is_named_and_the_marker_joins_their_remedies() {
     let mut a = call_file("a.rs", FilePrior::Source, &[1]);
     a.lines = 5;
@@ -755,6 +997,7 @@ fn every_cap_that_cut_lines_is_named_and_the_marker_joins_their_remedies() {
         stored_lines: true,
         file_defs: true,
         all_defs: true,
+        ..CapsHit::default()
     };
     let mut layout = Layout::default();
     layout.limits.max_stored_lines = 1;
@@ -1356,6 +1599,387 @@ fn the_word_view_lists_ten_files_by_default_and_counts_the_rest() {
 }
 
 // ============================================================================
+// Called definitions
+// ============================================================================
+
+fn linked_file(path: &str, called: &[(&str, u32)], defs: &[(&str, u32)]) -> FileScan {
+    use crate::cmd::search::roles::{CalledName, WordDeclaration};
+    let mut file = word_file(path, FilePrior::Source, &[1, 0], 1, Vec::new());
+    file.links.called = called
+        .iter()
+        .map(|(name, line)| CalledName {
+            name: (*name).to_owned(),
+            line: *line,
+        })
+        .collect();
+    file.links.defs = defs
+        .iter()
+        .map(|(name, line)| WordDeclaration {
+            name: (*name).to_owned(),
+            line: *line,
+            first_line: line - 1,
+            end_line: line + 2,
+        })
+        .collect();
+    file
+}
+
+fn called_scan() -> ScanOutput {
+    let mut first = linked_file("z.rs", &[("readBeta", 20), ("readAlpha", 4)], &[]);
+    first.word_lines = vec![4, 4];
+    let mut second = linked_file("a.rs", &[("readAlpha", 2)], &[]);
+    second.word_lines = vec![1, 1];
+    scan_of(vec![
+        first,
+        second,
+        linked_file("b.rs", &[], &[("readAlpha", 10), ("readBeta", 30)]),
+        linked_file("c.rs", &[], &[("readAlpha", 40)]),
+    ])
+}
+
+fn called_layout() -> Layout {
+    Layout {
+        limit: Some(2),
+        ..Layout::default()
+    }
+}
+
+#[test]
+fn the_word_view_lists_definitions_the_listed_source_files_call_once_each() {
+    let scan = called_scan();
+    let output = render_with(
+        &words(&["read", "other"]),
+        &scan,
+        called_layout(),
+        Format::Text,
+    )
+    .stdout;
+    assert!(
+        output.contains(
+            "not listed: 2 more files hold the words (--limit N lists more)\n\
+         called: 3 definitions that the listed files call hold a query word (by name)\n\
+         def b.rs:9-12: readAlpha, called from z.rs:4\n\
+         def c.rs:39-42: readAlpha, called from z.rs:4\n\
+         def b.rs:29-32: readBeta, called from z.rs:20\n"
+        ),
+        "{output}"
+    );
+    assert_eq!(output.lines().filter(|l| l.starts_with("def ")).count(), 3);
+}
+
+#[test]
+fn a_called_definition_in_a_listed_file_is_not_printed() {
+    let mut scan = called_scan();
+    let site = scan.files[1].links.defs[0].clone();
+    scan.files[0].links.defs.push(site);
+    let json = json_of(&words(&["read", "other"]), &scan, called_layout());
+    let sites = json["called_definitions"]
+        .as_array()
+        .expect("called definitions array");
+    assert_eq!(sites.len(), 3);
+    assert!(sites.iter().all(|site| site["path"] != "a.rs"));
+}
+
+#[test]
+fn called_definitions_past_the_display_cap_get_a_not_listed_line() {
+    let scan = called_scan();
+    let mut layout = called_layout();
+    layout.limits.max_called_shown = 1;
+    let query = words(&["read", "other"]);
+    let output = render_with(&query, &scan, layout, Format::Text).stdout;
+    assert!(
+        output.contains(
+            "called: 1 definitions that the listed files call hold a query word (by name)\n"
+        ),
+        "{output}"
+    );
+    assert!(output.contains("not listed: 2 more called definitions (display cap 1; narrow the pattern to see others)\n"), "{output}");
+    let json = json_of(&query, &scan, layout);
+    assert_eq!(json["called_definitions"].as_array().unwrap().len(), 1);
+    assert!(json["notices"].as_array().unwrap().contains(&json!(
+        "not listed: 2 more called definitions (display cap 1; narrow the pattern to see others)"
+    )));
+    layout.limits.max_called_shown = 0;
+    let output = render_with(&query, &scan, layout, Format::Text).stdout;
+    assert!(
+        output.contains("not listed: 3 more called definitions"),
+        "{output}"
+    );
+}
+
+#[test]
+fn the_name_link_caps_print_a_note_with_exact_counts_in_text_and_json() {
+    let mut scan = called_scan();
+    scan.files[0].links.called_dropped = 2;
+    scan.files[1].links.called_dropped = 3;
+    scan.files[1].links.defs_dropped = 4;
+    scan.files[2].links.defs_dropped = 5;
+    scan.files[3].links.long_names = 6;
+    scan.caps = CapsHit {
+        called_names: true,
+        file_word_defs: true,
+        all_word_defs: true,
+        name_bytes: true,
+        ..CapsHit::default()
+    };
+    let query = words(&["read", "other"]);
+    let notes = [
+        "5 called names are not stored (per-file called-name cap 32); narrow the pattern or read the source files with skim FILE --mode=full",
+        "9 callable definitions are not stored (per-file word-definition cap 64, word-definition cap 5000); narrow the pattern or read the files with skim FILE --mode=signatures",
+        "6 name occurrences are not stored (name-byte cap 256); read the files with skim FILE --mode=full",
+    ];
+    let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+    let json = json_of(&query, &scan, called_layout());
+    for note in notes {
+        assert!(output.contains(&format!("note: {note}\n")), "{output}");
+        assert!(
+            json["notices"].as_array().unwrap().contains(&json!(note)),
+            "{json}"
+        );
+    }
+    for (file_cap, all_cap, cause) in [
+        (true, false, "per-file word-definition cap 64"),
+        (false, true, "word-definition cap 5000"),
+    ] {
+        scan.caps.file_word_defs = file_cap;
+        scan.caps.all_word_defs = all_cap;
+        let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+        assert!(
+            output.contains(&format!("9 callable definitions are not stored ({cause});")),
+            "{output}"
+        );
+    }
+}
+
+fn unlabel_called_file(scan: &mut ScanOutput, reason: Unlabelled) {
+    let file = file_named_mut(scan, "c.rs");
+    file.unlabelled = Some(reason);
+    file.links = Default::default();
+    scan.parse.unlabelled_files = 1;
+    scan.parse.by_reason.insert(reason, 1);
+}
+
+fn call_gamma(scan: &mut ScanOutput) {
+    file_named_mut(scan, "a.rs")
+        .links
+        .called
+        .push(crate::cmd::search::roles::CalledName {
+            name: "readGamma".to_owned(),
+            line: 50,
+        });
+}
+
+#[test]
+fn called_names_with_no_definition_and_one_unlabelled_file_get_a_singular_note() {
+    let mut scan = called_scan();
+    file_named_mut(&mut scan, "c.rs").links.defs[0].name = "readGamma".to_owned();
+    call_gamma(&mut scan);
+    let query = words(&["read", "other"]);
+    let parsed = json_of(&query, &scan, called_layout());
+    assert!(
+        parsed["called_definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|site| site["path"] == "c.rs" && site["name"] == "readGamma"),
+        "{parsed}"
+    );
+    unlabel_called_file(&mut scan, Unlabelled::Budget);
+    let note = "1 called name has no definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
+    let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+    assert!(output.contains(&format!("note: {note}\n")), "{output}");
+    assert!(
+        json_of(&query, &scan, called_layout())["notices"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(note))
+    );
+}
+
+#[test]
+fn called_names_with_definitions_get_no_unlabelled_name_note() {
+    let mut scan = called_scan();
+    unlabel_called_file(&mut scan, Unlabelled::Budget);
+    let query = words(&["read", "other"]);
+    let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+    assert!(output.contains("1 matched file has no labels"), "{output}");
+    assert!(!output.contains("in the parsed files"), "{output}");
+    let value = json_of(&query, &scan, called_layout());
+    assert!(
+        value["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|note| !note.as_str().unwrap().contains("in the parsed files")),
+        "{value}"
+    );
+}
+
+#[test]
+fn called_names_with_a_parse_cap_get_no_budget_remedy() {
+    let mut scan = called_scan();
+    unlabel_called_file(&mut scan, Unlabelled::ParseCap);
+    call_gamma(&mut scan);
+    let query = words(&["read", "other"]);
+    let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+    assert!(
+        output.contains("1 called name has no definition"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("narrow the pattern to label more files"),
+        "{output}"
+    );
+    let value = json_of(&query, &scan, called_layout());
+    assert!(
+        value["notices"].as_array().unwrap().iter().all(|note| !note
+            .as_str()
+            .unwrap()
+            .contains("narrow the pattern to label more files")),
+        "{value}"
+    );
+}
+
+#[test]
+fn called_names_with_word_definition_caps_say_no_stored_definition() {
+    let mut scan = called_scan();
+    unlabel_called_file(&mut scan, Unlabelled::Budget);
+    call_gamma(&mut scan);
+    file_named_mut(&mut scan, "b.rs").links.defs_dropped = 1;
+    let query = words(&["read", "other"]);
+    for (file_cap, all_cap) in [(true, false), (false, true)] {
+        scan.caps.file_word_defs = file_cap;
+        scan.caps.all_word_defs = all_cap;
+        let note = "1 called name has no stored definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
+        let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+        assert!(output.contains(&format!("note: {note}\n")), "{output}");
+        let value = json_of(&query, &scan, called_layout());
+        assert!(
+            value["notices"].as_array().unwrap().contains(&json!(note)),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn called_names_and_paths_are_escaped_and_quoted() {
+    let name = "read\u{202e}\u{7f}";
+    let mut caller = linked_file("z\u{7f}.rs", &[(name, 4)], &[]);
+    caller.word_lines = vec![1, 1];
+    let scan = scan_of(vec![
+        caller,
+        linked_file("b\u{202e}.rs", &[], &[(name, 10)]),
+    ]);
+    let layout = Layout {
+        limit: Some(1),
+        ..Layout::default()
+    };
+    let output = render_with(&words(&["read", "other"]), &scan, layout, Format::Text).stdout;
+    assert!(
+        output.contains(
+            "def \"b\\342\\200\\256.rs\":9-12: read\\u{202e}\\x7F, called from \"z\\177.rs\":4\n"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains(['\u{202e}', '\u{7f}']));
+}
+
+#[test]
+fn json_called_definitions_match_the_text_block_and_add_no_file_row() {
+    let scan = called_scan();
+    let query = words(&["read", "other"]);
+    let value = json_of(&query, &scan, called_layout());
+    assert_eq!(
+        value["called_definitions"],
+        json!([
+            {"name":"readAlpha", "path":"b.rs", "line":10, "first_line":9, "end_line":12, "caller":{"path":"z.rs", "line":4}},
+            {"name":"readAlpha", "path":"c.rs", "line":40, "first_line":39, "end_line":42, "caller":{"path":"z.rs", "line":4}},
+            {"name":"readBeta", "path":"b.rs", "line":30, "first_line":29, "end_line":32, "caller":{"path":"z.rs", "line":20}},
+        ])
+    );
+    let mut without = scan.clone();
+    for file in &mut without.files {
+        file.links = Default::default();
+    }
+    let original = json_of(&query, &without, called_layout());
+    for key in [
+        "files",
+        "total_lines",
+        "total_files",
+        "cost",
+        "parse",
+        "definitions",
+    ] {
+        assert_eq!(value[key], original[key], "{key}");
+    }
+}
+
+#[test]
+fn called_definitions_use_only_source_callers_on_the_current_page_and_exact_names() {
+    let mut scan = called_scan();
+    let mut layout = called_layout();
+    layout.offset = 1;
+    layout.limit = Some(1);
+    let query = words(&["read", "other"]);
+    let value = json_of(&query, &scan, layout);
+    assert_eq!(
+        value["called_definitions"],
+        json!([
+            {"name":"readAlpha", "path":"b.rs", "line":10, "first_line":9, "end_line":12, "caller":{"path":"a.rs", "line":2}},
+            {"name":"readAlpha", "path":"c.rs", "line":40, "first_line":39, "end_line":42, "caller":{"path":"a.rs", "line":2}},
+        ]),
+        "the caller on this page supplies both definitions; {value}"
+    );
+    file_named_mut(&mut scan, "a.rs").links.called[0].name = "READALPHA".to_owned();
+    let value = json_of(&query, &scan, layout);
+    assert_eq!(
+        value["called_definitions"],
+        json!([]),
+        "exact names only; {value}"
+    );
+    let caller = file_named_mut(&mut scan, "a.rs");
+    caller.links.called[0].name = "readAlpha".to_owned();
+    caller.prior = FilePrior::Test;
+    let value = json_of(&words(&["read", "other"]), &scan, layout);
+    assert_eq!(
+        value["called_definitions"],
+        json!([]),
+        "test callers excluded; {value}"
+    );
+}
+
+#[test]
+fn calls_on_one_line_keep_callee_order_before_definition_path_order() {
+    let mut scan = called_scan();
+    let caller = &mut scan.files[3];
+    caller.links.called[0].line = 4;
+    let value = json_of(&words(&["read", "other"]), &scan, called_layout());
+    assert_eq!(value["called_definitions"][0]["name"], "readBeta");
+}
+
+#[cfg(unix)]
+#[test]
+fn both_called_definition_paths_mark_invalid_utf8_as_lossy() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut scan = called_scan();
+    scan.files[3].path = PathBuf::from(OsString::from_vec(b"z\xff.rs".to_vec()));
+    scan.files[1].path = PathBuf::from(OsString::from_vec(b"b\xfe.rs".to_vec()));
+    let query = words(&["read", "other"]);
+    let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
+    assert!(
+        output.contains("def \"b\\376.rs\":9-12: readAlpha, called from \"z\\377.rs\":4\n"),
+        "{output}"
+    );
+    let value = json_of(&query, &scan, called_layout());
+    let first = &value["called_definitions"][0];
+    assert_eq!(first["path"], "b\u{fffd}.rs");
+    assert_eq!(first["path_lossy"], true);
+    assert_eq!(first["caller"]["path"], "z\u{fffd}.rs");
+    assert_eq!(first["caller"]["path_lossy"], true);
+}
+
+// ============================================================================
 // No match
 // ============================================================================
 
@@ -1446,6 +2070,7 @@ fn the_json_output_is_one_object_with_the_documented_keys() {
             "total_files",
             "has_more",
             "definitions",
+            "called_definitions",
             "files",
             "searched_files",
             "left_out",
