@@ -69,7 +69,9 @@ A run goes through these steps. Pass 1 runs the old per-file code and counts eac
 
 ## Passthrough for an explicit list
 
-`SKIM_PASSTHROUGH=1` with an explicit file list now gives raw bytes in sorted path order, with no headers and no size bound, with or without `--tokens`. `resolve_explicit_paths` is the one resolver for the transform path and the raw path. It keeps the warnings, the all-fail error, the sort and the dedup. `passthrough_explicit_files` uses bare `?` on writes, so a closed pipe exits 141. The gate sits in `main.rs` after the stdin-mix check.
+`SKIM_PASSTHROUGH=1` streams raw bytes in sorted path order, with no headers or size limit. It does this with or without `--tokens`. `resolve_explicit_paths` shares the path order, duplicate removal and path-resolution diagnostics with the transform path. The gate sits in `main.rs` after the stdin-mix check.
+
+For an explicit list, `passthrough_explicit_files` reports each input error with `display_path` and continues to the next file. Bytes already sent to stdout stay in the output. If at least one file succeeds, the exit code is 0. If every file fails, the exit code is 1. An output error stops the run at once. A closed stdout pipe exits 141.
 
 ## Anti-Patterns
 

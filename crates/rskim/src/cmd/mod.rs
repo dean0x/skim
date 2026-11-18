@@ -83,6 +83,7 @@ mod pkg;
 mod proxy;
 mod rewrite;
 mod safe_fs;
+pub(crate) use safe_fs::{FileCopyError, copy_file_raw};
 mod search;
 mod session;
 pub(crate) mod session_sidecar;

@@ -496,9 +496,7 @@ fn cut_analytics_rows_stay_unmeasured_and_omit_unshown_files() {
 }
 
 #[cfg(unix)]
-#[test]
-fn closed_stderr_does_not_panic_on_the_run_notice() {
-    let home = rust_home(4);
+fn run_with_closed_stderr(home: &TempDir, args: &[&str]) -> Output {
     let sandbox = common::skim_sandboxed(home.path());
     let mut cmd = std::process::Command::new(sandbox.get_program());
     cmd.current_dir(sandbox.get_current_dir().unwrap());
@@ -512,23 +510,59 @@ fn closed_stderr_does_not_panic_on_the_run_notice() {
     // Close the read end before exec, so the child cannot finish before closure.
     let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
     drop(reader);
-    let output = cmd
-        .args([
-            "input/*.rs",
-            "--mode",
-            "types",
-            "--tokens",
-            "180",
-            "--no-cache",
-        ])
+    cmd.args(args)
+        .arg("--no-cache")
         .stderr(std::process::Stdio::from(std::os::fd::OwnedFd::from(
             writer,
         )))
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_does_not_panic_on_the_run_notice() {
+    let output = run_with_closed_stderr(
+        &rust_home(4),
+        &["input/*.rs", "--mode", "types", "--tokens", "180"],
+    );
     assert!(output.status.success(), "{:?}", output.status);
     bounded(&output, 180);
     assert!(!output.stdout.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_keeps_complete_stdout_on_a_fitting_run() {
+    let home = golden_home(false);
+    let args = ["input/*.rs", "--tokens", "1000"];
+    let baseline = run(&home, &args);
+    let golden = include_str!("fixtures/tokens_run_budget/fit.stdout");
+    assert_eq!(stdout(&baseline), golden);
+    assert!(!stderr(&baseline).contains("budget covers the whole output"));
+    assert!(stderr(&baseline).contains("SKIM_PASSTHROUGH=1"));
+
+    let output = run_with_closed_stderr(&home, &args);
+    assert_eq!(stdout(&output), golden);
+    assert!(output.status.success(), "{:?}", output.status);
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_keeps_complete_stdout_if_one_file_fails() {
+    let home = golden_home(false);
+    fs::write(home.path().join("input/z.rs"), [0xff]).unwrap();
+    let args = ["input/*.rs", "--tokens", "1000"];
+    let baseline = run(&home, &args);
+    assert!(stderr(&baseline).contains("Error processing input/z.rs:"));
+    assert!(stderr(&baseline).contains("2 file(s) successfully, 1 failed"));
+
+    let output = run_with_closed_stderr(&home, &args);
+    assert_eq!(
+        stdout(&output),
+        include_str!("fixtures/tokens_run_budget/fit.stdout")
+    );
+    assert!(output.status.success(), "{:?}", output.status);
 }
 
 /// Both stdout fixtures come from `skim 3.0.0 (f370ffc5)`, not the current build.

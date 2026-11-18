@@ -1803,30 +1803,31 @@ fn process_single_arg(
             // Stdin passthrough: copy bounded stdin → stdout.
             let buf = cmd::read_stdin_bounded()?;
             out.write_all(buf.as_bytes())?;
-        } else if path.is_dir() {
+            return Ok(());
+        }
+        let mut copy = |path: &std::path::Path| -> anyhow::Result<()> {
+            match cmd::copy_file_raw(path, &mut out) {
+                Ok(()) => Ok(()),
+                Err(cmd::FileCopyError::Input(error)) => {
+                    anyhow::bail!("passthrough read {}: {error}", path.display())
+                }
+                Err(cmd::FileCopyError::Output(error)) => Err(error)?,
+            }
+        };
+        if path.is_dir() {
             // Directory passthrough: collect all skim-supported files and
             // print their raw bytes concatenated (mirrors process_directory).
-            let paths = multi::collect_passthrough_paths_dir(path, args.no_ignore);
-            for p in &paths {
-                let contents = std::fs::read(p)
-                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
-                out.write_all(&contents)?;
+            for path in multi::collect_passthrough_paths_dir(path, args.no_ignore) {
+                copy(&path)?;
             }
         } else if multi::has_glob_pattern(file) {
             // Glob passthrough: expand, then print raw bytes of each match.
-            let paths = multi::collect_passthrough_paths_glob(file, args.no_ignore)?;
-            for p in &paths {
-                let contents = std::fs::read(p)
-                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
-                out.write_all(&contents)?;
+            for path in multi::collect_passthrough_paths_glob(file, args.no_ignore)? {
+                copy(&path)?;
             }
         } else {
-            // File passthrough: read raw bytes and copy to stdout.
-            // Skip validation (size limits, UTF-8) — the point of passthrough
-            // is byte-faithful forwarding without skim's transform guards.
-            let contents =
-                std::fs::read(file).map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
-            out.write_all(&contents)?;
+            // Stream the raw bytes without a size limit or UTF-8 check.
+            copy(path)?;
         }
         return Ok(());
     }

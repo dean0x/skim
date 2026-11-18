@@ -344,6 +344,51 @@ fn explicit_list_passthrough_warns_for_missing_paths_and_fails_if_all_are_missin
         .stderr("Error: File not found: 'missing.ts'\nFile not found: 'absent.ts'\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_continues_after_an_input_error() {
+    let dir = TempDir::new().unwrap();
+    let first = b"a\r\n";
+    let last = b"c\0\xff";
+    fs::write(dir.path().join("a.ts"), first).unwrap();
+    fs::write(dir.path().join("c.ts"), last).unwrap();
+    // The socket exists, but cannot be opened as a file, even by root.
+    let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("b\nbad.ts")).unwrap();
+
+    common::skim_sandboxed(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .args(["a.ts", "b\nbad.ts", "c.ts"])
+        .assert()
+        .stdout([&first[..], &last[..]].concat())
+        .success()
+        .stderr(predicate::str::contains("Error processing b?bad.ts:"))
+        .stderr(predicate::str::contains("b\nbad.ts").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_uses_the_transform_exit_code_if_all_inputs_fail() {
+    let dir = TempDir::new().unwrap();
+    let args = ["a.ts", "b.ts"];
+    let _sockets =
+        args.map(|path| std::os::unix::net::UnixListener::bind(dir.path().join(path)).unwrap());
+    let transform = common::skim_sandboxed(dir.path())
+        .args(args)
+        .output()
+        .unwrap();
+    let code = transform.status.code().filter(|&code| code != 0).unwrap();
+
+    common::skim_sandboxed(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .args(args)
+        .assert()
+        .code(code)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("Error processing a.ts:"))
+        .stderr(predicate::str::contains("Error processing b.ts:"))
+        .stderr(predicate::str::contains("All 2 file(s) failed to process"));
+}
+
 #[test]
 fn explicit_list_passthrough_rejects_stdin_mixed_with_files() {
     passthrough_skim()
@@ -1358,6 +1403,70 @@ fn wait_for_child(child: &mut std::process::Child, tag: &str) -> std::process::E
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     }
+}
+
+#[cfg(unix)]
+fn assert_passthrough_writes_before_eof(args: &[&str]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::process::{Command, Stdio};
+
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("input.ts");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&input)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(dir.path().join("z.ts"), b"").unwrap();
+    let mut child = Command::new(common::skim_bin())
+        .current_dir(dir.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Open the writer only after skim opens the FIFO. Keep it open until stdout has a line.
+    let options = fs::File::options()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .clone();
+    let writer = (0..200).find_map(|_| match options.open(&input) {
+        Ok(writer) => Some(writer),
+        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            None
+        }
+        Err(error) => panic!("open FIFO: {error}"),
+    });
+    let Some(mut writer) = writer else {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("skim did not open the FIFO");
+    };
+    writer.write_all(b"first line\n").unwrap();
+    assert_eq!(
+        read_one_line_then_close(&mut child, "raw stream"),
+        "first line"
+    );
+    drop(writer);
+    assert!(wait_for_child(&mut child, "raw stream").success());
+}
+
+#[cfg(unix)]
+#[test]
+fn single_file_passthrough_writes_before_eof() {
+    assert_passthrough_writes_before_eof(&["input.ts"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_list_passthrough_writes_before_eof() {
+    assert_passthrough_writes_before_eof(&["input.ts", "z.ts"]);
 }
 
 /// `SKIM_PASSTHROUGH=1 skim <file> | head -1` must exit 141, not 1.

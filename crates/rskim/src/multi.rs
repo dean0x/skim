@@ -17,6 +17,7 @@ use rskim_core::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::cascade::{RungWalk, serde_rungs, walk_rungs};
+use crate::cmd::{FileCopyError, copy_file_raw, display_path};
 use crate::output::ELISION_HINT;
 use crate::process::{
     ProcessOptions, ProcessResult, process_file, report_token_stats, run_budget_applies,
@@ -739,7 +740,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
                 }
             }
             Err(e) => {
-                eprintln!("Error processing {}: {}", path.display(), e);
+                report_file_error(path.display(), e);
                 error_count += 1;
             }
         }
@@ -753,9 +754,11 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
     }
 
     if error_count > 0 {
-        eprintln!(
+        let _ = writeln!(
+            io::stderr().lock(),
             "\nProcessed {} file(s) successfully, {} failed",
-            processed_successes, error_count
+            processed_successes,
+            error_count
         );
     }
 
@@ -799,7 +802,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             total_paths,
         )
     {
-        eprint!("{}", notice.line());
+        let _ = write!(io::stderr().lock(), "{}", notice.line());
     }
 
     if options.process.show_stats && total_original_tokens > 0 {
@@ -930,18 +933,32 @@ pub(crate) fn process_explicit_files(
     process_files(resolve_explicit_paths(args, options.no_ignore)?, options)
 }
 
-/// Serve the explicit list as raw bytes, in the same path order as the transform.
+#[allow(clippy::disallowed_methods)] // Report file errors even if stderr cannot accept a line
+fn report_file_error(path: impl std::fmt::Display, error: impl std::fmt::Display) {
+    let _ = writeln!(io::stderr().lock(), "Error processing {path}: {error}");
+}
+
+/// Stream the explicit list as raw bytes, in the same path order as the transform.
 /// Directory and glob arguments use the same collectors and ignore rules.
-/// Write errors keep their source so a closed stdout pipe exits 141.
+/// Report each input error and continue, even if part of that file reached stdout.
+/// The run succeeds if at least one file reaches EOF without an error.
+/// A write error stops the run at once. A closed stdout pipe exits 141.
 #[allow(clippy::disallowed_methods)] // File-list output needs one stdout lock for the raw byte stream
 pub(crate) fn passthrough_explicit_files(args: &[String], no_ignore: bool) -> anyhow::Result<()> {
     let paths = resolve_explicit_paths(args, no_ignore)?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    for path in paths {
-        let contents = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", path.display()))?;
-        out.write_all(&contents)?;
+    let mut successes = 0;
+    for path in &paths {
+        match copy_file_raw(path, &mut out) {
+            Ok(()) => successes += 1,
+            Err(FileCopyError::Input(error)) => report_file_error(display_path(path), error),
+            Err(FileCopyError::Output(error)) => Err(error)?,
+        }
+    }
+    out.flush()?;
+    if successes == 0 {
+        anyhow::bail!("All {} file(s) failed to process", paths.len());
     }
     Ok(())
 }
