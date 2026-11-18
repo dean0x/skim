@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--tokens N -n` keeps the cut view and its elision marker with source line numbers.
 - `skim search` explains a repeated subcommand before a second pattern. It exits 2 and says to drop the extra `search`.
 - Global Cursor installs and uninstalls leave project guidance and `.cursorrules` unchanged.
 - Cursor guidance upgrades keep user text without extra rule headers. Guidance updates keep existing file permissions.
@@ -26,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Default single-file and stdin reads keep stdout plus their view notice below 29,000 characters (Unicode scalar values, not bytes).
+  The bound applies to terminals, pipes and file redirects.
+  Skim tries structure, signatures, then types before a whole-line cut.
+  Explicit modes, line limits, `--tokens`, `--symbol`, hook file rewrites and multi-file runs have no default character bound.
+  Use `--max-lines N` for a line limit or `--symbol NAME` for one declaration in a file.
+  Use a typed `--mode` for that mode without the bound, or `SKIM_PASSTHROUGH=1` for raw file or stdin output.
 - Word-view rank uses file kind, then a file name that holds a query word, then the hit count. The name test ignores case and matches whole tokens. The matched files and the fewer-word fallback stay the same.
 - hook.log drift notes and `skim doctor` remedies name `skim init` as the refresh command.
 - Re-run `skim init` in the same scope after an upgrade to refresh guidance. The shorter guidance says when to use `skim search` or `rg`.

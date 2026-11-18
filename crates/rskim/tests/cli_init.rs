@@ -1609,6 +1609,19 @@ fn test_init_creates_guidance() {
         content.contains("skim") || content.contains("rskim"),
         "Guidance should reference skim or rskim"
     );
+    for fact in [
+        "below 29,000",
+        "Unicode scalar values, not bytes",
+        "terminals, pipes and file redirects",
+        "`--symbol NAME`",
+        "`--max-lines N`",
+        "`SKIM_PASSTHROUGH=1` for raw output",
+    ] {
+        assert!(
+            content.contains(fact),
+            "installed guidance must say {fact:?}"
+        );
+    }
 }
 
 #[test]

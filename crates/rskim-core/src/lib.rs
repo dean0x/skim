@@ -60,7 +60,8 @@ pub use transform::utils::{ElidedSide, elision_marker_line, get_comment_prefix};
 /// carve-out, the source-space elision count (ADR-017), and the #511
 /// literal-aware pull-back for free.
 pub use transform::truncate::{
-    simple_last_line_truncate, simple_last_line_truncate_with_start, simple_line_truncate,
+    TruncationCountSource, simple_last_line_truncate, simple_last_line_truncate_with_start,
+    simple_line_truncate,
 };
 
 /// Return the structural priority of a tree-sitter node kind (1–5).
@@ -445,6 +446,38 @@ where
         known_token_count,
         elision_hint,
         source_line_count,
+    )
+}
+
+/// Cut a view to a measured budget with an explicit omission-count coordinate space.
+///
+/// `measure` and `budget` must use the same unit. `known_count` can supply the
+/// full view's measurement. Selection and literal pull-back use view lines.
+/// The marker uses source lines for `SourceTotal` and `LineMap`, or view lines
+/// for `ViewLines`. A map too short for the kept prefix falls back to view lines;
+/// debug builds assert that the map covers the kept prefix.
+/// Marker text, compact-marker rules and newline preservation match
+/// [`truncate_to_token_budget`].
+pub fn truncate_with_count_source<F>(
+    text: &str,
+    language: Language,
+    budget: usize,
+    measure: F,
+    known_count: Option<usize>,
+    elision_hint: Option<&str>,
+    count_source: TruncationCountSource<'_>,
+) -> Result<String>
+where
+    F: Fn(&str) -> usize,
+{
+    transform::truncate::truncate_with_count_source(
+        text,
+        language,
+        budget,
+        measure,
+        known_count,
+        elision_hint,
+        count_source,
     )
 }
 

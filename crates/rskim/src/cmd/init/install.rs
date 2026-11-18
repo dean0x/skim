@@ -1982,7 +1982,10 @@ mod tests {
         };
         let current = guidance_content("3.0.1", GuidanceHooks::Hook);
         let longer_version = guidance_content("3.0.10", GuidanceHooks::Hook);
-        let edited = current.replace("Skim earns its cost", "Skim earns its keep");
+        let edited = current.replace(
+            "structural overview, kept under about 29,000 characters",
+            "structural overview (default mode)",
+        );
         let broken = current.replace("<!-- skim-end -->", "");
 
         assert!(!gate(None), "no file: the install must run");

@@ -49,6 +49,52 @@ fn parse_transformed_token_count(stderr: &str) -> usize {
         .unwrap_or_else(|e| panic!("Invalid token count '{token_str}': {e}. stderr: {stderr:?}"))
 }
 
+fn assert_token_cut_with_line_numbers(stdin: bool) {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("types.ts");
+    let source: String = (0..80)
+        .map(|i| format!("export type Alias{i} = {{ id: string; value: number }};\n"))
+        .collect();
+    std::fs::write(&file, &source).unwrap();
+    let read = |numbered: bool| {
+        let mut cmd = skim_cmd();
+        if stdin {
+            cmd.args(["-", "--language", "typescript"])
+                .write_stdin(source.clone());
+        } else {
+            cmd.arg(&file);
+        }
+        cmd.args(["--tokens", "40", "--mode", "types", "--no-cache"]);
+        if numbered {
+            cmd.arg("-n");
+        }
+        cmd.assert().success().get_output().clone()
+    };
+    let plain = read(false);
+    let numbered = read(true);
+    let plain_text = String::from_utf8(plain.stdout).unwrap();
+    let numbered_text = String::from_utf8(numbered.stdout).unwrap();
+    assert!(plain_text.contains("lines truncated"), "{plain_text}");
+    let without_numbers: String = numbered_text
+        .split_inclusive('\n')
+        .map(|line| line.split_once('\t').map_or(line, |(_, text)| text))
+        .collect();
+    assert_eq!(without_numbers, plain_text, "the token cut must survive -n");
+    assert!(numbered_text.lines().any(|line| line.starts_with("1\t")));
+    assert_eq!(numbered_text.lines().last(), plain_text.lines().last());
+    assert_eq!(numbered.stderr, plain.stderr);
+}
+
+#[test]
+fn tokens_file_line_numbers_keep_the_cut_and_unnumbered_marker() {
+    assert_token_cut_with_line_numbers(false);
+}
+
+#[test]
+fn tokens_stdin_line_numbers_keep_the_cut_and_unnumbered_marker() {
+    assert_token_cut_with_line_numbers(true);
+}
+
 // ============================================================================
 // Basic tests
 // ============================================================================
