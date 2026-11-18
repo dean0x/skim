@@ -135,6 +135,25 @@ fn blocks(text: &str) -> Vec<(&str, &str)> {
 }
 
 #[test]
+fn help_describes_the_whole_run_budget_mode_order_and_floor() {
+    let home = TempDir::new().unwrap();
+    for flag in ["--help", "-h"] {
+        let output = run(&home, &[flag]);
+        let help = stdout(&output)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for fact in [
+            "One budget covers the whole output of a run",
+            "full -> minimal -> pseudo -> structure -> signatures -> types",
+            "the omitted-files line can exceed N",
+        ] {
+            assert!(help.contains(fact), "{flag} must say {fact:?}: {help}");
+        }
+    }
+}
+
+#[test]
 fn directory_stdout_obeys_one_budget() {
     let home = rust_home(20);
     let plain = run(&home, &["input", "--mode", "structure"]);

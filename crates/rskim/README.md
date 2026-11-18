@@ -72,7 +72,7 @@ skim --clear-cache
 - **Fast**: 14.6ms for 3000-line files (3x faster than target)
 - **Cached**: 40-50x speedup on repeated processing (enabled by default)
 - **Multi-file**: Glob patterns with parallel processing (`skim 'src/**/*.ts'`)
-- **Token Budget**: Cascade through modes to fit a target token count (`--tokens N`)
+- **Token Budget**: One `--tokens N` budget covers the whole output of a run, not each file
 - **Token Stats**: Show reduction statistics with `--show-stats`
 - **Streaming**: Outputs to stdout for pipe workflows
 - **Safe**: Built-in DoS protections
@@ -96,7 +96,7 @@ Options:
                              markdown, json, yaml, c, cpp, toml, csharp, ruby, sql, kotlin,
                              swift, bash]
       --filename <PATH>     Hint filename for stdin language detection
-      --tokens <N>          Target token budget (cascades through modes to fit)
+      --tokens <N>          One budget for the whole output of a run, not each file
       --max-lines <N>       Maximum output lines (AST-aware truncation)
   -j, --jobs <JOBS>         Number of parallel jobs [default: number of CPUs]
       --no-header           Don't print file path headers for multi-file output
@@ -106,6 +106,29 @@ Options:
   -h, --help                Print help
   -V, --version             Print version
 ```
+
+### Whole-run token budget
+
+With `--tokens N`, one budget covers the whole output of a run, not each file.
+This applies to an explicit list of files, a glob and a directory.
+The budget counts stdout, including headers, source line numbers and markers, but not stderr.
+
+```bash
+skim src/ --tokens 1000
+skim 'src/**/*.ts' --tokens 1000
+skim first.ts second.ts --tokens 1000
+```
+
+The mode order is **full → minimal → pseudo → structure → signatures → types**.
+Skim starts at `--mode` if set, else structure.
+If the run is too large, skim tries smaller views, then cuts whole lines with exact counts.
+It can omit trailing files and count them on the last stdout line.
+A changed run gets one stderr notice.
+
+For a tiny multi-file budget, only the omitted-files line prints.
+That line can exceed N; this is the minimum output floor.
+Use a larger `--tokens` value or fewer files for more content.
+`SKIM_PASSTHROUGH=1` gives the full output for an explicit list of files, a glob or a directory.
 
 ## Transformation Modes
 

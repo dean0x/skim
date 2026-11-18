@@ -267,14 +267,12 @@ Skim earns its cost when you **orient** before a detailed read:
 - Survey files in a directory.
 - Check spec or config sections.
 
-Skim wastes tokens when you already know you need the content — most commonly
-when you're about to edit a file. Read it directly.
+Skim wastes tokens before an edit that needs exact content. Use Read directly.
 
 ### Anti-pattern: skim then Read the same file
 
-If you skim a file and then Read it (in full or in large part), you paid for
-the file twice. This means skim was the wrong choice — you needed content,
-not structure. Pick one tool per file based on what you actually need.
+If you skim then Read most of the same file, you pay twice.
+Use one tool per file: skim for structure, Read for content.
 
 The valid skim→Read sequence is across **different files**: skim several files
 to orient, then Read the one you actually need in detail.
@@ -288,7 +286,7 @@ skim 'src/**/*.ts'               # multi-file scan (glob)
 skim file1.ts file2.ts           # multi-file scan (explicit files)
 skim src/                        # all files in directory recursively
 skim <file> --max-lines 50       # cap output with AST-aware truncation
-skim <file> --tokens 500         # fit output within a token budget
+skim <file> --tokens 500         # one budget covers the whole output of a run
 
 # Modes (most to least content; also the --tokens escalation order):
 # full → minimal → pseudo → structure (default) → signatures → types
@@ -296,6 +294,8 @@ skim <file> --mode=types         # type definitions only
 skim <file> --mode=signatures    # function/method signatures only
 skim <file> --mode=pseudo        # logic without syntactic noise
 ```
+
+`--tokens N` counts headers and markers, not stderr. For tiny multi-file budgets, the omitted-files line can exceed N; no file content prints.
 
 ### Default single-input limit
 
@@ -845,6 +845,22 @@ mod tests {
     }
 
     #[test]
+    fn test_guidance_explains_the_whole_run_token_budget_in_every_render() {
+        for (name, content) in all_renders() {
+            for fact in [
+                "one budget covers the whole output of a run",
+                "`--tokens N` counts headers and markers",
+                "the omitted-files line can exceed N; no file content prints",
+            ] {
+                assert!(
+                    content.contains(fact),
+                    "the {name} render must say {fact:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_guidance_explains_the_default_character_bound_in_every_render() {
         for (name, content) in all_renders() {
             for fact in [
@@ -1044,12 +1060,9 @@ mod tests {
         }
     }
 
-    /// Bounds on the size of a render, in bytes and lines. Each is the next
-    /// multiple of 256 bytes and of 10 lines above the largest render of its
-    /// variant, a rule file included, for the version "3.0.0": the hook render
-    /// of a rule file is 7,047 bytes and 141 lines, and the no-hook render of a
-    /// rule file is 5,806 bytes and 118 lines. The hook text, which an agent
-    /// loads in every session, was 7,733 bytes before the cuts.
+    /// Bounds on each render, in bytes and lines, with rule-file frontmatter.
+    /// Keep the guidance within these bounds for version "3.0.0". Cut text
+    /// rather than raise a bound.
     const MAX_HOOK_BYTES: usize = 7_168;
     const MAX_HOOK_LINES: usize = 150;
     const MAX_NO_HOOK_BYTES: usize = 5_888;

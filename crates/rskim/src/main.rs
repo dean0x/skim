@@ -451,18 +451,25 @@ struct Args {
     )]
     symbol: Option<String>,
 
-    /// Token budget - cascade through modes until output fits within N tokens
+    /// One budget covers the whole output of a run, with headers and markers.
     ///
-    /// Progressively applies more aggressive modes (full -> minimal -> structure
-    /// -> signatures -> types) until the output fits within the specified token
-    /// budget. If --mode is also specified, cascade starts at that mode.
-    /// Final fallback: line-based truncation of the most aggressive mode's output.
+    /// The budget counts stdout, not stderr.
+    /// Modes: full -> minimal -> pseudo -> structure -> signatures -> types.
+    /// Start at --mode if set, else structure. If no view fits, cut whole lines
+    /// with exact counts, then omit trailing files.
+    ///
+    /// For tiny multi-file budgets, the omitted-files line can exceed N; no file
+    /// content prints. For tiny single-file or stdin budgets, the count stays on
+    /// stdout and the SKIM_PASSTHROUGH=1 remedy prints on stderr.
     #[arg(
         long,
         value_name = "N",
-        help = "Fit the output within N tokens by escalating modes, then line-truncating \
-                with a marker; on very small budgets the count stays on stdout and the \
-                SKIM_PASSTHROUGH=1 remedy is printed to stderr"
+        help = "One budget covers the whole output of a run, with headers and markers. \
+                The budget counts stdout, not stderr. \
+                Modes: full -> minimal -> pseudo -> structure -> signatures -> types. \
+                Cut whole lines, then omit trailing files. For tiny multi-file budgets, \
+                the omitted-files line can exceed N; no file content prints. \
+                Use SKIM_PASSTHROUGH=1 for full output"
     )]
     tokens: Option<usize>,
 
