@@ -46,6 +46,7 @@ Manual adversarial dog-food (SEARCH-ADR-007) is still required for these:
 - Role precision outside the frozen names. `refs.call_precision` covers the names in `[[refs]]` entries only, and
   `roles.precision.<lang>` covers the names of `[[refs]]` and `[[clash]]` entries only.
 - Call assignment outside the frozen clash entries. `clash.split_right` checks assignment precision; `clash.split_assigned` counts assigned frozen calls.
+- The word-view `called_definitions` block. No check reads it; the links are by name, not resolved.
 - Latency. It is INFO, because shared CI runners are noisy. The cost counters (`cost.*`) are the RATCHET.
 - A corpus outside the four, and a file count above the largest corpus.
 - Any new query flag, until it has golden entries here.

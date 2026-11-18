@@ -41,6 +41,7 @@ dog-food campaign as the standing gate. Manual dog-food remains only where the s
 - role precision outside the frozen names (`refs.call_precision` covers the `[[refs]]` names only; `roles.precision.*`
   covers the `[[refs]]` and `[[clash]]` names only);
 - call assignment outside the frozen `[[clash]]` entries (`clash.split_right` checks assigned calls; `clash.split_assigned` counts assigned frozen calls);
+- the word-view `called_definitions` block. No check reads it; the links are by name, not resolved;
 - latency (INFO), a corpus outside the four, and any new query flag until it has golden entries.
 
 The runbook is `crates/rskim-bench/scoreboard/README.md`. This file covers what it does not spell out: how the pieces
