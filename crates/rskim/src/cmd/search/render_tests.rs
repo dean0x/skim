@@ -1785,7 +1785,7 @@ fn called_names_with_no_definition_and_one_unlabelled_file_get_a_singular_note()
         "{parsed}"
     );
     unlabel_called_file(&mut scan, Unlabelled::Budget);
-    let note = "1 called names have no definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
+    let note = "1 called name has no definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
     let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
     assert!(output.contains(&format!("note: {note}\n")), "{output}");
     assert!(
@@ -1803,14 +1803,14 @@ fn called_names_with_definitions_get_no_unlabelled_name_note() {
     let query = words(&["read", "other"]);
     let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
     assert!(output.contains("1 matched file has no labels"), "{output}");
-    assert!(!output.contains("called names have no"), "{output}");
+    assert!(!output.contains("in the parsed files"), "{output}");
     let value = json_of(&query, &scan, called_layout());
     assert!(
         value["notices"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|note| !note.as_str().unwrap().contains("called names have no")),
+            .all(|note| !note.as_str().unwrap().contains("in the parsed files")),
         "{value}"
     );
 }
@@ -1823,7 +1823,7 @@ fn called_names_with_a_parse_cap_get_no_budget_remedy() {
     let query = words(&["read", "other"]);
     let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
     assert!(
-        output.contains("1 called names have no definition"),
+        output.contains("1 called name has no definition"),
         "{output}"
     );
     assert!(
@@ -1850,7 +1850,7 @@ fn called_names_with_word_definition_caps_say_no_stored_definition() {
     for (file_cap, all_cap) in [(true, false), (false, true)] {
         scan.caps.file_word_defs = file_cap;
         scan.caps.all_word_defs = all_cap;
-        let note = "1 called names have no stored definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
+        let note = "1 called name has no stored definition in the parsed files; 1 matched file has no labels; narrow the pattern to label more files";
         let output = render_with(&query, &scan, called_layout(), Format::Text).stdout;
         assert!(output.contains(&format!("note: {note}\n")), "{output}");
         let value = json_of(&query, &scan, called_layout());

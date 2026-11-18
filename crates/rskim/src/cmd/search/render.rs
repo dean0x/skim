@@ -655,6 +655,11 @@ fn name_link_notices(report: &Report<'_>, called: &CalledDefinitions<'_>, notes:
         } else {
             "definition"
         };
+        let names = if called.unmatched == 1 {
+            "name has"
+        } else {
+            "names have"
+        };
         let verb = if scan.parse.unlabelled_files == 1 {
             "file has"
         } else {
@@ -666,7 +671,7 @@ fn name_link_notices(report: &Report<'_>, called: &CalledDefinitions<'_>, notes:
             ""
         };
         notes.push(format!(
-            "{} called names have no {definition} in the parsed files; \
+            "{} called {names} no {definition} in the parsed files; \
              {} matched {verb} no labels{remedy}",
             called.unmatched, scan.parse.unlabelled_files
         ));
