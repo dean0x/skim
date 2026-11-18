@@ -269,7 +269,54 @@ fn word_input<'a>(path: &'a Path, prior: FilePrior, counts: &'a [u32]) -> WordIn
         path,
         prior,
         counts,
+        name_hit: false,
     }
+}
+
+#[test]
+fn a_file_whose_name_holds_a_word_ranks_first_among_equal_words_and_prior() {
+    let inputs = [
+        word_input(Path::new("a.rs"), FilePrior::Source, &[40, 40]),
+        WordInput {
+            name_hit: true,
+            ..word_input(Path::new("z_alpha.rs"), FilePrior::Source, &[1, 1])
+        },
+    ];
+
+    assert_eq!(order(&rank_words(&inputs)), [1, 0]);
+    assert_eq!(inputs.map(|input| input.words_matched()), [2, 2]);
+    assert_eq!(files_with_all_words(&inputs, 2), 2);
+}
+
+#[test]
+fn the_name_tier_never_lifts_a_file_over_a_better_prior_or_more_words() {
+    let inputs = [
+        word_input(Path::new("a.rs"), FilePrior::Source, &[1, 1]),
+        WordInput {
+            name_hit: true,
+            ..word_input(Path::new("tests/alpha.rs"), FilePrior::Test, &[40, 40])
+        },
+        word_input(Path::new("generated.rs"), FilePrior::Generated, &[1, 1]),
+        WordInput {
+            name_hit: true,
+            ..word_input(Path::new("alpha.rs"), FilePrior::Source, &[500, 0])
+        },
+    ];
+
+    assert_eq!(order(&rank_words(&inputs)), [0, 1, 2, 3]);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_file_name_test_reads_the_stem_of_a_lossy_name() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = PathBuf::from(OsString::from_vec(b"parent/alpha.\xff.rs".to_vec()));
+    assert!(file_name_hit(&path, &["missing".into(), "ALPHA".into()]));
+    assert!(!file_name_hit(&path, &["rs".into()]));
+    assert!(!file_name_hit(&path, &["parent".into()]));
+    assert!(!file_name_hit(Path::new("/"), &["alpha".into()]));
 }
 
 #[test]
@@ -305,16 +352,35 @@ fn a_few_matching_lines_in_many_words_beat_many_lines_of_one_word() {
 
 #[test]
 fn the_word_score_never_increases_down_the_list_and_follows_its_formula() {
-    let paths: Vec<PathBuf> = (0..40).map(|i| PathBuf::from(format!("f{i:02}"))).collect();
-    let counts: Vec<[u32; 3]> = (0..40u32)
-        .map(|i| [i % 4, (i / 4) % 3, 1000 * (i % 2)])
+    let paths: Vec<PathBuf> = (0..200)
+        .map(|i| PathBuf::from(format!("f{i:03}")))
         .collect();
-    let priors = [FilePrior::Source, FilePrior::Test, FilePrior::Docs];
+    let counts: Vec<[u32; MAX_WORDS]> = (0..200u32)
+        .map(|i| {
+            if i % 7 == 0 {
+                [u32::MAX; MAX_WORDS]
+            } else {
+                let mut counts = [0; MAX_WORDS];
+                counts[..3].copy_from_slice(&[i % 4, (i / 4) % 3, 1000 * (i % 2)]);
+                counts
+            }
+        })
+        .collect();
+    let priors = [
+        FilePrior::Source,
+        FilePrior::Test,
+        FilePrior::Docs,
+        FilePrior::Changelog,
+        FilePrior::Generated,
+    ];
     let inputs: Vec<_> = paths
         .iter()
         .zip(&counts)
         .enumerate()
-        .map(|(i, (path, c))| word_input(path, priors[i % 3], c))
+        .map(|(i, (path, c))| WordInput {
+            name_hit: i % 2 == 1,
+            ..word_input(path, priors[(i / 2) % priors.len()], c)
+        })
         .collect();
 
     let ranked = rank_words(&inputs);
@@ -322,11 +388,15 @@ fn the_word_score_never_increases_down_the_list_and_follows_its_formula() {
     let scores: Vec<f64> = ranked.iter().map(|r| r.score).collect();
     assert!(never_increases(&scores), "{scores:?}");
 
-    let path = PathBuf::from("x");
-    let c = [3u32, 0, 1];
-    let one = rank_words(&[word_input(&path, FilePrior::Docs, &c)]);
-    let sum = 3f64.ln_1p() + 1f64.ln_1p();
-    assert!((one[0].score - (2000.0 + 100.0 * 2.0 + sum)).abs() < 1e-9);
+    for ranked in &ranked {
+        let input = &inputs[ranked.index];
+        let sum: f64 = input.counts.iter().map(|&c| f64::from(c).ln_1p()).sum();
+        let expected = 1000.0 * input.words_matched() as f64
+            + 200.0 * f64::from(4 - input.prior.level())
+            + 100.0 * f64::from(input.name_hit)
+            + sum.min(99.0);
+        assert!((ranked.score - expected).abs() < 1e-9, "{ranked:?}");
+    }
 }
 
 #[test]
@@ -349,7 +419,7 @@ fn the_count_part_of_the_word_score_stops_at_the_cap() {
 
     let ranked = rank_words(&[word_input(&path, FilePrior::Source, &counts)]);
 
-    let expected = 1000.0 * MAX_WORDS as f64 + 400.0 + 99.0;
+    let expected = 1000.0 * MAX_WORDS as f64 + 800.0 + 99.0;
     assert!(
         (ranked[0].score - expected).abs() < 1e-9,
         "{}",

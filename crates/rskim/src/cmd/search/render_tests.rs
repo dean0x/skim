@@ -56,6 +56,7 @@ fn file(path: impl Into<PathBuf>, prior: FilePrior, records: Vec<Record>) -> Fil
         prior,
         lines: (defs.len() + rest.len()) as u32,
         word_lines: Vec::new(),
+        name_hit: false,
         unlabelled: None,
         roles,
         defs,

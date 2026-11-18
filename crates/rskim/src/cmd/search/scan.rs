@@ -8,8 +8,9 @@
 //!
 //! **Phase A** reads every admitted file once. It counts the matching lines
 //! exactly (per word for a word query), notes whether a matching line holds a
-//! declaration keyword before the match, takes the file prior and a digest of
-//! the content. No line text is kept, so memory is O(files).
+//! declaration keyword before the match, takes the file prior, the file-stem
+//! name hit and a digest of the content. No line text is kept, so memory is
+//! O(files).
 //!
 //! **Phase B** visits the matched files in parse order. It re-reads each file
 //! and compares the digest (a file that changed is counted and not listed), then
@@ -43,7 +44,9 @@ use rayon::prelude::*;
 use rskim_core::Language;
 
 use super::matcher::Matcher;
-use super::rank::{FilePrior, WORD_VIEW_BEST_LINES, WordInput, file_prior, rank_words};
+use super::rank::{
+    FilePrior, WORD_VIEW_BEST_LINES, WordInput, file_name_hit, file_prior, rank_words,
+};
 use super::roles::{
     Holder, Labelling, Labels, Role, RoleCounts, Unlabelled, declaration_keywords,
     has_declaration_keyword,
@@ -128,6 +131,8 @@ pub(super) enum QueryPlan {
 /// The query and how to read hits.
 pub(super) struct ScanQuery {
     pub(super) plan: QueryPlan,
+    /// Original query words for the name tier; empty for a pattern.
+    pub(super) words: Vec<String>,
     /// The pattern is a bare identifier: a hit inside a longer identifier is
     /// `partial`.
     pub(super) identifier: bool,
@@ -199,6 +204,8 @@ pub(super) struct FileScan {
     pub(super) lines: u32,
     /// Matching lines of each word (word view only; empty otherwise).
     pub(super) word_lines: Vec<u32>,
+    /// The file stem holds a query word, computed once in phase A.
+    pub(super) name_hit: bool,
     /// `None` when the file has labels; the reason when it has none.
     pub(super) unlabelled: Option<Unlabelled>,
     /// Exact role counts over all matching lines. Empty after a counts-only
@@ -363,6 +370,7 @@ struct Matched {
     digest: u64,
     lines: u32,
     word_lines: Vec<u32>,
+    name_hit: bool,
     keyword_line: bool,
     prior: FilePrior,
 }
@@ -458,6 +466,7 @@ fn phase_a_file(
         digest: digest(&text),
         lines: found.lines,
         word_lines: found.word_lines,
+        name_hit: file_name_hit(&candidate.rel, &query.words),
         keyword_line: found.keyword_line,
         prior: file_prior(&candidate.rel, &text),
     });
@@ -600,6 +609,7 @@ fn plan_jobs(counted: &Counted<'_>) -> (Vec<Job>, bool) {
                     path: path(m),
                     prior: m.prior,
                     counts: &m.word_lines,
+                    name_hit: m.name_hit,
                 })
                 .collect();
             order = rank_words(&inputs).into_iter().map(|r| r.index).collect();
@@ -773,6 +783,7 @@ fn file_scan(
         prior: m.prior,
         lines: m.lines,
         word_lines: m.word_lines.clone(),
+        name_hit: m.name_hit,
         unlabelled,
         roles,
         defs: Vec::new(),

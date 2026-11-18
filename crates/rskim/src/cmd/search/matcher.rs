@@ -225,13 +225,6 @@ impl Iterator for Matches<'_> {
 ///
 /// This name rule is distinct from the line matcher's `-w` rule. It compares
 /// slices of the original name without allocation or Unicode case conversion.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "The next rank step consumes this shared name test."
-    )
-)]
 pub(super) fn name_holds_word(name: &str, word: &str) -> bool {
     name_tokens(name).any(|token| token.eq_ignore_ascii_case(word))
 }

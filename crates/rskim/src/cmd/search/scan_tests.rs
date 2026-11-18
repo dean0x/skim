@@ -49,6 +49,7 @@ fn matcher(pattern: &str) -> Matcher {
 fn pattern(p: &str, identifier: bool) -> ScanQuery {
     ScanQuery {
         plan: QueryPlan::Pattern(Box::new(matcher(p))),
+        words: Vec::new(),
         identifier,
     }
 }
@@ -56,6 +57,7 @@ fn pattern(p: &str, identifier: bool) -> ScanQuery {
 fn words(ws: &[&str]) -> ScanQuery {
     ScanQuery {
         plan: QueryPlan::Words(ws.iter().map(|w| matcher(w)).collect()),
+        words: ws.iter().map(|w| (*w).to_owned()).collect(),
         identifier: false,
     }
 }
@@ -875,6 +877,75 @@ fn the_word_view_stores_two_lines_per_file_in_rank_order_up_to_the_cap() {
 
     assert_eq!(file(&out, "src/a.rs").records.len(), 2);
     assert_eq!(file(&out, "docs/b.md").records.len(), 1);
+}
+
+#[test]
+fn the_word_view_parses_files_in_list_order_with_the_name_tier() {
+    use crate::cmd::search::args::{SearchAction, parse_flags};
+    use crate::cmd::search::build_query;
+
+    let tree = Tree::new();
+    tree.write("a.rs", "// alpha beta\n".repeat(3));
+    tree.write("z_alpha.rs", "// alpha beta\n");
+    tree.write("docs/beta.md", "alpha beta\n".repeat(5));
+    tree.write("beta.rs", "// unrelated\n");
+    let SearchAction::Query(flags) = parse_flags(&["alpha beta".into()]).unwrap() else {
+        panic!("expected a word query");
+    };
+    let (query, info) = build_query(&flags).unwrap();
+    let limits = Limits {
+        parse_files: 1,
+        max_stored_lines: 2,
+        ..Limits::default()
+    };
+    let config = config(&tree.root, &query, limits, 0);
+    let counted = count(&config, list_universe(&tree.root).unwrap()).unwrap();
+    let (jobs, _) = plan_jobs(&counted);
+    let parse_order: Vec<_> = jobs
+        .iter()
+        .map(|job| {
+            counted.candidates[counted.matched[job.matched].candidate]
+                .rel
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        parse_order,
+        ["z_alpha.rs", "a.rs", "docs/beta.md"].map(PathBuf::from)
+    );
+
+    let out = counted.label();
+    assert_eq!(out.searched_files, 4);
+    assert_eq!(out.files.len(), 3, "a name alone admits no file");
+    assert_eq!(file(&out, "z_alpha.rs").unlabelled, None);
+    assert_eq!(file(&out, "a.rs").unlabelled, Some(Unlabelled::Budget));
+    assert_eq!(file(&out, "z_alpha.rs").word_lines, [1, 1]);
+    assert_eq!(file(&out, "a.rs").word_lines, [3, 3]);
+    assert_eq!(file(&out, "z_alpha.rs").records.len(), 1);
+    assert_eq!(file(&out, "a.rs").records.len(), 1);
+    assert!(file(&out, "docs/beta.md").records.is_empty());
+    let output = render(
+        &Report {
+            query: &info,
+            scan: &out,
+            layout: Layout {
+                limits,
+                ..Layout::default()
+            },
+            duration_ms: 0,
+        },
+        Format::Json,
+    );
+    let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    let list_order: Vec<_> = value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| PathBuf::from(file["path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(list_order, parse_order);
+    assert_eq!(value["files_with_all_words"], 3);
+    assert_eq!(value["files"][0]["words_matched"], 2);
 }
 
 // ============================================================================

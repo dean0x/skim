@@ -657,6 +657,7 @@ fn word_inputs(files: &[FileScan]) -> Vec<WordInput<'_>> {
             path: &f.path,
             prior: f.prior,
             counts: &f.word_lines,
+            name_hit: f.name_hit,
         })
         .collect()
 }
