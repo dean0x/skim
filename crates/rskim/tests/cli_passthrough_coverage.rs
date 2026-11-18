@@ -188,9 +188,9 @@ fn tokens_batch_keeps_selected_bytes_without_per_file_lines() {
         .stderr(predicate::str::contains("SKIM_PASSTHROUGH=1"));
 }
 
-/// A one-file glob is still a batch, including the serde fallback.
+/// A one-file glob uses the run floor and one remedy, including serde files.
 #[test]
-fn tokens_batch_uses_one_remedy_for_compact_cuts() {
+fn tokens_batch_floor_uses_one_run_remedy() {
     let dir = TempDir::new().unwrap();
     for (file, source) in [
         (
@@ -232,7 +232,12 @@ fn tokens_batch_uses_one_remedy_for_compact_cuts() {
             .args([&pattern, "--tokens", "5", "--no-cache"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("truncated"))
+            .stdout(predicate::eq(
+                "// [skim] 1 files omitted (0 of 1 shown) — SKIM_PASSTHROUGH=1 for full output\n",
+            ))
+            .stderr(predicate::str::contains(
+                "the --tokens 5 budget covers the whole output of the run",
+            ))
             .stderr(predicate::str::contains("token budget:").not())
             .stderr(predicate::str::contains("output truncated to the --tokens budget").not())
             .stderr(predicate::str::contains("SKIM_PASSTHROUGH=1").count(1));

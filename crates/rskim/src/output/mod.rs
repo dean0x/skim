@@ -1085,7 +1085,6 @@ pub(crate) struct BoundNotice {
 
 /// Facts for one run-scoped disclosure. `total` counts successful files only.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RunNoticeFacts<'a> {
     pub(crate) budget: usize,
     pub(crate) requested: rskim_core::Mode,
@@ -1104,7 +1103,6 @@ pub(crate) struct RunNoticeFacts<'a> {
 
 /// One unconditional loss-bearing notice replaces the aggregate notice.
 /// Batch analytics rows do not charge this run-scoped notice.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn run_view_marker(facts: &RunNoticeFacts<'_>) -> EmittedNotice {
     let mut middle = format!(
         ": {}/{} files; the --tokens {} budget covers the whole output of the run",
@@ -1151,7 +1149,6 @@ pub(crate) fn run_view_marker(facts: &RunNoticeFacts<'_>) -> EmittedNotice {
 }
 
 /// Counts successful files only. The caller puts this on its own stdout line.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn run_trailer_line(shown: usize, total: usize) -> Option<String> {
     elision_marker(shown, total, "files").map(|marker| format!("// {marker}\n"))
 }
