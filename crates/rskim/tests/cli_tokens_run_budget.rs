@@ -576,21 +576,31 @@ fn fitting_pass_one_escalation_equals_base_golden() {
 
 #[test]
 fn tiny_one_match_glob_keeps_the_remedy_cold_and_warm() {
-    let home = rust_home(1);
-    let read = || {
-        common::skim_sandboxed(home.path())
-            .args(["input/*.rs", "--tokens", "5"])
-            .assert()
-            .success()
-            .get_output()
-            .clone()
-    };
-    let cold = read();
-    let warm = read();
-    assert_eq!(cold.stdout, warm.stdout);
-    assert_eq!(cold.stderr, warm.stderr);
-    assert_eq!(stdout(&cold), trailer(0, 1));
-    notice(&cold);
+    for budget in ["5", "20"] {
+        let home = rust_home(1);
+        let read = || {
+            common::skim_sandboxed(home.path())
+                .args(["input/*.rs", "--mode", "types", "--tokens", budget])
+                .assert()
+                .success()
+                .get_output()
+                .clone()
+        };
+        let cold = read();
+        let warm = read();
+        assert_eq!(cold.stdout, warm.stdout);
+        assert_eq!(cold.stderr, warm.stderr);
+        if budget == "5" {
+            assert_eq!(stdout(&cold), trailer(0, 1));
+            notice(&cold);
+        } else {
+            bounded(&cold, 20);
+            assert!(stdout(&cold).contains("truncated"));
+            assert!(!stdout(&cold).contains("SKIM_PASSTHROUGH=1"));
+            assert_eq!(stderr(&cold).lines().count(), 1);
+            assert!(stderr(&cold).contains("SKIM_PASSTHROUGH=1 for full output"));
+        }
+    }
 }
 
 #[test]
