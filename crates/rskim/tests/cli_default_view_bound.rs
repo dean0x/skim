@@ -179,6 +179,7 @@ fn rust_stdin_steps_down_and_has_only_stdin_remedies() {
         &["--language=rust", "--mode=structure"],
     );
     assert!(typed.out.chars().count() > LIMIT);
+    assert_ne!(typed.out, source, "fixture must not degrade to raw");
     let view = stdin(home.path(), &source, &["--language=rust"]);
     bounded(&view);
     assert!(view.err.contains("use --max-lines N for more"));
