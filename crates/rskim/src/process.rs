@@ -1064,7 +1064,10 @@ fn default_view(
         cascade::RungWalk::Fits { mode, rung } => (rung, make_bound(mode, false)),
         cascade::RungWalk::NoneFits { mode, mut rung } => {
             let bound = make_bound(mode, true);
-            let budget = limit.saturating_sub(1 + notice_chars(mode, true, Some(bound)));
+            // The core measures content plus marker, then adds the input's final
+            // newline. Reserve that newline apart from the strict-limit margin.
+            let trailing = usize::from(rung.text.ends_with('\n'));
+            let budget = limit.saturating_sub(1 + trailing + notice_chars(mode, true, Some(bound)));
             let prefix_width = if options.line_numbers && rung.line_map.is_some() {
                 raw.lines().count().max(1).ilog10() as usize + 2
             } else {
@@ -1919,6 +1922,369 @@ mod tests {
     }
 
     #[test]
+    fn bound_outcomes_measure_print_and_charge_one_notice() {
+        use crate::output::{BoundNotice, BoundShape};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Outcome {
+            Unchanged,
+            Raw,
+            StepDown,
+            Cut,
+            AssemblyFallback,
+            NumberedCut,
+        }
+
+        for outcome in [
+            Outcome::Unchanged,
+            Outcome::Raw,
+            Outcome::StepDown,
+            Outcome::Cut,
+            Outcome::AssemblyFallback,
+            Outcome::NumberedCut,
+        ] {
+            let limit = 600;
+            let numbered = matches!(outcome, Outcome::NumberedCut);
+            let mut options = ProcessOptions {
+                line_numbers: numbered,
+                ..notice_opts(
+                    Mode::Structure,
+                    TruncationOptions {
+                        char_budget: Some(limit),
+                        ..Default::default()
+                    },
+                    false,
+                )
+            };
+            let (raw, text, language, map) = match outcome {
+                Outcome::Unchanged | Outcome::AssemblyFallback => {
+                    ("x".repeat(5000), "kept view\n".to_owned(), None, None)
+                }
+                Outcome::Raw => ("界".repeat(limit - 1), "a".repeat(limit - 20), None, None),
+                Outcome::StepDown => {
+                    let raw = format!(
+                        "pub struct Kept {{ pub value: usize }}\n{}",
+                        (0..40)
+                            .map(|n| format!(
+                                "pub fn item{n}() {{ let value = {n}; println!(\"{{value}}\"); }}\n"
+                            ))
+                            .collect::<String>()
+                    );
+                    let mut config = cascade::build_config(Mode::Structure, &options.trunc);
+                    config.line_numbers = true;
+                    let (text, _, map, _) =
+                        transform_with_line_map(&raw, Language::Rust, &config).unwrap();
+                    (raw, text, Some(Language::Rust), map)
+                }
+                Outcome::Cut | Outcome::NumberedCut => (
+                    format!("{}\n", vec!["x".repeat(500); 10].join("\n")),
+                    format!("{}\n", vec!["a".repeat(100); 10].join("\n")),
+                    Some(Language::Json),
+                    Some((1..=10).collect()),
+                ),
+            };
+            if matches!(outcome, Outcome::Cut | Outcome::NumberedCut) {
+                let bound = BoundNotice {
+                    mode: Mode::Structure,
+                    default_view_chars: annotated_chars(&text, &options, map.as_deref())
+                        + notice_chars(options.mode, true, None),
+                    cut: true,
+                    shape: BoundShape::File,
+                };
+                let candidate = format!(
+                    "{}\n{}\n{}",
+                    "a".repeat(100),
+                    "a".repeat(100),
+                    elision_marker_line(
+                        Some(Language::Json),
+                        8,
+                        ElidedSide::Truncated,
+                        Some(ELISION_HINT)
+                    )
+                );
+                // Two plain lines fit exactly. Number prefixes must reduce that
+                // selection, not turn the final assembly into a bare marker.
+                options.trunc.char_budget = Some(
+                    candidate.chars().count() + notice_chars(options.mode, true, Some(bound)) + 2,
+                );
+            }
+            let limit = options.trunc.char_budget.unwrap();
+            let mut view = default_view(
+                &raw,
+                language,
+                &options,
+                cascade::CharBudgetRung {
+                    text,
+                    line_map: map,
+                    has_errors: false,
+                    degraded: false,
+                },
+                BoundShape::File,
+            )
+            .unwrap();
+            if matches!(outcome, Outcome::AssemblyFallback) {
+                // Exercise the final check with an oversized assembly. Valid
+                // rung estimates normally prevent this fail-closed path.
+                let mut bound = BoundNotice {
+                    mode: Mode::Structure,
+                    default_view_chars: 52000,
+                    cut: false,
+                    shape: BoundShape::File,
+                };
+                let oversized = "x".repeat(limit - notice_chars(bound.mode, true, Some(bound)));
+                view.output =
+                    enforce_default_assembly(oversized, &raw, language, &mut bound, limit);
+                view.bound = Some(bound);
+                view.view_differs = true;
+                view.served = None;
+            }
+            match outcome {
+                Outcome::Unchanged => {
+                    assert_eq!(view.output, "kept view\n");
+                    assert_eq!(view.bound, None);
+                }
+                Outcome::Raw => {
+                    assert_eq!(view.output, raw);
+                    assert!(!view.view_differs);
+                    assert_eq!(view.bound, None);
+                }
+                Outcome::StepDown => {
+                    let bound = view.bound.unwrap();
+                    assert_eq!(bound.mode, Mode::Types);
+                    assert!(!bound.cut);
+                    assert!(view.output.contains("Kept"));
+                }
+                Outcome::Cut | Outcome::NumberedCut => {
+                    assert!(view.bound.unwrap().cut);
+                    assert!(view.output.contains(&"a".repeat(100)));
+                    assert!(
+                        view.output
+                            .lines()
+                            .last()
+                            .unwrap()
+                            .contains("lines truncated")
+                    );
+                    assert_eq!(view.output.lines().count(), if numbered { 2 } else { 3 });
+                    if numbered {
+                        assert!(view.output.starts_with("1\t"));
+                        assert!(!view.output.lines().last().unwrap().contains('\t'));
+                    }
+                }
+                Outcome::AssemblyFallback => {
+                    assert!(view.bound.unwrap().cut);
+                    assert_eq!(view.output.lines().count(), 1);
+                    assert!(view.output.contains("1 line truncated"));
+                }
+            }
+
+            let result = ProcessResult {
+                output: view.output,
+                original_tokens: None,
+                transformed_tokens: None,
+                guardrail_triggered: view.guardrail_triggered,
+                served: view.served,
+                parse_tier: view.parse_tier,
+                language,
+                stdin_raw: None,
+                view_differs: view.view_differs,
+                bound: view.bound,
+            };
+            // The final fit check measures annotated stdout. The cut's prefix
+            // estimate reserves space; it does not add a second notice cost.
+            let measured = result.output.chars().count()
+                + notice_chars(options.mode, result.view_differs, result.bound);
+            let printed =
+                single_file_notice(options.mode.name(), result.view_differs, result.bound);
+            let printed_chars = printed
+                .as_ref()
+                .map_or(0, |notice| notice.line().chars().count());
+            assert_eq!(
+                measured,
+                result.output.chars().count() + printed_chars,
+                "{outcome:?}"
+            );
+            assert!(measured < limit, "{outcome:?}: {measured}");
+            let charged = crate::file_analytics_notice(&result, options.mode.name());
+            assert_eq!(charged, printed, "{outcome:?}");
+            if let Some(notice) = charged {
+                assert_eq!(notice.bytes(), printed.as_ref().unwrap().line().len());
+            }
+        }
+    }
+
+    #[test]
+    fn cut_rung_reserves_the_final_newline_at_an_exact_candidate_boundary() {
+        use crate::output::{BoundNotice, BoundShape};
+        for trailing in ["\n", ""] {
+            let text = format!("{}{trailing}", vec!["a".repeat(100); 10].join("\n"));
+            let raw = "x".repeat(5000);
+            let bound = BoundNotice {
+                mode: Mode::Structure,
+                default_view_chars: text.chars().count()
+                    + notice_chars(Mode::Structure, true, None),
+                cut: true,
+                shape: BoundShape::File,
+            };
+            let candidate = format!(
+                "{}\n{}\n{}",
+                "a".repeat(100),
+                "a".repeat(100),
+                elision_marker_line(
+                    Some(Language::Json),
+                    8,
+                    ElidedSide::Truncated,
+                    Some(ELISION_HINT)
+                )
+            );
+            for extra in [0, 1] {
+                let limit = candidate.chars().count()
+                    + notice_chars(Mode::Structure, true, Some(bound))
+                    + 1
+                    + extra;
+                let options = notice_opts(
+                    Mode::Structure,
+                    TruncationOptions {
+                        char_budget: Some(limit),
+                        ..Default::default()
+                    },
+                    false,
+                );
+                let view = default_view(
+                    &raw,
+                    Some(Language::Json),
+                    &options,
+                    cascade::CharBudgetRung {
+                        text: text.clone(),
+                        line_map: None,
+                        has_errors: false,
+                        degraded: false,
+                    },
+                    BoundShape::File,
+                )
+                .unwrap();
+                let kept = if trailing.is_empty() { 2 } else { 1 + extra };
+                let expected = format!(
+                    "{}\n{}{trailing}",
+                    vec!["a".repeat(100); kept].join("\n"),
+                    elision_marker_line(
+                        Some(Language::Json),
+                        10 - kept,
+                        ElidedSide::Truncated,
+                        Some(ELISION_HINT)
+                    )
+                );
+                assert_eq!(view.output, expected, "extra={extra}");
+                assert_eq!(view.bound, Some(bound));
+                assert!(
+                    view.output.chars().count() + notice_chars(options.mode, true, view.bound)
+                        < limit
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_character_check_keeps_output_one_character_below_the_limit() {
+        use crate::output::{BoundNotice, BoundShape};
+        let limit = 600;
+        let mut bound = BoundNotice {
+            mode: Mode::Full,
+            default_view_chars: 52000,
+            cut: false,
+            shape: BoundShape::File,
+        };
+        let output = "界".repeat(limit - 1 - notice_chars(Mode::Full, true, Some(bound)));
+        let result =
+            enforce_default_assembly(output.clone(), "first\nsecond\n", None, &mut bound, limit);
+        assert_eq!(result, output);
+        assert!(!bound.cut);
+        assert_eq!(
+            result.chars().count() + notice_chars(Mode::Full, true, Some(bound)),
+            limit - 1
+        );
+    }
+
+    #[test]
+    fn unchanged_default_view_keeps_only_totals_below_the_limit() {
+        let limit = 600;
+        let options = notice_opts(
+            Mode::Structure,
+            TruncationOptions {
+                char_budget: Some(limit),
+                ..Default::default()
+            },
+            false,
+        );
+        let raw = "x".repeat(5000);
+        for shortfall in [1, 0] {
+            let text = "a".repeat(limit - shortfall - notice_chars(options.mode, true, None));
+            let view = default_view(
+                &raw,
+                None,
+                &options,
+                cascade::CharBudgetRung {
+                    text: text.clone(),
+                    line_map: None,
+                    has_errors: false,
+                    degraded: false,
+                },
+                crate::output::BoundShape::File,
+            )
+            .unwrap();
+            if shortfall == 1 {
+                assert_eq!(view.output, text);
+                assert_eq!(view.bound, None);
+                assert_eq!(view.served, Some(crate::output::Served::Transformed));
+            } else {
+                assert_ne!(view.output, text);
+                assert!(view.bound.unwrap().cut);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_default_view_keeps_only_totals_below_the_limit() {
+        let limit = 600;
+        let options = notice_opts(
+            Mode::Structure,
+            TruncationOptions {
+                char_budget: Some(limit),
+                ..Default::default()
+            },
+            false,
+        );
+        for shortfall in [1, 0] {
+            // Unicode makes raw larger in bytes. The guard keeps the candidate,
+            // but its notice makes it too large in characters.
+            let raw = "界".repeat(limit - shortfall);
+            let text = "a".repeat(limit - 20);
+            let view = default_view(
+                &raw,
+                None,
+                &options,
+                cascade::CharBudgetRung {
+                    text,
+                    line_map: None,
+                    has_errors: false,
+                    degraded: false,
+                },
+                crate::output::BoundShape::File,
+            )
+            .unwrap();
+            if shortfall == 1 {
+                assert_eq!(view.output, raw);
+                assert_eq!(view.bound, None);
+                assert!(!view.view_differs);
+                assert!(view.guardrail_triggered);
+                assert_eq!(view.served, None);
+            } else {
+                assert_ne!(view.output, raw);
+                assert!(view.bound.unwrap().cut);
+            }
+        }
+    }
+
+    #[test]
     fn final_character_check_fails_closed_at_and_above_the_limit() {
         use crate::output::{BoundNotice, BoundShape, MAX_STDOUT_CHARS};
         for extra in [0, 1] {
@@ -1997,7 +2363,12 @@ mod tests {
     }
 
     #[test]
-    fn budgeted_cached_output_at_the_limit_is_a_miss() {
+    #[serial_test::serial]
+    fn budgeted_cached_output_keeps_only_totals_below_the_limit() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let old_cache_dir = std::env::var_os("SKIM_CACHE_DIR");
+        // SAFETY: test-only, serial-gated. Restore the prior value below.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_dir.path()) };
         let source = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
         fs::write(source.path(), "fn original() {}\n").unwrap();
         let options = ProcessOptions {
@@ -2017,38 +2388,62 @@ mod tests {
                 shape: crate::output::BoundShape::File,
             }),
         ] {
-            let content = "x".repeat(
-                crate::output::MAX_STDOUT_CHARS - notice_chars(Mode::Structure, true, bound),
-            );
-            cache::write_cache(&cache::CacheWriteParams {
-                key: cache::CacheKeyParams {
-                    path: source.path(),
-                    mode: options.mode,
-                    trunc: options.trunc,
-                    line_numbers: false,
-                    notice_bytes: 0,
-                    symbol: None,
-                },
-                content: &content,
-                original_tokens: None,
-                transformed_tokens: None,
-                effective_mode: None,
-                parse_tier: None,
-                view_differs: true,
-                notice: None,
-                bound,
-            })
-            .unwrap();
-            assert!(
-                try_cached_result(source.path(), &options, 0)
-                    .unwrap()
-                    .is_none()
-            );
+            for shortfall in [1, 0] {
+                let content = "界".repeat(
+                    crate::output::MAX_STDOUT_CHARS
+                        - shortfall
+                        - notice_chars(Mode::Structure, true, bound),
+                );
+                cache::write_cache(&cache::CacheWriteParams {
+                    key: cache::CacheKeyParams {
+                        path: source.path(),
+                        mode: options.mode,
+                        trunc: options.trunc,
+                        line_numbers: false,
+                        notice_bytes: 0,
+                        symbol: None,
+                    },
+                    content: &content,
+                    original_tokens: None,
+                    transformed_tokens: None,
+                    effective_mode: None,
+                    parse_tier: None,
+                    view_differs: true,
+                    notice: None,
+                    bound,
+                })
+                .unwrap();
+                let hit = try_cached_result(source.path(), &options, 0).unwrap();
+                if shortfall == 1 {
+                    let hit = hit.expect("a total one character below the limit is a hit");
+                    assert_eq!(hit.output, content);
+                    assert_eq!(hit.bound, bound);
+                    assert_eq!(
+                        hit.output.chars().count()
+                            + notice_chars(options.mode, hit.view_differs, hit.bound),
+                        crate::output::MAX_STDOUT_CHARS - 1
+                    );
+                } else {
+                    assert!(hit.is_none(), "a total at the limit is a miss");
+                }
+            }
+        }
+        // SAFETY: test-only, serial-gated.
+        unsafe {
+            match old_cache_dir {
+                Some(value) => std::env::set_var("SKIM_CACHE_DIR", value),
+                None => std::env::remove_var("SKIM_CACHE_DIR"),
+            }
         }
     }
 
     #[test]
-    fn cached_result_rebuilds_the_cold_bound_notice_from_typed_state() {
+    #[serial_test::serial]
+    fn cached_result_preserves_output_and_typed_bound_state() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let old_cache_dir = std::env::var_os("SKIM_CACHE_DIR");
+        // SAFETY: test-only, serial-gated. Restore the prior value below.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_dir.path()) };
         let source = tempfile::NamedTempFile::with_suffix(".rs").unwrap();
         fs::write(source.path(), "fn original() {}\n").unwrap();
         let options = ProcessOptions {
@@ -2090,10 +2485,13 @@ mod tests {
                 .unwrap();
             assert_eq!(warm.output, "served output\n");
             assert_eq!(warm.bound, Some(bound));
-            assert_eq!(
-                single_file_notice("structure", warm.view_differs, warm.bound),
-                single_file_notice("structure", true, Some(bound)),
-            );
+        }
+        // SAFETY: test-only, serial-gated.
+        unsafe {
+            match old_cache_dir {
+                Some(value) => std::env::set_var("SKIM_CACHE_DIR", value),
+                None => std::env::remove_var("SKIM_CACHE_DIR"),
+            }
         }
     }
 

@@ -1914,6 +1914,14 @@ fn run_symbol_read(
     process::write_symbol_result(&read, show_stats)
 }
 
+/// Build the charged notice from the same result fields as the emitter.
+fn file_analytics_notice(
+    result: &process::ProcessResult,
+    mode_str: &str,
+) -> Option<output::EmittedNotice> {
+    process::single_file_notice(mode_str, result.view_differs, result.bound)
+}
+
 /// Record token analytics for file operations (single file or stdin).
 ///
 /// Takes `result` by value so `output` and `stdin_raw` can be moved into the
@@ -1945,7 +1953,7 @@ fn record_file_analytics(
     file_path: Option<PathBuf>,
 ) {
     // Read before `result` is partially moved below.
-    let notice = process::single_file_notice(&mode_str, result.view_differs, result.bound);
+    let notice = file_analytics_notice(&result, &mode_str);
     let served = result.served;
 
     // Determine counts variant: Known when both token counts are already computed
