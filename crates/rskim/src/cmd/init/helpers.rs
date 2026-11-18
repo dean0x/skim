@@ -262,12 +262,7 @@ Skim shows code and prose **structure**: signatures, types, headings and definit
 If your next step requires the actual content (editing, understanding logic,
 debugging), go straight to Read — don't skim first.
 
-Skim earns its cost when you **orient** before a detailed read:
-- Check definitions in a module.
-- Survey files in a directory.
-- Check spec or config sections.
-
-Skim wastes tokens before an edit that needs exact content. Use Read directly.
+Use skim to find definitions, survey directories or find spec sections.
 
 ### Anti-pattern: skim then Read the same file
 
@@ -297,17 +292,17 @@ skim <file> --mode=pseudo        # logic without syntactic noise
 
 `--tokens N` counts headers and markers, not stderr. For tiny multi-file budgets, the omitted-files line can exceed N; no file content prints.
 
-### Default single-input limit
+### Default output limit
 
 Default `skim FILE` and `skim -` keep stdout plus its view notice below 29,000 characters (Unicode scalar values, not bytes). Source line numbers count.
-The bound applies to terminals, pipes and file redirects.
-Skim tries structure, signatures, then types and skips empty views.
-JSON/YAML/TOML skip step-down. If none fits, skim cuts whole lines with a hidden-line count.
-
+Default directory, glob and file list reads have one character limit for the whole run. The same limit counts headers and the view notice.
+The bound applies to terminals, pipes and file redirects. Skim tries structure, signatures, then types and skips empty views.
+JSON/YAML/TOML skip step-down. If none fits, skim cuts whole lines with a hidden-line count. A run can also omit trailing files.
 The notice names the served view and any cut.
-Use `--symbol NAME` (file only) or `--max-lines N` for more.
-Use typed `--mode` for that mode, or `SKIM_PASSTHROUGH=1` for raw output.
-Explicit modes, `--max-lines`, `--last-lines`, `--tokens`, `--symbol` and multi-file runs have no default character bound. Other agents' limits are not known.
+
+Typed `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol` replace the default bound. Line limits apply per file.
+Use `--symbol NAME` (file only) or `--max-lines N` for more. Use `SKIM_PASSTHROUGH=1` for raw output.
+Other agents' limits are not known.
 
 ### Search and read
 
@@ -876,10 +871,11 @@ mod tests {
                 "notice names the served view and any cut",
                 "`--symbol NAME`",
                 "`--max-lines N`",
-                "typed `--mode`",
+                "Typed `--mode`",
                 "`SKIM_PASSTHROUGH=1` for raw output",
-                "`--max-lines`, `--last-lines`, `--tokens`, `--symbol`",
-                "multi-file runs have no default character bound",
+                "`--max-lines`, `--last-lines`, `--tokens` or `--symbol` replace the default bound",
+                "Default directory, glob and file list reads have one character limit for the whole run.",
+                "Line limits apply per file.",
                 "Other agents' limits are not known",
             ] {
                 assert!(

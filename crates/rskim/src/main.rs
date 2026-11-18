@@ -1662,8 +1662,18 @@ fn main() -> ExitCode {
     exit_code
 }
 
-/// Build input options from clap's explicit-mode state, not the default mode value.
-/// Batch reads and every typed view selection keep their existing unbounded behavior.
+/// A transformed read is default only if the user did not select a view or limit.
+/// `mode_given` comes from clap's value source, not from the mode value.
+fn default_read(args: &Args, mode_given: bool) -> bool {
+    !mode_given
+        && args.max_lines.is_none()
+        && args.last_lines.is_none()
+        && args.tokens.is_none()
+        && args.symbol.is_none()
+}
+
+/// Set the per-input character budget for default single-file and stdin reads.
+/// A default batch has a separate character budget for the whole run.
 fn file_process_options(args: &Args, mode_given: bool, batch: bool) -> process::ProcessOptions {
     process::ProcessOptions {
         mode: Mode::from(args.mode),
@@ -1674,13 +1684,8 @@ fn file_process_options(args: &Args, mode_given: bool, batch: bool) -> process::
             max_lines: args.max_lines,
             last_lines: args.last_lines,
             token_budget: args.tokens,
-            char_budget: (!batch
-                && !mode_given
-                && args.max_lines.is_none()
-                && args.last_lines.is_none()
-                && args.tokens.is_none()
-                && args.symbol.is_none())
-            .then_some(output::MAX_STDOUT_CHARS),
+            char_budget: (!batch && default_read(args, mode_given))
+                .then_some(output::MAX_STDOUT_CHARS),
         },
         line_numbers: args.line_numbers,
         batch,
@@ -1726,6 +1731,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
 
     let multi_options = multi::MultiFileOptions {
         process: file_process_options(&args, mode_given, true),
+        char_run: default_read(&args, mode_given),
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,
@@ -1790,46 +1796,40 @@ fn process_single_arg(
     // detect `EPIPE` and exit 141 rather than 1.  Wrapping with `anyhow::anyhow!`
     // produces a `Message` error with no source, which `chain()` cannot walk.
     //
-    // The aggregate marker names SKIM_PASSTHROUGH=1 for full output. Every
-    // multi-file shape must accept that remedy: directories and globs here,
-    // explicit lists in run_file_operation via passthrough_explicit_files.
-    // Both paths use the transform collectors and the same no_ignore value.
+    // Directories, globs and explicit lists share the raw multi-file writer.
+    // All three use the transform collectors and the same no_ignore value.
     if cmd::is_passthrough_mode() {
-        use std::io::Write as _;
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        let path = std::path::Path::new(file);
         if file == "-" {
-            // Stdin passthrough: copy bounded stdin → stdout.
+            use std::io::Write as _;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
             let buf = cmd::read_stdin_bounded()?;
             out.write_all(buf.as_bytes())?;
             return Ok(());
         }
-        let mut copy = |path: &std::path::Path| -> anyhow::Result<()> {
-            match cmd::copy_file_raw(path, &mut out) {
-                Ok(()) => Ok(()),
-                Err(cmd::FileCopyError::Input(error)) => {
-                    anyhow::bail!("passthrough read {}: {error}", path.display())
-                }
-                Err(cmd::FileCopyError::Output(error)) => Err(error)?,
-            }
-        };
+        let path = std::path::Path::new(file);
         if path.is_dir() {
-            // Directory passthrough: collect all skim-supported files and
-            // print their raw bytes concatenated (mirrors process_directory).
-            for path in multi::collect_passthrough_paths_dir(path, args.no_ignore) {
-                copy(&path)?;
-            }
-        } else if multi::has_glob_pattern(file) {
-            // Glob passthrough: expand, then print raw bytes of each match.
-            for path in multi::collect_passthrough_paths_glob(file, args.no_ignore)? {
-                copy(&path)?;
-            }
-        } else {
-            // Stream the raw bytes without a size limit or UTF-8 check.
-            copy(path)?;
+            return multi::passthrough_paths(&multi::collect_passthrough_paths_dir(
+                path,
+                args.no_ignore,
+            ));
         }
-        return Ok(());
+        if multi::has_glob_pattern(file) {
+            return multi::passthrough_paths(&multi::collect_passthrough_paths_glob(
+                file,
+                args.no_ignore,
+            )?);
+        }
+        // Stream one file without a size limit or UTF-8 check.
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        return match cmd::copy_file_raw(path, &mut out) {
+            Ok(()) => Ok(()),
+            Err(cmd::FileCopyError::Input(error)) => {
+                anyhow::bail!("passthrough read {}: {error}", path.display())
+            }
+            Err(cmd::FileCopyError::Output(error)) => Err(error)?,
+        };
     }
 
     if let Some(name) = args.symbol.as_deref() {
@@ -2269,7 +2269,7 @@ mod tests {
     }
 
     #[test]
-    fn default_character_budget_applies_only_to_default_single_inputs() {
+    fn view_selection_controls_default_read_and_single_input_char_budget() {
         use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
         let cases: &[(&[&str], Option<usize>)] = &[
             (&["a.rs"], Some(output::MAX_STDOUT_CHARS)),
@@ -2278,6 +2278,7 @@ mod tests {
                 Some(output::MAX_STDOUT_CHARS),
             ),
             (&["a.rs", "--show-stats"], Some(output::MAX_STDOUT_CHARS)),
+            (&["a.rs", "--no-header"], Some(output::MAX_STDOUT_CHARS)),
             (&["a.rs", "--mode", "structure"], None),
             (&["a.rs", "--mode=full"], None),
             (&["a.rs", "--max-lines", "10"], None),
@@ -2291,6 +2292,11 @@ mod tests {
                 .unwrap();
             let args = Args::from_arg_matches(&matches).unwrap();
             let mode_given = matches.value_source("mode") == Some(ValueSource::CommandLine);
+            assert_eq!(
+                default_read(&args, mode_given),
+                expected.is_some(),
+                "{argv:?}"
+            );
             let single = file_process_options(&args, mode_given, false);
             assert_eq!(single.trunc.char_budget, *expected, "{argv:?}");
             let multi = file_process_options(&args, mode_given, true);

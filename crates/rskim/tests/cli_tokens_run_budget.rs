@@ -596,6 +596,45 @@ fn closed_stderr_keeps_complete_stdout_on_a_fitting_run() {
 
 #[cfg(unix)]
 #[test]
+fn closed_stderr_preserves_the_view_when_a_list_path_is_missing() {
+    let home = golden_home(false);
+    let golden = include_str!("fixtures/tokens_run_budget/fit.stdout");
+    for args in [
+        &["input/*.rs", "input/missing.rs"][..],
+        &["input/*.rs", "input/missing.rs", "--tokens", "1000"],
+    ] {
+        let output = run_with_closed_stderr(&home, args);
+        assert!(output.status.success(), "{:?}", output.status);
+        assert_eq!(stdout(&output), golden);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_preserves_the_view_when_stats_are_requested() {
+    let home = golden_home(false);
+    for args in [
+        &["input/*.rs", "--show-stats"][..],
+        &["input/*.rs", "--show-stats", "--tokens", "1000"],
+        &["input/a.rs", "--show-stats"],
+    ] {
+        let baseline = run(&home, args);
+        assert!(
+            stderr(&baseline)
+                .lines()
+                .any(|line| line.starts_with("[skim] ") && line.contains(" tokens → ")),
+            "{args:?}: no stats line in stderr: {}",
+            stderr(&baseline)
+        );
+
+        let output = run_with_closed_stderr(&home, args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert_eq!(output.stdout, baseline.stdout, "{args:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn closed_stderr_keeps_complete_stdout_if_one_file_fails() {
     let home = golden_home(false);
     fs::write(home.path().join("input/z.rs"), [0xff]).unwrap();

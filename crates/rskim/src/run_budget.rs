@@ -1,8 +1,10 @@
 //! Pure run-budget selection. The caller owns paths, I/O and the rayon pool.
 
-use crate::output::{ELISION_HINT, run_trailer_line};
+use crate::output::{ELISION_HINT, RunBudget, run_trailer_line};
+use crate::process::raw_line_cut;
 use rayon::prelude::*;
 use rskim_core::{Language, TruncationCountSource, truncate_with_count_source};
+use std::borrow::Cow;
 
 type Counter<'a> = dyn Fn(&str) -> Option<usize> + Sync + 'a;
 /// Chosen default, not measured. The conservative 2N stop can reject a BPE join
@@ -12,26 +14,27 @@ pub(crate) const MAX_DROP_RETRIES: usize = 3;
 
 /// Cuts count hidden view lines, not source lines. A worker pre-cut stores its
 /// own final marker, including its newline and any cut-inside clause. A fixed
-/// body is all-or-nothing and can carry a pass-1 source-line marker.
-#[derive(Debug)]
-pub(crate) enum Body {
-    Whole(String),
+/// body is all-or-nothing and can carry a pass-1 source-line marker. Borrowed
+/// text always refers to the pass-1 result for this file.
+#[derive(Clone, Debug)]
+pub(crate) enum Body<'a> {
+    Whole(Cow<'a, str>),
     PreCut {
         kept: String,
         marker: String,
         total_view_lines: usize,
         marked_count: usize,
     },
-    Fixed(String),
+    Fixed(Cow<'a, str>),
 }
 
 /// One path-ordered file. `count` covers prefix plus body. `floor` is the lesser
 /// of that count and prefix plus compact marker; fixed bodies use their full
 /// count. Workers compute these costs before the pure planner runs.
 #[derive(Debug)]
-pub(crate) struct Piece {
+pub(crate) struct Piece<'a> {
     pub(crate) prefix: String,
-    pub(crate) body: Body,
+    pub(crate) body: Body<'a>,
     pub(crate) cut_language: Option<Language>,
     pub(crate) count: usize,
     pub(crate) floor: usize,
@@ -39,7 +42,8 @@ pub(crate) struct Piece {
 
 #[derive(Debug)]
 pub(crate) struct PlannedBody {
-    pub(crate) output: String,
+    /// None keeps the original pass-1 text in its result.
+    pub(crate) replacement: Option<String>,
     pub(crate) cut: bool,
 }
 
@@ -50,7 +54,7 @@ pub(crate) struct CutPlan {
     pub(crate) omitted: usize,
 }
 
-impl Body {
+impl Body<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Whole(s) | Self::Fixed(s) => s.len(),
@@ -69,19 +73,24 @@ impl Body {
     }
 
     fn whole(&self) -> PlannedBody {
-        let mut output = String::new();
-        self.append_to(&mut output);
-        PlannedBody {
-            output,
-            cut: matches!(self, Self::PreCut { .. }),
-        }
+        self.clone().into_planned()
+    }
+
+    pub(crate) fn into_planned(self) -> PlannedBody {
+        let cut = matches!(self, Self::PreCut { .. });
+        let replacement = match self {
+            Self::Whole(Cow::Borrowed(_)) | Self::Fixed(Cow::Borrowed(_)) => None,
+            Self::Whole(Cow::Owned(text)) | Self::Fixed(Cow::Owned(text)) => Some(text),
+            Self::PreCut { kept, marker, .. } => Some(kept + &marker),
+        };
+        PlannedBody { replacement, cut }
     }
 }
 
 /// One fit rule for pass 1 and every rung. Bytes give a count-free upper bound.
 /// Otherwise each piece must fit N, the saturating sum must fit 2N, and the
 /// exact joined count must fit N. A missing count fails closed.
-pub(crate) fn set_fits(pieces: &[Piece], n: usize, count: &Counter<'_>) -> Option<String> {
+pub(crate) fn set_fits(pieces: &[Piece<'_>], n: usize, count: &Counter<'_>) -> Option<String> {
     let bytes = pieces.iter().fold(0usize, |sum, p| {
         sum.saturating_add(p.prefix.len())
             .saturating_add(p.body.len())
@@ -108,7 +117,7 @@ pub(crate) fn set_fits(pieces: &[Piece], n: usize, count: &Counter<'_>) -> Optio
 
 /// Keep the largest path prefix whose floors and reserved trailer fit. Floors
 /// use saturating sums in one linear pass, not a binary search over BPE counts.
-fn kept_prefix(pieces: &[Piece], n: usize, trailer_cost: usize) -> usize {
+fn kept_prefix(pieces: &[Piece<'_>], n: usize, trailer_cost: usize) -> usize {
     let available = n.saturating_sub(trailer_cost);
     let mut sum = 0usize;
     let mut kept = 0usize;
@@ -133,7 +142,12 @@ fn trailer_cost(total: usize, count: &Counter<'_>) -> usize {
 
 /// Each cuttable body gets its marker floor first. A single sorted pass gives
 /// small bodies their full demand and splits the rest at one max-min level.
-fn shares(pieces: &[Piece], n: usize, trailer: usize, count: &Counter<'_>) -> Vec<(usize, usize)> {
+fn shares(
+    pieces: &[Piece<'_>],
+    n: usize,
+    trailer: usize,
+    count: &Counter<'_>,
+) -> Vec<(usize, usize)> {
     let mut available = n.saturating_sub(trailer);
     let mut result = Vec::with_capacity(pieces.len());
     let mut demands = Vec::with_capacity(pieces.len());
@@ -174,6 +188,13 @@ fn shares(pieces: &[Piece], n: usize, trailer: usize, count: &Counter<'_>) -> Ve
     result
 }
 
+/// Core adds the final newline after its fit check. Raw cuts count it directly.
+pub(crate) fn core_cut_share(budget: RunBudget, text: &str, share: usize) -> usize {
+    share.saturating_sub(usize::from(
+        matches!(budget, RunBudget::Chars(_)) && text.ends_with('\n'),
+    ))
+}
+
 fn core_cut(
     text: &str,
     language: Language,
@@ -181,11 +202,12 @@ fn core_cut(
     known: usize,
     count: &Counter<'_>,
     source: TruncationCountSource<'_>,
+    budget: RunBudget,
 ) -> Option<String> {
     truncate_with_count_source(
         text,
         language,
-        share,
+        core_cut_share(budget, text, share),
         |s| count(s).unwrap_or(usize::MAX),
         Some(known),
         Some(ELISION_HINT),
@@ -194,21 +216,36 @@ fn core_cut(
     .ok()
 }
 
-fn cut_piece(p: &Piece, share: usize, real: usize, count: &Counter<'_>) -> Option<PlannedBody> {
+fn cut_piece(
+    p: &Piece<'_>,
+    share: usize,
+    real: usize,
+    count: &Counter<'_>,
+    budget: RunBudget,
+) -> Option<PlannedBody> {
     let output = match &p.body {
         Body::Fixed(_) => return Some(p.body.whole()),
         Body::Whole(_) if real <= share => return Some(p.body.whole()),
         Body::PreCut {
             marked_count, kept, ..
         } if *marked_count <= share || kept.is_empty() => return Some(p.body.whole()),
-        Body::Whole(s) => core_cut(
-            s,
-            p.cut_language?,
-            share,
-            real,
-            count,
-            TruncationCountSource::ViewLines,
-        )?,
+        Body::Whole(s) => match p.cut_language {
+            Some(language) => core_cut(
+                s,
+                language,
+                share,
+                real,
+                count,
+                TruncationCountSource::ViewLines,
+                budget,
+            )?,
+            None if matches!(budget, RunBudget::Chars(_)) => {
+                raw_line_cut(s, None, 0, |candidate| {
+                    count(candidate).is_some_and(|cost| cost <= share)
+                })
+            }
+            None => return None,
+        },
         Body::PreCut {
             kept,
             total_view_lines,
@@ -221,16 +258,24 @@ fn cut_piece(p: &Piece, share: usize, real: usize, count: &Counter<'_>) -> Optio
             *marked_count,
             count,
             TruncationCountSource::SourceTotal(*total_view_lines),
+            budget,
         )?,
     };
-    Some(PlannedBody { output, cut: true })
+    Some(PlannedBody {
+        replacement: Some(output),
+        cut: true,
+    })
 }
 
-fn join_plan(pieces: &[Piece], bodies: &[PlannedBody], total: usize) -> String {
+fn join_plan(pieces: &[Piece<'_>], bodies: &[PlannedBody], total: usize) -> String {
     let mut output = String::new();
     for (p, body) in pieces.iter().zip(bodies) {
         output.push_str(&p.prefix);
-        output.push_str(&body.output);
+        if let Some(text) = &body.replacement {
+            output.push_str(text);
+        } else {
+            p.body.append_to(&mut output);
+        }
     }
     if let Some(trailer) = run_trailer_line(bodies.len(), total) {
         if !output.is_empty() && !output.ends_with('\n') {
@@ -249,12 +294,24 @@ fn trailer_only(total: usize) -> CutPlan {
     }
 }
 
+pub(crate) fn plan_cut(pieces: &[Piece<'_>], n: usize, count: &Counter<'_>) -> CutPlan {
+    plan_cut_inner(pieces, RunBudget::Tokens(n), count)
+}
+
+pub(crate) fn plan_char_cut(pieces: &[Piece<'_>], n: usize, count: &Counter<'_>) -> CutPlan {
+    plan_cut_inner(pieces, RunBudget::Chars(n), count)
+}
+
 /// Plan once, cut each over-share body once in the caller's rayon pool, then
 /// verify the exact stdout string. At most three last-file drops follow the
 /// first exact check. Never return an unverified content candidate. The sole
 /// floor exception is the trailer-only result, which can exceed a tiny N.
 /// Returned bodies match the accepted string and support final-output stats.
-pub(crate) fn plan_cut(pieces: &[Piece], n: usize, count: &Counter<'_>) -> CutPlan {
+fn plan_cut_inner(pieces: &[Piece<'_>], budget: RunBudget, count: &Counter<'_>) -> CutPlan {
+    let (n, trailer_join) = match budget {
+        RunBudget::Tokens(n) => (n, 0),
+        RunBudget::Chars(n) => (n, 1),
+    };
     if let Some(output) = set_fits(pieces, n, count) {
         return CutPlan {
             output,
@@ -262,8 +319,14 @@ pub(crate) fn plan_cut(pieces: &[Piece], n: usize, count: &Counter<'_>) -> CutPl
             omitted: 0,
         };
     }
-    let trailer = trailer_cost(pieces.len(), count);
-    let k = kept_prefix(pieces, n, trailer);
+    let trailer = trailer_cost(pieces.len(), count).saturating_add(trailer_join);
+    // Character floors add exactly. If they all fit, no trailer will print.
+    // Token joins do not have this property. Keep their existing reserve.
+    let k = if matches!(budget, RunBudget::Chars(_)) && kept_prefix(pieces, n, 0) == pieces.len() {
+        pieces.len()
+    } else {
+        kept_prefix(pieces, n, trailer)
+    };
     if k == 0 {
         return trailer_only(pieces.len());
     }
@@ -276,7 +339,7 @@ pub(crate) fn plan_cut(pieces: &[Piece], n: usize, count: &Counter<'_>) -> CutPl
     let Some(mut bodies): Option<Vec<_>> = pieces[..k]
         .par_iter()
         .zip(shares)
-        .map(|(p, (share, real))| cut_piece(p, share, real, count))
+        .map(|(p, (share, real))| cut_piece(p, share, real, count, budget))
         .collect()
     else {
         return trailer_only(pieces.len());
@@ -309,9 +372,9 @@ mod tests {
         Some(s.len())
     }
 
-    fn piece(prefix: &str, body: Body) -> Piece {
+    fn piece<'a>(prefix: &str, body: Body<'a>) -> Piece<'a> {
         let output = match &body {
-            Body::Whole(s) | Body::Fixed(s) => s.clone(),
+            Body::Whole(s) | Body::Fixed(s) => s.to_string(),
             Body::PreCut { kept, marker, .. } => format!("{kept}{marker}"),
         };
         let floor = match &body {
@@ -338,12 +401,86 @@ mod tests {
         }
     }
 
-    fn whole(text: &str) -> Piece {
-        piece("", Body::Whole(text.to_owned()))
+    fn whole(text: &str) -> Piece<'static> {
+        piece("", Body::Whole(text.to_owned().into()))
     }
 
     fn many_lines(n: usize) -> String {
         (0..n).map(|i| format!("let x{i} = {i};\n")).collect()
+    }
+
+    #[test]
+    fn char_core_cut_fits_the_final_newline_at_the_exact_share() {
+        let chars = |s: &str| Some(s.chars().count());
+        let first = "// A résumé with enough characters for this test to reach the core cut";
+        let marker = elision_marker_line(
+            Some(Language::Rust),
+            1,
+            ElidedSide::Truncated,
+            Some(ELISION_HINT),
+        );
+        for ending in ["", "\n"] {
+            let input = whole(&format!("{first}\n// {}{ending}", "é".repeat(200)));
+            let expected = format!("{first}\n{marker}{ending}");
+            let share = expected.chars().count();
+            let plan = plan_char_cut(&[input], share, &chars);
+            assert_eq!(plan.output, expected);
+            assert!(plan.bodies[0].cut);
+        }
+        let input = whole(&format!("{first}\n// {}\n", "é".repeat(200)));
+        let share = format!("{first}\n{marker}").chars().count();
+        let plan = plan_char_cut(&[input], share, &chars);
+        assert_eq!(plan.omitted, 0);
+        assert_eq!(plan.output, "// ... (2 lines truncated)\n");
+    }
+
+    #[test]
+    fn char_raw_cut_uses_the_full_share_and_keeps_the_following_file() {
+        let chars = |s: &str| Some(s.chars().count());
+        let first = "A line with enough characters to reach the raw cut: élan";
+        let mut raw = whole(&format!("{first}\n{}\nlast", "é".repeat(200)));
+        raw.cut_language = None;
+        let marker = elision_marker_line(None, 2, ElidedSide::Truncated, Some(ELISION_HINT));
+        let expected = format!("{first}\n{marker}\nfn f();\n");
+        let plan = plan_char_cut(&[raw, whole("fn f();\n")], expected.chars().count(), &chars);
+        assert_eq!(plan.output, expected);
+        assert!(plan.bodies[0].cut);
+        assert!(!plan.bodies[1].cut);
+    }
+
+    #[test]
+    fn char_cut_keeps_every_file_when_the_cut_bodies_fit_without_a_trailer() {
+        let chars = |s: &str| Some(s.chars().count());
+        let short = "fn small();\n";
+        let marker = "// ... (2 lines truncated)\n";
+        let input = [whole(&format!("{}\nlast\n", "x".repeat(200))), whole(short)];
+        let expected = format!("{marker}{short}");
+        let plan = plan_char_cut(&input, expected.chars().count(), &chars);
+        assert_eq!(plan.output, expected);
+        assert_eq!(plan.omitted, 0);
+    }
+
+    #[test]
+    fn char_cut_reserves_the_join_newline_before_the_trailer() {
+        let chars = |s: &str| Some(s.chars().count());
+        let first = "// first";
+        let marker = elision_marker_line(
+            Some(Language::Rust),
+            1,
+            ElidedSide::Truncated,
+            Some(ELISION_HINT),
+        );
+        let trailer = run_trailer_line(1, 2).unwrap();
+        let input = [
+            whole(&format!("{first}\n// {}", "x".repeat(200))),
+            piece("", Body::Fixed("x".repeat(200).into())),
+        ];
+        let budget = format!("{first}\n{marker}{trailer}").chars().count();
+        let plan = plan_char_cut(&input, budget, &chars);
+        assert_eq!(
+            plan.output,
+            format!("// ... (2 lines truncated)\n{trailer}")
+        );
     }
 
     #[test]
@@ -375,7 +512,7 @@ mod tests {
             }
         };
         let pieces: Vec<_> = (0..8)
-            .map(|_| piece("HEADER\n", Body::Whole(many_lines(200))))
+            .map(|_| piece("HEADER\n", Body::Whole(many_lines(200).into())))
             .collect();
         let plan = plan_cut(&pieces, 1000, &count);
         assert_eq!(plan.output, run_trailer_line(0, 8).unwrap());
@@ -424,6 +561,7 @@ mod tests {
             usize::MAX,
             &|_| None,
             TruncationCountSource::ViewLines,
+            RunBudget::Tokens(100),
         )
         .unwrap();
         assert_eq!(
@@ -435,7 +573,7 @@ mod tests {
         );
     }
 
-    fn precut(kept: String, total: usize) -> Body {
+    fn precut(kept: String, total: usize) -> Body<'static> {
         let marker = format!(
             "{}\n",
             elision_marker_line(
@@ -457,7 +595,12 @@ mod tests {
     fn assert_one_exact_marker(plan: &CutPlan, total: usize, n: usize) {
         assert_eq!(plan.bodies.len(), 1);
         assert!(plan.bodies[0].cut);
-        let lines: Vec<_> = plan.bodies[0].output.lines().collect();
+        let lines: Vec<_> = plan.bodies[0]
+            .replacement
+            .as_deref()
+            .unwrap()
+            .lines()
+            .collect();
         let kept = lines.len() - 1;
         assert_eq!(
             lines.last().copied(),
@@ -488,14 +631,23 @@ mod tests {
         let body = precut(kept.clone(), 1000);
         let plan = plan_cut(&[piece("", body)], n, &bytes);
         assert_one_exact_marker(&plan, 1000, n);
-        assert!(plan.bodies[0].output.lines().count() - 1 < kept.lines().count());
+        assert!(
+            plan.bodies[0]
+                .replacement
+                .as_deref()
+                .unwrap()
+                .lines()
+                .count()
+                - 1
+                < kept.lines().count()
+        );
     }
 
     #[test]
     fn trailer_starts_on_its_own_line_after_a_fixed_body() {
         let pieces = [
             piece("", Body::Fixed("small".into())),
-            piece("", Body::Fixed("x".repeat(500))),
+            piece("", Body::Fixed("x".repeat(500).into())),
         ];
         let n = 5 + run_trailer_line(0, 2).unwrap().len() + 1;
         let plan = plan_cut(&pieces, n, &bytes);
@@ -514,8 +666,8 @@ mod tests {
         assert_eq!(plan.bodies.len(), 3);
         assert_eq!(plan.omitted, 0);
         assert!(plan.bodies[0].cut);
-        assert_eq!(plan.bodies[1].output, "small\n");
-        assert_eq!(plan.bodies[2].output, "tiny\n");
+        assert_eq!(plan.bodies[1].replacement.as_deref().unwrap(), "small\n");
+        assert_eq!(plan.bodies[2].replacement.as_deref().unwrap(), "tiny\n");
         assert!(plan.output.len() <= 400);
     }
 
@@ -573,7 +725,7 @@ mod tests {
         assert_eq!(expected.len(), 68);
         let plan = plan_cut(&[first, whole(&many_lines(500))], 500, &bytes);
         assert_eq!(plan.bodies.len(), 2);
-        assert_eq!(plan.bodies[0].output, expected);
+        assert_eq!(plan.bodies[0].replacement.as_deref().unwrap(), expected);
         assert!(plan.bodies[0].cut);
     }
 
@@ -600,7 +752,7 @@ mod tests {
             &bytes,
         );
         assert!(!plan.bodies.is_empty());
-        assert_eq!(plan.bodies[0].output, marker);
+        assert_eq!(plan.bodies[0].replacement.as_deref().unwrap(), marker);
         assert!(plan.output.len() <= n);
     }
 

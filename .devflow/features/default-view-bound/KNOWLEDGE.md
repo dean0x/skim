@@ -13,7 +13,7 @@ updated: 2026-11-18
 ## Rules
 
 - **KB-INV-1** The limit is strict: stdout characters plus the printed stderr notice characters must be below `MAX_STDOUT_CHARS`. Count Unicode scalar values (`chars().count()`), not bytes. `output::within_output_limit` is the one predicate; the post-hook capture check uses it too.
-- **KB-INV-2** Only a default read has `trunc.char_budget`. `file_process_options` sets it when the read is not a batch and no `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol` was given. `mode_given` comes from clap `value_source`, not from the mode value.
+- **KB-INV-2** `default_read` is true when the user gives no `--mode`, `--max-lines`, `--last-lines`, `--tokens` or `--symbol`. `mode_given` comes from clap `value_source`, not from the mode value. `file_process_options` sets `trunc.char_budget` only for a default single-file or stdin read. A default batch uses `RunBudget::Chars` for the whole run instead. Raw reads bypass both paths.
 - **KB-INV-3** The rung walk order is structure, signatures, types. The walk returns `Fits`, `NoneFits`, `AllEmpty` or `NoOutput`. A rung that is empty after `trim()`, or degraded, never fits.
 - **KB-INV-4** The cut budget is `limit - 1 - trailing_newline - notice_chars`. The `1` is the strict margin. The `trailing_newline` is 1 when the rung text ends with `\n`, because the core adds that newline after its search. The notice is the one built with `cut: true`.
 - **KB-INV-5** `truncate_with_count_source` re-measures after the literal pull-back. A pull-back keeps fewer lines, so the omitted count can gain digits and the marker can grow.
@@ -31,9 +31,11 @@ updated: 2026-11-18
 
 ## Overview
 
-A default read of one input (`skim FILE` or `skim -`) must not print more than the limit that Claude Code can show. The limit counts what the reader sees: stdout plus the stderr notice. Typed modes, multi-file runs, directories, globs, `--symbol`, `--max-lines`, `--last-lines`, `--tokens` and hook file rewrites have no default character limit. A multi-file run with `--tokens N` is not unbounded: one token budget covers its whole stdout (see `tokens-run-budget`). `SKIM_PASSTHROUGH=1` gives raw output.
+The default character limit counts final stdout and the view notice. For `skim FILE` or `skim -`, it applies per input. For a directory, glob or explicit list, it applies to the whole run. A one-match glob or directory, or a list that dedups to one path, still uses the run path.
 
-The code has four layers. `main.rs` decides if a read is bounded. `process.rs` (`default_view`) chooses the view. `cascade.rs` (`walk_rungs`, `select_for_char_budget`) walks the modes. `rskim-core` `truncate_with_count_source` cuts whole lines. `cache.rs` stores and replays the outcome.
+Typed modes, `--symbol`, `--max-lines`, `--last-lines`, `--tokens` and hook file rewrites do not use the default character limit. Line limits stay per file. `--tokens N` on a multi-file read sets a separate limit on the whole stdout. `SKIM_PASSTHROUGH=1` and `--passthrough` serve raw output.
+
+For a single input, `process.rs` (`default_view`) chooses the view. `cascade.rs` walks the modes, and `truncate_with_count_source` cuts whole lines. `cache.rs` stores and replays the outcome. For a batch, see `tokens-run-budget` for the shared run stage and its fit, rung and cut limits.
 
 ## Decision flow in `default_view`
 
@@ -91,5 +93,5 @@ The first rung is reused from the caller when its mode matches the requested mod
 
 ## Related
 
-- Feature knowledge: `symbol-read` (`--symbol` is unbounded and has its own cache key), `file-wrapper-fidelity` (notice and fidelity rules), `analytics` (cost charge), `tokens-run-budget` (the whole-run `--tokens` budget for multi-file reads; shares the rung walk and the notice line builder).
+- Feature knowledge: `symbol-read` (one declaration with its own cache key), `file-wrapper-fidelity` (notice and fidelity rules), `analytics` (cost charge), `tokens-run-budget` (the shared run planner and notice rules).
 - Source: `crates/rskim/src/cmd/rewrite/post_hook.rs` (shares `within_output_limit`), `docs/modes.md`, `docs/usage.md`.

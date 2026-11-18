@@ -1083,16 +1083,22 @@ pub(crate) struct BoundNotice {
     pub(crate) shape: BoundShape,
 }
 
+/// The limit for a whole batch, in tokens or Unicode scalar values.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RunBudget {
+    Tokens(usize),
+    Chars(usize),
+}
+
 /// Facts for one run-scoped disclosure. `total` counts successful files only.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RunNoticeFacts<'a> {
-    pub(crate) budget: usize,
+    pub(crate) budget: RunBudget,
     pub(crate) requested: rskim_core::Mode,
     pub(crate) served: rskim_core::Mode,
     pub(crate) differing: usize,
     pub(crate) total: usize,
-    /// Shown files with a run cut. Retained pass-1 bodies are never cut again,
-    /// so their source-line markers do not add to this count.
+    /// Shown files with a run cut, not files with only a per-file marker.
     pub(crate) cut: usize,
     pub(crate) omitted: usize,
     #[allow(dead_code)] // Outcome metadata for the run executor, not another notice clause.
@@ -1104,9 +1110,23 @@ pub(crate) struct RunNoticeFacts<'a> {
 /// One unconditional loss-bearing notice replaces the aggregate notice.
 /// Batch analytics rows do not charge this run-scoped notice.
 pub(crate) fn run_view_marker(facts: &RunNoticeFacts<'_>) -> EmittedNotice {
+    let (limit, selection) = match facts.budget {
+        RunBudget::Tokens(n) => (
+            format!("--tokens {n} budget"),
+            "a larger --tokens or fewer files",
+        ),
+        RunBudget::Chars(limit) => {
+            let selection = if facts.total >= 2 {
+                "--tokens N, a typed --mode or fewer files"
+            } else {
+                "--tokens N or a typed --mode"
+            };
+            (format!("{limit}-character output limit"), selection)
+        }
+    };
     let mut middle = format!(
-        ": {}/{} files; the --tokens {} budget covers the whole output of the run",
-        facts.differing, facts.total, facts.budget,
+        ": {}/{} files; the {limit} covers the whole output of the run",
+        facts.differing, facts.total,
     );
     if facts.served != facts.requested {
         middle.push_str(&format!(
@@ -1141,11 +1161,7 @@ pub(crate) fn run_view_marker(facts: &RunNoticeFacts<'_>) -> EmittedNotice {
         }
         middle.push_str(", and the last stdout line counts them");
     }
-    view_notice_line(
-        facts.served.name(),
-        &middle,
-        "a larger --tokens or fewer files",
-    )
+    view_notice_line(facts.served.name(), &middle, selection)
 }
 
 /// Counts successful files only. The caller puts this on its own stdout line.
@@ -1546,7 +1562,7 @@ mod run_view_marker_tests {
 
     fn facts() -> RunNoticeFacts<'static> {
         RunNoticeFacts {
-            budget: 2000,
+            budget: RunBudget::Tokens(2000),
             requested: Mode::Structure,
             served: Mode::Signatures,
             differing: 12,
@@ -1567,6 +1583,38 @@ mod run_view_marker_tests {
             "[skim] signatures view: all but signatures removed: 12/40 files; the --tokens 2000 budget covers the whole output of the run, so the view stepped down from structure; 3 files are cut, and the last line of each counts its hidden view lines; 28 of 40 files are omitted after src/b.rs, first omitted src/c.rs, and the last stdout line counts them; use a larger --tokens or fewer files for more, or SKIM_PASSTHROUGH=1 for full output\n"
         );
         assert!(!notice.line().contains(['\u{2014}', '\u{2013}']));
+    }
+
+    #[test]
+    fn approved_char_run_notice_is_byte_exact() {
+        let notice = run_view_marker(&RunNoticeFacts {
+            budget: RunBudget::Chars(MAX_STDOUT_CHARS),
+            ..facts()
+        });
+        assert_eq!(
+            notice.line(),
+            "[skim] signatures view: all but signatures removed: 12/40 files; the 29000-character output limit covers the whole output of the run, so the view stepped down from structure; 3 files are cut, and the last line of each counts its hidden view lines; 28 of 40 files are omitted after src/b.rs, first omitted src/c.rs, and the last stdout line counts them; use --tokens N, a typed --mode or fewer files for more, or SKIM_PASSTHROUGH=1 for full output\n"
+        );
+    }
+
+    #[test]
+    fn one_file_char_run_notice_has_no_fewer_files_remedy() {
+        let notice = run_view_marker(&RunNoticeFacts {
+            budget: RunBudget::Chars(500),
+            requested: Mode::Structure,
+            served: Mode::Structure,
+            differing: 1,
+            total: 1,
+            cut: 1,
+            omitted: 0,
+            kept_pass_1: 0,
+            last_shown: None,
+            first_omitted: None,
+        });
+        assert_eq!(
+            notice.line(),
+            "[skim] structure view: bodies removed: 1/1 files; the 500-character output limit covers the whole output of the run; 1 file is cut, and the last line of each counts its hidden view lines; use --tokens N or a typed --mode for more, or SKIM_PASSTHROUGH=1 for full output\n"
+        );
     }
 
     #[test]
