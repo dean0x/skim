@@ -536,6 +536,7 @@ fn samples(idents: Vec<IdentSample>) -> CorpusSamples {
         idents,
         concepts: Vec::new(),
         refs: Vec::new(),
+        clash_split_assigned: Vec::new(),
         roles: BTreeMap::new(),
         costs: Vec::new(),
     }
@@ -800,6 +801,7 @@ fn occ(path: &str, line: u32, role: Option<Role>) -> Occurrence {
         path: path.to_string(),
         line,
         role,
+        def_line: None,
     }
 }
 
@@ -947,6 +949,171 @@ fn clash_entry() -> ClashEntry {
     )
     .clashes
     .remove(0)
+}
+
+fn exact_clash_entry() -> ClashEntry {
+    let mut entry = clash_entry();
+    entry.split = ClashSplit::Exact;
+    entry.defs[1].line = 4;
+    entry.calls[1].path = "src/b.rs".into();
+    entry.calls[1].def = CallDef::Index(1);
+    entry
+}
+
+fn assigned(path: &str, line: u32, def_line: u32) -> Occurrence {
+    Occurrence {
+        def_line: Some(def_line),
+        ..occ(path, line, Some(Role::Call))
+    }
+}
+
+fn split_evaluation(entry: ClashEntry, occurrences: Vec<Occurrence>) -> CorpusEvaluation {
+    let repo = FixtureRepo::new();
+    repo.write("src/a.rs", "fn run() {}\nfn go() { run(); }\n");
+    repo.commit_all("init");
+    let text = text_universe(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let mut golden = golden_with("");
+    golden.clashes.push(entry.clone());
+    let observation = EntryObservation {
+        id: entry.id,
+        full: ResultPage {
+            occurrences,
+            searched_files: Some(1),
+            left_out: Some(BTreeMap::new()),
+            ..ResultPage::default()
+        },
+        sweeps: Vec::new(),
+        limited: Vec::new(),
+        text: None,
+    };
+    evaluate(&text, &plan(&golden).unwrap(), &[observation]).unwrap()
+}
+
+fn split_outcome(entry: ClashEntry, occurrences: Vec<Occurrence>) -> CheckOutcome {
+    split_evaluation(entry, occurrences)
+        .outcomes
+        .into_iter()
+        .find(|(_, check, _)| check.as_str() == "clash.split_right")
+        .expect("the HARD split check must run")
+        .2
+}
+
+#[test]
+fn clash_split_right_accepts_correct_assignments_and_unassigned_calls() {
+    let entry = exact_clash_entry();
+    assert!(
+        split_outcome(
+            entry.clone(),
+            vec![
+                assigned("src/a.rs", 2, 1),
+                assigned("src/b.rs", 7, 4),
+                occ("src/other.rs", 8, Some(Role::Call)),
+            ]
+        )
+        .is_pass()
+    );
+    // This check judges precision; recall and the ratchet judge lost calls.
+    assert!(split_outcome(entry, Vec::new()).is_pass());
+}
+
+#[test]
+fn clash_split_right_rejects_a_wrong_definition_line_or_file() {
+    let entry = exact_clash_entry();
+    let wrong_line = split_outcome(entry.clone(), vec![assigned("src/a.rs", 2, 4)]);
+    assert!(is_fail(&wrong_line), "{wrong_line:?}");
+    assert!(detail(&wrong_line).contains("src/a.rs:2"));
+    let mut other_file = entry;
+    other_file.calls[0].def = CallDef::Index(1);
+    other_file.defs[1].line = 1;
+    assert!(is_fail(&split_outcome(
+        other_file,
+        vec![assigned("src/a.rs", 2, 1)]
+    )));
+}
+
+#[test]
+fn clash_split_right_rejects_any_assignment_when_split_is_none() {
+    assert!(is_fail(&split_outcome(
+        clash_entry(),
+        vec![assigned("src/a.rs", 2, 1)]
+    )));
+}
+
+#[test]
+fn clash_split_right_rejects_assignments_on_unfrozen_sites_or_non_call_roles() {
+    for (path, line) in [("src/a.rs", 3), ("src/other.rs", 2)] {
+        assert!(is_fail(&split_outcome(
+            exact_clash_entry(),
+            vec![assigned(path, line, 1)]
+        )));
+    }
+    for role in [None, Some(Role::Ref), Some(Role::Def)] {
+        let mut occurrence = assigned("src/a.rs", 2, 1);
+        occurrence.role = role;
+        assert!(is_fail(&split_outcome(
+            exact_clash_entry(),
+            vec![occurrence]
+        )));
+    }
+}
+
+#[test]
+fn clash_split_right_rejects_an_assignment_without_a_frozen_definition_index() {
+    for def in [
+        CallDef::Unassigned(crate::scoreboard::golden::Unassigned::Unassigned),
+        CallDef::Index(2),
+    ] {
+        let mut entry = exact_clash_entry();
+        entry.calls[0].def = def;
+        assert!(is_fail(&split_outcome(
+            entry,
+            vec![assigned("src/a.rs", 2, 1)]
+        )));
+    }
+}
+
+#[test]
+fn clash_split_assigned_counts_unique_frozen_calls_on_exact_entries_and_ratchets_zero() {
+    let entry = exact_clash_entry();
+    let measured = split_evaluation(
+        entry.clone(),
+        vec![
+            assigned("src/a.rs", 2, 1),
+            assigned("src/a.rs", 2, 1),
+            assigned("src/b.rs", 7, 4),
+            assigned("src/other.rs", 2, 1),
+            Occurrence {
+                role: Some(Role::Ref),
+                ..assigned("src/a.rs", 3, 1)
+            },
+        ],
+    );
+    let non_call = split_evaluation(
+        entry.clone(),
+        vec![Occurrence {
+            role: Some(Role::Ref),
+            ..assigned("src/a.rs", 2, 1)
+        }],
+    );
+    assert_eq!(
+        ratchet_values(&[&non_call.samples]).get("clash.split_assigned"),
+        Some(&0.0)
+    );
+    let lost = split_evaluation(entry, vec![occ("src/a.rs", 2, Some(Role::Call))]);
+    let none = split_evaluation(clash_entry(), vec![assigned("src/a.rs", 2, 1)]);
+    let current = ratchet_values(&[&measured.samples]);
+    assert_eq!(current.get("clash.split_assigned"), Some(&2.0));
+    let zero = ratchet_values(&[&lost.samples]);
+    assert_eq!(zero.get("clash.split_assigned"), Some(&0.0));
+    assert!(!ratchet_values(&[&none.samples]).contains_key("clash.split_assigned"));
+    assert_eq!(
+        ratchet_values(&[&measured.samples, &measured.samples]).get("clash.split_assigned"),
+        Some(&4.0)
+    );
+    assert_eq!(
+        compare_ratchet("clash.split_assigned", 2.0, zero["clash.split_assigned"]),
+        RatchetChange::Regressed
+    );
 }
 
 #[test]
@@ -1316,6 +1483,7 @@ fn a_clash_entry_runs_the_clash_checks_and_the_unique_path_check_only() {
             CheckId::ClashDefsComplete,
             CheckId::ClashDefCount,
             CheckId::ClashCallsRecall,
+            CheckId::ClashSplitRight,
         ]
     );
 }
