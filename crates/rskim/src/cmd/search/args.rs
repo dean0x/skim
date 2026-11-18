@@ -517,6 +517,22 @@ impl Draft {
                  use -F for exact words or -E for a regex",
             ));
         }
+        // The word view lists at most two best lines per file and has no
+        // sections, so -C, --all and --full have nothing to change there. A
+        // flag that silently does nothing reads as an answer, so refuse it.
+        if matches!(shape, QueryShape::Words(_)) {
+            let view_flags = [
+                ("-C", self.context.is_some()),
+                ("--all", self.all),
+                ("--full", self.full),
+            ];
+            if let Some((flag, _)) = view_flags.iter().find(|(_, set)| *set) {
+                return Err(UsageError::new(format!(
+                    "{flag} does not apply to the word view (several words in one \
+                     argument); use -F for exact words or -E for a regex"
+                )));
+            }
+        }
         let case = if self.ignore_case {
             CaseMode::Insensitive
         } else if self.smart_case {
@@ -657,6 +673,8 @@ Output:
   -C, --context N         Print N lines around each line (0 to 100)
   --all                   List every section
   --full                  Print the text of every line, also in a long section
+                          -C, --all and --full apply to the labelled view
+                          only. The word view exits 2 with them.
   --json                  Print one JSON object on one line
   --limit N               List the first N files in rank order (1 to 1000000)
   --offset N              Skip the first N files

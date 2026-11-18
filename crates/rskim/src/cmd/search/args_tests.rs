@@ -451,6 +451,48 @@ fn conflicting_flag_pairs_exit_2() {
 }
 
 #[test]
+fn the_word_view_refuses_context_all_and_full() {
+    let tail = "does not apply to the word view (several words in one argument); \
+                use -F for exact words or -E for a regex";
+    let cases: [(&[&str], &str); 6] = [
+        (&["-C", "2", "two words"], "-C"),
+        (&["-C", "0", "two words"], "-C"),
+        (&["--context=3", "two words"], "-C"),
+        (&["--all", "two words"], "--all"),
+        (&["--full", "two words"], "--full"),
+        (&["--full", "--all", "-C", "1", "two words"], "-C"),
+    ];
+    for (parts, flag) in cases {
+        assert_eq!(error(parts), format!("{flag} {tail}"), "{parts:?}");
+    }
+}
+
+#[test]
+fn context_all_and_full_still_apply_outside_the_word_view() {
+    for parts in [
+        &["-F", "-C", "2", "--all", "--full", "two words"][..],
+        &["-E", "-C", "2", "--all", "--full", "two words"][..],
+        &["-C", "2", "--all", "--full", "name"][..],
+        // One word left after the split is a pattern, not a list of words.
+        &["-C", "2", "--all", "--full", " name "][..],
+    ] {
+        let flags = query(parts);
+        assert!(
+            !matches!(flags.shape, QueryShape::Words(_)),
+            "{parts:?}: not the word view"
+        );
+        assert_eq!(flags.context, 2, "{parts:?}");
+        assert!(flags.all && flags.full, "{parts:?}");
+    }
+}
+
+#[test]
+fn the_help_says_where_context_all_and_full_apply() {
+    assert!(SEARCH_HELP_TEXT.contains("-C, --all and --full apply to the labelled view"));
+    assert!(SEARCH_HELP_TEXT.contains("The word view exits 2 with them."));
+}
+
+#[test]
 fn list_modes_accept_limit_and_offset() {
     let flags = query(&["-l", "--limit", "3", "--offset", "2", "x"]);
     assert_eq!(flags.list, ListMode::Files);
