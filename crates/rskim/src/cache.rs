@@ -883,7 +883,17 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn budgeted_cache_rejects_missing_bound_state_and_invalid_served_modes() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let old_cache_dir = std::env::var_os("SKIM_CACHE_DIR");
+        // SAFETY: this serial test uses its own cache directory.
+        unsafe { std::env::set_var("SKIM_CACHE_DIR", cache_dir.path()) };
+        assert_eq!(
+            get_cache_dir().unwrap(),
+            cache_dir.path(),
+            "cache writes must stay in this test's own directory"
+        );
         let source = NamedTempFile::new().unwrap();
         let path = source.path();
         let trunc = TruncationOptions {
@@ -928,6 +938,13 @@ mod tests {
             }
             fs::write(&entry_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
             assert!(read_cache(&key()).is_none(), "invalid {field} must miss");
+        }
+        // SAFETY: this serial test restores the prior environment value.
+        unsafe {
+            match old_cache_dir {
+                Some(value) => std::env::set_var("SKIM_CACHE_DIR", value),
+                None => std::env::remove_var("SKIM_CACHE_DIR"),
+            }
         }
     }
 
