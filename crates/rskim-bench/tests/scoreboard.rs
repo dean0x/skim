@@ -28,7 +28,7 @@ use std::process::{Command, Output};
 use rskim_bench::scoreboard::MAX_PAGES;
 use rskim_bench::scoreboard::corpus::load_corpora;
 use rskim_bench::scoreboard::golden::{
-    ClashSplit, IntegrityContext, Origin, StakesExpect, check_integrity, parse_golden,
+    CallDef, ClashSplit, IntegrityContext, Origin, StakesExpect, check_integrity, parse_golden,
 };
 use rskim_bench::scoreboard::oracle::{LexicalQuery, ground_truth};
 use rskim_bench::scoreboard::test_support::FixtureRepo;
@@ -1584,20 +1584,21 @@ fn exact_refs_entry() -> String {
     refs_entry(&[("src/staleness.rs", 2, "def"), ("src/other.rs", 2, "call")])
 }
 
-/// A `[[clash]]` entry for `check_staleness`; `defs` and `calls` are
-/// `(path, line)`. The fixture defines the name once and holds it as a whole
-/// word on two lines only, so a test that needs two definitions treats the call
-/// line as the second one, and freezes that same line as the call: the entry
-/// only has to hold whole-word lines. Its calls are not split by definition.
-fn clash_entry(defs: &[(&str, u32)], calls: &[(&str, u32)], split: &str) -> String {
+/// A `[[clash]]` entry for `check_staleness`; `defs` holds `(path, line)` and
+/// `calls` holds `(path, line, optional definition index)`. The fixture defines
+/// the name once and holds it as a whole word on two lines only, so a test that
+/// needs two definitions treats the call line as the second one and freezes
+/// that same line as the call. Integrity checks whole-word lines, not roles.
+fn clash_entry(defs: &[(&str, u32)], calls: &[(&str, u32, Option<usize>)], split: &str) -> String {
     let defs: Vec<String> = defs
         .iter()
         .map(|(path, line)| format!("{{ path = \"{path}\", line = {line} }}"))
         .collect();
     let calls: String = calls
         .iter()
-        .map(|(path, line)| {
-            format!("  {{ path = \"{path}\", line = {line}, def = \"unassigned\" }},\n")
+        .map(|(path, line, def)| {
+            let def = def.map_or_else(|| "\"unassigned\"".to_string(), |index| index.to_string());
+            format!("  {{ path = \"{path}\", line = {line}, def = {def} }},\n")
         })
         .collect();
     format!(
@@ -1611,7 +1612,8 @@ const TWO_DEFS: &[(&str, u32)] = &[("src/staleness.rs", 2), ("src/other.rs", 2)]
 
 /// The call line of the fixture, which `TWO_DEFS` also lists as its second
 /// definition.
-const CLASH_CALLS: &[(&str, u32)] = &[("src/other.rs", 2)];
+const CLASH_CALLS: &[(&str, u32, Option<usize>)] = &[("src/other.rs", 2, None)];
+const INDEXED_CLASH_CALLS: &[(&str, u32, Option<usize>)] = &[("src/other.rs", 2, Some(1))];
 
 /// A `[[concept]]` entry on the fixture's `build lock` query, which freezes
 /// `first`. The query is the one of `fixture-C01`, so the stub already
@@ -1652,7 +1654,7 @@ fn stakes_entries() -> String {
 fn frozen_answer_entries() -> String {
     [
         exact_refs_entry(),
-        clash_entry(TWO_DEFS, CLASH_CALLS, "none"),
+        clash_entry(TWO_DEFS, INDEXED_CLASH_CALLS, "exact"),
         concept_with_first("fixture-C02", "src/lock.rs"),
         stakes_entries(),
     ]
@@ -1675,9 +1677,10 @@ impl Harness {
         }
     }
 
-    /// Serve the ident query with two definition sites (the stub states the
-    /// definitions of a clash): `rows` as its list, `TWO_DEFS` as its sites.
-    fn write_two_defs(&self, rows: &[Row]) {
+    /// Serve the ident query with `TWO_DEFS` as its definition sites. Set
+    /// `def_line` on call occurrences only, so tests control the assignment
+    /// without a second envelope builder.
+    fn write_two_defs(&self, rows: &[Row], def_line: Option<u32>) {
         let (_, q, f) = IDENT;
         let mut body = envelope(q, rows, 0, by_file(rows).len(), false, self.searched());
         body["definitions"] = json!({
@@ -1688,6 +1691,15 @@ impl Harness {
                 .map(|(path, line)| json!({"path": path, "line": line}))
                 .collect::<Vec<_>>(),
         });
+        if let Some(def_line) = def_line {
+            for file in body["files"].as_array_mut().unwrap() {
+                for occurrence in file["occurrences"].as_array_mut().unwrap() {
+                    if occurrence["role"] == "call" {
+                        occurrence["def_line"] = json!(def_line);
+                    }
+                }
+            }
+        }
         self.write_full_json(q, f, &body);
         self.write_text(q, f, &text_labelled(rows));
     }
@@ -1725,7 +1737,7 @@ impl Harness {
 fn frozen_answer_harness() -> Harness {
     let h = Harness::new();
     h.write_golden_with(DEF_LINE, &frozen_answer_entries());
-    h.write_two_defs(&h.correct_rows(IDENT.1, Some(DEF_PATH)));
+    h.write_two_defs(&h.correct_rows(IDENT.1, Some(DEF_PATH)), Some(2));
     h.write_stakes_responses();
     h
 }
@@ -1776,7 +1788,7 @@ fn a_refs_entry_whose_sites_differ_from_the_whole_word_lines_exits_2_at_integrit
 }
 
 #[test]
-fn a_clash_with_one_definition_or_a_split_exits_2_at_integrity() {
+fn a_clash_with_one_definition_or_an_unindexed_exact_split_exits_2_at_integrity() {
     let err = integrity_failure_of(&clash_entry(&TWO_DEFS[..1], CLASH_CALLS, "none"));
     assert!(
         err.contains("fixture-D01") && err.contains("2 or more"),
@@ -1785,14 +1797,17 @@ fn a_clash_with_one_definition_or_a_split_exits_2_at_integrity() {
 
     let err = integrity_failure_of(&clash_entry(TWO_DEFS, CLASH_CALLS, "exact"));
     assert!(
-        err.contains("fixture-D01") && err.contains("split"),
+        err.contains("fixture-D01")
+            && err.contains("split = \"exact\" needs a def index on every call"),
         "{err}"
     );
 
-    // The two-definition entry with no split passes integrity.
-    let h = Harness::new();
-    h.write_golden_with(DEF_LINE, &clash_entry(TWO_DEFS, CLASH_CALLS, "none"));
-    assert_exit(&h.run(), 0);
+    // Both an unassigned none entry and a fully indexed exact entry pass integrity.
+    for (calls, split) in [(CLASH_CALLS, "none"), (INDEXED_CLASH_CALLS, "exact")] {
+        let h = Harness::new();
+        h.write_golden_with(DEF_LINE, &clash_entry(TWO_DEFS, calls, split));
+        assert_exit(&h.run(), 0);
+    }
 }
 
 #[test]
@@ -1835,6 +1850,7 @@ fn the_frozen_answer_entries_pass_when_the_output_states_them() {
         ("fixture-D01", "clash.defs_complete"),
         ("fixture-D01", "clash.def_count"),
         ("fixture-D01", "clash.calls_recall"),
+        ("fixture-D01", "clash.split_right"),
         ("fixture-C02", "concept.first_right_top5"),
         ("fixture-L01", "ident.def_first"),
         ("fixture-S01", "stakes.exit"),
@@ -1855,6 +1871,12 @@ fn the_frozen_answer_entries_pass_when_the_output_states_them() {
             detail_of(&report, id, check)
         );
     }
+    for ratchet in [
+        &report["corpora"][0]["ratchet"],
+        &report["aggregate"]["ratchet"],
+    ] {
+        assert_eq!(ratchet["clash.split_assigned"], 1.0);
+    }
     // The first-file check is for the concepts that freeze one.
     assert_eq!(
         outcome(&report, "fixture-C01", "concept.first_right_top5"),
@@ -1866,11 +1888,34 @@ fn the_frozen_answer_entries_pass_when_the_output_states_them() {
 }
 
 #[test]
+fn a_clash_call_assigned_to_the_wrong_definition_fails_clash_split_right() {
+    let h = frozen_answer_harness();
+    h.write_two_defs(&h.correct_rows(IDENT.1, Some(DEF_PATH)), Some(99));
+
+    assert_exit(&h.run(), 0);
+
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-D01", "clash.split_right").as_deref(),
+        Some("fail")
+    );
+    let detail = detail_of(&report, "fixture-D01", "clash.split_right");
+    assert!(
+        detail.contains("src/other.rs:2 (def 99: assignment names the wrong definition)"),
+        "{detail}"
+    );
+    assert_eq!(
+        outcome(&report, "fixture-D01", "clash.calls_recall").as_deref(),
+        Some("pass")
+    );
+}
+
+#[test]
 fn a_call_the_output_labels_as_text_fails_the_call_recall() {
     let h = frozen_answer_harness();
     let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
     rows[1].role = Some("text");
-    h.write_two_defs(&rows);
+    h.write_two_defs(&rows, None);
 
     assert_exit(&h.run(), 0);
 
@@ -2199,6 +2244,76 @@ fn each_golden_file_holds_a_clash_entry() {
         assert!(
             !golden.clashes.is_empty(),
             "{corpus} holds no [[clash]] entry, expected 1 or more"
+        );
+    }
+}
+
+/// These indices come from the pinned source and its imports, not search output.
+#[test]
+fn the_exact_golden_clashes_freeze_the_hand_read_definition_indices() {
+    let standard = "crates/printer/src/standard.rs";
+    let v3 = "packages/zod/src/v3/types.ts";
+    let v4 = "packages/zod/src/v4/core/schemas.ts";
+    for (corpus, expected) in [
+        (
+            "ripgrep",
+            vec![
+                (standard, 1053, 0),
+                (standard, 1075, 0),
+                (standard, 1137, 0),
+                (standard, 1198, 1),
+                (standard, 1231, 0),
+                (standard, 1587, 1),
+            ],
+        ),
+        (
+            "zod",
+            vec![
+                (v3, 3253, 0),
+                (v3, 3270, 0),
+                (v3, 3302, 0),
+                (v4, 2514, 1),
+                (v4, 2535, 1),
+                (v4, 2589, 1),
+            ],
+        ),
+    ] {
+        let golden = parse_golden(&real_golden_text(corpus)).unwrap();
+        let clash = golden
+            .clashes
+            .iter()
+            .find(|c| c.id == format!("{corpus}-D01"))
+            .unwrap();
+        assert_eq!(clash.split, ClashSplit::Exact, "{corpus}");
+        let calls: Vec<_> = clash
+            .calls
+            .iter()
+            .map(|c| (c.path.as_str(), c.line, c.def))
+            .collect();
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(p, l, i)| (p, l, CallDef::Index(i)))
+            .collect();
+        assert_eq!(calls, expected, "{corpus}");
+    }
+}
+
+#[test]
+fn the_unsplit_golden_clashes_keep_every_call_unassigned() {
+    for corpus in ["skim", "flask"] {
+        let golden = parse_golden(&real_golden_text(corpus)).unwrap();
+        let clash = golden
+            .clashes
+            .iter()
+            .find(|c| c.id == format!("{corpus}-D01"))
+            .unwrap();
+        assert_eq!(clash.split, ClashSplit::None, "{corpus}");
+        assert!(
+            clash
+                .calls
+                .iter()
+                .all(|c| matches!(c.def, CallDef::Unassigned(_))),
+            "{corpus}"
         );
     }
 }

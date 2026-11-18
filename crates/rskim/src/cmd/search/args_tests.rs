@@ -113,6 +113,36 @@ fn the_help_text_documents_every_flag() {
 }
 
 #[test]
+fn the_help_text_states_the_called_definitions_the_name_rank_and_the_call_assignment() {
+    let missing: Vec<_> = [
+        "called-definitions block lists, by name",
+        "only files already parsed",
+        "file kind, then a file-name word, then count",
+        "The name test ignores case and matches whole tokens",
+        "(def N)",
+        "N is the definition's name line",
+        "one definition of the name in their own file",
+        "plain call needs a free function and no import of that name",
+        "self, this or Self call needs a method",
+        "Rust, TypeScript, JavaScript, Python and Go only",
+        "If any call line is assigned, the clash note counts assigned and other",
+        "call lines, not individual calls",
+    ]
+    .into_iter()
+    .filter(|needle| !SEARCH_HELP_TEXT.contains(needle))
+    .collect();
+    assert!(missing.is_empty(), "the help text must mention {missing:?}");
+}
+
+#[test]
+fn the_help_text_explains_the_repeated_subcommand_error() {
+    assert!(
+        SEARCH_HELP_TEXT
+            .contains("skim search: one pattern only; \"search\" is the subcommand, drop it")
+    );
+}
+
+#[test]
 fn the_help_text_states_the_rule_for_hidden_and_secret_files() {
     assert!(SEARCH_HELP_TEXT.contains("hidden or"));
     assert!(SEARCH_HELP_TEXT.contains("may hold secrets"));
@@ -565,6 +595,34 @@ fn a_second_pattern_exits_2() {
         error(&["foo", "bar"]),
         "one pattern only; quote words as one argument; use -g to filter paths"
     );
+}
+
+#[test]
+fn the_subcommand_word_as_first_pattern_gets_a_fixed_message() {
+    for parts in [
+        vec!["search", "foo"],
+        vec!["search", "--", "foo"],
+        vec!["search", "line\n\u{1b}[31m"],
+    ] {
+        assert_eq!(
+            error(&parts),
+            "one pattern only; \"search\" is the subcommand, drop it",
+            "{parts:?}"
+        );
+    }
+}
+
+#[test]
+fn a_second_word_after_another_pattern_keeps_the_generic_message() {
+    assert_eq!(
+        error(&["foo", "search"]),
+        "one pattern only; quote words as one argument; use -g to filter paths"
+    );
+}
+
+#[test]
+fn search_alone_is_a_query() {
+    assert_eq!(pattern_of(&query(&["search"])), ("search", true));
 }
 
 #[test]

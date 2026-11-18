@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use crate::scoreboard::MAX_PAGES;
 use crate::scoreboard::fmt::{round4, sample};
 use crate::scoreboard::golden::{
-    ClashEntry, DefSite, GoldenFile, RefsEntry, SiteRole, StakesEntry, StakesExpect, StakesRun,
+    CallDef, ClashEntry, ClashSplit, DefSite, GoldenFile, RefsEntry, SiteRole, StakesEntry,
+    StakesExpect, StakesRun,
 };
 use crate::scoreboard::oracle::{
     LexicalQuery, baseline_alphabetical, baseline_occurrence_count, ground_truth, line_truth,
@@ -199,9 +200,10 @@ impl PlannedQuery {
             CheckId::RefsRecall | CheckId::RefsCallsRecall | CheckId::UniverseAccounted => {
                 self.refs_entry().is_some()
             }
-            CheckId::ClashDefsComplete | CheckId::ClashDefCount | CheckId::ClashCallsRecall => {
-                self.clash_entry().is_some()
-            }
+            CheckId::ClashDefsComplete
+            | CheckId::ClashDefCount
+            | CheckId::ClashCallsRecall
+            | CheckId::ClashSplitRight => self.clash_entry().is_some(),
             CheckId::LexicalRecallTracked => self.lexical_oracle().is_some(),
             CheckId::IdentDefFirst => matches!(self.target, Target::Definition(_)),
             CheckId::ConceptFirstRightTop5 => self.first_files().is_some(),
@@ -727,11 +729,72 @@ pub fn check_clash_def_count(page: &ResultPage, entry: &ClashEntry) -> CheckOutc
 }
 
 /// `clash.calls_recall`: every frozen call site of either definition is an
-/// occurrence with the role `call` (calls are not split by definition).
+/// occurrence with the role `call`, whether assigned to a definition or not.
 pub fn check_clash_calls_recall(page: &ResultPage, entry: &ClashEntry) -> CheckOutcome {
     let calls = entry.calls.iter().map(|c| (c.path.as_str(), c.line));
     let (total, problems) = calls_not_labelled(page, calls);
     calls_outcome(total, &problems, " of either definition")
+}
+
+/// `clash.split_right`: judge only assignments the page makes. A missing
+/// assignment does not fail this precision check; `clash.split_assigned`
+/// records its loss. The frozen definition's path is part of its identity:
+/// `def_line` always names a definition in the occurrence's own file.
+pub fn check_clash_split_right(page: &ResultPage, entry: &ClashEntry) -> CheckOutcome {
+    let calls: BTreeMap<(&str, u32), CallDef> = entry
+        .calls
+        .iter()
+        .map(|c| ((c.path.as_str(), c.line), c.def))
+        .collect();
+    let mut problems = Vec::new();
+    for o in &page.occurrences {
+        let Some(def_line) = o.def_line else {
+            continue;
+        };
+        let reason = if entry.split == ClashSplit::None {
+            Some("split = \"none\" forbids assignments")
+        } else if o.role != Some(Role::Call) {
+            Some("assigned occurrence is not labelled call")
+        } else {
+            match calls.get(&(o.path.as_str(), o.line)) {
+                None => Some("assigned occurrence is not a frozen call"),
+                Some(CallDef::Unassigned(_)) => Some("frozen call has no definition index"),
+                Some(CallDef::Index(index)) => match entry.defs.get(*index) {
+                    Some(def) if def.path == o.path && def.line == def_line => None,
+                    _ => Some("assignment names the wrong definition"),
+                },
+            }
+        };
+        if let Some(reason) = reason {
+            problems.push(format!(
+                "{} (def {def_line}: {reason})",
+                site_label(&o.path, o.line)
+            ));
+        }
+    }
+    outcome_of(&problems)
+}
+
+/// Count unique assigned frozen call sites, not output duplicates. A `none`
+/// entry has no value; an exact entry with no assignments has value zero,
+/// so a complete loss still reaches the RATCHET gate.
+pub fn clash_split_assigned(page: &ResultPage, entry: &ClashEntry) -> Option<u64> {
+    if entry.split != ClashSplit::Exact {
+        return None;
+    }
+    let assigned: BTreeSet<(&str, u32)> = page
+        .occurrences
+        .iter()
+        .filter(|o| o.role == Some(Role::Call) && o.def_line.is_some())
+        .map(|o| (o.path.as_str(), o.line))
+        .collect();
+    Some(
+        entry
+            .calls
+            .iter()
+            .filter(|c| assigned.contains(&(c.path.as_str(), c.line)))
+            .count() as u64,
+    )
 }
 
 /// `lexical.recall_tracked`: every file of the text universe (`gt`, with no
@@ -1275,6 +1338,9 @@ pub struct CorpusSamples {
     pub concepts: Vec<ConceptSample>,
     /// Per-`[[refs]]`-entry measurements, in plan order.
     pub refs: Vec<RefsSample>,
+    /// Assigned frozen call counts for exact `[[clash]]` entries, in plan
+    /// order. An exact page with no assignments contributes zero.
+    pub clash_split_assigned: Vec<u64>,
     /// Per language, the role labels of the `[[refs]]` and `[[clash]]` pages and
     /// the ones the role oracle confirms ([`page_role_tallies`]).
     pub roles: BTreeMap<OracleLang, RoleTally>,
@@ -1456,6 +1522,12 @@ pub const RATCHET_METRICS: &[MetricDef] = &[
         Direction::LowerBetter,
         Tolerance::Exact,
         "= 0",
+    ),
+    def(
+        "clash.split_assigned",
+        Direction::HigherBetter,
+        Tolerance::Exact,
+        "ratchet (assigned frozen calls on exact entries)",
     ),
     // The rows below have a value only when the search output states the
     // data they read; a row with no value is absent from the values, and an
@@ -1662,6 +1734,15 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
     }
     put_text_byte_values(&mut out, &idents, &concepts);
     put_refs_values(&mut out, samples);
+    put(
+        &mut out,
+        "clash.split_assigned",
+        samples
+            .iter()
+            .flat_map(|s| s.clash_split_assigned.iter().copied())
+            .reduce(|a, b| a + b)
+            .map(|count| count as f64),
+    );
     put_role_values(&mut out, samples);
     put_cost_values(&mut out, samples);
     out
@@ -1933,6 +2014,7 @@ pub fn evaluate(
     let mut idents = Vec::new();
     let mut concepts = Vec::new();
     let mut refs = Vec::new();
+    let mut clash_split_assigned_counts = Vec::new();
     let mut costs = Vec::new();
     let mut roles: BTreeMap<OracleLang, RoleTally> = BTreeMap::new();
 
@@ -1978,6 +2060,9 @@ pub fn evaluate(
                 call_precision: refs_call_precision(&obs.full, entry).map(round4),
             });
         }
+        if let Some(entry) = q.clash_entry() {
+            clash_split_assigned_counts.extend(clash_split_assigned(&obs.full, entry));
+        }
         costs.extend(obs.full.cost);
     }
     outcomes.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
@@ -1994,6 +2079,7 @@ pub fn evaluate(
             idents,
             concepts,
             refs,
+            clash_split_assigned: clash_split_assigned_counts,
             roles,
             costs,
         },
@@ -2126,6 +2212,7 @@ fn run_check(
         CheckId::ClashDefsComplete => check_clash_defs_complete(&obs.full, clash()?),
         CheckId::ClashDefCount => check_clash_def_count(&obs.full, clash()?),
         CheckId::ClashCallsRecall => check_clash_calls_recall(&obs.full, clash()?),
+        CheckId::ClashSplitRight => check_clash_split_right(&obs.full, clash()?),
         CheckId::LexicalRecallTracked => check_recall_tracked(&obs.full.rows, gt()?),
         CheckId::UniverseAccounted => check_universe_accounted(&obs.full, inputs.text),
         CheckId::IdentDefFirst => match &q.target {
