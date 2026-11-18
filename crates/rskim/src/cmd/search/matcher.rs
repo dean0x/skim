@@ -221,6 +221,59 @@ impl Iterator for Matches<'_> {
     }
 }
 
+/// Whether a whole name token equals `word`, with ASCII case ignored.
+///
+/// This name rule is distinct from the line matcher's `-w` rule. It compares
+/// slices of the original name without allocation or Unicode case conversion.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "The next rank step consumes this shared name test."
+    )
+)]
+pub(super) fn name_holds_word(name: &str, word: &str) -> bool {
+    name_tokens(name).any(|token| token.eq_ignore_ascii_case(word))
+}
+
+/// Split at separators, lower-to-upper case, acronym ends and letter/digit
+/// transitions in either direction. `char_indices` keeps every slice on an
+/// original UTF-8 boundary. Each loop step consumes one character of `name`.
+fn name_tokens(name: &str) -> impl Iterator<Item = &str> {
+    let mut chars = name.char_indices().peekable();
+    let mut start = 0;
+    let mut previous: Option<char> = None;
+    std::iter::from_fn(move || {
+        while let Some((index, current)) = chars.next() {
+            let separator = !current.is_alphanumeric();
+            let boundary = separator
+                || previous.is_some_and(|prev| {
+                    (prev.is_lowercase() && current.is_uppercase())
+                        || (prev.is_uppercase()
+                            && current.is_uppercase()
+                            && chars.peek().is_some_and(|(_, next)| next.is_lowercase()))
+                        || (prev.is_alphabetic() && current.is_numeric())
+                        || (prev.is_numeric() && current.is_alphabetic())
+                });
+            previous = Some(current);
+            if boundary {
+                let token = &name[start..index];
+                start = if separator {
+                    index + current.len_utf8()
+                } else {
+                    index
+                };
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+        let token = &name[start..];
+        start = name.len();
+        (!token.is_empty()).then_some(token)
+    })
+}
+
 /// Compile `source` under the size limits.
 fn compile(source: &str, insensitive: bool) -> Result<Regex, regex::Error> {
     RegexBuilder::new(source)
