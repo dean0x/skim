@@ -434,6 +434,20 @@ fn file_errors_and_missing_paths_do_not_change_the_run_counts() {
     assert!(!err.contains(RUN_NOTICE), "{err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn directory_read_filters_control_characters_from_file_errors() {
+    let fixture = Fixture::new(1, 1);
+    let bad_name = "z\x1bbad.rs";
+    fs::write(fixture.home.path().join(bad_name), [0xff, 0xfe]).unwrap();
+
+    let output = run(fixture.command().args(["--no-cache", "."]));
+    let err = stderr(&output);
+
+    assert!(err.contains("Error processing ./z?bad.rs:"), "{err:?}");
+    assert!(!err.contains('\x1b'), "{err:?}");
+}
+
 fn cache_entries(home: &TempDir) -> Vec<PathBuf> {
     let cache_dir = common::sandbox_var_path(home.path(), ".cache/skim");
     let mut entries: Vec<_> = fs::read_dir(cache_dir)

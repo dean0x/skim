@@ -41,7 +41,7 @@ Pass 1 runs the per-file code and counts each piece. If the set fits, the run wr
 
 `prepare_results` in `multi.rs` is the entry. It runs in the pool that `process_files` builds.
 
-1. **Pass 1.** `process_file` runs for each path with the real options. Each success gets a `Fixed` piece with prefix, count and floor.
+1. **Pass 1.** `process_file` runs for each path with the real options. Each success gets a `Fixed` piece that borrows the pass-1 body. Character piece counts add the prefix and body counts. Token piece counts use the joined text.
 2. **Fit test.** `select_run` calls `set_fits` on the pass-1 set. A set that fits goes out unchanged, with the aggregate notice as before.
 3. **Rung walk.** `walk_rungs` (from `cascade.rs`) goes over the modes after the start mode. For each rung, `run_rung` with `RungKind::Probe` transforms every file with `token_budget: None`. It stops counting when one piece is over N or the running sum is over 2N. Workers still transform after the stop, because the empty test needs every body.
 4. **Cut base.** When no rung fits, reuse the last non-empty probe if it is complete. If it is incomplete, rebuild that rung with `RungKind::CutBase`. If no probe gives a cut base, use the start mode. Each worker pre-cuts only cuttable bodies over N.
