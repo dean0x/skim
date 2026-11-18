@@ -1,0 +1,5 @@
+// input/a.rs
+pub fn alpha() -> i32  {...}
+
+// input/b.rs
+pub fn beta() -> i32  {...}

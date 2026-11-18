@@ -953,3 +953,104 @@ fn a_symbol_read_that_fails_leaves_no_cache_entry() {
         cache_entries(&home)
     );
 }
+
+fn run_budget_home() -> TempDir {
+    let home = TempDir::new().unwrap();
+    fs::create_dir(home.path().join("input")).unwrap();
+    for i in 0..12 {
+        let source: String = (0..40)
+            .map(|j| {
+                format!(
+                    "pub struct Record{i}_{j} {{\n    pub value: i32,\n    pub label: String,\n}}\n"
+                )
+            })
+            .collect();
+        fs::write(home.path().join(format!("input/f{i:02}.rs")), source).unwrap();
+    }
+    home
+}
+
+#[test]
+fn run_cut_and_omission_match_cold_and_warm_and_read_rung_cache() {
+    let home = run_budget_home();
+    let args = [
+        "input/*.rs",
+        "--mode",
+        "types",
+        "--tokens",
+        "180",
+        "--jobs",
+        "1",
+    ];
+    let cold = read_ok(&home, &args);
+    assert!(cold.stdout.contains("lines truncated"), "{}", cold.stdout);
+    assert!(
+        cold.stdout
+            .lines()
+            .last()
+            .unwrap()
+            .contains("files omitted")
+    );
+    assert_eq!(cold, read_ok(&home, &args));
+    let four_args = [
+        "input/*.rs",
+        "--mode",
+        "types",
+        "--tokens",
+        "180",
+        "--jobs",
+        "4",
+    ];
+    assert_eq!(cold, read_ok(&home, &four_args));
+    let four_home = run_budget_home();
+    let four_cold = read_ok(&four_home, &four_args);
+    assert_eq!(cold, four_cold);
+    assert_eq!(four_cold, read_ok(&four_home, &four_args));
+    assert!(!cache_entries(&home).is_empty());
+    // A one-match glob uses the same batch cache key as the run's rung.
+    let rung = read_ok(&home, &["input/f00.*", "--mode", "types", "--no-header"]);
+    replace_stored_lines(&home, &rung, "struct CacheChanged;\n");
+    let changed = read_ok(&home, &args);
+    assert_ne!(
+        cold.stdout, changed.stdout,
+        "the next run must use the changed rung entry"
+    );
+    assert!(
+        changed.stdout.contains("CacheChanged"),
+        "{}",
+        changed.stdout
+    );
+}
+
+#[test]
+fn run_cut_with_an_extensionless_shebang_matches_cold_and_warm() {
+    let home = run_budget_home();
+    fs::write(
+        home.path().join("input/a-script"),
+        "#!/usr/bin/env python3\ndef launch(value: int) -> int:\n    return value + 1\n",
+    )
+    .unwrap();
+    let args = ["input/*", "--tokens", "300"];
+    let cold = read_ok(&home, &args);
+    assert!(cold.stdout.contains("// input/a-script\n"));
+    assert!(cold.stdout.contains("launch"), "{}", cold.stdout);
+    assert!(cold.stdout.contains("lines truncated"), "{}", cold.stdout);
+    assert!(
+        cold.stderr
+            .contains("budget covers the whole output of the run")
+    );
+    assert_eq!(cold, read_ok(&home, &args));
+}
+
+#[test]
+fn run_level_cuts_do_not_replace_plain_types_cache_entries() {
+    let home = run_budget_home();
+    let cut = read_ok(&home, &["input/*.rs", "--mode", "types", "--tokens", "180"]);
+    assert!(cut.stdout.contains("lines truncated"));
+    assert!(cut.stdout.contains("files omitted"));
+    let cached = read_ok(&home, &["input/*.rs", "--mode", "types"]);
+    let uncached = read_ok(&home, &["input/*.rs", "--mode", "types", "--no-cache"]);
+    assert!(!cached.stdout.contains("truncated"));
+    assert!(!cached.stdout.contains("files omitted"));
+    assert_eq!(cached, uncached);
+}
