@@ -368,6 +368,87 @@ fn a_word_query_with_a_tracked_name_that_is_not_utf8_exits_0_and_marks_the_path_
     assert_eq!(json["files_with_all_words"], 2);
 }
 
+#[test]
+fn a_called_name_with_bidi_and_del_prints_escaped() {
+    let repo = SearchRepo::new();
+    let name = "alpha_\u{202e}\u{7f}";
+    repo.write("src/main.sh", format!("# alpha beta\n{name}\n"));
+    repo.write("src/defs.sh", format!("{name}() {{\n  :\n}}\n"));
+    repo.track_all();
+    let run = repo.search(&["alpha beta", "--limit", "1"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        run.stdout
+            .contains("def src/defs.sh:1-3: alpha_\\u{202e}\\x7F, called from src/main.sh:2\n"),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains(['\u{202e}', '\u{7f}']));
+    let value = json_of(&repo.search(&["alpha beta", "--limit", "1", "--json"]));
+    assert_eq!(value["called_definitions"][0]["name"], name);
+}
+
+#[test]
+fn a_called_name_of_two_thousand_bytes_is_counted_not_printed() {
+    let repo = SearchRepo::new();
+    let name = format!("alpha_{}", "x".repeat(1994));
+    repo.write(
+        "src/main.rs",
+        format!("// alpha beta\nfn run() {{ {name}(); }}\n"),
+    );
+    repo.write("src/defs.rs", format!("fn {name}() {{}}\n"));
+    repo.track_all();
+    let run = repo.search(&["alpha beta", "--limit", "1"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let note =
+        "2 names are not stored (name-byte cap 256); read the files with skim FILE --mode=full";
+    assert!(
+        run.stdout.contains(&format!("note: {note}\n")),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout
+            .lines()
+            .any(|line| line.starts_with("called:") || line.starts_with("def "))
+    );
+    let value = json_of(&repo.search(&["alpha beta", "--limit", "1", "--json"]));
+    assert_eq!(value["called_definitions"], serde_json::json!([]));
+    assert!(
+        value["notices"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(note))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_called_definition_in_a_path_that_is_not_utf8_is_quoted_and_marked_lossy() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    let repo = SearchRepo::new();
+    let name = OsStr::from_bytes(b"src/bad\xff.rs");
+    repo.write("src/main.rs", "// alpha beta\nfn run() { read_alpha(); }\n");
+    if let Err(error) = fs::write(repo.root().join(name), "fn read_alpha() {}\n") {
+        eprintln!("file system rejects non-UTF-8 names: {error}");
+        return;
+    }
+    repo.track_all();
+    let run = repo.search(&["alpha beta", "--limit", "1"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        run.stdout
+            .contains("def \"src/bad\\377.rs\":1-1: read_alpha, called from src/main.rs:2\n"),
+        "{}",
+        run.stdout
+    );
+    let value = json_of(&repo.search(&["alpha beta", "--limit", "1", "--json"]));
+    assert_eq!(value["called_definitions"][0]["path"], "src/bad\u{fffd}.rs");
+    assert_eq!(value["called_definitions"][0]["path_lossy"], true);
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+}
+
 // ============================================================================
 // The root walk
 // ============================================================================

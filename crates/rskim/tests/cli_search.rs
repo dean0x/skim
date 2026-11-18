@@ -1178,6 +1178,39 @@ fn a_word_query_lists_a_file_whose_name_holds_a_word_first_among_equals() {
 }
 
 #[test]
+fn a_word_query_lists_the_definitions_that_listed_files_call_by_name() {
+    let repo = SearchRepo::new();
+    repo.write(
+        "src/main.rs",
+        "// alpha beta\nfn run() { read_alpha(); read_alpha(); }\n",
+    );
+    repo.write("src/defs.rs", "// alpha\npub fn read_alpha() {\n}\n");
+    repo.track_all();
+    let text = repo.search(&["alpha beta", "--limit", "1"]);
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    assert!(text.stdout.contains("called: 1 definitions that the listed files call hold a query word (by name)\ndef src/defs.rs:2-3: read_alpha, called from src/main.rs:2\n"), "{}", text.stdout);
+    assert_eq!(listed_paths(&text.stdout), ["src/main.rs"]);
+    assert_eq!(word_headers(&text.stdout), ["src/main.rs"]);
+    let run = repo.search(&["alpha beta", "--limit", "1", "--json"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let value = json_of(&run);
+    assert_eq!(
+        value["called_definitions"],
+        serde_json::json!([
+            {"name":"read_alpha", "path":"src/defs.rs", "line":2, "first_line":2, "end_line":3,
+             "caller":{"path":"src/main.rs", "line":2}}
+        ])
+    );
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+    assert_eq!(value["files"][0]["path"], "src/main.rs");
+    assert_eq!(
+        value["files"][0]["occurrences"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(value["parse"]["files"], 2);
+}
+
+#[test]
 fn a_word_query_with_fewer_than_three_full_files_adds_files_with_fewer_words() {
     let repo = SearchRepo::new();
     repo.write("src/a.rs", "alpha beta gamma\n");
