@@ -23,7 +23,7 @@ referencedFiles:
   - crates/rskim-research/src/clone.rs
   - .github/workflows/ci.yml
 created: 2026-09-25
-updated: 2026-11-13
+updated: 2026-11-18
 ---
 
 # Search scoreboard (quality gate) and the role oracle
@@ -40,7 +40,8 @@ dog-food campaign as the standing gate. Manual dog-food remains only where the s
   `-c` output and the exit code);
 - role precision outside the frozen names (`refs.call_precision` covers the `[[refs]]` names only; `roles.precision.*`
   covers the `[[refs]]` and `[[clash]]` names only);
-- calls split by definition (a name with several definitions gets a note; `split = "none"`);
+- call assignment outside the frozen `[[clash]]` entries (`clash.split_right` checks assigned calls; `clash.split_assigned` counts assigned frozen calls);
+- the word-view `called_definitions` block. No check reads it; the links are by name, not resolved;
 - latency (INFO), a corpus outside the four, and any new query flag until it has golden entries.
 
 The runbook is `crates/rskim-bench/scoreboard/README.md`. This file covers what it does not spell out: how the pieces
@@ -84,7 +85,7 @@ couple across the crates, which invariant is enforced where, and the traps.
 
 | Class | Scope | Tolerance | Where defined |
 |---|---|---|---|
-| HARD | golden entry × check (`CheckId::ALL`, 23 checks) | 0; only a ledger entry excuses a failure | `types.rs` `CheckId`, `metrics.rs` `PlannedQuery::checks` |
+| HARD | golden entry × check (`CheckId::ALL`) | 0; only a ledger entry excuses a failure | `types.rs` `CheckId`, `metrics.rs` `PlannedQuery::checks` |
 | RATCHET | per corpus + aggregate | exact after `round4`; `bytes.text_*` and `bytes.first_correct_*` ±3% **relative to the baseline value** | `metrics.rs` `RATCHET_METRICS`, `compare_ratchet` |
 | INFO | latency, beats-baseline, `bytes.rgw_*` and `bytes.first_relevant_median` (`info.reference` of each corpus) | never gated, not in `baseline.json` | `report.rs`, `metrics.rs` `reference_values` |
 
@@ -116,7 +117,8 @@ from `-i`, `-S`, `-w`, `-F`, `-E`, `-g`, `-t`, `-l`, `-c` and `-C`). The set of 
 |---|---|---|
 | `[[refs]]` (`def`, `sites` with roles) | `refs.recall` (every site is an occurrence), `refs.calls_recall` (every frozen `call` is labelled `call`), `universe.accounted` (`searched_files` + `left_out` reasons equal the oracle's text universe) | HARD |
 | `[[refs]]` | `refs.call_precision` (share of the `call` group that is frozen calls; no value when nothing is labelled `call`) | RATCHET |
-| `[[clash]]` (`defs`, `calls`, `split = "none"`) | `clash.defs_complete`, `clash.def_count` (`at_least` passes only as a valid lower bound), `clash.calls_recall` | HARD |
+| `[[clash]]` (`defs`, `calls`, `split = "none"` or `"exact"`) | `clash.defs_complete`, `clash.def_count` (`at_least` passes only as a valid lower bound), `clash.calls_recall`, `clash.split_right` (each assignment names the frozen definition in its own file; `none` forbids assignments) | HARD |
+| `[[clash]]` with `split = "exact"` | `clash.split_assigned` (sum of assigned frozen call sites; zero when all assignments disappear, absent for `none`) | RATCHET |
 | `[[lexical]]` | `lexical.recall_tracked` (recall over the text universe, no language allow-list) | HARD |
 | `[[ident]]` | `ident.def_first` (the first definition site is the frozen `def` path and line) | HARD |
 | `[[concept]]` `first` (optional) | `concept.first_right_top5` (a frozen first file is among the first 5 files) | HARD |
@@ -130,15 +132,22 @@ from `-i`, `-S`, `-w`, `-F`, `-E`, `-g`, `-t`, `-l`, `-c` and `-C`). The set of 
   secret-bearing tracked files are in it, as `git grep` lists them. A file leaves it only for a counted `left_out`
   reason (`LEFT_OUT_REASONS`: `binary`, `not_utf8`, `too_large` above `MAX_FILE_BYTES` = 5 MiB, `unreadable`,
   `vanished`, `outside_root`, `symlink`). The reason names equal the engine's `left_out` keys.
+- **Call assignment** uses optional `Occurrence.def_line`, a positive `u32` definition-name line in the occurrence's own file.
+  `clash.split_right` rejects a wrong definition, an assignment on a `none` entry, or an assigned occurrence outside the frozen calls.
+  It also rejects an assigned occurrence whose role is not `call`. Missing assignments pass this precision check.
+  `clash.split_assigned` counts unique assigned frozen call sites on `exact` entries; it sums them per corpus and in the aggregate.
+  `ripgrep-D01` and `zod-D01` use `exact` from a hand read; `flask-D01` and `skim-D01` keep `none`.
+  A golden definition index states the call target. It does not require the search to assign that call.
 - **Known divergence** (untracked files only; empty on a verified-clean clone): the engine's walk honours `.ignore`
   files and `git ls-files --exclude-standard` does not.
 - **Adapter** (`types.rs` `ResultPage::from_envelope`, `from_files_text`, `from_counts_text`): the page is parsed from
   the one-line JSON envelope. An `error` key, a missing key, a wrong type or an unknown role is a harness error
   (exit 2), never a regression.
 - **Integrity** (`golden.rs` `check_refs`, `check_clash`, `check_stakes`): `sites` equal the whole-word line set at the
-  pin and include a `call` site; a clash has 2+ `defs`, 1+ calls and `split = "none"`; a stakes exit agrees with the
-  oracle's hit count, and a stakes `lines`, `files` or `counts` entry has at least one matching line (an empty answer
-  passes any output).
+  pin and include a `call` site; a clash has 2+ `defs` and 1+ calls, with each call index in range.
+  A clash accepts `split = "none"` or `"exact"`; `exact` requires every frozen call to have a definition index.
+  A stakes exit agrees with the oracle's hit count, and a stakes `lines`, `files` or `counts` entry has at least one matching line.
+  An empty answer passes any output.
 - **Stakes calls** (`runner.rs` `observe_stakes`): the entry's own flags go to skim. `-l` and `-c` cannot combine with
   `--json`, so those calls read text output (a path per line, or `path:count`). An entry that expects an exit code
   reads the exit status of a text call. A stakes `-g` is a subset of the `rg` glob rules in `oracle.rs` (`* ? ** !`,

@@ -737,6 +737,29 @@ fn a_usage_error_under_json_prints_an_error_object_and_exits_2() {
     assert!(run.stderr.contains("-l and -c cannot be combined"));
 }
 
+#[test]
+fn the_subcommand_word_as_first_pattern_exits_2_with_one_json_error() {
+    let repo = SearchRepo::new();
+    let message = "one pattern only; \"search\" is the subcommand, drop it";
+    for parts in [
+        vec!["search", "foo"],
+        vec!["search", "--", "foo"],
+        vec!["search", "line\n\u{1b}[31m"],
+    ] {
+        let run = repo.search(&parts);
+        assert_eq!(run.code, 2, "{parts:?}");
+        assert_eq!(run.stdout, "", "{parts:?}");
+        assert_eq!(run.stderr, format!("skim search: {message}\n"));
+
+        let mut json_parts = vec!["--json"];
+        json_parts.extend_from_slice(&parts);
+        let run = repo.search(&json_parts);
+        assert_json_error("a repeated subcommand", &run);
+        assert_eq!(json_of(&run), serde_json::json!({"error": message}));
+        assert_eq!(run.stderr, format!("skim search: {message}\n"));
+    }
+}
+
 /// An exit-2 run under `--json` prints one object that holds only the error
 /// message, and the same message on stderr behind the program prefix.
 fn assert_json_error(case: &str, run: &Run) {
@@ -948,9 +971,71 @@ fn two_rust_definitions_of_one_name_print_both_and_the_clash_note() {
         run.stdout
     );
     assert!(lines.contains(&"def b/two.rs:1-1: pub fn dup() {}"));
-    assert!(lines.contains(&"note: 2 definitions of dup; calls are not split by definition"));
+    assert!(lines.contains(&"b/two.rs:2: [t] (def 1) fn t() { dup(); }"));
+    assert!(lines.contains(&"note: 2 definitions of dup; call lines assigned to the one definition in their file: 1; call lines not split by definition: 0"));
     let json = json_of(&repo.search(&["dup", "--json"]));
     assert_eq!(json["definitions"]["count"], 2);
+}
+
+#[test]
+fn a_method_and_an_imported_free_function_of_one_name_split_only_the_self_calls() {
+    let repo = SearchRepo::new();
+    repo.write(
+        "a/method.rs",
+        "use crate::free::dup;\nstruct Bag;\nimpl Bag {\n    fn\n    dup(&self) {}\n    fn run(&self) {\n        self.dup();\n        self.dup(); self.dup();\n        self.dup();\n        Self::dup(self);\n        dup();\n        dup();\n    }\n}\n",
+    );
+    repo.write("b/free.rs", "pub fn dup() {}\n");
+    repo.track_all();
+
+    for flags in [vec!["dup"], vec!["dup", "-C", "1"]] {
+        let run = repo.search(&flags);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert!(run.lines().contains(&"note: 2 definitions of dup; call lines assigned to the one definition in their file: 4; call lines not split by definition: 2"), "{}", run.stdout);
+        assert!(
+            run.stdout
+                .contains("a/method.rs:7: [run] (def 5) self.dup();\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout
+                .contains("a/method.rs:10: [run] (def 5) Self::dup(self);\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("a/method.rs:11: [run] dup();\n"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("a/method.rs:12: [run] dup();\n"),
+            "{}",
+            run.stdout
+        );
+    }
+    let json = json_of(&repo.search(&["dup", "--json"]));
+    let method = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "a/method.rs")
+        .unwrap();
+    let calls: Vec<&Value> = method["occurrences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|occurrence| occurrence["role"] == "call")
+        .collect();
+    assert_eq!(calls.len(), 6, "{json}");
+    for occurrence in calls {
+        let line = occurrence["line"].as_u64().unwrap();
+        if (7..=10).contains(&line) {
+            assert_eq!(occurrence["def_line"], 5, "{json}");
+        } else {
+            assert!(occurrence.get("def_line").is_none(), "{json}");
+        }
+    }
 }
 
 #[test]
@@ -969,6 +1054,27 @@ fn two_typescript_definitions_of_one_name_print_the_same_note() {
     );
     assert!(lines.contains(&"def b/two.ts:1-1: export const dup = () => 1;"));
     assert!(lines.contains(&"note: 2 definitions of dup; calls are not split by definition"));
+}
+
+#[test]
+fn a_typescript_call_names_the_exported_arrow_definition_in_its_file() {
+    let repo = SearchRepo::new();
+    repo.write("a/one.ts", "export function dup(): void {}\n");
+    repo.write("b/two.ts", "export const dup = () => 1;\ndup();\n");
+    repo.track_all();
+
+    let run = repo.search(&["dup"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        run.lines().contains(&"b/two.ts:2: [top] (def 1) dup();"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.lines().contains(&"note: 2 definitions of dup; call lines assigned to the one definition in their file: 1; call lines not split by definition: 0"),
+        "{}",
+        run.stdout
+    );
 }
 
 /// One file per language, each with a definition that spans several lines.
@@ -1058,6 +1164,104 @@ fn a_word_query_lists_the_files_that_hold_all_the_words_by_prior_then_count() {
     );
     assert!(!run.stdout.contains("note:"), "{}", run.stdout);
     assert!(run.stdout.contains("files: 4 hold all 3 words; 4 listed\n"));
+}
+
+#[test]
+fn a_word_query_lists_a_file_whose_name_holds_a_word_first_among_equals() {
+    let repo = SearchRepo::new();
+    repo.write("src/a.rs", "// alpha beta\n".repeat(20));
+    repo.write("src/withAlpha.rs", "// alpha beta\n");
+    repo.write("src/z.rs", "// alpha beta\n");
+    repo.write("src/beta.rs", "// alpha\n");
+    repo.write("src/alpha.rs", "// neither word\n");
+    repo.track_all();
+
+    let run = repo.search(&["alpha beta"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        word_headers(&run.stdout),
+        ["src/withAlpha.rs", "src/a.rs", "src/z.rs"],
+        "the name tier precedes hit counts but adds no candidate: {}",
+        run.stdout
+    );
+    let json = json_of(&repo.search(&["alpha beta", "--json"]));
+    assert_eq!(json["files_with_all_words"], 3);
+    assert_eq!(json["total_files"], 3);
+    assert_eq!(json["files"][0]["path"], "src/withAlpha.rs");
+    assert_eq!(json["files"][0]["words_matched"], 2);
+    let scores: Vec<f64> = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["score"].as_f64().unwrap())
+        .collect();
+    assert!(scores.windows(2).all(|pair| pair[0] >= pair[1]));
+}
+
+#[test]
+fn a_word_query_lists_the_definitions_that_listed_files_call_by_name() {
+    let repo = SearchRepo::new();
+    repo.write(
+        "src/main.rs",
+        "// alpha beta\nfn run() { read_alpha(); read_alpha(); }\n",
+    );
+    repo.write("src/defs.rs", "// alpha\npub fn read_alpha() {\n}\n");
+    repo.track_all();
+    let text = repo.search(&["alpha beta", "--limit", "1"]);
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    assert!(text.stdout.contains("called: 1 definitions that the listed files call hold a query word (by name)\ndef src/defs.rs:2-3: read_alpha, called from src/main.rs:2\n"), "{}", text.stdout);
+    assert_eq!(listed_paths(&text.stdout), ["src/main.rs"]);
+    assert_eq!(word_headers(&text.stdout), ["src/main.rs"]);
+    let run = repo.search(&["alpha beta", "--limit", "1", "--json"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let value = json_of(&run);
+    assert_eq!(
+        value["called_definitions"],
+        serde_json::json!([
+            {"name":"read_alpha", "path":"src/defs.rs", "line":2, "first_line":2, "end_line":3,
+             "caller":{"path":"src/main.rs", "line":2}}
+        ])
+    );
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+    assert_eq!(value["files"][0]["path"], "src/main.rs");
+    assert_eq!(
+        value["files"][0]["occurrences"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(value["parse"]["files"], 2);
+}
+
+#[test]
+fn a_word_query_links_a_typescript_camel_case_call_to_an_exported_arrow_definition() {
+    let repo = SearchRepo::new();
+    repo.write("src/main.ts", "// beta\nreadAlpha();\n");
+    repo.write("src/defs.ts", "export const readAlpha = () => 1;\n");
+    repo.track_all();
+
+    // The line match must admit the camel-case name before the name join.
+    let text = repo.search(&["alpha beta", "-i", "--limit", "1"]);
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    assert_eq!(word_headers(&text.stdout), ["src/main.ts"]);
+    assert!(
+        text.lines()
+            .contains(&"def src/defs.ts:1-1: readAlpha, called from src/main.ts:2"),
+        "{}",
+        text.stdout
+    );
+
+    let run = repo.search(&["alpha beta", "-i", "--limit", "1", "--json"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let value = json_of(&run);
+    assert_eq!(
+        value["called_definitions"],
+        serde_json::json!([
+            {"name":"readAlpha", "path":"src/defs.ts", "line":1, "first_line":1, "end_line":1,
+             "caller":{"path":"src/main.ts", "line":2}}
+        ])
+    );
+    assert_eq!(value["view"], "words");
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+    assert_eq!(value["files"][0]["path"], "src/main.ts");
 }
 
 #[test]

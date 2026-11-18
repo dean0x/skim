@@ -331,8 +331,8 @@ limits = [5, 20]
 # comment, string and text. A [[refs]] entry lists every whole-word line of its
 # name, so its sites add up to the grep count.
 #
-# [[clash]] names have 2 or more definitions. Calls are not split by definition
-# (split = "none"), so every call is "unassigned".
+# [[clash]] names have 2 or more definitions. An exact entry indexes every call.
+# Output may leave exact calls unassigned. A none entry forbids output assignments.
 
 [[refs]]
 id = "zod-R01"
@@ -393,15 +393,16 @@ defs = [
     { path = "packages/zod/src/v3/types.ts", line = 3241 },
     { path = "packages/zod/src/v4/core/schemas.ts", line = 2495 },
 ]
+# Each call names the function in its own file.
 calls = [
-    { path = "packages/zod/src/v3/types.ts", line = 3253, def = "unassigned" },
-    { path = "packages/zod/src/v3/types.ts", line = 3270, def = "unassigned" },
-    { path = "packages/zod/src/v3/types.ts", line = 3302, def = "unassigned" },
-    { path = "packages/zod/src/v4/core/schemas.ts", line = 2514, def = "unassigned" },
-    { path = "packages/zod/src/v4/core/schemas.ts", line = 2535, def = "unassigned" },
-    { path = "packages/zod/src/v4/core/schemas.ts", line = 2589, def = "unassigned" },
+    { path = "packages/zod/src/v3/types.ts", line = 3253, def = 0 },
+    { path = "packages/zod/src/v3/types.ts", line = 3270, def = 0 },
+    { path = "packages/zod/src/v3/types.ts", line = 3302, def = 0 },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 2514, def = 1 },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 2535, def = 1 },
+    { path = "packages/zod/src/v4/core/schemas.ts", line = 2589, def = 1 },
 ]
-split = "none"
+split = "exact"
 origin = "curated"
 
 # Plain-word queries with the files that hold the answer. The relevance regex was

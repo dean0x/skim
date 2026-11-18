@@ -49,6 +49,64 @@ fn found(matcher: &Matcher, line: &str) -> Vec<Range<usize>> {
 }
 
 #[test]
+fn a_name_holds_a_word_as_a_whole_token_in_any_case() {
+    for (name, word, holds) in [
+        ("withStoreLock", "lock", true),
+        ("withStoreLock", "LOCK", true),
+        ("WITH_STORE_LOCK", "lock", true),
+        ("runPlugin", "plugin", true),
+        ("readLastUsed", "last", true),
+        ("readLastUsed", "used", true),
+        ("unlockQueueEntry", "lock", false),
+        ("locks", "lock", false),
+        ("hook", "hooks", false),
+        ("utf8", "utf8", false),
+        ("last_seen", "last_seen", false),
+        ("", "lock", false),
+        ("lock", "", false),
+        ("__", "", false),
+    ] {
+        assert_eq!(name_holds_word(name, word), holds, "{name:?}, {word:?}");
+    }
+}
+
+#[test]
+fn name_tokens_split_at_case_acronym_digit_and_separator_breaks() {
+    for (name, words) in [
+        ("lowerUpper", &["lower", "upper"][..]),
+        ("HTTPServer", &["http", "server"][..]),
+        ("XML", &["xml"][..]),
+        ("Version42Entry", &["version", "42", "entry"][..]),
+        ("md5Hash", &["md", "5", "hash"][..]),
+        ("snake_case", &["snake", "case"][..]),
+        ("dash-name.file", &["dash", "name", "file"][..]),
+        (
+            "_read/last:used@value_",
+            &["read", "last", "used", "value"][..],
+        ),
+    ] {
+        for word in words {
+            assert!(name_holds_word(name, word), "{name:?}, {word:?}");
+        }
+    }
+}
+
+#[test]
+fn a_non_ascii_name_never_panics_and_the_kelvin_sign_is_not_k() {
+    for (name, word, holds) in [
+        ("İName", "name", true),
+        ("İ", "İ", true),
+        ("İ", "i", false),
+        ("KName", "name", true),
+        ("K", "K", true),
+        ("K", "k", false),
+        ("éLock", "lock", true),
+    ] {
+        assert_eq!(name_holds_word(name, word), holds, "{name:?}, {word:?}");
+    }
+}
+
+#[test]
 fn a_literal_matches_itself_and_its_metacharacters_are_text() {
     let m = literal("foo(");
     assert!(m.is_match("call foo(1)"));

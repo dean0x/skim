@@ -340,7 +340,8 @@ fn parse_number(flag: &str, raw: &str, min: u64, max: u64) -> Result<u64, UsageE
 }
 
 impl Draft {
-    /// Record a positional argument: the pattern.
+    /// Record a positional argument: the pattern. A repeated subcommand gets a
+    /// fixed remedy that never echoes the next argument.
     fn positional(&mut self, arg: &str, previous: Option<&str>) -> Result<(), UsageError> {
         if self.pattern.is_none() {
             self.pattern = Some(arg.to_owned());
@@ -349,6 +350,11 @@ impl Draft {
         if previous == Some("-n") && !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) {
             return Err(UsageError::new(
                 "-n no longer sets the limit; use --limit N",
+            ));
+        }
+        if self.pattern.as_deref() == Some("search") {
+            return Err(UsageError::new(
+                "one pattern only; \"search\" is the subcommand, drop it",
             ));
         }
         Err(UsageError::new(
@@ -621,10 +627,27 @@ The PATTERN is a literal. It gives one of two views.
                        line range. The calls follow, each with the function that
                        holds it. Imports, strings, comments and other lines are
                        counted (--all lists them).
+                       With two or more definitions, assigned call lines show
+                       (def N); N is the definition's name line. Calls must fit
+                       the one definition of the name in their own file.
+                       A plain call needs a free function and no import of that name.
+                       A self, this or Self call needs a method.
+                       Rust, TypeScript, JavaScript, Python and Go only.
+                       A line is assigned only if every call match fits.
+                       If any call line is assigned, the clash note counts assigned and other
+                       call lines, not individual calls. Other calls stay not split.
   Several words in     The word view. The files that hold all the words come
-  one argument         first, ranked, with their best lines. If fewer than 3
-                       files hold all of them, files with fewer words follow.
+  one argument         first, ranked by file kind, then a file-name word, then count.
+                       If fewer than 3 files hold all words, files with fewer words follow.
+                       The name test ignores case and matches whole tokens.
+                       The called-definitions block lists, by name, callable definitions
+                       that listed source files call when the name holds a query word.
+                       It uses only files already parsed and skips definitions in listed files.
+                       These are name links, not resolved calls.
 Any other pattern, and every -E pattern, gives the labelled view with --all.
+
+Use search once as the subcommand. A repeated search before another pattern exits 2:
+  skim search: one pattern only; \"search\" is the subcommand, drop it
 
 Match options:
   -i, --ignore-case       Ignore case

@@ -24,6 +24,345 @@ use super::{
     Labelling, Labels, Role, Unlabelled, declaration_keywords, has_declaration_keyword, is_partial,
 };
 
+#[test]
+fn called_names_keep_every_callee_shape_whose_name_holds_a_word() {
+    let cases = [
+        (
+            Language::Rust,
+            "rs",
+            "fn run() { readLock(); self.readLock(); Self::readLock(); Type::readLock(); other.readLock(); readLock!(); readLock::<u8>(); }",
+        ),
+        (
+            Language::TypeScript,
+            "ts",
+            "readLock(); this.readLock(); other.readLock(); new readLock(); readLock<string>();",
+        ),
+        (
+            Language::JavaScript,
+            "js",
+            "readLock(); this.readLock(); other.readLock(); new readLock();",
+        ),
+        (
+            Language::Python,
+            "py",
+            "readLock()\nself.readLock()\nother.readLock()\n",
+        ),
+        (
+            Language::Go,
+            "go",
+            "package p\nfunc run() { readLock(); self.readLock(); other.readLock() }",
+        ),
+        (Language::C, "c", "void run() { readLock(); }"),
+    ];
+    for (lang, ext, source) in cases {
+        // Select each shape in isolation, so deduplication cannot hide a miss.
+        let starts: Vec<_> = source.match_indices("readLock").map(|(i, _)| i).collect();
+        for start in starts {
+            let mut one = source.to_owned();
+            for (i, _) in source
+                .match_indices("readLock")
+                .filter(|(i, _)| *i != start)
+            {
+                one.replace_range(i..i + 8, "readElse");
+            }
+            let labels = Labels::new(&one, lang, ext).unwrap();
+            let names = labels.called_names(
+                &one,
+                |n| super::super::matcher::name_holds_word(n, "lock"),
+                super::NameCap {
+                    count: 32,
+                    bytes: 256,
+                },
+            );
+            assert_eq!(
+                names.kept,
+                [super::CalledName {
+                    name: "readLock".into(),
+                    line: 1 + source[..start].bytes().filter(|b| *b == b'\n').count() as u32
+                }],
+                "{lang:?}: {one}"
+            );
+        }
+    }
+    let source = "const readLock = 1; readLock; holder.readLock; readLockArg(readLock); // readLock()\n\"readLock()\";";
+    let labels = Labels::new(source, Language::JavaScript, "js").unwrap();
+    assert!(
+        labels
+            .called_names(
+                source,
+                |n| n == "readLock",
+                super::NameCap {
+                    count: 32,
+                    bytes: 256
+                }
+            )
+            .kept
+            .is_empty()
+    );
+}
+
+#[test]
+fn qualified_calls_share_the_bare_name_quota_and_ignore_scope_words() {
+    let scope = "A".repeat(300);
+    let source = format!(
+        "fn run() {{\n Self::readLock();\n Type::readLock();\n Type::readLock();\n readLock();\n Module::Type::readLock();\n {scope}::readLock();\n Other::writeLock();\n Lock::unrelated();\n}}"
+    );
+    let labels = Labels::new(&source, Language::Rust, "rs").unwrap();
+    let names = labels.called_names(
+        &source,
+        |n| super::super::matcher::name_holds_word(n, "lock"),
+        super::NameCap {
+            count: 2,
+            bytes: 256,
+        },
+    );
+    assert_eq!(
+        names
+            .kept
+            .iter()
+            .map(|name| (name.name.as_str(), name.line))
+            .collect::<Vec<_>>(),
+        [("readLock", 2), ("writeLock", 8)]
+    );
+    assert_eq!(names.dropped, 0);
+    assert_eq!(names.long_names, 0);
+}
+
+#[test]
+fn word_declarations_keep_callable_kinds_only() {
+    let cases = [
+        (
+            Language::Rust,
+            "rs",
+            "type LockAlias = u8; enum LockEnum { LockVariant } struct LockType { lockField: u8 } trait T { fn lockSignature(&self); } fn lockRun() {}",
+            vec!["lockSignature", "lockRun"],
+        ),
+        (
+            Language::TypeScript,
+            "ts",
+            "type LockAlias = string; enum LockEnum { LockVariant } class LockClass { lockField = 1; lockMethod() {} } function lockRun() {} function* lockGenerator() {} declare function lockSignature(): void;",
+            vec!["lockMethod", "lockRun", "lockGenerator", "lockSignature"],
+        ),
+        (
+            Language::JavaScript,
+            "js",
+            "class LockClass { lockField = 1; lockMethod() {} } function lockRun() {} function* lockGenerator() {}",
+            vec!["lockMethod", "lockRun", "lockGenerator"],
+        ),
+        (
+            Language::Python,
+            "py",
+            "class LockClass:\n def lockMethod(self): pass\ndef lockRun(): pass\nlockValue = 1\n",
+            vec!["lockMethod", "lockRun"],
+        ),
+        (
+            Language::Go,
+            "go",
+            "package p\ntype LockType struct { lockField int }\nfunc lockRun() {}\nfunc (t LockType) lockMethod() {}",
+            vec!["lockRun", "lockMethod"],
+        ),
+        (
+            Language::Java,
+            "java",
+            "class LockClass { int lockField; void lockMethod() {} }",
+            vec!["lockMethod"],
+        ),
+    ];
+    for (lang, ext, source, expected) in cases {
+        let labels = Labels::new(source, lang, ext).unwrap();
+        let defs = labels.word_declarations(
+            |n| super::super::matcher::name_holds_word(n, "lock"),
+            super::NameCap {
+                count: 64,
+                bytes: 256,
+            },
+        );
+        assert_eq!(
+            defs.kept
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{lang:?}"
+        );
+    }
+}
+
+#[test]
+fn an_arrow_function_const_is_callable_and_a_plain_const_is_not() {
+    let source = "const lockArrow = () => 1;\nconst lockFunction = function() {};\nconst lockGenerator = function*() {};\nconst lockPlain = 1;\nfunction\nlockRun() {\n return 1;\n}\n";
+    let labels = Labels::new(source, Language::TypeScript, "ts").unwrap();
+    let defs = labels.word_declarations(
+        |n| super::super::matcher::name_holds_word(n, "lock"),
+        super::NameCap {
+            count: 64,
+            bytes: 256,
+        },
+    );
+    assert_eq!(
+        defs.kept
+            .iter()
+            .map(|d| (d.name.as_str(), d.line, d.first_line, d.end_line))
+            .collect::<Vec<_>>(),
+        [
+            ("lockArrow", 1, 1, 1),
+            ("lockFunction", 2, 2, 2),
+            ("lockGenerator", 3, 3, 3),
+            ("lockRun", 6, 5, 8)
+        ]
+    );
+}
+
+#[test]
+fn a_capped_declaration_walk_refuses_labels_before_name_links() {
+    let source = format!(
+        "fn run() {{ {}readLock();{} }}",
+        "{".repeat(510),
+        "}".repeat(510)
+    );
+    assert!(matches!(
+        Labels::new(&source, Language::Rust, "rs"),
+        Err(Unlabelled::WalkCap)
+    ));
+}
+
+#[test]
+fn the_call_shape_is_plain_own_member_or_other_per_language() {
+    use super::CallShape::{Other, OwnMember, Plain};
+    let cases = [
+        (
+            Language::Rust,
+            "rs",
+            "fn run() { ping(); self.ping(); Self::ping(); Type::ping(); other.ping(); ping!(); ping::<u8>(); wrap!(ping()); }",
+            vec![
+                Plain, OwnMember, OwnMember, Other, Other, Other, Other, Other,
+            ],
+        ),
+        (
+            Language::TypeScript,
+            "ts",
+            "ping(); this.ping(); other.ping(); new ping(); ping<string>();",
+            vec![Plain, OwnMember, Other, Other, Other],
+        ),
+        (
+            Language::JavaScript,
+            "js",
+            "ping(); this.ping(); other.ping(); new ping();",
+            vec![Plain, OwnMember, Other, Other],
+        ),
+        (
+            Language::Python,
+            "py",
+            "ping()\nself.ping()\nother.ping()\n",
+            vec![Plain, OwnMember, Other],
+        ),
+        (
+            Language::Go,
+            "go",
+            "package p\nfunc run() { ping(); self.ping(); other.ping() }",
+            vec![Plain, Other, Other],
+        ),
+        (Language::C, "c", "void run() { ping(); }", vec![Other]),
+    ];
+    for (lang, ext, source, expected) in cases {
+        let labels = Labels::new(source, lang, ext).unwrap();
+        let actual: Vec<_> = source
+            .match_indices("ping")
+            .map(|(start, _)| {
+                let (shape, name) = labels.call_shape(source, start);
+                if shape != Other {
+                    assert_eq!(name, Some("ping"));
+                }
+                shape
+            })
+            .collect();
+        assert_eq!(actual, expected, "{lang:?}");
+    }
+}
+
+#[test]
+fn a_single_callable_definition_needs_exactly_one_declaration_of_the_name() {
+    for source in [
+        "fn ping() {}",
+        "trait T { fn ping(&self); }",
+        "fn\nping() {}",
+    ] {
+        let labels = Labels::new(source, Language::Rust, "rs").unwrap();
+        let def = labels.single_callable_def(|name| name == "ping").unwrap();
+        assert_eq!(def.name, "ping");
+        assert_eq!(def.line, if source.starts_with("fn\n") { 2 } else { 1 });
+    }
+    for source in [
+        "fn ping() {} fn ping() {}",
+        "fn ping() {} struct T { ping: u8 }",
+        "type ping = u8;",
+        "const ping: u8 = 1;",
+    ] {
+        let labels = Labels::new(source, Language::Rust, "rs").unwrap();
+        assert!(
+            labels.single_callable_def(|name| name == "ping").is_none(),
+            "{source}"
+        );
+    }
+    for (source, callable) in [
+        ("function ping() {}", true),
+        ("function* ping() {}", true),
+        ("declare function ping(): void;", true),
+        ("const ping = () => 1;", true),
+        ("const ping = function() {};", true),
+        ("const ping = function*() {};", true),
+        ("const ping = 1;", false),
+        ("type ping = string;", false),
+    ] {
+        let labels = Labels::new(source, Language::TypeScript, "ts").unwrap();
+        assert_eq!(
+            labels.single_callable_def(|name| name == "ping").is_some(),
+            callable,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn the_method_test_reads_impl_trait_class_and_method_kinds() {
+    let cases = [
+        (Language::Rust, "rs", "impl T { fn ping(&self) {} }", true),
+        (Language::Rust, "rs", "trait T { fn ping(&self); }", true),
+        (Language::Rust, "rs", "mod t { fn ping() {} }", false),
+        (Language::TypeScript, "ts", "class T { ping() {} }", true),
+        (Language::TypeScript, "ts", "function ping() {}", false),
+        (Language::JavaScript, "js", "class T { ping() {} }", true),
+        (Language::JavaScript, "js", "function ping() {}", false),
+        (
+            Language::Python,
+            "py",
+            "class T:\n def ping(self): pass\n",
+            true,
+        ),
+        (Language::Python, "py", "def ping(): pass", false),
+        // A function scope gives a nested declaration no class container.
+        (
+            Language::Python,
+            "py",
+            "def outer():\n def ping(): pass\n",
+            false,
+        ),
+        (Language::Go, "go", "package p\nfunc (t T) ping() {}", true),
+        (Language::Go, "go", "package p\nfunc ping() {}", false),
+    ];
+    for (lang, ext, source, expected) in cases {
+        let labels = Labels::new(source, lang, ext).unwrap();
+        assert_eq!(
+            labels
+                .single_callable_def(|name| name == "ping")
+                .unwrap()
+                .is_method,
+            expected,
+            "{source}"
+        );
+    }
+}
+
 // ============================================================================
 // Fixtures
 // ============================================================================

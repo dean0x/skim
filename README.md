@@ -160,8 +160,8 @@ Its notes do not change files or the exit code. Fix broken markers by hand befor
 
 ### Code Search (`skim search`)
 - **Scan engine** — `skim search NAME` reads the files at query time. There is no index, no build step, no cache and no git hook. Each query lists or counts every matching line. Every bound is a named constant, and each bound that fires prints a marker with exact counts. `skim search` records no analytics row.
-- **Labelled view** — a bare identifier (`skim search launchWorker`) gives the definition first, with its line range. Each call follows, with the function that holds it. Imports, strings, comments, text and partial matches are counted by role (`--all` lists them, `--full` prints the text of long sections). When a name has two or more definitions, each definition is listed and a note gives the count. Calls are not split by definition. Roles come from syntax, not from types.
-- **Word view** — a quoted argument with several words (`skim search "temporal staleness check"`) lists the files that hold all the words first, ranked by file kind (source, test, docs, changelog, generated) and then by count. It lists 10 files by default (`--limit N` lists more). If fewer than 3 files hold all the words, files with fewer words follow.
+- **Labelled view** — a bare identifier (`skim search launchWorker`) gives the definition first, with its line range. Each call follows, with the function that holds it. Imports, strings, comments, text and partial matches are counted by role (`--all` lists them, `--full` prints the text of long sections). When a name has two or more definitions, a call line can show `(def N)`. N is the definition's name line. Every call match on that line must fit the one definition of the name in its own file. A plain call needs a free function and no import of that name. A `self`, `this` or `Self` call needs a method. This rule covers Rust, TypeScript, JavaScript, Python and Go only. Other calls stay not split. If any call line is assigned, the clash note counts assigned and other call lines, not individual calls. With none assigned, the note gives the definition count and states that no calls are split. Roles come from syntax, not from types.
+- **Word view** — a quoted argument with several words (`skim search "temporal staleness check"`) lists the files that hold all the words first. Rank order is file kind (source, test, docs, changelog, generated), then a file name that holds a query word, then count. The name test ignores case and matches whole tokens in the file stem or definition name. It lists 10 files by default (`--limit N` lists more). If fewer than 3 files hold all the words, files with fewer words follow. The `called:` block also lists, by name, callable definitions that the listed source files call when the definition name holds a query word. Each definition appears once, with its source range and first caller. Definitions in listed files are skipped. The block uses only files already parsed; it does not resolve imports or calls. Bounds give exact counts and a remedy.
 - **Flags in the rg style** — `-i`, `-S` (smart case), `-w`, `-F`, `-E` (regex), `-g GLOB` and `-t TYPE` (repeat them; a leading `!` leaves files out), `-l` (paths), `-c` (counts per file), `-C N` (context lines), plus `--all`, `--full`, `--json`, `--limit N`, `--offset N` and `--root DIR`. Short boolean flags can join (`-iwF`). The pattern is a literal and is case sensitive by default. The flag set is closed: an unknown flag exits 2, and `skim search` starts no other program. `-l` and `-c` print in path order.
 - **Universe** — every tracked text file, plus the untracked files that the ignore files allow. There is no language list and no file cap. A file that is binary, not UTF-8, above 5 MiB, unreadable, missing, a link, or outside the root is not read. It is counted with its reason in the last line of the output (`total: …; N files searched, M left out`).
 - **Limit while a query runs** — a query checks each folder before it reads the files in it. A folder that another process replaces with a link while a query runs can make the query read outside the root. `rg` and `grep` have the same limit. Do not change the work tree while a query runs.
@@ -170,6 +170,35 @@ Its notes do not change files or the exit code. Fix broken markers by hand befor
 - **Output and exit codes** — `--json` prints one compact object on one line (an error is `{"error":"…"}`). `--limit N` and `--offset N` page the files in rank order. Exit codes: `0` a line matched, `1` no match, `2` an error (an unknown or removed flag, a bad value, an invalid regex, a bad `--root`, a git index or repository state that cannot be read), and `141` on unix when the reader of stdout stops.
 - **Old search data** — skim 2.x built an index and installed git hooks. `skim init` and `skim init --uninstall` remove the old hook block and keep every other line of the hook files. `skim init` needs an installed agent and changes nothing without one; `skim init --uninstall` removes the block with no agent, but it removes skim completely. A hook that cannot be read gets its own note and the other hooks are still cleaned. `skim --clear-cache` removes the old index data under the cache folder, including the journal and temp files that a crash left, and prints a note with the count of every entry it leaves in place. It does not enter a folder that another user owns. `skim doctor` reports both as advisory lines, and says so when it cannot read a hook or the old index folder. A query never deletes a file.
 - **Removed flags** — each exits 2 with a message that names the replacement, and prints nothing on stdout. `--ast`: use ast-grep. `--hot`, `--cold`, `--risky` and `--blast-radius`: use `skim heatmap`. `--phrase` and `--near`: use `-F 'exact words'` or `-E`. `--lang`: use `-t TYPE`. `-j`: use `--json`. `--weights`, `--build`, `--rebuild`, `--update`, `--stats`, `--install-hooks` and `--remove-hooks` have no replacement, because there is no index.
+
+#### Agent trial
+
+This trial compares `skim search` with three code search tools for agents. Each run gives one question to an LLM sub-agent (Claude Sonnet), with one search tool and a file read tool. Each task ran 3 times for each tool: 4 lookup tasks, 8 multi-site tasks, 2 same-name tasks and 2 pattern tasks, on one Rust repository and two TypeScript repositories. A scorer compares each answer with a hand-checked answer key, and the pattern class is for information only. The trial ran from 2026-11-14 to 2026-11-17. The re-check ran only the skim arm again, on the lookup and same-name classes, with the search changes of this release, on 2026-11-18, with the same prompts, repository versions and scorer.
+
+Median calls counts the search calls in the wrapper log of each run; file reads are not in that log. Median tokens is the size of the last model turn above the fixed prompt, so it is a lower bound of the real cost. The prompt showed the subcommand word, so some skim calls typed it twice; each such call exits 2 and the agent calls again. These calls are in the skim counts: lookup 14 of 35 calls (trial) and 7 of 23 (re-check), same name 4 of 11 (trial) and 4 of 10 (re-check). Without them, the skim median calls is 1.0 in lookup and in same name, in both runs.
+
+| Class | Run | Tool (version) | Right | Median calls | Median tokens (lower bound) |
+|---|---|---|---:|---:|---:|
+| Lookup | re-check | skim (this release) | 10/12 | 2.0 | 3,768 |
+| Lookup | trial | skim 3.0.0 pre-release | 9/12 | 2.0 | 3,548 |
+| Lookup | trial | ast-grep 0.51.2 | 10/12 | 3.0 | 8,447 |
+| Lookup | trial | Semble 0.7.3 | 6/12 | 1.0 | 3,634 |
+| Lookup | trial | Serena 2.1.0 | 9/12 | 1.5 | 5,724 |
+| Multi-site | trial | skim 3.0.0 pre-release | 24/24 | 1.0 | 2,596 |
+| Multi-site | trial | ast-grep 0.51.2 | 19/24 | 2.5 | 7,018 |
+| Multi-site | trial | Semble 0.7.3 | 7/24 | 4.0 | 22,218 |
+| Multi-site | trial | Serena 2.1.0 | 18/24 | 1.5 | 5,240 |
+| Same name | re-check | skim (this release) | 6/6 | 2.0 | 3,504 |
+| Same name | trial | skim 3.0.0 pre-release | 6/6 | 2.0 | 3,176 |
+| Same name | trial | ast-grep 0.51.2 | 5/6 | 2.5 | 12,886 |
+| Same name | trial | Semble 0.7.3 | 1/6 | 4.5 | 29,623 |
+| Same name | trial | Serena 2.1.0 | 6/6 | 1.0 | 3,948 |
+| Pattern (info) | trial | skim 3.0.0 pre-release | 6/6 | 3.0 | 7,342 |
+| Pattern (info) | trial | ast-grep 0.51.2 | 6/6 | 3.0 | 7,168 |
+| Pattern (info) | trial | Semble 0.7.3 | 3/6 | 7.5 | 96,104 |
+| Pattern (info) | trial | Serena 2.1.0 | 6/6 | 1.5 | 8,536 |
+
+skim loses in these cells: lookup right answers in the trial (9 against 10 for ast-grep), median calls in lookup (against Semble and Serena), in same name and in pattern (against Serena), lookup tokens in the re-check (against Semble), and pattern tokens (against ast-grep).
 
 ### LLM Proxy (`skim proxy`)
 - Resident loopback HTTP/1.1 reverse proxy that sits between your agent and the LLM API

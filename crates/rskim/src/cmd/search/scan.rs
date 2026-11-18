@@ -8,8 +8,9 @@
 //!
 //! **Phase A** reads every admitted file once. It counts the matching lines
 //! exactly (per word for a word query), notes whether a matching line holds a
-//! declaration keyword before the match, takes the file prior and a digest of
-//! the content. No line text is kept, so memory is O(files).
+//! declaration keyword before the match, takes the file prior, the file-stem
+//! name hit and a digest of the content. No line text is kept, so memory is
+//! O(files).
 //!
 //! **Phase B** visits the matched files in parse order. It re-reads each file
 //! and compares the digest (a file that changed is counted and not listed), then
@@ -42,11 +43,13 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use rskim_core::Language;
 
-use super::matcher::Matcher;
-use super::rank::{FilePrior, WORD_VIEW_BEST_LINES, WordInput, file_prior, rank_words};
+use super::matcher::{Matcher, name_holds_word};
+use super::rank::{
+    FilePrior, WORD_VIEW_BEST_LINES, WordInput, file_name_hit, file_prior, rank_words,
+};
 use super::roles::{
-    Holder, Labelling, Labels, Role, RoleCounts, Unlabelled, declaration_keywords,
-    has_declaration_keyword,
+    CallShape, CalledName, Holder, Labelling, Labels, NameCap, Role, RoleCounts, SingleDef,
+    Unlabelled, WordDeclaration, declaration_keywords, has_declaration_keyword, is_partial,
 };
 use super::universe::{Candidate, Containment, LeftOut, LeftOutCounts, Listing, Read};
 
@@ -79,6 +82,17 @@ pub(super) const MAX_DEF_SITES_PER_FILE: usize = 100;
 /// past it are counted in the role counts and not listed.
 pub(super) const MAX_DEF_SITES: usize = 10_000;
 
+/// Most distinct matching callee names kept per source file.
+pub(super) const MAX_CALLED_NAMES_PER_FILE: usize = 32;
+/// Most callable word declarations kept per file.
+pub(super) const MAX_WORD_DEFS_PER_FILE: usize = 64;
+/// Most callable word declarations kept over all files, in parse order.
+pub(super) const MAX_WORD_DEFS: usize = 5_000;
+/// Most bytes in a stored name. Longer names are counted, not copied.
+pub(super) const MAX_NAME_BYTES: usize = 256;
+/// Most called declarations listed in the word view.
+pub(super) const MAX_CALLED_SHOWN: usize = 10;
+
 /// The bounds of one scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Limits {
@@ -86,6 +100,11 @@ pub(super) struct Limits {
     pub(super) max_def_sites: usize,
     pub(super) max_def_sites_per_file: usize,
     pub(super) max_context_lines: usize,
+    pub(super) max_called_names_per_file: usize,
+    pub(super) max_word_defs_per_file: usize,
+    pub(super) max_word_defs: usize,
+    pub(super) max_name_bytes: usize,
+    pub(super) max_called_shown: usize,
     pub(super) parse_files: usize,
     pub(super) parse_bytes: usize,
     pub(super) per_file_parse_cap: usize,
@@ -98,6 +117,11 @@ impl Default for Limits {
             max_def_sites: MAX_DEF_SITES,
             max_def_sites_per_file: MAX_DEF_SITES_PER_FILE,
             max_context_lines: MAX_CONTEXT_LINES,
+            max_called_names_per_file: MAX_CALLED_NAMES_PER_FILE,
+            max_word_defs_per_file: MAX_WORD_DEFS_PER_FILE,
+            max_word_defs: MAX_WORD_DEFS,
+            max_name_bytes: MAX_NAME_BYTES,
+            max_called_shown: MAX_CALLED_SHOWN,
             parse_files: PARSE_BUDGET_FILES,
             parse_bytes: PARSE_BUDGET_BYTES,
             per_file_parse_cap: PER_FILE_PARSE_CAP,
@@ -128,6 +152,8 @@ pub(super) enum QueryPlan {
 /// The query and how to read hits.
 pub(super) struct ScanQuery {
     pub(super) plan: QueryPlan,
+    /// Original query words for the name tier; empty for a pattern.
+    pub(super) words: Vec<String>,
     /// The pattern is a bare identifier: a hit inside a longer identifier is
     /// `partial`.
     pub(super) identifier: bool,
@@ -174,6 +200,8 @@ pub(super) struct Record {
     pub(super) holder: Option<Holder>,
     /// For a `def`: the 1-based first and last line of the declaration.
     pub(super) def_lines: Option<(u32, u32)>,
+    /// The name line of the assigned same-file definition, if any.
+    pub(super) call_def: Option<u32>,
     /// The line, clipped to [`LINE_WIDTH_CAP`] bytes, without a trailing `\r`.
     pub(super) text: String,
     /// Bytes clipped from the end of the line.
@@ -190,6 +218,19 @@ pub(super) struct ContextLine {
     pub(super) truncated_bytes: u32,
 }
 
+/// Name evidence from the existing phase-B parse, independent of line records.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct NameLinks {
+    pub(super) called: Vec<CalledName>,
+    pub(super) defs: Vec<WordDeclaration>,
+    /// Distinct byte-bounded callee names beyond the per-file cap.
+    pub(super) called_dropped: u64,
+    /// Callable sites beyond the per-file or all-files cap, counted once.
+    pub(super) defs_dropped: u64,
+    /// Eligible callee occurrences and declaration sites above the byte cap.
+    pub(super) long_names: u64,
+}
+
 /// One matched file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FileScan {
@@ -199,11 +240,16 @@ pub(super) struct FileScan {
     pub(super) lines: u32,
     /// Matching lines of each word (word view only; empty otherwise).
     pub(super) word_lines: Vec<u32>,
+    /// The file stem holds a query word, computed once in phase A.
+    pub(super) name_hit: bool,
     /// `None` when the file has labels; the reason when it has none.
     pub(super) unlabelled: Option<Unlabelled>,
     /// Exact role counts over all matching lines. Empty after a counts-only
     /// scan.
     pub(super) roles: RoleCounts,
+    /// Exact assigned call-line count, including lines without a stored record.
+    pub(super) assigned_calls: u32,
+    pub(super) links: NameLinks,
     /// Definition lines, up to [`Limits::max_def_sites_per_file`].
     pub(super) defs: Vec<Record>,
     /// Other stored lines, in line order.
@@ -213,6 +259,15 @@ pub(super) struct FileScan {
 }
 
 impl FileScan {
+    /// A cut that removes the only definition must also remove its assignments,
+    /// including the exact count of call lines beyond the stored-line quota.
+    fn clear_call_assignments(&mut self) {
+        for record in &mut self.records {
+            record.call_def = None;
+        }
+        self.assigned_calls = 0;
+    }
+
     /// The text of `line` if the file stored it as a record, a definition or a
     /// context line.
     #[cfg(test)]
@@ -266,6 +321,14 @@ pub(super) struct CapsHit {
     pub(super) file_defs: bool,
     /// The cap over all files dropped a definition line.
     pub(super) all_defs: bool,
+    /// Distinct callee names past the per-file cap.
+    pub(super) called_names: bool,
+    /// Word declaration sites past the per-file cap.
+    pub(super) file_word_defs: bool,
+    /// Word declaration sites past the all-files cap.
+    pub(super) all_word_defs: bool,
+    /// Eligible names past the byte cap.
+    pub(super) name_bytes: bool,
 }
 
 impl CapsHit {
@@ -273,6 +336,10 @@ impl CapsHit {
         self.stored_lines |= other.stored_lines;
         self.file_defs |= other.file_defs;
         self.all_defs |= other.all_defs;
+        self.called_names |= other.called_names;
+        self.file_word_defs |= other.file_word_defs;
+        self.all_word_defs |= other.all_word_defs;
+        self.name_bytes |= other.name_bytes;
     }
 }
 
@@ -363,6 +430,7 @@ struct Matched {
     digest: u64,
     lines: u32,
     word_lines: Vec<u32>,
+    name_hit: bool,
     keyword_line: bool,
     prior: FilePrior,
 }
@@ -458,6 +526,7 @@ fn phase_a_file(
         digest: digest(&text),
         lines: found.lines,
         word_lines: found.word_lines,
+        name_hit: file_name_hit(&candidate.rel, &query.words),
         keyword_line: found.keyword_line,
         prior: file_prior(&candidate.rel, &text),
     });
@@ -600,6 +669,7 @@ fn plan_jobs(counted: &Counted<'_>) -> (Vec<Job>, bool) {
                     path: path(m),
                     prior: m.prior,
                     counts: &m.word_lines,
+                    name_hit: m.name_hit,
                 })
                 .collect();
             order = rank_words(&inputs).into_iter().map(|r| r.index).collect();
@@ -728,6 +798,7 @@ impl Counted<'_> {
         let mut context_hidden = 0u64;
         let mut caps = CapsHit::default();
         let mut defs_kept = 0usize;
+        let mut word_defs_kept = 0usize;
         let mut files = Vec::with_capacity(results.len());
         for mut result in results {
             // The results are in parse order, so the cap is the same on every run.
@@ -735,7 +806,23 @@ impl Counted<'_> {
             if result.file.defs.len() > room {
                 caps.all_defs = true;
                 result.file.defs.truncate(room);
+                // Assignment already requires one stored definition. Any cut
+                // here removes that witness, after the per-file final check.
+                result.file.clear_call_assignments();
             }
+            // Count each site at its cut, after the per-file cap, in parse order.
+            let links = &mut result.file.links;
+            let room = self
+                .config
+                .limits
+                .max_word_defs
+                .saturating_sub(word_defs_kept);
+            if links.defs.len() > room {
+                caps.all_word_defs = true;
+                links.defs_dropped += (links.defs.len() - room) as u64;
+                links.defs.truncate(room);
+            }
+            word_defs_kept += links.defs.len();
             caps.merge(result.caps);
             defs_kept += result.file.defs.len();
             if let Some(bytes) = result.parsed_bytes {
@@ -773,8 +860,11 @@ fn file_scan(
         prior: m.prior,
         lines: m.lines,
         word_lines: m.word_lines.clone(),
+        name_hit: m.name_hit,
         unlabelled,
         roles,
+        assigned_calls: 0,
+        links: NameLinks::default(),
         defs: Vec::new(),
         records: Vec::new(),
         context: Vec::new(),
@@ -846,7 +936,13 @@ fn phase_b_file(job: &Job, counted: &Counted<'_>) -> Labelled {
         records: job.record_quota,
         defs: config.limits.max_def_sites_per_file,
     };
-    let caps = collect_lines(&text, &labelling, config.query, select, quota, &mut file);
+    let mut caps = collect_lines(&text, &labelling, config.query, select, quota, &mut file);
+    if let (QueryPlan::Words(_), Labelling::Labelled(labels)) = (&config.query.plan, &labelling) {
+        file.links = name_links(&text, labels, config.query, file.prior, config.limits);
+        caps.called_names = file.links.called_dropped > 0;
+        caps.file_word_defs = file.links.defs_dropped > 0;
+        caps.name_bytes = file.links.long_names > 0;
+    }
     let text = (config.context > 0 && !file.records.is_empty()).then_some(text);
     Labelled {
         file,
@@ -854,6 +950,45 @@ fn phase_b_file(job: &Job, counted: &Counted<'_>) -> Labelled {
         caps,
         text,
         context_hidden: 0,
+    }
+}
+
+/// Reuse only the phase-B tree and its verified source. Non-code labels return
+/// no evidence. Callees come from source files; declarations use every parsed
+/// code file. Name cuts do not cut matching lines or affect their cap notices.
+fn name_links(
+    text: &str,
+    labels: &Labels,
+    query: &ScanQuery,
+    prior: FilePrior,
+    limits: Limits,
+) -> NameLinks {
+    let test = |name: &str| query.words.iter().any(|word| name_holds_word(name, word));
+    let called = if prior == FilePrior::Source {
+        labels.called_names(
+            text,
+            test,
+            NameCap {
+                count: limits.max_called_names_per_file,
+                bytes: limits.max_name_bytes,
+            },
+        )
+    } else {
+        Default::default()
+    };
+    let defs = labels.word_declarations(
+        test,
+        NameCap {
+            count: limits.max_word_defs_per_file,
+            bytes: limits.max_name_bytes,
+        },
+    );
+    NameLinks {
+        called: called.kept,
+        defs: defs.kept,
+        called_dropped: called.dropped,
+        defs_dropped: defs.dropped,
+        long_names: called.long_names + defs.long_names,
     }
 }
 
@@ -895,6 +1030,12 @@ fn collect_lines(
 ) -> CapsHit {
     let mut caps = CapsHit::default();
     let mut other_lines = 0usize;
+    let target = match (&query.plan, query.identifier, labelling) {
+        (QueryPlan::Pattern(matcher), true, Labelling::Labelled(labels)) => {
+            labels.single_callable_def(|name| matcher.matches(name).any(|r| r == (0..name.len())))
+        }
+        _ => None,
+    };
     for (number, start, line) in numbered_lines(text) {
         let (hit, distinct) = match &query.plan {
             QueryPlan::Pattern(matcher) => (
@@ -918,6 +1059,17 @@ fn collect_lines(
             continue;
         };
         file.roles.add(hit.role);
+        let call_def = match (&target, &query.plan, labelling) {
+            (Some(target), QueryPlan::Pattern(matcher), Labelling::Labelled(labels))
+                if hit.role == Role::Call =>
+            {
+                assigned_call_line(text, line, start, matcher, labels, target)
+            }
+            _ => None,
+        };
+        if call_def.is_some() {
+            file.assigned_calls = file.assigned_calls.saturating_add(1);
+        }
         let is_def = hit.role == Role::Def;
         other_lines += usize::from(!is_def);
         let room = if is_def {
@@ -944,6 +1096,7 @@ fn collect_lines(
             role: hit.role,
             holder: hit.holder,
             def_lines: hit.def_lines,
+            call_def,
             text,
             truncated_bytes,
             distinct_words: distinct,
@@ -967,7 +1120,47 @@ fn collect_lines(
         Select::BestWords => other_lines.min(WORD_VIEW_BEST_LINES),
     };
     caps.stored_lines = file.records.len() < wanted;
+    // Counts cover the whole file, not just its stored prefix. Imports can
+    // follow calls, and the per-file definition quota can remove the witness.
+    let valid = target.as_ref().is_some_and(|target| {
+        file.roles.get(Role::Def) == 1
+            && file.defs.len() == 1
+            && file.defs[0].line == target.line
+            && (target.is_method || file.roles.get(Role::Import) == 0)
+    });
+    if !valid {
+        file.clear_call_assignments();
+    }
     caps
+}
+
+/// Every call match on a line must fit the same exact-name declaration.
+/// Non-call matches on that line do not supply evidence for assignment.
+fn assigned_call_line(
+    source: &str,
+    line: &str,
+    start: usize,
+    matcher: &Matcher,
+    labels: &Labels,
+    target: &SingleDef<'_>,
+) -> Option<u32> {
+    let mut calls = 0usize;
+    for range in matcher.matches(line) {
+        let absolute = start + range.start..start + range.end;
+        if is_partial(line, &range) || labels.role(&absolute) != Role::Call {
+            continue;
+        }
+        calls += 1;
+        let (shape, name) = labels.call_shape(source, absolute.start);
+        let fits = matches!(
+            (shape, target.is_method),
+            (CallShape::Plain, false) | (CallShape::OwnMember, true)
+        );
+        if name != Some(target.name) || !fits {
+            return None;
+        }
+    }
+    (calls > 0).then_some(target.line)
 }
 
 /// Keep `record` among the best `quota` records of the word view: most distinct
