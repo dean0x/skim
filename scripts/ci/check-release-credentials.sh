@@ -14,12 +14,13 @@
 # npm (env: NODE_AUTH_TOKEN, NPM_PLATFORM_PACKAGES)
 #   1. `npm whoami` must pass. A token that is not valid fails with E401.
 #   2. For each package (rskim and @rskim/<platform>), read the `latest`
-#      dist-tag with `npm view`. Then send
-#      `PUT /-/package/<pkg>/dist-tags/latest` with that same version, and
-#      require HTTP 2xx. The registry accepts that write only from a token
-#      that can write the package, so a read-only token or a token without
-#      that package gets 401 or 403. The tag keeps its value, so the probe
-#      changes nothing.
+#      version with `npm view`. Then send
+#      `PUT /-/package/<pkg>/dist-tags/skim-release-check` with that version,
+#      and then `DELETE` the same tag. Each must get HTTP 2xx. The registry
+#      accepts these writes only from a token that can write the package, so
+#      a read-only token or a token without that package gets 401 or 403.
+#      The probe never writes `latest` or any other tag, so an old value from
+#      `npm view` can not move a real tag.
 #   The probe uses curl, not `npm dist-tag add`: npm sends no PUT when the
 #   tag already has the version, so it would exit 0 for any valid token.
 #   The script does not read `npm access list packages <user>`. That
@@ -35,6 +36,7 @@
 
 set -uo pipefail
 
+readonly NPM_PROBE_TAG="skim-release-check"
 readonly NPM_REGISTRY="https://registry.npmjs.org"
 readonly TAP_REPO="dean0x/homebrew-tap"
 readonly SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
@@ -74,19 +76,25 @@ check_npm() {
     packages+=("@rskim/${platform}")
   done
 
-  local failed=0 pkg latest code
+  local failed=0 pkg latest url code
   for pkg in "${packages[@]}"; do
     if ! latest=$(npm view "${pkg}" dist-tags.latest) || ! [[ "${latest}" =~ ${SEMVER_RE} ]]; then
       echo "::error::npm check: can not read the latest version of ${pkg}"
       failed=1
       continue
     fi
-    code=$(http_status "${NODE_AUTH_TOKEN:-}" application/json PUT \
-      "${NPM_REGISTRY}/-/package/${pkg/\//%2f}/dist-tags/latest" "\"${latest}\"")
-    if [[ "${code}" =~ ^2[0-9][0-9]$ ]]; then
-      echo "✅ ${pkg}: the token can write (latest stays ${latest})"
-    else
+    url="${NPM_REGISTRY}/-/package/${pkg/\//%2f}/dist-tags/${NPM_PROBE_TAG}"
+    code=$(http_status "${NODE_AUTH_TOKEN:-}" application/json PUT "${url}" "\"${latest}\"")
+    if ! [[ "${code}" =~ ^2[0-9][0-9]$ ]]; then
       echo "::error::npm check: the token of ${user} can not write ${pkg} (HTTP ${code}), so it can not publish it"
+      failed=1
+      continue
+    fi
+    code=$(http_status "${NODE_AUTH_TOKEN:-}" application/json DELETE "${url}" "")
+    if [[ "${code}" =~ ^2[0-9][0-9]$ ]]; then
+      echo "✅ ${pkg}: the token can write (probe tag ${NPM_PROBE_TAG} added and removed)"
+    else
+      echo "::error::npm check: the token of ${user} can not remove the ${NPM_PROBE_TAG} tag of ${pkg} (HTTP ${code})"
       failed=1
     fi
   done

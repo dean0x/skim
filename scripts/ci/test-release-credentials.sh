@@ -49,50 +49,70 @@ case "$1" in
 esac
 STUB
 
-# Stub curl. It reads the config on stdin and logs which stub token it holds.
-# Behaviour comes from these variables:
+# Stub curl. Like the real curl, it reads a config from stdin only with
+# `-K -`, and prints the HTTP code only with `-w '%{http_code}'`. A call with
+# no stub token gets HTTP 401. A write to any tag other than the probe tag
+# gets HTTP 500 and logs "wrote other tag". Behaviour comes from these
+# variables:
 #   STUB_CURL_EXIT      a curl exit code with no response (prints 000)
-#   STUB_PUT_CODE       HTTP code of a dist-tag PUT (default 200)
+#   STUB_PUT_CODE       HTTP code of a probe-tag PUT (default 200)
 #   STUB_WRITE_DENY     a package whose PUT gets STUB_DENY_CODE, or "all"
 #   STUB_DENY_CODE      HTTP code of a refused PUT (default 403)
+#   STUB_DELETE_CODE    HTTP code of a probe-tag DELETE (default 200)
 #   STUB_DISPATCH_CODE  HTTP code of the dispatch (default 204)
 cat > "$WORK/curl" <<'STUB'
 #!/usr/bin/env bash
 echo "curl $*" >> "$STUB_LOG"
-config=$(cat)
-case "$config" in
-  *"Bearer stub-npm-token"*) echo "auth npm-token" >> "$STUB_LOG" ;;
-  *"Bearer stub-tap-token"*) echo "auth tap-token" >> "$STUB_LOG" ;;
-  *) echo "auth none" >> "$STUB_LOG" ;;
-esac
 out=/dev/null
 url=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) out="$2"; shift ;;
-    https://*) url="$1" ;;
+method=GET
+config=""
+write_code=0
+prev=""
+for arg in "$@"; do
+  case "$prev" in
+    -o) out="$arg" ;;
+    -X) method="$arg" ;;
+    -K) [ "$arg" = - ] && config=$(cat) ;;
+    -w) [ "$arg" = '%{http_code}' ] && write_code=1 ;;
   esac
-  shift
+  case "$arg" in
+    https://*) url="$arg" ;;
+  esac
+  prev="$arg"
 done
+case "$config" in
+  *"Bearer stub-npm-token"*) auth=npm-token ;;
+  *"Bearer stub-tap-token"*) auth=tap-token ;;
+  *) auth=none ;;
+esac
+echo "auth $auth" >> "$STUB_LOG"
 if [ "${STUB_CURL_EXIT:-0}" != 0 ]; then
-  printf '000'
+  [ "$write_code" = 1 ] && printf '000'
   echo "curl: (7) Failed to connect" >&2
   exit "$STUB_CURL_EXIT"
 fi
-case "$url" in
-  */dist-tags/latest)
-    pkg="${url#https://registry.npmjs.org/-/package/}"
-    pkg="${pkg%/dist-tags/latest}"
-    if [ "${STUB_WRITE_DENY:-}" = all ] || [ "$pkg" = "${STUB_WRITE_DENY:-}" ]; then
-      code="${STUB_DENY_CODE:-403}"
-    else
-      code="${STUB_PUT_CODE:-200}"
-    fi ;;
-  */dispatches) code="${STUB_DISPATCH_CODE:-204}" ;;
-  *) code=404 ;;
-esac
+pkg="${url#https://registry.npmjs.org/-/package/}"
+pkg="${pkg%%/dist-tags/*}"
+if [ "$auth" = none ]; then
+  code=401
+else
+  case "$method $url" in
+    "PUT "*/dist-tags/skim-release-check)
+      if [ "${STUB_WRITE_DENY:-}" = all ] || [ "$pkg" = "${STUB_WRITE_DENY:-}" ]; then
+        code="${STUB_DENY_CODE:-403}"
+      else
+        code="${STUB_PUT_CODE:-200}"
+      fi ;;
+    "DELETE "*/dist-tags/skim-release-check) code="${STUB_DELETE_CODE:-200}" ;;
+    *" "*/dist-tags/*) echo "wrote other tag" >> "$STUB_LOG"; code=500 ;;
+    "POST "*/dispatches) code="${STUB_DISPATCH_CODE:-204}" ;;
+    *) code=404 ;;
+  esac
+fi
 echo "{\"stub\":\"HTTP $code\"}" > "$out"
-printf '%s' "$code"
+[ "$write_code" = 1 ] && printf '%s' "$code"
+exit 0
 STUB
 chmod +x "$WORK/npm" "$WORK/curl"
 
@@ -127,13 +147,23 @@ expect() {
 
 count() { grep -c -- "$1" <<< "$2"; }
 
+PROBE="dist-tags/skim-release-check"
+
+# probe_pair PKG_URL_NAME — true when the log has a PUT and then a DELETE of
+# the probe tag of that package.
+probe_pair() {
+  local put del
+  put=$(grep -n -- "-X PUT .* https://registry.npmjs.org/-/package/$1/$PROBE\$" <<< "$CALLS" | head -1 | cut -d: -f1)
+  del=$(grep -n -- "-X DELETE .* https://registry.npmjs.org/-/package/$1/$PROBE\$" <<< "$CALLS" | head -1 | cut -d: -f1)
+  [ -n "$put" ] && [ -n "$del" ] && [ "$put" -lt "$del" ]
+}
+
 case_publish_token_passes() {
   run_check npm
   [ "$CODE" = 0 ] &&
     [ "$(count '^curl .*-X PUT' "$CALLS")" = 3 ] &&
-    grep -q -- '-X PUT .*-d "3.0.0" https://registry.npmjs.org/-/package/rskim/dist-tags/latest$' <<< "$CALLS" &&
-    grep -q -- '-d "3.0.0" https://registry.npmjs.org/-/package/@rskim%2fcli-darwin-arm64/dist-tags/latest$' <<< "$CALLS" &&
-    grep -q -- '-d "3.0.0" https://registry.npmjs.org/-/package/@rskim%2fcli-linux-x64/dist-tags/latest$' <<< "$CALLS"
+    [ "$(count '^curl .*-X DELETE' "$CALLS")" = 3 ] &&
+    probe_pair rskim && probe_pair '@rskim%2fcli-darwin-arm64' && probe_pair '@rskim%2fcli-linux-x64'
 }
 
 case_no_listing_no_dist_tag_no_publish() {
@@ -143,10 +173,16 @@ case_no_listing_no_dist_tag_no_publish() {
     ! grep -q '^npm publish' <<< "$CALLS"
 }
 
-case_probe_keeps_value() {
+case_no_other_tag_written() {
+  run_check npm
+  [ "$CODE" = 0 ] && ! grep -q 'wrote other tag' <<< "$CALLS" &&
+    ! grep -q 'dist-tags/latest' <<< "$CALLS"
+}
+
+case_probe_uses_version_read() {
   run_check npm STUB_LATEST=2.9.1-rc.1
   [ "$CODE" = 0 ] &&
-    grep -q -- '-d "2.9.1-rc.1" https://registry.npmjs.org/-/package/rskim/dist-tags/latest$' <<< "$CALLS"
+    grep -q -- "-X PUT .*-d \"2.9.1-rc.1\" https://registry.npmjs.org/-/package/rskim/$PROBE\$" <<< "$CALLS"
 }
 
 case_tokens_not_in_argv() {
@@ -154,8 +190,13 @@ case_tokens_not_in_argv() {
   local npm_calls="$CALLS"
   run_check homebrew
   ! grep -q "$NPM_TOKEN_VALUE\|$TAP_TOKEN_VALUE" <<< "$npm_calls$CALLS" &&
-    [ "$(count '^auth npm-token$' "$npm_calls")" = 3 ] &&
+    [ "$(count '^auth npm-token$' "$npm_calls")" = 6 ] &&
     [ "$(count '^auth tap-token$' "$CALLS")" = 1 ]
+}
+
+case_delete_refused_fails() {
+  run_check npm STUB_DELETE_CODE=403
+  [ "$CODE" = 1 ] && [ "$(count 'can not remove the skim-release-check tag' "$OUT")" = 3 ]
 }
 
 case_invalid_token_fails() {
@@ -239,12 +280,14 @@ echo "Release credential check tests"
 echo ""
 expect "a token that can publish passes when the package listing is refused" case_publish_token_passes
 expect "the npm check never lists packages, never uses npm dist-tag and never publishes" case_no_listing_no_dist_tag_no_publish
-expect "the probe sets latest to the version it read" case_probe_keeps_value
+expect "the probe never writes latest or another tag" case_no_other_tag_written
+expect "the probe tag gets the version that was read" case_probe_uses_version_read
 expect "no token is in argv, and each call sends its own token" case_tokens_not_in_argv
 expect "a token that is not valid fails before any probe" case_invalid_token_fails
 expect "a read-only token (HTTP 403) fails for every package" case_read_only_token_fails
 expect "a token without one package fails for that package" case_one_package_denied_fails
 expect "a refused authentication (HTTP 401) fails" case_auth_refused_fails
+expect "a refused removal of the probe tag fails" case_delete_refused_fails
 expect "a redirect (HTTP 307) on the probe fails" case_redirect_fails
 expect "no response from the registry fails" case_no_response_fails
 expect "an unreadable latest version fails with no probe for that package" case_unreadable_version_fails
