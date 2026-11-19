@@ -968,7 +968,9 @@ fn passthrough_file_content(
     duration: std::time::Duration,
     reason: RawReason,
 ) -> anyhow::Result<exec::StdoutStatus> {
-    crate::debug_log!("{}", reason.banner());
+    if crate::debug::is_debug_enabled() {
+        let _ = exec::write_line_to_stderr(reason.banner());
+    }
     if exec::write_to_stdout(&raw)? == exec::StdoutStatus::PipeClosed {
         return Ok(exec::StdoutStatus::PipeClosed);
     }
@@ -1127,9 +1129,9 @@ fn run_show_file_content(
             // Move raw: the Err arm always returns, so Rust knows raw is
             // available after the match for the Ok path.
             if crate::debug::is_debug_enabled() {
-                eprintln!(
+                let _ = exec::write_line_to_stderr(&format!(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
-                );
+                ));
             }
             if passthrough_file_content(
                 raw,

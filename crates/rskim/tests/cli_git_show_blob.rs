@@ -253,9 +253,10 @@ fn raw_blob(repo: &std::path::Path) -> Vec<u8> {
     out.stdout
 }
 
-/// What `skim git …` actually serves for the same argv.
-fn served(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = common::skim();
+fn skim_git(repo: &std::path::Path, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(common::skim_bin());
+    cmd.env("SKIM_DISABLE_ANALYTICS", "1").env("NO_COLOR", "1");
+    cmd.env_remove("SKIM_REWRITTEN_FROM");
     // PF-026: the escape hatch would make every assertion below vacuous, and a
     // debug banner would satisfy a marker assertion that exists to pin an
     // unconditional one.
@@ -270,8 +271,13 @@ fn served(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
     }
     let mut argv: Vec<&str> = vec!["git"];
     argv.extend_from_slice(args);
-    cmd.current_dir(repo)
-        .args(argv)
+    cmd.current_dir(repo).args(argv);
+    cmd
+}
+
+/// What `skim git …` actually serves for the same argv.
+fn served(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+    skim_git(repo, args)
         .output()
         .unwrap_or_else(|e| panic!("subject `skim git {}` failed to spawn: {e}", args.join(" ")))
 }
@@ -520,6 +526,35 @@ fn test_blob_lossy_mode_discloses_itself_unconditionally() {
          stderr: {}",
         show(&verbatim.stderr),
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn blob_transform_error_serves_raw_when_stderr_pipe_closes() {
+    let body = format!("const value = {}0{};\n", "(".repeat(550), ")".repeat(550));
+    let (dir, repo) = repo_with_file("deep.ts", &body);
+    // The pathspec keeps the startup debug banner off stderr. Test the
+    // diagnostics of the failed blob transform, not the startup banner.
+    let args = ["show", "--mode=pseudo", "HEAD:deep.ts", "--", "--hook"];
+    let command = || {
+        let mut cmd = skim_git(&repo, &args);
+        cmd.env("SKIM_DEBUG", "1")
+            .env("SKIM_CACHE_DIR", dir.path().join("cache"));
+        cmd
+    };
+    let control = command().output().unwrap();
+    assert!(control.status.success(), "{control:?}");
+    assert!(
+        String::from_utf8_lossy(&control.stderr)
+            .contains("git show file-content transform failed for deep.ts:"),
+        "the fixture must reach the transform error: {control:?}"
+    );
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = command().stderr(writer).output().unwrap();
+    assert!(output.status.success(), "{}", output.status);
+    assert_eq!(output.stdout, body.as_bytes());
 }
 
 // ============================================================================
