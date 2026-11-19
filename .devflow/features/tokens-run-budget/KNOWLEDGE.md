@@ -21,7 +21,7 @@ updated: 2026-11-18
 - **KB-INV-7** A changed run prints exactly one run notice on stderr, and it replaces the aggregate notice. A run that fits prints the aggregate notice as before.
 - **KB-INV-8** The trailer is the last stdout line. Its numbers come from plan state, never from file text. It is a `// ` comment line with the omitted count, the shown-of-total count and the `SKIM_PASSTHROUGH=1` hint.
 - **KB-INV-9** Exit is 0 for a cut or an omission. The run fails only when every file fails. The notice total counts successes only.
-- **KB-INV-10** Output is the same for any `--jobs` value. An explicit list keeps command-line order; each glob or folder is sorted by path inside its own argument, and the first occurrence of a path wins. `process_files` uses one rayon pool for plan and stats counts.
+- **KB-INV-10** Output is the same for any `--jobs` value. An explicit list keeps command-line order. Each glob or folder is sorted by path inside its own argument. A direct list compares resolved path text and keeps the first match. `z.ts` and `./z.ts` count as two paths. Rewritten `cat`, `head`, and `tail` keep repeated operands. `process_files` uses one rayon pool for plan and stats counts.
 - **KB-INV-11** A run-level cut is never cached. Only plain `--mode m` rung results enter the cache. A warm run gives the same stdout and stderr as the cold run.
 - **KB-INV-12** Budget arithmetic saturates. A missing count means over budget (`usize::MAX`). No content candidate leaves the planner without an exact count or a byte bound.
 - **KB-AP-1** Do not print a candidate that the exact count did not accept. The planner returns the trailer only after the retries fail.

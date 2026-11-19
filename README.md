@@ -281,8 +281,10 @@ skim 'src/**/*.ts'
 # Process all TypeScript files with custom parallelism
 skim '*.{js,ts}' --jobs 4
 
-# Several files print in command-line order, each after a `// path` header
-# (a glob or directory is sorted inside its own argument; a repeated path prints once)
+# Several files print in command-line order, each after a `// path` header.
+# A glob or directory is sorted inside its own argument.
+# Direct lists keep the first match by path text. `z.ts` and `./z.ts` count as two paths.
+# Rewritten `cat`, `head`, and `tail` keep repeated operands.
 skim src/b.ts 'lib/*.ts' src/a.ts
 
 # Get only function signatures from multiple files

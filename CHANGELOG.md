@@ -18,16 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   give the same output as before. Stdin without `--filename` keeps the TypeScript grammar.
 - **An explicit list of files keeps command-line order** (#584). `skim b.ts a.ts` prints
   `b.ts` first, as `cat b.ts a.ts` does. Before, skim sorted the whole list. A glob or a
-  directory is sorted by path inside its own argument. A path that two arguments name prints
-  once, at its first place. `SKIM_PASSTHROUGH=1` uses the same order.
+  directory is sorted by path inside its own argument. A direct `skim` list compares resolved
+  path text and keeps the first match. `z.ts` and `./z.ts` count as two paths.
+  `SKIM_PASSTHROUGH=1` uses the same order.
 - **A rewritten `cat a.ts b.ts` prints one `// path` header per file** (#584). Before, the
   rewrite added `--no-header`, so the files ran together. The one view notice on stderr
   prints also when skim changes no file body, because the headers are not in the `cat`
   output. The notice names the headers, and its file count includes only the files whose
   body skim changes. The same notice prints for every rewritten read of two or more files:
-  `cat`, `head -N` and `tail -N`. Their headers are not in the `==> path <==` form that
-  `head` and `tail` print. The after-run hook still does not compress `cat` of two or more
-  files.
+  `cat`, `head -N` and `tail -N`. Rewritten commands keep repeated operands, as the
+  original commands do. Their headers are not in the `==> path <==` form that `head` and
+  `tail` print. The after-run hook still does not compress `cat` of two or more files.
 
 ### Added
 

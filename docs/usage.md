@@ -13,7 +13,7 @@ skim [FILE|DIRECTORY] [OPTIONS]
 - **Single file**: `skim file.ts` (auto-detects language from extension)
 - **Directory**: `skim src/` (recursively processes all supported files)
 - **Glob pattern**: `skim 'src/**/*.ts'` (processes matching files)
-- **Several arguments**: `skim b.ts 'src/*.ts' a.ts` prints the files in command-line order, each after a `// path` header. A glob or a directory is sorted by path inside its own argument. A path that two arguments name prints once, at its first place. `SKIM_PASSTHROUGH=1` uses the same order.
+- **Several arguments**: `skim b.ts 'src/*.ts' a.ts` prints the files in command-line order, each after a `// path` header. A glob or a directory is sorted by path inside its own argument. A direct `skim` list compares resolved path text and keeps the first match. `z.ts` and `./z.ts` count as two paths. A glob such as `'*.ts'` adds `./`, so `skim z.ts '*.ts'` can print the same file twice. Rewritten `cat`, `head`, and `tail` commands keep repeated operands, as the original commands do. `SKIM_PASSTHROUGH=1` uses the same order.
 - **Stdin**: `skim -` (`--language` recommended; else skim tries a shebang, then raw text within the default bound)
 
 ## Options

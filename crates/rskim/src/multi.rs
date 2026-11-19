@@ -316,12 +316,26 @@ fn pass_one_set<'a>(files: &[RunFile<'a>], budget: RunBudget, count: &Counter<'_
 
 /// The index is in all results, not just successes. A failed first file still
 /// leaves the separator before the next header, as in the streaming path.
+/// Escape control characters so a path cannot add another header line.
 fn piece_prefix(idx: usize, path: &Path, show_headers: bool) -> String {
-    if show_headers {
-        format!("{}// {}\n", if idx > 0 { "\n" } else { "" }, path.display())
-    } else {
-        String::new()
+    if !show_headers {
+        return String::new();
     }
+    let path = path.to_string_lossy();
+    let mut prefix = String::with_capacity(path.len() + 5);
+    if idx > 0 {
+        prefix.push('\n');
+    }
+    prefix.push_str("// ");
+    for ch in path.chars() {
+        if ch.is_ascii_control() {
+            prefix.extend(ch.escape_default());
+        } else {
+            prefix.push(ch);
+        }
+    }
+    prefix.push('\n');
+    prefix
 }
 
 /// Write the exact string whose joined count passed. Do not assemble it again.
@@ -1221,9 +1235,9 @@ pub(crate) fn passthrough_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
 }
 
 /// Resolve a mixed explicit list once for both transformed and raw output.
-/// Keep partial-failure warnings, the all-fail error, command-line order and
-/// first-occurrence deduplication. Each glob or folder is sorted by path inside
-/// its own argument (the walker sort in `configure_walker`).
+/// Keep partial-failure warnings, the all-fail error and command-line order.
+/// Each glob or folder is sorted by path inside its own argument (the walker
+/// sort in `configure_walker`).
 fn resolve_explicit_paths(args: &[String], no_ignore: bool) -> anyhow::Result<Vec<PathBuf>> {
     debug_assert!(
         !args.is_empty(),
@@ -1283,12 +1297,13 @@ fn resolve_explicit_paths(args: &[String], no_ignore: bool) -> anyhow::Result<Ve
         );
     }
 
-    // Keep command-line order, as `cat` does. A plain file arg and a glob arg
-    // may both resolve to the same path (e.g. `skim explicit.ts '*.ts'`): the
-    // first occurrence wins. The identity is the lexical path, so `./a.ts` and
-    // `a.ts` stay two entries.
-    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
-    paths.retain(|path| seen.insert(path.clone()));
+    // Rewritten cat/head/tail keep repeats, as the original commands do.
+    // Direct skim lists keep the first occurrence of each resolved path.
+    // The comparison is lexical, so `a.ts` and `./a.ts` stay two entries.
+    if crate::output::rewrite_origin().is_none() {
+        let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
+        paths.retain(|path| seen.insert(path.clone()));
+    }
 
     Ok(paths)
 }

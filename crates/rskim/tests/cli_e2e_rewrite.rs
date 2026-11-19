@@ -82,8 +82,9 @@ fn cache_dir_for_current_test() -> std::path::PathBuf {
 /// `unsafe` in a multi-threaded test binary.
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
-    cmd.env_remove("SKIM_PASSTHROUGH");
-    cmd.env_remove("SKIM_REWRITTEN_FROM");
+    for var in common::SANDBOX_REMOVED_VARS {
+        cmd.env_remove(var);
+    }
     cmd.env("SKIM_CACHE_DIR", cache_dir_for_current_test());
     cmd.env("PATH", common::rewrite_stub_path());
     cmd
@@ -3455,6 +3456,26 @@ fn test_hook_cat_of_two_unchanged_files_still_prints_the_view_notice() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "// b.ts\nfunction b() { return 2 }\n\n// a.ts\nfunction a() { return 1 }\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with(HOOK_CAT_HEADERS_NOTICE) && stderr.contains(": 0/2 files "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_hook_cat_keeps_repeated_unchanged_operands() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("c.ts"), "function c() { return 3 }\n").unwrap();
+
+    let output = run_hook_rewritten_cat(dir.path(), &["c.ts", "c.ts"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "// c.ts\nfunction c() { return 3 }\n\n// c.ts\nfunction c() { return 3 }\n"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(stderr.lines().count(), 1, "{stderr}");

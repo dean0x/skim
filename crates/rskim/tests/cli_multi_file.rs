@@ -111,6 +111,68 @@ fn test_multi_file_shows_headers() {
     );
 }
 
+fn assert_rewrite_origin_keeps_repeats(flags: &[&str]) {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("c.ts"), "function c() { return 3 }\n").unwrap();
+
+    let output = common::skim_sandboxed(dir.path())
+        .current_dir(dir.path())
+        .env("SKIM_REWRITTEN_FROM", "cat")
+        .args(flags)
+        .args(["c.ts", "c.ts"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "// c.ts\nfunction c()  {...}\n\n// c.ts\nfunction c()  {...}\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("each file starts with a // <path> header; ")
+            && stderr.contains(": 2/2 files "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_default_run_keeps_repeated_rewrite_operands() {
+    assert_rewrite_origin_keeps_repeats(&[]);
+}
+
+#[test]
+fn test_tokens_run_keeps_repeated_rewrite_operands() {
+    assert_rewrite_origin_keeps_repeats(&["--tokens", "512"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_control_characters_in_a_path_keep_the_header_on_one_line() {
+    let dir = TempDir::new().unwrap();
+    let path = "a\nb\rc\td\x1be\x7f.ts";
+    let body = "function a() {}\n";
+    if let Err(error) = fs::write(dir.path().join(path), body) {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+        ) {
+            return;
+        }
+        panic!("cannot write fixture: {error}");
+    }
+    fs::write(dir.path().join("normal.ts"), body).unwrap();
+
+    common::skim_sandboxed(dir.path())
+        .current_dir(dir.path())
+        .args(["--mode=full", path, "normal.ts"])
+        .assert()
+        .success()
+        .stdout("// a\\nb\\rc\\td\\u{1b}e\\u{7f}.ts\nfunction a() {}\n\n// normal.ts\nfunction a() {}\n");
+}
+
 /// An explicit list keeps command-line order, as `cat` does. A glob is sorted
 /// inside its own argument, and the first time a path appears wins.
 #[test]
