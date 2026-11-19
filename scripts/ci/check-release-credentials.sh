@@ -55,9 +55,12 @@ auth_config() {
 # curl gets no response). The response body goes to stderr for the log.
 http_status() {
   local body_file code
+  local body_args=()
+  # An empty BODY sends no body, as npm does for a DELETE.
+  [ -n "$5" ] && body_args=(-H "Content-Type: application/json" -d "$5")
   body_file=$(mktemp)
   code=$(auth_config "$1" | curl -sS -K - -o "${body_file}" -w '%{http_code}' \
-    -X "$3" -H "Content-Type: application/json" -H "Accept: $2" -d "$5" "$4") || code="000"
+    -X "$3" -H "Accept: $2" ${body_args[@]+"${body_args[@]}"} "$4") || code="000"
   cat "${body_file}" >&2
   rm -f "${body_file}"
   echo "${code}"

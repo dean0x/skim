@@ -194,6 +194,13 @@ case_tokens_not_in_argv() {
     [ "$(count '^auth tap-token$' "$CALLS")" = 1 ]
 }
 
+case_delete_sends_no_body() {
+  run_check npm
+  [ "$CODE" = 0 ] && [ "$(count '^curl .*-X DELETE' "$CALLS")" = 3 ] &&
+    ! grep -q -- '-X DELETE .* -d ' <<< "$CALLS" &&
+    [ "$(count '^curl .*-X PUT .*-H Content-Type: application/json -d "3.0.0"' "$CALLS")" = 3 ]
+}
+
 case_delete_refused_fails() {
   run_check npm STUB_DELETE_CODE=403
   [ "$CODE" = 1 ] && [ "$(count 'can not remove the skim-release-check tag' "$OUT")" = 3 ]
@@ -287,6 +294,7 @@ expect "a token that is not valid fails before any probe" case_invalid_token_fai
 expect "a read-only token (HTTP 403) fails for every package" case_read_only_token_fails
 expect "a token without one package fails for that package" case_one_package_denied_fails
 expect "a refused authentication (HTTP 401) fails" case_auth_refused_fails
+expect "the probe DELETE sends no body, and each PUT sends a JSON body" case_delete_sends_no_body
 expect "a refused removal of the probe tag fails" case_delete_refused_fails
 expect "a redirect (HTTP 307) on the probe fails" case_redirect_fails
 expect "no response from the registry fails" case_no_response_fails
