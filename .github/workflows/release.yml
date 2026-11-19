@@ -24,60 +24,24 @@ jobs:
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@v5
+
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
+      # The check methods are in the script header.
       - name: Check npm credentials
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          # `npm whoami` fails with E401 for a token that is not valid.
-          if ! NPM_USER=$(npm whoami); then
-            echo "::error::npm check: NPM_TOKEN is not valid (npm whoami failed)"
-            exit 1
-          fi
-          echo "npm token user: ${NPM_USER}"
-
-          # The packages that this user can write. A package can not be
-          # published unless the value is "read-write".
-          if ! npm access list packages "${NPM_USER}" --json > npm-access.json; then
-            echo "::error::npm check: can not list the packages of ${NPM_USER}"
-            exit 1
-          fi
-
-          FAILED=0
-          for pkg in rskim $(printf '@rskim/%s ' $NPM_PLATFORM_PACKAGES); do
-            ACCESS=$(jq -r --arg p "$pkg" '.[$p] // "none"' npm-access.json)
-            if [ "$ACCESS" = "read-write" ]; then
-              echo "✅ ${pkg}: read-write"
-            else
-              echo "::error::npm check: ${NPM_USER} has '${ACCESS}' access to ${pkg}, publish needs read-write"
-              FAILED=1
-            fi
-          done
-          exit "$FAILED"
+        run: bash scripts/ci/check-release-credentials.sh npm
 
       - name: Check Homebrew tap credentials
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          # Send the same dispatch as the trigger-homebrew job, with an event
-          # type that no tap workflow listens for. The tap workflow runs only
-          # for `update-formula`. HTTP 204 means the token can send the
-          # dispatch; any HTTP error fails the step.
-          if ! curl -sS --fail-with-body -X POST \
-            -H "Authorization: Bearer ${HOMEBREW_TAP_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/dean0x/homebrew-tap/dispatches \
-            -d '{"event_type":"skim-release-credential-check"}'; then
-            echo ""
-            echo "::error::Homebrew tap check: HOMEBREW_TAP_TOKEN can not send a dispatch to dean0x/homebrew-tap"
-            exit 1
-          fi
-          echo "✅ Homebrew tap dispatch accepted"
+        run: bash scripts/ci/check-release-credentials.sh homebrew
 
   test:
     name: Run Test Suite
