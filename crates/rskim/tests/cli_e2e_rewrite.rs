@@ -3373,8 +3373,14 @@ export class UserService {
 /// Rewrite `cat <files>` through the hook in `dir`, then run the rewritten
 /// command in `dir` with its origin tag as an environment variable.
 fn run_hook_rewritten_cat(dir: &std::path::Path, files: &[&str]) -> std::process::Output {
+    run_hook_rewritten(dir, &format!("cat {}", files.join(" ")))
+}
+
+/// Rewrite `command` through the hook in `dir`, then run the rewritten
+/// command in `dir` with its origin tag as an environment variable.
+fn run_hook_rewritten(dir: &std::path::Path, command: &str) -> std::process::Output {
     let input = serde_json::json!({
-        "tool_input": { "command": format!("cat {}", files.join(" ")) }
+        "tool_input": { "command": command }
     });
     let output = skim_cmd()
         .current_dir(dir)
@@ -3482,6 +3488,34 @@ fn test_hook_cat_notice_counts_only_the_changed_bodies() {
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(
         stderr.starts_with(HOOK_CAT_HEADERS_NOTICE) && stderr.contains(": 1/2 files "),
+        "{stderr}"
+    );
+}
+
+/// The `// path` headers are not the `==> path <==` lines that `head` prints,
+/// so a rewritten `head -N a b` also prints the one view notice when every
+/// body is shown whole. The notice names the headers, and its count of
+/// changed bodies is 0.
+#[test]
+fn test_hook_head_of_two_whole_files_prints_a_header_per_file_and_one_notice() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("b.ts"), "function b() { return 2 }\n").unwrap();
+    fs::write(dir.path().join("a.ts"), "function a() { return 1 }\n").unwrap();
+
+    let output = run_hook_rewritten(dir.path(), "head -5 b.ts a.ts");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "// b.ts\nfunction b() { return 2 }\n\n// a.ts\nfunction a() { return 1 }\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with(
+            "[skim] transformed view (head \u{2192} skim --mode=full): \
+             each file starts with a // <path> header; "
+        ) && stderr.contains(": 0/2 files "),
         "{stderr}"
     );
 }

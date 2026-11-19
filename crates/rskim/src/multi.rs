@@ -694,9 +694,11 @@ fn longest_display_paths<'a>(files: &[RunFile<'a>]) -> [Option<&'a Path>; 2] {
 struct NoticeOrigin<'a> {
     /// The command that a hook rewrote into this run (`SKIM_REWRITTEN_FROM`).
     tool: Option<&'a str>,
-    /// A hook rewrite of `cat a b` prints a `// path` header before each file,
-    /// and `cat` prints none. So the view differs from raw also when every body
-    /// is raw. The notice names the headers and keeps the exact body count.
+    /// Every hook-rewritten read of two or more files (`cat a b`, `head -N a b`,
+    /// `tail -N a b`) prints a `// path` header before each file. `cat` prints
+    /// no header, and `head` and `tail` print `==> a <==`. So the view differs
+    /// from raw also when every body is raw. The notice names the headers and
+    /// keeps the exact body count.
     headers_added: bool,
 }
 
