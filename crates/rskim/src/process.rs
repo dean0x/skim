@@ -262,6 +262,7 @@ pub(crate) fn single_file_notice(
         mode_str,
         if view_differs { 1 } else { 0 },
         1,
+        false,
     )
 }
 
@@ -2558,6 +2559,7 @@ mod tests {
                         mode,
                         usize::from(differs),
                         1,
+                        false,
                     ),
                 );
             }

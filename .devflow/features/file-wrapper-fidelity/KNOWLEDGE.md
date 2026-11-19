@@ -232,7 +232,7 @@ Uses `runner.run_stdout_degrade()` with a 64 MiB (`MAX_OUTPUT_BYTES`) ceiling. W
 
 ### git show `<rev>:<path>` — ADR-022 Verbatim Default (supersedes `AD-GIT-SHOW-PSEUDO`)
 
-`run_show_file_content` has no transform ladder on the default path. `select_file_content_view(mode)` maps `None` (no `--mode`) **and** `Some(Mode::Full)` to `FileContentView::Verbatim` — served with no language detection, no guardrail, and no marker — and any other `Mode` to `FileContentView::Transformed(mode)`, which transforms via `rskim_core::transform` and discloses (ADR-011 class 1, unconditional) only when the guardrail actually serves the transformed view (`served_transformed = !guardrail.was_triggered()`).
+`run_show_file_content` has no transform ladder on the default path. `select_file_content_view(mode)` maps `None` (no `--mode`) **and** `Some(Mode::Full)` to `FileContentView::Verbatim` — served with no language detection, no guardrail, and no marker — and any other `Mode` to `FileContentView::Transformed(mode)`, which transforms via `rskim_core::transform_auto` (the blob path picks the language and the grammar, so a `.tsx` blob parses with the TSX grammar) and discloses (ADR-011 class 1, unconditional) only when the guardrail actually serves the transformed view (`served_transformed = !guardrail.was_triggered()`).
 
 **`Mode::Full` takes the same Verbatim branch rather than routing through the transform** — `Mode::Full` is defined as "no transformation," so serving the blob verbatim honours it exactly without making byte-faithfulness contingent on tree-sitter parsing the blob or the guardrail's tie-rule electing raw, neither of which has any say in what `full` means.
 

@@ -689,10 +689,42 @@ fn longest_display_paths<'a>(files: &[RunFile<'a>]) -> [Option<&'a Path>; 2] {
     longest.map(|(_, path)| path)
 }
 
+/// The facts of a run that its aggregate view notice states besides the counts.
+#[derive(Clone, Copy)]
+struct NoticeOrigin<'a> {
+    /// The command that a hook rewrote into this run (`SKIM_REWRITTEN_FROM`).
+    tool: Option<&'a str>,
+    /// A hook rewrite of `cat a b` prints a `// path` header before each file,
+    /// and `cat` prints none. So the view differs from raw also when every body
+    /// is raw. The notice names the headers and keeps the exact body count.
+    headers_added: bool,
+}
+
+impl<'a> NoticeOrigin<'a> {
+    fn new(tool: Option<&'a str>, show_headers: bool) -> Self {
+        Self {
+            tool,
+            headers_added: show_headers && tool.is_some(),
+        }
+    }
+
+    /// The aggregate notice. The charge in [`char_limits`] and the printed
+    /// line in [`printed_notice`] both come from here.
+    fn aggregate(self, mode: Mode, differing: usize, total_paths: usize) -> Option<EmittedNotice> {
+        emitted_notice_cost(
+            self.tool,
+            mode.name(),
+            differing,
+            total_paths,
+            self.headers_added,
+        )
+    }
+}
+
 /// Pass 1 charges its exact aggregate notice. Rungs do not reserve the cut
 /// clauses: a long path must not force a cheaper rung if the rung fits as is.
 fn char_limits(
-    origin: Option<&str>,
+    origin: NoticeOrigin<'_>,
     mode: Mode,
     pass_1_differing: usize,
     total_paths: usize,
@@ -700,7 +732,7 @@ fn char_limits(
     limit: usize,
 ) -> Limits {
     let available = limit.saturating_sub(1);
-    let aggregate = emitted_notice_cost(origin, mode.name(), pass_1_differing, total_paths);
+    let aggregate = origin.aggregate(mode, pass_1_differing, total_paths);
     let fit = available.saturating_sub(notice_chars(aggregate.as_ref()));
     let total = files.len();
     let facts = RunNoticeFacts {
@@ -736,14 +768,14 @@ fn char_limits(
 /// A run notice replaces the aggregate notice. Neither is charged to a batch row.
 fn printed_notice(
     changed_run: Option<RunNoticeFacts<'_>>,
-    origin: Option<&str>,
+    origin: NoticeOrigin<'_>,
     mode: Mode,
     differing: usize,
     total_paths: usize,
 ) -> Option<EmittedNotice> {
     match changed_run {
         Some(facts) => Some(run_view_marker(&facts)),
-        None => emitted_notice_cost(origin, mode.name(), differing, total_paths),
+        None => origin.aggregate(mode, differing, total_paths),
     }
 }
 
@@ -800,7 +832,7 @@ fn seal_run(
     mut selection: RunSelection,
     files: &[RunFile<'_>],
     budget: RunBudget,
-    origin: Option<&str>,
+    origin: NoticeOrigin<'_>,
     total_paths: usize,
 ) -> RunReport {
     let requested = selection.requested;
@@ -845,24 +877,13 @@ fn prepare_results<'a>(
     opts: ProcessOptions,
     show_headers: bool,
     budget: Option<RunBudget>,
-    origin: Option<&str>,
+    origin: NoticeOrigin<'_>,
     plan_count: &Counter<'_>,
     stats_count: &Counter<'_>,
 ) -> anyhow::Result<(FileResults<'a>, Option<RunReport>)> {
-    // A hook rewrite of `cat a b` replaces the bytes that `cat` prints. A
-    // header is not in those bytes, so each headed file counts as a view
-    // difference: the one view notice prints even when every body is raw.
-    // Pass 1 and every rung use this one function, so all counts agree.
-    let headers_differ = show_headers && origin.is_some();
-    let process = |path: &Path, opts: ProcessOptions| {
-        process_file(path, opts).map(|mut pr| {
-            pr.view_differs |= headers_differ;
-            pr
-        })
-    };
     let processed: FileResults<'_> = paths
         .par_iter()
-        .map(|path| (path, process(path, opts)))
+        .map(|path| (path, process_file(path, opts)))
         .collect();
     let Some(budget) = budget else {
         return Ok((processed, None));
@@ -882,7 +903,7 @@ fn prepare_results<'a>(
         let differing = files.iter().filter(|f| f.pass_1.view_differs).count();
         char_limits(origin, opts.mode, differing, paths.len(), &files, limit)
     });
-    let selection = select_run(&files, stage, opts, &process, plan_count)?;
+    let selection = select_run(&files, stage, opts, &process_file, plan_count)?;
     let mut report = seal_run(selection, &files, budget, origin, paths.len());
     let results = final_results(processed, &mut report.selection, opts, stats_count);
     Ok((results, Some(report)))
@@ -922,14 +943,15 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         Some(RunBudget::Chars(_)) => &char_count,
         _ => &token_count,
     };
-    let origin = crate::output::rewrite_origin();
+    let tool = crate::output::rewrite_origin();
+    let origin = NoticeOrigin::new(tool.as_deref(), show_headers);
     let (results, run) = pool.install(|| {
         prepare_results(
             &paths,
             process_options,
             show_headers,
             budget,
-            origin.as_deref(),
+            origin,
             plan_count,
             &token_count,
         )
@@ -1022,7 +1044,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         }
         None => printed_notice(
             None,
-            origin.as_deref(),
+            origin,
             process_options.mode,
             view_differs_count,
             total_paths,
@@ -1429,7 +1451,7 @@ mod tests {
 
     #[test]
     fn run_fits_uses_the_strict_character_limit_with_the_notice() {
-        let notice = emitted_notice_cost(None, "structure", 1, 1).unwrap();
+        let notice = emitted_notice_cost(None, "structure", 1, 1, false).unwrap();
         let last_fit = MAX_STDOUT_CHARS - notice.line().chars().count() - 1;
         assert!(run_fits(&"é".repeat(last_fit), Some(&notice)));
         assert!(!run_fits(&"é".repeat(last_fit + 1), Some(&notice)));
@@ -1439,14 +1461,26 @@ mod tests {
     fn char_limits_charge_the_exact_aggregate_notice_to_pass_one() {
         let pr = result("view\n");
         let files = [run_file("a.rs", &pr)];
-        // The second path failed. The aggregate still uses both paths.
-        let limits = char_limits(Some("cat"), Mode::Structure, 1, 2, &files, MAX_STDOUT_CHARS);
-        let notice = emitted_notice_cost(Some("cat"), "structure", 1, 2).unwrap();
-        assert_eq!(
-            limits.fit + notice.line().chars().count(),
-            MAX_STDOUT_CHARS - 1
-        );
-        assert!(limits.cut <= limits.rung && limits.rung <= limits.fit);
+        // The second path failed. The aggregate still uses both paths. With
+        // headers, the charge is the header notice, also with no changed body.
+        for (differing, show_headers) in [(1, false), (0, true)] {
+            let origin = NoticeOrigin::new(Some("cat"), show_headers);
+            let limits = char_limits(
+                origin,
+                Mode::Structure,
+                differing,
+                2,
+                &files,
+                MAX_STDOUT_CHARS,
+            );
+            let notice =
+                emitted_notice_cost(Some("cat"), "structure", differing, 2, show_headers).unwrap();
+            assert_eq!(
+                limits.fit + notice.line().chars().count(),
+                MAX_STDOUT_CHARS - 1
+            );
+            assert!(limits.cut <= limits.rung && limits.rung <= limits.fit);
+        }
     }
 
     #[test]
@@ -1465,7 +1499,14 @@ mod tests {
             run_file(&longer, &pr),
         ];
         let limits = |files: &[RunFile<'_>]| {
-            char_limits(None, Mode::Structure, 3, 3, files, MAX_STDOUT_CHARS)
+            char_limits(
+                NoticeOrigin::new(None, true),
+                Mode::Structure,
+                3,
+                3,
+                files,
+                MAX_STDOUT_CHARS,
+            )
         };
         let short_limits = limits(&short);
         let deep_limits = limits(&deep);
@@ -1490,16 +1531,42 @@ mod tests {
             last_shown: None,
             first_omitted: None,
         };
-        let origin = Some("cat");
+        let origin = NoticeOrigin::new(Some("cat"), false);
         let aggregate = printed_notice(None, origin, Mode::Structure, 1, 2).unwrap();
         assert_eq!(
             aggregate.line(),
-            emitted_notice_cost(origin, "structure", 1, 2)
+            emitted_notice_cost(Some("cat"), "structure", 1, 2, false)
                 .unwrap()
                 .line()
         );
         let changed = printed_notice(Some(facts), origin, Mode::Structure, 1, 2).unwrap();
         assert_eq!(changed.line(), run_view_marker(&facts).line());
+    }
+
+    /// A hook rewrite of `cat a b` adds a header that `cat` does not print, so
+    /// the aggregate notice prints with raw bodies. Its count stays the number
+    /// of changed bodies. A direct `skim a b` adds no notice for its headers.
+    #[test]
+    fn hook_headers_print_the_notice_with_the_exact_body_count() {
+        let hook = NoticeOrigin::new(Some("cat"), true);
+        for differing in [0, 1] {
+            let notice = printed_notice(None, hook, Mode::Pseudo, differing, 2)
+                .expect("the headers differ from cat");
+            assert!(
+                notice
+                    .line()
+                    .contains("each file starts with a // <path> header; ")
+                    && notice.line().contains(&format!(": {differing}/2 files ")),
+                "{}",
+                notice.line()
+            );
+        }
+        let no_header = NoticeOrigin::new(Some("cat"), false);
+        assert!(printed_notice(None, no_header, Mode::Pseudo, 0, 2).is_none());
+        let direct = NoticeOrigin::new(None, true);
+        assert!(printed_notice(None, direct, Mode::Pseudo, 0, 2).is_none());
+        let changed = printed_notice(None, direct, Mode::Pseudo, 1, 2).unwrap();
+        assert!(!changed.line().contains("<path>"), "{}", changed.line());
     }
 
     #[test]
@@ -1520,7 +1587,7 @@ mod tests {
                 selected,
                 &files,
                 RunBudget::Chars(MAX_STDOUT_CHARS),
-                None,
+                NoticeOrigin::new(None, true),
                 2,
             );
             let notice = report.notice.unwrap();

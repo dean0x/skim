@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A rewritten `cat a.ts b.ts` prints one `// path` header per file** (#584). Before, the
   rewrite added `--no-header`, so the files ran together. The one view notice on stderr
   prints also when skim changes no file body, because the headers are not in the `cat`
-  output. The after-run hook still does not compress `cat` of two or more files.
+  output. The notice names the headers, and its file count includes only the files whose
+  body skim changes. The after-run hook still does not compress `cat` of two or more files.
 
 ### Added
 

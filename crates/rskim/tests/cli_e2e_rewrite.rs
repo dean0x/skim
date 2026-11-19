@@ -3420,17 +3420,22 @@ fn test_hook_cat_of_two_files_prints_a_header_per_file_and_one_notice() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with("// ")).collect();
     assert_eq!(headers, ["// b.ts", "// a.ts"], "{stdout}");
+    assert!(!stdout.contains("drop me"), "both bodies change:\n{stdout}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(
-        stderr.starts_with("[skim] transformed view (cat \u{2192} skim --mode=pseudo):")
-            && stderr.contains(": 2/2 files"),
+        stderr.starts_with(HOOK_CAT_HEADERS_NOTICE) && stderr.contains(": 2/2 files "),
         "{stderr}"
     );
 }
 
+/// The start of the view notice of a hook-rewritten `cat` of two or more files.
+const HOOK_CAT_HEADERS_NOTICE: &str = "[skim] transformed view (cat \u{2192} skim --mode=pseudo): \
+     each file starts with a // <path> header; ";
+
 /// The headers make the output differ from `cat` even when skim changes no
-/// body, so the one view notice still prints.
+/// body, so the one view notice still prints. It names the headers, and its
+/// count of changed bodies is 0.
 #[test]
 fn test_hook_cat_of_two_unchanged_files_still_prints_the_view_notice() {
     let dir = TempDir::new().unwrap();
@@ -3448,8 +3453,35 @@ fn test_hook_cat_of_two_unchanged_files_still_prints_the_view_notice() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(
-        stderr.starts_with("[skim] transformed view (cat \u{2192} skim --mode=pseudo):")
-            && stderr.contains(": 2/2 files"),
+        stderr.starts_with(HOOK_CAT_HEADERS_NOTICE) && stderr.contains(": 0/2 files "),
+        "{stderr}"
+    );
+}
+
+/// The notice counts only the bodies that skim changes: a raw body beside a
+/// changed one does not count.
+#[test]
+fn test_hook_cat_notice_counts_only_the_changed_bodies() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("b.ts"),
+        "function first() { return 1 }\n// drop me\nfunction second() {}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("a.ts"), "function a() { return 1 }\n").unwrap();
+
+    let output = run_hook_rewritten_cat(dir.path(), &["b.ts", "a.ts"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("drop me") && stdout.ends_with("// a.ts\nfunction a() { return 1 }\n"),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with(HOOK_CAT_HEADERS_NOTICE) && stderr.contains(": 1/2 files "),
         "{stderr}"
     );
 }
