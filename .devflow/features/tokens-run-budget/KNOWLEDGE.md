@@ -21,7 +21,7 @@ updated: 2026-11-18
 - **KB-INV-7** A changed run prints exactly one run notice on stderr, and it replaces the aggregate notice. A run that fits prints the aggregate notice as before.
 - **KB-INV-8** The trailer is the last stdout line. Its numbers come from plan state, never from file text. It is a `// ` comment line with the omitted count, the shown-of-total count and the `SKIM_PASSTHROUGH=1` hint.
 - **KB-INV-9** Exit is 0 for a cut or an omission. The run fails only when every file fails. The notice total counts successes only.
-- **KB-INV-10** Output is the same for any `--jobs` value. Files keep path order. `process_files` uses one rayon pool for plan and stats counts.
+- **KB-INV-10** Output is the same for any `--jobs` value. An explicit list keeps command-line order; each glob or folder is sorted by path inside its own argument, and the first occurrence of a path wins. `process_files` uses one rayon pool for plan and stats counts.
 - **KB-INV-11** A run-level cut is never cached. Only plain `--mode m` rung results enter the cache. A warm run gives the same stdout and stderr as the cold run.
 - **KB-INV-12** Budget arithmetic saturates. A missing count means over budget (`usize::MAX`). No content candidate leaves the planner without an exact count or a byte bound.
 - **KB-AP-1** Do not print a candidate that the exact count did not accept. The planner returns the trailer only after the retries fail.
@@ -64,7 +64,7 @@ The limits saturate and satisfy `cut <= rung <= fit`. `seal_run` checks the exac
 
 - **`Body`** has three forms. `Whole` can be cut. `PreCut` stores the worker's kept lines, its own marker, the total view lines and the marked count. `Fixed` keeps the body as-is, or the planner omits it.
 - **`set_fits`** is the one fit rule for pass 1 and every rung. A set whose bytes are at most N fits with no count. Otherwise it fails when a piece count is over N or the sum is over `RUN_SUM_STOP_FACTOR` times N. If neither fails, one exact count of the joined string decides.
-- **`kept_prefix`** sums file floors in path order. A `Fixed` floor is the full piece count. Other floors use the lesser of the whole piece and its prefix plus the shortest available marker. If all character floors fit, no trailer reserve is necessary. Otherwise the planner reserves the trailer with its widest numbers and, for characters, its join newline. Token runs always reserve the trailer for prefix selection.
+- **`kept_prefix`** sums file floors in run order. A `Fixed` floor is the full piece count. Other floors use the lesser of the whole piece and its prefix plus the shortest available marker. If all character floors fit, no trailer reserve is necessary. Otherwise the planner reserves the trailer with its widest numbers and, for characters, its join newline. Token runs always reserve the trailer for prefix selection.
 - **Cuts** count hidden view lines (`ViewLines`). A `PreCut` body whose marked count fits its share keeps the worker marker as it is. Otherwise the core cuts `kept` again with `SourceTotal(total_view_lines)`.
 - **Retries.** If the exact count is over N, the planner drops the last kept file, at most `MAX_DROP_RETRIES` times. Then it returns the trailer only.
 - **Floor.** When N is below the trailer cost, stdout is the trailer line only. This is the one case where stdout can be over N. `--tokens 0` and values over `MAX_TOKEN_BUDGET` are still usage errors.
@@ -81,7 +81,7 @@ For token runs, the remedies are a larger `--tokens`, fewer files and `SKIM_PASS
 
 ## Multi-file passthrough
 
-`SKIM_PASSTHROUGH=1` or `--passthrough` serves raw bytes in path order with no headers, view notice or size limit. It bypasses the run budget. `resolve_explicit_paths` shares path order, duplicate removal and path diagnostics with the transform path for a list.
+`SKIM_PASSTHROUGH=1` or `--passthrough` serves raw bytes in run order with no headers, view notice or size limit. It bypasses the run budget. `resolve_explicit_paths` shares command-line order, first-occurrence duplicate removal and path diagnostics with the transform path for a list.
 
 `passthrough_paths` serves the resolved paths for a list, directory or glob. It reports each input error and continues. If at least one file succeeds, the exit code is 0. A non-empty set in which every file fails exits 1. An empty set exits 0; a glob with no matches still fails during path resolution. An output error stops the run. A closed stdout pipe exits 141 on Unix.
 

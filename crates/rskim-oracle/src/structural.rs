@@ -38,8 +38,9 @@
 //! and a test keeps it equal to the version the workspace `Cargo.lock`
 //! resolves: a grammar bump fails that test until the headers are edited.
 //! `.tsx` files are parsed with the TSX grammar (SEARCH-ADR-007: an
-//! independent ground-truth oracle parses with the real grammar; #571),
-//! although skim parses them with the plain TypeScript grammar.
+//! independent ground-truth oracle parses with the real grammar; #571).
+//! skim parses them with the TSX grammar too, but the oracle keeps its own
+//! extension table and does not read skim's.
 //!
 //! Every query names one `@match` capture; the match line is the first
 //! (1-based) line of that node. Four patterns (six queries) carry a small
@@ -88,8 +89,9 @@ use tree_sitter::{
 ///
 /// `Tsx` is separate from `TypeScript` because the oracle parses `.tsx`
 /// with the TSX grammar (SEARCH-ADR-007 (independent ground-truth oracle),
-/// #571), whereas skim parses every TypeScript extension with
-/// `LANGUAGE_TYPESCRIPT` (`rskim_core::Language::to_tree_sitter`,
+/// #571). skim has no `Tsx` language: `rskim_core::Language::TypeScript`
+/// covers every TypeScript extension, and the parser takes `LANGUAGE_TSX`
+/// from the `.tsx` extension (`rskim_core::Parser::new_for_path`,
 /// `crates/rskim-core/src/types.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OracleLang {

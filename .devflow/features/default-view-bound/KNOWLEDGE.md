@@ -19,7 +19,7 @@ updated: 2026-11-18
 - **KB-INV-5** `truncate_with_count_source` re-measures after the literal pull-back. A pull-back keeps fewer lines, so the omitted count can gain digits and the marker can grow.
 - **KB-INV-6** `enforce_default_assembly` is the last check. It fails closed: a total at or above the limit becomes the marker line only, with `cut` set. It never panics in release.
 - **KB-INV-7** A warm cache hit re-checks stored content bytes plus the rebuilt notice against the limit. A total at or above the limit is a miss, not a hit.
-- **KB-INV-8** The cache key has the suffix `|char_budget:<n>` only when a budget is set. Schema version 4 stores `BoundState` (`NotFired` or `Fired`). A budgeted read of an entry without `BoundState` is a miss.
+- **KB-INV-8** The cache key has the suffix `|char_budget:<n>` only when a budget is set. Schema version 4 and later (now 5) store `BoundState` (`NotFired` or `Fired`). A budgeted read of an entry without `BoundState` is a miss.
 - **KB-INV-9** One constructor, `process::single_file_notice`, builds the notice for the fit measure, the printed line and the analytics charge. `bound_outcomes_measure_print_and_charge_one_notice` pins this.
 - **KB-INV-10** Boundary tests use the totals limit-1 (accepted) and limit (refused). Prove each test by one-character mutation of the production line, not by reading the test.
 - **KB-INV-11** A unit test that writes the cache has `#[serial_test::serial]` and sets its own tempdir `SKIM_CACHE_DIR`. It restores the old value at the end.

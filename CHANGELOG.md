@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`.tsx` files use the TSX grammar in every view** (#571). The structure, signatures, types,
+  minimal and pseudo views parse a `.tsx` file with the TSX grammar. Before, they used the
+  TypeScript grammar, which reads JSX as a type assertion, so a view could lose the
+  declarations after JSX. This also applies to `--tokens`, the default output limit, stdin
+  with `--filename x.tsx`, `git show <rev>:<path> --mode` and the after-run hook view of
+  `cat x.tsx`. This removes the `.tsx` known limit of the 3.0.0 `--symbol` entry. Other files
+  give the same output as before. Stdin without `--filename` keeps the TypeScript grammar.
+- **An explicit list of files keeps command-line order** (#584). `skim b.ts a.ts` prints
+  `b.ts` first, as `cat b.ts a.ts` does. Before, skim sorted the whole list. A glob or a
+  directory is sorted by path inside its own argument. A path that two arguments name prints
+  once, at its first place. `SKIM_PASSTHROUGH=1` uses the same order.
+- **A rewritten `cat a.ts b.ts` prints one `// path` header per file** (#584). Before, the
+  rewrite added `--no-header`, so the files ran together. The one view notice on stderr
+  prints also when skim changes no file body, because the headers are not in the `cat`
+  output. The after-run hook still does not compress `cat` of two or more files.
+
+### Added
+
+- `rskim_core::transform_with_line_map_for_path(source, language, path, config)` and
+  `rskim_core::Parser::new_for_path(language, path)`. The `language` argument always sets the
+  language. The path only selects the grammar: the TSX grammar for a `.tsx` path.
+
+### Changed
+
+- `rskim_core::transform_auto` and `rskim_core::transform_auto_with_config` give the TSX view
+  for a `.tsx` path. Library users get different output for `.tsx` files.
+- The cache schema is now version 5. Every cache entry that an earlier version wrote misses
+  once and is written again.
+
 ## [3.1.0] - 2026-11-19
 
 ### Fixed

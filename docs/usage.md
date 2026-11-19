@@ -13,6 +13,7 @@ skim [FILE|DIRECTORY] [OPTIONS]
 - **Single file**: `skim file.ts` (auto-detects language from extension)
 - **Directory**: `skim src/` (recursively processes all supported files)
 - **Glob pattern**: `skim 'src/**/*.ts'` (processes matching files)
+- **Several arguments**: `skim b.ts 'src/*.ts' a.ts` prints the files in command-line order, each after a `// path` header. A glob or a directory is sorted by path inside its own argument. A path that two arguments name prints once, at its first place. `SKIM_PASSTHROUGH=1` uses the same order.
 - **Stdin**: `skim -` (`--language` recommended; else skim tries a shebang, then raw text within the default bound)
 
 ## Options
@@ -199,7 +200,6 @@ skim src/app.ts --symbol run -n         # lines are numbered from the first line
 - Markdown and the data formats (JSON, YAML, TOML) exit with code 3.
 - Functions in C and C++ files are not found. Their name is inside the declarator.
 - The printed range holds the declaration only. Attributes, doc comments and decorators above the declaration are not in it.
-- For `.tsx` files, `--symbol` uses the TSX grammar. The structure mode still parses `.tsx` files with the TypeScript grammar.
 
 ### Caching Control
 
