@@ -7,12 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-19
+
 ### Fixed
 
 - **env view: mask every value.** The env views apply the value mask to every
   output form. Lines that the mask hides from text on stdin are counted in the
-  view. Known limit: for text on stdin, a line rule finds where each variable
-  starts, so the view can read one value over several lines as two variables.
+  view.
 - One `--tokens N` budget now covers the whole multi-file output, with headers, line numbers and markers.
 - `SKIM_PASSTHROUGH=1` now gives the full output for an explicit list of files.
 - `--tokens N -n` keeps the cut view and its elision marker with source line numbers.
