@@ -61,12 +61,15 @@ fn skim_cmd() -> Command {
 #[test]
 #[cfg(unix)]
 fn no_expansion_ls_la_tiny_dir() {
-    let dir = tempfile::tempdir().unwrap();
+    // Use a private parent so other tests cannot change the `..` row.
+    let outer = tempfile::tempdir().unwrap();
+    let dir = outer.path().join("d");
+    fs::create_dir(&dir).unwrap();
     // Populate a tiny directory — a few files so ls has something to format.
     for name in &["alpha.txt", "beta.txt", "gamma.txt"] {
-        fs::write(dir.path().join(name), "x").unwrap();
+        fs::write(dir.join(name), "x").unwrap();
     }
-    let dir_path = dir.path().to_str().unwrap();
+    let dir_path = dir.to_str().unwrap();
 
     // Run skim ls -la <dir>
     let skim_output = skim_cmd()
