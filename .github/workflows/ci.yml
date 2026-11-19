@@ -94,6 +94,9 @@ jobs:
       - name: Run version check validation tests
         run: bash scripts/ci/test-version-check.sh
 
+      - name: Run release credential check tests
+        run: bash scripts/ci/test-release-credentials.sh
+
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
