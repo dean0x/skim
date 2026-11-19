@@ -3370,6 +3370,90 @@ export class UserService {
     );
 }
 
+/// Rewrite `cat <files>` through the hook in `dir`, then run the rewritten
+/// command in `dir` with its origin tag as an environment variable.
+fn run_hook_rewritten_cat(dir: &std::path::Path, files: &[&str]) -> std::process::Output {
+    let input = serde_json::json!({
+        "tool_input": { "command": format!("cat {}", files.join(" ")) }
+    });
+    let output = skim_cmd()
+        .current_dir(dir)
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: serde_json::Value = serde_json::from_slice(&output).expect("hook emits JSON");
+    let rewritten = response["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .expect("rewritten command present");
+    let (origin, args) = rewritten
+        .split_once(" skim ")
+        .unwrap_or_else(|| panic!("not a skim rewrite: {rewritten}"));
+    let (key, value) = origin.split_once('=').expect("leading origin tag");
+    skim_cmd()
+        .current_dir(dir)
+        .env(key, value)
+        .args(args.split_whitespace())
+        .output()
+        .unwrap()
+}
+
+/// A rewritten `cat b.ts a.ts` prints one `// path` header per file, in
+/// command-line order, and one view notice on stderr.
+#[test]
+fn test_hook_cat_of_two_files_prints_a_header_per_file_and_one_notice() {
+    let dir = TempDir::new().unwrap();
+    for name in ["b.ts", "a.ts"] {
+        fs::write(
+            dir.path().join(name),
+            "function first() { return 1 }\n// drop me\nfunction second() {}\n",
+        )
+        .unwrap();
+    }
+
+    let output = run_hook_rewritten_cat(dir.path(), &["b.ts", "a.ts"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with("// ")).collect();
+    assert_eq!(headers, ["// b.ts", "// a.ts"], "{stdout}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("[skim] transformed view (cat \u{2192} skim --mode=pseudo):")
+            && stderr.contains(": 2/2 files"),
+        "{stderr}"
+    );
+}
+
+/// The headers make the output differ from `cat` even when skim changes no
+/// body, so the one view notice still prints.
+#[test]
+fn test_hook_cat_of_two_unchanged_files_still_prints_the_view_notice() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("b.ts"), "function b() { return 2 }\n").unwrap();
+    fs::write(dir.path().join("a.ts"), "function a() { return 1 }\n").unwrap();
+
+    let output = run_hook_rewritten_cat(dir.path(), &["b.ts", "a.ts"]);
+
+    assert!(output.status.success(), "{output:?}");
+    // Each body is the raw file; only the headers are new.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "// b.ts\nfunction b() { return 2 }\n\n// a.ts\nfunction a() { return 1 }\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("[skim] transformed view (cat \u{2192} skim --mode=pseudo):")
+            && stderr.contains(": 2/2 files"),
+        "{stderr}"
+    );
+}
+
 // ============================================================================
 // #317 — declaration files keep their signal (.d.ts / .pyi)
 // ============================================================================

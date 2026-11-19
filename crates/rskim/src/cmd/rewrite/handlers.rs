@@ -69,7 +69,8 @@ fn mode_for_files(files: &[&str]) -> Option<&'static str> {
 /// - `cat -s file.ts` → `skim file.ts --mode=pseudo` (-s squeeze blanks: pseudo is better)
 /// - `cat -n file.ts` → None (line numbers)
 /// - `cat -b/-v/-e/-t/-A` → None (display flags)
-/// - `cat file1.ts file2.py` → `skim file1.ts file2.py --mode=pseudo --no-header`
+/// - `cat file1.ts file2.py` → `skim file1.ts file2.py --mode=pseudo` (one `// path`
+///   header per file, so the reader can tell where each file starts)
 /// - `cat` (no file arg) → None
 /// - `cat non-code.txt` → None
 pub(super) fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
@@ -106,9 +107,6 @@ pub(super) fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
     let mut tokens: Vec<String> = vec!["skim".to_string()];
     tokens.extend(files.iter().map(|f| f.to_string()));
     tokens.push(mode.to_string());
-    if files.len() > 1 {
-        tokens.push("--no-header".to_string());
-    }
 
     Some(RewriteResult {
         tokens,

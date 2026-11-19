@@ -580,6 +580,24 @@ fn test_rewrite_cat_includes_origin_tag() {
         .stdout(predicate::str::contains("SKIM_REWRITTEN_FROM=cat"));
 }
 
+/// `cat a b` prints the files with nothing between them. The rewrite keeps
+/// the `// path` header of each file, so the reader can tell where each file
+/// starts, and keeps the typed mode, so no default output bound applies.
+#[test]
+fn test_rewrite_cat_two_code_files_keeps_the_headers() {
+    let output = skim_cmd()
+        .args(["rewrite", "cat", "b.ts", "a.ts"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(output).unwrap().trim_end(),
+        "SKIM_REWRITTEN_FROM=cat skim b.ts a.ts --mode=pseudo"
+    );
+}
+
 #[test]
 fn test_rewrite_cat_squeeze_blanks() {
     skim_cmd()

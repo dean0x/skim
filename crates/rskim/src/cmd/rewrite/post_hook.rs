@@ -123,8 +123,8 @@ pub(super) fn post_tool_for(result: &RewriteResult) -> Option<PostTool> {
 /// The tool for a `cat` rewrite of exactly one tree-sitter code file.
 ///
 /// The cat handler builds `[<origin tag>, skim, <file>, <mode>]` for one file.
-/// More files add `--no-header`, and caller env vars add leading tokens, so
-/// both give a different token count and are refused. A glob, brace or `$`
+/// Two or more files give five or more tokens, and caller env vars add leading
+/// tokens, so both give a different token count and are refused. A glob, brace or `$`
 /// in the one argument can expand to several files in the shell, so it is
 /// refused too. The cat rewrite also accepts Markdown and the serde data
 /// formats; this path does not.

@@ -849,9 +849,20 @@ fn prepare_results<'a>(
     plan_count: &Counter<'_>,
     stats_count: &Counter<'_>,
 ) -> anyhow::Result<(FileResults<'a>, Option<RunReport>)> {
+    // A hook rewrite of `cat a b` replaces the bytes that `cat` prints. A
+    // header is not in those bytes, so each headed file counts as a view
+    // difference: the one view notice prints even when every body is raw.
+    // Pass 1 and every rung use this one function, so all counts agree.
+    let headers_differ = show_headers && origin.is_some();
+    let process = |path: &Path, opts: ProcessOptions| {
+        process_file(path, opts).map(|mut pr| {
+            pr.view_differs |= headers_differ;
+            pr
+        })
+    };
     let processed: FileResults<'_> = paths
         .par_iter()
-        .map(|path| (path, process_file(path, opts)))
+        .map(|path| (path, process(path, opts)))
         .collect();
     let Some(budget) = budget else {
         return Ok((processed, None));
@@ -871,7 +882,7 @@ fn prepare_results<'a>(
         let differing = files.iter().filter(|f| f.pass_1.view_differs).count();
         char_limits(origin, opts.mode, differing, paths.len(), &files, limit)
     });
-    let selection = select_run(&files, stage, opts, &process_file, plan_count)?;
+    let selection = select_run(&files, stage, opts, &process, plan_count)?;
     let mut report = seal_run(selection, &files, budget, origin, paths.len());
     let results = final_results(processed, &mut report.selection, opts, stats_count);
     Ok((results, Some(report)))

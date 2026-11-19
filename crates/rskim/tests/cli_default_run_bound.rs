@@ -660,7 +660,7 @@ fn deep_paths_do_not_charge_cut_clauses_to_the_signatures_rung() {
 fn multi_file_hook_rewrites_keep_their_typed_views_and_limits() {
     let fixture = Fixture::new(3, 250);
     for (tool, flags) in [
-        ("cat", &["--mode=pseudo", "--no-header"][..]),
+        ("cat", &["--mode=pseudo"][..]),
         ("head -400", &["--mode=full", "--max-lines", "400"]),
         ("tail -400", &["--mode=full", "--last-lines", "400"]),
     ] {
