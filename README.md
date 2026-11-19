@@ -374,7 +374,7 @@ The limit counts all stdout and the view notice. This includes headers, line num
 File errors, warnings, the `Processed` summary, `--show-stats` and `SKIM_DEBUG` do not count.
 
 Skim first tries structure, then signatures, then types for the run.
-If no view fits, skim cuts whole lines and can omit trailing files in path order.
+If no view fits, skim cuts whole lines and can omit trailing files in command-line order.
 Each cut marker counts hidden view lines. The last stdout line counts omitted files, even with `--no-header`.
 One stderr notice describes any change to the default view.
 

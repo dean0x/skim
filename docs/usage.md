@@ -54,7 +54,7 @@ A directory or glob with one match, or a list that resolves to one path, still u
 The limit counts stdout, including headers, line numbers and markers, plus the view notice.
 File errors, warnings, the `Processed` summary, `--show-stats` and `SKIM_DEBUG` do not count.
 
-Skim tries structure, signatures and types for the run. If none fits, skim cuts whole lines and can omit trailing files.
+Skim tries structure, signatures and types for the run. If none fits, skim cuts whole lines and can omit trailing files in command-line order.
 Cut markers count hidden view lines. The last stdout line counts omitted files, even with `--no-header`.
 Use `--tokens N`, a typed `--mode`, or fewer files for more content.
 Use `SKIM_PASSTHROUGH=1` or `--passthrough` for raw output.
