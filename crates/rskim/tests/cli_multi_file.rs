@@ -111,6 +111,52 @@ fn test_multi_file_shows_headers() {
     );
 }
 
+/// An explicit list keeps command-line order, as `cat` does. A glob is sorted
+/// inside its own argument, and the first time a path appears wins.
+#[test]
+fn test_multi_file_keeps_command_line_order_and_first_duplicate() {
+    let home = TempDir::new().unwrap();
+    fs::create_dir(home.path().join("src")).unwrap();
+    let files = [
+        ("b.ts", "function b() { return 2; }\n"),
+        ("src/c.ts", "function c() { return 3; }\n"),
+        ("src/d.ts", "function d() { return 4; }\n"),
+        ("a.ts", "function a() { return 1; }\n"),
+    ];
+    for (path, text) in files {
+        fs::write(home.path().join(path), text).unwrap();
+    }
+    let args = ["b.ts", "src/*.ts", "a.ts", "b.ts", "src/c.ts"];
+
+    let mut views = Vec::new();
+    for jobs in ["1", "4"] {
+        let output = common::skim_sandboxed(home.path())
+            .args(args)
+            .args(["--mode=full", "--no-cache", "--jobs", jobs])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(output).unwrap();
+        let headers: Vec<&str> = stdout.lines().filter(|l| l.starts_with("// ")).collect();
+        assert_eq!(
+            headers,
+            ["// b.ts", "// src/c.ts", "// src/d.ts", "// a.ts"],
+            "--jobs {jobs}:\n{stdout}"
+        );
+        views.push(stdout);
+    }
+    assert_eq!(views[0], views[1], "output must not depend on --jobs");
+
+    common::skim_sandboxed(home.path())
+        .env("SKIM_PASSTHROUGH", "1")
+        .args(args)
+        .assert()
+        .success()
+        .stdout(files.map(|(_, text)| text).concat());
+}
+
 #[test]
 fn test_multi_file_no_header_flag() {
     let temp = TempDir::new().unwrap();

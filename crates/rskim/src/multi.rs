@@ -8,6 +8,7 @@ use globset::GlobBuilder;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -1153,7 +1154,7 @@ fn report_file_error(path: impl std::fmt::Display, error: impl std::fmt::Display
     let _ = writeln!(io::stderr().lock(), "Error processing {path}: {error}");
 }
 
-/// Resolve the explicit list with the same path order and ignore rules as the transform.
+/// Resolve the explicit list with the same command-line order and ignore rules as the transform.
 pub(crate) fn passthrough_explicit_files(args: &[String], no_ignore: bool) -> anyhow::Result<()> {
     passthrough_paths(&resolve_explicit_paths(args, no_ignore)?)
 }
@@ -1185,7 +1186,9 @@ pub(crate) fn passthrough_paths(paths: &[PathBuf]) -> anyhow::Result<()> {
 }
 
 /// Resolve a mixed explicit list once for both transformed and raw output.
-/// Keep partial-failure warnings, the all-fail error, path order and deduplication.
+/// Keep partial-failure warnings, the all-fail error, command-line order and
+/// first-occurrence deduplication. Each glob or folder is sorted by path inside
+/// its own argument (the walker sort in `configure_walker`).
 fn resolve_explicit_paths(args: &[String], no_ignore: bool) -> anyhow::Result<Vec<PathBuf>> {
     debug_assert!(
         !args.is_empty(),
@@ -1245,10 +1248,12 @@ fn resolve_explicit_paths(args: &[String], no_ignore: bool) -> anyhow::Result<Ve
         );
     }
 
-    // Deduplicate: a plain file arg and a glob arg may both resolve to the
-    // same path (e.g. `skim explicit.ts '*.ts'`). Sort first so dedup is O(n).
-    paths.sort();
-    paths.dedup();
+    // Keep command-line order, as `cat` does. A plain file arg and a glob arg
+    // may both resolve to the same path (e.g. `skim explicit.ts '*.ts'`): the
+    // first occurrence wins. The identity is the lexical path, so `./a.ts` and
+    // `a.ts` stay two entries.
+    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
+    paths.retain(|path| seen.insert(path.clone()));
 
     Ok(paths)
 }

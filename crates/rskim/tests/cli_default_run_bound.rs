@@ -368,6 +368,8 @@ fn unknown_first_file_gets_a_raw_cut_and_the_next_file_shows() {
     let mut fixture = Fixture::new(1, 2);
     let raw = "unknown-language content\n".repeat(2_000);
     fixture.add("a.unknown".into(), &raw);
+    // An explicit list keeps command-line order: name the unknown file first.
+    fixture.paths.rotate_right(1);
     let output = fixture.run(&[]);
     let notice = bounded_notice(&output);
     assert!(
