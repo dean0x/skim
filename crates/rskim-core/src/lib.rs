@@ -253,14 +253,61 @@ pub fn transform_with_line_map(
     language.transform_source_with_line_map(source, config)
 }
 
+/// Transform source code read from the file at `path`, and return the same
+/// tuple as [`transform_with_line_map`].
+///
+/// `language` always sets the language of the transform: the path never
+/// changes it. The path only picks the grammar where one language has two. A
+/// `.tsx` path parses [`Language::TypeScript`] with the TSX grammar, so JSX does
+/// not hide the declarations after it. Every other pair of language and path
+/// gives the same bytes as [`transform_with_line_map`]. The file is never read
+/// from disk.
+///
+/// # Errors
+///
+/// All errors from [`transform_with_line_map`].
+///
+/// # Examples
+///
+/// ```
+/// use rskim_core::{transform_with_line_map_for_path, Language, Mode, TransformConfig};
+/// use std::path::Path;
+///
+/// let source = "const banner = <b>hi</b>;\nfunction App() { return banner; }\n";
+/// let config = TransformConfig::with_mode(Mode::Structure);
+/// let (content, has_errors, _line_map, _degraded) = transform_with_line_map_for_path(
+///     source,
+///     Language::TypeScript,
+///     Path::new("app.tsx"),
+///     &config,
+/// )?;
+/// assert!(!has_errors);
+/// assert!(content.contains("function App()"));
+/// # Ok::<(), rskim_core::SkimError>(())
+/// ```
+pub fn transform_with_line_map_for_path(
+    source: &str,
+    language: Language,
+    path: &std::path::Path,
+    config: &TransformConfig,
+) -> Result<(String, bool, Option<Vec<usize>>, bool)> {
+    language.transform_source_with_line_map_for_extension(
+        source,
+        config,
+        types::grammar_extension(path),
+    )
+}
+
 /// Transform source code with automatic language detection from file path
 ///
-/// Convenience function that detects language from file extension.
+/// Convenience function that detects language from file extension. The path
+/// also picks the grammar, as in [`transform_with_line_map_for_path`]: a
+/// `.tsx` path parses with the TSX grammar.
 ///
 /// # Arguments
 ///
 /// * `source` - Source code as string slice
-/// * `path` - File path for language detection (NOT read from disk)
+/// * `path` - File path for language and grammar detection (NOT read from disk)
 /// * `mode` - Transformation mode
 ///
 /// # Errors
@@ -280,22 +327,21 @@ pub fn transform_with_line_map(
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn transform_auto(source: &str, path: &std::path::Path, mode: Mode) -> Result<String> {
-    let language = Language::from_path(path)
-        .ok_or_else(|| SkimError::UnsupportedLanguage(path.to_path_buf()))?;
-
-    transform(source, language, mode)
+    transform_auto_with_config(source, path, &TransformConfig::with_mode(mode))
 }
 
 /// Transform source code with automatic language detection and custom configuration
 ///
 /// Convenience function that detects language from file extension and applies
 /// the provided configuration. Useful for applying max_lines truncation with
-/// auto-detected language.
+/// auto-detected language. The path also picks the grammar, as in
+/// [`transform_with_line_map_for_path`]: a `.tsx` path parses with the TSX
+/// grammar.
 ///
 /// # Arguments
 ///
 /// * `source` - Source code as string slice
-/// * `path` - File path for language detection (NOT read from disk)
+/// * `path` - File path for language and grammar detection (NOT read from disk)
 /// * `config` - Full transformation configuration
 ///
 /// # Errors
@@ -325,7 +371,9 @@ pub fn transform_auto_with_config(
     let language = Language::from_path(path)
         .ok_or_else(|| SkimError::UnsupportedLanguage(path.to_path_buf()))?;
 
-    transform_with_config(source, language, config)
+    let (content, _has_errors, _line_map, _degraded) =
+        transform_with_line_map_for_path(source, language, path, config)?;
+    Ok(content)
 }
 
 /// Transform source code with full result metadata

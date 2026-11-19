@@ -202,12 +202,17 @@ impl Registry {
 /// created here and addressed as `HEAD`, so the fixture is immune both to CI's
 /// depth-1 checkout and to this repository's squash-merge policy.
 fn blob_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    repo_with_file(blob_path(), BLOB_FIXTURE)
+}
+
+/// A hermetic repo holding `content` at `path` in one commit.
+fn repo_with_file(path: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let repo = dir.path().join("repo");
-    let blob = repo.join(blob_path());
+    let blob = repo.join(path);
     std::fs::create_dir_all(blob.parent().expect("blob path must have a parent"))
         .expect("create blob parent dir");
-    std::fs::write(&blob, BLOB_FIXTURE).expect("write blob fixture");
+    std::fs::write(&blob, content).expect("write blob fixture");
 
     // PF-009: `-b main` pins the initial branch from creation rather than
     // inheriting the host's `init.defaultBranch`.
@@ -515,4 +520,29 @@ fn test_blob_lossy_mode_discloses_itself_unconditionally() {
          stderr: {}",
         show(&verbatim.stderr),
     );
+}
+
+// ============================================================================
+// A `.tsx` blob parses with the TSX grammar
+// ============================================================================
+
+#[test]
+fn tsx_blob_with_a_mode_serves_the_tsx_view() {
+    let (_dir, repo) = repo_with_file(
+        "component.tsx",
+        include_str!("../../../tests/fixtures/typescript/component.tsx"),
+    );
+
+    let out = served(&repo, &["show", "--mode=structure", "HEAD:component.tsx"]);
+
+    assert!(out.status.success(), "stderr: {}", show(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).expect("UTF-8 view");
+    // `ItemList` follows the JSX of `Button`. The TypeScript grammar reads
+    // that JSX as a type assertion and keeps the body of `ItemList`.
+    let item_list = stdout
+        .lines()
+        .find(|line| line.starts_with("export function ItemList("))
+        .unwrap_or_else(|| panic!("ItemList is lost:\n{stdout}"));
+    assert!(item_list.ends_with("{...}"), "body is kept: {item_list}");
+    assert!(!stdout.contains("<li key"), "{stdout}");
 }

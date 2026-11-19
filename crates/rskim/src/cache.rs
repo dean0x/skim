@@ -295,7 +295,9 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
 /// the stderr lossy-view disclosure, so stdout bytes depend on `notice_bytes`
 /// as well. Every v2 entry was written by a guard that priced the body only.
 /// v4: token-budget cuts with line numbers retain their cut and unnumbered marker.
-const CACHE_SCHEMA_VERSION: u32 = 4;
+/// v5: the transform modes parse a `.tsx` file with the TSX grammar, so a v4
+/// entry of a `.tsx` file holds the view of the TypeScript grammar.
+const CACHE_SCHEMA_VERSION: u32 = 5;
 
 /// Generate the cache key for the entry `p` identifies, as of `mtime`.
 ///
@@ -1066,8 +1068,8 @@ mod tests {
         let key_production = cache_key(&key_params(path, Mode::Structure, trunc), mtime).unwrap();
 
         assert_eq!(
-            CACHE_SCHEMA_VERSION, 4,
-            "token cuts with -n need fresh entries"
+            CACHE_SCHEMA_VERSION, 5,
+            "a .tsx view from the TypeScript grammar must not be served warm"
         );
 
         // Simulate the pre-A1 hash: same inputs, NO version prefix.
@@ -1300,7 +1302,7 @@ mod tests {
         assert_eq!(
             plain,
             sha(&format!(
-                "cache_schema_v4|{}|{mtime_secs}|Structure|none|none|none|0|0",
+                "cache_schema_v5|{}|{mtime_secs}|Structure|none|none|none|0|0",
                 canonical.display()
             ))
         );
@@ -1326,7 +1328,7 @@ mod tests {
         assert_eq!(
             busy,
             sha(&format!(
-                "cache_schema_v4|{}|{mtime_secs}|Pseudo|50|none|500|1|162",
+                "cache_schema_v5|{}|{mtime_secs}|Pseudo|50|none|500|1|162",
                 canonical.display()
             ))
         );

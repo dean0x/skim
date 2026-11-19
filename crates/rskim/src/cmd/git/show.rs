@@ -1095,12 +1095,13 @@ fn run_show_file_content(
     let path_str = split_refpath(refpath);
 
     // Detect language from path extension.
-    let lang = Language::from_path(Path::new(path_str)).filter(|l| !l.is_serde_based());
+    let path = Path::new(path_str);
+    let supported = Language::from_path(path).is_some_and(|l| !l.is_serde_based());
 
-    let Some(lang) = lang else {
+    if !supported {
         // Tier 2: unsupported or serde-based language — passthrough.
-        // Move raw: the else branch always returns, so Rust knows raw is
-        // available after the let-else for the Tier 1 path.
+        // Move raw: this branch always returns, so Rust knows raw is
+        // available after it for the Tier 1 path.
         if passthrough_file_content(
             raw,
             label,
@@ -1113,10 +1114,11 @@ fn run_show_file_content(
             return Ok(exec::pipe_closed_exit());
         }
         return Ok(ExitCode::SUCCESS);
-    };
+    }
 
-    // Tier 1: transform in memory, in the mode the caller named.
-    let transformed = match rskim_core::transform(&raw, lang, mode) {
+    // Tier 1: transform in memory, in the mode the caller named. The path picks
+    // the language and the grammar, so a `.tsx` blob parses with the TSX grammar.
+    let transformed = match rskim_core::transform_auto(&raw, path, mode) {
         Ok(t) => t,
         Err(e) => {
             // Tier 3: transform failed — fall back to raw passthrough.

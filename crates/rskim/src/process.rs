@@ -10,7 +10,7 @@ use std::path::Path;
 use rskim_core::{
     ElidedSide, Language, Mode, Parser, TransformConfig, declarations, detect_language_from_path,
     elision_marker_line, simple_last_line_truncate_with_start, simple_line_truncate,
-    transform_auto_with_config, transform_with_config, transform_with_line_map,
+    transform_auto_with_config, transform_with_line_map, transform_with_line_map_for_path,
 };
 
 use crate::output::ELISION_HINT;
@@ -578,7 +578,10 @@ fn run_transform(
         let Some(language) = fallback_lang else {
             return Err(auto_result.unwrap_err().into());
         };
-        Ok(Some(transform_with_config(contents, language, config)?))
+        // A path with `..` has no detected language, so a `.tsx` file can
+        // reach this fallback: keep its path for the grammar.
+        let (text, ..) = transform_lines(contents, language, Some(path), config)?;
+        Ok(Some(text))
     };
 
     match options.trunc.token_budget {
@@ -649,7 +652,7 @@ fn run_transform(
             let line_map = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
                 let (rerun_output, _has_errors, map, _degraded) =
-                    transform_with_line_map(contents, language, &config)?;
+                    transform_lines(contents, language, Some(path), &config)?;
                 map.map(|map| cut_line_map(&output, &rerun_output, &map))
             } else {
                 None
@@ -667,7 +670,7 @@ fn run_transform(
                     options.line_numbers || options.trunc.char_budget.is_some(),
                 );
                 let (output, has_errors, line_map, degraded) =
-                    transform_with_line_map(contents, lang, &config)?;
+                    transform_lines(contents, lang, Some(path), &config)?;
                 Ok((output, options.mode, has_errors, line_map, degraded))
             } else {
                 // Language detection failed from extension — try shebang.
@@ -697,6 +700,26 @@ fn run_transform(
                 Ok((output, options.mode, false, None, true)) // degraded=true
             }
         }
+    }
+}
+
+/// Transform `contents` as `language`, and return the tuple of
+/// [`transform_with_line_map`].
+///
+/// A file path also picks the grammar: a `.tsx` file parses with the TSX
+/// grammar, so JSX does not hide the declarations after it. `language` stays
+/// the language of the transform, so `--language javascript` keeps the
+/// JavaScript grammar. Stdin without `--filename` passes `None` and keeps the
+/// grammar of `language`.
+fn transform_lines(
+    contents: &str,
+    language: Language,
+    path: Option<&Path>,
+    config: &TransformConfig,
+) -> rskim_core::Result<(String, bool, Option<Vec<usize>>, bool)> {
+    match path {
+        Some(path) => transform_with_line_map_for_path(contents, language, path, config),
+        None => transform_with_line_map(contents, language, config),
     }
 }
 
@@ -972,9 +995,11 @@ fn enforce_default_assembly(
 /// Keep today's guard and notice below the limit. Above it, bypass the guard:
 /// raw may fit, else the character-bound walk selects or cuts a view. Step-down
 /// can remove whole declaration kinds. No token measurement occurs after step A.
+/// `path` picks the grammar of each step-down view, as in [`transform_lines`].
 fn default_view(
     raw: &str,
     language: Option<Language>,
+    path: Option<&Path>,
     options: &ProcessOptions,
     initial: cascade::CharBudgetRung,
     shape: crate::output::BoundShape,
@@ -1060,7 +1085,7 @@ fn default_view(
                 let mut config = config.clone();
                 config.line_numbers = true;
                 let (text, has_errors, line_map, degraded) =
-                    transform_with_line_map(raw, language, &config)?;
+                    transform_lines(raw, language, path, &config)?;
                 Ok(Some(cascade::CharBudgetRung {
                     text,
                     line_map,
@@ -1171,6 +1196,7 @@ fn stdin_passthrough_result(
         let view = default_view(
             &buffer,
             None,
+            None,
             options,
             cascade::CharBudgetRung {
                 text: buffer.clone(),
@@ -1236,7 +1262,9 @@ pub(crate) fn process_stdin(
         );
     }
 
-    let filename_lang = filename_hint.and_then(|f| Language::from_path(Path::new(f)));
+    // The `--filename` hint also picks the grammar, as a file path does.
+    let hint_path = filename_hint.map(Path::new);
+    let filename_lang = hint_path.and_then(Language::from_path);
 
     // Shebang detection: if no language from explicit flag or filename extension,
     // sniff the first line of the stdin buffer.
@@ -1284,13 +1312,17 @@ pub(crate) fn process_stdin(
                     language,
                     source_line_count,
                     cascade::CascadeLines::Print,
-                    |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
+                    // Not the auto-detecting transform: it would ignore --language.
+                    |config| {
+                        let (text, ..) = transform_lines(&buffer, language, hint_path, config)?;
+                        Ok(Some(text))
+                    },
                 )?;
                 // Re-run for source coordinates, but keep the cascade's token cut.
                 let line_map = if options.line_numbers {
                     let config = cascade::build_config_with_opts(mode, &options.trunc, true);
                     let (rerun, _errs, map, _degraded) =
-                        transform_with_line_map(&buffer, language, &config)?;
+                        transform_lines(&buffer, language, hint_path, &config)?;
                     map.map(|map| cut_line_map(&output, &rerun, &map))
                 } else {
                     None
@@ -1304,7 +1336,7 @@ pub(crate) fn process_stdin(
                     options.line_numbers || options.trunc.char_budget.is_some(),
                 );
                 let (output, has_errors, line_map, degraded) =
-                    transform_with_line_map(&buffer, language, &config)?;
+                    transform_lines(&buffer, language, hint_path, &config)?;
                 (output, has_errors, line_map, degraded)
             }
         };
@@ -1337,6 +1369,7 @@ pub(crate) fn process_stdin(
         default_view(
             &buffer,
             Some(language),
+            hint_path,
             &options,
             cascade::CharBudgetRung {
                 text: transformed,
@@ -1547,6 +1580,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         default_view(
             &contents,
             language,
+            Some(path),
             &options,
             cascade::CharBudgetRung {
                 text: result,
@@ -1767,11 +1801,7 @@ pub(crate) fn process_symbol_file(
         .ok_or_else(|| symbol::unknown_language(path))?;
     symbol::require_supported(language, path)?;
 
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default();
-    let tree = Parser::new_for_extension(language, extension)?.parse(&contents)?;
+    let tree = Parser::new_for_path(language, path)?.parse(&contents)?;
     let scan = declarations(&tree, &contents, language);
     let matches = symbol::select(&scan.decls, name);
     if matches.is_empty() {
@@ -2029,6 +2059,7 @@ mod tests {
             let mut view = default_view(
                 &raw,
                 language,
+                None,
                 &options,
                 cascade::CharBudgetRung {
                     text,
@@ -2169,6 +2200,7 @@ mod tests {
                 let view = default_view(
                     &raw,
                     Some(Language::Json),
+                    None,
                     &options,
                     cascade::CharBudgetRung {
                         text: text.clone(),
@@ -2238,6 +2270,7 @@ mod tests {
             let view = default_view(
                 &raw,
                 None,
+                None,
                 &options,
                 cascade::CharBudgetRung {
                     text: text.clone(),
@@ -2277,6 +2310,7 @@ mod tests {
             let text = "a".repeat(limit - 20);
             let view = default_view(
                 &raw,
+                None,
                 None,
                 &options,
                 cascade::CharBudgetRung {
@@ -2346,6 +2380,7 @@ mod tests {
         );
         let view = default_view(
             &raw,
+            None,
             None,
             &options,
             cascade::CharBudgetRung {

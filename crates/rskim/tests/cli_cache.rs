@@ -1054,3 +1054,34 @@ fn run_level_cuts_do_not_replace_plain_types_cache_entries() {
     assert!(!cached.stdout.contains("files omitted"));
     assert_eq!(cached, uncached);
 }
+
+#[test]
+fn tsx_warm_read_serves_the_cold_tsx_view() {
+    let home = symbol_home(
+        "component.tsx",
+        include_str!("../../../tests/fixtures/typescript/component.tsx"),
+    );
+    let args = ["component.tsx", "--mode=structure"];
+
+    let cold = read_ok(&home, &args);
+    let entries = fs::read_dir(home.path().join(".cache/skim"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        })
+        .count();
+    let warm = read_ok(&home, &args);
+
+    assert!(entries > 0, "the cold read writes a cache entry");
+    assert_eq!(cold, warm);
+    // `ItemList` follows the JSX of `Button`: the TSX view collapses its body.
+    let item_list = warm
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("export function ItemList("))
+        .unwrap_or_else(|| panic!("ItemList is lost:\n{}", warm.stdout));
+    assert!(item_list.ends_with("{...}"), "body is kept: {item_list}");
+    assert!(!warm.stdout.contains("<li key"), "{}", warm.stdout);
+}
