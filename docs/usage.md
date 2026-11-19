@@ -13,6 +13,7 @@ skim [FILE|DIRECTORY] [OPTIONS]
 - **Single file**: `skim file.ts` (auto-detects language from extension)
 - **Directory**: `skim src/` (recursively processes all supported files)
 - **Glob pattern**: `skim 'src/**/*.ts'` (processes matching files)
+- **Several arguments**: `skim b.ts 'src/*.ts' a.ts` prints the files in command-line order, each after a `// path` header. A glob or a directory is sorted by path inside its own argument. A direct `skim` list compares resolved path text and keeps the first match. `z.ts` and `./z.ts` count as two paths. A glob such as `'*.ts'` adds `./`, so `skim z.ts '*.ts'` can print the same file twice. Rewritten `cat`, `head`, and `tail` commands keep repeated operands, as the original commands do. `SKIM_PASSTHROUGH=1` uses the same order.
 - **Stdin**: `skim -` (`--language` recommended; else skim tries a shebang, then raw text within the default bound)
 
 ## Options
@@ -54,7 +55,7 @@ A directory or glob with one match, or a list that resolves to one path, still u
 The limit counts stdout, including headers, line numbers and markers, plus the view notice.
 File errors, warnings, the `Processed` summary, `--show-stats` and `SKIM_DEBUG` do not count.
 
-Skim tries structure, signatures and types for the run. If none fits, skim cuts whole lines and can omit trailing files.
+Skim tries structure, signatures and types for the run. If none fits, skim cuts whole lines and can omit trailing files in command-line order.
 Cut markers count hidden view lines. The last stdout line counts omitted files, even with `--no-header`.
 Use `--tokens N`, a typed `--mode`, or fewer files for more content.
 Use `SKIM_PASSTHROUGH=1` or `--passthrough` for raw output.
@@ -199,7 +200,6 @@ skim src/app.ts --symbol run -n         # lines are numbered from the first line
 - Markdown and the data formats (JSON, YAML, TOML) exit with code 3.
 - Functions in C and C++ files are not found. Their name is inside the declarator.
 - The printed range holds the declaration only. Attributes, doc comments and decorators above the declaration are not in it.
-- For `.tsx` files, `--symbol` uses the TSX grammar. The structure mode still parses `.tsx` files with the TypeScript grammar.
 
 ### Caching Control
 

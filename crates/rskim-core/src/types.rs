@@ -402,6 +402,24 @@ impl Language {
         source: &str,
         config: &TransformConfig,
     ) -> Result<(String, bool, Option<Vec<usize>>, bool)> {
+        self.transform_source_with_line_map_for_extension(source, config, "")
+    }
+
+    /// [`Self::transform_source_with_line_map`] for source read from a file
+    /// with the extension `ext`.
+    ///
+    /// The extension only picks the tree-sitter grammar, through
+    /// [`Parser::new_for_extension`]: `tsx` selects the TSX grammar for
+    /// TypeScript. `self` stays the language of the transform. An empty `ext`
+    /// gives the grammar of [`Parser::new`], so every other pair gives the same
+    /// bytes as before. The passthrough and serde branches return before the
+    /// parser exists, so the extension cannot change them.
+    pub(crate) fn transform_source_with_line_map_for_extension(
+        self,
+        source: &str,
+        config: &TransformConfig,
+        ext: &str,
+    ) -> Result<(String, bool, Option<Vec<usize>>, bool)> {
         debug_assert!(
             !(config.max_lines.is_some() && config.last_lines.is_some()),
             "max_lines and last_lines are mutually exclusive"
@@ -435,7 +453,7 @@ impl Language {
         }
 
         // Tree-sitter path (all non-serde languages in Structure/Signatures/Types/Minimal/Pseudo)
-        let mut parser = Parser::new(self)?;
+        let mut parser = Parser::new_for_extension(self, ext)?;
         let tree = parser.parse(source)?;
         let parse_errors = tree.root_node().has_error();
 
@@ -1221,6 +1239,18 @@ pub type Result<T> = std::result::Result<T, SkimError>;
 // Parser Types
 // ============================================================================
 
+/// The extension of `path` that picks a grammar: empty when the path has no
+/// extension or when the extension is not UTF-8.
+///
+/// This is the one place that reads a grammar extension off a path. Both
+/// [`Parser::new_for_path`] and [`crate::transform_with_line_map_for_path`]
+/// use it, so a symbol read and a transform of one file pick the same grammar.
+pub(crate) fn grammar_extension(path: &Path) -> &str {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+}
+
 /// Wrapper around tree-sitter Parser with language context
 ///
 /// ARCHITECTURE: Parser is injected, not global.
@@ -1254,8 +1284,10 @@ impl Parser {
     /// TypeScript grammar reads JSX as a type assertion and loses every
     /// declaration after it. Every other pair behaves like [`Parser::new`].
     ///
-    /// [`Language::from_extension`] and the transform modes do not change: they
-    /// keep the TypeScript grammar for `.tsx`.
+    /// [`Language::from_extension`] does not change: `.tsx` stays
+    /// [`Language::TypeScript`]. The transform modes give a file path, and
+    /// [`crate::transform_with_line_map_for_path`] passes its extension here, so
+    /// they parse a `.tsx` file with the TSX grammar too.
     ///
     /// # Errors
     /// Same as [`Parser::new`].
@@ -1264,6 +1296,19 @@ impl Parser {
             return Self::with_grammar(language, &tree_sitter_typescript::LANGUAGE_TSX.into());
         }
         Self::new(language)
+    }
+
+    /// Create parser for a language and the path of the file it will read.
+    ///
+    /// The path only gives the extension for [`Parser::new_for_extension`]. It
+    /// is never read, and it never changes `language`. A path with no
+    /// extension, or with an extension that is not UTF-8, gives the grammar of
+    /// [`Parser::new`].
+    ///
+    /// # Errors
+    /// Same as [`Parser::new`].
+    pub fn new_for_path(language: Language, path: &Path) -> Result<Self> {
+        Self::new_for_extension(language, grammar_extension(path))
     }
 
     fn with_grammar(language: Language, grammar: &tree_sitter::Language) -> Result<Self> {

@@ -5,7 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 
 use rskim_core::{
-    Language, Mode, TransformConfig, transform, transform_auto, transform_with_config,
+    Language, Mode, TransformConfig, transform, transform_auto, transform_auto_with_config,
+    transform_with_config, transform_with_line_map, transform_with_line_map_for_path,
     truncate_to_token_budget,
 };
 use std::path::Path;
@@ -277,6 +278,132 @@ fn test_markdown_full() {
 
     // Should be identical to input
     assert_eq!(result, source);
+}
+
+// ============================================================================
+// TSX grammar: the file path picks the grammar, the language stays TypeScript
+// ============================================================================
+
+const TSX_COMPONENT: &str = include_str!("../../../tests/fixtures/typescript/component.tsx");
+
+/// A `.ts` file that uses the angle-bracket type assertion. The TSX grammar
+/// reads `<Config>` as a JSX element that never closes.
+const TS_TYPE_ASSERTION: &str = "declare const raw: unknown;
+const value = <Config>raw;
+export function load(path: string): Config {
+  return read(path);
+}
+";
+
+const ALL_TRANSFORM_MODES: [Mode; 5] = [
+    Mode::Structure,
+    Mode::Signatures,
+    Mode::Types,
+    Mode::Minimal,
+    Mode::Pseudo,
+];
+
+#[test]
+fn tsx_path_parses_jsx_without_errors_in_every_transform_mode() {
+    let path = Path::new("component.tsx");
+    for mode in ALL_TRANSFORM_MODES {
+        let config = TransformConfig::with_mode(mode);
+        let (_, has_errors, _, degraded) =
+            transform_with_line_map_for_path(TSX_COMPONENT, Language::TypeScript, path, &config)
+                .unwrap();
+        assert!(!has_errors, "{mode:?}: the TSX grammar parses JSX");
+        assert!(!degraded, "{mode:?}");
+    }
+    // Fixture check: without the path, the TypeScript grammar must fail on the
+    // JSX. Otherwise this test would pass without the TSX grammar.
+    let config = TransformConfig::with_mode(Mode::Structure);
+    let (_, ts_errors, _, _) =
+        transform_with_line_map(TSX_COMPONENT, Language::TypeScript, &config).unwrap();
+    assert!(ts_errors, "the TypeScript grammar must not parse the JSX");
+}
+
+#[test]
+fn tsx_structure_view_is_smaller_and_keeps_the_component_after_jsx() {
+    let structure =
+        transform_auto(TSX_COMPONENT, Path::new("component.tsx"), Mode::Structure).unwrap();
+
+    assert!(structure.len() < TSX_COMPONENT.len(), "{structure}");
+    let item_list = structure
+        .lines()
+        .find(|line| line.starts_with("export function ItemList("));
+    assert!(
+        item_list.is_some_and(|line| line.ends_with("{...}")),
+        "ItemList is lost or keeps its body:\n{structure}"
+    );
+    assert!(!structure.contains("<li key"), "{structure}");
+    assert!(structure.contains("export function Footer(): JSX.Element"));
+}
+
+#[test]
+fn tsx_signatures_view_lists_every_component() {
+    let config = TransformConfig::with_mode(Mode::Signatures);
+    let signatures =
+        transform_auto_with_config(TSX_COMPONENT, Path::new("component.tsx"), &config).unwrap();
+
+    for name in ["Button(", "ItemList(", "Footer("] {
+        assert!(
+            signatures.contains(&format!("function {name}")),
+            "{name}:\n{signatures}"
+        );
+    }
+    assert!(!signatures.contains("<footer>"), "{signatures}");
+}
+
+#[test]
+fn tsx_path_never_changes_the_language_of_the_transform() {
+    // `language` wins: JavaScript stays JavaScript under a `.tsx` name, and
+    // the path picks no grammar for it.
+    for mode in ALL_TRANSFORM_MODES {
+        let config = TransformConfig::with_mode(mode);
+        let with_path = transform_with_line_map_for_path(
+            TSX_COMPONENT,
+            Language::JavaScript,
+            Path::new("component.tsx"),
+            &config,
+        )
+        .unwrap();
+        let without =
+            transform_with_line_map(TSX_COMPONENT, Language::JavaScript, &config).unwrap();
+        assert_eq!(with_path, without, "{mode:?}");
+    }
+}
+
+#[test]
+fn ts_path_keeps_the_typescript_grammar_for_a_type_assertion() {
+    let path = Path::new("load.ts");
+    for mode in ALL_TRANSFORM_MODES {
+        let config = TransformConfig::with_mode(mode);
+        let with_path = transform_with_line_map_for_path(
+            TS_TYPE_ASSERTION,
+            Language::TypeScript,
+            path,
+            &config,
+        )
+        .unwrap();
+        assert!(!with_path.1, "{mode:?}: a type assertion parses");
+        let without =
+            transform_with_line_map(TS_TYPE_ASSERTION, Language::TypeScript, &config).unwrap();
+        assert_eq!(with_path, without, "{mode:?}: a `.ts` path changes no byte");
+    }
+    // Fixture check: the TSX grammar must fail on the assertion, or this test
+    // would also pass if every TypeScript path took the TSX grammar.
+    let config = TransformConfig::with_mode(Mode::Structure);
+    let (_, tsx_errors, _, _) = transform_with_line_map_for_path(
+        TS_TYPE_ASSERTION,
+        Language::TypeScript,
+        Path::new("load.tsx"),
+        &config,
+    )
+    .unwrap();
+    assert!(
+        tsx_errors,
+        "the TSX grammar must not parse a type assertion"
+    );
 }
 
 // ============================================================================

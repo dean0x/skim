@@ -245,12 +245,12 @@ fn tokens_batch_floor_uses_one_run_remedy() {
 }
 
 #[test]
-fn explicit_list_passthrough_prints_sorted_raw_bytes_with_or_without_tokens() {
+fn explicit_list_passthrough_prints_raw_bytes_in_command_line_order_with_or_without_tokens() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("a.ts"), STRUCTURE_FIXTURE).unwrap();
-    let second = b"// raw bytes\r\n\xff\x00no final newline";
-    fs::write(dir.path().join("b.ts"), second).unwrap();
-    let expected = [STRUCTURE_FIXTURE.as_bytes(), second].concat();
+    let first: &[u8] = b"// raw bytes\r\n\xff\x00no final newline";
+    fs::write(dir.path().join("b.ts"), first).unwrap();
+    let expected = [first, STRUCTURE_FIXTURE.as_bytes()].concat();
     for flags in [vec![], vec!["--tokens", "50"]] {
         passthrough_skim()
             .current_dir(dir.path())
@@ -290,21 +290,21 @@ fn explicit_list_passthrough_uses_the_same_mixed_path_set() {
         .assert()
         .success()
         .stdout(
-            ["b.ts", "src/a.ts", "z.ts"]
+            ["z.ts", "src/a.ts", "b.ts"]
                 .map(|file| fs::read(dir.path().join(file)).unwrap())
                 .concat(),
         );
     for no_ignore in [false, true] {
         let files: &[&str] = if no_ignore {
             &[
-                "b.ts",
+                "z.ts",
                 "src/.hidden.ts",
                 "src/a.ts",
                 "src/ignored.ts",
-                "z.ts",
+                "b.ts",
             ]
         } else {
-            &["b.ts", "src/a.ts", "z.ts"]
+            &["z.ts", "src/a.ts", "b.ts"]
         };
         let mut command = passthrough_skim();
         command.current_dir(dir.path()).args(args);

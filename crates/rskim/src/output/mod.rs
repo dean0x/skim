@@ -1241,10 +1241,39 @@ pub(crate) fn lossy_view_marker(
     differing: usize,
     total: usize,
 ) -> Option<String> {
-    if differing == 0 {
+    view_marker(origin, mode_str, differing, total, false)
+}
+
+/// The one line builder of [`lossy_view_marker`] and [`emitted_notice_cost`].
+///
+/// `headers_added` is true when a hook-rewritten run of two or more files
+/// prints a `// path` header before each file. The rewritten command (`cat a
+/// b`) prints no header, so the view differs from raw also when `differing` is
+/// 0. The marker then names the headers first, and the count still names only
+/// the files whose body differs, so it never claims a removal from a raw body:
+/// ```text
+/// [skim] transformed view (cat → skim --mode=pseudo): each file starts with a // <path> header; non-doc comments below the module header and any syntax noise removed: 0/2 files — SKIM_PASSTHROUGH=1 for full output
+/// ```
+fn view_marker(
+    origin: Option<&str>,
+    mode_str: &str,
+    differing: usize,
+    total: usize,
+    headers_added: bool,
+) -> Option<String> {
+    debug_assert!(
+        !headers_added || total >= 2,
+        "headers print only for two or more paths"
+    );
+    if differing == 0 && !headers_added {
         return None;
     }
     let class = mode_class_label(mode_str);
+    let headers = if headers_added {
+        "each file starts with a // <path> header; "
+    } else {
+        ""
+    };
     // Route through `remedy_for` so the printed remedy is always the narrowest
     // one that is literally reachable from this invocation (ADR-011 class 1).
     // The file-read path is non-JSON with passthrough reproducing argv, so
@@ -1266,12 +1295,14 @@ pub(crate) fn lossy_view_marker(
         ),
         // Hook-rewritten, multi-file
         (Some(orig), _) => format!(
-            "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {class}: {differing}/{total} files{suffix}"
+            "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {headers}{class}: {differing}/{total} files{suffix}"
         ),
         // Direct invocation, single file
         (None, n) if n <= 1 => format!("[skim] {mode_str} view: {class}{suffix}"),
         // Direct invocation, multi-file
-        (None, _) => format!("[skim] {mode_str} view: {class}: {differing}/{total} files{suffix}"),
+        (None, _) => {
+            format!("[skim] {mode_str} view: {headers}{class}: {differing}/{total} files{suffix}")
+        }
     };
     Some(marker)
 }
@@ -1386,8 +1417,9 @@ impl EmittedNotice {
 
 /// The disclosure this invocation emits, and therefore charges the reader.
 ///
-/// Arguments are [`lossy_view_marker`]'s, and `None` propagates from it: no
-/// differing view, no marker, no cost.
+/// Arguments are [`lossy_view_marker`]'s plus `headers_added` (see
+/// [`view_marker`]), and `None` propagates from the builder: no differing view
+/// and no added header, no marker, no cost.
 ///
 /// # Why one function with two callers
 ///
@@ -1432,8 +1464,9 @@ pub(crate) fn emitted_notice_cost(
     mode_str: &str,
     differing: usize,
     total: usize,
+    headers_added: bool,
 ) -> Option<EmittedNotice> {
-    let marker = lossy_view_marker(origin, mode_str, differing, total)?;
+    let marker = view_marker(origin, mode_str, differing, total, headers_added)?;
     Some(EmittedNotice {
         line: format!("{marker}\n"),
     })
@@ -1728,7 +1761,7 @@ mod emitted_notice_cost_tests {
     #[test]
     fn line_is_the_marker_plus_its_terminator() {
         let marker = lossy_view_marker(None, "structure", 1, 1).expect("marker");
-        let notice = emitted_notice_cost(None, "structure", 1, 1).expect("notice");
+        let notice = emitted_notice_cost(None, "structure", 1, 1, false).expect("notice");
 
         assert_eq!(notice.line(), format!("{marker}\n"));
         assert_eq!(notice.bytes(), marker.len() + 1);
@@ -1746,7 +1779,7 @@ mod emitted_notice_cost_tests {
             for origin in [None, Some("cat")] {
                 let marker = lossy_view_marker(origin, mode, 1, 1).expect("marker");
                 let trimmed = crate::tokens::count_tokens(&marker).expect("tokeniser");
-                let emitted = emitted_notice_cost(origin, mode, 1, 1)
+                let emitted = emitted_notice_cost(origin, mode, 1, 1, false)
                     .expect("notice")
                     .tokens()
                     .expect("tokeniser");
@@ -1763,20 +1796,41 @@ mod emitted_notice_cost_tests {
     /// becoming a zero-cost notice that a recorder would store as a measured 0.
     #[test]
     fn identical_view_has_no_notice_at_all() {
-        assert!(emitted_notice_cost(None, "structure", 0, 1).is_none());
-        assert!(emitted_notice_cost(Some("cat"), "pseudo", 0, 3).is_none());
+        assert!(emitted_notice_cost(None, "structure", 0, 1, false).is_none());
+        assert!(emitted_notice_cost(Some("cat"), "pseudo", 0, 3, false).is_none());
     }
 
     /// The multi-file marker is one line for the whole run, and costs one line.
     #[test]
     fn multi_file_notice_is_a_single_line() {
-        let notice = emitted_notice_cost(Some("cat"), "structure", 2, 3).expect("notice");
+        let notice = emitted_notice_cost(Some("cat"), "structure", 2, 3, false).expect("notice");
         assert_eq!(
             notice.line().matches('\n').count(),
             1,
             "an aggregate marker is one line; charging it to one row must charge one line"
         );
         assert!(notice.line().contains("2/3 files"));
+    }
+
+    /// Added headers alone make the view differ, so the marker prints with no
+    /// changed body. It names the headers and claims no removal from a body.
+    #[test]
+    fn added_headers_print_the_marker_with_the_exact_body_count() {
+        let notice = emitted_notice_cost(Some("cat"), "pseudo", 0, 2, true).expect("notice");
+        assert_eq!(
+            notice.line(),
+            "[skim] transformed view (cat \u{2192} skim --mode=pseudo): each file starts with \
+             a // <path> header; non-doc comments below the module header and any syntax \
+             noise removed: 0/2 files \u{2014} SKIM_PASSTHROUGH=1 for full output\n"
+        );
+        let changed = emitted_notice_cost(Some("cat"), "pseudo", 1, 2, true).expect("notice");
+        assert!(
+            changed.line().contains("header; non-doc") && changed.line().contains(": 1/2 files "),
+            "{}",
+            changed.line()
+        );
+        let plain = emitted_notice_cost(Some("cat"), "pseudo", 1, 2, false).expect("notice");
+        assert!(!plain.line().contains("<path>"), "{}", plain.line());
     }
 
     #[test]

@@ -3067,7 +3067,7 @@ mod tests {
     fn delivered_cost_round_trips_from_the_emitted_line() {
         let (db, _tmp) = test_db();
 
-        let notice = crate::output::emitted_notice_cost(Some("cat"), "structure", 1, 1)
+        let notice = crate::output::emitted_notice_cost(Some("cat"), "structure", 1, 1, false)
             .expect("a differing view owes a marker");
         let mut r = sample_record();
         r.delivery = Delivery {
@@ -3534,8 +3534,8 @@ mod tests {
         // And a carried marker cannot override the regime: `measured` is the
         // outer decision, so a row that somehow still held an `EmittedNotice`
         // would not be charged for it either.
-        let notice =
-            crate::output::emitted_notice_cost(Some("cat"), "structure", 3, 3).expect("marker");
+        let notice = crate::output::emitted_notice_cost(Some("cat"), "structure", 3, 3, false)
+            .expect("marker");
         assert_eq!(file_op_notice_cost(Some(&notice), false), (None, None));
     }
 

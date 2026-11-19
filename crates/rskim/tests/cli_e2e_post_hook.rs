@@ -512,6 +512,27 @@ fn cat_compresses_the_given_text_not_the_file_and_keeps_escape_bytes() {
     assert!(post(&call("cat a.rs b.rs", &rust_source())).is_none());
 }
 
+#[test]
+fn cat_of_a_tsx_file_serves_the_tsx_view() {
+    let text = include_str!("../../../tests/fixtures/typescript/component.tsx");
+
+    let response = post(&call("cat src/component.tsx", text)).expect("must compress");
+
+    let served = response["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        .as_str()
+        .unwrap();
+    // The declarations after the JSX of `Button` keep their text, and the
+    // comments between them go. The TypeScript grammar drops the semicolon in
+    // the type literal and the return type of `ItemList`.
+    for kept in [
+        "type Item = { id: number; name: string }",
+        "export function ItemList({ items }: { items: Item[] }): JSX.Element",
+    ] {
+        assert!(served.contains(kept), "lost {kept:?}:\n{served}");
+    }
+    assert!(!served.contains("The footer closes every page"), "{served}");
+}
+
 // ---- TP-9: the pre-run path is unchanged ----
 
 #[test]

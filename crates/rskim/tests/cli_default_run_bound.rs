@@ -368,6 +368,8 @@ fn unknown_first_file_gets_a_raw_cut_and_the_next_file_shows() {
     let mut fixture = Fixture::new(1, 2);
     let raw = "unknown-language content\n".repeat(2_000);
     fixture.add("a.unknown".into(), &raw);
+    // An explicit list keeps command-line order: name the unknown file first.
+    fixture.paths.rotate_right(1);
     let output = fixture.run(&[]);
     let notice = bounded_notice(&output);
     assert!(
@@ -658,7 +660,7 @@ fn deep_paths_do_not_charge_cut_clauses_to_the_signatures_rung() {
 fn multi_file_hook_rewrites_keep_their_typed_views_and_limits() {
     let fixture = Fixture::new(3, 250);
     for (tool, flags) in [
-        ("cat", &["--mode=pseudo", "--no-header"][..]),
+        ("cat", &["--mode=pseudo"][..]),
         ("head -400", &["--mode=full", "--max-lines", "400"]),
         ("tail -400", &["--mode=full", "--last-lines", "400"]),
     ] {
