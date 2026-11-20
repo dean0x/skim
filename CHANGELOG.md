@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-20
+
 ### Fixed
 
 - **`.tsx` files use the TSX grammar in every view** (#571). The structure, signatures, types,
@@ -29,24 +31,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cat`, `head -N` and `tail -N`. Rewritten commands keep repeated operands, as the
   original commands do. Their headers are not in the `==> path <==` form that `head` and
   `tail` print. The after-run hook still does not compress `cat` of two or more files.
-
-### Added
-
-- `rskim_core::transform_with_line_map_for_path(source, language, path, config)` and
-  `rskim_core::Parser::new_for_path(language, path)`. The `language` argument always sets the
-  language. The path only selects the grammar: the TSX grammar for a `.tsx` path.
-
-### Changed
-
-- `rskim_core::transform_auto` and `rskim_core::transform_auto_with_config` give the TSX view
-  for a `.tsx` path. Library users get different output for `.tsx` files.
-- The cache schema is now version 5. Every cache entry that an earlier version wrote misses
-  once and is written again.
-
-## [3.1.0] - 2026-11-19
-
-### Fixed
-
 - **env view: mask every value.** The env views apply the value mask to every
   output form. Lines that the mask hides from text on stdin are counted in the
   view.
@@ -63,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `rskim_core::transform_with_line_map_for_path(source, language, path, config)` and
+  `rskim_core::Parser::new_for_path(language, path)`. The `language` argument always sets the
+  language. The path only selects the grammar: the TSX grammar for a `.tsx` path.
 - The word view lists called definitions by name when a listed source file calls them and their name holds a query word. It uses only files already parsed and skips definitions in listed files. These are name links, not resolved calls.
 - With several definitions, identifier call lines can show `(def N)`, the definition's name line. Every call match on a line must fit the one definition of the name in its file. A plain call needs a free function and no import of that name. A `self`, `this` or `Self` call needs a method. This rule covers Rust, TypeScript, JavaScript, Python and Go only. If any call line is assigned, the clash note counts assigned and other call lines.
 - Global guidance for Kiro, Roo Code, Cline, Augment and Windsurf when their root folders exist. These agents get no hooks.
@@ -70,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `rskim_core::transform_auto` and `rskim_core::transform_auto_with_config` give the TSX view
+  for a `.tsx` path. Library users get different output for `.tsx` files.
+- The cache schema is now version 5. Every cache entry that an earlier version wrote misses
+  once and is written again.
 - Default single-file and stdin reads keep stdout plus their view notice below 29,000 characters (Unicode scalar values, not bytes).
   The bound applies to terminals, pipes and file redirects.
   Skim tries structure, signatures, then types before a whole-line cut.
