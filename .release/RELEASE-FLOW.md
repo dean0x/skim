@@ -47,6 +47,7 @@ Release section: `## [{version}] - {YYYY-MM-DD}`
 - Method: CI-driven (triggered by tag push)
 - Pipeline: `.github/workflows/release.yml`
 - Sequence: test -> build (7 targets) -> GitHub Release -> crates.io (rskim-core, rskim-contract, rskim-llm, rskim-tokens, rskim-compress, rskim-proxy, rskim) -> npm (7 platform pkgs + main) -> Homebrew tap dispatch
+- npm auth: trusted publishing (OIDC) from `release.yml`, with no npm token secret. Each of the 8 npm packages needs a trusted publisher for `dean0x/skim` and `release.yml` with `npm publish` allowed. The `check-credentials` job does the OIDC token exchange for each package before any publish (`scripts/ci/check-release-credentials.sh`).
 
 ## Version Bump
 

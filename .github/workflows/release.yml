@@ -13,6 +13,10 @@ env:
   # The npm platform packages, without the `@rskim/` scope. The credential
   # check and the publish job read this one list.
   NPM_PLATFORM_PACKAGES: cli-darwin-arm64 cli-darwin-x64 cli-linux-x64 cli-linux-arm64 cli-linux-x64-musl cli-linux-arm64-musl cli-win32-x64
+  # npm publishes with trusted publishing (OIDC), which needs npm 11.5.1 or
+  # later. Node 24.22.2 has npm 11.19.1. The credential check and the publish
+  # job use this one version.
+  NPM_PUBLISH_NODE_VERSION: '24.22.2'
 
 jobs:
   # Every publish job needs this job. A crates.io version can not be removed,
@@ -23,19 +27,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # The npm check gets an OIDC ID token, as the npm publish does.
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: ${{ env.NPM_PUBLISH_NODE_VERSION }}
 
       # The check methods are in the script header.
-      - name: Check npm credentials
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Check npm trusted publishing
         run: bash scripts/ci/check-release-credentials.sh npm
 
       - name: Check Homebrew tap credentials
@@ -414,10 +417,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Trusted publishing (OIDC): `npm publish` exchanges the OIDC ID token of
+      # this job for a short-lived token for each package. There is no npm
+      # token secret. npm adds provenance on its own.
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: ${{ env.NPM_PUBLISH_NODE_VERSION }}
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
@@ -457,8 +463,6 @@ jobs:
         run: node scripts/generate-npm-packages.mjs ${{ steps.version.outputs.VERSION }} artifacts
 
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           for pkg in $NPM_PLATFORM_PACKAGES; do
@@ -472,8 +476,6 @@ jobs:
           done
 
       - name: Publish main package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
           echo "Publishing rskim@${VERSION}..."
