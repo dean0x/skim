@@ -8,22 +8,22 @@
 #
 # A crates.io version can not be removed, so a release that can not reach
 # every registry must stop before the first publish (#607). The release
-# workflow runs this script in its `check-credentials` job, and every publish
-# job needs that job.
+# workflow runs the npm mode in its `check-npm-publishing` job and the
+# homebrew mode in its `check-credentials` job. Every publish job needs both.
 #
 # npm (env: ACTIONS_ID_TOKEN_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN,
 #      NPM_PLATFORM_PACKAGES)
 #   The release publishes to npm with trusted publishing (OIDC), so there is
-#   no npm token. First, `npm --version` must be 11.5.1 or later, the first
-#   npm with trusted publishing. Then the check does the same token exchange
-#   as `npm publish`
+#   no npm token. The check does the same token exchange as `npm publish`
 #   (npm CLI `lib/utils/oidc.js`), for each package, and publishes nothing:
-#   1. Get a GitHub OIDC ID token with the audience `npm:registry.npmjs.org`.
-#      The job needs `permissions: id-token: write`.
-#   2. For each package (rskim and @rskim/<platform>), send
-#      `POST /-/npm/v1/oidc/token/exchange/package/<pkg>` with the ID token.
-#      Only HTTP 2xx with a token in the body passes. The registry gives a
-#      token only when the package has a trusted publisher for this
+#   1. `npm --version` must be 11.5.1 or later, the first npm with trusted
+#      publishing.
+#   2. For each package (rskim and @rskim/<platform>), get a new GitHub OIDC
+#      ID token with the audience `npm:registry.npmjs.org`, as `npm publish`
+#      does for each package. The job needs `permissions: id-token: write`.
+#   3. Send `POST /-/npm/v1/oidc/token/exchange/package/<pkg>` with that ID
+#      token. Only HTTP 2xx with a token in the body passes. The registry
+#      gives a token only when the package has a trusted publisher for this
 #      repository and this workflow file.
 #   `npm publish` falls back to other credentials when the exchange fails,
 #   so the publish job alone does not show a missing trusted publisher.
@@ -35,8 +35,11 @@
 #   event type that no tap workflow listens for. The tap workflow runs only
 #   for `update-formula`. Only HTTP 204 passes.
 #
-# curl reads each token from a config on stdin, so no token is in argv. The
-# script prints no token and no response body that can hold one.
+# Tokens: curl reads each token from a config on stdin, so no token is in
+# argv. A token must have the form of its kind, or the check fails, so no
+# value from the network reaches a curl config or a workflow command line.
+# A response body must be exactly one JSON object. Printed messages lose
+# their control characters. The script prints no token and no body.
 
 set -uo pipefail
 
@@ -44,6 +47,9 @@ readonly NPM_REGISTRY="https://registry.npmjs.org"
 readonly NPM_AUDIENCE="npm%3Aregistry.npmjs.org"
 readonly NPM_MIN_VERSION="11.5.1"
 readonly TAP_REPO="dean0x/homebrew-tap"
+# A JWT (the GitHub OIDC ID token) and an npm token.
+readonly JWT_RE='^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
+readonly NPM_TOKEN_RE='^[A-Za-z0-9._-]+$'
 
 fail() {
   echo "::error::$1"
@@ -51,25 +57,42 @@ fail() {
 }
 
 # auth_config TOKEN — a curl config line that sends TOKEN as a Bearer header.
+# It refuses a token with a quote, a backslash or a control character, which
+# could end the config line.
 auth_config() {
+  case "$1" in
+    *[\"\\]* | *[[:cntrl:]]*) return 1 ;;
+  esac
   printf 'header = "Authorization: Bearer %s"\n' "$1"
 }
 
 # http_request TOKEN ACCEPT METHOD URL BODY OUT — writes the response body to
 # the file OUT and prints the HTTP status code (000 when curl gets no
-# response). An empty BODY sends no body.
+# response, or when the token is refused). An empty BODY sends no body.
 http_request() {
   local code
   local body_args=()
   [ -n "$5" ] && body_args=(-H "Content-Type: application/json" -d "$5")
-  code=$(auth_config "$1" | curl -sS -K - -o "$6" -w '%{http_code}' \
+  : > "$6"
+  code=$(auth_config "$1" | curl -sS --retry 2 -K - -o "$6" -w '%{http_code}' \
     -X "$3" -H "Accept: $2" ${body_args[@]+"${body_args[@]}"} "$4") || code="000"
   echo "${code}"
 }
 
-# json_field FILE FIELD — prints the string value of FIELD, or nothing.
+# json_field FILE FIELD — prints the string value of FIELD when FILE holds
+# exactly one JSON object, or nothing.
 json_field() {
-  jq -r --arg f "$2" 'if type == "object" then (.[$f] // empty) | strings else empty end' "$1" 2>/dev/null
+  jq -rs --arg f "$2" \
+    'if length == 1 and (.[0] | type) == "object" then (.[0][$f] // empty) | strings else empty end' \
+    "$1" 2>/dev/null
+}
+
+# message FILE — the `message` field of FILE with no control characters,
+# at most 200 characters, for an error line.
+message() {
+  jq -rs 'if length == 1 and (.[0] | type) == "object"
+    then (.[0].message // "") | strings | gsub("[[:cntrl:]]"; " ") | .[0:200]
+    else "" end' "$1" 2>/dev/null
 }
 
 check_npm() {
@@ -94,7 +117,7 @@ check_npm() {
     packages+=("@rskim/${platform}")
   done
 
-  local body_file sep code id_token
+  local body_file sep id_url
   body_file=$(mktemp)
   # Remove the file on every exit, because it can hold a token. The path
   # comes from mktemp, so it is safe to expand it into the trap now.
@@ -102,25 +125,27 @@ check_npm() {
 
   sep="?"
   [[ "${ACTIONS_ID_TOKEN_REQUEST_URL}" == *"?"* ]] && sep="&"
-  code=$(http_request "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" application/json GET \
-    "${ACTIONS_ID_TOKEN_REQUEST_URL}${sep}audience=${NPM_AUDIENCE}" "" "${body_file}")
-  id_token=$(json_field "${body_file}" value)
-  if ! [[ "${code}" =~ ^2[0-9][0-9]$ ]] || [ -z "${id_token}" ]; then
-    fail "npm check: GitHub gave no OIDC ID token (HTTP ${code})"
-  fi
-  echo "::add-mask::${id_token}"
+  id_url="${ACTIONS_ID_TOKEN_REQUEST_URL}${sep}audience=${NPM_AUDIENCE}"
 
-  local failed=0 pkg token
+  local failed=0 pkg code id_token token
   for pkg in "${packages[@]}"; do
-    : > "${body_file}"
+    code=$(http_request "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" application/json GET "${id_url}" "" "${body_file}")
+    id_token=$(json_field "${body_file}" value)
+    if ! [[ "${code}" =~ ^2[0-9][0-9]$ ]] || ! [[ "${id_token}" =~ ${JWT_RE} ]]; then
+      echo "::error::npm check: GitHub gave no valid OIDC ID token for ${pkg} (HTTP ${code})"
+      failed=1
+      continue
+    fi
+    echo "::add-mask::${id_token}"
+
     code=$(http_request "${id_token}" application/json POST \
       "${NPM_REGISTRY}/-/npm/v1/oidc/token/exchange/package/${pkg/\//%2f}" "" "${body_file}")
     token=$(json_field "${body_file}" token)
-    if [[ "${code}" =~ ^2[0-9][0-9]$ ]] && [ -n "${token}" ]; then
+    if [[ "${code}" =~ ^2[0-9][0-9]$ ]] && [[ "${token}" =~ ${NPM_TOKEN_RE} ]]; then
       echo "::add-mask::${token}"
       echo "✅ ${pkg}: trusted publishing accepts this workflow"
     else
-      echo "::error::npm check: ${pkg} has no trusted publisher for this repository and workflow (HTTP ${code}: $(json_field "${body_file}" message))"
+      echo "::error::npm check: ${pkg} has no trusted publisher for this repository and workflow (HTTP ${code}: $(message "${body_file}"))"
       failed=1
     fi
   done
@@ -135,10 +160,14 @@ check_homebrew() {
     "https://api.github.com/repos/${TAP_REPO}/dispatches" \
     '{"event_type":"skim-release-credential-check"}' "${body_file}")
   if [ "${code}" != "204" ]; then
-    fail "Homebrew tap check: HOMEBREW_TAP_TOKEN can not send a dispatch to ${TAP_REPO} (HTTP ${code}: $(json_field "${body_file}" message))"
+    fail "Homebrew tap check: HOMEBREW_TAP_TOKEN can not send a dispatch to ${TAP_REPO} (HTTP ${code}: $(message "${body_file}"))"
   fi
   echo "✅ Homebrew tap dispatch accepted"
 }
+
+if ! command -v jq > /dev/null; then
+  fail "credential check: jq is not installed"
+fi
 
 case "${1:-}" in
   npm) check_npm ;;

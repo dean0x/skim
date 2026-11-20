@@ -47,7 +47,11 @@ Release section: `## [{version}] - {YYYY-MM-DD}`
 - Method: CI-driven (triggered by tag push)
 - Pipeline: `.github/workflows/release.yml`
 - Sequence: test -> build (7 targets) -> GitHub Release -> crates.io (rskim-core, rskim-contract, rskim-llm, rskim-tokens, rskim-compress, rskim-proxy, rskim) -> npm (7 platform pkgs + main) -> Homebrew tap dispatch
-- npm auth: trusted publishing (OIDC) from `release.yml`, with no npm token secret. Each of the 8 npm packages needs a trusted publisher for `dean0x/skim` and `release.yml` with `npm publish` allowed. The `check-credentials` job does the OIDC token exchange for each package before any publish (`scripts/ci/check-release-credentials.sh`).
+- npm auth: trusted publishing (OIDC) from `release.yml`, with no npm token secret. Each of the 8 npm packages needs a trusted publisher for `dean0x/skim` and `release.yml` with `npm publish` allowed. The `check-npm-publishing` job does the OIDC token exchange for each package before any publish (`scripts/ci/check-release-credentials.sh`).
+- One-time cleanup after the first release that publishes with trusted publishing (owner login with 2FA):
+  1. On each of the 8 packages, set Settings → Publishing access to "Require two-factor authentication and disallow tokens". Trusted publishing still works.
+  2. Revoke the old granular npm token on npmjs.com.
+  3. Delete the `NPM_TOKEN` repository secret. No workflow uses it.
 
 ## Version Bump
 

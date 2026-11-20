@@ -14,32 +14,45 @@ env:
   # check and the publish job read this one list.
   NPM_PLATFORM_PACKAGES: cli-darwin-arm64 cli-darwin-x64 cli-linux-x64 cli-linux-arm64 cli-linux-x64-musl cli-linux-arm64-musl cli-win32-x64
   # npm publishes with trusted publishing (OIDC), which needs npm 11.5.1 or
-  # later. Node 24.22.2 has npm 11.19.1. The credential check and the publish
+  # later. Node 24.22.3 has npm 11.19.1. The credential check and the publish
   # job use this one version.
-  NPM_PUBLISH_NODE_VERSION: '24.22.2'
+  NPM_PUBLISH_NODE_VERSION: '24.22.3'
 
 jobs:
-  # Every publish job needs this job. A crates.io version can not be removed,
-  # so a release that can not reach every registry must stop before the first
-  # publish (#607).
-  check-credentials:
-    name: Check publish credentials
+  # The npm half of the credential check. `id-token: write` lets each step
+  # of a job publish to npm, so the two jobs that have it (this one and
+  # publish-npm) pin their actions to full commit SHAs, and no other secret
+  # is in these jobs.
+  check-npm-publishing:
+    name: Check npm trusted publishing
     runs-on: ubuntu-latest
     permissions:
       contents: read
       # The npm check gets an OIDC ID token, as the npm publish does.
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NPM_PUBLISH_NODE_VERSION }}
 
       # The check methods are in the script header.
       - name: Check npm trusted publishing
         run: bash scripts/ci/check-release-credentials.sh npm
+
+  # Every publish job needs this job, and this job needs the npm check. A
+  # crates.io version can not be removed, so a release that can not reach
+  # every registry must stop before the first publish (#607).
+  check-credentials:
+    name: Check publish credentials
+    needs: check-npm-publishing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
 
       - name: Check Homebrew tap credentials
         env:
@@ -414,20 +427,21 @@ jobs:
       contents: read
       id-token: write
 
+    # The actions are pinned to full commit SHAs (see check-npm-publishing).
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Trusted publishing (OIDC): `npm publish` exchanges the OIDC ID token of
       # this job for a short-lived token for each package. There is no npm
       # token secret. npm adds provenance on its own.
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NPM_PUBLISH_NODE_VERSION }}
           registry-url: 'https://registry.npmjs.org'
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           path: artifacts
           merge-multiple: true
