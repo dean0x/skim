@@ -1376,16 +1376,20 @@ fn test_heatmap_card_uses_the_run_count_and_counts_both_touches() {
     let target = "tests/flags-cli.test.ts";
     let names: Vec<_> = (0..50).map(|i| format!("bulk/f{i:02}.rs")).collect();
     let ts = recent_ts();
-    for (offset, body) in [(0, "// one"), (60, "// two")] {
+    for (offset, body, changed) in [
+        (0, "// one", target),
+        (60, "// two", target),
+        (120, "// three", "src/other.rs"),
+    ] {
         let files: Vec<_> = names
             .iter()
             .map(|name| (name.as_str(), body))
-            .chain([(target, body)])
+            .chain([(changed, body)])
             .collect();
         git_commit_files(dir.path(), &files, "chore: bulk change", ts + offset);
     }
 
-    let global = "coupling: 2 commits with more than 50 files not paired";
+    let global = "coupling: 3 commits with more than 50 files not paired";
     let text = heatmap_stdout(dir.path(), &[target]);
     assert_eq!(
         coupling_warnings(&text),
@@ -2852,7 +2856,7 @@ fn test_heatmap_card_names_only_the_user_filter() {
     let text = heatmap_stdout(dir.path(), &args);
     assert_eq!(
         card_lines(&text, "bulk/f00.rs"),
-        ["bulk/f00.rs: left out by --exclude"],
+        ["bulk/f00.rs: left out by --exclude; remove the matching patterns to keep it"],
         "{text}"
     );
     assert!(coupling_warnings(&text).is_empty(), "{text}");

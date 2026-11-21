@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use super::guidance_path::{
-    GuidanceScope, PathRefusal, check_folder_in_root, resolve_guidance_path,
+    GuidanceScope, PathRefusal, check_folder_in_root, resolve_project_at_root,
 };
 use super::helpers::{HOOK_SCRIPT_NAME, config_backup_name, resolve_real_settings_path};
 use crate::cmd::hooks::{copilot::SKIM_JSON_NAME, protocol_for_agent};
@@ -128,7 +128,6 @@ impl ProjectHookScope {
     }
 
     fn check_at_root(agent: AgentKind, root: PathBuf) -> Result<Self, PathRefusal> {
-        let guidance = GuidanceScope::Project { root: root.clone() };
         let mut settings = None;
         let mut cursor_legacy = None;
         let hook = protocol_for_agent(agent);
@@ -149,8 +148,8 @@ impl ProjectHookScope {
                     check_folder_in_root(&root.join(parent), relative, &root)?;
                 }
                 HookTarget::UserFile(_) => {
-                    let checked = resolve_guidance_path(relative, &guidance)?.path;
-                    check_first_link_target(&root.join(relative), relative)?;
+                    let checked = resolve_project_at_root(relative, &root)?.path;
+                    check_config_file(&root.join(relative), relative)?;
                     if !hook.uses_dedicated_hook_file()
                         && relative.file_name() == Some(hook.config_filename().as_ref())
                     {
@@ -196,16 +195,22 @@ impl ProjectHookScope {
     }
 }
 
-/// The guidance policy checks where the link ends. Also check its first target
-/// without following a link there, because permission prune uses that path.
-fn check_first_link_target(file: &Path, shown: &Path) -> Result<(), PathRefusal> {
+/// Readers expect a regular config file. For a link, permission prune also
+/// needs the first target to be the file, not another link.
+fn check_config_file(file: &Path, shown: &Path) -> Result<(), PathRefusal> {
     let unchecked = |error| PathRefusal::Unchecked {
         path: shown.to_path_buf(),
         error,
     };
     match fs::symlink_metadata(file) {
+        Ok(meta) if meta.is_file() => return Ok(()),
         Ok(meta) if meta.file_type().is_symlink() => {}
-        Ok(_) => return Ok(()),
+        Ok(_) => {
+            return Err(unchecked(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            )));
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(unchecked(error)),
     }

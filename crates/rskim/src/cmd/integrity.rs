@@ -56,7 +56,11 @@ pub(crate) fn write_hash_manifest(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create hook directory {}", parent.display()))?;
     }
-    safe_fs::write_atomic(&manifest_path, &content, None).with_context(|| {
+    #[cfg(unix)]
+    let permissions = Some(std::os::unix::fs::PermissionsExt::from_mode(0o600));
+    #[cfg(not(unix))]
+    let permissions = None;
+    safe_fs::write_atomic(&manifest_path, &content, permissions).with_context(|| {
         format!(
             "cannot write integrity manifest {}\n\
              hint: the hook directory must be writable — skim refuses to install a hook \
@@ -202,6 +206,65 @@ pub(crate) fn manifest_path(config_dir: &Path, agent_cli_name: &str) -> PathBuf 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Set the mask in a child process, not in the shared test runner.
+    #[cfg(unix)]
+    #[test]
+    fn private_hook_files_keep_owner_access() -> anyhow::Result<()> {
+        const CHILD: &str = "SKIM_TEST_PRIVATE_HOOK_FILE_MODES";
+        if std::env::var_os(CHILD).is_some() {
+            return check_private_modes();
+        }
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "umask 0200; exec \"$@\"", "sh"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                &format!("{module}::private_hook_files_keep_owner_access"),
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn check_private_modes() -> anyhow::Result<()> {
+        use crate::cmd::permissions::{PermissionsTier, permissions_protocol_for_agent};
+        use crate::cmd::session::AgentKind::{CodexCli, GeminiCli};
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        for folder in ["", "hooks", "rules", "policies"] {
+            fs::create_dir_all(root.join(folder))?;
+            fs::set_permissions(root.join(folder), fs::Permissions::from_mode(0o700))?;
+        }
+        write_hash_manifest(root, "gemini", "skim-rewrite.sh", "abcd")?;
+        for agent in [CodexCli, GeminiCli] {
+            let protocol = permissions_protocol_for_agent(agent).unwrap();
+            protocol.seed(root, PermissionsTier::Seed, &[protocol.render_entry("ls")])?;
+        }
+        for path in [
+            "hooks/skim-gemini.sha256",
+            "rules/skim.rules",
+            "policies/skim.toml",
+        ] {
+            assert_eq!(
+                fs::metadata(root.join(path))?.permissions().mode() & 0o777,
+                0o600,
+                "{path}"
+            );
+        }
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]

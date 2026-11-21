@@ -178,7 +178,10 @@ pub(super) fn resolve_guidance_path(
 ) -> Result<ResolvedPath, PathRefusal> {
     match scope {
         GuidanceScope::Global => resolve_global(path),
-        GuidanceScope::Project { root } => resolve_project(path, root),
+        GuidanceScope::Project { root } => {
+            let root = std::fs::canonicalize(root).map_err(|e| unchecked(path, e))?;
+            resolve_project_at_root(path, &root)
+        }
     }
 }
 
@@ -227,8 +230,11 @@ fn resolve_global(path: &Path) -> Result<ResolvedPath, PathRefusal> {
     })
 }
 
-/// Project scope: the file, and the folders above it, stay inside `root`.
-fn resolve_project(path: &Path, root: &Path) -> Result<ResolvedPath, PathRefusal> {
+/// The file and its parent folders must stay inside the caller's canonical root.
+pub(super) fn resolve_project_at_root(
+    path: &Path,
+    root: &Path,
+) -> Result<ResolvedPath, PathRefusal> {
     // A `..` step could climb out of the root in a part of the path that does
     // not exist yet, where no check below can see it.
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -236,7 +242,6 @@ fn resolve_project(path: &Path, root: &Path) -> Result<ResolvedPath, PathRefusal
             path: path.to_path_buf(),
         });
     }
-    let root = std::fs::canonicalize(root).map_err(|e| unchecked(path, e))?;
     let file = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -244,12 +249,12 @@ fn resolve_project(path: &Path, root: &Path) -> Result<ResolvedPath, PathRefusal
     };
 
     if let Some(parent) = file.parent() {
-        check_folder_in_root(parent, path, &root)?;
+        check_folder_in_root(parent, path, root)?;
     }
 
-    let real = follow_final_link(&file, path, Some(&root))?;
+    let real = follow_final_link(&file, path, Some(root))?;
     let shown = real
-        .strip_prefix(&root)
+        .strip_prefix(root)
         .map_or_else(|_| real.clone(), Path::to_path_buf);
     Ok(ResolvedPath { path: real, shown })
 }
@@ -266,6 +271,12 @@ pub(super) fn check_folder_in_root(
         return Err(PathRefusal::LeavesProject {
             path: shown.to_path_buf(),
         });
+    }
+    if !std::fs::metadata(existing)
+        .map_err(|e| unchecked(shown, e))?
+        .is_dir()
+    {
+        return Err(unchecked(shown, io::ErrorKind::NotADirectory.into()));
     }
     Ok(())
 }

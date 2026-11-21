@@ -142,6 +142,25 @@ fn an_empty_root_passes_without_any_creation() {
 }
 
 #[test]
+fn a_folder_at_the_config_name_is_refused_before_install() {
+    let root = TempDir::new().unwrap();
+    let config = Path::new(".cursor/hooks.json");
+    fs::create_dir_all(root.path().join(config)).unwrap();
+    let refusal = ProjectHookScope::check(Cursor, root.path()).unwrap_err();
+    assert!(matches!(refusal, PathRefusal::Unchecked { path, .. } if path == config));
+}
+
+#[test]
+fn a_file_at_a_required_folder_is_refused() {
+    let root = TempDir::new().unwrap();
+    let folder = Path::new(".gemini/policies");
+    fs::create_dir(root.path().join(".gemini")).unwrap();
+    fs::write(root.path().join(folder), "user data").unwrap();
+    let refusal = ProjectHookScope::check(GeminiCli, root.path()).unwrap_err();
+    assert!(matches!(refusal, PathRefusal::Unchecked { path, .. } if path == folder));
+}
+
+#[test]
 fn a_missing_root_is_refused() {
     let root = TempDir::new().unwrap();
     assert!(matches!(

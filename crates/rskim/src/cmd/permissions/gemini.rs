@@ -239,7 +239,11 @@ fn write_policy(config_dir: &Path, entries: &[String]) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    crate::cmd::safe_fs::write_atomic(&config_path, &toml_content, None)?;
+    #[cfg(unix)]
+    let permissions = Some(std::os::unix::fs::PermissionsExt::from_mode(0o600));
+    #[cfg(not(unix))]
+    let permissions = None;
+    crate::cmd::safe_fs::write_atomic(&config_path, &toml_content, permissions)?;
 
     // Compute hash and write sidecar.
     // The file was just written by skim; exceeding the size bound here is unexpected.

@@ -233,7 +233,7 @@ fn push_card(out: &mut String, card: &Card, window: &WindowInfo, caps: ListCaps)
     if let Some(reason) = card.excluded {
         let filter = match reason {
             ExcludeReason::Default => "the default excludes; --no-exclude keeps it",
-            ExcludeReason::User => "--exclude",
+            ExcludeReason::User => "--exclude; remove the matching patterns to keep it",
         };
         push_line(out, &format!("{}: left out by {filter}", card.path));
         return;

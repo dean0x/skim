@@ -1783,7 +1783,7 @@ mod tests {
         let rendered = render_cards_text(&result, &cards, caps);
         assert_eq!(
             rendered.lines().last(),
-            Some("src/extra.rs: left out by --exclude")
+            Some("src/extra.rs: left out by --exclude; remove the matching patterns to keep it")
         );
         let json = serde_json::to_value(&cards.rows[0]).unwrap();
         assert_eq!(json["excluded"], "user");
