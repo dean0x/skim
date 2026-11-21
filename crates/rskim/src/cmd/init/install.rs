@@ -250,6 +250,7 @@ fn prune_retired_permissions(
     agent: AgentKind,
     perm_dir: &std::path::Path,
     dry_run: bool,
+    project_scope: Option<&ProjectHookScope>,
 ) -> Vec<String> {
     use crate::cmd::permissions::PruneMode;
 
@@ -262,7 +263,13 @@ fn prune_retired_permissions(
     } else {
         PruneMode::Apply
     };
-    let removed = match protocol.prune_retired(perm_dir, &current, mode) {
+    let result = project_scope
+        .map_or(Ok(None), |scope| scope.permission_config_path(agent))
+        .and_then(|path| match path {
+            Some(path) => protocol.prune_retired_at(perm_dir, &current, mode, Some(path)),
+            None => protocol.prune_retired(perm_dir, &current, mode),
+        });
+    let removed = match result {
         Ok(removed) => removed,
         Err(e) => {
             eprintln!(
@@ -621,7 +628,8 @@ fn run_install_single(
 
     // Before the fast path, so that a current install still loses the entries
     // that skim no longer seeds.
-    let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run);
+    let removed =
+        prune_retired_permissions(agent, perm_dir, flags.dry_run, state.project_scope.as_ref());
 
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
@@ -1912,6 +1920,47 @@ mod tests {
             "only the legacy skim hook must be removed from the checked target"
         );
         assert_eq!(fs::read(&replacement).unwrap(), replacement_bytes);
+    }
+
+    #[cfg(unix)]
+    fn check_prune_uses_checked_permission_config(agent: AgentKind, key: &str) {
+        use crate::cmd::permissions::{permissions_protocol_for_agent, sidecar::SIDECAR_FILENAME};
+        use std::{fs, os::unix::fs::symlink};
+
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(agent.dot_dir_name());
+        let protocol = permissions_protocol_for_agent(agent).unwrap();
+        let config = dir.join(protocol.config_filename());
+        let checked = dir.join("checked.json");
+        let other = dir.join("other.json");
+        let settings = |tag| serde_json::json!({(key): {"allow": ["retired", tag]}}).to_string();
+        let other_bytes = settings("other");
+        fs::create_dir(&dir).unwrap();
+        fs::write(&checked, settings("checked")).unwrap();
+        fs::write(&other, &other_bytes).unwrap();
+        let record = r#"{"version":1,"tier":"seed","entries":["retired"],"source_mirrors":{},"config_hash":""}"#;
+        fs::write(dir.join(SIDECAR_FILENAME), record).unwrap();
+        symlink(&checked, &config).unwrap();
+        let scope = ProjectHookScope::check(agent, project.path()).unwrap();
+        fs::remove_file(&config).unwrap();
+        symlink(&other, &config).unwrap();
+
+        prune_retired_permissions(agent, &dir, false, Some(&scope));
+        let pruned = read_settings_json(&checked).unwrap();
+        assert_eq!(pruned[key]["allow"], serde_json::json!(["checked"]));
+        assert_eq!(fs::read(&other).unwrap(), other_bytes.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_prunes_the_checked_permission_config() {
+        check_prune_uses_checked_permission_config(AgentKind::ClaudeCode, "permissions");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copilot_prunes_the_checked_permission_config() {
+        check_prune_uses_checked_permission_config(AgentKind::CopilotCli, "/project");
     }
 
     // ---- find_skim_section unit tests ----

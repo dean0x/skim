@@ -216,24 +216,24 @@ impl PermissionsProtocol for CopilotPermissions {
 
     /// Needs no project root: one sidecar serves every project in the file,
     /// so the retired entries go from every project.
-    fn prune_retired(
+    fn prune_retired_at(
         &self,
         config_dir: &Path,
         current: &[String],
         mode: PruneMode,
+        checked_path: Option<&Path>,
     ) -> anyhow::Result<Vec<String>> {
         let record = retired_seed_entries(config_dir, current);
         let config_path = config_dir.join(CONFIG_FILENAME);
         // No file means nothing to remove, and no file to hash for the sidecar.
-        if record.retired.is_empty() || !config_path.exists() {
+        if record.retired.is_empty() || !checked_path.unwrap_or(&config_path).exists() {
             return Ok(Vec::new());
         }
 
-        // The file is shared by every project, so it is written the way the
-        // Claude Code writer writes settings.json: through a symlink to its
-        // target, after a backup. The plan resolves the path too, so that a
-        // path the real run cannot resolve shows no planned removal.
-        let real_path = resolve_real_settings_path(&config_path)?;
+        let real_path = match checked_path {
+            Some(path) => path.to_path_buf(),
+            None => resolve_real_settings_path(&config_path)?,
+        };
         // load_or_create_settings (inside) enforces MAX_SETTINGS_SIZE.
         let mut map = load_permissions_map(&real_path)?;
         let mut removed: Vec<String> = Vec::new();

@@ -116,6 +116,7 @@ pub(super) struct ProjectHookScope {
     root: PathBuf,
     settings: Option<PathBuf>,
     cursor_legacy: Option<PathBuf>,
+    copilot_permissions: Option<PathBuf>,
 }
 
 impl ProjectHookScope {
@@ -130,6 +131,7 @@ impl ProjectHookScope {
     fn check_at_root(agent: AgentKind, root: PathBuf) -> Result<Self, PathRefusal> {
         let mut settings = None;
         let mut cursor_legacy = None;
+        let mut copilot_permissions = None;
         let hook = protocol_for_agent(agent);
         for target in project_hook_targets(agent) {
             let relative = target.path();
@@ -158,6 +160,9 @@ impl ProjectHookScope {
                         && relative.file_name() == Some(CURSOR_LEGACY_SETTINGS.as_ref())
                     {
                         cursor_legacy = Some(checked);
+                    } else if agent == AgentKind::CopilotCli {
+                        // Copilot's only user file is its permission config.
+                        copilot_permissions = Some(checked);
                     }
                 }
             }
@@ -166,6 +171,7 @@ impl ProjectHookScope {
             root,
             settings,
             cursor_legacy,
+            copilot_permissions,
         })
     }
 
@@ -192,6 +198,16 @@ impl ProjectHookScope {
     #[must_use]
     pub(super) fn cursor_legacy_path(&self) -> Option<&Path> {
         self.cursor_legacy.as_deref()
+    }
+
+    pub(super) fn permission_config_path(&self, agent: AgentKind) -> anyhow::Result<Option<&Path>> {
+        let checked = match agent {
+            AgentKind::ClaudeCode => self.settings_path(),
+            AgentKind::CopilotCli => self.copilot_permissions.as_deref(),
+            _ => return Ok(None),
+        };
+        let path = checked.ok_or_else(|| anyhow::anyhow!("missing checked permission path"))?;
+        Ok(Some(path))
     }
 }
 

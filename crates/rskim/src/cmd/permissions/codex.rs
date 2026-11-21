@@ -166,11 +166,12 @@ impl PermissionsProtocol for CodexPermissions {
     /// hash matches the sidecar). A file changed by hand could lack a
     /// recorded rule, and a regenerated file would add that rule back, so
     /// such a file is left as it is and nothing is removed.
-    fn prune_retired(
+    fn prune_retired_at(
         &self,
         config_dir: &Path,
         current: &[String],
         mode: PruneMode,
+        _checked_path: Option<&Path>,
     ) -> anyhow::Result<Vec<String>> {
         let record = retired_seed_entries(config_dir, current);
         if record.retired.is_empty() {

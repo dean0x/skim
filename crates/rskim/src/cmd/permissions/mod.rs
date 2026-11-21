@@ -199,6 +199,17 @@ pub(crate) trait PermissionsProtocol {
         config_dir: &Path,
         current: &[String],
         mode: PruneMode,
+    ) -> anyhow::Result<Vec<String>> {
+        self.prune_retired_at(config_dir, current, mode, None)
+    }
+
+    /// Use the checked path for a project user config.
+    fn prune_retired_at(
+        &self,
+        config_dir: &Path,
+        current: &[String],
+        mode: PruneMode,
+        checked_path: Option<&Path>,
     ) -> anyhow::Result<Vec<String>>;
 
     /// Check whether all `entries` are already present in the agent config.
