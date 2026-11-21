@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 
 use super::{HookInput, HookProtocol, HookSupport};
+use crate::cmd::safe_fs;
 use crate::cmd::session::AgentKind;
 
 /// Filename of the skim-owned hook registration for Copilot CLI.
@@ -218,9 +219,8 @@ impl HookProtocol for CopilotCliHook {
 /// `script_path` is embedded in the `"bash"` field of the command entry.
 /// The hooks directory is created if it does not exist.
 ///
-/// Uses a `.tmp`-sibling write + rename (crash-safe), the same idiom used by
-/// `atomic_write_settings` and `write_sidecar`. On Unix the temporary file is
-/// created with mode `0o600` (owner read/write only) before the rename.
+/// Uses an exclusive temporary file in the hooks directory. The rename
+/// replaces any link at the final name. On Unix the file has mode `0o600`.
 pub(crate) fn write_copilot_skim_json(
     hook_config_dir: &Path,
     script_path: &str,
@@ -237,17 +237,11 @@ pub(crate) fn write_copilot_skim_json(
         }
     });
     let content = serde_json::to_string_pretty(&json)?;
-    let tmp_path = skim_json_path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, format!("{content}\n"))?;
     #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-    }
-    std::fs::rename(&tmp_path, &skim_json_path)?;
+    let permissions = Some(std::fs::Permissions::from_mode(0o600));
+    #[cfg(not(unix))]
+    let permissions = None;
+    safe_fs::write_atomic(&skim_json_path, &format!("{content}\n"), permissions)?;
     Ok(())
 }
 
@@ -697,6 +691,42 @@ mod tests {
             entry.get("matcher").is_none(),
             "entry must NOT include matcher (undocumented field risks file rejection)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_writer_replaces_copilot_final_link_and_leaves_temp_link() {
+        use std::fs::{self, Permissions};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("keep");
+        let path = dir.path().join("hooks/skim.json");
+        let old_temp = path.with_extension("json.tmp");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&target, b"keep these bytes").unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &path).unwrap();
+        symlink(&target, &old_temp).unwrap();
+
+        write_copilot_skim_json(dir.path(), "skim-rewrite.sh", &CopilotCliHook).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"keep these bytes");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_link(&old_temp).unwrap(), target);
+        let meta = fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        fs::remove_file(&target).unwrap();
+        write_copilot_skim_json(dir.path(), "skim-rewrite.sh", &CopilotCliHook).unwrap();
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_link(&old_temp).unwrap(), target);
     }
 
     /// install_hook_registration returns true and creates skim.json.

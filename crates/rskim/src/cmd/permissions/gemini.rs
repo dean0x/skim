@@ -239,10 +239,7 @@ fn write_policy(config_dir: &Path, entries: &[String]) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Atomic write (tmp + rename).
-    let tmp_path = config_path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, &toml_content)?;
-    std::fs::rename(&tmp_path, &config_path)?;
+    crate::cmd::safe_fs::write_atomic(&config_path, &toml_content, None)?;
 
     // Compute hash and write sidecar.
     // The file was just written by skim; exceeding the size bound here is unexpected.
@@ -330,6 +327,43 @@ mod tests {
 
     fn protocol() -> Box<dyn PermissionsProtocol> {
         permissions_protocol_for_agent(AgentKind::GeminiCli).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_writer_replaces_policy_final_link_and_leaves_temp_link() {
+        use std::fs::{self, Permissions};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("keep");
+        let path = dir.path().join(CONFIG_FILENAME);
+        let old_temp = path.with_extension("toml.tmp");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&target, b"keep these bytes").unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &path).unwrap();
+        symlink(&target, &old_temp).unwrap();
+        let entries = ["skim grep".to_string()];
+
+        write_policy(dir.path(), &entries).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"keep these bytes");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_link(&old_temp).unwrap(), target);
+        let meta = fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        fs::remove_file(&target).unwrap();
+        write_policy(dir.path(), &entries).unwrap();
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_link(&old_temp).unwrap(), target);
     }
 
     // ---- render_entry ----

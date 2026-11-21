@@ -17,6 +17,8 @@ use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+use crate::cmd::safe_fs;
+
 /// Compute SHA-256 hash of file contents, returning the hex-encoded digest.
 ///
 /// The error carries the path: `create_hook_script` propagates this failure to
@@ -31,7 +33,7 @@ pub(crate) fn compute_file_hash(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", result))
 }
 
-/// Write a hash manifest for an agent's hook script.
+/// Write a hash manifest for an agent's hook script atomically.
 ///
 /// Creates the manifest at `{config_dir}/hooks/skim-{agent_cli_name}.sha256`.
 /// The manifest contains a single line: `sha256:<hash>  <script_name>\n`.
@@ -54,7 +56,7 @@ pub(crate) fn write_hash_manifest(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create hook directory {}", parent.display()))?;
     }
-    std::fs::write(&manifest_path, content).with_context(|| {
+    safe_fs::write_atomic(&manifest_path, &content, None).with_context(|| {
         format!(
             "cannot write integrity manifest {}\n\
              hint: the hook directory must be writable — skim refuses to install a hook \
@@ -187,7 +189,7 @@ pub(crate) fn verify_awareness_integrity(
 }
 
 /// Compute the manifest file path for a given agent.
-fn manifest_path(config_dir: &Path, agent_cli_name: &str) -> PathBuf {
+pub(crate) fn manifest_path(config_dir: &Path, agent_cli_name: &str) -> PathBuf {
     config_dir
         .join("hooks")
         .join(format!("skim-{agent_cli_name}.sha256"))
@@ -200,6 +202,54 @@ fn manifest_path(config_dir: &Path, agent_cli_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_writer_replaces_manifest_link_without_touching_target() {
+        use std::fs::{self, Permissions};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("keep");
+        let manifest = manifest_path(dir.path(), "claude");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&target, b"keep these bytes").unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &manifest).unwrap();
+
+        write_hash_manifest(dir.path(), "claude", "skim-rewrite.sh", "abcd").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"keep these bytes");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        let meta = fs::symlink_metadata(&manifest).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::read_to_string(&manifest).unwrap(),
+            "sha256:abcd  skim-rewrite.sh\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_writer_replaces_dangling_manifest_link_without_creating_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("missing");
+        let manifest = manifest_path(dir.path(), "claude");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &manifest).unwrap();
+
+        write_hash_manifest(dir.path(), "claude", "skim-rewrite.sh", "abcd").unwrap();
+
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(std::fs::symlink_metadata(&manifest).unwrap().is_file());
+    }
 
     #[test]
     fn test_compute_file_hash_deterministic() {
