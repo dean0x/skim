@@ -295,7 +295,7 @@ A capped section ends with one line that gives the exact hidden count and the se
 | Module support | 5 commits of the module |
 | Fix-risk lift | The 95% lower bound (Wilson) of the file's fix rate is above the base rate (fix commits / all commits after excludes). At a base rate of 0% or 100%, one reason line replaces the rows. |
 | Bus-factor gate | 2 or more distinct authors in the window |
-| Large commits | A commit with more than 50 files after excludes adds no coupling pairs. A warning line counts these commits and gives the touch count for each named file on the card view. |
+| Large commits | A commit with more than 50 files after excludes adds no coupling pairs. A warning line counts these commits and gives the touch count for each named file on the card view. If no shown file has a touch, the card view omits the line. |
 
 `files[]` in the JSON keeps the raw per-file values (for example `churn.commits` and `fix_risk.keyword_pct`) for files below these minimums.
 
