@@ -243,15 +243,8 @@ fn resolve_project(path: &Path, root: &Path) -> Result<ResolvedPath, PathRefusal
         root.join(path)
     };
 
-    // The deepest folder above the file that exists must lie inside the root.
-    // Folders below it do not exist, so no link can be in them.
     if let Some(parent) = file.parent() {
-        let existing = deepest_existing(parent).map_err(|e| unchecked(path, e))?;
-        if !existing.starts_with(&root) {
-            return Err(PathRefusal::LeavesProject {
-                path: path.to_path_buf(),
-            });
-        }
+        check_folder_in_root(parent, path, &root)?;
     }
 
     let real = follow_final_link(&file, path, Some(&root))?;
@@ -259,6 +252,22 @@ fn resolve_project(path: &Path, root: &Path) -> Result<ResolvedPath, PathRefusal
         .strip_prefix(&root)
         .map_or_else(|_| real.clone(), Path::to_path_buf);
     Ok(ResolvedPath { path: real, shown })
+}
+
+/// The deepest existing folder must lie inside the canonical `root`.
+/// Folders below it do not exist, so no link can be in them.
+pub(super) fn check_folder_in_root(
+    folder: &Path,
+    shown: &Path,
+    root: &Path,
+) -> Result<(), PathRefusal> {
+    let existing = deepest_existing(folder).map_err(|e| unchecked(shown, e))?;
+    if !existing.starts_with(root) {
+        return Err(PathRefusal::LeavesProject {
+            path: shown.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// The canonical path of the deepest ancestor of `folder` (or `folder` itself)

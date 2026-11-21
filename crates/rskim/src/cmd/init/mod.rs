@@ -23,6 +23,7 @@ mod guidance_block;
 mod guidance_path;
 mod guidance_report;
 mod helpers;
+mod hook_scope;
 mod install;
 mod state;
 mod targets;

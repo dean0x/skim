@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use super::{
-    GlobalPathRefusal, GuidanceScope, PathRefusal, check_global_target, require_absolute_global,
-    resolve_guidance_path,
+    GlobalPathRefusal, GuidanceScope, PathRefusal, check_folder_in_root, check_global_target,
+    require_absolute_global, resolve_guidance_path,
 };
 use crate::cmd::session::{AgentKind, InstructionEnv, RelativeOverride};
 
@@ -70,6 +70,63 @@ impl Fixture {
 #[cfg(unix)]
 fn link(target: &Path, at: &Path) {
     std::os::unix::fs::symlink(target, at).unwrap();
+}
+
+#[test]
+fn folder_check_accepts_missing_folders_without_any_creation() {
+    let fixture = Fixture::new();
+    let shown = Path::new("agent/hooks");
+    check_folder_in_root(
+        &fixture.root.path().join(shown),
+        shown,
+        &fixture.canonical_root(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_dir(fixture.root.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn folder_check_accepts_an_inside_folder_link() {
+    let fixture = Fixture::new();
+    let inside = fixture.in_root("real-agent");
+    std::fs::create_dir(&inside).unwrap();
+    link(&inside, &fixture.in_root("agent"));
+    check_folder_in_root(
+        &fixture.in_root("agent"),
+        Path::new("agent"),
+        &fixture.canonical_root(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn folder_check_refuses_an_outside_folder_link() {
+    let fixture = Fixture::new();
+    let agent = fixture.in_root("agent");
+    link(fixture.outside.path(), &agent);
+    assert!(matches!(
+        check_folder_in_root(&agent, Path::new("agent"), &fixture.canonical_root()),
+        Err(PathRefusal::LeavesProject { path }) if path == Path::new("agent")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn folder_check_refuses_dangling_links_without_any_creation() {
+    let fixture = Fixture::new();
+    let agent = fixture.in_root("agent");
+    for target in [fixture.in_root("missing"), fixture.in_outside("missing")] {
+        link(&target, &agent);
+        assert!(matches!(
+            check_folder_in_root(&agent, Path::new("agent"), &fixture.canonical_root()),
+            Err(PathRefusal::Unchecked { path, error })
+                if path == Path::new("agent") && error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!target.exists());
+        std::fs::remove_file(&agent).unwrap();
+    }
 }
 
 // ============================================================================
