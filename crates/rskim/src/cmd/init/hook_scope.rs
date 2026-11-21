@@ -9,9 +9,6 @@
 //! folder that another process replaces with a link after the check is
 //! followed. The guidance path policy has the same limit.
 
-// Phase 5 connects this module to init and uninstall.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -19,13 +16,37 @@ use std::path::{Component, Path, PathBuf};
 use super::guidance_path::{
     GuidanceScope, PathRefusal, check_folder_in_root, resolve_guidance_path,
 };
-use super::helpers::{HOOK_SCRIPT_NAME, config_backup_name};
+use super::helpers::{HOOK_SCRIPT_NAME, config_backup_name, resolve_real_settings_path};
 use crate::cmd::hooks::{copilot::SKIM_JSON_NAME, protocol_for_agent};
 use crate::cmd::integrity::manifest_path;
 use crate::cmd::permissions::{permissions_protocol_for_agent, sidecar::SIDECAR_FILENAME};
 use crate::cmd::session::AgentKind;
 
-const CURSOR_LEGACY_SETTINGS: &str = "settings.json";
+pub(super) const CURSOR_LEGACY_SETTINGS: &str = "settings.json";
+
+pub(super) enum SettingsFile {
+    Agent,
+    CursorLegacy,
+}
+
+/// In project scope, use the checked path or stop. Resolve the original path
+/// only for a global write.
+pub(super) fn settings_write_path(
+    scope: Option<&ProjectHookScope>,
+    file: SettingsFile,
+    path: &Path,
+) -> anyhow::Result<PathBuf> {
+    let Some(scope) = scope else {
+        return resolve_real_settings_path(path);
+    };
+    let checked = match file {
+        SettingsFile::Agent => scope.settings_path(),
+        SettingsFile::CursorLegacy => scope.cursor_legacy_path(),
+    };
+    checked
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("no checked path for project settings"))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum HookTarget {

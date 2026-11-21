@@ -232,6 +232,7 @@ impl DetectionEnv {
     /// This is the single authoritative config-dir resolver. All install,
     /// uninstall, and detection code paths MUST call this — not read env vars
     /// independently (avoids the PF-002 split-resolver hazard).
+    /// Project hook writers must also check paths with `ProjectHookScope`.
     pub(crate) fn resolve(
         &self,
         agent: AgentKind,

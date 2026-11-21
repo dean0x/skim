@@ -11,6 +11,9 @@ use super::helpers::{
     config_backup_name, confirm_grant, confirm_proceed, display_entries, load_or_create_settings,
     resolve_real_settings_path,
 };
+use super::hook_scope::{
+    CURSOR_LEGACY_SETTINGS, ProjectHookScope, SettingsFile, settings_write_path,
+};
 use super::state::{
     DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
 };
@@ -727,6 +730,14 @@ fn run_install_single(
         }
     }
 
+    let state = DetectedState {
+        project_scope: state
+            .project_scope
+            .as_ref()
+            .map(|scope| scope.recheck(agent))
+            .transpose()?,
+        ..state
+    };
     execute_install(
         &state,
         flags.no_guidance,
@@ -818,7 +829,7 @@ fn execute_install(
     // may have been written in a previous skim version when Cursor was (incorrectly)
     // treated as using the Claude Code settings.json / PreToolUse format.
     if let Some(AgentKind::Cursor) = AgentKind::from_str(state.agent_cli_name) {
-        migrate_cursor_legacy_settings(&state.config_dir)?;
+        migrate_cursor_legacy_settings(&state.config_dir, state.project_scope.as_ref())?;
     }
 
     // B8: Patch settings.json (or hooks.json for Cursor)
@@ -1219,7 +1230,7 @@ fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Res
         crate::cmd::hooks::HookMode::requested(dev_requested),
     );
 
-    atomic_write_executable(&hooks_dir, &script_path, &script_content)?;
+    atomic_write_executable(&script_path, &script_content)?;
 
     // Compute and store SHA-256 hash for integrity verification (#57).
     // Errors are propagated with `?` — silently installing without tamper
@@ -1240,39 +1251,14 @@ fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Res
     Ok(())
 }
 
-/// Atomically write `content` to `script_path` and set executable permissions.
-///
-/// Writes to a `.tmp` sibling first, then renames — a crash mid-write produces
-/// a tmp file instead of a truncated script.  The tmp file is removed on any
-/// failure (cleanup guard).  On Unix, `0o755` permissions are applied to the
-/// tmp file *before* the rename so the final path is always executable.
-fn atomic_write_executable(
-    dir: &std::path::Path,
-    script_path: &std::path::Path,
-    content: &str,
-) -> anyhow::Result<()> {
-    let tmp_path = dir.join(format!("{HOOK_SCRIPT_NAME}.tmp"));
-
-    if let Err(e) = std::fs::write(&tmp_path, content) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-
+/// Publish the script from an exclusive temporary file. On Unix, set mode
+/// 0755 on the open file before the rename. Replace a link at the final name.
+fn atomic_write_executable(script_path: &std::path::Path, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(0o755);
-        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, script_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-
-    Ok(())
+    let permissions = Some(std::fs::Permissions::from_mode(0o755));
+    #[cfg(not(unix))]
+    let permissions = None;
+    crate::cmd::safe_fs::write_atomic(script_path, content, permissions)
 }
 
 // ============================================================================
@@ -1315,8 +1301,11 @@ fn remove_skim_entries_from_event(settings: &mut serde_json::Value, event_key: &
 ///
 /// Non-fatal: if `settings.json` doesn't exist or can't be parsed, this is
 /// silently skipped (the correct `hooks.json` is still written).
-fn migrate_cursor_legacy_settings(config_dir: &std::path::Path) -> anyhow::Result<()> {
-    let legacy_path = config_dir.join("settings.json");
+fn migrate_cursor_legacy_settings(
+    config_dir: &std::path::Path,
+    project_scope: Option<&ProjectHookScope>,
+) -> anyhow::Result<()> {
+    let legacy_path = config_dir.join(CURSOR_LEGACY_SETTINGS);
     if !legacy_path.exists() {
         return Ok(());
     }
@@ -1330,8 +1319,8 @@ fn migrate_cursor_legacy_settings(config_dir: &std::path::Path) -> anyhow::Resul
     let removed_lower = remove_skim_entries_from_event(&mut settings, "preToolUse");
 
     if removed_pre || removed_lower {
-        // Atomic write to legacy path
-        let real_path = resolve_real_settings_path(&legacy_path)?;
+        let real_path =
+            settings_write_path(project_scope, SettingsFile::CursorLegacy, &legacy_path)?;
         atomic_write_settings(&settings, &real_path)?;
         println!(
             "  {} Cleaned legacy settings.json entry (migrated to hooks.json)",
@@ -1555,7 +1544,11 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
         std::fs::create_dir_all(&state.config_dir)?;
     }
 
-    let real_path = resolve_real_settings_path(&state.settings_path)?;
+    let real_path = settings_write_path(
+        state.project_scope.as_ref(),
+        SettingsFile::Agent,
+        &state.settings_path,
+    )?;
     let mut settings = load_or_create_settings(&real_path)?;
 
     // Back up the existing file under the name of its own config file. The
@@ -1768,6 +1761,55 @@ mod tests {
     use crate::cmd::init::guidance_block::GuidanceHooks;
     use crate::cmd::init::helpers::guidance_content;
     use crate::cmd::session::AgentKind;
+
+    #[cfg(unix)]
+    fn check_hook_script_write(link_name: &str, keeps_link: bool) {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let hooks = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("user.txt");
+        fs::write(&target, b"user data\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = hooks.path().join(link_name);
+        symlink(&target, &link).unwrap();
+
+        let script = hooks.path().join(HOOK_SCRIPT_NAME);
+        let content = "#!/bin/sh\nexit 0\n";
+        atomic_write_executable(&script, content).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"user data\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        let entries: Vec<_> = fs::read_dir(outside.path())
+            .unwrap()
+            .take(2)
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["user.txt"]);
+        if keeps_link {
+            assert_eq!(fs::read_link(&link).unwrap(), target);
+        }
+        let meta = fs::symlink_metadata(&script).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::read_to_string(&script).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_script_writer_leaves_the_old_temp_link_untouched() {
+        check_hook_script_write("skim-rewrite.sh.tmp", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_script_writer_replaces_a_link_with_an_executable_file() {
+        check_hook_script_write(HOOK_SCRIPT_NAME, false);
+    }
 
     #[test]
     fn test_upsert_hook_entry_idempotent() {
@@ -2030,6 +2072,7 @@ mod tests {
             skim_version: "1.0.0".to_string(),
             config_dir: std::path::PathBuf::from("/tmp"),
             hook_config_dir: std::path::PathBuf::from("/tmp"),
+            project_scope: None,
             settings_path: std::path::PathBuf::from("/tmp/settings.json"),
             settings_exists: false,
             hook_installed: false,

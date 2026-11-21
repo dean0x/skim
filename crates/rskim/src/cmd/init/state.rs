@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::flags::DetectionEnv;
 use super::helpers::HOOK_SCRIPT_NAME;
+use super::hook_scope::ProjectHookScope;
 use crate::cmd::hooks::claude::POST_TOOL_USE_EVENT;
 use crate::cmd::hooks::{
     HookMode, HookProtocol, honour_dev_declaration, parse_mode_from_script, protocol_for_agent,
@@ -23,6 +24,8 @@ pub(super) struct DetectedState {
     /// Equals `config_dir` for all agents except Copilot CLI, which routes hook
     /// artifacts to `~/.copilot/` via `HookProtocol::hook_config_dir`.
     pub(super) hook_config_dir: PathBuf,
+    pub(super) project_scope: Option<ProjectHookScope>,
+    /// Used for detection and display, not directly for writes.
     pub(super) settings_path: PathBuf,
     pub(super) settings_exists: bool,
     pub(super) hook_installed: bool,
@@ -217,6 +220,9 @@ pub(super) fn detect_state(
     let skim_binary = super::helpers::resolve_skim_binary()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
     let config_dir = env.resolve(agent, project)?;
+    let project_scope = project
+        .then(|| ProjectHookScope::for_current_folder(agent))
+        .transpose()?;
     let protocol = protocol_for_agent(agent);
 
     // Compute the hook artifact directory via the protocol seam.
@@ -349,6 +355,7 @@ pub(super) fn detect_state(
         skim_version,
         config_dir,
         hook_config_dir,
+        project_scope,
         settings_path,
         settings_exists,
         hook_installed,
@@ -1240,6 +1247,7 @@ mod tests {
             skim_version: env!("CARGO_PKG_VERSION").to_string(),
             config_dir: std::path::PathBuf::from("/tmp/test-config"),
             hook_config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            project_scope: None,
             settings_path: std::path::PathBuf::from("/tmp/test-config/settings.json"),
             settings_exists: true,
             hook_installed: true,
@@ -1280,6 +1288,7 @@ mod tests {
             skim_version: env!("CARGO_PKG_VERSION").to_string(),
             config_dir: std::path::PathBuf::from("/tmp/test-config"),
             hook_config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            project_scope: None,
             settings_path: std::path::PathBuf::from("/tmp/test-config/settings.json"),
             settings_exists: true,
             hook_installed: true,
@@ -1425,6 +1434,7 @@ mod tests {
             skim_version: env!("CARGO_PKG_VERSION").to_string(),
             config_dir: std::path::PathBuf::from("/tmp/test-config"),
             hook_config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            project_scope: None,
             settings_path: std::path::PathBuf::from("/tmp/test-config/settings.json"),
             settings_exists: true,
             hook_installed: true,
@@ -1827,6 +1837,7 @@ mod tests {
             skim_version: env!("CARGO_PKG_VERSION").to_string(),
             config_dir: std::path::PathBuf::from("/tmp/test"),
             hook_config_dir: std::path::PathBuf::from("/tmp/test"),
+            project_scope: None,
             settings_path: std::path::PathBuf::from("/tmp/test/settings.json"),
             settings_exists: false,
             hook_installed: true,

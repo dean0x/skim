@@ -9,8 +9,8 @@ use super::guidance::{
 use super::guidance_path::GuidanceScope;
 use super::helpers::{
     HOOK_SCRIPT_NAME, atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
-    resolve_real_settings_path,
 };
+use super::hook_scope::{ProjectHookScope, SettingsFile, settings_write_path};
 use super::state::{detect_state, has_skim_hook_entry, read_settings_json, skim_event_keys};
 use super::targets::{agent_names, remove_targets};
 use crate::cmd::display_path;
@@ -174,6 +174,10 @@ fn uninstall_agent(
     }
     let protocol = protocol_for_agent(agent);
     let config_dir = det_env.resolve(agent, flags.project)?;
+    let project_scope = flags
+        .project
+        .then(|| ProjectHookScope::for_current_folder(agent))
+        .transpose()?;
 
     // Resolve hook artifact directory via the protocol seam.
     // For all agents except Copilot CLI this equals config_dir.
@@ -263,6 +267,11 @@ fn uninstall_agent(
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
+    let project_scope = project_scope
+        .as_ref()
+        .map(|scope| scope.recheck(agent))
+        .transpose()?;
+
     // Remove hook registration — dispatch on style.
     if protocol.uses_dedicated_hook_file() {
         if protocol.remove_hook_registration(&hook_config_dir)? {
@@ -270,7 +279,8 @@ fn uninstall_agent(
             println!("  {} Removed: {}", check_mark(true), skim_json.display());
         }
     } else if settings_has_hook {
-        let real_path = resolve_real_settings_path(&settings_path)?;
+        let real_path =
+            settings_write_path(project_scope.as_ref(), SettingsFile::Agent, &settings_path)?;
         let mut settings = load_or_create_settings(&real_path)?;
 
         for event_key in protocol.hook_event_keys() {

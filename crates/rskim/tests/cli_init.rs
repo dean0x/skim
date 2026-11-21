@@ -2398,24 +2398,35 @@ fn test_project_init_and_uninstall_refuse_an_outside_instruction_file_and_dry_ru
 }
 
 #[test]
-fn test_project_init_refuses_cursor_guidance_in_a_folder_that_leads_outside() {
+fn test_project_init_refuses_a_cursor_folder_that_leads_outside() {
     let sandbox = Sandbox::new();
     let project = sandbox.project_dir("project");
     let outside = sandbox.project_dir("outside");
     std::os::unix::fs::symlink(&outside, project.join(".cursor")).unwrap();
-    fs::write(outside.join("user.md"), "user instructions\n").unwrap();
+    let user_file = outside.join("user.md");
+    let bytes = b"user instructions\n";
+    fs::write(&user_file, bytes).unwrap();
+    let mode = fs::metadata(&user_file).unwrap().permissions().mode();
 
-    let stdout = project_init(&sandbox, &project, "cursor");
+    sandbox
+        .init()
+        .args(["--project", "--agent", "cursor", "--yes", "--no-wrappers"])
+        .current_dir(&project)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            ".cursor leads outside this project folder",
+        ));
 
-    assert!(
-        stdout.contains(".cursor/rules/skim.mdc leads outside this project folder"),
-        "{stdout}"
-    );
-    assert!(!outside.join("rules").exists());
-    assert_eq!(
-        fs::read_to_string(outside.join("user.md")).unwrap(),
-        "user instructions\n"
-    );
+    let entries: Vec<_> = fs::read_dir(&outside)
+        .unwrap()
+        .take(2)
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["user.md"]);
+    assert_eq!(fs::read(&user_file).unwrap(), bytes);
+    assert_eq!(fs::metadata(&user_file).unwrap().permissions().mode(), mode);
     assert!(
         fs::symlink_metadata(project.join(".cursor"))
             .unwrap()
