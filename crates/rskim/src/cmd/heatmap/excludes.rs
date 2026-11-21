@@ -83,18 +83,18 @@ pub(crate) struct Excludes {
 
 impl Excludes {
     /// `--no-exclude` disables both sets of patterns.
-    #[must_use]
-    pub(crate) fn new(no_exclude: bool, extra: &[String]) -> Self {
+    /// The flag parser supplies parsed user globs. Only defaults need parsing here.
+    pub(crate) fn new(no_exclude: bool, extra: &[Glob]) -> Result<Self, globset::Error> {
         if no_exclude {
-            return Self {
+            return Ok(Self {
                 defaults: GlobSet::empty(),
                 extra: GlobSet::empty(),
-            };
+            });
         }
-        Self {
-            defaults: build_set(DEFAULT_EXCLUDES.iter().copied()),
-            extra: build_set(extra.iter().map(String::as_str)),
-        }
+        Ok(Self {
+            defaults: build_set(DEFAULT_EXCLUDES)?,
+            extra: GlobSet::new(extra)?,
+        })
     }
 
     /// Match a path in git's numstat form. The default set wins overlaps.
@@ -119,14 +119,12 @@ impl Excludes {
     }
 }
 
-fn build_set<'a>(patterns: impl Iterator<Item = &'a str>) -> GlobSet {
+fn build_set(patterns: &[&str]) -> Result<GlobSet, globset::Error> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        if let Ok(glob) = Glob::new(pattern) {
-            builder.add(glob);
-        }
+        builder.add(Glob::new(pattern)?);
     }
-    builder.build().unwrap_or_else(|_| GlobSet::empty())
+    builder.build()
 }
 
 /// Return `true` when a numstat line represents a binary file.
@@ -142,6 +140,7 @@ pub(crate) fn is_binary_marker(additions: &str, deletions: &str) -> bool {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -150,20 +149,27 @@ mod tests {
     }
 
     #[test]
+    fn test_default_exclude_patterns_compile() {
+        let set = build_set(DEFAULT_EXCLUDES).unwrap();
+        assert_eq!(set.len(), DEFAULT_EXCLUDES.len());
+    }
+
+    #[test]
     fn test_default_reason_wins_over_a_user_pattern() {
-        let extra = ["*.json".to_string()];
-        let set = Excludes::new(false, &extra);
+        let extra = [Glob::new("*.json").unwrap()];
+        let set = Excludes::new(false, &extra).unwrap();
         assert_eq!(
             set.excluded_by("package-lock.json"),
             Some(ExcludeReason::Default)
         );
         assert_eq!(set.excluded_by("other.json"), Some(ExcludeReason::User));
-        assert_eq!(Excludes::new(true, &extra).excluded_by("other.json"), None);
+        let disabled = Excludes::new(true, &extra).unwrap();
+        assert_eq!(disabled.excluded_by("other.json"), None);
     }
 
     #[test]
     fn test_lock_file_excluded_by_default() {
-        let set = Excludes::new(false, &[]);
+        let set = Excludes::new(false, &[]).unwrap();
         assert!(should_exclude("Cargo.lock", &set));
         assert!(should_exclude("package-lock.json", &set));
         assert!(should_exclude("yarn.lock", &set));
@@ -171,28 +177,28 @@ mod tests {
 
     #[test]
     fn test_build_dir_excluded_by_default() {
-        let set = Excludes::new(false, &[]);
+        let set = Excludes::new(false, &[]).unwrap();
         assert!(should_exclude("dist/main.js", &set));
         assert!(should_exclude("target/debug/foo", &set));
     }
 
     #[test]
     fn test_minified_excluded() {
-        let set = Excludes::new(false, &[]);
+        let set = Excludes::new(false, &[]).unwrap();
         assert!(should_exclude("app.min.js", &set));
         assert!(should_exclude("styles.min.css", &set));
     }
 
     #[test]
     fn test_source_file_not_excluded() {
-        let set = Excludes::new(false, &[]);
+        let set = Excludes::new(false, &[]).unwrap();
         assert!(!should_exclude("src/main.rs", &set));
         assert!(!should_exclude("lib/utils.ts", &set));
     }
 
     #[test]
     fn test_no_exclude_skips_all_patterns() {
-        let set = Excludes::new(true, &[]);
+        let set = Excludes::new(true, &[]).unwrap();
         assert!(!should_exclude("Cargo.lock", &set));
         assert!(!should_exclude("dist/main.js", &set));
     }
@@ -215,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_changelog_snapshot_and_generated_paths_excluded_by_default() {
-        let set = Excludes::new(false, &[]);
+        let set = Excludes::new(false, &[]).unwrap();
         let kept: Vec<&str> = CHANGELOG_SNAPSHOT_GENERATED
             .iter()
             .copied()
@@ -226,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_no_exclude_keeps_changelog_snapshot_and_generated_paths() {
-        let set = Excludes::new(true, &[]);
+        let set = Excludes::new(true, &[]).unwrap();
         let dropped: Vec<&str> = CHANGELOG_SNAPSHOT_GENERATED
             .iter()
             .copied()
@@ -239,7 +245,7 @@ mod tests {
     /// its header, or with "generated" only in its file name, stays in.
     #[test]
     fn test_generated_marker_or_name_outside_generated_folder_not_excluded() {
-        let set = Excludes::new(false, &[]);
+        let set = Excludes::new(false, &[]).unwrap();
         for path in [
             "src/schema.rs",
             "src/generated.rs",
@@ -251,8 +257,8 @@ mod tests {
 
     #[test]
     fn test_extra_excludes_applied() {
-        let extra = vec!["*.generated.ts".to_string()];
-        let set = Excludes::new(false, &extra);
+        let extra = [Glob::new("*.generated.ts").unwrap()];
+        let set = Excludes::new(false, &extra).unwrap();
         assert!(should_exclude("foo.generated.ts", &set));
         assert!(!should_exclude("foo.ts", &set));
     }
@@ -276,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_default_excludes_match_paths_that_git_quotes() {
-        let set = Excludes::new(false, &[]);
+        let set = Excludes::new(false, &[]).unwrap();
         let kept: Vec<&str> = QUOTED_EXCLUDED
             .iter()
             .copied()
@@ -288,8 +294,8 @@ mod tests {
 
     #[test]
     fn test_extra_excludes_match_paths_that_git_quotes() {
-        let extra = vec!["*.generated.ts".to_string(), "pkg/café/**".to_string()];
-        let set = Excludes::new(false, &extra);
+        let extra = ["*.generated.ts", "pkg/café/**"].map(|pattern| Glob::new(pattern).unwrap());
+        let set = Excludes::new(false, &extra).unwrap();
         assert!(should_exclude(r#""src/caf\303\251.generated.ts""#, &set));
         assert!(should_exclude(r#""pkg/caf\303\251/main.rs""#, &set));
         assert!(!should_exclude(r#""src/caf\303\251.ts""#, &set));

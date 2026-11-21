@@ -114,7 +114,10 @@ fn apply_value_flag(
             args.last_n = Some(n);
         }
         ValueFlagAction::Exclude => {
-            args.extra_excludes.push(val);
+            let glob = globset::Glob::new(&val).map_err(|e| {
+                anyhow::anyhow!("--exclude requires a valid glob; got {val:?}: {}", e.kind())
+            })?;
+            args.extra_excludes.push(glob);
         }
         ValueFlagAction::CouplingThreshold => {
             args.coupling_threshold = val
@@ -664,7 +667,8 @@ mod tests {
     #[test]
     fn test_parse_args_extra_exclude() {
         let args = parse_args(&["--exclude=*.generated.ts".to_string()]).unwrap();
-        assert_eq!(args.extra_excludes, vec!["*.generated.ts"]);
+        let expected = globset::Glob::new("*.generated.ts").unwrap();
+        assert_eq!(args.extra_excludes, [expected]);
     }
 
     #[test]

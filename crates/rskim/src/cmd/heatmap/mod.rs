@@ -369,7 +369,7 @@ fn prepare_commits(
     }
 
     // Step 4: Apply exclusions
-    let excludes = Excludes::new(config.no_exclude, &config.extra_excludes);
+    let excludes = Excludes::new(config.no_exclude, &config.extra_excludes)?;
     let raw_commit_count = raw_commits.len();
     let mut commits = raw_commits;
     for commit in &mut commits {
@@ -862,7 +862,7 @@ fn compute_heatmap(
         let capacity = excludes::DEFAULT_EXCLUDES.len() + config.extra_excludes.len();
         let mut patterns = Vec::with_capacity(capacity);
         patterns.extend(excludes::DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
-        patterns.extend(config.extra_excludes.iter().cloned());
+        patterns.extend(config.extra_excludes.iter().map(|g| g.glob().into()));
         patterns
     };
 
@@ -1776,7 +1776,7 @@ mod tests {
             vec![stub_commit(0, &["src/core.rs", "src/extra.rs"])],
             HeatmapArgs {
                 files: vec!["src/extra.rs".into()],
-                extra_excludes: vec!["src/extra.rs".into()],
+                extra_excludes: vec![globset::Glob::new("src/extra.rs").unwrap()],
                 ..HeatmapArgs::default()
             },
         );

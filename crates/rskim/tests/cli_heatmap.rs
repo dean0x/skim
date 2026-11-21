@@ -2848,6 +2848,22 @@ fn test_heatmap_card_keeps_the_lockfile_with_no_exclude() {
 }
 
 #[test]
+fn test_heatmap_refuses_an_invalid_exclude_pattern() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(dir.path(), "gen/a.rs", "// a", "feat: a", recent_ts());
+
+    common::skim()
+        .args(["heatmap", "--exclude", "gen/{a,b", "gen/a.rs"])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("gen/{a,b"))
+        .stderr(predicate::str::contains("unclosed alternate group"));
+}
+
+#[test]
 fn test_heatmap_card_names_only_the_user_filter() {
     let dir = tempfile::tempdir().expect("tempdir");
     create_repo_with_60_file_commit(dir.path());

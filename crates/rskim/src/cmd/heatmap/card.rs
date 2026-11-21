@@ -799,7 +799,8 @@ mod tests {
         targets: &[String],
         caps: ListCaps,
     ) -> Section<Card> {
-        super::build_cards(commits, result, targets, caps, &Excludes::new(false, &[])).0
+        let excludes = Excludes::new(false, &[]).unwrap();
+        super::build_cards(commits, result, targets, caps, &excludes).0
     }
 
     #[test]
@@ -823,7 +824,7 @@ mod tests {
                 "src/small.rs".into(),
             ],
             default_caps(),
-            &Excludes::new(false, &[]),
+            &Excludes::new(false, &[]).unwrap(),
         );
         assert_eq!(counts, [1, 0, 0, 0, 0]);
     }
