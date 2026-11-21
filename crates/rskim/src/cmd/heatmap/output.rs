@@ -10,6 +10,7 @@
 //! filters and caps nothing.
 
 use super::card::{Card, CardCounts};
+use super::excludes::ExcludeReason;
 use super::noise;
 use super::types::{DetailSection, HeatmapResult, InsightsResult, Severity, WindowInfo};
 use super::view::{
@@ -229,6 +230,14 @@ pub(crate) fn render_cards_text(
 /// heading: they are text from the repository, not instructions. The owner
 /// names are in quotes too, so a name with `, ` stays one entry.
 fn push_card(out: &mut String, card: &Card, window: &WindowInfo, caps: ListCaps) {
+    if let Some(reason) = card.excluded {
+        let filter = match reason {
+            ExcludeReason::Default => "the default excludes; --no-exclude keeps it",
+            ExcludeReason::User => "--exclude",
+        };
+        push_line(out, &format!("{}: left out by {filter}", card.path));
+        return;
+    }
     if !card.in_window {
         push_line(
             out,
@@ -801,6 +810,7 @@ mod tests {
         Card {
             path: "src/a.rs".to_string(),
             in_window: true,
+            excluded: None,
             commits: 7,
             counts: CardCounts {
                 owners: full(2),
@@ -870,6 +880,7 @@ mod tests {
     fn test_card_outside_the_window_uses_the_singular_noun_for_one_commit() {
         let card = Card {
             in_window: false,
+            excluded: None,
             ..card_with("Test User", "Ada", "fix: a")
         };
         let mut window = make_result().window;
