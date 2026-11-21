@@ -1306,11 +1306,15 @@ fn migrate_cursor_legacy_settings(
     project_scope: Option<&ProjectHookScope>,
 ) -> anyhow::Result<()> {
     let legacy_path = config_dir.join(CURSOR_LEGACY_SETTINGS);
-    if !legacy_path.exists() {
+    let checked_path = project_scope
+        .map(|scope| settings_write_path(Some(scope), SettingsFile::CursorLegacy, &legacy_path))
+        .transpose()?;
+    let read_path = checked_path.as_deref().unwrap_or(&legacy_path);
+    if !read_path.exists() {
         return Ok(());
     }
 
-    let Some(mut settings) = read_settings_json(&legacy_path) else {
+    let Some(mut settings) = read_settings_json(read_path) else {
         return Ok(()); // Unreadable or invalid — skip silently
     };
 
@@ -1319,8 +1323,10 @@ fn migrate_cursor_legacy_settings(
     let removed_lower = remove_skim_entries_from_event(&mut settings, "preToolUse");
 
     if removed_pre || removed_lower {
-        let real_path =
-            settings_write_path(project_scope, SettingsFile::CursorLegacy, &legacy_path)?;
+        let real_path = match checked_path {
+            Some(path) => path,
+            None => resolve_real_settings_path(&legacy_path)?,
+        };
         atomic_write_settings(&settings, &real_path)?;
         println!(
             "  {} Cleaned legacy settings.json entry (migrated to hooks.json)",
@@ -1828,6 +1834,84 @@ mod tests {
             1,
             "running upsert twice should produce exactly one entry, not a duplicate"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_settings_edits_the_checked_settings_target() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let project = tempfile::tempdir().unwrap();
+        let config_dir = project.path().join(".claude");
+        fs::create_dir(&config_dir).unwrap();
+        let settings_path = config_dir.join("settings.json");
+        let checked = config_dir.join("checked.json");
+        let replacement = config_dir.join("replacement.json");
+        let replacement_bytes = br#"{"model":"replacement"}"#;
+        fs::write(&checked, br#"{"model":"checked"}"#).unwrap();
+        fs::write(&replacement, replacement_bytes).unwrap();
+        symlink(&checked, &settings_path).unwrap();
+
+        let agent = AgentKind::ClaudeCode;
+        let scope = ProjectHookScope::check(agent, project.path()).unwrap();
+        fs::remove_file(&settings_path).unwrap();
+        symlink(&replacement, &settings_path).unwrap();
+        let state = DetectedState {
+            config_dir: config_dir.clone(),
+            hook_config_dir: config_dir,
+            project_scope: Some(scope),
+            settings_path,
+            ..state_with_cli_name(agent.cli_name())
+        };
+
+        patch_settings(&state).unwrap();
+
+        let settings = read_settings_json(&checked).unwrap();
+        let script = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            script.to_str().unwrap(),
+            "the checked target must gain the hook"
+        );
+        assert_eq!(settings["model"], "checked");
+        assert_eq!(fs::read(&replacement).unwrap(), replacement_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_migration_edits_the_checked_legacy_settings_target() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let project = tempfile::tempdir().unwrap();
+        let config_dir = project.path().join(".cursor");
+        fs::create_dir(&config_dir).unwrap();
+        let settings_path = config_dir.join(CURSOR_LEGACY_SETTINGS);
+        let checked = config_dir.join("checked.json");
+        let replacement = config_dir.join("replacement.json");
+        let legacy_settings = |theme| {
+            serde_json::json!({
+                "theme": theme,
+                "hooks": { "PreToolUse": [{ "hooks": [{ "command": "skim-rewrite.sh" }] }] }
+            })
+            .to_string()
+        };
+        let replacement_bytes = legacy_settings("replacement").into_bytes();
+        fs::write(&checked, legacy_settings("checked")).unwrap();
+        fs::write(&replacement, &replacement_bytes).unwrap();
+        symlink(&checked, &settings_path).unwrap();
+
+        let scope = ProjectHookScope::check(AgentKind::Cursor, project.path()).unwrap();
+        fs::remove_file(&settings_path).unwrap();
+        symlink(&replacement, &settings_path).unwrap();
+
+        migrate_cursor_legacy_settings(&config_dir, Some(&scope)).unwrap();
+
+        assert_eq!(
+            read_settings_json(&checked),
+            Some(serde_json::json!({ "theme": "checked" })),
+            "only the legacy skim hook must be removed from the checked target"
+        );
+        assert_eq!(fs::read(&replacement).unwrap(), replacement_bytes);
     }
 
     // ---- find_skim_section unit tests ----
