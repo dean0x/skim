@@ -7,7 +7,10 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
-use super::{HookTarget, PathRefusal, ProjectHookScope, project_hook_targets};
+use super::{
+    CURSOR_LEGACY_SETTINGS, HookTarget, PathRefusal, ProjectHookScope, project_hook_targets,
+};
+use crate::cmd::init::DetectionEnv;
 use crate::cmd::session::AgentKind::{
     self, ClaudeCode, CodexCli, CopilotCli, Crush, Cursor, GeminiCli,
 };
@@ -329,13 +332,14 @@ mod links {
 fn real_writers_create_only_listed_targets() {
     const CHILD_ROOT: &str = "SKIM_TEST_WRITER_SCOPE_ROOT";
     let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
-    // Copilot seed reads cwd to select a project key. Only the child uses a
-    // different cwd; no test mutates the cwd of the test runner.
+    // Only the isolated child changes cwd. Install and Copilot seed use it.
     if let Some(expected) = std::env::var_os(CHILD_ROOT) {
         assert_eq!(expected, cwd.as_os_str());
         for &agent in AgentKind::all_supported() {
             let root = tempfile::tempdir_in(&cwd).unwrap();
+            std::env::set_current_dir(root.path()).unwrap();
             exercise_writers(agent, root.path());
+            std::env::set_current_dir(&cwd).unwrap();
         }
         let scope = ProjectHookScope::for_current_folder(Cursor).unwrap();
         assert_eq!(
@@ -347,9 +351,21 @@ fn real_writers_create_only_listed_targets() {
 
     let project = TempDir::new().unwrap();
     fs::create_dir(project.path().join(".git")).unwrap();
+    let home = project.path().join("home");
+    fs::create_dir(&home).unwrap();
     let (_, module) = module_path!().split_once("::").unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .current_dir(project.path())
+        .env_clear()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("CODEX_HOME", home.join("codex"))
+        .envs(AgentKind::all_supported().iter().map(|&agent| {
+            (
+                DetectionEnv::override_var(agent),
+                home.join(agent.cli_name()),
+            )
+        }))
         .env(CHILD_ROOT, project.path().canonicalize().unwrap())
         .args([
             "--exact",
@@ -391,31 +407,58 @@ fn assert_listed_paths(agent: AgentKind, root: &Path, targets: &[HookTarget]) {
 }
 
 fn exercise_writers(agent: AgentKind, root: &Path) {
-    use crate::cmd::hooks::protocol_for_agent;
-    use crate::cmd::init::helpers::{
-        HOOK_SCRIPT_NAME, atomic_write_settings, backup_config_file, config_backup_name,
-    };
-    use crate::cmd::integrity::write_hash_manifest;
+    use crate::cmd::hooks::{HookSupport, protocol_for_agent};
+    use crate::cmd::init::helpers::{HOOK_SCRIPT_NAME, config_backup_name};
+    use crate::cmd::init::install::execute_install;
+    use crate::cmd::init::state::{detect_state, read_settings_json};
     use crate::cmd::permissions::{
         PermissionsTier, PruneMode, SeedOutcome, permissions_protocol_for_agent,
     };
+    use crate::cmd::session::InstructionEnv;
 
     let dir = root.join(agent.dot_dir_name());
     let hook = protocol_for_agent(agent);
-    write_hash_manifest(&dir, agent.cli_name(), HOOK_SCRIPT_NAME, "fixture").unwrap();
-    let script = dir.join("hooks").join(HOOK_SCRIPT_NAME);
-    if hook.uses_dedicated_hook_file() {
-        assert!(
-            hook.install_hook_registration(&dir, script.to_str().unwrap())
-                .unwrap()
-        );
-    } else {
-        let settings_path = dir.join(hook.config_filename());
-        let mut settings = serde_json::json!({});
-        hook.upsert_hook(&mut settings, script.to_str().unwrap())
+    if hook.hook_support() == HookSupport::RealHook {
+        let uses_settings = !hook.uses_dedicated_hook_file();
+        if uses_settings {
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join(hook.config_filename()), "{}").unwrap();
+        }
+        let legacy = dir.join(CURSOR_LEGACY_SETTINGS);
+        if agent == Cursor {
+            fs::write(
+                &legacy,
+                r#"{"theme":"fixture","hooks":{"PreToolUse":[{"hooks":[{"command":"skim-rewrite.sh"}]}]}}"#,
+            )
             .unwrap();
-        atomic_write_settings(&settings, &settings_path).unwrap();
-        backup_config_file(&settings_path, &dir.join(config_backup_name(agent))).unwrap();
+        }
+
+        let env = DetectionEnv::from_process();
+        let state = detect_state(agent, true, &env).unwrap();
+        assert_eq!(state.config_dir, dir);
+        assert_eq!(state.hook_config_dir, dir);
+        execute_install(
+            &state,
+            true,
+            false,
+            &InstructionEnv::from_process(),
+            false,
+            PermissionsTier::Seed,
+            false,
+        )
+        .unwrap();
+
+        assert!(dir.join("hooks").join(HOOK_SCRIPT_NAME).is_file());
+        assert!(detect_state(agent, true, &env).unwrap().hook_installed);
+        if uses_settings {
+            assert!(dir.join(config_backup_name(agent)).is_file());
+        }
+        if agent == Cursor {
+            assert_eq!(
+                read_settings_json(&legacy),
+                Some(serde_json::json!({ "theme": "fixture" }))
+            );
+        }
     }
     let targets = project_hook_targets(agent);
     if let Some(protocol) = permissions_protocol_for_agent(agent) {
@@ -427,9 +470,15 @@ fn exercise_writers(agent: AgentKind, root: &Path) {
             SeedOutcome::Added { .. }
         ));
         assert_listed_paths(agent, root, &targets);
+        let scope = ProjectHookScope::check(agent, root).unwrap();
         assert_eq!(
             protocol
-                .prune_retired(&dir, &entries[..1], PruneMode::Apply)
+                .prune_retired_at(
+                    &dir,
+                    &entries[..1],
+                    PruneMode::Apply,
+                    scope.permission_config_path(agent).unwrap(),
+                )
                 .unwrap(),
             entries[1..]
         );

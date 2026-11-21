@@ -820,7 +820,7 @@ fn agent_from_state(state: &DetectedState) -> anyhow::Result<AgentKind> {
     })
 }
 
-fn execute_install(
+pub(super) fn execute_install(
     state: &DetectedState,
     no_guidance: bool,
     global: bool,
