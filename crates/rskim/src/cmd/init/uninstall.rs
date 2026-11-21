@@ -1,5 +1,7 @@
 //! Uninstall flow for `skim init` (B10).
 
+use std::path::Path;
+
 use super::flags::{
     DetectionEnv, InitFlags, detect_installed_agents, resolve_agent, resolve_single_agent,
 };
@@ -14,7 +16,7 @@ use super::hook_scope::{ProjectHookScope, SettingsFile, settings_write_path};
 use super::state::{detect_state, has_skim_hook_entry, read_settings_json, skim_event_keys};
 use super::targets::{agent_names, remove_targets};
 use crate::cmd::display_path;
-use crate::cmd::hooks::protocol_for_agent;
+use crate::cmd::hooks::{HookProtocol, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
 /// Remove skim hook entries from a settings value.
@@ -37,6 +39,22 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value, event_key: &str) 
             obj.remove("hooks");
         }
     }
+}
+
+/// Read and write the same checked settings path in project scope.
+fn remove_hook_entries_from_settings(
+    project_scope: Option<&ProjectHookScope>,
+    settings_path: &Path,
+    protocol: &dyn HookProtocol,
+) -> anyhow::Result<()> {
+    let real_path = settings_write_path(project_scope, SettingsFile::Agent, settings_path)?;
+    let mut settings = load_or_create_settings(&real_path)?;
+
+    for event_key in protocol.hook_event_keys() {
+        remove_skim_from_settings(&mut settings, event_key);
+    }
+
+    atomic_write_settings(&settings, &real_path)
 }
 
 pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
@@ -279,15 +297,11 @@ fn uninstall_agent(
             println!("  {} Removed: {}", check_mark(true), skim_json.display());
         }
     } else if settings_has_hook {
-        let real_path =
-            settings_write_path(project_scope.as_ref(), SettingsFile::Agent, &settings_path)?;
-        let mut settings = load_or_create_settings(&real_path)?;
-
-        for event_key in protocol.hook_event_keys() {
-            remove_skim_from_settings(&mut settings, event_key);
-        }
-
-        atomic_write_settings(&settings, &real_path)?;
+        remove_hook_entries_from_settings(
+            project_scope.as_ref(),
+            &settings_path,
+            protocol.as_ref(),
+        )?;
 
         println!(
             "  {} Removed: hook entry from {}",
@@ -529,6 +543,42 @@ mod tests {
             "value",
             "unrelated keys must be untouched"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_edits_the_checked_settings_target() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let project = tempfile::tempdir().unwrap();
+        let config_dir = project.path().join(".claude");
+        fs::create_dir(&config_dir).unwrap();
+        let settings_path = config_dir.join("settings.json");
+        let checked = config_dir.join("checked.json");
+        let replacement = config_dir.join("replacement.json");
+        let original = serde_json::json!({ "hooks": { "PreToolUse": [skim_entry()] } }).to_string();
+        fs::write(&checked, &original).unwrap();
+        fs::write(&replacement, &original).unwrap();
+        symlink(&checked, &settings_path).unwrap();
+
+        let agent = AgentKind::ClaudeCode;
+        let scope = ProjectHookScope::check(agent, project.path()).unwrap();
+        fs::remove_file(&settings_path).unwrap();
+        symlink(&replacement, &settings_path).unwrap();
+
+        remove_hook_entries_from_settings(
+            Some(&scope),
+            &settings_path,
+            protocol_for_agent(agent).as_ref(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_settings_json(&checked),
+            Some(serde_json::json!({})),
+            "the checked target must lose the hook entry"
+        );
+        assert_eq!(fs::read_to_string(&replacement).unwrap(), original);
     }
 
     // ---- A shared guidance file ----
