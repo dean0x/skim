@@ -1346,8 +1346,8 @@ pub(crate) fn process_stdin(
     // due to a structural safety cap. The notice goes to stderr to avoid polluting stdout.
     if stdin_degraded {
         crate::debug_log!(
-            "[skim] notice: file too large to compress in {:?} mode \
-             (structural cap exceeded) — degraded to passthrough",
+            "[skim] notice: input exceeds a structural cap in {:?} mode \
+             (size or nesting) — degraded to passthrough",
             options.mode
         );
     }
@@ -1547,14 +1547,13 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         .or_else(|| detect_language_from_path(path))
         .or_else(|| detect_language_from_shebang(&contents));
 
-    // Emit notice when debug output is enabled and the transform degraded to passthrough.
-    // Two distinct degrade reasons: unknown language (no extension/shebang match)
-    // or file too large to compress (structural safety cap exceeded).
+    // In debug mode, report why the transform returns raw text.
+    // The language is unknown, or the input reaches a size or nesting cap.
     if degraded {
         if language.is_some() {
             crate::debug_log!(
-                "[skim] notice: file too large to compress in {:?} mode \
-                 (structural cap exceeded) — degraded to passthrough",
+                "[skim] notice: input exceeds a structural cap in {:?} mode \
+                 (size or nesting) — degraded to passthrough",
                 options.mode
             );
         } else {
