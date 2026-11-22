@@ -2160,6 +2160,37 @@ mod tests {
         );
     }
 
+    /// Write `script` to `dir/name` as an executable stub and return its path.
+    ///
+    /// A `sh` child creates the file, so this test process never holds a write
+    /// descriptor on it. On Linux, `execve` of a file fails with "Text file
+    /// busy" (ETXTBSY) while any process holds it open for writing. A parallel
+    /// test that forks while this process holds such a descriptor keeps a copy
+    /// until its child calls `exec`. `query_binary_info` then reads the failed
+    /// spawn as "no version", and the test fails for a reason that is not in
+    /// the code under test (#635). The child's descriptor closes when it
+    /// exits, and no fork of this process can inherit it.
+    #[cfg(unix)]
+    fn write_stub(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sh to write the stub");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("send the stub script to sh");
+        let status = child.wait().expect("wait for sh");
+        assert!(status.success(), "sh could not write the stub: {status}");
+        path
+    }
+
     // ---- query_binary_info acquisition-path test ----
     //
     // This is the regression test whose absence caused Defect 1.
@@ -2174,14 +2205,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_query_binary_info_commit_from_version_no_commit_flag() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::TempDir::new().unwrap();
-        let stub = dir.path().join("skim-stub");
 
         // Write a shell stub: emits version+commit on --version, fails on --commit.
-        std::fs::write(
-            &stub,
+        let stub = write_stub(
+            dir.path(),
+            "skim-stub",
             "#!/bin/sh\n\
              if [ \"$1\" = '--version' ]; then\n\
                echo 'skim 2.11.0 (d5695c1)'\n\
@@ -2190,13 +2219,7 @@ mod tests {
              # Simulate pre-B4 binary: unknown flags → non-zero exit\n\
              echo 'error: unexpected argument' >&2\n\
              exit 1\n",
-        )
-        .unwrap();
-
-        let meta = std::fs::metadata(&stub).unwrap();
-        let mut perms = meta.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).unwrap();
+        );
 
         let info = query_binary_info(&stub);
 
@@ -2215,14 +2238,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_query_binary_info_no_parenthetical_falls_back_to_commit_flag() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::TempDir::new().unwrap();
-        let stub = dir.path().join("skim-stub2");
 
         // Stub: --version has no parenthetical; --commit returns a sha.
-        std::fs::write(
-            &stub,
+        let stub = write_stub(
+            dir.path(),
+            "skim-stub2",
             "#!/bin/sh\n\
              if [ \"$1\" = '--version' ]; then\n\
                echo 'skim 2.11.0'\n\
@@ -2233,13 +2254,7 @@ mod tests {
                exit 0\n\
              fi\n\
              exit 1\n",
-        )
-        .unwrap();
-
-        let meta = std::fs::metadata(&stub).unwrap();
-        let mut perms = meta.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).unwrap();
+        );
 
         let info = query_binary_info(&stub);
 
@@ -2254,16 +2269,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_query_binary_info_non_skim_binary_returns_none() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::TempDir::new().unwrap();
-        let stub = dir.path().join("not-skim");
 
         // A realistic non-skim binary: --version output lacks "skim " prefix,
         // and unknown flags (like --commit) are rejected with non-zero exit.
         // Both conditions must produce None for version and commit.
-        std::fs::write(
-            &stub,
+        let stub = write_stub(
+            dir.path(),
+            "not-skim",
             "#!/bin/sh\n\
              if [ \"$1\" = '--version' ]; then\n\
                echo 'some-other-tool 1.2.3 (xyz)'\n\
@@ -2271,13 +2284,7 @@ mod tests {
              fi\n\
              # Unknown flag → non-zero exit (realistic non-skim behavior)\n\
              exit 1\n",
-        )
-        .unwrap();
-
-        let meta = std::fs::metadata(&stub).unwrap();
-        let mut perms = meta.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&stub, perms).unwrap();
+        );
 
         let info = query_binary_info(&stub);
 
