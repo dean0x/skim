@@ -345,7 +345,7 @@ fn markdown_below_the_nesting_limit_keeps_the_heading_view() {
         ("spaced break", "- ".repeat(120)),
         // The solid thematic break has an estimate of 2.
         ("solid break", "-".repeat(300)),
-        // The border stops the estimate at its first plus sign (estimate 1).
+        // Only the final plus sign counts. The border has an estimate of 2.
         ("table border", format!("{}+", "+---".repeat(203))),
     ];
     for (case, body) in cases {

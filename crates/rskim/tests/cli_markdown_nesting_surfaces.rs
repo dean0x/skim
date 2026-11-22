@@ -163,14 +163,21 @@ fn cached_markdown_keeps_the_raw_output_and_empty_stderr() {
     };
 
     let cold = read();
-    assert!(fs::read_dir(&cache).unwrap().any(|entry| {
-        entry
-            .unwrap()
-            .path()
-            .extension()
-            .is_some_and(|ext| ext == "json")
-    }));
+    let entry = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .expect("cache entry for report.md");
+    // A second cold read would replace the entry and change this time.
+    let mark = std::time::SystemTime::UNIX_EPOCH;
+    fs::File::options()
+        .write(true)
+        .open(&entry)
+        .unwrap()
+        .set_modified(mark)
+        .unwrap();
     let warm = read();
+    assert_eq!(fs::metadata(entry).unwrap().modified().unwrap(), mark);
     assert_eq!(cold.stdout, text.as_bytes());
     assert_eq!(cold.stderr, b"");
     assert_eq!(warm.stdout, cold.stdout);

@@ -63,7 +63,7 @@ For `Language::TypeScript` and the extension `tsx` (any case) it loads the TSX g
 
 ### `Parser::parse_bounded(source, limit) -> Result<Option<Tree>>`
 
-- The progress callback returns `true` to stop the parse. It compares the time since the call with `limit`.
+- The clock starts after the input limit check. The progress callback returns `true` when the elapsed time reaches `limit`.
 - A stop gives `Ok(None)`. The caller has no tree and must treat the file as unlabelled.
 - A stop calls `reset()` on the parser. Without it, the next parse would resume at the stop point, whatever source it gets. Test `parser_after_a_stopped_parse_gives_the_tree_a_new_parser_gives` pins this.
 - If the check passes but the parser returns no tree and the callback does not stop it, the result is `SkimError::ParseError`.

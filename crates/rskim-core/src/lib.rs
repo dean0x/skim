@@ -207,8 +207,8 @@ pub fn transform_with_quality(
 /// (0-based) to its 1-indexed source line number. A value of `0` in the map
 /// indicates an omission/truncation marker with no line number annotation.
 ///
-/// The `degraded` flag is `true` when the input reaches a size or nesting cap.
-/// The transform returns raw text, subject to the configured line limits.
+/// The `degraded` flag is `true` if a size or nesting cap makes the transform return raw text.
+/// In that case, the configured line limits still apply.
 /// Callers should record the tier as "degraded", not "full".
 /// Emit a debug notice for a lossless fallback only under `SKIM_DEBUG=1`.
 ///
