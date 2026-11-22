@@ -3559,29 +3559,41 @@ mod tests {
     // shape) would otherwise pass silently on every language except Python.
     //
     // THRESHOLD RATIONALE — 2.8 ≈ 2^1.5 is the exponent-space midpoint between
-    // linear (2.0×) and quadratic (4.0×), matching the Go guards in minimal.rs.
+    // linear (2.0×) and quadratic (4.0×).
     // These shapes measure 2.01×–2.07× at the guard sizes, so 2.8 leaves ~35 % headroom.
     // The Python guard is the exception: it grows N 4× against 8.0 = 4^1.5, the
     // same midpoint, because its doubling form failed on CI runner noise alone.
+    // The Go guards in minimal.rs use the 4× form for the same reason.
 
-    /// Time the pseudo transform for `source` in `language`.
+    /// Time the pseudo transform for `small` and `large` in `language`, sampled
+    /// in turn.
     ///
-    /// Returns `(min, median)` of 5 samples (see `scaling_guard` module doc):
+    /// Returns `(min, median)` of 5 samples for each input, small first (see
+    /// `scaling_guard` module doc):
     /// - Use `min`    for ratio gates:    `ratio = t2_min / t1_min; assert!(ratio < 2.8)`
     /// - Use `median` for absolute gates: `assert!(t1_median >= FLOOR)`
     ///
-    /// The parse is hoisted outside the sampling loop — we time the walk, not the
-    /// parser (per `scaling_guard` module doc).
-    fn time_pseudo(source: &str, language: Language) -> (f64, f64) {
-        let mut parser = Parser::new(language).unwrap();
-        let tree = parser.parse(source).unwrap(); // hoisted outside the sample loop
+    /// The parses are hoisted outside the sampling loop — we time the walk, not
+    /// the parser (per `scaling_guard` module doc).
+    fn time_pseudo_pair(
+        small: &str,
+        large: &str,
+        language: Language,
+    ) -> (
+        crate::transform::scaling_guard::MinMedian,
+        crate::transform::scaling_guard::MinMedian,
+    ) {
+        let parse = |source: &str| Parser::new(language).unwrap().parse(source).unwrap();
+        let (small_tree, large_tree) = (parse(small), parse(large));
         let config = TransformConfig::with_mode(Mode::Pseudo);
-        crate::transform::scaling_guard::time_5(|| {
-            let start = std::time::Instant::now();
-            let r = transform_pseudo_with_spans_and_line_map(source, &tree, language, &config);
+        let run = |source: &str, tree: &tree_sitter::Tree| {
+            let r = transform_pseudo_with_spans_and_line_map(source, tree, language, &config);
             assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
-            start.elapsed().as_secs_f64() * 1000.0
-        })
+        };
+        crate::transform::scaling_guard::time_pair_5(
+            || run(small, &small_tree),
+            || run(large, &large_tree),
+        )
     }
 
     /// N top-level statements, each terminated by a `;` — the site-1 population.
@@ -3631,8 +3643,11 @@ mod tests {
         //
         // Each call returns (min, median) of 5 samples.  Parse is hoisted outside
         // the sample loop (see scaling_guard module doc).
-        let (t1_min, t1_median) = time_pseudo(&ts_semicolon_source(4000), Language::TypeScript);
-        let (t2_min, _) = time_pseudo(&ts_semicolon_source(8000), Language::TypeScript);
+        let ((t1_min, t1_median), (t2_min, _)) = time_pseudo_pair(
+            &ts_semicolon_source(4000),
+            &ts_semicolon_source(8000),
+            Language::TypeScript,
+        );
 
         // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
         // We FAIL rather than skip: a vacuous floor provides no protection.
@@ -3677,8 +3692,11 @@ mod tests {
         // 2.93× with no walker change. The threshold 8.0 = 4^1.5 keeps the same
         // exponent-space midpoint, and allows 2× noise. The step cannot start at
         // N=1000: N=4000 is over MAX_AST_NODES and returns Err(ComplexityLimit).
-        let (t1_min, t1_median) = time_pseudo(&python_return_type_source(500), Language::Python);
-        let (t2_min, _) = time_pseudo(&python_return_type_source(2000), Language::Python);
+        let ((t1_min, t1_median), (t2_min, _)) = time_pseudo_pair(
+            &python_return_type_source(500),
+            &python_return_type_source(2000),
+            Language::Python,
+        );
 
         // Noise floor uses MEDIAN (absolute gate).
         assert!(
@@ -3709,8 +3727,11 @@ mod tests {
             "the `template` keyword must be consumed with its parameter list, got: {out}"
         );
 
-        let (t1_min, t1_median) = time_pseudo(&cpp_template_source(1000), Language::Cpp);
-        let (t2_min, _) = time_pseudo(&cpp_template_source(2000), Language::Cpp);
+        let ((t1_min, t1_median), (t2_min, _)) = time_pseudo_pair(
+            &cpp_template_source(1000),
+            &cpp_template_source(2000),
+            Language::Cpp,
+        );
 
         // Noise floor uses MEDIAN (absolute gate).
         assert!(

@@ -1062,6 +1062,7 @@ fn find_leading_blank_fold(text: &str, protected: &[(usize, usize)]) -> Option<L
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // acceptable in tests
 mod tests {
     use super::*;
+    use crate::transform::scaling_guard::{self, MinMedian};
 
     // ========================================================================
     // compute_header_end_byte and is_module_header_comment unit tests
@@ -1881,23 +1882,26 @@ mod tests {
     // hardware (~18 ms measured), keeping the noise floor assertion below the expected
     // measurement by ~9×.
 
-    /// Time N=4000 and N=8000 contiguous-leading-comment Python files with
-    /// `transform_minimal`.  Parse is hoisted outside the sample loop (per
-    /// `scaling_guard` module doc).  Returns (min, median) of 5 samples for each N.
-    fn sample_python_minimal(source: &str) -> (f64, f64) {
-        let mut parser = crate::Parser::new(Language::Python).unwrap();
-        let tree = parser.parse(source).unwrap(); // hoisted outside sample loop
+    /// Time the N=4000 and N=8000 contiguous-leading-comment Python files with
+    /// `transform_minimal`, sampled in turn.  Parse is hoisted outside the
+    /// sample loop (per `scaling_guard` module doc).  Returns (min, median) of
+    /// 5 samples for each N, small first.
+    fn sample_python_minimal_pair(small: &str, large: &str) -> (MinMedian, MinMedian) {
+        let parse = |source: &str| {
+            let mut parser = crate::Parser::new(Language::Python).unwrap();
+            parser.parse(source).unwrap()
+        };
+        let (small_tree, large_tree) = (parse(small), parse(large));
         let config = TransformConfig::default();
-        crate::transform::scaling_guard::time_5(|| {
-            let start = std::time::Instant::now();
-            let r = transform_minimal(source, &tree, Language::Python, &config);
+        let run = |source: &str, tree: &tree_sitter::Tree| {
+            let r = transform_minimal(source, tree, Language::Python, &config);
             assert!(
                 r.is_ok(),
                 "Python minimal transform must succeed: {:?}",
                 r.err()
             );
-            start.elapsed().as_secs_f64() * 1000.0
-        })
+        };
+        scaling_guard::time_pair_5(|| run(small, &small_tree), || run(large, &large_tree))
     }
 
     #[test]
@@ -1932,8 +1936,7 @@ mod tests {
             let _ = transform_minimal(&source_4k, &tree, Language::Python, &config);
         }
 
-        let (t1_min, t1_median) = sample_python_minimal(&source_4k);
-        let (t2_min, _) = sample_python_minimal(&source_8k);
+        let ((t1_min, t1_median), (t2_min, _)) = sample_python_minimal_pair(&source_4k, &source_8k);
 
         // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
         // We FAIL rather than skip: a silently-passing guard provides no protection.
@@ -2461,12 +2464,12 @@ mod tests {
     //   leading-run/minimal: N=2000 → 4.62 ms | N=4000 → 6.48 ms | N=8000 → 11.91 ms
     //   leading-run/pseudo : N=2000 → 3.26 ms | N=4000 → 6.58 ms | N=8000 → 13.27 ms
     //
-    // THRESHOLD RATIONALE — the ratio guards use 2.8, not the 2.5 used by the
-    // Python `test_quadratic_scaling_guard`. A doubling ratio of 2.8 ≈ 2^1.5 is
-    // the exponent-space midpoint between linear (2.0×) and quadratic (4.0×).
-    // The Python guard can afford 2.5 because its measured ratio is ~1.63 —
-    // fixed overhead pulls it well below 2.0. The Go guards measure ~1.84–2.02,
-    // so 2.5 would leave only ~25 % headroom and flake on a loaded machine.
+    // THRESHOLD RATIONALE — the Go ratio guards grow N 4× against 8.0 = 4^1.5,
+    // the exponent-space midpoint between linear (4×) and quadratic (16×).
+    // The earlier doubling form against 2.8 ≈ 2^1.5 measured ~1.84–2.02 on the
+    // linear walk, so it allowed only ~1.4× runner noise, and it failed on CI
+    // runners at 3.16× and 3.20× (#633, #635). The 4× form allows 2× noise.
+    // See `assert_go_growth_is_linear`.
 
     /// A one-line module header, a blank line, then N contiguous comments, then
     /// `package main`.
@@ -2503,47 +2506,62 @@ mod tests {
         s
     }
 
-    /// Time `transform_minimal` on `source` with 5 samples.
-    /// Parse is hoisted outside the sample loop — we time the walk, not the parser.
-    /// Returns `(min, median)` per the `scaling_guard` sampling rule.
-    fn time_go_minimal(source: &str) -> (f64, f64) {
-        let mut parser = crate::Parser::new(Language::Go).unwrap();
-        let tree = parser.parse(source).unwrap(); // hoisted outside sample loop
-        let config = TransformConfig::default();
-        crate::transform::scaling_guard::time_5(|| {
-            let start = std::time::Instant::now();
-            let r = transform_minimal(source, &tree, Language::Go, &config);
-            assert!(r.is_ok(), "minimal transform must succeed: {:?}", r.err());
-            start.elapsed().as_secs_f64() * 1000.0
-        })
+    /// A Go source parsed once. The parse stays outside every sample, so a
+    /// sample times the walk and not the parser (`scaling_guard` module doc).
+    struct ParsedGo {
+        source: String,
+        tree: tree_sitter::Tree,
     }
 
-    /// Time `transform_pseudo` on `source` with 5 samples.
-    /// Parse is hoisted outside the sample loop — we time the walk, not the parser.
-    /// Returns `(min, median)` per the `scaling_guard` sampling rule.
-    fn time_go_pseudo(source: &str) -> (f64, f64) {
-        let mut parser = crate::Parser::new(Language::Go).unwrap();
-        let tree = parser.parse(source).unwrap(); // hoisted outside sample loop
-        let config = TransformConfig::default();
-        crate::transform::scaling_guard::time_5(|| {
-            let start = std::time::Instant::now();
-            let r = crate::transform::pseudo::transform_pseudo_with_spans_and_line_map(
-                source,
-                &tree,
+    impl ParsedGo {
+        fn new(source: String) -> Self {
+            let mut parser = crate::Parser::new(Language::Go).unwrap();
+            let tree = parser.parse(&source).unwrap();
+            Self { source, tree }
+        }
+
+        fn run_minimal(&self) {
+            let r = transform_minimal(
+                &self.source,
+                &self.tree,
                 Language::Go,
-                &config,
+                &TransformConfig::default(),
+            );
+            assert!(r.is_ok(), "minimal transform must succeed: {:?}", r.err());
+        }
+
+        fn run_pseudo(&self) {
+            let r = crate::transform::pseudo::transform_pseudo_with_spans_and_line_map(
+                &self.source,
+                &self.tree,
+                Language::Go,
+                &TransformConfig::default(),
             );
             assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
-            start.elapsed().as_secs_f64() * 1000.0
-        })
+        }
+    }
+
+    /// One Go transform mode: `ParsedGo::run_minimal` or `ParsedGo::run_pseudo`.
+    type GoRun = fn(&ParsedGo);
+
+    /// `(min, median)` of 5 samples of `run` on `source` (absolute gate).
+    fn time_go(run: GoRun, source: String) -> MinMedian {
+        let parsed = ParsedGo::new(source);
+        scaling_guard::time_5(|| run(&parsed))
+    }
+
+    /// `(min, median)` of `small` and of `large`, sampled in turn (ratio gate).
+    fn time_go_pair(run: GoRun, small: String, large: String) -> (MinMedian, MinMedian) {
+        let (small, large) = (ParsedGo::new(small), ParsedGo::new(large));
+        scaling_guard::time_pair_5(|| run(&small), || run(&large))
     }
 
     /// Cheap cubic tripwire. Runs FIRST inside each ratio guard so that a
     /// reintroduced Θ(M³) implementation fails in ~40 s at N=1000 instead of
     /// letting the N=8000 measurement grind for hours.
     /// Uses MEDIAN of 5 samples (absolute gate — scaling_guard rule).
-    fn assert_no_cubic_regression(timer: fn(&str) -> (f64, f64), mode: &str) {
-        let (_, probe_median) = timer(&go_leading_run_source(1000));
+    fn assert_no_cubic_regression(run: GoRun, mode: &str) {
+        let (_, probe_median) = time_go(run, go_leading_run_source(1000));
         assert!(
             probe_median < 200.0,
             "[{mode}] N=1000 Go leading comment run median took {probe_median:.1}ms (budget 200ms). \
@@ -2561,7 +2579,7 @@ mod tests {
         // cubic code exceeds it by ~208×.
         let n = 1000usize;
         let source = go_leading_run_source(n);
-        let (_, elapsed_median) = time_go_minimal(&source);
+        let (_, elapsed_median) = time_go(ParsedGo::run_minimal, source.clone());
 
         // Behaviour assertion alongside the timing: the run precedes
         // `package main`, which is NOT an is_go_declaration kind, so every one
@@ -2587,63 +2605,81 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_go_leading_comment_run_scaling_guard() {
-        assert_no_cubic_regression(time_go_minimal, "minimal");
-
-        let (t1_min, t1_median) = time_go_minimal(&go_leading_run_source(4000));
-        let (t2_min, _) = time_go_minimal(&go_leading_run_source(8000));
+    /// The 4× growth gate of the Go guards (`scaling_guard` module doc).
+    ///
+    /// Grows the input from `n` to `4n` of `source`, against 8.0 = 4^1.5, the
+    /// exponent-space midpoint between linear (4×) and quadratic (16×). The
+    /// doubling form against 2.8 allowed only 1.4× runner noise, and failed on
+    /// CI runners at 3.16× and 3.20× with no walker change (#633, #635); this
+    /// form allows 2×.
+    fn assert_go_growth_is_linear(
+        run: GoRun,
+        shape: &str,
+        source: fn(usize) -> String,
+        n: usize,
+        floor_ms: f64,
+    ) {
+        let ((small_min, small_median), (large_min, _)) =
+            time_go_pair(run, source(n), source(4 * n));
+        let large_n = 4 * n;
 
         // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
         // We FAIL rather than skip: a silently-passing scaling guard provides no protection.
         assert!(
-            t1_median >= 1.5,
-            "N=4000 median of 5 completed in {t1_median:.3}ms — too fast to measure reliably \
-             (expected ≥ 1.5ms; ~6.5ms measured on debug builds). Either the \
-             transform is being cached/skipped or N must be raised. \
-             DO NOT convert this to a skip."
+            small_median >= floor_ms,
+            "[{shape}] N={n} median of 5 took {small_median:.3}ms — too fast to measure \
+             reliably (expected ≥ {floor_ms}ms). Either the transform is being \
+             cached/skipped or N must be raised. DO NOT convert this to a skip."
         );
 
         // Ratio uses MIN (ratio gate — scaling_guard rule).
-        // A3 discrimination evidence: under a quadratic walk the ratio was 3.72×;
-        // normal implementation measures 1.84×.
-        let ratio = t2_min / t1_min;
+        let ratio = large_min / small_min;
         assert!(
-            ratio < 2.8,
-            "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 1.84× on the linear implementation). \
-             O(N) → ~2.0×; O(N²) → ~4.0×; 2.8 ≈ 2^1.5 is the exponent-space \
-             midpoint. N=4000 min {t1_min:.2}ms, N=8000 min {t2_min:.2}ms."
+            ratio < 8.0,
+            "[{shape}] Growing N 4× from {n} to {large_n} must produce a ratio below 8.0 \
+             (got {ratio:.2}×). O(N) → ~4×; O(N²) → ~16×; 8.0 = 4^1.5 is the \
+             exponent-space midpoint. N={n} min {small_min:.2}ms, \
+             N={large_n} min {large_min:.2}ms. Check that is_go_doc_comment does \
+             not walk siblings per node (PF-020)."
+        );
+    }
+
+    #[test]
+    fn test_go_leading_comment_run_scaling_guard() {
+        assert_no_cubic_regression(ParsedGo::run_minimal, "minimal");
+
+        // A3 discrimination evidence at this 4× step (thread CPU time, debug
+        // build): with a per-comment walk over the parent's children injected
+        // the ratio was 15.87×–15.96×; the linear walk measures
+        // 4.04×–4.31×.
+        assert_go_growth_is_linear(
+            ParsedGo::run_minimal,
+            "leading run, minimal",
+            go_leading_run_source,
+            4000,
+            1.5,
         );
     }
 
     #[test]
     fn test_go_doc_block_scaling_guard() {
-        // n is capped at 2000: each block is ~17 AST nodes, so n=4000 would
-        // approach MAX_AST_NODES (100_000) and silently turn this guard into an
-        // Err(ComplexityLimit) assertion instead of a timing assertion.
+        // The large n is capped at 2000: each block is ~17 AST nodes, so
+        // n=4000 would approach MAX_AST_NODES (100_000) and silently turn this
+        // guard into an Err(ComplexityLimit) assertion instead of a timing
+        // assertion.
         //
         // This shape was already linear before the fix (α = 1.08) — it is a
         // REGRESSION guard, not evidence of the fix. See the series above.
-        let (t1_min, t1_median) = time_go_minimal(&go_doc_blocks_source(1000));
-        let (t2_min, _) = time_go_minimal(&go_doc_blocks_source(2000));
-
-        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
-        assert!(
-            t1_median >= 3.0,
-            "n=1000 doc blocks median of 5 completed in {t1_median:.3}ms — too fast to measure \
-             reliably (expected ≥ 3ms; ~25ms measured). DO NOT convert to a skip."
-        );
-
-        // Ratio uses MIN (ratio gate — scaling_guard rule).
-        // A3 discrimination evidence: under a quadratic walk the ratio was 3.54×;
-        // normal implementation measures 1.99×.
-        let ratio = t2_min / t1_min;
-        assert!(
-            ratio < 2.8,
-            "Doubling doc-block count from 1000 to 2000 must produce a ratio \
-             below 2.8 (got {ratio:.2}×; measured 1.99×). \
-             n=1000 min {t1_min:.2}ms, n=2000 min {t2_min:.2}ms."
+        //
+        // A3 discrimination evidence at this 4× step: with a per-comment walk
+        // over the parent's children injected the ratio was 15.45×–15.56×;
+        // the linear walk measures 3.95×–4.14×.
+        assert_go_growth_is_linear(
+            ParsedGo::run_minimal,
+            "doc blocks, minimal",
+            go_doc_blocks_source,
+            500,
+            1.5,
         );
     }
 
@@ -2653,27 +2689,17 @@ mod tests {
         // --mode=pseudo for regular code files (ADR-008), so this is the mode an
         // agent actually reads Go through. Go's pseudo rules strip no node kinds
         // and no keywords, so this measures the comment walk almost in isolation.
-        assert_no_cubic_regression(time_go_pseudo, "pseudo");
+        assert_no_cubic_regression(ParsedGo::run_pseudo, "pseudo");
 
-        let (t1_min, t1_median) = time_go_pseudo(&go_leading_run_source(4000));
-        let (t2_min, _) = time_go_pseudo(&go_leading_run_source(8000));
-
-        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
-        assert!(
-            t1_median >= 1.5,
-            "N=4000 pseudo median of 5 completed in {t1_median:.3}ms — too fast to measure \
-             reliably (expected ≥ 1.5ms; ~6.6ms measured). DO NOT convert this to a skip."
-        );
-
-        // Ratio uses MIN (ratio gate — scaling_guard rule).
-        // A3 discrimination evidence: under a quadratic walk the ratio was 3.67×;
-        // normal implementation measures 2.02×.
-        let ratio = t2_min / t1_min;
-        assert!(
-            ratio < 2.8,
-            "Doubling N from 4000 to 8000 in pseudo mode must produce a ratio \
-             below 2.8 (got {ratio:.2}×; measured 2.02×). \
-             N=4000 min {t1_min:.2}ms, N=8000 min {t2_min:.2}ms."
+        // A3 discrimination evidence at this 4× step: with a per-comment walk
+        // over the parent's children injected the ratio was 15.85×–15.93×;
+        // the linear walk measures 4.01×–4.24×.
+        assert_go_growth_is_linear(
+            ParsedGo::run_pseudo,
+            "leading run, pseudo",
+            go_leading_run_source,
+            4000,
+            1.5,
         );
     }
 

@@ -2630,6 +2630,7 @@ version = "3.2.0"
 dependencies = [
  "criterion",
  "insta",
+ "libc",
  "serde_json",
  "serde_yaml_ng",
  "thiserror",
