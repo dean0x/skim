@@ -12,7 +12,7 @@ updated: 2026-11-12
 
 ## Rules
 
-- **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. Unbudgeted reads keep their hash input apart from schema changes. A default whole-file read adds `|char_budget:<limit>`; a typed mode and `--symbol` have no character budget. Schema 4 invalidated older entries because token cuts with line numbers keep their cut and marker. Schema 5 invalidates schema 4 entries because the transform modes parse a `.tsx` file with the TSX grammar.
+- **KB-INV-1** The cache key of a symbol read holds `symbol:<byte length>:<name>|` between the schema version and the path. Unbudgeted reads keep their hash input apart from schema changes. A default whole-file read adds `|char_budget:<limit>`; a typed mode and `--symbol` have no character budget. Schema 4 invalidated older entries because token cuts with line numbers keep their cut and marker. Schema 5 invalidates schema 4 entries because the transform modes parse a `.tsx` file with the TSX grammar. Schema 6 invalidates schema 5 entries because skim prints Markdown unchanged when its nesting estimate reaches the limit.
 - **KB-INV-2** A successful symbol read prints its stderr notice on every run, warm or cold, because the reader sees part of the file. The notice is stored in the cache entry, and the read records no analytics row.
 - **KB-INV-3** A variable declared in a function body (TypeScript, JavaScript, Go) is a local and is not a declaration. A variable at the top level is a declaration.
 - **KB-INV-4** The search engine reuses `Declaration.name_bytes`, `enclosing_declaration`, `DeclScan.truncated` and `Parser::new_for_extension`. Keep their signatures and meaning. Search parses with plain `parse` and has no time bound.
@@ -55,6 +55,8 @@ Top-level `const f = () => {}` in TypeScript is a declaration. A Go `var` or `co
 
 ## `Parser` helpers (`types.rs`)
 
+Both `parse` and `parse_bounded` check the grammar limits before they parse. Each returns `SkimError::ComplexityLimit` if the Markdown nesting estimate reaches the limit.
+
 ### `Parser::new_for_extension(language, ext)`
 
 For `Language::TypeScript` and the extension `tsx` (any case) it loads the TSX grammar. Every other pair behaves like `Parser::new`. The plain TypeScript grammar reads JSX as a type assertion and loses every declaration after it. `Language::from_extension` does not change: there is no TSX language. `grammar_extension(path)` is the one helper that reads the grammar extension off a path. `Parser::new_for_path` (the symbol read) and `transform_with_line_map_for_path` (the transform modes) both call it, so `--language typescript` on a `.tsx` file also gets TSX.
@@ -64,7 +66,7 @@ For `Language::TypeScript` and the extension `tsx` (any case) it loads the TSX g
 - The progress callback returns `true` to stop the parse. It compares the time since the call with `limit`.
 - A stop gives `Ok(None)`. The caller has no tree and must treat the file as unlabelled.
 - A stop calls `reset()` on the parser. Without it, the next parse would resume at the stop point, whatever source it gets. Test `parser_after_a_stopped_parse_gives_the_tree_a_new_parser_gives` pins this.
-- If the tree is `None` and the callback did not stop it, the result is `SkimError::ParseError`.
+- If the check passes but the parser returns no tree and the callback does not stop it, the result is `SkimError::ParseError`.
 - The callback runs only about once per 100 parse steps. A source short enough to finish before the first call always parses, even with `Duration::ZERO`. A test that wants a stop needs a large source (`many_rust_functions(5000)` in `tests/decl.rs`).
 - No production code calls it. The symbol read (`process_symbol_file`) and `skim search` (`roles.rs`) use plain `parse`, which has no time bound. Only tests call it today.
 

@@ -55,6 +55,12 @@ Error: File too large: 52,428,800 bytes exceeds maximum of 52,428,800 bytes (50M
 const x = [[[[[[...]]]]]]  // Extremely deep nesting
 ```
 
+### Markdown Nesting Limit
+
+**Limit**: Nesting estimate of 200
+
+If the estimate reaches this limit, skim prints the file unchanged and exits with status 0. Output limits still apply.
+
 ### Max JSON Nesting Depth
 
 **Limit**: 500 levels (serde_json enforces 128 by default)

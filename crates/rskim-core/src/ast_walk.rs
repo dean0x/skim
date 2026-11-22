@@ -291,16 +291,7 @@ pub const AST_SIZE_LIMIT_DEFAULT: u64 = 1024 * 1024;
 /// cap; the old SQL-specific 1 MiB exception is dissolved.  JSON, YAML, and TOML
 /// have no tree-sitter grammar in this codebase and return `None`.
 ///
-/// Returning `Some` means the language has a grammar, not that it is present in
-/// the AST index's `LANG_MAPS` node-kind vocabulary.  Bash has a grammar but no
-/// vocabulary entry, so `linearize_source` admits it past the size gate and then
-/// returns an empty result at the `LANG_MAPS` lookup (Guard 2).
-///
-/// ## Anti-pattern avoided
-///
-/// This function MUST NOT reference `LANG_MAPS` from `linearize.rs` (a
-/// `LazyLock` that constructs 14 tree-sitter parsers at first access).  Calling
-/// `ast_size_limit` from `--stats` must be free of parser-construction cost.
+/// This function does not construct a parser.
 #[must_use]
 pub fn ast_size_limit(lang: crate::Language) -> Option<u64> {
     use crate::Language;
