@@ -5,7 +5,7 @@ mod common;
 mod markdown;
 
 use markdown::{clean, nested_report, run};
-use std::{fs, path::Path, process::Output};
+use std::{fs, path::Path, process::Output, time::Duration};
 use tempfile::TempDir;
 
 const BANNER: &str = "[skim] notice: input exceeds a structural cap in Structure mode (size or nesting) — degraded to passthrough";
@@ -125,6 +125,108 @@ fn markdown_below_the_limit_keeps_its_heading_view() {
 
     let output = file_read(&path, &["--mode", "structure"], false);
     assert_eq!(output.stdout, b"# Report\n");
+}
+
+/// The longest time one child read may take before the test fails.
+const CHILD_TIME_LIMIT: Duration = Duration::from_secs(60);
+
+/// Read `text` as a Markdown file in structure mode. The process must not
+/// stop: it must exit 0 and print the input unchanged, with empty stderr.
+fn assert_deep_input_reads_raw(text: &str) {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("deep.md");
+    fs::write(&path, text).unwrap();
+
+    let mut cmd = common::skim();
+    clean(&mut cmd)
+        .timeout(CHILD_TIME_LIMIT)
+        .arg("--no-cache")
+        .arg(&path)
+        .args(["--mode", "structure"]);
+    assert_raw(&run(&mut cmd), text);
+}
+
+/// A list with one level per line, each level two spaces deeper.
+fn deep_list(levels: usize, line_end: &str) -> String {
+    (0..levels)
+        .map(|depth| format!("{}- x{line_end}", "  ".repeat(depth)))
+        .collect()
+}
+
+#[test]
+fn deep_quote_line_after_a_bom_reads_raw() {
+    assert_deep_input_reads_raw(&format!("\u{FEFF}{} x\n", ">".repeat(300)));
+}
+
+#[test]
+fn deep_list_with_bare_cr_line_ends_reads_raw() {
+    let list = deep_list(256, "\r");
+    assert_deep_input_reads_raw(&list);
+    assert_deep_input_reads_raw(&format!("# Report\n\n{list}"));
+}
+
+#[test]
+fn deep_list_with_crlf_line_ends_reads_raw() {
+    assert_deep_input_reads_raw(&deep_list(256, "\r\n"));
+}
+
+#[test]
+fn deep_list_indented_with_tabs_reads_raw() {
+    let text: String = (0..300)
+        .map(|depth| format!("{}- x\n", "\t".repeat(depth)))
+        .collect();
+    assert_deep_input_reads_raw(&text);
+}
+
+#[test]
+fn deep_line_of_dash_and_tab_markers_reads_raw() {
+    assert_deep_input_reads_raw(&format!("{}x\n", "-\t".repeat(300)));
+}
+
+#[test]
+fn deep_line_of_ordered_markers_with_a_close_paren_reads_raw() {
+    assert_deep_input_reads_raw(&format!("{}x\n", "1) ".repeat(300)));
+}
+
+#[test]
+fn deep_line_of_nine_digit_ordered_markers_reads_raw() {
+    assert_deep_input_reads_raw(&format!("{}x\n", "123456789. ".repeat(300)));
+}
+
+#[test]
+fn deep_line_of_plus_markers_reads_raw() {
+    assert_deep_input_reads_raw(&format!("{}x\n", "+ ".repeat(300)));
+}
+
+#[test]
+fn deep_line_of_quote_and_dash_pairs_reads_raw() {
+    assert_deep_input_reads_raw(&format!("{}x\n", "> - ".repeat(128)));
+}
+
+#[test]
+fn code_and_html_blocks_inside_deep_quotes_read_raw() {
+    let quotes = ">".repeat(254);
+    for text in [
+        format!("{quotes}```\n{quotes}x\n{quotes}```\n"),
+        format!("{quotes}<div>\n{quotes}x\n"),
+        format!("{quotes}     x\n"),
+    ] {
+        assert_deep_input_reads_raw(&text);
+    }
+}
+
+/// Every line counts, also lines that look like they are inside a fence.
+#[test]
+fn deep_quotes_after_long_backtick_lines_read_raw() {
+    let quotes = format!("{} x\n", ">".repeat(300));
+    assert_deep_input_reads_raw(&format!("{}\n{quotes}", "`".repeat(256)));
+    assert_deep_input_reads_raw(&format!("{}\n```\n{quotes}", "`".repeat(259)));
+}
+
+/// Every line counts, also lines with four or more leading spaces.
+#[test]
+fn deep_quotes_in_an_indented_list_paragraph_read_raw() {
+    assert_deep_input_reads_raw(&format!("- x\n\n    {} x\n", ">".repeat(300)));
 }
 
 fn long_nested_report() -> String {
