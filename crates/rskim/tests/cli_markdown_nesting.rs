@@ -61,14 +61,14 @@ fn nested_markdown_reads_raw_in_each_mode() {
 fn nested_list_at_the_limit_reads_raw() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("report.md");
-    let text: String = (0..200)
-        .map(|depth| format!("{}- Notes\n", "  ".repeat(depth)))
-        .collect();
-    fs::write(&path, &text).unwrap();
+    for levels in [200, 250] {
+        let text: String = (0..levels)
+            .map(|depth| format!("{}- Notes\n", "  ".repeat(depth)))
+            .collect();
+        fs::write(&path, &text).unwrap();
 
-    let output = file_read(&path, &["--mode", "structure"], false);
-    assert!(output.stdout == text.as_bytes(), "the list view changed");
-    assert_eq!(output.stderr, b"");
+        assert_raw(&file_read(&path, &["--mode", "structure"], false), &text);
+    }
 }
 
 #[test]

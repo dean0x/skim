@@ -191,6 +191,45 @@ mod tests {
     }
 
     #[test]
+    fn markdown_limit_counts_only_valid_ordered_markers() {
+        let prefix = ">".repeat(198);
+        assert_limit_edge(
+            &format!("{prefix}123456789x"),
+            &format!("{prefix}123456789."),
+        );
+    }
+
+    #[test]
+    fn markdown_limit_counts_prefix_after_punctuation() {
+        for punctuation in ['.', ')'] {
+            let below = format!("{}{punctuation}>", ">".repeat(197));
+            assert_limit_edge(&below, &format!("{below}>"));
+        }
+    }
+
+    #[test]
+    fn markdown_limit_stops_at_the_limit_on_a_line() {
+        let below = ">".repeat(198);
+        assert_limit_edge(&below, &format!("{below}>>"));
+    }
+
+    #[test]
+    fn markdown_limit_stops_after_the_first_line_at_the_limit() {
+        let line = ">".repeat(198);
+        assert_limit_edge(&format!("{line}\n{line}"), &format!("{line}>\n{line}\t"));
+    }
+
+    #[test]
+    fn markdown_line_end_counts_crlf_as_one_boundary() {
+        let line = ">".repeat(198);
+        let below = format!("text\r\n{line}");
+        let at = format!("{below}>");
+        assert_eq!(next_line(below.as_bytes()), line.as_bytes());
+        assert_eq!(next_line(at.as_bytes()), format!("{line}>").as_bytes());
+        assert_limit_edge(&below, &at);
+    }
+
+    #[test]
     fn markdown_limit_accepts_large_shallow_text() {
         const SIZE: usize = 5 * 1024 * 1024;
         assert!(check_grammar_limits(Language::Markdown, &"x".repeat(SIZE)).is_ok());
