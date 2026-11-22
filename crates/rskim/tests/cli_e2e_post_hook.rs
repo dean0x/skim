@@ -102,7 +102,12 @@ fn run_quiet(stdin: impl AsRef<[u8]>) -> Output {
 }
 
 fn assert_quiet(output: &Output) {
-    assert!(output.status.success(), "status {:?}", output.status);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(output.status.signal(), None);
+    }
+    assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.is_empty(), "stderr: {stderr}");
 }
@@ -531,6 +536,12 @@ fn cat_of_a_tsx_file_serves_the_tsx_view() {
         assert!(served.contains(kept), "lost {kept:?}:\n{served}");
     }
     assert!(!served.contains("The footer closes every page"), "{served}");
+}
+
+#[test]
+fn cat_of_nested_markdown_leaves_the_output_unchanged() {
+    let text = format!("# Report\n\n{} Release notes\n", ">".repeat(200));
+    assert!(post(&call("cat report.md", &text)).is_none());
 }
 
 // ---- TP-9: the pre-run path is unchanged ----
