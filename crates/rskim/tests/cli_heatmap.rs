@@ -1348,6 +1348,152 @@ fn test_insights_text_and_json_carry_the_run_warnings() {
     );
 }
 
+fn coupling_warnings(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("warning: "))
+        .filter(|warning| warning.starts_with("coupling: "))
+        .collect()
+}
+
+#[test]
+fn test_heatmap_card_names_the_file_in_one_large_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+    let expected = format!("{LARGE_COMMIT_WARNING} (1 touches bulk/f00.rs)");
+
+    for args in [&["bulk/f00.rs"][..], &["--insights", "bulk/f00.rs"][..]] {
+        let text = heatmap_stdout(dir.path(), args);
+        assert_eq!(coupling_warnings(&text), [expected.as_str()], "{text}");
+        let json = heatmap_json_with(dir.path(), args);
+        assert_eq!(json["warnings"], serde_json::json!([expected]), "{json}");
+    }
+}
+
+#[test]
+fn test_heatmap_card_uses_the_run_count_and_counts_both_touches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let target = "tests/flags-cli.test.ts";
+    let names: Vec<_> = (0..50).map(|i| format!("bulk/f{i:02}.rs")).collect();
+    let ts = recent_ts();
+    for (offset, body, changed) in [
+        (0, "// one", target),
+        (60, "// two", target),
+        (120, "// three", "src/other.rs"),
+    ] {
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), body))
+            .chain([(changed, body)])
+            .collect();
+        git_commit_files(dir.path(), &files, "chore: bulk change", ts + offset);
+    }
+
+    let global = "coupling: 3 commits with more than 50 files not paired";
+    let text = heatmap_stdout(dir.path(), &[target]);
+    assert_eq!(
+        coupling_warnings(&text),
+        [format!("{global} (2 touch {target})")],
+        "{text}"
+    );
+    let plain = heatmap_stdout(dir.path(), &[]);
+    assert_eq!(coupling_warnings(&plain), [global], "{plain}");
+}
+
+#[test]
+fn test_heatmap_card_omits_the_warning_without_a_large_commit_touch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+    let args = ["src/main.rs"];
+
+    let text = heatmap_stdout(dir.path(), &args);
+    assert!(coupling_warnings(&text).is_empty(), "{text}");
+    let json = heatmap_json_with(dir.path(), &args);
+    assert_eq!(json["warnings"], serde_json::json!([]), "{json}");
+    let plain = heatmap_stdout(dir.path(), &[]);
+    assert_eq!(coupling_warnings(&plain), [LARGE_COMMIT_WARNING], "{plain}");
+}
+
+#[test]
+fn test_heatmap_card_warning_names_targets_in_argument_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &["bulk/f12.rs", "bulk/f00.rs"]);
+    assert_eq!(
+        coupling_warnings(&text),
+        [format!(
+            "{LARGE_COMMIT_WARNING} (1 touches bulk/f12.rs, 1 touches bulk/f00.rs)"
+        )],
+        "{text}"
+    );
+}
+
+#[test]
+fn test_heatmap_card_warning_uses_the_safe_path_in_text_and_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    assert!(
+        StdCommand::new("git")
+            .args(["config", "core.quotePath", "false"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git config")
+            .success()
+    );
+    let target = "bulk/b\u{202E}c.rs";
+    let names: Vec<_> = (0..50).map(|i| format!("bulk/f{i:02}.rs")).collect();
+    let files: Vec<_> = names
+        .iter()
+        .map(|name| (name.as_str(), "// bulk"))
+        .chain([(target, "// bulk")])
+        .collect();
+    git_commit_files(dir.path(), &files, "chore: bulk reformat", recent_ts());
+
+    let text = heatmap_stdout(dir.path(), &[target]);
+    let warnings = coupling_warnings(&text);
+    assert_eq!(
+        warnings,
+        [format!(
+            "{LARGE_COMMIT_WARNING} (1 touches bulk/b\u{FFFD}c.rs)"
+        )],
+        "{text:?}"
+    );
+    assert!(!text.contains('\u{202E}'), "{text:?}");
+    let json = heatmap_json_with(dir.path(), &[target]);
+    assert_eq!(json["warnings"], serde_json::json!(warnings), "{json:?}");
+    assert_eq!(json["cards"][0]["path"], "bulk/b\u{FFFD}c.rs", "{json:?}");
+}
+
+#[test]
+fn test_heatmap_diff_keeps_the_global_large_commit_warning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+    assert!(
+        StdCommand::new("git")
+            .args(["checkout", "-b", "feature-card"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git checkout")
+            .status
+            .success()
+    );
+    git_commit(
+        dir.path(),
+        "src/main.rs",
+        "// branch",
+        "feat: branch",
+        recent_ts() + 200,
+    );
+
+    let args = ["--diff", "main"];
+    let text = heatmap_stdout(dir.path(), &args);
+    assert_eq!(coupling_warnings(&text), [LARGE_COMMIT_WARNING], "{text}");
+    let json = heatmap_json_with(dir.path(), &args);
+    assert_eq!(json["file_targets"], serde_json::json!(["src/main.rs"]));
+    assert_eq!(json["warnings"], serde_json::json!([LARGE_COMMIT_WARNING]));
+}
+
 #[test]
 fn test_heatmap_proximity_counts_feat_then_later_fix() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2651,6 +2797,90 @@ fn test_heatmap_card_of_a_file_outside_the_window_names_the_window() {
         )],
         "{text}"
     );
+}
+
+fn create_lockfile_repo(dir: &Path) {
+    git_init(dir);
+    git_commit(dir, "package-lock.json", "{}", "chore: lock", recent_ts());
+}
+
+#[test]
+fn test_heatmap_card_names_the_default_filter_when_it_drops_all_commits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_lockfile_repo(dir.path());
+    let args = ["package-lock.json"];
+
+    let text = heatmap_stdout(dir.path(), &args);
+    assert_eq!(
+        card_lines(&text, "package-lock.json"),
+        ["package-lock.json: left out by the default excludes; --no-exclude keeps it"],
+        "{text}"
+    );
+    let json = heatmap_json_with(dir.path(), &args);
+    let card = &json["cards"][0];
+    assert_eq!(card["path"], "package-lock.json");
+    assert_eq!(card["in_window"], false);
+    assert_eq!(card["excluded"], "default");
+    assert_eq!(json["window"]["commits_analyzed"], 0);
+    assert!(
+        !json.to_string().contains("not in history window"),
+        "{json}"
+    );
+}
+
+#[test]
+fn test_heatmap_card_keeps_the_lockfile_with_no_exclude() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_lockfile_repo(dir.path());
+    let args = ["--no-exclude", "package-lock.json"];
+
+    let text = heatmap_stdout(dir.path(), &args);
+    assert_eq!(
+        top_level_lines(&text),
+        ["package-lock.json: 1 commit"],
+        "{text}"
+    );
+    let json = heatmap_json_with(dir.path(), &args);
+    let card = &json["cards"][0];
+    assert_eq!(card["in_window"], true);
+    assert_eq!(card["commits"], 1);
+    assert!(card.get("excluded").is_none(), "{card}");
+}
+
+#[test]
+fn test_heatmap_refuses_an_invalid_exclude_pattern() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(dir.path(), "gen/a.rs", "// a", "feat: a", recent_ts());
+
+    common::skim()
+        .args(["heatmap", "--exclude", "gen/{a,b", "gen/a.rs"])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("gen/{a,b"))
+        .stderr(predicate::str::contains("unclosed alternate group"));
+}
+
+#[test]
+fn test_heatmap_card_names_only_the_user_filter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_repo_with_60_file_commit(dir.path());
+    let args = ["--exclude", "bulk/f00.rs", "bulk/f00.rs"];
+
+    let text = heatmap_stdout(dir.path(), &args);
+    assert_eq!(
+        card_lines(&text, "bulk/f00.rs"),
+        ["bulk/f00.rs: left out by --exclude; remove the matching patterns to keep it"],
+        "{text}"
+    );
+    assert!(coupling_warnings(&text).is_empty(), "{text}");
+    let json = heatmap_json_with(dir.path(), &args);
+    let card = &json["cards"][0];
+    assert_eq!(card["in_window"], false);
+    assert_eq!(card["excluded"], "user");
+    assert_eq!(json["warnings"], serde_json::json!([]));
 }
 
 #[test]

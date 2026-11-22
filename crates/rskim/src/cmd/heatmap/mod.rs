@@ -27,7 +27,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::analytics::{CommandType, RecordingContext};
 
 use args::{parse_args, print_help};
-use excludes::{build_exclude_set, should_exclude};
+use excludes::Excludes;
 use git_source::{CliGitSource, GitDataSource};
 use insights::{build_insights_result, compute_insights, keep_code_findings};
 use metrics::{
@@ -238,6 +238,7 @@ struct PreparedCommits {
     warnings: Vec<String>,
     /// Package roots for module labels; empty means the top-folder rule.
     module_roots: ModuleRoots,
+    excludes: Excludes,
 }
 
 /// Execute Steps 1–4 of the heatmap pipeline (git I/O + exclusions).
@@ -245,8 +246,8 @@ struct PreparedCommits {
 /// Consumes `args` by value — after this call `HeatmapArgs` is replaced by the
 /// resolved `HeatmapConfig` stored in `PreparedCommits`.
 ///
-/// Returns `Ok(None)` for all early-exit conditions (not a git repo, no commits,
-/// all commits excluded). Callers treat `None` as a `ExitCode::FAILURE` signal.
+/// Returns `Ok(None)` for early exits (not a git repo, no commits, or all
+/// commits excluded in a ranked view). Callers treat `None` as failure.
 /// Returns `Ok(Some(PreparedCommits))` when the pipeline should proceed to
 /// metric computation.
 fn prepare_commits(
@@ -368,13 +369,13 @@ fn prepare_commits(
     }
 
     // Step 4: Apply exclusions
-    let exclude_set = build_exclude_set(config.no_exclude, &config.extra_excludes);
+    let excludes = Excludes::new(config.no_exclude, &config.extra_excludes)?;
     let raw_commit_count = raw_commits.len();
     let mut commits = raw_commits;
     for commit in &mut commits {
         commit
             .changed_files
-            .retain(|f| !should_exclude(&f.path.to_string_lossy(), &exclude_set));
+            .retain(|f| excludes.excluded_by(&f.path.to_string_lossy()).is_none());
     }
     // Remove commits that are now file-less after exclusion
     commits.retain(|c| !c.changed_files.is_empty());
@@ -387,7 +388,8 @@ fn prepare_commits(
         );
     }
 
-    if commits.is_empty() {
+    // A card can report its filter even when no commits remain.
+    if commits.is_empty() && !matches!(config.targets, FileTargets::Cards(_)) {
         eprintln!("skim heatmap: No analyzable files after exclusions");
         return Ok(None);
     }
@@ -402,6 +404,7 @@ fn prepare_commits(
         repo_root,
         warnings,
         module_roots,
+        excludes,
     }))
 }
 
@@ -464,6 +467,7 @@ fn run_with_source(
         repo_root,
         warnings,
         module_roots,
+        excludes,
     } = match prepare_commits(source, args)? {
         Some(p) => p,
         None => return Ok(ExitCode::FAILURE),
@@ -491,14 +495,14 @@ fn run_with_source(
             apply_file_scope(&mut result, files, &module_roots);
             None
         }
-        FileTargets::Cards(paths) => {
-            // A card says itself when its file is not in the window, so
-            // there is no warning for it.
-            let targets = card::history_paths(paths, &result.files);
-            let cards = card::build_cards(&commits, &result, &targets, spec.lists());
-            apply_file_scope(&mut result, &targets, &module_roots);
-            Some(cards)
-        }
+        FileTargets::Cards(paths) => Some(scope_cards(
+            &mut result,
+            &commits,
+            paths,
+            spec.lists(),
+            &module_roots,
+            &excludes,
+        )),
     };
     // The warning list is complete here, and both JSON outputs give it as is.
     debug_assert!(
@@ -588,8 +592,7 @@ fn record_heatmap_analytics(
 // File-scope display filter (Step 5-alt)
 // ============================================================================
 
-/// Names in a counted warning about `--diff` paths. The warning counts the
-/// paths that it does not name.
+/// Names in a counted warning. The warning counts paths that it does not name.
 const WARNING_NAMES: usize = 3;
 
 /// The first [`WARNING_NAMES`] of `names` in single quotes, then
@@ -600,7 +603,11 @@ fn named_paths(names: &[&str]) -> String {
         .take(WARNING_NAMES)
         .map(|name| format!("'{name}'"))
         .collect();
-    let unnamed = names.len().saturating_sub(WARNING_NAMES);
+    join_warning_names(&shown, names.len())
+}
+
+fn join_warning_names(shown: &[String], total: usize) -> String {
+    let unnamed = total.saturating_sub(shown.len());
     let rest = if unnamed > 0 {
         format!(" and {unnamed} more")
     } else {
@@ -633,6 +640,76 @@ fn warn_missing_targets(result: &mut HeatmapResult, files: &[String]) {
         ),
     };
     result.warnings.push(warning);
+}
+
+/// Scope the view to file cards and name only shown targets in the coupling warning.
+fn scope_cards(
+    result: &mut HeatmapResult,
+    commits: &[CommitInfo],
+    paths: &[String],
+    caps: view::ListCaps,
+    roots: &ModuleRoots,
+    excludes: &Excludes,
+) -> view::Section<card::Card> {
+    let targets = card::history_paths(paths, &result.files);
+    let (cards, counts) = card::build_cards(commits, result, &targets, caps, excludes);
+    debug_assert_eq!(cards.rows.len(), counts.len());
+    let skipped = commits
+        .iter()
+        .filter(|c| metrics::is_large_commit(c))
+        .count();
+    let touches: Vec<_> = cards
+        .rows
+        .iter()
+        .zip(counts)
+        .filter(|&(_, count)| count > 0)
+        .map(|(card, count)| (card.path.as_str(), count))
+        .collect();
+    scope_coupling_warning(&mut result.warnings, skipped, &touches);
+    apply_file_scope(result, &targets, roots);
+    cards
+}
+
+/// `None` for `touches` gives the global line. A card view only reports it
+/// when one or more shown targets had a large commit.
+fn coupling_warning(skipped: usize, touches: Option<&[(&str, usize)]>) -> Option<String> {
+    if skipped == 0 {
+        return None;
+    }
+    let noun = if skipped == 1 { "commit" } else { "commits" };
+    let global =
+        format!("coupling: {skipped} {noun} with more than {COUPLING_MAX_FILES} files not paired");
+    match touches {
+        None => Some(global),
+        Some([]) => None,
+        Some(touches) => {
+            let shown: Vec<_> = touches
+                .iter()
+                .take(WARNING_NAMES)
+                .map(|(path, count)| {
+                    let verb = if *count == 1 { "touches" } else { "touch" };
+                    format!("{count} {verb} {path}")
+                })
+                .collect();
+            Some(format!(
+                "{global} ({})",
+                join_warning_names(&shown, touches.len())
+            ))
+        }
+    }
+}
+
+/// Replace or remove the exact global line without changing the warning order.
+fn scope_coupling_warning(warnings: &mut Vec<String>, skipped: usize, touches: &[(&str, usize)]) {
+    if let Some(global) = coupling_warning(skipped, None)
+        && let Some(index) = warnings.iter().position(|line| *line == global)
+    {
+        if let Some(scoped) = coupling_warning(skipped, Some(touches)) {
+            warnings[index] = scoped;
+        } else {
+            warnings.remove(index);
+        }
+    }
 }
 
 /// Filter heatmap results to only include targeted files.
@@ -727,16 +804,7 @@ fn compute_heatmap(
         },
     );
 
-    if large_commits_skipped > 0 {
-        let noun = if large_commits_skipped == 1 {
-            "commit"
-        } else {
-            "commits"
-        };
-        warnings.push(format!(
-            "coupling: {large_commits_skipped} {noun} with more than {COUPLING_MAX_FILES} files not paired"
-        ));
-    }
+    warnings.extend(coupling_warning(large_commits_skipped, None));
 
     if config.debug {
         let elapsed = t0.elapsed();
@@ -794,7 +862,7 @@ fn compute_heatmap(
         let capacity = excludes::DEFAULT_EXCLUDES.len() + config.extra_excludes.len();
         let mut patterns = Vec::with_capacity(capacity);
         patterns.extend(excludes::DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
-        patterns.extend(config.extra_excludes.iter().cloned());
+        patterns.extend(config.extra_excludes.iter().map(|g| g.glob().into()));
         patterns
     };
 
@@ -1569,6 +1637,156 @@ mod tests {
             coupling,
             ["coupling: 2 commits with more than 50 files not paired"]
         );
+    }
+
+    fn card_view(
+        commits: Vec<CommitInfo>,
+        args: HeatmapArgs,
+    ) -> (HeatmapResult, view::Section<card::Card>, view::ListCaps) {
+        let source = StubSource {
+            commits,
+            ..StubSource::with_malformed(0)
+        };
+        let p = prepare_commits(&source, args).unwrap().expect("card view");
+        let caps = view::ViewSpec::from_config(&p.config).lists();
+        let FileTargets::Cards(paths) = &p.config.targets else {
+            panic!("expected file targets");
+        };
+        let mut result = compute_heatmap(
+            &p.commits,
+            &p.config,
+            &p.window,
+            p.now_epoch,
+            p.repo_root,
+            p.warnings,
+            &p.module_roots,
+        );
+        let cards = scope_cards(
+            &mut result,
+            &p.commits,
+            paths,
+            caps,
+            &p.module_roots,
+            &p.excludes,
+        );
+        (result, cards, caps)
+    }
+
+    #[test]
+    fn test_card_warning_names_three_targets_in_argument_order() {
+        let names: Vec<String> = (0..51).map(|i| format!("src/f{i}.rs")).collect();
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (result, _, _) = card_view(
+            vec![stub_commit(0, &files), stub_commit(1, &files)],
+            HeatmapArgs {
+                files: ["src/f4.rs", "src/f2.rs", "src/f1.rs", "src/f3.rs"]
+                    .map(String::from)
+                    .into(),
+                ..HeatmapArgs::default()
+            },
+        );
+        assert_eq!(
+            result.warnings,
+            [
+                "coupling: 2 commits with more than 50 files not paired (2 touch src/f4.rs, 2 touch src/f2.rs, 2 touch src/f1.rs and 1 more)"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_card_warning_replaces_the_exact_global_line_in_place() {
+        let mut warnings = [
+            "coupling: other detail",
+            "coupling: 1 commit with more than 50 files not paired",
+            "Shallow clone detected",
+        ]
+        .map(String::from)
+        .to_vec();
+        scope_coupling_warning(&mut warnings, 1, &[("src/core.rs", 1)]);
+        assert_eq!(
+            warnings,
+            [
+                "coupling: other detail",
+                "coupling: 1 commit with more than 50 files not paired (1 touches src/core.rs)",
+                "Shallow clone detected",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_card_warning_omits_targets_past_the_cap() {
+        let names: Vec<String> = (0..51).map(|i| format!("src/f{i}.rs")).collect();
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (result, _, _) = card_view(
+            vec![stub_commit(0, &files), stub_commit(1, &["src/solo.rs"])],
+            HeatmapArgs {
+                files: ["src/solo.rs", "a.rs", "b.rs", "c.rs", "d.rs", "src/f0.rs"]
+                    .map(String::from)
+                    .into(),
+                ..HeatmapArgs::default()
+            },
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn test_excluded_card_names_the_filter_and_preserves_the_window_count() {
+        let (result, cards, caps) = card_view(
+            vec![stub_commit(0, &["package-lock.json"])],
+            HeatmapArgs {
+                files: vec!["package-lock.json".into()],
+                ..HeatmapArgs::default()
+            },
+        );
+        let rendered = render_cards_text(&result, &cards, caps);
+        assert_eq!(result.window.commits_analyzed, 0);
+        assert_eq!(
+            rendered.lines().last(),
+            Some("package-lock.json: left out by the default excludes; --no-exclude keeps it")
+        );
+        let json = serde_json::to_value(&cards.rows[0]).unwrap();
+        assert_eq!(json["in_window"], false);
+        assert_eq!(json["excluded"], "default");
+    }
+
+    #[test]
+    fn test_no_exclude_restores_the_lockfile_card() {
+        let (result, cards, caps) = card_view(
+            vec![stub_commit(0, &["package-lock.json"])],
+            HeatmapArgs {
+                files: vec!["package-lock.json".into()],
+                no_exclude: true,
+                ..HeatmapArgs::default()
+            },
+        );
+        let rendered = render_cards_text(&result, &cards, caps);
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "package-lock.json: 1 commit")
+        );
+        let json = serde_json::to_value(&cards.rows[0]).unwrap();
+        assert_eq!(json["in_window"], true);
+        assert!(json.get("excluded").is_none());
+    }
+
+    #[test]
+    fn test_card_names_the_user_exclude_flag() {
+        let (result, cards, caps) = card_view(
+            vec![stub_commit(0, &["src/core.rs", "src/extra.rs"])],
+            HeatmapArgs {
+                files: vec!["src/extra.rs".into()],
+                extra_excludes: vec![globset::Glob::new("src/extra.rs").unwrap()],
+                ..HeatmapArgs::default()
+            },
+        );
+        let rendered = render_cards_text(&result, &cards, caps);
+        assert_eq!(
+            rendered.lines().last(),
+            Some("src/extra.rs: left out by --exclude; remove the matching patterns to keep it")
+        );
+        let json = serde_json::to_value(&cards.rows[0]).unwrap();
+        assert_eq!(json["excluded"], "user");
     }
 
     #[test]

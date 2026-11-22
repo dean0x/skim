@@ -13,7 +13,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use super::metrics::without_quotes;
+use super::excludes::{ExcludeReason, Excludes};
+use super::metrics::{is_large_commit, without_quotes};
 use super::noise;
 use super::types::{CommitInfo, Count, CouplingEntry, FileMetrics, HeatmapResult};
 use super::view::{ListCaps, Section};
@@ -75,8 +76,10 @@ pub(crate) struct CardCounts {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Card {
     pub(crate) path: String,
-    /// False when no commit of the window touches the file.
+    /// False when no counted commit touches the file.
     pub(crate) in_window: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) excluded: Option<ExcludeReason>,
     /// Commits of the window that touch the file.
     pub(crate) commits: usize,
     pub(crate) counts: CardCounts,
@@ -86,12 +89,13 @@ pub(crate) struct Card {
 }
 
 impl Card {
-    /// The card of a file that no commit of the window touches.
-    fn not_in_window(path: String) -> Self {
+    /// The card of a file with no counted commits, with the filter if it matched.
+    fn not_counted(path: String, excluded: Option<ExcludeReason>) -> Self {
         let none = Count { total: 0, shown: 0 };
         Self {
             path,
             in_window: false,
+            excluded,
             commits: 0,
             counts: CardCounts {
                 owners: none,
@@ -319,32 +323,52 @@ fn short_sha(hash: &str) -> &str {
 /// `targets` are in the path form of the history (see [`history_paths`]).
 /// The partners come from each file's blast radius, so the pair gates and
 /// the confidence are the ones of the coupling metric; this module counts
-/// no pairs. The section total is the count of all targets.
+/// no pairs. The section total is the count of all targets. The second
+/// result has one large-commit count per card, in the same order as the rows.
 #[must_use]
 pub(crate) fn build_cards(
     commits: &[CommitInfo],
     result: &HeatmapResult,
     targets: &[String],
     caps: ListCaps,
-) -> Section<Card> {
+    excludes: &Excludes,
+) -> (Section<Card>, Vec<usize>) {
     let shown = targets.get(..caps.cards).unwrap_or(targets);
     let touching = commits_touching(commits, shown);
-    let rows = shown
+    let (rows, counts) = shown
         .iter()
         .map(|target| {
             let metrics = result.files.iter().find(|f| f.path == *target);
             let touched = touching.get(target.as_str()).map_or(&[][..], Vec::as_slice);
             match metrics {
-                Some(metrics) => card_of(metrics, touched, caps),
-                None => Card::not_in_window(sanitize(target, usize::MAX)),
+                Some(metrics) => (
+                    card_of(metrics, touched, caps),
+                    large_commits_touching(touched),
+                ),
+                None => (
+                    Card::not_counted(sanitize(target, usize::MAX), excludes.excluded_by(target)),
+                    0,
+                ),
             }
         })
-        .collect();
-    Section {
-        rows,
-        total: targets.len(),
-        left_out: 0,
-    }
+        .unzip();
+    (
+        Section {
+            rows,
+            total: targets.len(),
+            left_out: 0,
+        },
+        counts,
+    )
+}
+
+/// Count large commits in one target's deduplicated touch list.
+#[must_use]
+fn large_commits_touching(touched: &[&CommitInfo]) -> usize {
+    touched
+        .iter()
+        .filter(|commit| is_large_commit(commit))
+        .count()
 }
 
 /// The commits that touch each target, in history order, each commit once.
@@ -375,6 +399,7 @@ fn card_of(metrics: &FileMetrics, touched: &[&CommitInfo], caps: ListCaps) -> Ca
     Card {
         path: sanitize(&metrics.path, usize::MAX),
         in_window: true,
+        excluded: None,
         commits: metrics.churn.commits,
         counts: CardCounts {
             owners: owner_count,
@@ -768,6 +793,42 @@ mod tests {
 
     const DAY: i64 = 86_400;
 
+    fn build_cards(
+        commits: &[CommitInfo],
+        result: &HeatmapResult,
+        targets: &[String],
+        caps: ListCaps,
+    ) -> Section<Card> {
+        let excludes = Excludes::new(false, &[]).unwrap();
+        super::build_cards(commits, result, targets, caps, &excludes).0
+    }
+
+    #[test]
+    fn test_card_counts_only_large_commits_and_counts_each_commit_once() {
+        let mut files = ["src/core.rs"; 51];
+        files[2] = "src/small.rs";
+        let commits = [
+            commit(1, "Ann", "feat: large", DAY, &files),
+            commit(2, "Ann", "feat: small", 2 * DAY, &["src/core.rs"; 50]),
+        ];
+        let result = result_with(vec![metrics("src/core.rs", 2), metrics("src/small.rs", 1)]);
+        let (_, counts) = super::build_cards(
+            &commits,
+            &result,
+            &[
+                "src/core.rs".into(),
+                "a.rs".into(),
+                "b.rs".into(),
+                "c.rs".into(),
+                "d.rs".into(),
+                "src/small.rs".into(),
+            ],
+            default_caps(),
+            &Excludes::new(false, &[]).unwrap(),
+        );
+        assert_eq!(counts, [1, 0, 0, 0, 0]);
+    }
+
     #[test]
     fn test_card_ranks_test_partners_first_then_confidence_support_and_path() {
         let mut core = metrics("src/core.rs", 6);
@@ -929,6 +990,7 @@ mod tests {
             [Card {
                 path: "src/gone.rs".to_string(),
                 in_window: false,
+                excluded: None,
                 commits: 0,
                 counts: CardCounts {
                     owners: zero,

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `skim heatmap <file>` counts the large commits that touch each named file. If none touch a shown file, skim omits the coupling warning. An excluded file card names the filter.
+- Hook files stay inside the project.
+
+### Changed
+
+- With `--project`, skim refuses an agent folder or config-file link that leads outside the current folder. Remove the link, or run from the folder that holds the real agent folder.
+- `skim heatmap` refuses an `--exclude` pattern that is not a valid glob. It exits 1 and names the pattern on stderr. Before, skim skipped the pattern with no message.
+
 ## [3.1.0] - 2026-11-20
 
 ### Fixed

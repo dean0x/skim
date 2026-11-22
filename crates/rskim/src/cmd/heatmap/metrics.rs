@@ -147,6 +147,12 @@ pub(crate) fn edge_order(x: &CouplingEdge, y: &CouplingEdge) -> Ordering {
         .then_with(|| x.b.cmp(&y.b))
 }
 
+/// A commit is too large to pair when its file count after excludes is above the cap.
+#[must_use]
+pub(crate) fn is_large_commit(commit: &CommitInfo) -> bool {
+    commit.changed_files.len() > COUPLING_MAX_FILES
+}
+
 /// Compute file coupling from commit co-occurrences.
 ///
 /// Weights each pair's contribution by `1.0 / sqrt(files_in_commit)` to
@@ -175,7 +181,7 @@ pub(crate) fn compute_coupling(
         let n = commit.changed_files.len();
         // A commit above the cap adds to neither map: the same commits must
         // make the numerator and the denominator of every confidence.
-        if n > COUPLING_MAX_FILES {
+        if is_large_commit(commit) {
             large_commits_skipped += 1;
             continue;
         }
@@ -750,6 +756,16 @@ mod tests {
             .map(|s| s.to_string())
             .chain((0..n).map(|i| format!("bulk_{i}.rs")))
             .collect()
+    }
+
+    #[test]
+    fn test_large_commit_boundary() {
+        let files = file_names(51, &[]);
+        let paths: Vec<&str> = files.iter().map(String::as_str).collect();
+        let at_cap = make_commit("h1", "A", 1, "m", &paths[..50]);
+        let above_cap = make_commit("h2", "A", 2, "m", &paths);
+        assert!(!is_large_commit(&at_cap));
+        assert!(is_large_commit(&above_cap));
     }
 
     #[test]

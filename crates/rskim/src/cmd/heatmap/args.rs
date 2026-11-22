@@ -114,7 +114,10 @@ fn apply_value_flag(
             args.last_n = Some(n);
         }
         ValueFlagAction::Exclude => {
-            args.extra_excludes.push(val);
+            let glob = globset::Glob::new(&val).map_err(|e| {
+                anyhow::anyhow!("--exclude requires a valid glob; got {val:?}: {}", e.kind())
+            })?;
+            args.extra_excludes.push(glob);
         }
         ValueFlagAction::CouplingThreshold => {
             args.coupling_threshold = val
@@ -359,8 +362,11 @@ NOISE RULES:
     the 95% lower bound of the file's fix rate to be above the base rate.
     Coupling needs 3 shared commits. Modules need 5 commits. Bus factor shows
     only when the window has 2 or more authors. Commits with more than 50
-    files are not paired; a warning line gives their count. Insights follow
-    the same minimums and rank by severity, score, support, then path.
+    files after excludes add no pairs. A warning line gives their count.
+    For file cards, the line also counts how many of these commits touch
+    each named file. If none touch a shown file, skim omits the line.
+    Insights follow the same minimums and rank by severity, score, support,
+    then path.
 
 NON-CODE PATHS (--include-docs keeps them):
     Doc files (*.md, *.mdx, *.markdown, *.rst, *.txt, *.adoc) and files
@@ -661,7 +667,8 @@ mod tests {
     #[test]
     fn test_parse_args_extra_exclude() {
         let args = parse_args(&["--exclude=*.generated.ts".to_string()]).unwrap();
-        assert_eq!(args.extra_excludes, vec!["*.generated.ts"]);
+        let expected = globset::Glob::new("*.generated.ts").unwrap();
+        assert_eq!(args.extra_excludes, [expected]);
     }
 
     #[test]

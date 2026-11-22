@@ -540,7 +540,8 @@ mod tests {
         args.insights = true;
         args.detail = Some(DetailSection::FixRisk);
         args.path = Some("src/".to_string());
-        args.extra_excludes = vec!["*.generated.ts".to_string()];
+        let extra = globset::Glob::new("*.generated.ts").unwrap();
+        args.extra_excludes = vec![extra.clone()];
         args.files = vec!["src/main.rs".to_string()];
         let mut warnings = Vec::new();
 
@@ -556,7 +557,7 @@ mod tests {
         assert!(config.insights);
         assert_eq!(config.detail, Some(DetailSection::FixRisk));
         assert_eq!(config.path.as_deref(), Some("src/"));
-        assert_eq!(config.extra_excludes, vec!["*.generated.ts"]);
+        assert_eq!(config.extra_excludes, vec![extra]);
         assert_eq!(
             config.targets,
             FileTargets::Cards(vec!["src/main.rs".to_string()])

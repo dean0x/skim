@@ -392,12 +392,7 @@ pub(super) const SEARCH_SECTION_NEEDLES: [&str; 8] = [
 
 /// Back up a settings file before first modification.
 ///
-/// Creates `{config_dir}/settings.json.bak` — a byte-for-byte copy of
-/// `real_path`. Rejects paths that became symlinks after resolution (TOCTOU
-/// guard: a symlink appearing here after `resolve_real_settings_path()` ran
-/// indicates a race or tamper attempt).
-///
-/// Used by the Claude permissions writer before modifying `settings.json`.
+/// Creates `{config_dir}/settings.json.bak` with an exact copy of `real_path`.
 pub(crate) fn backup_settings_file(config_dir: &Path, real_path: &Path) -> anyhow::Result<()> {
     backup_config_file(real_path, &config_dir.join(SETTINGS_BACKUP))
 }
@@ -412,9 +407,8 @@ pub(super) fn config_backup_name(agent: AgentKind) -> String {
 /// Copy `real_path` byte for byte to `backup_path` before a write: the one
 /// writer of every config-file backup.
 ///
-/// The source is opened without following a link. The caller resolved it with
-/// [`resolve_real_settings_path`], so a link here means the path changed after
-/// resolution. A regular file at `backup_path` is replaced. A link, a folder or
+/// The backup open refuses a link at the final component of `real_path`.
+/// A regular file at `backup_path` is replaced. A link, a folder or
 /// any other file at `backup_path` stops the backup with an error, and nothing
 /// at that name is changed. A random temporary file in the same folder is
 /// created exclusively with mode 0600. The copy syncs before rename, so a failed

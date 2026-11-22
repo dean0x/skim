@@ -31,9 +31,10 @@ use std::os::unix::fs::PermissionsExt;
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::init::MAX_SETTINGS_SIZE;
+use crate::cmd::safe_fs;
 
 /// Filename of the per-agent sidecar manifest, relative to `config_dir`.
-pub(super) const SIDECAR_FILENAME: &str = "skim-permissions.json";
+pub(crate) const SIDECAR_FILENAME: &str = "skim-permissions.json";
 
 // ============================================================================
 // Schema
@@ -148,30 +149,19 @@ pub(crate) fn load_sidecar(path: &Path) -> Result<PermissionSidecar, SidecarErro
 
 /// Write the sidecar manifest to `path` atomically.
 ///
-/// Uses a `.tmp`-sibling write + rename (crash-safe). On Unix the temporary
-/// file is created with mode `0o600` (owner read/write only) — the rename
-/// atomically grants that permission to the final path. The final file is
-/// pretty-printed JSON terminated by a newline for readability.
+/// Uses an exclusive temporary file next to `path`. The rename replaces any
+/// link at `path`. On Unix the file has mode `0o600`. The JSON ends in a newline.
 pub(crate) fn write_sidecar(path: &Path, sidecar: &PermissionSidecar) -> anyhow::Result<()> {
     let pretty = serde_json::to_string_pretty(sidecar)?;
-    let tmp_path = path.with_extension("json.tmp");
-
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(&tmp_path, format!("{pretty}\n"))?;
-
     #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(0o600);
-        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-    }
-
-    std::fs::rename(&tmp_path, path)?;
+    let permissions = Some(std::fs::Permissions::from_mode(0o600));
+    #[cfg(not(unix))]
+    let permissions = None;
+    safe_fs::write_atomic(path, &format!("{pretty}\n"), permissions)?;
     Ok(())
 }
 
@@ -346,6 +336,42 @@ mod tests {
             !tmp_path.exists(),
             "tmp file must not remain after successful write"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_writer_replaces_sidecar_final_link_and_leaves_temp_link() {
+        use std::fs::{self, Permissions};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("keep");
+        let path = dir.path().join(SIDECAR_FILENAME);
+        let old_temp = path.with_extension("json.tmp");
+        fs::write(&target, b"keep these bytes").unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, &path).unwrap();
+        symlink(&target, &old_temp).unwrap();
+        let sidecar = sample_sidecar();
+
+        write_sidecar(&path, &sidecar).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"keep these bytes");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_link(&old_temp).unwrap(), target);
+        let meta = fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+        fs::remove_file(&target).unwrap();
+        write_sidecar(&path, &sidecar).unwrap();
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_link(&old_temp).unwrap(), target);
     }
 
     // ---- field preservation ----

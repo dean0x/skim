@@ -2398,30 +2398,520 @@ fn test_project_init_and_uninstall_refuse_an_outside_instruction_file_and_dry_ru
 }
 
 #[test]
-fn test_project_init_refuses_cursor_guidance_in_a_folder_that_leads_outside() {
+fn test_project_init_refuses_a_cursor_folder_that_leads_outside() {
     let sandbox = Sandbox::new();
     let project = sandbox.project_dir("project");
     let outside = sandbox.project_dir("outside");
     std::os::unix::fs::symlink(&outside, project.join(".cursor")).unwrap();
-    fs::write(outside.join("user.md"), "user instructions\n").unwrap();
+    let user_file = outside.join("user.md");
+    let bytes = b"user instructions\n";
+    fs::write(&user_file, bytes).unwrap();
+    let mode = fs::metadata(&user_file).unwrap().permissions().mode();
 
-    let stdout = project_init(&sandbox, &project, "cursor");
+    sandbox
+        .init()
+        .args(["--project", "--agent", "cursor", "--yes", "--no-wrappers"])
+        .current_dir(&project)
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            ".cursor leads outside this project folder",
+        ));
 
-    assert!(
-        stdout.contains(".cursor/rules/skim.mdc leads outside this project folder"),
-        "{stdout}"
-    );
-    assert!(!outside.join("rules").exists());
-    assert_eq!(
-        fs::read_to_string(outside.join("user.md")).unwrap(),
-        "user instructions\n"
-    );
+    let entries: Vec<_> = fs::read_dir(&outside)
+        .unwrap()
+        .take(2)
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["user.md"]);
+    assert_eq!(fs::read(&user_file).unwrap(), bytes);
+    assert_eq!(fs::metadata(&user_file).unwrap().permissions().mode(), mode);
     assert!(
         fs::symlink_metadata(project.join(".cursor"))
             .unwrap()
             .file_type()
             .is_symlink()
     );
+}
+
+// Project hook scope. Keep the project and the outside fixture under one
+// sandbox home. Compare the outside tree without following any links.
+struct ProjectHooks {
+    sandbox: Sandbox,
+    project: std::path::PathBuf,
+    outside: std::path::PathBuf,
+}
+
+impl ProjectHooks {
+    fn new() -> Self {
+        let sandbox = Sandbox::new();
+        let project = sandbox.project_dir("project");
+        let outside = sandbox.project_dir("outside");
+        let file = outside.join("user.json");
+        fs::write(&file, "{}\n").unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o640)).unwrap();
+        Self {
+            sandbox,
+            project,
+            outside,
+        }
+    }
+
+    fn init(&self, args: &[&str]) -> Command {
+        let mut cmd = self.sandbox.init();
+        cmd.args(["--project", "--no-wrappers"])
+            .args(args)
+            .current_dir(&self.project)
+            .timeout(std::time::Duration::from_secs(15));
+        cmd
+    }
+
+    fn link(&self, name: &str, target: &std::path::Path) -> std::path::PathBuf {
+        let link = self.project.join(name);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        link
+    }
+
+    fn check_outside(&self, run: impl FnOnce()) {
+        let before = snapshot_tree(&self.outside);
+        run();
+        assert_eq!(snapshot_tree(&self.outside), before, "outside tree changed");
+    }
+
+    fn assert_prune_plan(&self, agent: &str, retired: &str) {
+        self.check_outside(|| {
+            self.init(&["--agent", agent, "--yes", "--no-permissions", "--dry-run"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains(format!(
+                    "Would remove entries that skim no longer seeds: {retired}"
+                )));
+        });
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HookTreeEntry {
+    Folder,
+    File(Vec<u8>),
+    Link(std::path::PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeSnapshot {
+    mode: u32,
+    entries: BTreeMap<std::path::PathBuf, (u32, HookTreeEntry)>,
+}
+
+/// Compare folder entries, modes, file bytes and link targets without following links.
+fn snapshot_tree(root: &std::path::Path) -> TreeSnapshot {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        depth: usize,
+        entries: &mut BTreeMap<std::path::PathBuf, (u32, HookTreeEntry)>,
+    ) {
+        assert!(depth <= 5, "fixture tree is too deep: {path:?}");
+        let meta = fs::symlink_metadata(path).unwrap();
+        let entry = if meta.is_dir() {
+            let mut children = fs::read_dir(path).unwrap();
+            for child in children.by_ref().take(64) {
+                visit(root, &child.unwrap().path(), depth + 1, entries);
+            }
+            assert!(children.next().is_none(), "too many entries: {path:?}");
+            HookTreeEntry::Folder
+        } else if meta.is_file() {
+            HookTreeEntry::File(fs::read(path).unwrap())
+        } else {
+            assert!(meta.file_type().is_symlink(), "unexpected entry: {path:?}");
+            HookTreeEntry::Link(fs::read_link(path).unwrap())
+        };
+        entries.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            (meta.permissions().mode(), entry),
+        );
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, 0, &mut entries);
+    let (mode, entry) = entries.remove(std::path::Path::new("")).unwrap();
+    assert_eq!(entry, HookTreeEntry::Folder);
+    TreeSnapshot { mode, entries }
+}
+
+fn write_retired_seed(dir: &std::path::Path, entry: &str, config: &[u8]) {
+    use sha2::{Digest, Sha256};
+
+    let sidecar = serde_json::json!({
+        "version": 1,
+        "tier": "seed",
+        "entries": [entry],
+        "source_mirrors": {},
+        "config_hash": format!("{:x}", Sha256::digest(config)),
+    });
+    fs::write(
+        dir.join("skim-permissions.json"),
+        serde_json::to_vec(&sidecar).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_project_hooks_dry_run_refuses_outside_folder_without_changes() {
+    let fixture = ProjectHooks::new();
+    fixture.link(".cursor", &fixture.outside);
+    let before = snapshot_tree(&fixture.project);
+
+    fixture.check_outside(|| {
+        fixture
+            .init(&["--agent", "cursor", "--yes", "--dry-run"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(
+                ".cursor leads outside this project folder",
+            ));
+    });
+    assert_eq!(snapshot_tree(&fixture.project), before);
+}
+
+#[test]
+fn test_project_hooks_uninstall_refuses_outside_folder_before_prompt() {
+    let fixture = ProjectHooks::new();
+    project_init(&fixture.sandbox, &fixture.project, "claude-code");
+    let installed = fixture.outside.join("installed");
+    fs::rename(fixture.project.join(".claude"), &installed).unwrap();
+    let link = fixture.link(".claude", &installed);
+    let guidance = fixture.project.join("CLAUDE.md");
+    let before = fs::read_to_string(&guidance).unwrap();
+    assert!(before.contains("<!-- skim-start"));
+
+    fixture.check_outside(|| {
+        fixture
+            .init(&["--uninstall", "--agent", "claude-code"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(
+                ".claude leads outside this project folder",
+            ))
+            .stdout(predicate::str::contains("    * Delete").not());
+    });
+    assert_eq!(fs::read_link(link).unwrap(), installed);
+    assert_eq!(fs::read_to_string(guidance).unwrap(), before);
+}
+
+#[test]
+fn test_project_hooks_refuse_nested_outside_hook_folders() {
+    for (agent, name) in [
+        ("claude-code", ".claude/hooks"),
+        ("copilot", ".github/hooks"),
+    ] {
+        let fixture = ProjectHooks::new();
+        let link = fixture.link(name, &fixture.outside);
+        fixture.check_outside(|| {
+            fixture
+                .init(&["--agent", agent, "--yes"])
+                .assert()
+                .code(1)
+                .stderr(predicate::str::contains(format!(
+                    "{name} leads outside this project folder"
+                )));
+        });
+        assert_eq!(fs::read_link(link).unwrap(), fixture.outside);
+    }
+}
+
+#[test]
+fn test_project_hooks_refuse_outside_policy_and_rule_folders_with_retired_entries() {
+    for (agent, folder, file, retired, config) in [
+        (
+            "gemini",
+            ".gemini/policies",
+            "skim.toml",
+            "skim rg",
+            "[[rule]]\naction = \"allow\"\ntool = \"run_shell_command\"\npattern = \"skim rg\"\n",
+        ),
+        (
+            "codex",
+            ".codex/rules",
+            "skim.rules",
+            "rg",
+            "allow(\"Bash\", \"skim rg\")\n",
+        ),
+    ] {
+        let fixture = ProjectHooks::new();
+        project_init(&fixture.sandbox, &fixture.project, agent);
+        let link = fixture.link(folder, &fixture.outside);
+        fs::write(fixture.outside.join(file), config).unwrap();
+        write_retired_seed(link.parent().unwrap(), retired, config.as_bytes());
+        let project_before = snapshot_tree(&fixture.project);
+
+        for operation in [None, Some("--uninstall")] {
+            fixture.check_outside(|| {
+                fixture
+                    .init(&["--agent", agent, "--yes"])
+                    .args(operation)
+                    .assert()
+                    .code(1)
+                    .stderr(predicate::str::contains(format!(
+                        "{folder} leads outside this project folder"
+                    )));
+            });
+            assert_eq!(snapshot_tree(&fixture.project), project_before);
+        }
+
+        // A local copy must report a prune with the same sidecar and bytes.
+        fs::remove_file(&link).unwrap();
+        fs::create_dir(&link).unwrap();
+        fs::write(link.join(file), config).unwrap();
+        fixture.assert_prune_plan(agent, retired);
+    }
+}
+
+#[test]
+fn test_project_hooks_replace_owned_final_links() {
+    let fixture = ProjectHooks::new();
+    let target = fixture.outside.join("user.json");
+    let paths = ["skim-rewrite.sh", "skim-copilot.sha256", "skim.json"]
+        .map(|name| fixture.link(&format!(".github/hooks/{name}"), &target));
+
+    fixture.check_outside(|| {
+        fixture
+            .init(&["--agent", "copilot", "--yes", "--force"])
+            .assert()
+            .success();
+    });
+    for (path, mode) in paths.iter().zip([0o755, 0o600, 0o600]) {
+        let meta = fs::symlink_metadata(path).unwrap();
+        assert!(meta.is_file(), "expected a regular file: {path:?}");
+        assert_eq!(meta.permissions().mode() & 0o777, mode, "{path:?}");
+    }
+}
+
+#[test]
+fn test_project_hooks_leave_dangling_temp_target_and_manifest_target_absent() {
+    let fixture = ProjectHooks::new();
+    let temp_target = fixture.outside.join("absent-temp");
+    let temp = fixture.link(".claude/hooks/skim-rewrite.sh.tmp", &temp_target);
+    let manifest = fixture.link(
+        ".claude/hooks/skim-claude-code.sha256",
+        &fixture.outside.join("absent-manifest"),
+    );
+
+    fixture.check_outside(|| {
+        fixture
+            .init(&["--agent", "claude-code", "--yes"])
+            .assert()
+            .success();
+    });
+    assert_eq!(fs::read_link(temp).unwrap(), temp_target);
+    assert!(fs::symlink_metadata(manifest).unwrap().is_file());
+}
+
+#[test]
+fn test_project_hooks_refuse_outside_config_links_present_or_dangling() {
+    for (file, reason) in [
+        ("user.json", "leads outside this project folder"),
+        (
+            "absent.json",
+            "is a link that does not end at a regular file",
+        ),
+    ] {
+        let fixture = ProjectHooks::new();
+        fixture.link(".claude/settings.json", &fixture.outside.join(file));
+        let before = snapshot_tree(&fixture.project);
+
+        fixture.check_outside(|| {
+            fixture
+                .init(&["--agent", "claude-code", "--yes"])
+                .assert()
+                .code(1)
+                .stderr(predicate::str::contains(format!(
+                    ".claude/settings.json {reason}"
+                )));
+        });
+        assert_eq!(snapshot_tree(&fixture.project), before);
+    }
+}
+
+#[test]
+fn test_project_hooks_keep_outside_link_in_config_chain_on_install_and_uninstall() {
+    let fixture = ProjectHooks::new();
+    project_init(&fixture.sandbox, &fixture.project, "cursor");
+    let name = ".cursor/hooks.json";
+    let real = fixture.project.join("hook-config.json");
+    fs::rename(fixture.project.join(name), &real).unwrap();
+    let intermediate = fixture.outside.join("link.json");
+    std::os::unix::fs::symlink(real, &intermediate).unwrap();
+    fixture.link(name, &intermediate);
+    let before = snapshot_tree(&fixture.project);
+
+    for operation in [None, Some("--uninstall")] {
+        fixture.check_outside(|| {
+            fixture
+                .init(&["--agent", "cursor", "--yes"])
+                .args(operation)
+                .assert()
+                .code(1)
+                .stderr(predicate::str::contains(
+                    ".cursor/hooks.json is a link that does not end at a regular file",
+                ));
+        });
+        assert_eq!(snapshot_tree(&fixture.project), before);
+    }
+}
+
+#[test]
+fn test_project_hooks_refuse_config_chains_before_claude_or_copilot_prune() {
+    const RETIRED: &str = "Bash(skim rg:*)";
+    for (agent, name, config) in [
+        (
+            "claude-code",
+            ".claude/settings.json",
+            serde_json::json!({"permissions": {"allow": [RETIRED]}}),
+        ),
+        (
+            "copilot",
+            ".github/permissions-config.json",
+            serde_json::json!({"/old-project": {"allow": [RETIRED]}}),
+        ),
+    ] {
+        let fixture = ProjectHooks::new();
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let real = fixture.project.join("permissions.json");
+        fs::write(&real, &bytes).unwrap();
+        let intermediate = fixture.outside.join("permissions-link.json");
+        std::os::unix::fs::symlink(&real, &intermediate).unwrap();
+        let link = fixture.link(name, &intermediate);
+        write_retired_seed(link.parent().unwrap(), RETIRED, &bytes);
+        let before = snapshot_tree(&fixture.project);
+
+        fixture.check_outside(|| {
+            fixture
+                .init(&["--agent", agent, "--yes", "--no-permissions"])
+                .assert()
+                .code(1)
+                .stderr(predicate::str::contains(format!(
+                    "{name} is a link that does not end at a regular file"
+                )));
+        });
+        assert_eq!(snapshot_tree(&fixture.project), before);
+
+        // Prove the same bytes and sidecar qualify without the link chain.
+        fs::remove_file(&link).unwrap();
+        fs::write(link, bytes).unwrap();
+        fixture.assert_prune_plan(agent, RETIRED);
+    }
+}
+
+#[test]
+fn test_project_hooks_install_and_uninstall_through_inside_folder_link() {
+    let fixture = ProjectHooks::new();
+    let real = fixture.project.join("inside");
+    fs::create_dir(&real).unwrap();
+    let link = fixture.link(".claude", &real);
+    let script = real.join("hooks/skim-rewrite.sh");
+    let manifest = real.join("hooks/skim-claude-code.sha256");
+    let settings = real.join("settings.json");
+
+    fixture.check_outside(|| {
+        fixture
+            .init(&["--agent", "claude-code", "--yes"])
+            .assert()
+            .success();
+        assert!(script.is_file());
+        assert!(manifest.is_file());
+        assert!(
+            fs::read_to_string(&settings)
+                .unwrap()
+                .contains("skim-rewrite.sh")
+        );
+    });
+    fixture.check_outside(|| {
+        fixture
+            .init(&["--uninstall", "--agent", "claude-code", "--yes"])
+            .assert()
+            .success();
+        assert!(!script.exists());
+        assert!(!manifest.exists());
+        assert!(
+            !fs::read_to_string(settings)
+                .unwrap()
+                .contains("skim-rewrite.sh")
+        );
+    });
+    assert_eq!(fs::read_link(link).unwrap(), real);
+}
+
+#[test]
+fn test_project_hooks_patch_inside_config_link_and_keep_it() {
+    let fixture = ProjectHooks::new();
+    let real = fixture.project.join("user-settings.json");
+    fs::write(&real, r#"{"user_key":"keep"}"#).unwrap();
+    let link = fixture.link(".claude/settings.json", &real);
+
+    for operation in [None, Some("--uninstall")] {
+        fixture.check_outside(|| {
+            fixture
+                .init(&["--agent", "claude-code", "--yes"])
+                .args(operation)
+                .assert()
+                .success();
+        });
+        let contents = fs::read_to_string(&real).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(settings["user_key"], "keep");
+        assert_eq!(contents.contains("skim-rewrite.sh"), operation.is_none());
+        assert_eq!(fs::read_link(&link).unwrap(), real);
+    }
+}
+
+#[test]
+fn test_project_hooks_refuse_dangling_agent_folders_inside_or_outside() {
+    for inside in [false, true] {
+        let fixture = ProjectHooks::new();
+        let parent = if inside {
+            &fixture.project
+        } else {
+            &fixture.outside
+        };
+        fixture.link(".cursor", &parent.join("absent"));
+        let before = snapshot_tree(&fixture.project);
+
+        fixture.check_outside(|| {
+            fixture
+                .init(&["--agent", "cursor", "--yes"])
+                .assert()
+                .code(1)
+                .stderr(predicate::str::contains("skim could not check .cursor"));
+        });
+        assert_eq!(snapshot_tree(&fixture.project), before);
+    }
+}
+
+#[test]
+fn test_project_hooks_auto_detect_installs_other_agents_after_a_refusal() {
+    let fixture = ProjectHooks::new();
+    fixture.sandbox.config_dir(".cursor");
+    let link = fixture.link(".cursor", &fixture.outside);
+
+    fixture.check_outside(|| {
+        fixture
+            .init(&["--yes"])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(
+                "✗ Cursor: failed — .cursor leads outside this project folder",
+            ));
+    });
+    assert!(
+        fixture
+            .project
+            .join(".claude/hooks/skim-rewrite.sh")
+            .is_file()
+    );
+    assert_eq!(fs::read_link(link).unwrap(), fixture.outside);
 }
 
 #[test]
@@ -4300,34 +4790,6 @@ const CURSORRULES_WITH_BLOCK: &str = "# User rules\n\n<!-- skim-start v1.0.0 -->
 const CURSOR_GLOBAL_NOTE: &str = "Note: Cursor has no global guidance file. \
      In a repository, run `skim init --agent cursor --project` to add it.";
 
-/// Every file and folder under `dir`, by relative path, with the bytes of each
-/// file (`None` for a folder), for a before/after check.
-fn snapshot_tree(dir: &std::path::Path) -> BTreeMap<String, Option<Vec<u8>>> {
-    fn walk(
-        root: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut BTreeMap<String, Option<Vec<u8>>>,
-    ) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            if path.is_dir() {
-                out.insert(name, None);
-                walk(root, &path, out);
-            } else {
-                out.insert(name, Some(fs::read(&path).unwrap()));
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    walk(dir, dir, &mut out);
-    out
-}
-
 /// A global init with Cursor writes nothing in the current folder, leaves a
 /// `.cursorrules` file as it is, and prints the project command.
 #[test]
@@ -4840,7 +5302,7 @@ fn test_init_skips_the_guidance_only_agents_under_agent_project_and_no_guidance(
         assert_no_guidance_only_files(&sandbox);
         for (name, root, _, _) in GUIDANCE_ONLY {
             assert!(
-                snapshot_tree(&sandbox.home().join(root)).is_empty(),
+                snapshot_tree(&sandbox.home().join(root)).entries.is_empty(),
                 "{name}: {root} changed under {args:?}"
             );
         }

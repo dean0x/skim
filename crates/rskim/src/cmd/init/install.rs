@@ -11,6 +11,9 @@ use super::helpers::{
     config_backup_name, confirm_grant, confirm_proceed, display_entries, load_or_create_settings,
     resolve_real_settings_path,
 };
+use super::hook_scope::{
+    CURSOR_LEGACY_SETTINGS, ProjectHookScope, SettingsFile, settings_write_path,
+};
 use super::state::{
     DetectedState, ForeignPostHook, detect_state, has_skim_hook_entry, read_settings_json,
 };
@@ -247,6 +250,7 @@ fn prune_retired_permissions(
     agent: AgentKind,
     perm_dir: &std::path::Path,
     dry_run: bool,
+    project_scope: Option<&ProjectHookScope>,
 ) -> Vec<String> {
     use crate::cmd::permissions::PruneMode;
 
@@ -259,7 +263,13 @@ fn prune_retired_permissions(
     } else {
         PruneMode::Apply
     };
-    let removed = match protocol.prune_retired(perm_dir, &current, mode) {
+    let result = project_scope
+        .map_or(Ok(None), |scope| scope.permission_config_path(agent))
+        .and_then(|path| match path {
+            Some(path) => protocol.prune_retired_at(perm_dir, &current, mode, Some(path)),
+            None => protocol.prune_retired(perm_dir, &current, mode),
+        });
+    let removed = match result {
         Ok(removed) => removed,
         Err(e) => {
             eprintln!(
@@ -618,7 +628,8 @@ fn run_install_single(
 
     // Before the fast path, so that a current install still loses the entries
     // that skim no longer seeds.
-    let removed = prune_retired_permissions(agent, perm_dir, flags.dry_run);
+    let removed =
+        prune_retired_permissions(agent, perm_dir, flags.dry_run, state.project_scope.as_ref());
 
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
@@ -727,6 +738,14 @@ fn run_install_single(
         }
     }
 
+    let state = DetectedState {
+        project_scope: state
+            .project_scope
+            .as_ref()
+            .map(|scope| scope.recheck(agent))
+            .transpose()?,
+        ..state
+    };
     execute_install(
         &state,
         flags.no_guidance,
@@ -801,7 +820,7 @@ fn agent_from_state(state: &DetectedState) -> anyhow::Result<AgentKind> {
     })
 }
 
-fn execute_install(
+pub(super) fn execute_install(
     state: &DetectedState,
     no_guidance: bool,
     global: bool,
@@ -818,7 +837,7 @@ fn execute_install(
     // may have been written in a previous skim version when Cursor was (incorrectly)
     // treated as using the Claude Code settings.json / PreToolUse format.
     if let Some(AgentKind::Cursor) = AgentKind::from_str(state.agent_cli_name) {
-        migrate_cursor_legacy_settings(&state.config_dir)?;
+        migrate_cursor_legacy_settings(&state.config_dir, state.project_scope.as_ref())?;
     }
 
     // B8: Patch settings.json (or hooks.json for Cursor)
@@ -1219,7 +1238,7 @@ fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Res
         crate::cmd::hooks::HookMode::requested(dev_requested),
     );
 
-    atomic_write_executable(&hooks_dir, &script_path, &script_content)?;
+    atomic_write_executable(&script_path, &script_content)?;
 
     // Compute and store SHA-256 hash for integrity verification (#57).
     // Errors are propagated with `?` — silently installing without tamper
@@ -1240,39 +1259,14 @@ fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Res
     Ok(())
 }
 
-/// Atomically write `content` to `script_path` and set executable permissions.
-///
-/// Writes to a `.tmp` sibling first, then renames — a crash mid-write produces
-/// a tmp file instead of a truncated script.  The tmp file is removed on any
-/// failure (cleanup guard).  On Unix, `0o755` permissions are applied to the
-/// tmp file *before* the rename so the final path is always executable.
-fn atomic_write_executable(
-    dir: &std::path::Path,
-    script_path: &std::path::Path,
-    content: &str,
-) -> anyhow::Result<()> {
-    let tmp_path = dir.join(format!("{HOOK_SCRIPT_NAME}.tmp"));
-
-    if let Err(e) = std::fs::write(&tmp_path, content) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-
+/// Publish the script from an exclusive temporary file. On Unix, set mode
+/// 0755 on the open file before the rename. Replace a link at the final name.
+fn atomic_write_executable(script_path: &std::path::Path, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
-    {
-        let perms = std::fs::Permissions::from_mode(0o755);
-        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, script_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-
-    Ok(())
+    let permissions = Some(std::fs::Permissions::from_mode(0o755));
+    #[cfg(not(unix))]
+    let permissions = None;
+    crate::cmd::safe_fs::write_atomic(script_path, content, permissions)
 }
 
 // ============================================================================
@@ -1315,13 +1309,20 @@ fn remove_skim_entries_from_event(settings: &mut serde_json::Value, event_key: &
 ///
 /// Non-fatal: if `settings.json` doesn't exist or can't be parsed, this is
 /// silently skipped (the correct `hooks.json` is still written).
-fn migrate_cursor_legacy_settings(config_dir: &std::path::Path) -> anyhow::Result<()> {
-    let legacy_path = config_dir.join("settings.json");
-    if !legacy_path.exists() {
+fn migrate_cursor_legacy_settings(
+    config_dir: &std::path::Path,
+    project_scope: Option<&ProjectHookScope>,
+) -> anyhow::Result<()> {
+    let legacy_path = config_dir.join(CURSOR_LEGACY_SETTINGS);
+    let checked_path = project_scope
+        .map(|scope| settings_write_path(Some(scope), SettingsFile::CursorLegacy, &legacy_path))
+        .transpose()?;
+    let read_path = checked_path.as_deref().unwrap_or(&legacy_path);
+    if !read_path.exists() {
         return Ok(());
     }
 
-    let Some(mut settings) = read_settings_json(&legacy_path) else {
+    let Some(mut settings) = read_settings_json(read_path) else {
         return Ok(()); // Unreadable or invalid — skip silently
     };
 
@@ -1330,8 +1331,10 @@ fn migrate_cursor_legacy_settings(config_dir: &std::path::Path) -> anyhow::Resul
     let removed_lower = remove_skim_entries_from_event(&mut settings, "preToolUse");
 
     if removed_pre || removed_lower {
-        // Atomic write to legacy path
-        let real_path = resolve_real_settings_path(&legacy_path)?;
+        let real_path = match checked_path {
+            Some(path) => path,
+            None => resolve_real_settings_path(&legacy_path)?,
+        };
         atomic_write_settings(&settings, &real_path)?;
         println!(
             "  {} Cleaned legacy settings.json entry (migrated to hooks.json)",
@@ -1555,7 +1558,11 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
         std::fs::create_dir_all(&state.config_dir)?;
     }
 
-    let real_path = resolve_real_settings_path(&state.settings_path)?;
+    let real_path = settings_write_path(
+        state.project_scope.as_ref(),
+        SettingsFile::Agent,
+        &state.settings_path,
+    )?;
     let mut settings = load_or_create_settings(&real_path)?;
 
     // Back up the existing file under the name of its own config file. The
@@ -1769,6 +1776,55 @@ mod tests {
     use crate::cmd::init::helpers::guidance_content;
     use crate::cmd::session::AgentKind;
 
+    #[cfg(unix)]
+    fn check_hook_script_write(link_name: &str, keeps_link: bool) {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let hooks = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("user.txt");
+        fs::write(&target, b"user data\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = hooks.path().join(link_name);
+        symlink(&target, &link).unwrap();
+
+        let script = hooks.path().join(HOOK_SCRIPT_NAME);
+        let content = "#!/bin/sh\nexit 0\n";
+        atomic_write_executable(&script, content).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"user data\n");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        let entries: Vec<_> = fs::read_dir(outside.path())
+            .unwrap()
+            .take(2)
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["user.txt"]);
+        if keeps_link {
+            assert_eq!(fs::read_link(&link).unwrap(), target);
+        }
+        let meta = fs::symlink_metadata(&script).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o755);
+        assert_eq!(fs::read_to_string(&script).unwrap(), content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_script_writer_leaves_the_old_temp_link_untouched() {
+        check_hook_script_write("skim-rewrite.sh.tmp", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_script_writer_replaces_a_link_with_an_executable_file() {
+        check_hook_script_write(HOOK_SCRIPT_NAME, false);
+    }
+
     #[test]
     fn test_upsert_hook_entry_idempotent() {
         let protocol = protocol_for_agent(AgentKind::ClaudeCode);
@@ -1786,6 +1842,125 @@ mod tests {
             1,
             "running upsert twice should produce exactly one entry, not a duplicate"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_settings_edits_the_checked_settings_target() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let project = tempfile::tempdir().unwrap();
+        let config_dir = project.path().join(".claude");
+        fs::create_dir(&config_dir).unwrap();
+        let settings_path = config_dir.join("settings.json");
+        let checked = config_dir.join("checked.json");
+        let replacement = config_dir.join("replacement.json");
+        let replacement_bytes = br#"{"model":"replacement"}"#;
+        fs::write(&checked, br#"{"model":"checked"}"#).unwrap();
+        fs::write(&replacement, replacement_bytes).unwrap();
+        symlink(&checked, &settings_path).unwrap();
+
+        let agent = AgentKind::ClaudeCode;
+        let scope = ProjectHookScope::check(agent, project.path()).unwrap();
+        fs::remove_file(&settings_path).unwrap();
+        symlink(&replacement, &settings_path).unwrap();
+        let state = DetectedState {
+            config_dir: config_dir.clone(),
+            hook_config_dir: config_dir,
+            project_scope: Some(scope),
+            settings_path,
+            ..state_with_cli_name(agent.cli_name())
+        };
+
+        patch_settings(&state).unwrap();
+
+        let settings = read_settings_json(&checked).unwrap();
+        let script = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            script.to_str().unwrap(),
+            "the checked target must gain the hook"
+        );
+        assert_eq!(settings["model"], "checked");
+        assert_eq!(fs::read(&replacement).unwrap(), replacement_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_migration_edits_the_checked_legacy_settings_target() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let project = tempfile::tempdir().unwrap();
+        let config_dir = project.path().join(".cursor");
+        fs::create_dir(&config_dir).unwrap();
+        let settings_path = config_dir.join(CURSOR_LEGACY_SETTINGS);
+        let checked = config_dir.join("checked.json");
+        let replacement = config_dir.join("replacement.json");
+        let legacy_settings = |theme| {
+            serde_json::json!({
+                "theme": theme,
+                "hooks": { "PreToolUse": [{ "hooks": [{ "command": "skim-rewrite.sh" }] }] }
+            })
+            .to_string()
+        };
+        let replacement_bytes = legacy_settings("replacement").into_bytes();
+        fs::write(&checked, legacy_settings("checked")).unwrap();
+        fs::write(&replacement, &replacement_bytes).unwrap();
+        symlink(&checked, &settings_path).unwrap();
+
+        let scope = ProjectHookScope::check(AgentKind::Cursor, project.path()).unwrap();
+        fs::remove_file(&settings_path).unwrap();
+        symlink(&replacement, &settings_path).unwrap();
+
+        migrate_cursor_legacy_settings(&config_dir, Some(&scope)).unwrap();
+
+        assert_eq!(
+            read_settings_json(&checked),
+            Some(serde_json::json!({ "theme": "checked" })),
+            "only the legacy skim hook must be removed from the checked target"
+        );
+        assert_eq!(fs::read(&replacement).unwrap(), replacement_bytes);
+    }
+
+    #[cfg(unix)]
+    fn check_prune_uses_checked_permission_config(agent: AgentKind, key: &str) {
+        use crate::cmd::permissions::{permissions_protocol_for_agent, sidecar::SIDECAR_FILENAME};
+        use std::{fs, os::unix::fs::symlink};
+
+        let project = tempfile::tempdir().unwrap();
+        let dir = project.path().join(agent.dot_dir_name());
+        let protocol = permissions_protocol_for_agent(agent).unwrap();
+        let config = dir.join(protocol.config_filename());
+        let checked = dir.join("checked.json");
+        let other = dir.join("other.json");
+        let settings = |tag| serde_json::json!({(key): {"allow": ["retired", tag]}}).to_string();
+        let other_bytes = settings("other");
+        fs::create_dir(&dir).unwrap();
+        fs::write(&checked, settings("checked")).unwrap();
+        fs::write(&other, &other_bytes).unwrap();
+        let record = r#"{"version":1,"tier":"seed","entries":["retired"],"source_mirrors":{},"config_hash":""}"#;
+        fs::write(dir.join(SIDECAR_FILENAME), record).unwrap();
+        symlink(&checked, &config).unwrap();
+        let scope = ProjectHookScope::check(agent, project.path()).unwrap();
+        fs::remove_file(&config).unwrap();
+        symlink(&other, &config).unwrap();
+
+        prune_retired_permissions(agent, &dir, false, Some(&scope));
+        let pruned = read_settings_json(&checked).unwrap();
+        assert_eq!(pruned[key]["allow"], serde_json::json!(["checked"]));
+        assert_eq!(fs::read(&other).unwrap(), other_bytes.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_prunes_the_checked_permission_config() {
+        check_prune_uses_checked_permission_config(AgentKind::ClaudeCode, "permissions");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copilot_prunes_the_checked_permission_config() {
+        check_prune_uses_checked_permission_config(AgentKind::CopilotCli, "/project");
     }
 
     // ---- find_skim_section unit tests ----
@@ -2030,6 +2205,7 @@ mod tests {
             skim_version: "1.0.0".to_string(),
             config_dir: std::path::PathBuf::from("/tmp"),
             hook_config_dir: std::path::PathBuf::from("/tmp"),
+            project_scope: None,
             settings_path: std::path::PathBuf::from("/tmp/settings.json"),
             settings_exists: false,
             hook_installed: false,

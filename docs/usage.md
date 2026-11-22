@@ -295,7 +295,7 @@ A capped section ends with one line that gives the exact hidden count and the se
 | Module support | 5 commits of the module |
 | Fix-risk lift | The 95% lower bound (Wilson) of the file's fix rate is above the base rate (fix commits / all commits after excludes). At a base rate of 0% or 100%, one reason line replaces the rows. |
 | Bus-factor gate | 2 or more distinct authors in the window |
-| Large commits | A commit with more than 50 files adds no coupling pairs; a warning line counts these commits. |
+| Large commits | A commit with more than 50 files after excludes adds no coupling pairs. A warning line counts these commits and gives the touch count for each named file on the card view. If no shown file has a touch, the card view omits the line. |
 
 `files[]` in the JSON keeps the raw per-file values (for example `churn.commits` and `fix_risk.keyword_pct`) for files below these minimums.
 
@@ -348,7 +348,8 @@ crates/rskim/src/cmd/heatmap/view.rs: 7 commits
 - **Owners** (`owners: "A" 89%, "B" 11%`) show only when the file has 2 or more distinct authors. Each name is in double quotes.
 - **Partners** are files with 3 or more shared commits and a confidence at or above `--coupling-threshold`. Test files come first.
 - **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first. In the text view, a `"` or `\` in a subject or an owner name shows as `\"` or `\\`.
-- A file with no commits in the window prints `<path>: not in history window (N commits since DATE)` (`1 commit` for one), where N and DATE describe the window.
+- If a filter leaves out a file, its card says `left out by the default excludes; --no-exclude keeps it` or `left out by --exclude; remove the matching patterns to keep it`. Otherwise, a file with no commits in the window prints `<path>: not in history window (N commits since DATE)` (`1 commit` for one). N and DATE describe the window.
+- The large-commit warning gives the run count and the touch count for each named file. For example: `warning: coupling: 1 commit with more than 50 files not paired (1 touches src/main.rs)`. The line names up to three shown files in argument order, then gives the count of more names. If no shown file has a touch, skim omits the line.
 - Control characters, bidirectional characters and invisible format characters (for example zero-width characters and Unicode tag characters) in subjects, author names and partner paths become U+FFFD. Each of these strings is cut at 72 characters.
 - `./x`, an absolute path under the repository root, a path relative to the current folder and a path with `..` give the same card. A path outside the repository exits 1. skim does not open the file. An absolute path through a symbolic-link prefix (for example macOS `/var`) is refused.
 
@@ -362,6 +363,8 @@ Metrics come from the full window; a card only narrows the display.
 #### Default Excludes
 
 By default the analysis leaves out lock files, build and dist output, minified bundles, logs, `vendor/` and `node_modules/`, IDE metadata, coverage output, and, at any depth, `CHANGELOG.md`, `*.snap`, `snapshots/`, `*.pb.go`, `*_pb2.py` and `generated/` folders. These files are absent from every section and from `files[]`. `--no-exclude` keeps them; `--exclude <PATTERN>` adds a pattern. The patterns match paths only: a file marked "generated" only in a header line stays in.
+
+Skim refuses an invalid `--exclude` pattern and gives the reason.
 
 #### Insights Mode
 
@@ -380,7 +383,7 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 - `file_targets[]` holds at most 20 targets, and `counts.file_targets` gives their full and shown count. `warnings[]` has at most one line for each kind of warning: the `--diff` files that are not in the window give one line that counts them and names the first 3. `excluded_patterns[]` is the fixed pattern list: the default excludes and the `--exclude` values.
 - `counts.<section>.{total,shown}` gives the full and the shown count of each section (`hotspots`, `coupling`, `fix_risk`, `modules`, `bus_factor`).
 - `files[]` keeps its per-file keys; no support minimum applies to it.
-- With file arguments, `cards[]` holds the cards (`path`, `in_window`, `commits`, `counts`, `owners`, `partners`, `fix_commits`) and `counts.cards` their counts.
+- With file arguments, `cards[]` holds the cards (`path`, `in_window`, `commits`, `counts`, `owners`, `partners`, `fix_commits`) and `counts.cards` their counts. An excluded card has `in_window: false` and an `excluded` field of `"default"` or `"user"`. Other cards omit `excluded`.
 - `--insights --json` gives `insights[]`, `top_files[]` and `flagged_modules[]` for the shown findings only, with `counts.insights`. Its `warnings[]` is the same list as in `--json`.
 - `repository` gives the repository name, the same name as the text header, never the absolute path. This is the same in `--insights --json` and with file arguments.
 

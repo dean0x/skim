@@ -107,7 +107,7 @@ pub(crate) struct HeatmapArgs {
     /// and the insights (`--include-docs`).
     pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
-    pub(crate) extra_excludes: Vec<String>,
+    pub(crate) extra_excludes: Vec<globset::Glob>,
     /// Coupling confidence threshold (default 0.5).
     pub(crate) coupling_threshold: f64,
     /// Fix-after-touch proximity window in commits (default 5).
@@ -233,7 +233,7 @@ pub(crate) struct HeatmapConfig {
     /// and the insights (`--include-docs`).
     pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
-    pub(crate) extra_excludes: Vec<String>,
+    pub(crate) extra_excludes: Vec<globset::Glob>,
     /// Coupling confidence threshold (default 0.5).
     pub(crate) coupling_threshold: f64,
     /// Fix-after-touch proximity window in commits (default 5).
