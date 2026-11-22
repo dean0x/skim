@@ -1,13 +1,9 @@
 //! Parser module - tree-sitter wrapper
 //!
-//! ARCHITECTURE: This is the ONLY module that imports tree-sitter.
-//! All AST operations happen here or in transform module.
-//!
-//! Design: Parser instance is bound to a specific language.
-//!
-//! NOTE: Parser struct is defined in types.rs for better module organization.
-//! This module only contains language-specific helper functions.
+//! The `Parser` type in `types.rs` wraps tree-sitter and selects the language.
+//! This module owns the language helpers and input limits.
 
+pub(crate) mod grammar_limits;
 pub mod language;
 
 // Tests moved to validate actual Parser struct (not deleted duplicate)

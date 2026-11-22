@@ -454,7 +454,15 @@ impl Language {
 
         // Tree-sitter path (all non-serde languages in Structure/Signatures/Types/Minimal/Pseudo)
         let mut parser = Parser::new_for_extension(self, ext)?;
-        let tree = parser.parse(source)?;
+        let tree = match parser.parse(source) {
+            Ok(tree) => tree,
+            Err(e) if e.is_complexity_limit() => {
+                let (content, _, line_map) =
+                    self.transform_passthrough_with_line_map(source, config)?;
+                return Ok((content, false, line_map, true));
+            }
+            Err(e) => return Err(e),
+        };
         let parse_errors = tree.root_node().has_error();
 
         // The tail marker's count is resolved from the transform's own line map
@@ -1168,15 +1176,10 @@ pub enum SkimError {
     #[error("Failed to parse source code: {0}")]
     ParseError(String),
 
-    /// A structural safety cap was exceeded (AST node / signature / type-def /
-    /// markdown-header count). The input is legitimate but too large to compress,
-    /// so the transform dispatcher degrades to a lossless raw passthrough rather
-    /// than failing the command. (#317 — compress, never truncate; if we can't
-    /// compress, cleanly passthrough.) Distinct from [`ParseError`] (genuine
-    /// failure) and the depth caps (kept as hard `ParseError`s because deep
-    /// nesting beyond the limit signals pathological/malicious input, not size).
-    ///
-    /// [`ParseError`]: SkimError::ParseError
+    /// The input is too large or too deeply nested to compress.
+    /// The transform returns raw text instead. For Markdown nesting, `count`
+    /// is an estimate of 200 or more, not the actual depth.
+    /// Depth limits for JSON, YAML and TOML still return [`SkimError::ParseError`].
     #[error("{what} exceeded safety cap: {count} (max: {max})")]
     ComplexityLimit {
         what: &'static str,
@@ -1208,11 +1211,9 @@ pub enum SkimError {
 }
 
 impl SkimError {
-    /// Returns `true` for [`SkimError::ComplexityLimit`] — a structural
-    /// safety-cap overflow the transform dispatcher degrades to raw passthrough
-    /// instead of surfacing as a command failure. Callers outside the dispatcher
-    /// (e.g. the CLI) can use this to distinguish "too big to compress" (degrade)
-    /// from a genuine parse failure (report).
+    /// Returns `true` for [`SkimError::ComplexityLimit`].
+    /// The input is too big or too deeply nested to compress, so the transform returns raw text.
+    /// Callers can use this check to tell a limit from a parse failure.
     #[must_use]
     pub fn is_complexity_limit(&self) -> bool {
         matches!(self, SkimError::ComplexityLimit { .. })
@@ -1321,6 +1322,10 @@ impl Parser {
         })
     }
 
+    fn check_limits(&self, source: &str) -> Result<()> {
+        crate::parser::grammar_limits::check_grammar_limits(self.language, source)
+    }
+
     /// Parse source code into AST
     ///
     /// ARCHITECTURE: Returns tree-sitter Tree, not custom AST.
@@ -1328,7 +1333,9 @@ impl Parser {
     ///
     /// # Errors
     /// Returns `SkimError::ParseError` if parsing fails.
+    /// Returns `SkimError::ComplexityLimit` at the Markdown nesting limit.
     pub fn parse(&mut self, source: &str) -> Result<tree_sitter::Tree> {
+        self.check_limits(source)?;
         self.tree_sitter_parser.parse(source, None).ok_or_else(|| {
             SkimError::ParseError(format!("Failed to parse {} source", self.language.name()))
         })
@@ -1343,16 +1350,18 @@ impl Parser {
     ///
     /// The parser reads the clock about once per 100 parse steps, so a source
     /// short enough to finish before the first read always parses, whatever the
-    /// limit. The clock starts when this method is called.
+    /// limit. The clock starts after the input limit check.
     ///
     /// # Errors
     /// Returns `SkimError::ParseError` if parsing fails for a reason other than
     /// the time bound.
+    /// Returns `SkimError::ComplexityLimit` at the Markdown nesting limit.
     pub fn parse_bounded(
         &mut self,
         source: &str,
         limit: Duration,
     ) -> Result<Option<tree_sitter::Tree>> {
+        self.check_limits(source)?;
         let start = Instant::now();
         let mut stopped = false;
         // The callback returns true to stop the parse (tree-sitter 0.25
