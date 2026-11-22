@@ -284,6 +284,8 @@ fn test_markdown_full() {
 // Markdown Nesting Tests
 // ============================================================================
 
+// The heading and blank line each count as 1. The 200 quote markers would give 201.
+// The estimate stops at 200, before the last marker.
 fn deep_markdown() -> String {
     format!("# Report\n\n{}\n", ">".repeat(200))
 }
