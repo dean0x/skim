@@ -2186,7 +2186,20 @@ mod tests {
             .expect("piped stdin")
             .write_all(script.as_bytes())
             .expect("send the stub script to sh");
-        let status = child.wait().expect("wait for sh");
+        // Bounded wait: 3000 polls of 10 ms (30 s). The bound stops a hang only;
+        // it is wide so that a slow runner does not fail the test.
+        let status = (0..3000)
+            .find_map(|_| {
+                let polled = child.try_wait().expect("poll sh");
+                if polled.is_none() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                polled
+            })
+            .unwrap_or_else(|| {
+                let _ = child.kill();
+                panic!("sh did not write the stub within 30 s");
+            });
         assert!(status.success(), "sh could not write the stub: {status}");
         path
     }

@@ -1364,6 +1364,7 @@ fn extend_past_trailing_comma(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod tests {
     use super::*;
+    use crate::transform::scaling_guard::{self, MinMedian};
     use crate::{Mode, Parser, TransformConfig};
 
     fn transform(source: &str, language: Language) -> String {
@@ -3558,31 +3559,24 @@ mod tests {
     // in this walker (e.g. someone adding a per-node sibling walk, the Go bug's
     // shape) would otherwise pass silently on every language except Python.
     //
-    // THRESHOLD RATIONALE — 2.8 ≈ 2^1.5 is the exponent-space midpoint between
-    // linear (2.0×) and quadratic (4.0×).
-    // These shapes measure 2.01×–2.07× at the guard sizes, so 2.8 leaves ~35 % headroom.
-    // The Python guard is the exception: it grows N 4× against 8.0 = 4^1.5, the
-    // same midpoint, because its doubling form failed on CI runner noise alone.
-    // The Go guards in minimal.rs use the 4× form for the same reason.
+    // THRESHOLD RATIONALE — each guard grows N 4× against 8.0 = 4^1.5, the
+    // exponent-space midpoint between linear (4×) and quadratic (16×). These
+    // shapes measure 4.19×–4.36× at the guard sizes, so 8.0 allows ~1.9× runner
+    // noise. The earlier doubling form against 2.8 measured ~2.0× and allowed
+    // only ~1.4×; the Python guard failed on a CI runner at 2.93× with no walker
+    // change (#633, #635).
 
     /// Time the pseudo transform for `small` and `large` in `language`, sampled
     /// in turn.
     ///
     /// Returns `(min, median)` of 5 samples for each input, small first (see
     /// `scaling_guard` module doc):
-    /// - Use `min`    for ratio gates:    `ratio = t2_min / t1_min; assert!(ratio < 2.8)`
+    /// - Use `min`    for ratio gates:    `ratio = t2_min / t1_min; assert!(ratio < 8.0)`
     /// - Use `median` for absolute gates: `assert!(t1_median >= FLOOR)`
     ///
     /// The parses are hoisted outside the sampling loop — we time the walk, not
     /// the parser (per `scaling_guard` module doc).
-    fn time_pseudo_pair(
-        small: &str,
-        large: &str,
-        language: Language,
-    ) -> (
-        crate::transform::scaling_guard::MinMedian,
-        crate::transform::scaling_guard::MinMedian,
-    ) {
+    fn time_pseudo_pair(small: &str, large: &str, language: Language) -> (MinMedian, MinMedian) {
         let parse = |source: &str| Parser::new(language).unwrap().parse(source).unwrap();
         let (small_tree, large_tree) = (parse(small), parse(large));
         let config = TransformConfig::with_mode(Mode::Pseudo);
@@ -3590,10 +3584,7 @@ mod tests {
             let r = transform_pseudo_with_spans_and_line_map(source, tree, language, &config);
             assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
         };
-        crate::transform::scaling_guard::time_pair_5(
-            || run(small, &small_tree),
-            || run(large, &large_tree),
-        )
+        scaling_guard::time_pair_5(|| run(small, &small_tree), || run(large, &large_tree))
     }
 
     /// N top-level statements, each terminated by a `;` — the site-1 population.
@@ -3638,13 +3629,11 @@ mod tests {
             "top-level statement semicolons must be stripped, got: {out}"
         );
 
+        // A 4× step against 8.0 = 4^1.5 (see the THRESHOLD RATIONALE above).
         // N=8000 is ~56 k AST nodes, comfortably under MAX_AST_NODES (100 k);
         // above it this would silently become an Err(ComplexityLimit) assertion.
-        //
-        // Each call returns (min, median) of 5 samples.  Parse is hoisted outside
-        // the sample loop (see scaling_guard module doc).
         let ((t1_min, t1_median), (t2_min, _)) = time_pseudo_pair(
-            &ts_semicolon_source(4000),
+            &ts_semicolon_source(2000),
             &ts_semicolon_source(8000),
             Language::TypeScript,
         );
@@ -3652,22 +3641,23 @@ mod tests {
         // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
         // We FAIL rather than skip: a vacuous floor provides no protection.
         assert!(
-            t1_median >= 8.0,
-            "N=4000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
-             reliably (expected ≥ 8ms; ~36.0ms measured on debug builds). \
+            t1_median >= 4.0,
+            "N=2000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 4ms; ~14ms measured on debug builds). \
              Either the transform is being cached/skipped or N must be raised. \
              DO NOT convert this to a skip."
         );
 
         // Ratio uses MIN (ratio gate — scaling_guard rule).
-        // A3 discrimination evidence: under a quadratic walk the ratio was 3.86×;
-        // normal implementation measures 2.07×.
+        // A3 discrimination evidence at this 4× step: with a per-node walk over
+        // the parent's children injected the ratio was 15.99×–16.41×; the normal walker
+        // measures 4.31×–4.36×.
         let ratio = t2_min / t1_min;
         assert!(
-            ratio < 2.8,
-            "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.07×). O(N) → ~2.0×; O(N²) → ~4.0×; \
-             2.8 ≈ 2^1.5 is the exponent-space midpoint. N=4000 min {t1_min:.2}ms, \
+            ratio < 8.0,
+            "Growing N 4× from 2000 to 8000 must produce a ratio below 8.0 \
+             (got {ratio:.2}×). O(N) → ~4.0×; O(N²) → ~16×; \
+             8.0 = 4^1.5 is the exponent-space midpoint. N=2000 min {t1_min:.2}ms, \
              N=8000 min {t2_min:.2}ms. Check that the walker threads WalkPosition \
              and does not walk siblings per node (PF-020)."
         );
@@ -3687,10 +3677,7 @@ mod tests {
             "pseudo must still strip Python parameter annotations, got: {out}"
         );
 
-        // A 4× step (not the 2× doubling of the other guards). The doubling form
-        // allowed only 1.4× runner noise (2.8 / 2.0) and failed on a CI runner at
-        // 2.93× with no walker change. The threshold 8.0 = 4^1.5 keeps the same
-        // exponent-space midpoint, and allows 2× noise. The step cannot start at
+        // A 4× step against 8.0 = 4^1.5 (see the THRESHOLD RATIONALE above). The step cannot start at
         // N=1000: N=4000 is over MAX_AST_NODES and returns Err(ComplexityLimit).
         let ((t1_min, t1_median), (t2_min, _)) = time_pseudo_pair(
             &python_return_type_source(500),
@@ -3705,8 +3692,9 @@ mod tests {
              reliably (expected ≥ 4ms; ~10.2ms measured). DO NOT convert to a skip."
         );
 
-        // A3 discrimination evidence at this 4× step: with a per-node sibling walk
-        // injected the ratio was 10.6×–10.75×; the normal walker measures 4.15×–4.22×.
+        // A3 discrimination evidence at this 4× step (thread CPU time): with a
+        // per-node walk over the parent's children injected the ratio was
+        // 9.84×–10.00×; the normal walker measures 4.20×–4.28×.
         let ratio = t2_min / t1_min;
         assert!(
             ratio < 8.0,
@@ -3727,26 +3715,31 @@ mod tests {
             "the `template` keyword must be consumed with its parameter list, got: {out}"
         );
 
+        // A 4× step against 8.0 = 4^1.5 (see the THRESHOLD RATIONALE above).
+        // The step cannot start at N=1000: each line is ~30 AST nodes, so
+        // N=4000 is over MAX_AST_NODES and returns Err(ComplexityLimit).
         let ((t1_min, t1_median), (t2_min, _)) = time_pseudo_pair(
-            &cpp_template_source(1000),
+            &cpp_template_source(500),
             &cpp_template_source(2000),
             Language::Cpp,
         );
 
         // Noise floor uses MEDIAN (absolute gate).
         assert!(
-            t1_median >= 5.0,
-            "N=1000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
-             reliably (expected ≥ 5ms; ~24.2ms measured). DO NOT convert to a skip."
+            t1_median >= 2.5,
+            "N=500 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 2.5ms; ~10ms measured). DO NOT convert to a skip."
         );
 
-        // A3 discrimination evidence: under a quadratic walk the ratio was 3.03×;
-        // normal implementation measures 2.01×.
+        // A3 discrimination evidence at this 4× step: with a per-node walk over
+        // the parent's children injected the ratio was 10.05×–10.20×; the normal walker
+        // measures 4.19×–4.27×.
         let ratio = t2_min / t1_min;
         assert!(
-            ratio < 2.8,
-            "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.01×). N=1000 min {t1_min:.2}ms, \
+            ratio < 8.0,
+            "Growing N 4× from 500 to 2000 must produce a ratio below 8.0 \
+             (got {ratio:.2}×). O(N) → ~4.0×; O(N²) → ~16×; \
+             8.0 = 4^1.5 is the exponent-space midpoint. N=500 min {t1_min:.2}ms, \
              N=2000 min {t2_min:.2}ms."
         );
     }

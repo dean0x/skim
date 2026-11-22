@@ -5,8 +5,10 @@
 //! On unix, a sample is the **CPU time of the calling thread**
 //! (`CLOCK_THREAD_CPUTIME_ID`), not wall-clock time. On a loaded CI runner the
 //! scheduler can take the thread off the CPU in the middle of a sample. Wall
-//! time counts that wait and CPU time does not, so a busy runner can not make a
-//! linear walk look super-linear. Other targets fall back to `Instant`; CI runs
+//! time counts that wait and CPU time does not, so a busy runner has much less
+//! effect on a ratio. CPU time still counts some interference: cache refill
+//! after a switch, a busy SMT sibling, frequency changes. The 4× step below
+//! gives the margin for that part. Other targets fall back to `Instant`; CI runs
 //! the guards on Linux only.
 //!
 //! # Paired, alternate samples
@@ -39,17 +41,16 @@
 //!
 //! # Threshold derivation
 //!
-//! The ratio threshold 2.8 ≈ 2^1.5 is the exponent-space midpoint between
-//! linear growth (2^1.0 = 2.0×) and quadratic growth (2^2.0 = 4.0×) on a
-//! 2× input doubling.  Choosing the midpoint gives equal log-scale margin to
-//! both sides, whereas an empirically fitted constant (the historical 2.5)
-//! drifts as hardware changes.  Measured ratios for correct implementations
-//! sit in the 1.8×–2.1× range; 2.8 leaves ~35% headroom.
+//! Every ratio guard grows N 4× and asserts a ratio below 8.0 = 4^1.5, the
+//! exponent-space midpoint between linear growth (4^1.0 = 4×) and quadratic
+//! growth (4^2.0 = 16×).  Choosing the midpoint gives equal log-scale margin
+//! to both sides, whereas an empirically fitted constant drifts as hardware
+//! changes.  Correct implementations measure 3.95×–4.36×, so 8.0 allows
+//! ~1.9× runner noise.
 //!
-//! A guard that needs more noise headroom grows N 4× instead, against
-//! 4^1.5 = 8.0: the same exponent midpoint, with 2× noise headroom instead
-//! of 1.4×. The Python return-type guard in `pseudo.rs` and the Go guards in
-//! `minimal.rs` use this form.
+//! The earlier doubling form (2× growth against 2.8 ≈ 2^1.5) measured ~2.0×
+//! and allowed only ~1.4× noise.  It failed on CI runners at 2.93×, 3.16× and
+//! 3.20× with no walker change (#633, #635).
 
 /// Minimum and median of one 5-sample measurement, in milliseconds.
 pub(crate) type MinMedian = (f64, f64);
