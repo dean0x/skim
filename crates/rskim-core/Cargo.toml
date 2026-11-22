@@ -36,6 +36,10 @@ serde_yaml_ng = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
 
+# Thread CPU clock for the test-only scaling guards (`transform/scaling_guard.rs`).
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
 [[bench]]
 name = "transform_bench"
 harness = false
