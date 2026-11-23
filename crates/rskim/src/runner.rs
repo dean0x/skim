@@ -351,6 +351,9 @@ impl CommandRunner {
     /// typically short, and a flooded stderr is a real problem worth surfacing.
     ///
     /// The caller decides whether to use the partial output or reject it.
+    ///
+    /// Applies ADR-002 (degrade instead of error at the size cap) scoped to
+    /// the git-log output path (reliability-01 / #317 compress-never-truncate).
     pub(crate) fn run_stdout_bytes_degrade(
         &self,
         program: &str,
