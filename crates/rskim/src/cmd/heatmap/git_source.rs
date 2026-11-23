@@ -198,7 +198,7 @@ impl CliGitSource {
             .stdout
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+            .map(str::to_owned)
             .collect())
     }
 
@@ -304,9 +304,11 @@ impl GitDataSource for CliGitSource {
 /// The paths come from the committed tree, so git does not read the index
 /// and no index setting of the repository applies. A branch with no commits
 /// makes git fail, and the caller then uses its fallback. `--full-tree` lists
-/// the whole tree for any cwd.
-fn tracked_files_args(repo_root: &str) -> [&str; 7] {
+/// the whole tree for any cwd. Both HEAD reads stay local. If Git cannot
+/// read a blob size, `ls-tree -l` can report `BAD` even with exit 0.
+fn tracked_files_args(repo_root: &str) -> [&str; 8] {
     [
+        "--no-lazy-fetch",
         "-C",
         repo_root,
         "ls-tree",
@@ -319,7 +321,8 @@ fn tracked_files_args(repo_root: &str) -> [&str; 7] {
 
 /// Scope a count from the cwd, but always return root-relative keys.
 fn head_line_count_args<'a>(repo_root: &'a str, path: Option<&'a str>) -> Vec<&'a str> {
-    let mut args = Vec::with_capacity(12);
+    let mut args = Vec::with_capacity(13);
+    args.push("--no-lazy-fetch");
     match path {
         Some(_) => args.push("--literal-pathspecs"),
         None => args.extend(["-C", repo_root]),
@@ -459,8 +462,9 @@ fn parse_tree_line(line: &str) -> Option<(&str, HeadEntry)> {
 }
 
 /// No text matches gives an empty result, not a failed count.
+/// Git can report a read error on stderr with exit 0 or 1.
 fn head_line_counts_from(out: &CommandOutput, cut: bool) -> anyhow::Result<HeadCounts> {
-    anyhow::ensure!(!cut, "incomplete git grep output");
+    anyhow::ensure!(!cut && out.stderr.is_empty(), "incomplete git grep output");
     match out.exit_code {
         Some(0) => out
             .stdout
@@ -876,7 +880,10 @@ mod tests {
     fn output(stdout: &str, exit_code: Option<i32>) -> CommandOutput {
         CommandOutput {
             stdout: stdout.to_string(),
-            stderr: "fatal: test\n".to_string(),
+            stderr: match exit_code {
+                Some(0 | 1) => String::new(),
+                _ => "fatal: test\n".into(),
+            },
             exit_code,
             duration: Duration::ZERO,
         }
@@ -1380,7 +1387,16 @@ mod tests {
     fn test_tracked_files_args_read_the_head_tree() {
         assert_eq!(
             tracked_files_args("/repo").as_slice(),
-            ["-C", "/repo", "ls-tree", "-r", "-l", "--full-tree", "HEAD"]
+            [
+                "--no-lazy-fetch",
+                "-C",
+                "/repo",
+                "ls-tree",
+                "-r",
+                "-l",
+                "--full-tree",
+                "HEAD",
+            ]
         );
     }
 
@@ -1389,6 +1405,7 @@ mod tests {
         assert_eq!(
             head_line_count_args("/repo", Some(":(exclude)src")),
             [
+                "--no-lazy-fetch",
                 "--literal-pathspecs",
                 "grep",
                 "-I",
@@ -1471,6 +1488,15 @@ mod tests {
             ("", None, false),
         ] {
             assert!(head_line_counts_from(&output(stdout, code), cut).is_err());
+        }
+    }
+
+    #[test]
+    fn test_head_counts_reject_missing_blobs_even_with_matching_lines() {
+        for (stdout, status) in [("HEAD:ok.rs:2\n", 0), ("", 1)] {
+            let mut out = output(stdout, Some(status));
+            out.stderr = "error: 'HEAD:missing.rs': unable to read blob\n".into();
+            assert!(head_line_counts_from(&out, false).is_err());
         }
     }
 

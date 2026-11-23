@@ -114,11 +114,23 @@ fn resolve_diff_files(
             note(format_args!("skim heatmap: no files changed vs '{base}'"));
             Ok(Some(ExitCode::FAILURE))
         }
-        Ok(files) => {
-            // git diff output is repo-root-relative, so resolve paths against
-            // the repo root to avoid cwd-dependent failures. The warning gates
-            // nothing: `args.diff_files` still receives the full diff list, and
-            // apply_file_scope filters the output by set intersection.
+        Ok(mut files) => {
+            // Check the decoded path. Keep Git's spelling as the history key.
+            let total = files.len();
+            files.retain(|f| disk_path(f).is_some_and(|p| super::is_repo_relative_safe(&p)));
+            let rejected = total - files.len();
+            if rejected > 0 {
+                let noun = if rejected == 1 { "path" } else { "paths" };
+                note(format_args!(
+                    "skim heatmap: warning: dropped {rejected} invalid changed {noun}"
+                ));
+            }
+            if files.is_empty() {
+                note(format_args!("skim heatmap: no valid changed paths"));
+                return Ok(Some(ExitCode::FAILURE));
+            }
+
+            // Check the accepted paths for the warning, without changing the scope.
             let root = match git_source.get_repo_root() {
                 Ok(root) => root,
                 Err(e) => {
@@ -276,7 +288,10 @@ fn prepare_commits(
     let debug = args.debug;
 
     if debug {
-        debug_note(format_args!("[skim:heatmap] repo root: {repo_root}"));
+        debug_note(format_args!(
+            "[skim:heatmap] repo root: {}",
+            card::shown_path(&repo_root)
+        ));
     }
 
     // Resolve and display the window from the same clock snapshot.

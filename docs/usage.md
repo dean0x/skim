@@ -277,7 +277,7 @@ Module health and bus factor are not in the default view. Use `--detail` to see 
 
 #### Hotspot Rank
 
-The score is commits in the window × text lines at HEAD. Skim sorts by score, then by commit count, both from highest to lowest. If both values match, skim sorts by path, lowest first. Skim uses Git to count text lines at HEAD, so uncommitted edits do not change the line count. Empty files have a score of zero. Binary files at HEAD stay out of the ranked lists, even if their history has text changes. If HEAD data is not available, skim warns and ranks by commits.
+The score is commits in the window × text lines at HEAD. Skim sorts by score, then by commit count, both from highest to lowest. If both values match, skim sorts by path, lowest first. Skim uses Git to count text lines at HEAD, so uncommitted edits do not change the line count. Empty files have a score of zero. Binary files at HEAD stay out of the ranked lists, even if their history has text changes. HEAD reads do not fetch objects. If HEAD data is not available, skim warns and ranks by commits. Git versions without `--no-lazy-fetch` also use this fallback.
 
 Skim joins history across renames that Git reports. When HEAD data is available, hotspots, coupling, fix risk and bus factor omit paths that are not regular files at HEAD. The hotspot summary counts those paths. A file card can still show the history of such a path.
 
