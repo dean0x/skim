@@ -4714,3 +4714,367 @@ fn test_heatmap_json_repository_is_the_repo_folder_name() {
     let header = text.lines().next().unwrap_or_default();
     assert!(header.starts_with(&format!("Heatmap: {name} ")), "{header}");
 }
+
+// 2023-11-14 22:13:20 UTC. Use explicit windows with these fixtures.
+const MAP_COMMIT_TIME: u64 = 1_700_000_000;
+const MAP_ARGS: &[&str] = &["--map", "--window", "all"];
+
+fn create_map_repo(root: &Path) {
+    git_init(root);
+    for i in 0..3 {
+        git_commit_files(
+            root,
+            &[
+                (
+                    "src/z_long.rs",
+                    &format!("struct Item;\n\nfn long() {{\n    let _x = {i};\n}}\n"),
+                ),
+                (
+                    "src/a_short.rs",
+                    &format!("fn short() {{ let _x = {i}; }}\n"),
+                ),
+            ],
+            "feat: update paired files",
+            MAP_COMMIT_TIME + i,
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_map_shows_ranked_file_blocks_with_symbols_and_partners() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("map-fixture");
+    std::fs::create_dir(&root).unwrap();
+    create_map_repo(&root);
+
+    let text = heatmap_stdout(&root, MAP_ARGS);
+    let header = text.lines().next().unwrap();
+    assert!(
+        header.starts_with("Heatmap map: map-fixture 1970-01-01.."),
+        "{text}"
+    );
+    assert!(header.ends_with(", 3 commits, all window"), "{text}");
+    assert_eq!(
+        text.lines().skip(1).collect::<Vec<_>>(),
+        [
+            "src/z_long.rs: 3 commits, 5 lines, score 15",
+            "  changes with: src/a_short.rs",
+            "  struct_item Item:1",
+            "  function_item long:3",
+            "src/a_short.rs: 3 commits, 1 line, score 3",
+            "  changes with: src/z_long.rs",
+            "  function_item short:1",
+        ],
+        "{text}"
+    );
+}
+
+const MAP_CODE_FILES: usize = 32;
+
+fn create_large_map_repo(root: &Path) {
+    git_init(root);
+    let code: String = (0..12)
+        .map(|i| format!("fn count_unique_matches_in_bucket_{i}() {{}}\n"))
+        .collect();
+    let paths: Vec<_> = (0..MAP_CODE_FILES)
+        .map(|i| format!("src/file_{i:02}.rs"))
+        .collect();
+    let mut files: Vec<_> = paths
+        .iter()
+        .map(|path| (path.as_str(), code.as_str()))
+        .collect();
+    // The larger JSON file ranks first. Its language has no symbol rows.
+    let metadata = format!("[\n{}0\n]\n", "0,\n".repeat(20));
+    files.push(("src/metadata.json", &metadata));
+    git_commit_files(root, &files, "feat: add map fixture", MAP_COMMIT_TIME);
+}
+
+fn map_token_count(text: &str) -> usize {
+    static COUNTER: std::sync::LazyLock<rskim_tokens::Counter> = std::sync::LazyLock::new(|| {
+        rskim_tokens::Counter::new(rskim_tokens::Encoding::Cl100k).unwrap()
+    });
+    COUNTER.count(text)
+}
+
+#[test]
+fn test_heatmap_map_bounds_all_stdout_at_default_and_explicit_budgets() {
+    let dir = tempfile::tempdir().unwrap();
+    create_large_map_repo(dir.path());
+
+    let default = heatmap_stdout(dir.path(), MAP_ARGS);
+    let small = heatmap_stdout(dir.path(), &["--map", "--window", "all", "--tokens", "300"]);
+    let (default_tokens, small_tokens) = (map_token_count(&default), map_token_count(&small));
+    assert!(
+        default_tokens <= 1000 && small_tokens <= 300,
+        "stdout tokens: {default_tokens} (limit 1000), {small_tokens} (limit 300)"
+    );
+    for text in [&default, &small] {
+        assert!(text.starts_with("Heatmap map: "), "{text}");
+        assert!(
+            text.contains("  function_item count_unique_matches_in_bucket_0:1\n"),
+            "{text}"
+        );
+    }
+    assert!(default.lines().count() > small.lines().count());
+}
+
+#[test]
+fn test_heatmap_map_trailer_counts_shown_files_and_symbol_losses() {
+    let dir = tempfile::tempdir().unwrap();
+    create_large_map_repo(dir.path());
+
+    let text = heatmap_stdout(dir.path(), &["--map", "--window", "all", "--tokens", "300"]);
+    let shown = text.lines().filter(|line| line.starts_with("src/")).count();
+    let total = MAP_CODE_FILES + 1;
+    assert!((2..total).contains(&shown), "{text}");
+    assert!(text.contains("src/metadata.json: "), "{text}");
+    assert_eq!(
+        text.lines().last().unwrap(),
+        format!(
+            "[skim] {shown} of {total} files; language: 1 — adjust the map budget with --tokens"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("SKIM_PASSTHROUGH"), "{text}");
+}
+
+#[test]
+fn test_heatmap_map_two_runs_give_identical_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    create_map_repo(dir.path());
+
+    let first = heatmap_stdout(dir.path(), MAP_ARGS);
+    let second = heatmap_stdout(dir.path(), MAP_ARGS);
+    assert!(first.contains("  function_item long:3\n"), "{first}");
+    assert_eq!(first.as_bytes(), second.as_bytes());
+}
+
+#[test]
+fn test_heatmap_map_empty_repository_exits_one_with_no_commits_message() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+
+    let output = common::skim()
+        .arg("heatmap")
+        .args(MAP_ARGS)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_refused(&output, "No commits found in repository");
+}
+
+#[test]
+fn test_heatmap_map_shallow_clone_ranks_by_size_within_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    create_map_repo(&source);
+    let output = StdCommand::new("git")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .current_dir(dir.path())
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            &format!("file://{}", source.display()),
+            "shallow",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let text = heatmap_stdout(
+        &dir.path().join("shallow"),
+        &["--map", "--window", "all", "--tokens", "300"],
+    );
+    assert!(text.starts_with("Heatmap map: shallow "), "{text}");
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .ends_with(", 1 commit, all window"),
+        "{text}"
+    );
+    let lines = top_level_lines(&text);
+    assert!(
+        lines[0].starts_with("warning: Shallow clone detected"),
+        "{text}"
+    );
+    assert_eq!(
+        lines[1..],
+        [
+            "src/z_long.rs: 1 commit, 5 lines, score 5",
+            "src/a_short.rs: 1 commit, 1 line, score 1"
+        ],
+        "{text}"
+    );
+    assert!(map_token_count(&text) <= 300, "{text}");
+}
+
+#[test]
+fn test_heatmap_map_refuses_conflicts_and_invalid_token_budgets() {
+    let dir = tempfile::tempdir().unwrap();
+    for (args, message) in [
+        (&["--map", "--json"][..], "cannot combine --map with --json"),
+        (
+            &["--map", "--format", "json"],
+            "cannot combine --map with --json",
+        ),
+        (
+            &["--map", "--detail", "hotspots"],
+            "cannot combine --map with --detail",
+        ),
+        (
+            &["--map", "--insights"],
+            "cannot combine --map with --insights",
+        ),
+        (
+            &["--map", "--diff", "main"],
+            "cannot combine --map with --diff",
+        ),
+        (
+            &["--map", "src/a.rs"],
+            "cannot combine --map with explicit file arguments",
+        ),
+        (&["--map", "--top", "20"], "cannot combine --map with --top"),
+        (&["--map", "--tokens", "0"], "--tokens must be at least 1"),
+        (
+            &["--map", "--tokens", "10000001"],
+            "--tokens must be at most 10000000",
+        ),
+        (&["--tokens", "300"], "--tokens requires --map"),
+    ] {
+        let output = common::skim()
+            .arg("heatmap")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_refused(&output, message);
+        assert_refused(&output, "Run `skim heatmap --help` for usage.");
+    }
+}
+
+#[test]
+fn test_heatmap_map_path_window_and_excludes_scope_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_commit(
+        root,
+        "src/old.rs",
+        "fn old() {}\n",
+        "feat: add old",
+        MAP_COMMIT_TIME,
+    );
+    git_commit_files(
+        root,
+        &[
+            ("src/keep.rs", "fn keep() {}\n"),
+            ("src/skip.rs", "fn skip() {}\n"),
+            ("src/Cargo.lock", "version = 4\n"),
+            ("lib/other.rs", "fn other() {}\n"),
+        ],
+        "feat: add current files",
+        MAP_COMMIT_TIME + 86_400,
+    );
+
+    let rows = |args: &[&str]| -> Vec<String> {
+        top_level_lines(&heatmap_stdout(root, args))
+            .iter()
+            .filter_map(|line| line.split_once(": "))
+            .filter(|(_, stats)| stats.starts_with("1 commit, "))
+            .map(|(path, _)| path.to_owned())
+            .collect()
+    };
+    assert_eq!(
+        rows(MAP_ARGS),
+        ["lib/other.rs", "src/keep.rs", "src/old.rs", "src/skip.rs"]
+    );
+    assert_eq!(
+        rows(&["--map", "--window", "all", "--path", "src"]),
+        ["src/keep.rs", "src/old.rs", "src/skip.rs"]
+    );
+    assert_eq!(
+        rows(&["--map", "--since", "2023-11-15", "--path", "src"]),
+        ["src/keep.rs", "src/skip.rs"]
+    );
+    assert_eq!(
+        rows(&[
+            "--map",
+            "--since",
+            "2023-11-15",
+            "--path",
+            "src",
+            "--exclude",
+            "**/skip.rs"
+        ]),
+        ["src/keep.rs"]
+    );
+    assert_eq!(
+        rows(&[
+            "--map",
+            "--since",
+            "2023-11-15",
+            "--path",
+            "src",
+            "--no-exclude"
+        ]),
+        ["src/Cargo.lock", "src/keep.rs", "src/skip.rs"]
+    );
+}
+
+#[test]
+fn test_heatmap_map_keeps_head_symbols_after_an_uncommitted_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    create_map_repo(dir.path());
+    let before = heatmap_stdout(dir.path(), MAP_ARGS);
+    std::fs::write(dir.path().join("src/z_long.rs"), "fn not_in_head() {}\n").unwrap();
+
+    let after = heatmap_stdout(dir.path(), MAP_ARGS);
+    assert!(after.contains("  function_item long:3\n"), "{after}");
+    assert_eq!(after.as_bytes(), before.as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_map_closed_stderr_keeps_full_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    create_map_repo(dir.path());
+    let args = ["heatmap", "--map", "--window", "all", "--debug"];
+    let baseline = common::skim()
+        .args(args)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        stdout_of(&baseline).contains("  function_item long:3\n"),
+        "{baseline:?}"
+    );
+    assert!(String::from_utf8_lossy(&baseline.stderr).contains("[skim:heatmap] HEAD data:"));
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = StdCommand::new(assert_cmd::cargo::cargo_bin!("skim"))
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .args(args)
+        .current_dir(dir.path())
+        .stderr(std::process::Stdio::from(writer))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, baseline.stdout);
+}
+
+#[test]
+fn test_heatmap_help_names_map_and_its_token_budget() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim heatmap --map [OPTIONS]"))
+        .stdout(predicate::str::contains("--tokens <N>"))
+        .stdout(predicate::str::contains(
+            "default: 1000; range: 1 to 10000000",
+        ));
+}
