@@ -48,6 +48,17 @@ use window::{build_window_info, format_epoch, resolve_config};
 // Entry point
 // ============================================================================
 
+/// Heatmap does not stop when stderr is closed.
+fn note(message: std::fmt::Arguments<'_>) {
+    let _ = crate::cmd::execution::write_line_to_stderr(&message.to_string());
+}
+
+fn debug_note(message: std::fmt::Arguments<'_>) {
+    if crate::debug::is_debug_enabled() {
+        note(message);
+    }
+}
+
 /// Run the `skim heatmap` subcommand.
 pub(crate) fn run(
     args: &[String],
@@ -61,8 +72,8 @@ pub(crate) fn run(
     let mut raw_args = match parse_args(args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("skim heatmap: {e}");
-            eprintln!("Run `skim heatmap --help` for usage.");
+            note(format_args!("skim heatmap: {e}"));
+            note(format_args!("Run `skim heatmap --help` for usage."));
             return Ok(ExitCode::FAILURE);
         }
     };
@@ -100,7 +111,7 @@ fn resolve_diff_files(
 
     match git_source.fetch_diff_files(&base) {
         Ok(files) if files.is_empty() => {
-            eprintln!("skim heatmap: no files changed vs '{base}'");
+            note(format_args!("skim heatmap: no files changed vs '{base}'"));
             Ok(Some(ExitCode::FAILURE))
         }
         Ok(files) => {
@@ -110,13 +121,13 @@ fn resolve_diff_files(
             // apply_file_scope filters the output by set intersection.
             let root = git_source.get_repo_root().unwrap_or_default();
             if let Some(warning) = diff_not_file_warning(std::path::Path::new(&root), &files) {
-                eprintln!("skim heatmap: warning: {warning}");
+                note(format_args!("skim heatmap: warning: {warning}"));
             }
             args.diff_files = files;
             Ok(None)
         }
         Err(e) => {
-            eprintln!("skim heatmap: {e}");
+            note(format_args!("skim heatmap: {e}"));
             Ok(Some(ExitCode::FAILURE))
         }
     }
@@ -143,7 +154,10 @@ fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<Str
         .collect();
     match not_files.as_slice() {
         [] => None,
-        [only] => Some(format!("'{only}' is not a regular file on current branch")),
+        [only] => Some(format!(
+            "{} is not a regular file on current branch",
+            warning_name(only)
+        )),
         _ => Some(format!(
             "{} changed paths are not regular files on current branch: {}",
             not_files.len(),
@@ -185,7 +199,7 @@ fn skipped_log_warning(parsed: &ParsedLog) -> Option<String> {
 /// On an early exit there is no result view to carry this warning.
 fn emit_skipped_log_warning(warning: Option<&str>) {
     if let Some(warning) = warning {
-        let _ = crate::cmd::execution::write_line_to_stderr(&format!("skim heatmap: {warning}"));
+        note(format_args!("skim heatmap: {warning}"));
     }
 }
 
@@ -219,14 +233,14 @@ fn prepare_commits(
 ) -> anyhow::Result<Option<PreparedCommits>> {
     // Step 1: Validate git environment
     if !source.is_git_repo() {
-        eprintln!("skim heatmap: Not a git repository");
+        note(format_args!("skim heatmap: Not a git repository"));
         return Ok(None);
     }
 
     let repo_root = match source.get_repo_root() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("skim heatmap: {e}");
+            note(format_args!("skim heatmap: {e}"));
             return Ok(None);
         }
     };
@@ -237,7 +251,7 @@ fn prepare_commits(
         match card_targets(source, &repo_root, &args.files) {
             Ok(targets) => args.files = targets,
             Err(e) => {
-                eprintln!("skim heatmap: {e}");
+                note(format_args!("skim heatmap: {e}"));
                 return Ok(None);
             }
         }
@@ -256,7 +270,7 @@ fn prepare_commits(
     let debug = args.debug;
 
     if debug {
-        eprintln!("[skim:heatmap] repo root: {repo_root}");
+        debug_note(format_args!("[skim:heatmap] repo root: {repo_root}"));
     }
 
     // Resolve and display the window from the same clock snapshot.
@@ -276,12 +290,12 @@ fn prepare_commits(
         } else {
             "time"
         };
-        eprintln!("[skim:heatmap] window mode: {mode}");
+        debug_note(format_args!("[skim:heatmap] window mode: {mode}"));
         if let Some(since) = config.since {
-            eprintln!(
+            debug_note(format_args!(
                 "[skim:heatmap] since epoch: {since} ({})",
                 format_epoch(since)
-            );
+            ));
         }
     }
 
@@ -291,9 +305,9 @@ fn prepare_commits(
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("not installed") || msg.contains("not in PATH") {
-                eprintln!("skim heatmap: {msg}");
+                note(format_args!("skim heatmap: {msg}"));
             } else {
-                eprintln!("skim heatmap: failed to fetch git log: {msg}");
+                note(format_args!("skim heatmap: failed to fetch git log: {msg}"));
             }
             return Ok(None);
         }
@@ -311,12 +325,15 @@ fn prepare_commits(
     let raw_commits = parsed.commits;
 
     if debug {
-        eprintln!("[skim:heatmap] raw commits fetched: {}", raw_commits.len());
+        debug_note(format_args!(
+            "[skim:heatmap] raw commits fetched: {}",
+            raw_commits.len()
+        ));
     }
 
     if raw_commits.is_empty() {
         emit_skipped_log_warning(skipped_warning.as_deref());
-        eprintln!("skim heatmap: No commits found in repository");
+        note(format_args!("skim heatmap: No commits found in repository"));
         return Ok(None);
     }
 
@@ -333,17 +350,19 @@ fn prepare_commits(
     commits.retain(|c| !c.changed_files.is_empty());
 
     if debug {
-        eprintln!(
+        debug_note(format_args!(
             "[skim:heatmap] commits after exclusion: {} ({} excluded)",
             commits.len(),
             raw_commit_count - commits.len()
-        );
+        ));
     }
 
     // A card can report its filter even when no commits remain.
     if commits.is_empty() && !matches!(config.targets, FileTargets::Cards(_)) {
         emit_skipped_log_warning(skipped_warning.as_deref());
-        eprintln!("skim heatmap: No analyzable files after exclusions");
+        note(format_args!(
+            "skim heatmap: No analyzable files after exclusions"
+        ));
         return Ok(None);
     }
     warnings.extend(skipped_warning);
@@ -436,8 +455,7 @@ fn trace_head_data(head_tree: Option<&HeadTree>) {
         }
         None => "unavailable".to_string(),
     };
-    let _ =
-        crate::cmd::execution::write_line_to_stderr(&format!("[skim:heatmap] HEAD data: {totals}"));
+    debug_note(format_args!("[skim:heatmap] HEAD data: {totals}"));
 }
 
 /// Orchestration with injected data source (enables testing).
@@ -602,13 +620,18 @@ fn record_heatmap_analytics(
 /// Names in a counted warning. The warning counts paths that it does not name.
 const WARNING_NAMES: usize = 3;
 
+/// Path text in all heatmap views shows the same form.
+fn warning_name(path: &str) -> String {
+    format!("'{}'", card::shown_path(path))
+}
+
 /// The first [`WARNING_NAMES`] of `names` in single quotes, then
 /// `" and N more"` for the others.
 fn named_paths(names: &[&str]) -> String {
     let shown: Vec<String> = names
         .iter()
         .take(WARNING_NAMES)
-        .map(|name| format!("'{name}'"))
+        .map(|name| warning_name(name))
         .collect();
     join_warning_names(&shown, names.len())
 }
@@ -684,7 +707,10 @@ fn warn_missing_targets(result: &mut HeatmapResult, files: &[String], dropped: &
         .collect();
     let warning = match missing.as_slice() {
         [] => return,
-        [only] => format!("targeted file '{only}' not found in git history"),
+        [only] => format!(
+            "targeted file {} not found in git history",
+            warning_name(only)
+        ),
         _ => format!(
             "{} targeted files not found in git history: {}",
             missing.len(),
@@ -710,12 +736,11 @@ fn scope_cards(
         .iter()
         .filter(|c| metrics::is_large_commit(c))
         .count();
-    let touches: Vec<_> = cards
-        .rows
+    let touches: Vec<_> = targets
         .iter()
         .zip(counts)
         .filter(|&(_, count)| count > 0)
-        .map(|(card, count)| (card.path.as_str(), count))
+        .map(|(path, count)| (path.as_str(), count))
         .collect();
     scope_coupling_warning(&mut result.warnings, skipped, &touches);
     apply_file_scope(result, &targets, roots);
@@ -740,7 +765,7 @@ fn coupling_warning(skipped: usize, touches: Option<&[(&str, usize)]>) -> Option
                 .take(WARNING_NAMES)
                 .map(|(path, count)| {
                     let verb = if *count == 1 { "touches" } else { "touch" };
-                    format!("{count} {verb} {path}")
+                    format!("{count} {verb} {}", card::shown_path(path))
                 })
                 .collect();
             Some(format!(
@@ -858,13 +883,13 @@ fn compute_heatmap(
 
     if config.debug {
         let elapsed = t0.elapsed();
-        eprintln!(
+        debug_note(format_args!(
             "[skim:heatmap] metrics computed in {:.1}ms — {} files, {} coupling edges, {} modules",
             elapsed.as_secs_f64() * 1000.0,
             churn_map.len(),
             coupling_graph.len(),
             modules.len(),
-        );
+        ));
     }
 
     // Window totals for the view gates: the fix-risk base rate and the
@@ -942,6 +967,37 @@ fn compute_heatmap(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Heatmap does not stop when stderr is closed. The shared runner cap
+    /// marker is outside this check. Heatmap uses `run_stdout_degrade` instead.
+    #[test]
+    fn test_heatmap_stderr_source_contract() {
+        let direct_stderr = regex::Regex::new(r"\b(?:eprint|eprintln|debug_log)\s*!").unwrap();
+        let runner_with_marker = regex::Regex::new(r"\.\s*run(?:_with_env)?\s*\(").unwrap();
+        for (file, source) in [
+            ("args.rs", include_str!("args.rs")),
+            ("card.rs", include_str!("card.rs")),
+            ("excludes.rs", include_str!("excludes.rs")),
+            ("git_source.rs", include_str!("git_source.rs")),
+            ("insights.rs", include_str!("insights.rs")),
+            ("metrics.rs", include_str!("metrics.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("noise.rs", include_str!("noise.rs")),
+            ("output.rs", include_str!("output.rs")),
+            ("types.rs", include_str!("types.rs")),
+            ("view.rs", include_str!("view.rs")),
+            ("window.rs", include_str!("window.rs")),
+        ] {
+            let production = source.split("\n#[cfg(test)]").next().unwrap();
+            assert!(!direct_stderr.is_match(production), "{file}: stderr macro");
+            if file == "git_source.rs" {
+                assert!(
+                    !runner_with_marker.is_match(production),
+                    "{file}: runner call"
+                );
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // apply_file_scope
@@ -1093,14 +1149,21 @@ mod tests {
 
     #[test]
     fn test_warn_missing_targets_gives_one_counted_warning_in_argument_order() {
-        let names = ["z.rs", "a.rs", "m.rs", "z.rs", "k.rs", "b.rs"];
+        let names = [
+            "z\u{202e}.rs",
+            "a.rs",
+            "m.rs",
+            "z\u{202e}.rs",
+            "k.rs",
+            "b.rs",
+        ];
         let targets: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
         let mut result = make_test_result();
         result.warnings.clear();
         warn_missing_targets(&mut result, &targets, &HashSet::new());
         assert_eq!(
             result.warnings,
-            ["5 targeted files not found in git history: 'z.rs', 'a.rs', 'm.rs' and 2 more"]
+            ["5 targeted files not found in git history: 'z�.rs', 'a.rs', 'm.rs' and 2 more"]
         );
     }
 

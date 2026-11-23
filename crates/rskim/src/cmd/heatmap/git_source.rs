@@ -10,6 +10,7 @@ use crate::cmd::is_repo_relative_safe;
 use crate::runner::{CommandOutput, CommandRunner, MAX_OUTPUT_BYTES, is_spawn_error};
 
 use super::metrics::without_quotes;
+use super::note;
 use super::types::{CommitInfo, FileChangeInfo, HeatmapConfig};
 
 /// `git log` record header: hash, author timestamp, author name and subject,
@@ -149,6 +150,22 @@ impl CliGitSource {
         }
     }
 
+    /// Heatmap does not stop when stderr is closed.
+    fn capture_git(&self, args: &[&str]) -> anyhow::Result<CommandOutput> {
+        let (out, cut) = self.runner.run_stdout_degrade("git", args)?;
+        if cut {
+            note(format_args!(
+                "{}",
+                crate::output::fidelity::output_cap_marker(
+                    "git",
+                    out.stdout.len(),
+                    MAX_OUTPUT_BYTES
+                )
+            ));
+        }
+        Ok(out)
+    }
+
     /// Resolve files changed between `base` and HEAD using three-dot diff.
     ///
     /// Uses `git diff --name-only --end-of-options <base>...HEAD` so that only
@@ -156,7 +173,7 @@ impl CliGitSource {
     pub(crate) fn fetch_diff_files(&self, base: &str) -> anyhow::Result<Vec<String>> {
         let owned_args = build_diff_args(base);
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        let out = self.runner.run("git", &args).map_err(git_not_found)?;
+        let out = self.capture_git(&args).map_err(git_not_found)?;
 
         if out.exit_code != Some(0) {
             let stderr = out.stderr.trim();
@@ -182,8 +199,7 @@ impl CliGitSource {
     /// a failed `git log` is then reported, not hidden as an empty history.
     fn head_is_unborn(&self) -> bool {
         matches!(
-            self.runner
-                .run("git", &["rev-parse", "--verify", "--quiet", "HEAD"]),
+            self.capture_git(&["rev-parse", "--verify", "--quiet", "HEAD"]),
             Ok(out) if out.exit_code == Some(1)
         )
     }
@@ -191,10 +207,7 @@ impl CliGitSource {
 
 impl GitDataSource for CliGitSource {
     fn is_git_repo(&self) -> bool {
-        match self
-            .runner
-            .run("git", &["rev-parse", "--is-inside-work-tree"])
-        {
+        match self.capture_git(&["rev-parse", "--is-inside-work-tree"]) {
             Ok(out) => out.exit_code == Some(0),
             Err(_) => false,
         }
@@ -202,17 +215,13 @@ impl GitDataSource for CliGitSource {
 
     fn get_repo_root(&self) -> anyhow::Result<String> {
         let out = self
-            .runner
-            .run("git", &["rev-parse", "--show-toplevel"])
+            .capture_git(&["rev-parse", "--show-toplevel"])
             .map_err(git_not_found)?;
         Ok(out.stdout.trim().to_string())
     }
 
     fn detect_shallow_clone(&self) -> bool {
-        match self
-            .runner
-            .run("git", &["rev-parse", "--is-shallow-repository"])
-        {
+        match self.capture_git(&["rev-parse", "--is-shallow-repository"]) {
             Ok(out) => out.stdout.trim() == "true",
             Err(_) => false,
         }
@@ -224,18 +233,15 @@ impl GitDataSource for CliGitSource {
         }
         let skip = n.saturating_sub(1).to_string();
         let n_str = n.to_string();
-        let out = self.runner.run(
-            "git",
-            &[
-                "log",
-                "--format=%ad",
-                "--date=unix",
-                "-n",
-                &n_str,
-                "--skip",
-                &skip,
-            ],
-        )?;
+        let out = self.capture_git(&[
+            "log",
+            "--format=%ad",
+            "--date=unix",
+            "-n",
+            &n_str,
+            "--skip",
+            &skip,
+        ])?;
         // The first line is the timestamp. A line that is not a valid
         // timestamp gives `None`, never a zero timestamp.
         let ts = out
@@ -274,8 +280,7 @@ impl GitDataSource for CliGitSource {
 
     fn show_prefix(&self) -> anyhow::Result<String> {
         let out = self
-            .runner
-            .run("git", &["rev-parse", "--show-prefix"])
+            .capture_git(&["rev-parse", "--show-prefix"])
             .map_err(git_not_found)?;
         prefix_from(&out)
     }
