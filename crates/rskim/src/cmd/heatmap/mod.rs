@@ -433,12 +433,13 @@ fn load_head_data(
     path: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> (ModuleRoots, Option<HeadTree>) {
-    let Ok(mut entries) = source.list_tracked_files(repo_root) else {
+    let no_lazy_fetch = source.detect_partial_clone(repo_root);
+    let Ok(mut entries) = source.list_tracked_files(repo_root, no_lazy_fetch) else {
         warnings.push(HEAD_UNAVAILABLE.into());
         return (ModuleRoots::default(), None);
     };
     let roots = ModuleRoots::from_tracked_files(entries.keys());
-    let Ok(counts) = source.count_head_lines(repo_root, path) else {
+    let Ok(counts) = source.count_head_lines(repo_root, path, no_lazy_fetch) else {
         warnings.push(HEAD_UNAVAILABLE.into());
         return (roots, None);
     };
@@ -1488,7 +1489,14 @@ mod tests {
                 ..ParsedLog::default()
             })
         }
-        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<HeadTree> {
+        fn detect_partial_clone(&self, _repo_root: &str) -> bool {
+            false
+        }
+        fn list_tracked_files(
+            &self,
+            _repo_root: &str,
+            _no_lazy_fetch: bool,
+        ) -> anyhow::Result<HeadTree> {
             match &self.tracked {
                 TrackedStub::Listed(entries) => Ok(entries.clone()),
                 TrackedStub::Unavailable => anyhow::bail!("simulated ls-tree failure"),
@@ -1498,6 +1506,7 @@ mod tests {
             &self,
             repo_root: &str,
             path: Option<&str>,
+            _no_lazy_fetch: bool,
         ) -> anyhow::Result<git_source::HeadCounts> {
             self.count_calls
                 .borrow_mut()

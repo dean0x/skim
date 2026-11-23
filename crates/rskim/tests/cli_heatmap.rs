@@ -1528,17 +1528,108 @@ fn test_heatmap_large_file_with_fewer_commits_ranks_first() {
 }
 
 #[cfg(unix)]
-#[test]
-fn test_heatmap_head_failure_keeps_history_in_commit_order() {
-    let repo = tempfile::tempdir().unwrap();
-    git_init(repo.path());
+fn head_rank_fixture(root: &Path) {
+    git_init(root);
     git_commit_files(
-        repo.path(),
+        root,
         &[("a.rs", "one\ntwo\nthree\n"), ("z.rs", "one\n")],
         "feat: add files",
         1_700_000_000,
     );
-    git_commit(repo.path(), "z.rs", "two\n", "feat: update", 1_700_000_001);
+    git_commit(root, "z.rs", "two\n", "feat: update", 1_700_000_001);
+}
+
+#[cfg(unix)]
+fn heatmap_with_old_git(root: &Path) -> serde_json::Value {
+    let real_git = StdCommand::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success(), "{real_git:?}");
+    let real_git =
+        std::fs::canonicalize(String::from_utf8(real_git.stdout).unwrap().trim()).unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    common::write_stub_script(
+        tools.path(),
+        "git",
+        r#"#!/bin/sh
+for arg do
+    if [ "$arg" = "--no-lazy-fetch" ]; then
+        printf '%s\n' 'unknown option: --no-lazy-fetch' >&2
+        exit 129
+    fi
+done
+exec "$HEATMAP_TEST_REAL_GIT" "$@"
+"#,
+    );
+    let output = common::skim()
+        .env("PATH", common::stub_path(tools.path()))
+        .env("HEATMAP_TEST_REAL_GIT", real_git)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["heatmap", "--window", "all", "--json"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_old_git_keeps_line_rank_for_a_full_clone() {
+    let repo = tempfile::tempdir().unwrap();
+    head_rank_fixture(repo.path());
+
+    let json = heatmap_with_old_git(repo.path());
+    assert_eq!(json["files"][0]["path"], "a.rs", "{json}");
+    assert_eq!(json["files"][0]["lines"], 3);
+    assert_eq!(json["files"][0]["score"], 3);
+    assert_eq!(json["files"][1]["lines"], 1);
+    assert_eq!(json["files"][1]["score"], 2);
+    assert_eq!(json["warnings"], serde_json::json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_old_git_warns_and_ranks_a_partial_clone_by_commits() {
+    let repo = tempfile::tempdir().unwrap();
+    let source = repo.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    head_rank_fixture(&source);
+    git_config(&source, "uploadpack.allowFilter", "true");
+
+    // All fixture blobs fit the filter. Only the rejected option causes fallback.
+    let clone = repo.path().join("clone");
+    let output = StdCommand::new("git")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .args([
+            "clone",
+            "--no-local",
+            "--no-checkout",
+            "--filter=blob:limit=1m",
+        ])
+        .arg(&source)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let json = heatmap_with_old_git(&clone);
+    assert_eq!(json["files"][0]["path"], "z.rs", "{json}");
+    assert_eq!(json["files"][0]["churn"]["commits"], 2);
+    assert_eq!(json["files"][0]["score"], 0);
+    assert_eq!(
+        json["warnings"],
+        serde_json::json!(["HEAD data is not available. Hotspots rank by commits only."])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_head_failure_keeps_history_in_commit_order() {
+    let repo = tempfile::tempdir().unwrap();
+    head_rank_fixture(repo.path());
     let tools = tempfile::tempdir().unwrap();
     common::write_stub_script(
         tools.path(),

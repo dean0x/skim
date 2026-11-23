@@ -75,12 +75,20 @@ pub(crate) trait GitDataSource {
     /// commits gives an empty history.
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<ParsedLog>;
 
+    /// Return `true` if a HEAD read may fetch objects, including on config errors.
+    fn detect_partial_clone(&self, repo_root: &str) -> bool;
+
     /// List the complete HEAD tree, with keys relative to `repo_root`.
     /// Git quotes the keys in the same form as in the log and count output.
-    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<HeadTree>;
+    fn list_tracked_files(&self, repo_root: &str, no_lazy_fetch: bool) -> anyhow::Result<HeadTree>;
 
     /// Count text lines in HEAD. A scope is literal and relative to the cwd.
-    fn count_head_lines(&self, repo_root: &str, path: Option<&str>) -> anyhow::Result<HeadCounts>;
+    fn count_head_lines(
+        &self,
+        repo_root: &str,
+        path: Option<&str>,
+        no_lazy_fetch: bool,
+    ) -> anyhow::Result<HeadCounts>;
 
     /// Return the path of the cwd below the repository root
     /// (`git rev-parse --show-prefix`): empty at the root, else it ends in `/`.
@@ -277,17 +285,40 @@ impl GitDataSource for CliGitSource {
         parsed_log_from(&output, cut, || self.head_is_unborn())
     }
 
-    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<HeadTree> {
+    fn detect_partial_clone(&self, repo_root: &str) -> bool {
+        let result = self.runner.run_stdout_degrade(
+            "git",
+            &[
+                "-C",
+                repo_root,
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.promisor)$",
+            ],
+        );
+        match result {
+            Ok((out, cut)) => config_may_enable_lazy_fetch(&out, cut),
+            Err(_) => true,
+        }
+    }
+
+    fn list_tracked_files(&self, repo_root: &str, no_lazy_fetch: bool) -> anyhow::Result<HeadTree> {
         let (out, cut) = self
             .runner
-            .run_stdout_degrade("git", &tracked_files_args(repo_root))?;
+            .run_stdout_degrade("git", &tracked_files_args(repo_root, no_lazy_fetch))?;
         tracked_files_from(&out, cut)
     }
 
-    fn count_head_lines(&self, repo_root: &str, path: Option<&str>) -> anyhow::Result<HeadCounts> {
+    fn count_head_lines(
+        &self,
+        repo_root: &str,
+        path: Option<&str>,
+        no_lazy_fetch: bool,
+    ) -> anyhow::Result<HeadCounts> {
         let (out, cut) = self
             .runner
-            .run_stdout_degrade("git", &head_line_count_args(repo_root, path))?;
+            .run_stdout_degrade("git", &head_line_count_args(repo_root, path, no_lazy_fetch))?;
         head_line_counts_from(&out, cut)
     }
 
@@ -299,16 +330,49 @@ impl GitDataSource for CliGitSource {
     }
 }
 
+/// `git config --null --get-regexp` writes NUL-terminated records with a
+/// newline between the key and value. Allow HEAD reads without the flag only
+/// for no matches or a complete list of explicitly disabled promisor keys.
+/// An extension entry, enabled promisor, or invalid response keeps the flag.
+fn config_may_enable_lazy_fetch(out: &CommandOutput, cut: bool) -> bool {
+    if cut || !out.stderr.is_empty() {
+        return true;
+    }
+    match out.exit_code {
+        Some(1) => !out.stdout.is_empty(),
+        Some(0) => {
+            let Some(records) = out.stdout.strip_suffix('\0') else {
+                return true;
+            };
+            records.split('\0').any(|record| !disabled_promisor(record))
+        }
+        _ => true,
+    }
+}
+
+fn disabled_promisor(record: &str) -> bool {
+    let Some((key, value)) = record.split_once('\n') else {
+        return false;
+    };
+    key.strip_prefix("remote.")
+        .and_then(|key| key.strip_suffix(".promisor"))
+        .is_some_and(|name| !name.is_empty())
+        && ["false", "no", "off", "0", ""]
+            .iter()
+            .any(|disabled| value.eq_ignore_ascii_case(disabled))
+}
+
 /// The arg list that lists the paths of the HEAD tree of `repo_root`.
 ///
 /// The paths come from the committed tree, so git does not read the index
 /// and no index setting of the repository applies. A branch with no commits
 /// makes git fail, and the caller then uses its fallback. `--full-tree` lists
-/// the whole tree for any cwd. Both HEAD reads stay local. If Git cannot
-/// read a blob size, `ls-tree -l` can report `BAD` even with exit 0.
-fn tracked_files_args(repo_root: &str) -> [&str; 8] {
-    [
-        "--no-lazy-fetch",
+/// the whole tree for any cwd. If Git cannot read a blob size, `ls-tree -l`
+/// can report `BAD` even with exit 0.
+fn tracked_files_args(repo_root: &str, no_lazy_fetch: bool) -> Vec<&str> {
+    let mut args = Vec::with_capacity(8);
+    args.extend(no_lazy_fetch.then_some("--no-lazy-fetch"));
+    args.extend([
         "-C",
         repo_root,
         "ls-tree",
@@ -316,13 +380,18 @@ fn tracked_files_args(repo_root: &str) -> [&str; 8] {
         "-l",
         "--full-tree",
         "HEAD",
-    ]
+    ]);
+    args
 }
 
 /// Scope a count from the cwd, but always return root-relative keys.
-fn head_line_count_args<'a>(repo_root: &'a str, path: Option<&'a str>) -> Vec<&'a str> {
+fn head_line_count_args<'a>(
+    repo_root: &'a str,
+    path: Option<&'a str>,
+    no_lazy_fetch: bool,
+) -> Vec<&'a str> {
     let mut args = Vec::with_capacity(13);
-    args.push("--no-lazy-fetch");
+    args.extend(no_lazy_fetch.then_some("--no-lazy-fetch"));
     match path {
         Some(_) => args.push("--literal-pathspecs"),
         None => args.extend(["-C", repo_root]),
@@ -1380,45 +1449,92 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tracked files and show-prefix
+    // Partial clone config, tracked files and show-prefix
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_partial_clone_config_recognizes_git_settings() {
+        assert!(!config_may_enable_lazy_fetch(&output("", Some(1)), false));
+        for config in [
+            "extensions.partialclone\norigin\0",
+            "extensions.partialclone\n\0",
+        ] {
+            assert!(
+                config_may_enable_lazy_fetch(&output(config, Some(0)), false),
+                "{config:?}"
+            );
+        }
+        for value in ["true", "YeS", "On", "1"] {
+            let config = format!("remote.other.promisor\nfalse\0remote.x.y.promisor\n{value}\0");
+            assert!(
+                config_may_enable_lazy_fetch(&output(&config, Some(0)), false),
+                "{config:?}"
+            );
+        }
+        for value in ["false", "nO", "Off", "0", ""] {
+            let config = format!("remote.x.promisor\n{value}\0");
+            assert!(
+                !config_may_enable_lazy_fetch(&output(&config, Some(0)), false),
+                "{config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_clone_config_fails_closed_on_unexpected_output() {
+        for (stdout, code, cut) in [
+            ("", Some(128), false),
+            ("", None, false),
+            ("", Some(1), true),
+            ("unexpected output", Some(1), false),
+            ("", Some(0), false),
+            ("remote.x.promisor\nfalse", Some(0), false),
+            ("remote.x.promisor\ninvalid\0", Some(0), false),
+            ("remote.x.promisor\0", Some(0), false),
+            ("unexpected.key\nfalse\0", Some(0), false),
+        ] {
+            assert!(
+                config_may_enable_lazy_fetch(&output(stdout, code), cut),
+                "{stdout:?}, {code:?}, cut={cut}"
+            );
+        }
+        let mut error = output("", Some(1));
+        error.stderr = "config read failed".into();
+        assert!(config_may_enable_lazy_fetch(&error, false));
+    }
+
+    #[test]
     fn test_tracked_files_args_read_the_head_tree() {
-        assert_eq!(
-            tracked_files_args("/repo").as_slice(),
-            [
-                "--no-lazy-fetch",
-                "-C",
-                "/repo",
-                "ls-tree",
-                "-r",
-                "-l",
-                "--full-tree",
-                "HEAD",
-            ]
-        );
+        let full = ["-C", "/repo", "ls-tree", "-r", "-l", "--full-tree", "HEAD"];
+        let partial: Vec<_> = ["--no-lazy-fetch"].into_iter().chain(full).collect();
+        assert_eq!(tracked_files_args("/repo", false), full);
+        assert_eq!(tracked_files_args("/repo", true), partial);
     }
 
     #[test]
     fn test_head_count_args_pass_a_literal_scope_without_submodule_recursion() {
+        let full = [
+            "--literal-pathspecs",
+            "grep",
+            "-I",
+            "-c",
+            "--full-name",
+            "--no-color",
+            "--no-recurse-submodules",
+            "-e",
+            "",
+            "HEAD",
+            "--",
+            ":(exclude)src",
+        ];
+        let partial: Vec<_> = ["--no-lazy-fetch"].into_iter().chain(full).collect();
         assert_eq!(
-            head_line_count_args("/repo", Some(":(exclude)src")),
-            [
-                "--no-lazy-fetch",
-                "--literal-pathspecs",
-                "grep",
-                "-I",
-                "-c",
-                "--full-name",
-                "--no-color",
-                "--no-recurse-submodules",
-                "-e",
-                "",
-                "HEAD",
-                "--",
-                ":(exclude)src",
-            ]
+            head_line_count_args("/repo", Some(":(exclude)src"), false),
+            full
+        );
+        assert_eq!(
+            head_line_count_args("/repo", Some(":(exclude)src"), true),
+            partial
         );
     }
 
@@ -1602,7 +1718,7 @@ mod tests {
         add_files(root, &["b.rs"]);
 
         let tracked = CliGitSource::new()
-            .list_tracked_files(root.to_str().unwrap())
+            .list_tracked_files(root.to_str().unwrap(), false)
             .unwrap();
         assert_eq!(
             tracked,
@@ -1619,7 +1735,7 @@ mod tests {
 
         assert!(
             CliGitSource::new()
-                .list_tracked_files(root.to_str().unwrap())
+                .list_tracked_files(root.to_str().unwrap(), false)
                 .is_err()
         );
     }
@@ -1643,12 +1759,12 @@ mod tests {
         let root_arg = root.to_str().unwrap();
         let source = CliGitSource::new();
         let mut tracked: Vec<_> = source
-            .list_tracked_files(root_arg)
+            .list_tracked_files(root_arg, false)
             .unwrap()
             .into_keys()
             .collect();
         let mut counted: Vec<_> = source
-            .count_head_lines(root_arg, None)
+            .count_head_lines(root_arg, None, false)
             .unwrap()
             .into_iter()
             .map(|(path, count)| {
@@ -1692,7 +1808,7 @@ mod tests {
         ] {
             let stdout = git_in(
                 &subfolder,
-                &head_line_count_args(root.to_str().unwrap(), scope),
+                &head_line_count_args(root.to_str().unwrap(), scope, false),
             );
             assert_eq!(stdout, expected);
         }

@@ -402,9 +402,13 @@ mod tests {
         fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<ParsedLog> {
             Ok(ParsedLog::default())
         }
+        fn detect_partial_clone(&self, _repo_root: &str) -> bool {
+            false
+        }
         fn list_tracked_files(
             &self,
             _repo_root: &str,
+            _no_lazy_fetch: bool,
         ) -> anyhow::Result<super::super::git_source::HeadTree> {
             Ok(Default::default())
         }
@@ -412,6 +416,7 @@ mod tests {
             &self,
             _repo_root: &str,
             _path: Option<&str>,
+            _no_lazy_fetch: bool,
         ) -> anyhow::Result<super::super::git_source::HeadCounts> {
             Ok(Vec::new())
         }
