@@ -298,8 +298,7 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
 /// v5: the transform modes parse a `.tsx` file with the TSX grammar, so a v4
 /// entry of a `.tsx` file holds the view of the TypeScript grammar.
 /// v6: a Markdown file whose nesting estimate reaches the bound prints raw.
-/// v7: the Markdown grammar moves to tree-sitter-md 0.5.4, which can change
-/// output bytes, so no entry that 0.5.1 wrote is served.
+/// v7: tree-sitter-md 0.5.4 can change Markdown output. Skim skips all v6 entries.
 const CACHE_SCHEMA_VERSION: u32 = 7;
 
 /// Generate the cache key for the entry `p` identifies, as of `mtime`.
@@ -1072,7 +1071,7 @@ mod tests {
 
         assert_eq!(
             CACHE_SCHEMA_VERSION, 7,
-            "an entry written with the tree-sitter-md 0.5.1 grammar must not be served"
+            "the tree-sitter-md 0.5.4 update requires cache schema 7"
         );
 
         // Simulate the pre-A1 hash: same inputs, NO version prefix.
