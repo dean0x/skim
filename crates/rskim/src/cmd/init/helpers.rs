@@ -333,11 +333,11 @@ Use `skim heatmap` for git-history risk.
 ```
 skim heatmap                     # short ranked view of the default window
 skim heatmap <file>              # "before you edit" card for one file
-skim heatmap --detail coupling   # 25 rows of one section (hotspots, coupling,
-                                 # fix-risk, modules, bus-factor)
+skim heatmap --detail coupling   # 25 rows of one section
 skim heatmap --top 3             # --top sets the rows of every view
 skim heatmap --diff main         # default view for the files changed vs main
 skim heatmap --insights          # top 20 ranked findings
+skim heatmap --map               # token-bounded map with HEAD symbols
 skim heatmap --json              # JSON version 2: compact and capped
 ```
 <!-- skim-end -->"#,
@@ -831,6 +831,18 @@ mod tests {
             )
         );
         assert!(!content.contains("uncapped"));
+    }
+
+    #[test]
+    fn test_every_render_names_the_token_bounded_heatmap_map() {
+        let map_line = "skim heatmap --map               # token-bounded map with HEAD symbols";
+        for (name, content) in all_renders() {
+            assert_eq!(
+                content.lines().filter(|line| *line == map_line).count(),
+                1,
+                "the {name} render must have one map line"
+            );
+        }
     }
 
     #[test]
