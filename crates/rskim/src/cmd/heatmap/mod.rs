@@ -194,9 +194,10 @@ fn locate_card(
 /// True when `GIT_DIR` or `GIT_WORK_TREE` is set and not empty. Git hooks
 /// set `GIT_DIR`.
 fn git_repo_env_set() -> bool {
-    ["GIT_DIR", "GIT_WORK_TREE"]
-        .iter()
-        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+    const GIT_DIR: &str = "GIT_DIR";
+    const GIT_WORK_TREE: &str = "GIT_WORK_TREE";
+    let set = |value: Option<std::ffi::OsString>| value.is_some_and(|v| !v.is_empty());
+    set(std::env::var_os(GIT_DIR)) || set(std::env::var_os(GIT_WORK_TREE))
 }
 
 /// Resolve `--diff` to a concrete file list, mutating `args.diff_files`.

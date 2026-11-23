@@ -171,6 +171,8 @@ pub const SANDBOX_REMOVED_VARS: &[&str] = &[
     "SKIM_CRUSH_DIR",           // session-provider transcript dir (Crush)
     "ANTHROPIC_API_KEY",        // rskim-tokens credential; a host key reaches the live API
     "GIT_CEILING_DIRECTORIES",  // `skim search` root walk; a host value moves the root
+    "GIT_DIR",                  // heatmap card repo lookup; a host value pins the repo
+    "GIT_WORK_TREE",            // heatmap card repo lookup; a host value pins the repo
 ];
 
 /// Env vars deliberately inherited from the host.
