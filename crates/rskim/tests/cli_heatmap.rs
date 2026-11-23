@@ -476,9 +476,96 @@ fn test_heatmap_since_date_errors_name_all_forms() {
     }
 }
 
+#[test]
+fn test_heatmap_since_far_future_date_excludes_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(dir.path(), "a.rs", "one\n", "feat: add file", 2_114_380_800);
+
+    common::skim()
+        .args(["heatmap", "--since", "9999-12-31"])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("No commits found in repository"));
+}
+
 // ============================================================================
 // --window preset
 // ============================================================================
+
+#[test]
+fn test_heatmap_window_all_and_since_zero_include_early_commits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "old.rs",
+        "old\n",
+        "feat: old file",
+        1_000_000_000,
+    );
+    git_commit(
+        dir.path(),
+        "new.rs",
+        "new\n",
+        "feat: new file",
+        1_100_000_000,
+    );
+    git_commit(
+        dir.path(),
+        "Cargo.lock",
+        "lock\n",
+        "chore: lock",
+        1_200_000_000,
+    );
+    let output = StdCommand::new("git")
+        .args(["rev-list", "--count", "--no-merges", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git rev-list");
+    assert!(output.status.success());
+    let total: u64 = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(total, 3);
+
+    for args in [
+        ["--window", "all"],
+        ["--since", "0"],
+        ["--since", "1970-01-01"],
+    ] {
+        let json = heatmap_json_with(dir.path(), &args);
+        assert_eq!(json["window"]["commits_analyzed"], total - 1);
+        assert_eq!(json["window"]["since"], "1970-01-01");
+    }
+}
+
+#[test]
+fn test_heatmap_window_unknown_preset_names_valid_presets() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(dir.path(), "a.rs", "one\n", "feat: add file", 1_700_000_000);
+
+    for args in [
+        vec!["--window=biweekly"],
+        vec!["--since=0", "--window=biweekly"],
+    ] {
+        common::skim()
+            .arg("heatmap")
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains(
+                "--window must be one of sprint, month, quarter, half, year, all; got: biweekly",
+            ));
+    }
+}
 
 #[test]
 fn test_heatmap_window_sprint_preset() {

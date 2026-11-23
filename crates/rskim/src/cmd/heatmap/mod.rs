@@ -214,11 +214,10 @@ fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
 }
 
 /// Kinds of run warning: a shallow clone, more than one window flag, an
-/// unresolved `--last`, an unknown `--window` preset, malformed git log
-/// records, git log output at its limit, commits too large to pair and
-/// `--diff` files not in the window. Each kind adds at most one line, so a
-/// run has at most this many warnings in either JSON output.
-const WARNING_KINDS: usize = 8;
+/// unresolved `--last`, malformed git log records, git log output at its
+/// limit, commits too large to pair and `--diff` files not in the window.
+/// Each kind adds at most one line in either JSON output.
+const WARNING_KINDS: usize = 7;
 
 /// True when `warnings` has at most [`WARNING_KINDS`] lines and no line
 /// twice.

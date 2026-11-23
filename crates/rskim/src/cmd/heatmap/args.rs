@@ -102,6 +102,7 @@ fn apply_value_flag(
             args.top_explicit = true;
         }
         ValueFlagAction::Window => {
+            super::window::preset_days(&val)?;
             args.window_preset = Some(val);
         }
         ValueFlagAction::LastN => {

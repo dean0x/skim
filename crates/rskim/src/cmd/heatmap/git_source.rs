@@ -117,8 +117,9 @@ fn build_git_log_args(since: Option<u64>, path: Option<&str>) -> Vec<String> {
         "-M".to_string(),
     ];
 
-    if let Some(since) = since {
-        args.push(format!("--since={since}"));
+    if let Some(since) = since.filter(|&epoch| epoch != 0) {
+        // An explicit epoch keeps Git from guessing the date of a bare number.
+        args.push(format!("--since=@{since} +0000"));
     }
 
     if let Some(path) = path {
@@ -821,7 +822,7 @@ mod tests {
                 "--no-merges",
                 "--date=unix",
                 "-M",
-                "--since=1700000000",
+                "--since=@1700000000 +0000",
                 "--",
                 "src/",
             ]
@@ -856,7 +857,7 @@ mod tests {
     }
 
     /// Each flag value reaches git as one argument: the `--diff` value after
-    /// `--end-of-options`, the window start as one `--since=<n>` token, and
+    /// `--end-of-options`, the window start with its UTC offset, and
     /// the `--path` value after `--`.
     #[test]
     fn test_flag_values_reach_git_as_one_argument_each() {
@@ -871,7 +872,7 @@ mod tests {
         let log = build_git_log_args(Some(42), Some("-x"));
         assert_eq!(
             log.iter().filter(|a| a.contains("42")).collect::<Vec<_>>(),
-            vec!["--since=42"],
+            vec!["--since=@42 +0000"],
             "args: {log:?}"
         );
         assert_eq!(log[log.len() - 2..], ["--", "-x"], "args: {log:?}");
