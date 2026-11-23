@@ -1,6 +1,6 @@
 [package]
 name = "rskim-core"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -35,6 +35,10 @@ serde_yaml_ng = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 criterion = { workspace = true }
+
+# Thread CPU clock for the test-only scaling guards (`transform/scaling_guard.rs`).
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
 
 [[bench]]
 name = "transform_bench"
