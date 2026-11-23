@@ -1040,6 +1040,29 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_cycle_resolves_to_one_path_in_one_pass() {
+        let input = format!(
+            "{}:100644 100644 1234 5678 R90\tb.rs\ta.rs\n1\t0\tb.rs => a.rs\n\n\
+             {}:100644 100644 1234 5678 R90\ta.rs\tb.rs\n1\t0\ta.rs => b.rs\n\n\
+             {}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n",
+            header(HASH_A, "3000", "Alice", "move back"),
+            header(HASH_B, "2000", "Alice", "move out"),
+            header(
+                "cccccccccccccccccccccccccccccccccccccccc",
+                "1000",
+                "Alice",
+                "edit"
+            ),
+        );
+
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(parsed.commits.len(), 3);
+        for commit in &parsed.commits {
+            assert_eq!(paths(commit), [Path::new("a.rs")]);
+        }
+    }
+
+    #[test]
     fn test_log_skips_unpaired_records_without_installing_aliases() {
         let fresh = header(HASH_A, "2000", "Alice", "bad");
         let prior = header(HASH_B, "1000", "Alice", "good")
@@ -1111,6 +1134,15 @@ mod tests {
                 "--",
                 "src/",
             ]
+        );
+    }
+
+    #[test]
+    fn test_git_log_args_omit_since_for_epoch_zero() {
+        let args = build_git_log_args(Some(0), None);
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--since")),
+            "args: {args:?}"
         );
     }
 

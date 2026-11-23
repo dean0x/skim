@@ -1661,6 +1661,79 @@ fn test_heatmap_plain_rename_moves_history_to_new_path() {
 }
 
 #[test]
+fn test_heatmap_rename_uses_the_new_path_in_all_metric_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    let ts = 1_700_000_000;
+    for i in 0..5 {
+        git_commit_paths_as(
+            root,
+            &["a.rs", "partner.rs"],
+            &format!("fix: before {i}"),
+            ts + i,
+            "Alice",
+        );
+    }
+    git_commit_move(root, "a.rs", "b.rs", "refactor: rename", ts + 5);
+    for i in 0..5 {
+        git_commit_paths_as(
+            root,
+            &["b.rs", "partner.rs"],
+            &format!("fix: after {i}"),
+            ts + 6 + i,
+            "Alice",
+        );
+    }
+    // A second author and a lower base fix rate let both path names meet the gates.
+    for i in 0..12 {
+        git_commit_as(
+            root,
+            "other.rs",
+            &format!("feat: other {i}"),
+            ts + 11 + i,
+            "Bob",
+        );
+    }
+
+    let json = heatmap_json_with(root, &["--window", "all", "--detail", "bus-factor"]);
+    let mut old_path_sections = Vec::new();
+    for key in ["files", "fix_risk", "bus_factor"] {
+        let rows = json[key].as_array().unwrap();
+        assert!(
+            rows.iter().any(|row| row["path"] == "b.rs"),
+            "b.rs missing from {key}: {rows:?}"
+        );
+        if rows.iter().any(|row| row["path"] == "a.rs") {
+            old_path_sections.push(key);
+        }
+    }
+    let edges = json["coupling_graph"].as_array().unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge["a"] == "b.rs" && edge["b"] == "partner.rs"),
+        "b.rs missing from coupling_graph: {edges:?}"
+    );
+    if edges
+        .iter()
+        .any(|edge| edge["a"] == "a.rs" || edge["b"] == "a.rs")
+    {
+        old_path_sections.push("coupling_graph");
+    }
+    assert!(
+        old_path_sections.is_empty(),
+        "a.rs remains in {old_path_sections:?}"
+    );
+    assert_eq!(
+        json["left_out"]["not_at_head"].as_u64().unwrap_or(0),
+        0,
+        "the HEAD filter must not hide the old path"
+    );
+    assert_eq!(file_entry(&json, "b.rs")["churn"]["commits"], 10);
+}
+
+#[test]
 fn test_heatmap_brace_rename_paths_use_the_new_path() {
     let dir = tempfile::tempdir().unwrap();
     git_init(dir.path());
