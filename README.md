@@ -150,7 +150,8 @@ Its notes do not change files or the exit code. Fix broken markers by hand befor
 - **Short ranked default view** (30 lines or fewer): the header gives the repository name, window dates, commit count and window type. The view shows the top 10 **hotspots**, 5 code-to-code **coupling** pairs and 5 **fix-risk** files above the repository base rate. A capped section ends with one exact `N more (--detail <section>)` line. The last line points to the per-file card (`skim heatmap <file>`).
 - **Hotspot rank:** The score is commits in the window × text lines at HEAD. If scores match, more commits come first. If both values match, skim sorts by path, lowest first. If HEAD data is not available, skim warns and ranks by commits. Skim joins history across renames that Git reports.
 - **`--detail <section>`** shows 25 rows of one section (`--top N` raises it), then one exact `N more (raise --top)` line: `hotspots`, `coupling`, `fix-risk`, `modules` (crate, package or top-folder encapsulation) or `bus-factor` (one author with more than 80% of a file's commits). Module health and bus factor show only with `--detail`
-- **`--top N`** sets the rows of each list in every view: the default view, `--detail`, `--insights`, the cards and JSON
+- **`skim heatmap --map`** shows whole file blocks in hotspot order. Each block gives file stats, one co-change partner if available, and up to 12 symbol names from HEAD with kind and line. The symbol rules depend on the language. TypeScript and JavaScript include top-level `const` names. JSON, YAML and TOML files have no symbol rows. The map is text only. Use `--tokens N` to set its cl100k token budget (default 1,000; range 1 to 10,000,000). See the [repository map guide](docs/usage.md#repository-map-map) for row rules, flag conflicts and the trailer.
+- **`--top N`** sets the row caps in the default, detail, insights, card and JSON views.
 - **`skim heatmap <file>...`** prints a "before you edit" card per file (at most 5): co-change partners with 3 or more shared commits (tests first), up to 3 fix commits from history (at most 5 at any `--top`), and owners when the file has 2 or more authors. `--insights <file>` prints the same card. The card comes from the git repository that holds the file, also when the current folder is in another repository or in none. Files from two repositories in one call exit 1.
 - **Noise rules:** fix risk and bus factor need 5 commits of a file, coupling needs 3 shared commits, modules need 5 commits; a fix-risk row needs the lower bound of its fix rate above the repository base rate; bus factor needs 2 or more authors in the window. Modules come from tracked `Cargo.toml` and `package.json` folders, else the top folder
 - **Default excludes:** lock files, build output, logs, vendored code, and at any depth `CHANGELOG.md`, `*.snap`, `snapshots/`, `*.pb.go`, `*_pb2.py` and `generated/` folders (`--no-exclude` keeps them; a file marked "generated" only in a header line stays in)
@@ -802,7 +803,7 @@ cargo bench
 - MCP server mode for agent-native workflows
 
 ✅ **Analytics & Intelligence:**
-- `skim heatmap` — git history risk analysis: a short ranked view (churn, coupling, fix risk), `--detail` sections and per-file "before you edit" cards
+- `skim heatmap` — git history risk analysis: a short ranked view, `--detail` sections, per-file cards and a token-bounded `--map`
 - `skim stats` — persistent SQLite dashboard with cost estimation
 - `skim discover` — missed optimization finder across agent sessions
 - `skim learn` — CLI error pattern detection and correction rules
