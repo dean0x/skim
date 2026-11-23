@@ -297,7 +297,9 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
 /// v4: token-budget cuts with line numbers retain their cut and unnumbered marker.
 /// v5: the transform modes parse a `.tsx` file with the TSX grammar, so a v4
 /// entry of a `.tsx` file holds the view of the TypeScript grammar.
-const CACHE_SCHEMA_VERSION: u32 = 5;
+/// v6: a Markdown file whose nesting estimate reaches the bound prints raw.
+/// v7: tree-sitter-md 0.5.4 can change Markdown output. Skim skips all v6 entries.
+const CACHE_SCHEMA_VERSION: u32 = 7;
 
 /// Generate the cache key for the entry `p` identifies, as of `mtime`.
 ///
@@ -1068,8 +1070,8 @@ mod tests {
         let key_production = cache_key(&key_params(path, Mode::Structure, trunc), mtime).unwrap();
 
         assert_eq!(
-            CACHE_SCHEMA_VERSION, 5,
-            "a .tsx view from the TypeScript grammar must not be served warm"
+            CACHE_SCHEMA_VERSION, 7,
+            "the tree-sitter-md 0.5.4 update requires cache schema 7"
         );
 
         // Simulate the pre-A1 hash: same inputs, NO version prefix.
@@ -1274,9 +1276,7 @@ mod tests {
         );
     }
 
-    /// A read without `--symbol` keeps the exact hash input it had before the
-    /// symbol field existed. A different input would orphan every warm entry
-    /// without a schema bump, and a schema bump is not wanted for an additive flag.
+    /// A read without `--symbol` keeps the same hash input apart from the schema version.
     #[test]
     fn test_cache_key_without_symbol_is_unchanged() {
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -1302,7 +1302,7 @@ mod tests {
         assert_eq!(
             plain,
             sha(&format!(
-                "cache_schema_v5|{}|{mtime_secs}|Structure|none|none|none|0|0",
+                "cache_schema_v{CACHE_SCHEMA_VERSION}|{}|{mtime_secs}|Structure|none|none|none|0|0",
                 canonical.display()
             ))
         );
@@ -1328,7 +1328,7 @@ mod tests {
         assert_eq!(
             busy,
             sha(&format!(
-                "cache_schema_v5|{}|{mtime_secs}|Pseudo|50|none|500|1|162",
+                "cache_schema_v{CACHE_SCHEMA_VERSION}|{}|{mtime_secs}|Pseudo|50|none|500|1|162",
                 canonical.display()
             ))
         );

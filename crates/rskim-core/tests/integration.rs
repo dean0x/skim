@@ -281,6 +281,83 @@ fn test_markdown_full() {
 }
 
 // ============================================================================
+// Markdown Nesting Tests
+// ============================================================================
+
+// The heading and blank line each count as 1. The 200 quote markers would give 201.
+// The estimate stops at 200, before the last marker.
+fn deep_markdown() -> String {
+    format!("# Report\n\n{}\n", ">".repeat(200))
+}
+
+fn assert_markdown_nesting_error(error: rskim_core::SkimError) {
+    assert!(error.is_complexity_limit());
+    assert!(matches!(
+        error,
+        rskim_core::SkimError::ComplexityLimit {
+            what: "markdown nesting depth",
+            count: 200..,
+            max: 199,
+        }
+    ));
+}
+
+#[test]
+fn deep_markdown_returns_raw_text() {
+    let source = deep_markdown();
+    let (content, has_errors, line_map, degraded) =
+        transform_with_line_map(&source, Language::Markdown, &TransformConfig::default()).unwrap();
+    assert_eq!(
+        (content, has_errors, line_map, degraded),
+        (source, false, None, true)
+    );
+}
+
+#[test]
+fn parse_reports_the_markdown_nesting_limit() {
+    let mut parser = rskim_core::Parser::new(Language::Markdown).unwrap();
+    assert_markdown_nesting_error(parser.parse(&deep_markdown()).unwrap_err());
+}
+
+#[test]
+fn bounded_parse_reports_the_markdown_nesting_limit() {
+    let mut parser = rskim_core::Parser::new(Language::Markdown).unwrap();
+    let result = parser.parse_bounded(&deep_markdown(), std::time::Duration::from_secs(1));
+    assert_markdown_nesting_error(result.unwrap_err());
+}
+
+#[test]
+fn parser_transform_reports_the_markdown_nesting_limit() {
+    let mut parser = rskim_core::Parser::new(Language::Markdown).unwrap();
+    let result = parser.transform(&deep_markdown(), &TransformConfig::default());
+    assert_markdown_nesting_error(result.unwrap_err());
+}
+
+#[test]
+fn markdown_below_the_nesting_limit_keeps_the_heading_view() {
+    let cases = [
+        // Each indented line has an estimate of 51.
+        (
+            "fence",
+            format!("```text\n{0}first\n{0}second\n```", " ".repeat(100)),
+        ),
+        // The whitespace-only line has an estimate of 151.
+        ("blank line", " ".repeat(300)),
+        // The spaced thematic break has an estimate of 181.
+        ("spaced break", "- ".repeat(120)),
+        // The solid thematic break has an estimate of 2.
+        ("solid break", "-".repeat(300)),
+        // Only the final plus sign counts. The border has an estimate of 2.
+        ("table border", format!("{}+", "+---".repeat(203))),
+    ];
+    for (case, body) in cases {
+        let source = format!("# Report\n\n{body}\n");
+        let view = transform(&source, Language::Markdown, Mode::Structure).unwrap();
+        assert_eq!(view, "# Report\n", "{case}");
+    }
+}
+
+// ============================================================================
 // TSX grammar: the file path picks the grammar, the language stays TypeScript
 // ============================================================================
 

@@ -694,6 +694,7 @@ Skim includes built-in DoS protections:
 - **Max recursion depth**: 500 levels
 - **Max input size**: 50MB per file
 - **Max AST nodes**: 100,000 nodes
+- **Markdown nesting limit**: Skim prints the file unchanged at the limit. Output limits still apply.
 - **Path traversal protection**: Rejects malicious paths
 - **No code execution**: Only parses, never runs code
 
