@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Heatmap ranks hotspots by commits in the window × text lines at HEAD. If scores match, more commits come first. If both values match, skim sorts by path, lowest first. If HEAD data is not available, skim warns and ranks by commits. JSON version 2 adds `files[].lines`, `files[].score` and `left_out.not_at_head`.
-- Fix risk leaves out doc files and non-code folders by default, as hotspots do. The text view and `left_out.fix_risk` count these paths. Use `--include-docs` to keep them.
+- Fix risk leaves out doc files and non-code folders by default, as hotspots do. The text view and `left_out.fix_risk` count only eligible rows. Use `--include-docs` to keep them.
 
 ### Fixed
 

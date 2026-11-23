@@ -311,7 +311,7 @@ Skim joins history across renames that Git reports. When HEAD data is available,
 
 Doc files (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.txt`, `*.adoc`) stay out of hotspots, fix risk and insights. This rule also applies to files under the top folders `docs`, `doc`, `.github`, `.devflow`, `tests` and `test`. These folders also stay out of modules. The folder rule does not apply to a nested folder such as `crates/x/tests/`.
 
-The summary line counts the paths that the rule leaves out. In JSON, `left_out.hotspots` and `left_out.fix_risk` count the same non-code files, before the fix-risk support and lift rules. `left_out.modules` counts non-code folders. With `--insights --json`, `counts.left_out` counts non-code findings.
+The summary line counts the paths that the rule leaves out. In JSON, `left_out.hotspots` counts non-code files in the hotspot list before the cap. `left_out.fix_risk` counts only non-code files that pass the fix-risk support and lift rules. `left_out.modules` counts non-code folders. With `--insights --json`, `counts.left_out` counts non-code findings.
 
 Use `--include-docs` to keep non-code paths. `--diff`, file arguments and a `--path` that is a non-code folder bypass this filter. Coupling never pairs a doc file.
 

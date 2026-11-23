@@ -374,17 +374,25 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
         .filter(|e| !noise::is_doc_path(&e.a) && !noise::is_doc_path(&e.b))
         .collect();
 
-    let fix_risk: Vec<FixRiskRow<'_>> = hotspots
+    let mut fix_risk = Vec::new();
+    let mut fix_risk_left_out = 0;
+    for f in result
+        .files
         .iter()
         .filter(|f| noise::passes_lift(f.fix_risk.fix_commits, f.churn.commits, base_rate))
-        .map(|f| FixRiskRow {
+    {
+        if spec.leaves_out(&f.path) {
+            fix_risk_left_out += 1;
+            continue;
+        }
+        fix_risk.push(FixRiskRow {
             path: &f.path,
             fix_commits: f.fix_risk.fix_commits,
             support: f.churn.commits,
             lift: noise::lift(f.fix_risk.fix_commits, f.churn.commits, base_rate),
             lower_bound: noise::wilson_lower_bound(f.fix_risk.fix_commits, f.churn.commits),
-        })
-        .collect();
+        });
+    }
 
     let modules: Vec<&ModuleHealth> = result
         .modules
@@ -419,7 +427,7 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
         not_at_head: result.not_at_head,
         coupling: Section::ranked(coupling, coupling_order, spec.cap(DetailSection::Coupling)),
         fix_risk: Section::ranked(fix_risk, fix_risk_order, spec.cap(DetailSection::FixRisk))
-            .with_left_out(hotspots_left_out),
+            .with_left_out(fix_risk_left_out),
         modules: Section::ranked(modules, module_order, spec.cap(DetailSection::Modules))
             .with_left_out(modules_left_out),
         bus_factor: Section::ranked(
@@ -1126,6 +1134,7 @@ mod tests {
             with_fixes(file("src/a.rs", 5), 5),
             with_fixes(file("README.md", 5), 5),
             with_fixes(file("docs/example.rs", 5), 5),
+            file("docs/guide.md", 5),
         ];
         let spec = detail_view(DetailSection::FixRisk, None);
         let view = build_view(&result, &spec);

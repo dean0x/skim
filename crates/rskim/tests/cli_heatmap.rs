@@ -2858,6 +2858,13 @@ fn test_heatmap_fix_risk_counts_non_code_rows_and_include_docs_restores_them() {
     create_five_commit_repo(root, "feat");
     let ts = recent_ts() + 600;
     for i in 0..5 {
+        git_commit(
+            root,
+            "docs/guide.md",
+            &format!("Guide {i}\n"),
+            "feat: update guide",
+            ts + i * 2,
+        );
         let body = format!("// revision {i}\n");
         git_commit_files(
             root,
@@ -2867,24 +2874,25 @@ fn test_heatmap_fix_risk_counts_non_code_rows_and_include_docs_restores_them() {
                 ("docs/example.rs", &body),
             ],
             "fix: update files",
-            ts + i,
+            ts + i * 2 + 1,
         );
     }
 
     let args = ["--detail", "fix-risk"];
     let json = heatmap_json_with(root, &args);
-    assert_eq!(sorted_paths(&json, "fix_risk"), ["src/live.rs"]);
-    assert_eq!(json["left_out"]["fix_risk"], 2);
-    let text = heatmap_stdout(root, &args);
-    assert!(
-        section_lines(&text, "Fix risk").contains(&"  2 non-code files left out (--include-docs)"),
-        "{text}"
-    );
-
+    let paths = sorted_paths(&json, "fix_risk");
+    assert_eq!(paths, ["src/live.rs"]);
     let all = heatmap_json_with(root, &["--detail", "fix-risk", "--include-docs"]);
-    assert_eq!(
-        sorted_paths(&all, "fix_risk"),
-        ["README.md", "docs/example.rs", "src/live.rs"]
+    let all_paths = sorted_paths(&all, "fix_risk");
+    assert_eq!(all_paths, ["README.md", "docs/example.rs", "src/live.rs"]);
+    let restored = all_paths.len() - paths.len();
+    assert_eq!(json["left_out"]["fix_risk"], restored);
+
+    let text = heatmap_stdout(root, &args);
+    let expected = format!("  {restored} non-code files left out (--include-docs)");
+    assert!(
+        section_lines(&text, "Fix risk").contains(&expected.as_str()),
+        "{text}"
     );
 }
 
