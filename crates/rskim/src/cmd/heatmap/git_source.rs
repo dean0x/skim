@@ -4,7 +4,7 @@
 //! `CommitInfo` values via a simple state machine.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cmd::is_repo_relative_safe;
 use crate::runner::{CommandOutput, CommandRunner, MAX_OUTPUT_BYTES, is_spawn_error};
@@ -100,8 +100,21 @@ pub(crate) trait GitDataSource {
 // ============================================================================
 
 /// Concrete git data source that delegates to the `git` binary.
+///
+/// Git runs in the cwd, or in `dir` when it is set (`git -C <dir>`). The
+/// trait docs say "the cwd" for that folder.
 pub(crate) struct CliGitSource {
     runner: CommandRunner,
+    dir: Option<String>,
+}
+
+/// Why [`CliGitSource::toplevel_in`] gave no repository root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoToplevel {
+    /// No repository holds the path.
+    NoRepository,
+    /// Git failed for another reason. The text is git's message.
+    Git(String),
 }
 
 /// Build the `git log` arg list for a window start and an optional `--path`.
@@ -166,12 +179,42 @@ impl CliGitSource {
     pub(crate) fn new() -> Self {
         Self {
             runner: CommandRunner::new(),
+            dir: None,
         }
+    }
+
+    /// A source whose git commands all run in `dir`, not in the cwd.
+    pub(crate) fn in_dir(dir: String) -> Self {
+        Self {
+            runner: CommandRunner::new(),
+            dir: Some(dir),
+        }
+    }
+
+    /// Run git with `args`, in `dir` when it is set.
+    fn run_git(&self, args: &[&str]) -> anyhow::Result<(CommandOutput, bool)> {
+        let full = with_dir(self.dir.as_deref(), args);
+        self.runner.run_stdout_degrade("git", &full)
+    }
+
+    /// The root of the work tree that holds the folder `folder`, as git
+    /// reports it.
+    ///
+    /// [`toplevel_from`] reads git's English "not a git repository" text.
+    /// With a git that prints translated messages, a folder in no
+    /// repository gives [`NoToplevel::Git`] with git's own text instead:
+    /// the run still exits 1. The runner takes no environment here, so the
+    /// call cannot set `LC_ALL`.
+    pub(crate) fn toplevel_in(&self, folder: &str) -> Result<String, NoToplevel> {
+        let (out, _) = self
+            .run_git(&["-C", folder, "rev-parse", "--show-toplevel"])
+            .map_err(|e| NoToplevel::Git(git_not_found(e).to_string()))?;
+        toplevel_from(&out)
     }
 
     /// Heatmap does not stop when stderr is closed.
     fn capture_git(&self, args: &[&str]) -> anyhow::Result<CommandOutput> {
-        let (out, cut) = self.runner.run_stdout_degrade("git", args)?;
+        let (out, cut) = self.run_git(args)?;
         if cut {
             note(format_args!(
                 "{}",
@@ -278,25 +321,19 @@ impl GitDataSource for CliGitSource {
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<ParsedLog> {
         let owned_args = build_git_log_args(config.since, config.path.as_deref());
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        let (output, cut) = self
-            .runner
-            .run_stdout_degrade("git", &args)
-            .map_err(git_not_found)?;
+        let (output, cut) = self.run_git(&args).map_err(git_not_found)?;
         parsed_log_from(&output, cut, || self.head_is_unborn())
     }
 
     fn detect_partial_clone(&self, repo_root: &str) -> bool {
-        let result = self.runner.run_stdout_degrade(
-            "git",
-            &[
-                "-C",
-                repo_root,
-                "config",
-                "--null",
-                "--get-regexp",
-                r"^(extensions\.partialclone|remote\..*\.promisor)$",
-            ],
-        );
+        let result = self.run_git(&[
+            "-C",
+            repo_root,
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ]);
         match result {
             Ok((out, cut)) => config_may_enable_lazy_fetch(&out, cut),
             Err(_) => true,
@@ -304,9 +341,7 @@ impl GitDataSource for CliGitSource {
     }
 
     fn list_tracked_files(&self, repo_root: &str, no_lazy_fetch: bool) -> anyhow::Result<HeadTree> {
-        let (out, cut) = self
-            .runner
-            .run_stdout_degrade("git", &tracked_files_args(repo_root, no_lazy_fetch))?;
+        let (out, cut) = self.run_git(&tracked_files_args(repo_root, no_lazy_fetch))?;
         tracked_files_from(&out, cut)
     }
 
@@ -316,9 +351,7 @@ impl GitDataSource for CliGitSource {
         path: Option<&str>,
         no_lazy_fetch: bool,
     ) -> anyhow::Result<HeadCounts> {
-        let (out, cut) = self
-            .runner
-            .run_stdout_degrade("git", &head_line_count_args(repo_root, path, no_lazy_fetch))?;
+        let (out, cut) = self.run_git(&head_line_count_args(repo_root, path, no_lazy_fetch))?;
         head_line_counts_from(&out, cut)
     }
 
@@ -554,6 +587,51 @@ fn parse_count_line(line: &str) -> Option<(String, u64)> {
         return None;
     }
     Some((path.to_owned(), count.parse().ok()?))
+}
+
+/// The nearest folder at or above the absolute `path` that exists: `path`
+/// itself when it is a folder. A path that is not on disk (a deleted file)
+/// thus still has a folder for git to run in. Nothing is opened; the check
+/// follows symlinks, as git does. `ancestors` ends at the file system root,
+/// so the walk has one step per path component at most.
+pub(crate) fn nearest_folder(path: &str) -> Option<&str> {
+    debug_assert!(Path::new(path).is_absolute(), "the path is absolute");
+    Path::new(path)
+        .ancestors()
+        .find(|p| p.is_dir())
+        .and_then(Path::to_str)
+}
+
+/// `args` after `-C <dir>`, or `args` alone when there is no `dir`. A later
+/// `-C` in `args` is read relative to `dir`; the callers give it an absolute
+/// path.
+fn with_dir<'a>(dir: Option<&'a str>, args: &[&'a str]) -> Vec<&'a str> {
+    let mut full = Vec::with_capacity(args.len() + 2);
+    if let Some(dir) = dir {
+        full.extend(["-C", dir]);
+    }
+    full.extend_from_slice(args);
+    full
+}
+
+/// The root from `git rev-parse --show-toplevel` output. Git reports a
+/// folder in no repository as "not a git repository"; any other failure keeps
+/// git's message.
+fn toplevel_from(out: &CommandOutput) -> Result<String, NoToplevel> {
+    if out.exit_code == Some(0) {
+        let root = out.stdout.strip_suffix('\n').unwrap_or(&out.stdout);
+        if !root.is_empty() {
+            return Ok(root.to_string());
+        }
+    }
+    let stderr = out.stderr.trim();
+    if stderr.contains("not a git repository") {
+        Err(NoToplevel::NoRepository)
+    } else {
+        Err(NoToplevel::Git(format!(
+            "git rev-parse --show-toplevel failed: {stderr}"
+        )))
+    }
 }
 
 /// Keep each path byte except Git's line terminator.
@@ -1634,6 +1712,68 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("--show-prefix failed"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_with_dir_puts_the_folder_first_only_when_set() {
+        let args = ["rev-parse", "--show-toplevel"];
+        assert_eq!(with_dir(None, &args), args);
+        assert_eq!(
+            with_dir(Some("/work/repo"), &args),
+            ["-C", "/work/repo", "rev-parse", "--show-toplevel"]
+        );
+    }
+
+    #[test]
+    fn test_toplevel_from_tells_no_repository_from_a_git_failure() {
+        assert_eq!(
+            toplevel_from(&output("/work/repo\n", Some(0))),
+            Ok("/work/repo".to_string())
+        );
+        let mut none = output("", Some(128));
+        none.stderr =
+            "fatal: not a git repository (or any of the parent directories): .git\n".into();
+        assert_eq!(toplevel_from(&none), Err(NoToplevel::NoRepository));
+        let Err(NoToplevel::Git(message)) = toplevel_from(&output("", Some(128))) else {
+            panic!("another git failure keeps git's message");
+        };
+        assert!(message.contains("fatal: test"), "{message}");
+        assert!(matches!(
+            toplevel_from(&output("", Some(0))),
+            Err(NoToplevel::Git(_))
+        ));
+    }
+
+    #[test]
+    fn test_in_dir_source_reads_that_repo_and_toplevel_in_finds_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        git_in(&root, &["init", "-q"]);
+        std::fs::create_dir(root.join("src")).unwrap();
+        let root_text = root.to_str().unwrap();
+
+        let source = CliGitSource::in_dir(root_text.to_string());
+        assert!(source.is_git_repo());
+        assert_eq!(source.get_repo_root().unwrap(), root_text);
+        assert_eq!(source.show_prefix().unwrap(), "");
+
+        // A file that is not on disk, below a folder that is not on disk.
+        let gone = format!("{root_text}/src/gone/deleted.rs");
+        let src = format!("{root_text}/src");
+        assert_eq!(nearest_folder(&gone), Some(src.as_str()));
+        // A folder is its own nearest folder.
+        assert_eq!(nearest_folder(root_text), Some(root_text));
+        assert_eq!(
+            CliGitSource::new().toplevel_in(&src),
+            Ok(root_text.to_string())
+        );
+        assert_eq!(
+            CliGitSource::new()
+                .toplevel_in(&format!("{root_text}/.git"))
+                .map_err(|e| matches!(e, NoToplevel::Git(_))),
+            Err(true),
+            "a folder inside .git is a git failure, not 'no repository'"
+        );
     }
 
     /// Run `git -C <dir> <args>` with a fixed identity; panics on failure.

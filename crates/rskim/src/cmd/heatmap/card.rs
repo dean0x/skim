@@ -113,6 +113,27 @@ impl Card {
 // Path arguments
 // ============================================================================
 
+/// Why a file argument maps to no repo-relative path. Each kind holds the
+/// argument as typed, in the form that the message shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TargetError {
+    /// The path is not below the repository root, by text.
+    Outside(String),
+    /// The path is the repository root itself.
+    Root(String),
+}
+
+impl std::fmt::Display for TargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Outside(shown) => write!(f, "'{shown}' is outside the repository root"),
+            Self::Root(shown) => write!(f, "'{shown}' names the repository root, not a file"),
+        }
+    }
+}
+
+impl std::error::Error for TargetError {}
+
 /// Map the file argument `arg` to a repo-relative path, by text only.
 ///
 /// An absolute `arg` loses the `repo_root` prefix (the root as git reports
@@ -123,22 +144,46 @@ impl Card {
 /// symlinked folder is refused. The shared containment check is the last
 /// step: a path that is still absolute or that starts with `..` is outside
 /// the root.
-pub(crate) fn normalise_target(arg: &str, repo_root: &str, prefix: &str) -> anyhow::Result<String> {
+pub(crate) fn normalise_target(
+    arg: &str,
+    repo_root: &str,
+    prefix: &str,
+) -> Result<String, TargetError> {
     let joined = if Path::new(arg).is_absolute() {
         arg.to_string()
     } else {
         format!("{prefix}{arg}")
     };
-    let folded = fold_dots(&joined);
+    target_below(&joined, repo_root, arg)
+}
+
+/// The repo-relative form of `path` (absolute, or relative to the root),
+/// by text only, as in [`normalise_target`]. An error shows `arg`, the
+/// argument as the user typed it.
+pub(crate) fn target_below(path: &str, repo_root: &str, arg: &str) -> Result<String, TargetError> {
+    let folded = fold_dots(path);
     let relative = below_root(&folded, repo_root).unwrap_or(&folded);
-    let shown = sanitize(arg, CARD_TEXT_MAX_CHARS);
+    let shown = || sanitize(arg, CARD_TEXT_MAX_CHARS);
     if !crate::cmd::is_repo_relative_safe(Path::new(relative)) {
-        anyhow::bail!("'{shown}' is outside the repository root");
+        return Err(TargetError::Outside(shown()));
     }
     if relative.is_empty() {
-        anyhow::bail!("'{shown}' names the repository root, not a file");
+        return Err(TargetError::Root(shown()));
     }
     Ok(relative.to_string())
+}
+
+/// The file argument `arg` as an absolute path, by text only: a relative
+/// `arg` goes below `cwd`, then `.`, `..` and repeated `/` fold as in
+/// [`normalise_target`]. `cwd` must be absolute.
+#[must_use]
+pub(crate) fn absolute_arg(arg: &str, cwd: &str) -> String {
+    debug_assert!(Path::new(cwd).is_absolute(), "the cwd is absolute");
+    if Path::new(arg).is_absolute() {
+        fold_dots(arg)
+    } else {
+        fold_dots(&format!("{cwd}/{arg}"))
+    }
 }
 
 /// Fold the `.` and `..` components and the repeated `/` of `path`, by
@@ -594,6 +639,36 @@ mod tests {
                 format!("'{arg}' names the repository root, not a file"),
                 "{arg} from {prefix:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_target_below_names_the_typed_arg_in_each_error() {
+        assert_eq!(
+            target_below("/work/repo/src/x.rs", ROOT, "../repo/src/x.rs"),
+            Ok("src/x.rs".to_string())
+        );
+        assert_eq!(
+            target_below("/elsewhere/x.rs", ROOT, "../../elsewhere/x.rs"),
+            Err(TargetError::Outside("../../elsewhere/x.rs".to_string()))
+        );
+        assert_eq!(
+            target_below("/work/repo", ROOT, "../repo"),
+            Err(TargetError::Root("../repo".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_absolute_arg_joins_a_relative_arg_to_the_cwd_and_folds_it() {
+        for (arg, expected) in [
+            ("src/main.rs", "/work/repo/src/main.rs"),
+            ("./src//main.rs", "/work/repo/src/main.rs"),
+            ("../other/lib.rs", "/work/other/lib.rs"),
+            ("/abs/./x/../y.rs", "/abs/y.rs"),
+            // A `..` above `/` stays, as in `normalise_target`.
+            ("../../../../x.rs", "/../../x.rs"),
+        ] {
+            assert_eq!(absolute_arg(arg, "/work/repo"), expected, "{arg}");
         }
     }
 

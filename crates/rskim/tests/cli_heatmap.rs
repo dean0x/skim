@@ -4149,25 +4149,300 @@ fn test_heatmap_two_forms_of_one_file_give_one_card() {
     assert_eq!(paths, [CARD_FILE, "src/util.rs"]);
 }
 
-#[test]
-fn test_heatmap_card_path_outside_the_root_exits_1_with_no_card() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    create_card_repo(dir.path());
+/// Three folders below one temp folder: two repos, `a` (the card repo) and
+/// `b` (one commit), and `plain`, a folder in no repo. Git looks for a
+/// repo no higher than the temp folder, so a repo of the host machine
+/// cannot hold `plain`. The temp folder path has no symlink in it.
+struct RepoPair {
+    _tmp: tempfile::TempDir,
+    root: std::path::PathBuf,
+}
 
-    for arg in ["../outside.rs", "src/../../outside.rs", "/etc/hosts"] {
-        let output = common::skim()
-            .args(["heatmap", arg])
-            .current_dir(dir.path())
+impl RepoPair {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical temp folder");
+        for name in ["a", "b", "plain"] {
+            std::fs::create_dir(root.join(name)).expect("create folder");
+        }
+        create_card_repo(&root.join("a"));
+        git_init(&root.join("b"));
+        git_commit(
+            &root.join("b"),
+            "main.rs",
+            "fn main() {}",
+            "feat: b",
+            recent_ts(),
+        );
+        std::fs::write(root.join("plain/loose.rs"), "fn loose() {}").expect("write file");
+        Self { _tmp: tmp, root }
+    }
+
+    fn path(&self, rel: &str) -> std::path::PathBuf {
+        self.root.join(rel)
+    }
+
+    fn heatmap(&self, cwd: &str, args: &[&str]) -> std::process::Output {
+        common::skim()
+            .arg("heatmap")
+            .args(args)
+            .env("GIT_CEILING_DIRECTORIES", &self.root)
+            .current_dir(self.path(cwd))
             .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1), "{arg}");
-        assert!(output.stdout.is_empty(), "{arg}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains(&format!("'{arg}' is outside the repository")),
-            "{arg}: {stderr}"
+            .expect("spawn skim heatmap")
+    }
+}
+
+#[test]
+fn test_heatmap_card_of_a_file_in_another_repo_comes_from_that_repo() {
+    let repos = RepoPair::new();
+    let own = repos.heatmap("a", &[CARD_FILE]);
+    assert!(own.status.success(), "{own:?}");
+    let expected = String::from_utf8(own.stdout).unwrap();
+    assert_eq!(
+        card_lines(&expected, CARD_FILE).first().copied(),
+        Some("src/core.rs: 9 commits")
+    );
+
+    let absolute = repos.path("a/src/core.rs");
+    let absolute = absolute.to_str().unwrap();
+    for (cwd, arg) in [
+        ("b", absolute),
+        ("b", "../a/src/core.rs"),
+        ("b", "../a/src/../src/./core.rs"),
+        ("plain", absolute),
+        ("plain", "../a/src/core.rs"),
+    ] {
+        let output = repos.heatmap(cwd, &[arg]);
+        assert!(output.status.success(), "{cwd} {arg}: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{cwd} {arg}"
         );
     }
+}
+
+#[test]
+fn test_heatmap_path_scope_with_a_card_in_another_repo_is_relative_to_that_root() {
+    let repos = RepoPair::new();
+    let own = repos.heatmap("a", &["--path", "src", CARD_FILE]);
+    assert!(own.status.success(), "{own:?}");
+    let other = repos.heatmap("b", &["--path", "src", "../a/src/core.rs"]);
+    assert!(other.status.success(), "{other:?}");
+    assert_eq!(other.stdout, own.stdout);
+    // The scope narrows the history: the card differs from the full one.
+    let full = repos.heatmap("a", &[CARD_FILE]);
+    assert_ne!(own.stdout, full.stdout);
+}
+
+#[test]
+fn test_heatmap_json_card_of_a_file_in_another_repo_names_the_repo_path() {
+    let repos = RepoPair::new();
+    let output = repos.heatmap("b", &["--json", "../a/src/core.rs", "../a/src/util.rs"]);
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["file_targets"],
+        serde_json::json!(["src/core.rs", "src/util.rs"])
+    );
+}
+
+#[test]
+fn test_heatmap_card_path_in_no_repo_exits_1_and_names_the_path() {
+    let repos = RepoPair::new();
+    let loose = repos.path("plain/loose.rs");
+    let loose = loose.to_str().unwrap().to_string();
+    let missing = repos.path("plain/missing/gone.rs");
+    let missing = missing.to_str().unwrap().to_string();
+
+    for (cwd, arg) in [
+        ("a", "../plain/loose.rs"),
+        ("a", "src/../../plain/loose.rs"),
+        ("a", loose.as_str()),
+        ("a", missing.as_str()),
+        ("plain", "loose.rs"),
+        ("b", "../outside.rs"),
+    ] {
+        let output = repos.heatmap(cwd, &[arg]);
+        assert_eq!(output.status.code(), Some(1), "{cwd} {arg}");
+        assert!(output.stdout.is_empty(), "{cwd} {arg}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("'{arg}' is in no git repository")),
+            "{cwd} {arg}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_cards_from_two_repos_exit_1_with_no_card() {
+    let repos = RepoPair::new();
+    for (cwd, args) in [
+        ("a", [CARD_FILE, "../b/main.rs"]),
+        ("b", ["main.rs", "../a/src/core.rs"]),
+        ("plain", ["../a/src/core.rs", "../b/main.rs"]),
+    ] {
+        let output = repos.heatmap(cwd, &args);
+        assert_eq!(output.status.code(), Some(1), "{cwd} {args:?}");
+        assert!(output.stdout.is_empty(), "{cwd} {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "'{}' and '{}' are in different repositories",
+                args[0], args[1]
+            )),
+            "{cwd} {args:?}: {stderr}"
+        );
+    }
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout.clone()).expect("utf-8 stdout")
+}
+
+fn assert_refused(output: &std::process::Output, message: &str) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(message), "want {message:?} in {stderr}");
+}
+
+#[test]
+fn test_heatmap_card_of_a_repo_root_names_the_root() {
+    let repos = RepoPair::new();
+    for (cwd, arg) in [
+        ("a", "."),
+        ("a", "./"),
+        ("a/src", ".."),
+        ("b", "../a"),
+        ("plain", "../a"),
+    ] {
+        let output = repos.heatmap(cwd, &[arg]);
+        assert_refused(
+            &output,
+            &format!("'{arg}' names the repository root, not a file"),
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_card_with_git_dir_set_keeps_the_cwd_repo() {
+    let repos = RepoPair::new();
+    let expected = stdout_of(&repos.heatmap("a", &[CARD_FILE]));
+    let absolute = repos.path("a/.git");
+    for git_dir in [std::ffi::OsStr::new(".git"), absolute.as_os_str()] {
+        let output = common::skim()
+            .args(["heatmap", CARD_FILE])
+            .env("GIT_CEILING_DIRECTORIES", &repos.root)
+            .env("GIT_DIR", git_dir)
+            .current_dir(repos.path("a"))
+            .output()
+            .unwrap();
+        assert_eq!(stdout_of(&output), expected, "GIT_DIR={git_dir:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_card_through_a_symlinked_folder_in_the_cwd_repo_keeps_the_cwd_repo() {
+    let repos = RepoPair::new();
+    // The link is in repo `a`, and it points into repo `b`.
+    std::os::unix::fs::symlink(repos.path("b"), repos.path("a/linkdir")).expect("symlink");
+    let text = stdout_of(&repos.heatmap("a", &["linkdir/main.rs"]));
+    let card = card_lines(&text, "linkdir/main.rs");
+    assert_eq!(card.len(), 1, "{text}");
+    assert!(
+        card[0].starts_with("linkdir/main.rs: not in history window ("),
+        "{text}"
+    );
+}
+
+#[test]
+fn test_heatmap_card_path_that_leaves_and_reenters_the_cwd_repo_gives_the_card() {
+    let repos = RepoPair::new();
+    let expected = stdout_of(&repos.heatmap("a", &[CARD_FILE]));
+    assert_eq!(
+        stdout_of(&repos.heatmap("a", &["../a/src/core.rs"])),
+        expected
+    );
+    assert_eq!(
+        stdout_of(&repos.heatmap("a/src", &["../../a/src/core.rs"])),
+        expected
+    );
+}
+
+#[test]
+fn test_heatmap_card_with_path_scope_from_a_subfolder_keeps_the_cwd_scope() {
+    let repos = RepoPair::new();
+    let expected = stdout_of(&repos.heatmap("a", &["--path", "src", CARD_FILE]));
+    assert_eq!(
+        stdout_of(&repos.heatmap("a/src", &["--path", ".", "core.rs"])),
+        expected
+    );
+}
+
+#[test]
+fn test_heatmap_card_git_failure_in_another_repo_names_the_path() {
+    let repos = RepoPair::new();
+    let output = repos.heatmap("b", &["../a/.git/config"]);
+    assert_refused(
+        &output,
+        "'../a/.git/config': git rev-parse --show-toplevel failed",
+    );
+}
+
+#[test]
+fn test_heatmap_cards_in_one_folder_of_another_repo_ask_git_once_for_the_root() {
+    let repos = RepoPair::new();
+    let trace = repos.path("trace.log");
+    let output = common::skim()
+        .args([
+            "heatmap",
+            "../a/src/core.rs",
+            "../a/src/util.rs",
+            "../a/src/gone.rs",
+        ])
+        .env("GIT_CEILING_DIRECTORIES", &repos.root)
+        .env("GIT_TRACE", &trace)
+        .current_dir(repos.path("b"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let log = std::fs::read_to_string(&trace).expect("git trace");
+    // One call for the cwd root, one for the folder `a/src`, and one in the
+    // run itself. Without the cache of each folder, each file adds a call.
+    let calls = log
+        .lines()
+        .filter(|l| l.contains("rev-parse --show-toplevel"))
+        .count();
+    assert_eq!(calls, 3, "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_card_path_through_a_symlinked_folder_stays_refused() {
+    let repos = RepoPair::new();
+    let link = repos.path("link");
+    std::os::unix::fs::symlink(repos.path("a"), &link).expect("symlink");
+    let arg = link.join("src/core.rs");
+    let arg = arg.to_str().unwrap();
+
+    let output = repos.heatmap("b", &[arg]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty());
+    // This error cuts a path longer than 72 chars to 69 chars and "...".
+    let shown = if arg.chars().count() <= 72 {
+        arg.to_string()
+    } else {
+        format!("{}...", arg.chars().take(69).collect::<String>())
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("'{shown}' is outside the repository root")),
+        "{stderr}"
+    );
 }
 
 #[cfg(unix)]
