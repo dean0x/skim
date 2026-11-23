@@ -565,6 +565,22 @@ mod tests {
     }
 
     #[test]
+    fn test_map_refuses_non_numeric_tokens() {
+        assert_eq!(
+            parse_error(&["--map", "--tokens", "abc"]),
+            "--tokens requires a positive integer"
+        );
+    }
+
+    #[test]
+    fn test_map_refuses_negative_tokens() {
+        assert_eq!(
+            parse_error(&["--map", "--tokens=-5"]),
+            "--tokens requires a positive integer"
+        );
+    }
+
+    #[test]
     fn test_map_refuses_zero_tokens() {
         assert_eq!(
             parse_error(&["--map", "--tokens", "0"]),
