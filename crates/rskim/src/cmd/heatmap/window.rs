@@ -426,7 +426,7 @@ mod tests {
         ) -> anyhow::Result<super::super::git_source::HeadCounts> {
             Ok(Vec::new())
         }
-        fn read_blob(&self, _oid: &str, _size: u64) -> Option<String> {
+        fn read_blob(&self, _oid: &str, _size: u64, _no_lazy_fetch: bool) -> Option<String> {
             None
         }
         fn show_prefix(&self) -> anyhow::Result<String> {

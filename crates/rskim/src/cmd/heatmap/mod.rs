@@ -346,8 +346,14 @@ struct PreparedCommits {
     warnings: Vec<String>,
     /// Package roots for module labels; empty means the top-folder rule.
     module_roots: ModuleRoots,
-    head_tree: Option<HeadTree>,
+    head: Option<HeadData>,
     excludes: Excludes,
+}
+
+/// Pair the HEAD tree with the fetch rule for later reads of its blobs.
+struct HeadData {
+    tree: HeadTree,
+    no_lazy_fetch: bool,
 }
 
 /// Execute Steps 1–4 of the heatmap pipeline (git I/O + exclusions).
@@ -502,7 +508,7 @@ fn prepare_commits(
     }
     warnings.extend(skipped_warning);
 
-    let (module_roots, head_tree) =
+    let (module_roots, head) =
         load_head_data(source, &repo_root, config.path.as_deref(), &mut warnings);
 
     Ok(Some(PreparedCommits {
@@ -513,7 +519,7 @@ fn prepare_commits(
         repo_root,
         warnings,
         module_roots,
-        head_tree,
+        head,
         excludes,
     }))
 }
@@ -546,7 +552,7 @@ fn load_head_data(
     repo_root: &str,
     path: Option<&str>,
     warnings: &mut Vec<String>,
-) -> (ModuleRoots, Option<HeadTree>) {
+) -> (ModuleRoots, Option<HeadData>) {
     let no_lazy_fetch = source.detect_partial_clone(repo_root);
     let Ok(mut entries) = source.list_tracked_files(repo_root, no_lazy_fetch) else {
         warnings.push(HEAD_UNAVAILABLE.into());
@@ -570,7 +576,13 @@ fn load_head_data(
             "HEAD data: {unmatched} line-count rows have no tree entry."
         ));
     }
-    (roots, Some(entries))
+    (
+        roots,
+        Some(HeadData {
+            tree: entries,
+            no_lazy_fetch,
+        }),
+    )
 }
 
 fn trace_head_data(head_tree: Option<&HeadTree>) {
@@ -616,15 +628,16 @@ fn run_with_source(
         repo_root,
         warnings,
         module_roots,
-        head_tree,
+        head,
         excludes,
     } = match prepare_commits(source, args)? {
         Some(p) => p,
         None => return Ok(ExitCode::FAILURE),
     };
 
+    let head_tree = head.as_ref().map(|head| &head.tree);
     if config.debug {
-        trace_head_data(head_tree.as_ref());
+        trace_head_data(head_tree);
     }
 
     // Steps 5-9: Compute metrics and assemble result
@@ -638,7 +651,7 @@ fn run_with_source(
         warnings,
         &module_roots,
     );
-    let (mut result, at_head) = keep_at_head(result, head_tree.as_ref(), &config.targets);
+    let (mut result, at_head) = keep_at_head(result, head_tree, &config.targets);
     result.not_at_head = at_head.not_at_head;
     let spec = view::ViewSpec::from_config(&config);
 
@@ -674,8 +687,9 @@ fn run_with_source(
 
     // Step 10: Render
     let elapsed = start_time.elapsed();
-    let mut symbols =
-        symbols::Reader::new(head_tree.as_ref(), |oid, size| source.read_blob(oid, size));
+    let mut symbols = symbols::Reader::new(head_tree, |oid, size| {
+        source.read_blob(oid, size, head.as_ref()?.no_lazy_fetch)
+    });
     let label = write_output(out, &result, &config, &spec, cards.as_ref(), |path| {
         symbols.read(path)
     })?;
@@ -1140,24 +1154,27 @@ mod tests {
     fn test_heatmap_stderr_source_contract() {
         let direct_stderr = regex::Regex::new(r"\b(?:eprint|eprintln|debug_log)\s*!").unwrap();
         let runner_with_marker = regex::Regex::new(r"\.\s*run(?:_with_env)?\s*\(").unwrap();
-        for (file, source) in [
-            ("args.rs", include_str!("args.rs")),
-            ("card.rs", include_str!("card.rs")),
-            ("excludes.rs", include_str!("excludes.rs")),
-            ("git_source.rs", include_str!("git_source.rs")),
-            ("insights.rs", include_str!("insights.rs")),
-            ("map.rs", include_str!("map.rs")),
-            ("metrics.rs", include_str!("metrics.rs")),
-            ("mod.rs", include_str!("mod.rs")),
-            ("noise.rs", include_str!("noise.rs")),
-            ("output.rs", include_str!("output.rs")),
-            ("types.rs", include_str!("types.rs")),
-            ("view.rs", include_str!("view.rs")),
-            ("window.rs", include_str!("window.rs")),
-        ] {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/heatmap");
+        let mod_source = std::fs::read_to_string(dir.join("mod.rs")).unwrap();
+        let (production, _) = mod_source.split_once("\n#[cfg(test)]").unwrap();
+        let module_decl = regex::Regex::new(
+            r"(?m)^(?:pub(?:\([^\n)]+\))?[ \t]+)?mod[ \t]+([a-zA-Z_][a-zA-Z_0-9]*)[ \t]*;",
+        )
+        .unwrap();
+        let declared: Vec<_> = module_decl
+            .captures_iter(production)
+            .map(|m| m.get(1).unwrap().as_str())
+            .collect();
+        assert!(declared.len() >= 13, "module scan found {declared:?}");
+
+        for module in std::iter::once("mod").chain(declared) {
+            let file = format!("{module}.rs");
+            let source = std::fs::read_to_string(dir.join(&file))
+                .unwrap_or_else(|err| panic!("{file}: {err}"));
             let production = source.split("\n#[cfg(test)]").next().unwrap();
+            assert!(!production.is_empty(), "{file}: no production source");
             assert!(!direct_stderr.is_match(production), "{file}: stderr macro");
-            if file == "git_source.rs" {
+            if module == "git_source" {
                 assert!(
                     !runner_with_marker.is_match(production),
                     "{file}: runner call"
@@ -1659,7 +1676,7 @@ mod tests {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("simulated grep failure"))
         }
-        fn read_blob(&self, _oid: &str, _size: u64) -> Option<String> {
+        fn read_blob(&self, _oid: &str, _size: u64, _no_lazy_fetch: bool) -> Option<String> {
             self.blob_calls.set(self.blob_calls.get() + 1);
             None
         }
@@ -1697,7 +1714,7 @@ mod tests {
             *source.count_calls.borrow(),
             [("/stub/repo".into(), Some("src".into()))]
         );
-        let tree = prepared.head_tree.unwrap();
+        let tree = prepared.head.unwrap().tree;
         assert_eq!(tree["src/main.rs"], regular(Some(12)));
         assert_eq!(tree["src/link.rs"], HeadEntry::Other);
         assert_eq!(tree["src/binary.rs"], regular(None));
@@ -1720,7 +1737,7 @@ mod tests {
                 .unwrap()
                 .expect("the run continues");
             assert_eq!(source.count_calls.borrow().len(), count_calls);
-            assert!(prepared.head_tree.is_none());
+            assert!(prepared.head.is_none());
             assert_eq!(prepared.warnings, [HEAD_UNAVAILABLE]);
             assert_eq!(prepared.commits.len(), 1);
         }

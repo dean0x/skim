@@ -91,7 +91,7 @@ pub(crate) trait GitDataSource {
     ) -> anyhow::Result<HeadCounts>;
 
     /// Read the exact text of a listed HEAD blob, or reject the result.
-    fn read_blob(&self, oid: &str, size: u64) -> Option<String>;
+    fn read_blob(&self, oid: &str, size: u64, no_lazy_fetch: bool) -> Option<String>;
 
     /// Return the path of the cwd below the repository root
     /// (`git rev-parse --show-prefix`): empty at the root, else it ends in `/`.
@@ -377,8 +377,11 @@ impl GitDataSource for CliGitSource {
         head_line_counts_from(&out, cut)
     }
 
-    fn read_blob(&self, oid: &str, size: u64) -> Option<String> {
-        read_blob_with(oid, size, |args| self.run_git(args))
+    fn read_blob(&self, oid: &str, size: u64, no_lazy_fetch: bool) -> Option<String> {
+        read_blob_with(oid, size, no_lazy_fetch, |args| {
+            let full = with_dir(self.dir.as_deref(), args);
+            self.runner.run_stdout_bytes_degrade("git", &full)
+        })
     }
 
     fn show_prefix(&self) -> anyhow::Result<String> {
@@ -549,18 +552,22 @@ pub(crate) enum HeadEntry {
 fn read_blob_with(
     oid: &str,
     size: u64,
-    run: impl FnOnce(&[&str]) -> anyhow::Result<(CommandOutput, bool)>,
+    no_lazy_fetch: bool,
+    run: impl FnOnce(&[&str]) -> anyhow::Result<(CommandOutput<Vec<u8>>, bool)>,
 ) -> Option<String> {
     if !is_object_id(oid) {
         return None;
     }
+    // A partial clone can lack the object at read time, even after a full listing.
+    let mut args = Vec::with_capacity(5);
+    args.extend(no_lazy_fetch.then_some("--no-lazy-fetch"));
     // The ID names the bytes themselves, not a substitute from a replace ref.
-    let (out, cut) = run(&["--no-replace-objects", "cat-file", "blob", oid]).ok()?;
-    (!cut
-        && out.exit_code == Some(0)
-        && u64::try_from(out.stdout.len()).ok() == Some(size)
-        && !out.stdout.contains(char::REPLACEMENT_CHARACTER))
-    .then_some(out.stdout)
+    args.extend(["--no-replace-objects", "cat-file", "blob", oid]);
+    let (out, cut) = run(&args).ok()?;
+    if cut || out.exit_code != Some(0) || u64::try_from(out.stdout.len()).ok() != Some(size) {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 /// Reject a partial listing. A missing row could otherwise look like a deletion.
@@ -1670,18 +1677,38 @@ mod tests {
         );
     }
 
+    fn blob_output(stdout: &[u8], exit_code: Option<i32>) -> CommandOutput<Vec<u8>> {
+        CommandOutput {
+            stdout: stdout.to_vec(),
+            stderr: String::new(),
+            exit_code,
+            duration: Duration::ZERO,
+        }
+    }
+
     #[test]
     fn test_blob_read_submits_only_a_checked_object_id() {
         for oid in ["a".repeat(40), "B".repeat(64)] {
-            let blob = read_blob_with(&oid, 3, |args| {
-                assert_eq!(args, ["--no-replace-objects", "cat-file", "blob", &oid]);
-                Ok((output("é\n", Some(0)), false))
-            });
-            assert_eq!(blob.as_deref(), Some("é\n"));
+            let full = ["--no-replace-objects", "cat-file", "blob", oid.as_str()];
+            let partial = [
+                "--no-lazy-fetch",
+                "--no-replace-objects",
+                "cat-file",
+                "blob",
+                &oid,
+            ];
+            for (no_lazy_fetch, expected) in [(false, full.as_slice()), (true, partial.as_slice())]
+            {
+                let blob = read_blob_with(&oid, 3, no_lazy_fetch, |args| {
+                    assert_eq!(args, expected);
+                    Ok((blob_output("é\n".as_bytes(), Some(0)), false))
+                });
+                assert_eq!(blob.as_deref(), Some("é\n"));
+            }
         }
         for oid in ["-h", "HEAD:src/main.rs", &"g".repeat(40), &"a".repeat(39)] {
             assert_eq!(
-                read_blob_with(oid, 0, |_| panic!("invalid oid reached git")),
+                read_blob_with(oid, 0, false, |_| panic!("invalid oid reached git")),
                 None
             );
         }
@@ -1690,21 +1717,25 @@ mod tests {
     #[test]
     fn test_blob_read_rejects_an_incomplete_or_non_text_result() {
         for (stdout, size, code, cut) in [
-            ("abc", 3, Some(128), false),
-            ("abc", 3, None, false),
-            ("abc", 3, Some(0), true),
-            ("ab", 3, Some(0), false),
-            ("abcd", 3, Some(0), false),
-            ("\u{fffd}", 3, Some(0), false),
+            (b"abc".as_slice(), 3, Some(128), false),
+            (b"abc", 3, None, false),
+            (b"abc", 3, Some(0), true),
+            (b"ab", 3, Some(0), false),
+            (b"abcd", 3, Some(0), false),
+            (b"\xe9", 1, Some(0), false),
+            (b"\xf0\x9f\x98", 3, Some(0), false),
         ] {
             assert_eq!(
-                read_blob_with(&"a".repeat(40), size, |_| Ok((output(stdout, code), cut))),
+                read_blob_with(&"a".repeat(40), size, false, |_| Ok((
+                    blob_output(stdout, code),
+                    cut
+                ))),
                 None,
                 "{stdout:?}, {size}, {code:?}, {cut}"
             );
         }
         assert_eq!(
-            read_blob_with(&"a".repeat(40), 0, |_| anyhow::bail!("failed")),
+            read_blob_with(&"a".repeat(40), 0, false, |_| anyhow::bail!("failed")),
             None
         );
     }
@@ -1967,7 +1998,80 @@ mod tests {
         };
         assert_eq!((*size, *lines), (2, None));
         let source = CliGitSource::in_dir(root.to_str().unwrap().into());
-        assert_eq!(source.read_blob(oid, *size).as_deref(), Some("x\n"));
+        assert_eq!(source.read_blob(oid, *size, false).as_deref(), Some("x\n"));
+    }
+
+    #[test]
+    fn test_partial_clone_blob_read_leaves_missing_object_unfetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q", "source"]);
+        let remote = root.join("source");
+        git_in(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        add_files(&remote, &["a.rs"]);
+        git_in(&remote, &["commit", "-q", "-m", "one"]);
+        let oid = git_in(&remote, &["rev-parse", "HEAD:a.rs"]);
+        let oid = oid.trim();
+        git_in(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                "--filter=blob:none",
+                "source",
+                "clone",
+            ],
+        );
+        let clone = root.join("clone");
+        git_in(&clone, &["config", "protocol.file.allow", "always"]);
+        let missing = git_in(
+            &clone,
+            &["rev-list", "--objects", "--missing=print", "HEAD"],
+        );
+        assert!(
+            missing
+                .lines()
+                .any(|line| line.strip_prefix('?') == Some(oid)),
+            "{missing}"
+        );
+        let before = git_in(&clone, &["count-objects", "-v"]);
+        let clone_path = clone.to_str().unwrap();
+        let source = CliGitSource::in_dir(clone_path.into());
+        let no_lazy_fetch = source.detect_partial_clone(clone_path);
+        assert!(no_lazy_fetch);
+
+        let text = source.read_blob(oid, 2, no_lazy_fetch);
+
+        assert_eq!(git_in(&clone, &["count-objects", "-v"]), before);
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn test_blob_reader_keeps_declarations_in_text_with_replacement_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), "// \u{fffd}\nfn keep() {}\n").unwrap();
+        git_in(root, &["add", "a.rs"]);
+        git_in(root, &["commit", "-q", "-m", "one"]);
+        let root = root.to_str().unwrap();
+        let source = CliGitSource::in_dir(root.into());
+        let tree = source.list_tracked_files(root, false).unwrap();
+        let mut reader = super::super::symbols::Reader::new(Some(&tree), |oid, size| {
+            source.read_blob(oid, size, false)
+        });
+
+        let symbols = reader.read("a.rs");
+
+        assert_eq!(symbols.reason, None);
+        assert_eq!(symbols.rows.len(), 1);
+        assert_eq!(
+            (symbols.rows[0].name.as_str(), symbols.rows[0].line),
+            ("keep", 2)
+        );
     }
 
     #[test]
@@ -1983,7 +2087,7 @@ mod tests {
 
         let source = CliGitSource::in_dir(root.to_str().unwrap().into());
         assert_eq!(
-            source.read_blob(original.trim(), 9).as_deref(),
+            source.read_blob(original.trim(), 9, false).as_deref(),
             Some("original\n")
         );
     }

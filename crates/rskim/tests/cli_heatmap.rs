@@ -1748,6 +1748,27 @@ fn test_heatmap_head_reads_leave_partial_clone_objects_unchanged() {
         json["warnings"],
         serde_json::json!(["HEAD data is not available. Hotspots rank by commits only."])
     );
+
+    let output = common::skim()
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env_remove("GIT_NO_LAZY_FETCH")
+        .args(["heatmap", "--since", "1700000500", "--map"])
+        .current_dir(&clone)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        local_git(&clone, &["count-objects", "-v"]),
+        before,
+        "map: object store grew"
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.ends_with(
+            "[skim] 1 of 1 files; read error: 1 — adjust the map budget with --tokens\n"
+        ),
+        "{text}"
+    );
 }
 
 #[test]
@@ -5058,6 +5079,41 @@ fn test_heatmap_map_shows_method_names_but_not_key_expressions() {
         );
     }
     assert!(!text.contains("keyFor"), "{text}");
+}
+
+#[test]
+fn test_heatmap_map_keeps_valid_utf8_symbols_and_reports_invalid_utf8() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    for (path, content) in [
+        ("valid.rs", "// \u{fffd}\nfn keep() {}\n".as_bytes()),
+        ("latin1.rs", b"// \xe9\nfn latin1() {}\n".as_slice()),
+        ("cut.rs", b"fn cut() {}\n// \xf0\x9f\x98".as_slice()),
+    ] {
+        std::fs::write(root.join(path), content).unwrap();
+    }
+    let added = StdCommand::new("git")
+        .args(["add", "--", "valid.rs", "latin1.rs", "cut.rs"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(added.status.success(), "{added:?}");
+    git_commit_staged(root, "feat: add files", MAP_COMMIT_TIME);
+
+    let text = heatmap_stdout(root, MAP_ARGS);
+
+    assert!(text.contains("  function_item keep:2\n"), "{text}");
+    assert!(
+        !text.contains("  function_item latin1:") && !text.contains("  function_item cut:"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(
+            "[skim] 3 of 3 files; read error: 2 — adjust the map budget with --tokens\n"
+        ),
+        "{text}"
+    );
 }
 
 #[test]
