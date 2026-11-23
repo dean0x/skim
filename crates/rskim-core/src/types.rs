@@ -1312,6 +1312,8 @@ impl Parser {
         Self::new_for_extension(language, grammar_extension(path))
     }
 
+    /// Pair every Markdown block grammar with [`Language::Markdown`].
+    /// The language value, not the grammar, enables the Markdown limit check.
     fn with_grammar(language: Language, grammar: &tree_sitter::Language) -> Result<Self> {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(grammar)?;
