@@ -4,6 +4,7 @@
 //! For tests that need a git repo, we create a TempDir and set up deterministic commits.
 
 use predicates::prelude::*;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command as StdCommand;
 mod common;
@@ -37,9 +38,10 @@ fn git_init(dir: &Path) {
         .ok();
 }
 
-fn git_set_quote_path(dir: &Path, value: &str) {
+fn git_config(dir: &Path, key: &str, value: impl AsRef<OsStr>) {
     let out = StdCommand::new("git")
-        .args(["config", "core.quotePath", value])
+        .args(["config", key])
+        .arg(value)
         .current_dir(dir)
         .output()
         .unwrap();
@@ -571,6 +573,21 @@ fn test_heatmap_since_date_errors_name_all_forms() {
 }
 
 #[test]
+fn test_heatmap_since_duration_out_of_range_is_a_usage_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    common::skim()
+        .args(["heatmap", "--since", "200000000000000d"])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "--since expects epoch seconds, a UTC date (YYYY-MM-DD), or a duration (Nd, Nh, Nw)",
+        ))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+#[test]
 fn test_heatmap_since_far_future_date_excludes_history() {
     let dir = tempfile::tempdir().expect("tempdir");
     git_init(dir.path());
@@ -891,6 +908,43 @@ fn test_heatmap_last_flag() {
         .current_dir(dir.path())
         .assert()
         .success();
+}
+
+#[test]
+fn test_heatmap_counts_signed_commits_with_signature_display_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    let key = root.join(".git").join("fixture-signing-key");
+    let keygen = StdCommand::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .output();
+    let keygen = match keygen {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skip signed heatmap test: ssh-keygen is not available");
+            return;
+        }
+        result => result.expect("spawn ssh-keygen"),
+    };
+    assert!(keygen.status.success(), "ssh-keygen failed: {keygen:?}");
+    let signers = root.join(".git").join("fixture-allowed-signers");
+    let public_key = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    std::fs::write(&signers, format!("test@example.com {public_key}")).unwrap();
+    git_config(root, "gpg.format", "ssh");
+    git_config(root, "gpg.ssh.allowedSignersFile", &signers);
+    git_config(root, "user.signingkey", &key);
+    git_config(root, "commit.gpgsign", "true");
+    git_config(root, "log.showSignature", "true");
+    let ts = 1_700_000_000;
+    for (i, text) in ["one", "two", "three"].into_iter().enumerate() {
+        git_commit(root, "a.rs", text, text, ts + i as u64);
+    }
+
+    let all = heatmap_json_with(root, &["--window", "all"]);
+    assert_eq!(all["window"]["commits_analyzed"], 3, "{all}");
+    let last = heatmap_json_with(root, &["--last", "2"]);
+    assert_eq!(last["window"]["commits_analyzed"], 2, "{last}");
 }
 
 // ============================================================================
@@ -1478,7 +1532,7 @@ fn test_heatmap_counts_quoted_head_paths_from_a_subfolder() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git_init(root);
-    git_set_quote_path(root, "true");
+    git_config(root, "core.quotePath", "true");
     git_commit_files(
         root,
         &[("top.rs", "a\n"), ("src/deep/café.rs", "a\nb\n")],
@@ -1495,6 +1549,38 @@ fn test_heatmap_counts_quoted_head_paths_from_a_subfolder() {
     let scoped = heatmap_json_with(&cwd, &["--window", "all", "--path", "deep"]);
     assert_eq!(sorted_paths(&scoped, "files"), [quoted]);
     assert_eq!(file_entry(&scoped, quoted)["lines"], 2, "{scoped}");
+}
+
+#[test]
+fn test_heatmap_uses_root_relative_git_paths_with_diff_relative_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let ts = 1_700_000_000;
+    git_init(root);
+    git_config(root, "diff.relative", "true");
+    git_commit(root, "base.rs", "base\n", "feat: add base", ts);
+    git_commit(root, "top.rs", "top\n", "feat: add top", ts + 1);
+    git_commit(root, "src/a.rs", "one\ntwo\n", "feat: add source", ts + 2);
+
+    let cwd = root.join("src");
+    let all = heatmap_json_with(&cwd, &["--window", "all"]);
+    assert_eq!(
+        sorted_paths(&all, "files"),
+        ["base.rs", "src/a.rs", "top.rs"],
+        "{all}"
+    );
+    assert_eq!(all["files"][0]["path"], "src/a.rs", "{all}");
+    assert_eq!(all["files"][0]["score"], 2, "{all}");
+    assert_eq!(all["left_out"]["not_at_head"].as_u64().unwrap_or(0), 0);
+
+    let scoped = heatmap_json_with(&cwd, &["--window", "all", "--path", "a.rs"]);
+    assert_eq!(sorted_paths(&scoped, "files"), ["src/a.rs"], "{scoped}");
+    let diff = heatmap_json_with(&cwd, &["--window", "all", "--diff", "HEAD~2"]);
+    assert_eq!(
+        sorted_paths(&diff, "files"),
+        ["src/a.rs", "top.rs"],
+        "{diff}"
+    );
 }
 
 #[test]
@@ -2117,7 +2203,7 @@ fn test_heatmap_card_warning_uses_the_safe_path_in_text_and_json() {
 
 fn diff_warning_repo(root: &Path) {
     git_init(root);
-    git_set_quote_path(root, "false");
+    git_config(root, "core.quotePath", "false");
     let git = |args: &[&str]| {
         let out = StdCommand::new("git")
             .args(args)
@@ -3979,7 +4065,7 @@ fn test_heatmap_default_detail_and_insights_use_the_card_path_form() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     git_init(root);
-    git_set_quote_path(root, "false");
+    git_config(root, "core.quotePath", "false");
     let path = "src/a\u{202e}.rs";
     let shown = "src/a�.rs";
     for i in 0..3 {

@@ -98,6 +98,9 @@ pub(crate) struct CliGitSource {
 
 /// Build the `git log` arg list for a window start and an optional `--path`.
 ///
+/// Disable signature output so each record contains only the expected rows.
+/// Keep paths root-relative so they match the HEAD tree and line counts.
+///
 /// `--literal-pathspecs` goes before the subcommand, so git reads the path
 /// after `--` as a literal path: a folder still matches the files below it,
 /// but a glob or a pathspec magic prefix matches only that literal name. It is
@@ -106,6 +109,10 @@ pub(crate) struct CliGitSource {
 /// no environment.
 fn build_git_log_args(since: Option<u64>, path: Option<&str>) -> Vec<String> {
     let mut args = vec![
+        "-c".to_string(),
+        "log.showSignature=false".to_string(),
+        "-c".to_string(),
+        "diff.relative=false".to_string(),
         "--literal-pathspecs".to_string(),
         "log".to_string(),
         LOG_FORMAT.to_string(),
@@ -131,11 +138,15 @@ fn build_git_log_args(since: Option<u64>, path: Option<&str>) -> Vec<String> {
 
 /// Build the `git diff` arg list for the files changed between `base` and HEAD.
 ///
+/// Keep paths root-relative so the targets match the history paths.
+///
 /// `--end-of-options` makes git read the next argument as a revision, so the
 /// `--diff` value reaches git as a value only. The revision must never go
 /// after `--`: git reads anything there as a path.
 fn build_diff_args(base: &str) -> Vec<String> {
     vec![
+        "-c".to_string(),
+        "diff.relative=false".to_string(),
         "diff".to_string(),
         "--name-only".to_string(),
         "--end-of-options".to_string(),
@@ -232,7 +243,10 @@ impl GitDataSource for CliGitSource {
         }
         let skip = n.saturating_sub(1).to_string();
         let n_str = n.to_string();
+        // The first line must be a timestamp, not a signature report.
         let out = self.capture_git(&[
+            "-c",
+            "log.showSignature=false",
             "log",
             "--format=%ad",
             "--date=unix",
@@ -1040,6 +1054,41 @@ mod tests {
     }
 
     #[test]
+    fn test_rename_follows_only_the_new_file_after_path_reuse() {
+        let input = format!(
+            "{}:100644 100644 5678 5678 R100\told.rs\tnew.rs\n0\t0\told.rs => new.rs\n\n\
+             {}:000000 100644 0000 5678 A\told.rs\n1\t0\told.rs\n\n\
+             {}:100644 000000 1234 0000 D\told.rs\n0\t1\told.rs\n\n\
+             {}:000000 100644 0000 1234 A\told.rs\n1\t0\told.rs\n",
+            header(HASH_A, "4000", "Alice", "rename second file"),
+            header(HASH_B, "3000", "Alice", "add second file"),
+            header(
+                "cccccccccccccccccccccccccccccccccccccccc",
+                "2000",
+                "Alice",
+                "delete first file"
+            ),
+            header(
+                "dddddddddddddddddddddddddddddddddddddddd",
+                "1000",
+                "Alice",
+                "add first file"
+            ),
+        );
+
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(
+            parsed.commits.iter().map(paths).collect::<Vec<_>>(),
+            [
+                vec![],
+                vec![Path::new("new.rs")],
+                vec![Path::new("old.rs")],
+                vec![Path::new("old.rs")]
+            ]
+        );
+    }
+
+    #[test]
     fn test_rename_cycle_resolves_to_one_path_in_one_pass() {
         let input = format!(
             "{}:100644 100644 1234 5678 R90\tb.rs\ta.rs\n1\t0\tb.rs => a.rs\n\n\
@@ -1122,6 +1171,10 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-c",
+                "log.showSignature=false",
+                "-c",
+                "diff.relative=false",
                 "--literal-pathspecs",
                 "log",
                 "--format=COMMIT:%H%x00%ad%x00%aN%x00%s",
@@ -1151,7 +1204,11 @@ mod tests {
     #[test]
     fn test_git_log_args_read_the_path_value_as_a_literal_path() {
         let args = build_git_log_args(None, Some("*"));
-        assert_eq!(args[..2], ["--literal-pathspecs", "log"], "args: {args:?}");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--literal-pathspecs", "log"]),
+            "args: {args:?}"
+        );
         assert_eq!(args[args.len() - 2..], ["--", "*"], "args: {args:?}");
         assert_eq!(
             args.iter().filter(|a| a.as_str() == "--").count(),
@@ -1164,7 +1221,14 @@ mod tests {
     fn test_diff_args_put_end_of_options_before_revision() {
         assert_eq!(
             build_diff_args("main"),
-            vec!["diff", "--name-only", "--end-of-options", "main...HEAD"]
+            vec![
+                "-c",
+                "diff.relative=false",
+                "diff",
+                "--name-only",
+                "--end-of-options",
+                "main...HEAD",
+            ]
         );
         let args = build_diff_args("-x");
         let end = args.iter().position(|a| a == "--end-of-options").unwrap();
@@ -1182,7 +1246,14 @@ mod tests {
             let rev = format!("{base}...HEAD");
             assert_eq!(
                 build_diff_args(base),
-                vec!["diff", "--name-only", "--end-of-options", rev.as_str()],
+                vec![
+                    "-c",
+                    "diff.relative=false",
+                    "diff",
+                    "--name-only",
+                    "--end-of-options",
+                    rev.as_str(),
+                ],
                 "--diff {base:?}"
             );
         }
