@@ -404,6 +404,7 @@ impl Default for FixRiskMetrics {
 /// A coupling entry in a file's blast radius.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CouplingEntry {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     /// Confidence score (0.0–1.0).
     pub(crate) confidence: f64,
@@ -414,7 +415,9 @@ pub(crate) struct CouplingEntry {
 /// A directed coupling edge in the global graph.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CouplingEdge {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) a: String,
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) b: String,
     pub(crate) confidence: f64,
     pub(crate) support: usize,
@@ -423,6 +426,7 @@ pub(crate) struct CouplingEdge {
 /// Encapsulation health for a module directory.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModuleHealth {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     /// Percentage of commits touching only this module (0.0–100.0).
     pub(crate) encapsulation_pct: f64,
@@ -468,7 +472,10 @@ pub(crate) enum InsightCategory {
 pub(crate) struct Insight {
     pub(crate) severity: Severity,
     pub(crate) category: InsightCategory,
+    #[serde(skip)]
     pub(crate) file: String,
+    #[serde(rename = "file")]
+    pub(crate) shown_file: String,
     pub(crate) message: String,
     pub(crate) metric_value: f64,
     /// Commits behind the finding: commits of the file or the module, or the
@@ -532,6 +539,7 @@ pub(crate) struct InsightsResult {
 /// Condensed file entry for [`InsightsResult`].
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CompactFileEntry {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     pub(crate) stability: u8,
     pub(crate) churn_commits: usize,
@@ -542,6 +550,7 @@ pub(crate) struct CompactFileEntry {
 /// Flagged module entry for [`InsightsResult`].
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CompactModuleEntry {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     pub(crate) encapsulation_pct: f64,
     pub(crate) cross_boundary: usize,

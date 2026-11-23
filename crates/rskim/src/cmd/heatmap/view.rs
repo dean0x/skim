@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use super::card::Card;
+use super::card::{Card, serialize_path, shown_path};
 use super::metrics::edge_order;
 use super::noise;
 use super::types::{
@@ -315,6 +315,7 @@ impl<T> Section<T> {
 /// A file above the fix-risk base rate.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(crate) struct FixRiskRow<'a> {
+    #[serde(serialize_with = "serialize_path")]
     pub(crate) path: &'a str,
     pub(crate) fix_commits: usize,
     /// Commits that touch the file.
@@ -328,6 +329,7 @@ pub(crate) struct FixRiskRow<'a> {
 /// A file with one dominant author.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(crate) struct BusFactorRow<'a> {
+    #[serde(serialize_with = "serialize_path")]
     pub(crate) path: &'a str,
     pub(crate) top_author_pct: f64,
     /// Commits that touch the file.
@@ -556,7 +558,7 @@ impl<'a> HeatmapView<'a> {
             left_out: LeftOutJson::of(self),
             excluded_patterns: &result.excluded_patterns,
             warnings: &result.warnings,
-            file_targets: shown_targets,
+            file_targets: shown_targets.map(|paths| paths.iter().map(|p| shown_path(p)).collect()),
             cards: cards.map(|c| c.rows.as_slice()),
         }
     }
@@ -579,6 +581,7 @@ pub(crate) struct HeatmapJson<'a> {
     version: u8,
     generated_at: &'a str,
     /// The repository name ([`repo_name`]), the same as the text header.
+    #[serde(serialize_with = "serialize_path")]
     repository: &'a str,
     window: &'a WindowInfo,
     base_rate: f64,
@@ -594,7 +597,7 @@ pub(crate) struct HeatmapJson<'a> {
     excluded_patterns: &'a [String],
     warnings: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
-    file_targets: Option<&'a [String]>,
+    file_targets: Option<Vec<String>>,
     /// One card per shown file argument, in argument order.
     #[serde(skip_serializing_if = "Option::is_none")]
     cards: Option<&'a [Card]>,
@@ -626,6 +629,7 @@ impl LeftOutJson {
 /// cut to its [`BLAST_RADIUS_JSON_MAX`] strongest partners.
 #[derive(Debug, Serialize)]
 pub(crate) struct FileJson<'a> {
+    #[serde(serialize_with = "serialize_path")]
     path: &'a str,
     churn: &'a ChurnMetrics,
     lines: u64,

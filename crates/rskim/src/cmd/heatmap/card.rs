@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use super::excludes::{ExcludeReason, Excludes};
 use super::metrics::{is_large_commit, without_quotes};
@@ -308,6 +308,16 @@ pub(crate) fn sanitize(s: &str, max_chars: usize) -> String {
     cut
 }
 
+/// The form of a full path in heatmap views.
+#[must_use]
+pub(super) fn shown_path(path: &str) -> String {
+    sanitize(path, usize::MAX)
+}
+
+pub(super) fn serialize_path<S: Serializer>(path: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&shown_path(path))
+}
+
 /// The first [`SHORT_SHA_CHARS`] chars of `hash`, or all of a shorter
 /// hash.
 fn short_sha(hash: &str) -> &str {
@@ -346,7 +356,7 @@ pub(crate) fn build_cards(
                     large_commits_touching(touched),
                 ),
                 None => (
-                    Card::not_counted(sanitize(target, usize::MAX), excludes.excluded_by(target)),
+                    Card::not_counted(shown_path(target), excludes.excluded_by(target)),
                     0,
                 ),
             }
@@ -397,7 +407,7 @@ fn card_of(metrics: &FileMetrics, touched: &[&CommitInfo], caps: ListCaps) -> Ca
     let (partners, partner_count) = capped(partners_of(&metrics.blast_radius), caps.partners);
     let (fix_commits, fix_count) = capped(fix_commits_of(touched), caps.fix_commits);
     Card {
-        path: sanitize(&metrics.path, usize::MAX),
+        path: shown_path(&metrics.path),
         in_window: true,
         excluded: None,
         commits: metrics.churn.commits,
