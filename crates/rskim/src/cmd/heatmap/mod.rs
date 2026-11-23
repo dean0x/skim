@@ -695,9 +695,8 @@ fn write_output(
     cards: Option<&view::Section<card::Card>>,
 ) -> anyhow::Result<&'static str> {
     if let Some(budget) = config.map {
-        let text = map::render(result, spec, budget, &|s| {
-            crate::tokens::count_tokens(s).ok()
-        });
+        let cl100k_ready = crate::tokens::cl100k_is_ready();
+        let text = map::render(result, spec, budget, &|s| map_token_count(s, cl100k_ready));
         out.write_all(text.as_bytes())?;
         return Ok("skim heatmap --map");
     }
@@ -732,6 +731,14 @@ fn write_output(
         write!(out, "{}", render_text(result, &view))?;
     }
     Ok("skim heatmap")
+}
+
+/// A heuristic count cannot enforce the map's exact cl100k budget.
+fn map_token_count(text: &str, cl100k_ready: bool) -> Option<usize> {
+    if !cl100k_ready {
+        return None;
+    }
+    crate::tokens::count_tokens(text).ok()
 }
 
 /// Fire-and-forget analytics recording for heatmap commands.
@@ -2201,6 +2208,11 @@ mod tests {
         assert!(keeps("tests/"));
         assert!(!keeps("src"));
         assert!(!keeps("crates/rskim/tests"));
+    }
+
+    #[test]
+    fn test_map_refuses_counts_without_cl100k() {
+        assert_eq!(map_token_count("src/main.rs", false), None);
     }
 
     #[test]
