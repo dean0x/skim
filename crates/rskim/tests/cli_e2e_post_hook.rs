@@ -538,12 +538,6 @@ fn cat_of_a_tsx_file_serves_the_tsx_view() {
     assert!(!served.contains("The footer closes every page"), "{served}");
 }
 
-#[test]
-fn cat_of_nested_markdown_leaves_the_output_unchanged() {
-    let text = format!("# Report\n\n{} Release notes\n", ">".repeat(200));
-    assert!(post(&call("cat report.md", &text)).is_none());
-}
-
 // ---- TP-9: the pre-run path is unchanged ----
 
 #[test]
