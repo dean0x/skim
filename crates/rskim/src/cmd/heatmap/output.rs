@@ -114,7 +114,7 @@ fn push_section(out: &mut String, view: &HeatmapView<'_>, section: DetailSection
 /// each row, in order.
 fn section_heading(section: DetailSection) -> &'static str {
     match section {
-        DetailSection::Hotspots => "Hotspots (commits):",
+        DetailSection::Hotspots => "Hotspots (commits x lines):",
         DetailSection::Coupling => "Coupling (confidence, shared commits):",
         DetailSection::FixRisk => "Fix risk (fix commits/commits, lift, base rate):",
         DetailSection::Modules => "Modules (encapsulation, commits):",
@@ -130,7 +130,15 @@ fn section_rows(view: &HeatmapView<'_>, section: DetailSection) -> Vec<String> {
             .hotspots
             .rows
             .iter()
-            .map(|f| format!("  {:>3}  {}", f.churn.commits, f.path))
+            .map(|f| {
+                format!(
+                    "  {:>3} x {} = {}  {}",
+                    f.churn.commits,
+                    f.lines,
+                    f.score(),
+                    f.path
+                )
+            })
             .collect(),
         DetailSection::Coupling => view
             .coupling
@@ -428,6 +436,7 @@ mod tests {
 
     fn make_result() -> HeatmapResult {
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "/home/dev/work/test-repo".to_string(),
             window: WindowInfo {
@@ -438,6 +447,7 @@ mod tests {
                 effective_strategy: Some("count".to_string()),
             },
             files: vec![FileMetrics {
+                lines: 0,
                 path: "src/main.rs".to_string(),
                 churn: ChurnMetrics {
                     commits: 5,
@@ -486,6 +496,7 @@ mod tests {
     /// A file with `commits` commits, `fix_commits` of them fix commits.
     fn file(path: &str, commits: usize, fix_commits: usize) -> FileMetrics {
         FileMetrics {
+            lines: 0,
             path: path.to_string(),
             churn: ChurnMetrics { commits, rate: 0.1 },
             stability_score: 50,
@@ -618,7 +629,7 @@ mod tests {
         let text = text_of(&result, DEFAULT_VIEW);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1..3], ["warning: first", "warning: second"]);
-        assert_eq!(lines[3], "Hotspots (commits):");
+        assert_eq!(lines[3], "Hotspots (commits x lines):");
     }
 
     #[test]
@@ -633,7 +644,7 @@ mod tests {
         assert_eq!(
             headings,
             [
-                "Hotspots (commits):",
+                "Hotspots (commits x lines):",
                 "Coupling (confidence, shared commits):",
                 "Fix risk (fix commits/commits, lift, base rate):",
                 CARD_HINT,
@@ -649,7 +660,10 @@ mod tests {
         result.files = vec![file("src/a.rs", 12, 0)];
         result.coupling_graph = vec![edge("src/a.rs", "src/b.rs", 0.87, 7)];
         let text = text_of(&result, DEFAULT_VIEW);
-        assert_eq!(section_lines(&text, "Hotspots"), ["   12  src/a.rs"]);
+        assert_eq!(
+            section_lines(&text, "Hotspots"),
+            ["   12 x 0 = 0  src/a.rs"]
+        );
         assert_eq!(
             section_lines(&text, "Coupling"),
             ["   87%   7  src/a.rs <-> src/b.rs"]
@@ -737,8 +751,8 @@ mod tests {
         assert_eq!(
             text.lines().skip(1).collect::<Vec<_>>(),
             [
-                "Hotspots (commits):",
-                "    4  src/f4.rs",
+                "Hotspots (commits x lines):",
+                "    4 x 0 = 0  src/f4.rs",
                 "  3 more (raise --top)"
             ]
         );

@@ -334,10 +334,31 @@ fn test_heatmap_json_has_all_metric_keys() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
-    // The hotspot order puts src/main.rs (4 commits) first.
     let file = &parsed["files"][0];
+    let mut keys: Vec<&str> = file
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "authors",
+            "blast_radius",
+            "churn",
+            "fix_risk",
+            "lines",
+            "path",
+            "score",
+            "stability_score"
+        ]
+    );
     assert_eq!(file["path"], "src/main.rs");
     assert_eq!(file["churn"]["commits"], 4, "nested churn.commits");
+    assert_eq!(file["lines"], 1);
+    assert_eq!(file["score"], 4);
     assert!(
         file["stability_score"].is_number(),
         "stability_score must be number"
@@ -379,7 +400,7 @@ fn test_heatmap_text_output_contains_sections() {
     assert_eq!(
         headings,
         [
-            "Hotspots (commits):",
+            "Hotspots (commits x lines):",
             "Coupling (confidence, shared commits):",
             "Fix risk (fix commits/commits, lift, base rate):",
         ],
@@ -1357,6 +1378,130 @@ fn file_entry<'a>(json: &'a serde_json::Value, path: &str) -> &'a serde_json::Va
         .unwrap_or_else(|| panic!("{path} missing from files[]"))
 }
 
+#[test]
+fn test_heatmap_large_file_with_fewer_commits_ranks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_commit_files(
+        root,
+        &[
+            ("large.rs", &"// large\n".repeat(20)),
+            ("small.rs", "// one\n"),
+        ],
+        "feat: add files",
+        1_700_000_000,
+    );
+    git_commit(root, "small.rs", "// two\n", "fix: small", 1_700_000_001);
+    std::fs::write(root.join("large.rs"), "// uncommitted\n").unwrap();
+
+    let json = heatmap_json_with(root, &["--window", "all"]);
+    assert_eq!(json["files"][0]["path"], "large.rs");
+    assert_eq!(json["files"][0]["churn"]["commits"], 1);
+    assert_eq!(json["files"][0]["lines"], 20);
+    assert_eq!(json["files"][0]["score"], 20);
+    assert_eq!(json["files"][1]["score"], 2);
+}
+
+#[test]
+fn test_heatmap_excludes_nonregular_head_paths_but_keeps_deleted_card_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    let base = 1_700_000_000;
+    for i in 0..5 {
+        let content = format!("// live {i}\n");
+        git_commit_files(
+            root,
+            &[
+                ("live.rs", &content),
+                ("gone.rs", &content),
+                ("link.rs", &content),
+                ("module.rs", &content),
+            ],
+            "fix: change files",
+            base + i,
+        );
+    }
+    let git = |args: &[&str]| {
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["config", "user.name", "Other Author"]);
+    for i in 5..11 {
+        git_commit(
+            root,
+            "side.rs",
+            &format!("// side {i}\n"),
+            "feat: side",
+            base + i,
+        );
+    }
+    let before = heatmap_json_with(root, &["--window", "all", "--detail", "bus-factor"]);
+    assert!(sorted_paths(&before, "fix_risk").contains(&"gone.rs".into()));
+    assert!(sorted_paths(&before, "bus_factor").contains(&"gone.rs".into()));
+
+    let blob = git(&["rev-parse", "HEAD:live.rs"]);
+    let commit = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "before-removal"]);
+    git(&["rm", "--", "gone.rs"]);
+    git(&[
+        "update-index",
+        "--cacheinfo",
+        &format!("120000,{blob},link.rs"),
+    ]);
+    git(&[
+        "update-index",
+        "--cacheinfo",
+        &format!("160000,{commit},module.rs"),
+    ]);
+    git_commit_staged(root, "feat: remove regular files", base + 11);
+    git_commit(
+        root,
+        "binary.dat",
+        "binary\0data",
+        "feat: add binary",
+        base + 12,
+    );
+
+    let json = heatmap_json_with(root, &["--window", "all", "--detail", "bus-factor"]);
+    assert_eq!(sorted_paths(&json, "files"), ["live.rs", "side.rs"]);
+    assert_eq!(json["left_out"]["not_at_head"], 3);
+    assert_eq!(json["coupling_graph"], serde_json::json!([]));
+    assert_eq!(
+        file_entry(&json, "live.rs")["blast_radius"],
+        serde_json::json!([])
+    );
+    assert_eq!(sorted_paths(&json, "fix_risk"), ["live.rs"]);
+    assert_eq!(sorted_paths(&json, "bus_factor"), ["live.rs", "side.rs"]);
+    let text = heatmap_stdout(root, &["--window", "all"]);
+    assert!(text.contains("3 paths not at HEAD"), "{text}");
+
+    let card = heatmap_json_with(root, &["--window", "all", "gone.rs"]);
+    assert_eq!(card["cards"][0]["commits"], 6);
+    assert_eq!(card["cards"][0]["partners"][0]["path"], "live.rs");
+    assert_eq!(card["cards"][0]["partners"].as_array().unwrap().len(), 1);
+    assert_eq!(card["files"], serde_json::json!([]));
+
+    let diff = heatmap_json_with(root, &["--window", "all", "--diff", "before-removal"]);
+    assert!(
+        diff["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| { !warning.as_str().unwrap().contains("gone.rs") })
+    );
+}
+
 fn git_move(dir: &Path, old: &str, new: &str) {
     std::fs::create_dir_all(dir.join(new).parent().unwrap()).unwrap();
     let out = StdCommand::new("git")
@@ -2193,9 +2338,11 @@ fn test_heatmap_text_ranks_ties_by_path() {
     create_ranked_repo(dir.path());
 
     let text = heatmap_stdout(dir.path(), &[]);
-    let mut expected: Vec<String> = (0..8).map(|i| format!("    6  src/hub/h{i}.rs")).collect();
-    expected.push("    5  src/pair/p0a.rs".to_string());
-    expected.push("    5  src/pair/p0b.rs".to_string());
+    let mut expected: Vec<String> = (0..8)
+        .map(|i| format!("    6 x 1 = 6  src/hub/h{i}.rs"))
+        .collect();
+    expected.push("    5 x 1 = 5  src/pair/p0a.rs".to_string());
+    expected.push("    5 x 1 = 5  src/pair/p0b.rs".to_string());
     assert_eq!(section_rows(&text, "Hotspots"), expected);
     assert_eq!(
         section_rows(&text, "Coupling"),
@@ -2221,7 +2368,7 @@ fn test_heatmap_text_ranks_ties_by_path() {
 }
 
 #[test]
-fn test_heatmap_hotspots_are_the_ten_highest_churn_files_in_order() {
+fn test_heatmap_hotspots_cap_the_one_line_files_in_score_order() {
     let dir = tempfile::tempdir().expect("tempdir");
     git_init(dir.path());
     let ts = recent_ts();
@@ -2244,8 +2391,10 @@ fn test_heatmap_hotspots_are_the_ten_highest_churn_files_in_order() {
     let rows: Vec<(u64, &str)> = section_rows(&text, "Hotspots")
         .iter()
         .map(|row| {
-            let (count, path) = row.trim_start().split_once("  ").expect("count and path");
-            (count.parse().expect("commit count"), path)
+            let (stats, path) = row.trim_start().split_once("  ").expect("stats and path");
+            let (commits, score) = stats.split_once(" x 1 = ").expect("one line at HEAD");
+            assert_eq!(commits, score, "{row}");
+            (score.parse().expect("hotspot score"), path)
         })
         .collect();
     assert_eq!(
@@ -3046,7 +3195,10 @@ fn test_heatmap_diff_gives_the_default_view_not_cards() {
 
     let text = heatmap_stdout(dir.path(), &["--diff", "main"]);
 
-    assert!(text.lines().any(|l| l == "Hotspots (commits):"), "{text}");
+    assert!(
+        text.lines().any(|l| l == "Hotspots (commits x lines):"),
+        "{text}"
+    );
     assert!(card_lines(&text, CARD_FILE).is_empty(), "{text}");
 }
 

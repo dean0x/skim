@@ -604,6 +604,7 @@ mod tests {
 
     fn metrics(path: &str, commits: usize) -> FileMetrics {
         FileMetrics {
+            lines: 0,
             path: path.to_string(),
             churn: ChurnMetrics { commits, rate: 0.0 },
             stability_score: 50,
@@ -771,6 +772,7 @@ mod tests {
 
     fn result_with(files: Vec<FileMetrics>) -> HeatmapResult {
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2026-11-12".to_string(),
             repository: "/work/repo".to_string(),
             window: WindowInfo {

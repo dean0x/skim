@@ -301,6 +301,8 @@ pub(crate) struct HeatmapResult {
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
     pub(crate) files: Vec<FileMetrics>,
+    /// History paths with no regular file at HEAD, before file scope.
+    pub(crate) not_at_head: usize,
     pub(crate) modules: Vec<ModuleHealth>,
     pub(crate) coupling_graph: Vec<CouplingEdge>,
     pub(crate) excluded_patterns: Vec<String>,
@@ -331,10 +333,19 @@ pub(crate) struct WindowInfo {
 pub(crate) struct FileMetrics {
     pub(crate) path: String,
     pub(crate) churn: ChurnMetrics,
+    /// Text lines at HEAD, or zero when no count is available.
+    pub(crate) lines: u64,
     pub(crate) stability_score: u8,
     pub(crate) authors: AuthorMetrics,
     pub(crate) fix_risk: FixRiskMetrics,
     pub(crate) blast_radius: Vec<CouplingEntry>,
+}
+
+impl FileMetrics {
+    #[must_use]
+    pub(crate) fn score(&self) -> u64 {
+        (self.churn.commits as u64).saturating_mul(self.lines)
+    }
 }
 
 /// Churn metrics for a file.

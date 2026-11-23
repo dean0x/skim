@@ -356,6 +356,7 @@ mod tests {
     /// 20%), 2 distinct authors.
     fn make_empty_result() -> HeatmapResult {
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "test-repo".to_string(),
             window: make_window(),
@@ -400,6 +401,7 @@ mod tests {
 
     fn make_file(spec: FileSpec<'_>) -> FileMetrics {
         FileMetrics {
+            lines: 0,
             path: spec.path.to_string(),
             churn: ChurnMetrics {
                 commits: spec.commits,

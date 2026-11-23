@@ -20,6 +20,7 @@ mod types;
 mod view;
 mod window;
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -474,7 +475,7 @@ fn run_with_source(
 
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
-    let mut result = compute_heatmap(
+    let result = compute_heatmap(
         &commits,
         &config,
         &window,
@@ -483,6 +484,8 @@ fn run_with_source(
         warnings,
         &module_roots,
     );
+    let (mut result, at_head) = keep_at_head(result, head_tree.as_ref(), &config.targets);
+    result.not_at_head = at_head.not_at_head;
     let spec = view::ViewSpec::from_config(&config);
 
     // File targets scope the result after the full metric computation, so
@@ -490,18 +493,23 @@ fn run_with_source(
     let cards = match &config.targets {
         FileTargets::All => None,
         FileTargets::Diff(files) => {
-            warn_missing_targets(&mut result, files);
+            warn_missing_targets(&mut result, files, &at_head.dropped);
             apply_file_scope(&mut result, files, &module_roots);
             None
         }
-        FileTargets::Cards(paths) => Some(scope_cards(
-            &mut result,
-            &commits,
-            paths,
-            spec.lists(),
-            &module_roots,
-            &excludes,
-        )),
+        FileTargets::Cards(paths) => {
+            let cards = scope_cards(
+                &mut result,
+                &commits,
+                paths,
+                spec.lists(),
+                &module_roots,
+                &excludes,
+            );
+            // A history-only target can give a card, but not a ranked row.
+            result.files.retain(|f| !at_head.dropped.contains(&f.path));
+            Some(cards)
+        }
     };
     // The warning list is complete here, and both JSON outputs give it as is.
     debug_assert!(
@@ -615,19 +623,64 @@ fn join_warning_names(shown: &[String], total: usize) -> String {
     format!("{}{rest}", shown.join(", "))
 }
 
+#[derive(Default)]
+struct AtHead {
+    not_at_head: usize,
+    dropped: HashSet<String>,
+}
+
+/// Apply HEAD status after the metrics so module totals and stability keep
+/// the full history. Keep explicit card targets until their cards are built.
+#[must_use]
+fn keep_at_head(
+    mut result: HeatmapResult,
+    head_tree: Option<&HeadTree>,
+    targets: &FileTargets,
+) -> (HeatmapResult, AtHead) {
+    let Some(head_tree) = head_tree else {
+        return (result, AtHead::default());
+    };
+    let card_paths: HashSet<String> = match targets {
+        FileTargets::Cards(paths) => card::history_paths(paths, &result.files)
+            .into_iter()
+            .collect(),
+        FileTargets::All | FileTargets::Diff(_) => HashSet::new(),
+    };
+    let mut dropped = HashSet::new();
+    result.files.retain_mut(|file| {
+        if let Some(HeadEntry::Regular(lines)) = head_tree.get(&file.path) {
+            file.lines = lines.unwrap_or(0);
+            return true;
+        }
+        dropped.insert(file.path.clone());
+        card_paths.contains(&file.path)
+    });
+    result
+        .coupling_graph
+        .retain(|edge| !dropped.contains(&edge.a) && !dropped.contains(&edge.b));
+    for file in &mut result.files {
+        file.blast_radius.retain(|p| !dropped.contains(&p.path));
+    }
+    let at_head = AtHead {
+        not_at_head: dropped.len(),
+        dropped,
+    };
+    (result, at_head)
+}
+
 /// Add one warning for the `--diff` files that are not in the window's
 /// history. It counts each missing file once and names the first
 /// [`WARNING_NAMES`] in argument order (a set order would change
 /// between runs). A large diff thus adds one warning, not one per file.
-fn warn_missing_targets(result: &mut HeatmapResult, files: &[String]) {
-    use std::collections::HashSet;
-
+fn warn_missing_targets(result: &mut HeatmapResult, files: &[String], dropped: &HashSet<String>) {
     let result_paths: HashSet<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
     let mut seen: HashSet<&str> = HashSet::new();
     let missing: Vec<&str> = files
         .iter()
         .map(String::as_str)
-        .filter(|target| !result_paths.contains(target) && seen.insert(target))
+        .filter(|target| {
+            !result_paths.contains(target) && !dropped.contains(*target) && seen.insert(target)
+        })
         .collect();
     let warning = match missing.as_slice() {
         [] => return,
@@ -718,8 +771,6 @@ fn scope_coupling_warning(warnings: &mut Vec<String>, skipped: usize, touches: &
 /// (blast radius view). Modules are kept when they hold a targeted file, by
 /// the same [`module_of`] mapping the module metric uses.
 fn apply_file_scope(result: &mut HeatmapResult, files: &[String], roots: &ModuleRoots) {
-    use std::collections::HashSet;
-
     let target_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
 
     // Filter files
@@ -841,6 +892,7 @@ fn compute_heatmap(
             let blast_radius = blast_radius_map.get(&path).cloned().unwrap_or_default();
 
             FileMetrics {
+                lines: 0,
                 path,
                 churn,
                 stability_score,
@@ -867,6 +919,7 @@ fn compute_heatmap(
 
     // Step 9: Build result
     HeatmapResult {
+        not_at_head: 0,
         generated_at: format_epoch(now_epoch),
         repository,
         window: window_info,
@@ -900,6 +953,7 @@ mod tests {
             WindowInfo,
         };
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01".to_string(),
             repository: "test".to_string(),
             window: WindowInfo {
@@ -911,6 +965,7 @@ mod tests {
             },
             files: vec![
                 FileMetrics {
+                    lines: 0,
                     path: "src/main.rs".to_string(),
                     churn: ChurnMetrics {
                         commits: 5,
@@ -922,6 +977,7 @@ mod tests {
                     blast_radius: vec![],
                 },
                 FileMetrics {
+                    lines: 0,
                     path: "src/lib.rs".to_string(),
                     churn: ChurnMetrics {
                         commits: 3,
@@ -933,6 +989,7 @@ mod tests {
                     blast_radius: vec![],
                 },
                 FileMetrics {
+                    lines: 0,
                     path: "tests/test.rs".to_string(),
                     churn: ChurnMetrics {
                         commits: 2,
@@ -1023,7 +1080,11 @@ mod tests {
     fn test_warn_missing_targets_names_the_missing_diff_file() {
         let mut result = make_test_result();
         result.warnings.clear();
-        warn_missing_targets(&mut result, &["nonexistent.rs".to_string()]);
+        warn_missing_targets(
+            &mut result,
+            &["nonexistent.rs".to_string()],
+            &HashSet::new(),
+        );
         assert_eq!(
             result.warnings,
             ["targeted file 'nonexistent.rs' not found in git history"]
@@ -1036,7 +1097,7 @@ mod tests {
         let targets: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
         let mut result = make_test_result();
         result.warnings.clear();
-        warn_missing_targets(&mut result, &targets);
+        warn_missing_targets(&mut result, &targets, &HashSet::new());
         assert_eq!(
             result.warnings,
             ["5 targeted files not found in git history: 'z.rs', 'a.rs', 'm.rs' and 2 more"]
@@ -1048,7 +1109,7 @@ mod tests {
         let targets = ["x.rs".to_string(), "y.rs".to_string(), "x.rs".to_string()];
         let mut result = make_test_result();
         result.warnings.clear();
-        warn_missing_targets(&mut result, &targets);
+        warn_missing_targets(&mut result, &targets, &HashSet::new());
         assert_eq!(
             result.warnings,
             ["2 targeted files not found in git history: 'x.rs', 'y.rs'"]
@@ -1060,7 +1121,7 @@ mod tests {
         let mut result = make_test_result();
         result.warnings.clear();
         let present: Vec<String> = result.files.iter().map(|f| f.path.clone()).collect();
-        warn_missing_targets(&mut result, &present);
+        warn_missing_targets(&mut result, &present, &HashSet::new());
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
@@ -1199,6 +1260,7 @@ mod tests {
         let mut result = make_test_result();
         // Replace the file list with a single deeply-nested path
         result.files = vec![FileMetrics {
+            lines: 0,
             path: "src/cmd/heatmap/mod.rs".to_string(),
             churn: ChurnMetrics {
                 commits: 1,
@@ -1544,7 +1606,7 @@ mod tests {
             p.warnings,
             &p.module_roots,
         );
-        warn_missing_targets(&mut result, &["gone.rs".to_string()]);
+        warn_missing_targets(&mut result, &["gone.rs".to_string()], &HashSet::new());
 
         assert_eq!(
             result

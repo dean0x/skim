@@ -349,6 +349,7 @@ pub(crate) struct HeatmapView<'a> {
     /// Fix commits divided by all commits in the window, `0.0..=1.0`.
     pub(crate) base_rate: f64,
     pub(crate) hotspots: Section<&'a FileMetrics>,
+    not_at_head: usize,
     pub(crate) coupling: Section<&'a CouplingEdge>,
     pub(crate) fix_risk: Section<FixRiskRow<'a>>,
     pub(crate) modules: Section<&'a ModuleHealth>,
@@ -416,6 +417,7 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
         base_rate,
         hotspots: Section::ranked(hotspots, hotspot_order, spec.cap(DetailSection::Hotspots))
             .with_left_out(hotspots_left_out),
+        not_at_head: result.not_at_head,
         coupling: Section::ranked(coupling, coupling_order, spec.cap(DetailSection::Coupling)),
         fix_risk: Section::ranked(fix_risk, fix_risk_order, spec.cap(DetailSection::FixRisk)),
         modules: Section::ranked(modules, module_order, spec.cap(DetailSection::Modules))
@@ -431,11 +433,11 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
 // Row orders. Each one ends on the path, so the order is total and two runs
 // give the same rows.
 
-/// Hotspot order: commits desc, then path asc.
+/// Hotspot order: score desc, commits desc, then path asc.
 fn hotspot_order(x: &&FileMetrics, y: &&FileMetrics) -> Ordering {
-    y.churn
-        .commits
-        .cmp(&x.churn.commits)
+    y.score()
+        .cmp(&x.score())
+        .then_with(|| y.churn.commits.cmp(&x.churn.commits))
         .then_with(|| x.path.cmp(&y.path))
 }
 
@@ -500,12 +502,25 @@ impl<'a> HeatmapView<'a> {
                 (0, ("", ""))
             }
         };
-        more_and_left_out_line(
+        let more = more_and_left_out_line(
             self.count(section).hidden(),
             self.spec.remedy(section),
             left_out,
             nouns,
-        )
+        );
+        if section != DetailSection::Hotspots || self.not_at_head == 0 {
+            return more;
+        }
+        let noun = if self.not_at_head == 1 {
+            "path"
+        } else {
+            "paths"
+        };
+        let omitted = format!("{} {noun} not at HEAD", self.not_at_head);
+        Some(match more {
+            Some(more) => format!("{more}; {omitted}"),
+            None => omitted,
+        })
     }
 
     /// The JSON v2 shape of this view, with the cards of a run with file
@@ -576,7 +591,7 @@ pub(crate) struct HeatmapJson<'a> {
     fix_risk: &'a [FixRiskRow<'a>],
     modules: &'a [&'a ModuleHealth],
     bus_factor: &'a [BusFactorRow<'a>],
-    /// Rows that the non-code rule left out, when any (see `--include-docs`).
+    /// Counts of rows left out by the non-code and HEAD filters, when any.
     #[serde(skip_serializing_if = "Option::is_none")]
     left_out: Option<LeftOutJson>,
     excluded_patterns: &'a [String],
@@ -588,22 +603,23 @@ pub(crate) struct HeatmapJson<'a> {
     cards: Option<&'a [Card]>,
 }
 
-/// The rows that the non-code rule left out of the hotspots (`files[]`) and
-/// the modules.
+/// The types of rows that the non-code and HEAD filters left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct LeftOutJson {
     hotspots: usize,
     modules: usize,
+    not_at_head: usize,
 }
 
 impl LeftOutJson {
-    /// The counts of `view`, or `None` when the rule left out no row.
+    /// The counts of `view`, or `None` when both filters left out no row.
     fn of(view: &HeatmapView<'_>) -> Option<Self> {
         let counts = Self {
             hotspots: view.hotspots.left_out,
             modules: view.modules.left_out,
+            not_at_head: view.not_at_head,
         };
-        (counts.hotspots + counts.modules > 0).then_some(counts)
+        (counts.hotspots > 0 || counts.modules > 0 || counts.not_at_head > 0).then_some(counts)
     }
 }
 
@@ -613,6 +629,8 @@ impl LeftOutJson {
 pub(crate) struct FileJson<'a> {
     path: &'a str,
     churn: &'a ChurnMetrics,
+    lines: u64,
+    score: u64,
     stability_score: u8,
     authors: &'a AuthorMetrics,
     fix_risk: &'a FixRiskMetrics,
@@ -627,6 +645,8 @@ impl<'a> FileJson<'a> {
         Self {
             path: &file.path,
             churn: &file.churn,
+            lines: file.lines,
+            score: file.score(),
             stability_score: file.stability_score,
             authors: &file.authors,
             fix_risk: &file.fix_risk,
@@ -660,6 +680,7 @@ mod tests {
     /// commits (base rate 20%), 2 distinct authors.
     fn empty_result() -> HeatmapResult {
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "repo".to_string(),
             window: WindowInfo {
@@ -683,6 +704,7 @@ mod tests {
     /// A file with `commits` commits, no fix commit, one author with 50%.
     fn file(path: &str, commits: usize) -> FileMetrics {
         FileMetrics {
+            lines: 0,
             path: path.to_string(),
             churn: ChurnMetrics { commits, rate: 0.0 },
             stability_score: 50,
@@ -800,15 +822,33 @@ mod tests {
     }
 
     #[test]
-    fn test_hotspots_tie_on_commits_sorts_path_ascending() {
+    fn test_hotspots_tie_on_score_sorts_commits_then_path() {
         let mut result = empty_result();
         result.files = vec![
-            file("src/b.rs", 3),
-            file("src/a.rs", 3),
-            file("src/c.rs", 5),
+            FileMetrics {
+                lines: 2,
+                ..file("src/c.rs", 3)
+            },
+            FileMetrics {
+                lines: 3,
+                ..file("src/a.rs", 2)
+            },
+            FileMetrics {
+                lines: 2,
+                ..file("src/b.rs", 3)
+            },
         ];
         let view = build_view(&result, &DEFAULT_VIEW);
-        assert_eq!(hotspot_paths(&view), ["src/c.rs", "src/a.rs", "src/b.rs"]);
+        assert_eq!(hotspot_paths(&view), ["src/b.rs", "src/c.rs", "src/a.rs"]);
+    }
+
+    #[test]
+    fn test_hotspot_score_saturates_at_u64_max() {
+        let f = FileMetrics {
+            lines: u64::MAX,
+            ..file("src/a.rs", 2)
+        };
+        assert_eq!(f.score(), u64::MAX);
     }
 
     #[test]
