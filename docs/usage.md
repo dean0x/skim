@@ -364,7 +364,7 @@ crates/rskim/src/cmd/heatmap/view.rs: 7 commits
 - **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first. In the text view, a `"` or `\` in a subject or an owner name shows as `\"` or `\\`.
 - If a filter leaves out a file, its card says `left out by the default excludes; --no-exclude keeps it` or `left out by --exclude; remove the matching patterns to keep it`. Otherwise, a file with no commits in the window prints `<path>: not in history window (N commits since DATE)` (`1 commit` for one). N and DATE describe the window.
 - The large-commit warning gives the run count and the touch count for each named file. For example: `warning: coupling: 1 commit with more than 50 files not paired (1 touches src/main.rs)`. The line names up to three shown files in argument order, then gives the count of more names. If no shown file has a touch, skim omits the line.
-- Control characters, bidirectional characters and invisible format characters in subjects and author names become U+FFFD. Skim limits each subject and author name to 72 characters.
+- In subjects, author names and card partner paths, control characters, bidirectional characters and invisible format characters become U+FFFD. Skim limits each of these fields to 72 characters.
 - `./x`, an absolute path under the repository root, a path relative to the current folder and a path with `..` give the same card. A path outside the repository exits 1. skim does not open the file. An absolute path through a symbolic-link prefix (for example macOS `/var`) is refused.
 
 Metrics come from the full window; a card only narrows the display.
