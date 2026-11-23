@@ -254,6 +254,66 @@ fn test_heatmap_help_describes_the_short_view_detail_and_cards() {
     }
 }
 
+#[test]
+fn test_heatmap_help_describes_utc_dates_and_window_presets() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("YYYY-MM-DD (00:00 UTC)"))
+        .stdout(predicate::str::contains(
+            "sprint|month|quarter|half|year|all",
+        ))
+        .stdout(predicate::str::contains(
+            "No date cutoff (same as --since 0)",
+        ))
+        .stdout(predicate::str::contains(
+            "An unknown --window preset exits 1 and lists the valid names.",
+        ));
+}
+
+#[test]
+fn test_heatmap_help_describes_hotspot_rank_and_fallback() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The score is commits in the window x text lines at HEAD.",
+        ))
+        .stdout(predicate::str::contains(
+            "If HEAD data is not available, skim warns and ranks by commits.",
+        ));
+}
+
+#[test]
+fn test_heatmap_help_describes_non_code_filter_for_fix_risk() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "NON-CODE PATHS (--include-docs keeps them)",
+        ))
+        .stdout(predicate::str::contains(
+            "out of the hotspots, fix risk and insights",
+        ));
+}
+
+#[test]
+fn test_heatmap_help_names_new_json_keys() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("files[].lines"))
+        .stdout(predicate::str::contains("files[].score"))
+        .stdout(predicate::str::contains(
+            "left_out.{hotspots,fix_risk,modules}",
+        ))
+        .stdout(predicate::str::contains("left_out.not_at_head"));
+}
+
 // ============================================================================
 // Not a git repo
 // ============================================================================
