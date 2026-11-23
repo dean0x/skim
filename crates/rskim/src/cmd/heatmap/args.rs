@@ -5,6 +5,8 @@
 use super::types::{DetailSection, HeatmapArgs};
 use std::time::UNIX_EPOCH;
 
+const MAX_MAP_TOKENS: usize = 10_000_000;
+
 // ============================================================================
 // Table-driven value flag dispatch
 // ============================================================================
@@ -22,6 +24,7 @@ enum ValueFlagAction {
     Format,
     Diff,
     Detail,
+    Tokens,
 }
 
 struct ValueFlagSpec {
@@ -73,6 +76,10 @@ const VALUE_FLAG_TABLE: &[ValueFlagSpec] = &[
     ValueFlagSpec {
         name: "--detail",
         action: ValueFlagAction::Detail,
+    },
+    ValueFlagSpec {
+        name: "--tokens",
+        action: ValueFlagAction::Tokens,
     },
 ];
 
@@ -162,6 +169,18 @@ fn apply_value_flag(
             };
             args.detail = Some(section);
         }
+        ValueFlagAction::Tokens => {
+            let n: usize = val
+                .parse()
+                .map_err(|_| anyhow::anyhow!("--tokens requires a positive integer"))?;
+            if n == 0 {
+                anyhow::bail!("--tokens must be at least 1");
+            }
+            if n > MAX_MAP_TOKENS {
+                anyhow::bail!("--tokens must be at most {MAX_MAP_TOKENS}");
+            }
+            args.tokens = Some(n);
+        }
     }
     Ok(())
 }
@@ -221,6 +240,21 @@ pub(super) fn parse_args(raw: &[String]) -> anyhow::Result<HeatmapArgs> {
     }
 
     // Post-parse validation
+    if args.map {
+        let conflicts = [
+            (args.format_json, "--json"),
+            (args.detail.is_some(), "--detail"),
+            (args.insights, "--insights"),
+            (args.diff_base.is_some(), "--diff"),
+            (!args.files.is_empty(), "explicit file arguments"),
+            (args.top_explicit, "--top"),
+        ];
+        if let Some((_, name)) = conflicts.into_iter().find(|(used, _)| *used) {
+            anyhow::bail!("cannot combine --map with {name}");
+        }
+    } else if args.tokens.is_some() {
+        anyhow::bail!("--tokens requires --map");
+    }
     if args.diff_base.is_some() && !args.files.is_empty() {
         anyhow::bail!("cannot combine --diff with explicit file arguments");
     }
@@ -249,6 +283,7 @@ fn apply_boolean_flag(args: &mut HeatmapArgs, flag: &str) -> anyhow::Result<bool
         "--no-exclude" => args.no_exclude = true,
         "--include-docs" => args.include_docs = true,
         "--insights" => args.insights = true,
+        "--map" => args.map = true,
         "--debug" => {
             args.debug = true;
             crate::debug::force_enable_debug();
@@ -307,15 +342,14 @@ fn parse_since_value(val: &str) -> anyhow::Result<u64> {
 // Help
 // ============================================================================
 
-pub(super) fn print_help() {
-    print!(
-        "\
+const HELP: &str = "\
 skim heatmap — git history risk and coupling analysis
 
 USAGE:
     skim heatmap [OPTIONS]                Short ranked view (30 lines or fewer)
     skim heatmap --detail <SECTION>       One full section
     skim heatmap --insights               Ranked CRITICAL/WARNING findings
+    skim heatmap --map [OPTIONS]          Repository map in hotspot order
     skim heatmap [OPTIONS] <FILE>...      One \"before you edit\" card per file
 
 OPTIONS:
@@ -334,6 +368,8 @@ OPTIONS:
     --coupling-threshold <FLOAT>  Coupling confidence threshold (default: 0.5)
     --fix-window <N>              Proximity window for fix-after-touch detection (default: 5)
     --insights                    Show ranked findings only
+    --map                         Show a text repository map
+    --tokens <N>                  Map token budget (default: 1000; range: 1 to 10000000)
     --debug                       Enable debug output
     -h, --help                    Show this help message
 
@@ -404,6 +440,8 @@ FILE TARGETING:
     --path scopes the git log itself (commit-level filter); it composes with
     file arguments. --diff and file arguments are mutually exclusive.
     --detail takes no file arguments and does not combine with --insights.
+    --map takes no file arguments, --json, --detail, --insights, --diff or --top.
+    --tokens requires --map.
 
 DEFAULT EXCLUDES (--no-exclude keeps them):
     Lock files, build and dist folders, minified bundles, logs, vendor and
@@ -413,11 +451,11 @@ DEFAULT EXCLUDES (--no-exclude keeps them):
 
 JSON (version 2):
     One compact line. Each array of rows has the cap of its section, and
-    counts.<section>.{{total,shown}} gives the full and shown counts.
+    counts.<section>.{total,shown} gives the full and shown counts.
     files[] holds the hotspot rows. No support minimum applies to it.
     files[].lines is the HEAD text line count, or 0 if there is no count.
     files[].score is the hotspot score.
-    left_out.{{hotspots,fix_risk,modules}} counts non-code paths.
+    left_out.{hotspots,fix_risk,modules} counts non-code paths.
     left_out.not_at_head counts history paths that are not regular files at HEAD.
     With file arguments, cards[] holds the cards. file_targets[] holds at
     most 20 targets. counts.file_targets gives their full and shown counts.
@@ -450,8 +488,10 @@ EXAMPLES:
     skim heatmap --window sprint              # Analyze last sprint
     skim heatmap --path src/                  # Scope to src/ directory
     skim heatmap --no-exclude                 # Keep lock files, changelogs and snapshots
-"
-    );
+";
+
+pub(super) fn print_help() {
+    print!("{HELP}");
 }
 
 // ============================================================================
@@ -463,6 +503,70 @@ EXAMPLES:
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_help_names_map_and_token_budget() {
+        assert!(HELP.contains("skim heatmap --map"));
+        assert!(HELP.contains("--tokens <N>"));
+    }
+
+    #[test]
+    fn test_map_accepts_window_path_and_exclude_flags() {
+        let args = strings(&[
+            "--map",
+            "--since",
+            "2025-01-01",
+            "--path",
+            "src",
+            "--exclude",
+            "*.snap",
+            "--include-docs",
+            "--no-exclude",
+            "--tokens=10000000",
+        ]);
+        assert!(parse_args(&args).is_ok());
+    }
+
+    #[test]
+    fn test_map_conflicts_name_the_other_option() {
+        for (other, name) in [
+            (&["--json"][..], "--json"),
+            (&["--format", "json"][..], "--json"),
+            (&["--detail", "hotspots"][..], "--detail"),
+            (&["--insights"][..], "--insights"),
+            (&["--diff", "main"][..], "--diff"),
+            (&["src/main.rs"][..], "explicit file arguments"),
+            (&["--top", "20"][..], "--top"),
+        ] {
+            let mut args = other.to_vec();
+            args.push("--map");
+            assert_eq!(
+                parse_error(&args),
+                format!("cannot combine --map with {name}")
+            );
+        }
+    }
+
+    #[test]
+    fn test_tokens_require_map() {
+        assert_eq!(parse_error(&["--tokens", "10"]), "--tokens requires --map");
+    }
+
+    #[test]
+    fn test_map_refuses_zero_tokens() {
+        assert_eq!(
+            parse_error(&["--map", "--tokens", "0"]),
+            "--tokens must be at least 1"
+        );
+    }
+
+    #[test]
+    fn test_map_refuses_tokens_above_cap() {
+        assert_eq!(
+            parse_error(&["--map", "--tokens=10000001"]),
+            "--tokens must be at most 10000000"
+        );
+    }
 
     #[test]
     fn test_parse_args_defaults() {

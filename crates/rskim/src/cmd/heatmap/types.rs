@@ -136,6 +136,10 @@ pub(crate) struct HeatmapArgs {
     pub(crate) top_explicit: bool,
     /// Show only threshold-filtered one-liner insights.
     pub(crate) insights: bool,
+    /// Show a repository map instead of the ranked view.
+    pub(super) map: bool,
+    /// Explicit token budget for the map.
+    pub(super) tokens: Option<usize>,
     /// The one section that `--detail` names, if given.
     pub(crate) detail: Option<DetailSection>,
 }
@@ -161,6 +165,8 @@ impl Default for HeatmapArgs {
             top_explicit: false,
             insights: false,
             detail: None,
+            map: false,
+            tokens: None,
         }
     }
 }
@@ -248,6 +254,8 @@ pub(crate) struct HeatmapConfig {
     pub(crate) insights: bool,
     /// The one section that `--detail` names, if given.
     pub(crate) detail: Option<DetailSection>,
+    /// The map token budget, or `None` for other views.
+    pub(super) map: Option<usize>,
 }
 
 /// The file targets of a run. The source decides the view.

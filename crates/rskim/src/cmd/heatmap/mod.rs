@@ -13,6 +13,7 @@ mod card;
 mod excludes;
 mod git_source;
 mod insights;
+mod map;
 mod metrics;
 mod noise;
 mod output;
@@ -684,8 +685,8 @@ fn run_with_source(
 ///
 /// A run with file arguments writes its cards, and `--insights` gives the
 /// same cards, text or JSON. Else `--insights` writes the ranked findings of
-/// the full result, capped at 20 or `--top`. Else the ranked view writes the
-/// default view or the `--detail` section.
+/// the full result, capped at 20 or `--top`. A map uses its own token budget.
+/// The ranked view writes the default view or the `--detail` section.
 fn write_output(
     out: &mut impl Write,
     result: &HeatmapResult,
@@ -693,6 +694,14 @@ fn write_output(
     spec: &view::ViewSpec,
     cards: Option<&view::Section<card::Card>>,
 ) -> anyhow::Result<&'static str> {
+    if let Some(budget) = config.map {
+        let text = map::render(result, spec, budget, &|s| {
+            crate::tokens::count_tokens(s).ok()
+        });
+        out.write_all(text.as_bytes())?;
+        return Ok("skim heatmap --map");
+    }
+
     if let Some(cards) = cards {
         if config.format_json {
             let view = view::build_view(result, spec);
@@ -1116,6 +1125,7 @@ mod tests {
             ("excludes.rs", include_str!("excludes.rs")),
             ("git_source.rs", include_str!("git_source.rs")),
             ("insights.rs", include_str!("insights.rs")),
+            ("map.rs", include_str!("map.rs")),
             ("metrics.rs", include_str!("metrics.rs")),
             ("mod.rs", include_str!("mod.rs")),
             ("noise.rs", include_str!("noise.rs")),
@@ -2191,6 +2201,21 @@ mod tests {
         assert!(keeps("tests/"));
         assert!(!keeps("src"));
         assert!(!keeps("crates/rskim/tests"));
+    }
+
+    #[test]
+    fn test_map_output_uses_the_map_label_and_omits_ranked_sections() {
+        let args = parse_args(&["--map".into(), "--since=0".into()]).unwrap();
+        let (config, _) =
+            resolve_config(args, &StubSource::with_malformed(0), &mut Vec::new(), 0).unwrap();
+        let spec = view::ViewSpec::from_config(&config);
+        let mut out = Vec::new();
+        let label = write_output(&mut out, &make_test_result(), &config, &spec, None).unwrap();
+        assert_eq!(label, "skim heatmap --map");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("Heatmap map: test 2024-10-01..2025-01-01, 10 commits"));
+        assert!(text.contains("src/main.rs"));
+        assert!(!text.contains("Hotspots (commits x lines):"));
     }
 
     // -----------------------------------------------------------------------
