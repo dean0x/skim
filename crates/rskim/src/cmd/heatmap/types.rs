@@ -103,8 +103,8 @@ pub(crate) struct HeatmapArgs {
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
-    /// Keep doc files and non-code folders in the hotspots, the modules
-    /// and the insights (`--include-docs`).
+    /// Keep doc files and non-code folders in hotspots, fix risk, modules
+    /// and insights (`--include-docs`).
     pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
     pub(crate) extra_excludes: Vec<globset::Glob>,
@@ -229,8 +229,8 @@ pub(crate) struct HeatmapConfig {
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
-    /// Keep doc files and non-code folders in the hotspots, the modules
-    /// and the insights (`--include-docs`).
+    /// Keep doc files and non-code folders in hotspots, fix risk, modules
+    /// and insights (`--include-docs`).
     pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
     pub(crate) extra_excludes: Vec<globset::Glob>,
@@ -301,6 +301,8 @@ pub(crate) struct HeatmapResult {
     pub(crate) repository: String,
     pub(crate) window: WindowInfo,
     pub(crate) files: Vec<FileMetrics>,
+    /// History paths with no regular file at HEAD, before file scope.
+    pub(crate) not_at_head: usize,
     pub(crate) modules: Vec<ModuleHealth>,
     pub(crate) coupling_graph: Vec<CouplingEdge>,
     pub(crate) excluded_patterns: Vec<String>,
@@ -331,10 +333,19 @@ pub(crate) struct WindowInfo {
 pub(crate) struct FileMetrics {
     pub(crate) path: String,
     pub(crate) churn: ChurnMetrics,
+    /// Text lines at HEAD, or zero when no count is available.
+    pub(crate) lines: u64,
     pub(crate) stability_score: u8,
     pub(crate) authors: AuthorMetrics,
     pub(crate) fix_risk: FixRiskMetrics,
     pub(crate) blast_radius: Vec<CouplingEntry>,
+}
+
+impl FileMetrics {
+    #[must_use]
+    pub(crate) fn score(&self) -> u64 {
+        (self.churn.commits as u64).saturating_mul(self.lines)
+    }
 }
 
 /// Churn metrics for a file.
@@ -393,6 +404,7 @@ impl Default for FixRiskMetrics {
 /// A coupling entry in a file's blast radius.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CouplingEntry {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     /// Confidence score (0.0–1.0).
     pub(crate) confidence: f64,
@@ -403,7 +415,9 @@ pub(crate) struct CouplingEntry {
 /// A directed coupling edge in the global graph.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CouplingEdge {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) a: String,
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) b: String,
     pub(crate) confidence: f64,
     pub(crate) support: usize,
@@ -412,6 +426,7 @@ pub(crate) struct CouplingEdge {
 /// Encapsulation health for a module directory.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModuleHealth {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     /// Percentage of commits touching only this module (0.0–100.0).
     pub(crate) encapsulation_pct: f64,
@@ -457,7 +472,10 @@ pub(crate) enum InsightCategory {
 pub(crate) struct Insight {
     pub(crate) severity: Severity,
     pub(crate) category: InsightCategory,
+    #[serde(skip)]
     pub(crate) file: String,
+    #[serde(rename = "file")]
+    pub(crate) shown_file: String,
     pub(crate) message: String,
     pub(crate) metric_value: f64,
     /// Commits behind the finding: commits of the file or the module, or the
@@ -521,6 +539,7 @@ pub(crate) struct InsightsResult {
 /// Condensed file entry for [`InsightsResult`].
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CompactFileEntry {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     pub(crate) stability: u8,
     pub(crate) churn_commits: usize,
@@ -531,6 +550,7 @@ pub(crate) struct CompactFileEntry {
 /// Flagged module entry for [`InsightsResult`].
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct CompactModuleEntry {
+    #[serde(serialize_with = "super::card::serialize_path")]
     pub(crate) path: String,
     pub(crate) encapsulation_pct: f64,
     pub(crate) cross_boundary: usize,

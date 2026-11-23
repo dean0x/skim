@@ -5,22 +5,30 @@
 
 use super::git_source::GitDataSource;
 use super::types::{FileTargets, HeatmapArgs, HeatmapConfig, ResolvedWindow, WindowInfo};
+use crate::cmd::session::civil::days_to_ymd;
 
 // ============================================================================
 // Preset mapping
 // ============================================================================
 
-/// Map a named preset to `--since` epoch seconds offset.
-fn preset_to_since_secs(preset: &str, now_epoch: u64) -> Option<u64> {
-    match preset {
-        "sprint" => Some(now_epoch.saturating_sub(14 * 86400)),
-        "month" => Some(now_epoch.saturating_sub(30 * 86400)),
-        "quarter" => Some(now_epoch.saturating_sub(90 * 86400)),
-        "half" => Some(now_epoch.saturating_sub(180 * 86400)),
-        "year" => Some(now_epoch.saturating_sub(365 * 86400)),
-        "all" => Some(0),
-        _ => None,
-    }
+const WINDOW_PRESETS: [(&str, Option<u64>); 6] = [
+    ("sprint", Some(14)),
+    ("month", Some(30)),
+    ("quarter", Some(90)),
+    ("half", Some(180)),
+    ("year", Some(365)),
+    ("all", None),
+];
+
+pub(super) fn preset_days(preset: &str) -> anyhow::Result<Option<u64>> {
+    WINDOW_PRESETS
+        .iter()
+        .find(|(name, _)| *name == preset)
+        .map(|(_, days)| *days)
+        .ok_or_else(|| {
+            let names = WINDOW_PRESETS.map(|(name, _)| name).join(", ");
+            anyhow::anyhow!("--window must be one of {names}; got: {preset}")
+        })
 }
 
 // ============================================================================
@@ -50,6 +58,14 @@ pub(super) fn resolve_config(
     warnings: &mut Vec<String>,
     now_epoch: u64,
 ) -> anyhow::Result<(HeatmapConfig, ResolvedWindow)> {
+    let preset_since = args
+        .window_preset
+        .as_deref()
+        .map(|preset| {
+            preset_days(preset).map(|days| days.map_or(0, |d| now_epoch.saturating_sub(d * 86400)))
+        })
+        .transpose()?;
+
     // Move window_preset and last_n into ResolvedWindow first so we can read
     // them from `window.*` rather than from `args` after partial move.
     let mut window = ResolvedWindow {
@@ -91,14 +107,8 @@ pub(super) fn resolve_config(
             )),
             Err(e) => warnings.push(format!("Could not resolve --last {n}: {e}")),
         }
-    } else if let Some(ref preset) = window.window_preset {
-        if let Some(s) = preset_to_since_secs(preset, now_epoch) {
-            since = Some(s);
-        } else {
-            warnings.push(format!(
-                "Unknown window preset '{preset}' — valid: sprint, month, quarter, half, year, all. Analyzing all history."
-            ));
-        }
+    } else if let Some(s) = preset_since {
+        since = Some(s);
     } else {
         // Dual default: max(last 90 days, last 200 commits)
         let time_since = now_epoch.saturating_sub(90 * 86400);
@@ -203,27 +213,8 @@ pub(super) fn build_window_info(
 
 /// Format a Unix epoch as a simple date string (YYYY-MM-DD).
 pub(super) fn format_epoch(epoch: u64) -> String {
-    // Manual calculation — no chrono dependency
-    // Days since 1970-01-01
-    let days = epoch / 86400;
-    let (year, month, day) = days_to_ymd(days);
+    let (year, month, day) = days_to_ymd(epoch / 86400);
     format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Convert days since 1970-01-01 to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month prime
-    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
-    let y_adj = if m <= 2 { y + 1 } else { y };
-    (y_adj, m, d)
 }
 
 // ============================================================================
@@ -236,7 +227,6 @@ mod tests {
     use super::super::git_source::ParsedLog;
     use super::super::types::DetailSection;
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn base_window() -> ResolvedWindow {
         ResolvedWindow {
@@ -259,37 +249,6 @@ mod tests {
     #[test]
     fn test_format_epoch_unix_epoch() {
         assert_eq!(format_epoch(0), "1970-01-01");
-    }
-
-    #[test]
-    fn test_preset_to_since_secs_sprint() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let since = preset_to_since_secs("sprint", now).unwrap();
-        let diff = now - since;
-        assert!((13 * 86400..=15 * 86400).contains(&diff));
-    }
-
-    #[test]
-    fn test_preset_to_since_secs_unknown() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(preset_to_since_secs("unknown-preset", now).is_none());
-    }
-
-    #[test]
-    fn test_days_to_ymd_epoch() {
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn test_days_to_ymd_known_date() {
-        // 2024-01-01 = 19723 days since epoch
-        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
     }
 
     #[test]
@@ -443,8 +402,23 @@ mod tests {
         fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<ParsedLog> {
             Ok(ParsedLog::default())
         }
-        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
-            Ok(None)
+        fn detect_partial_clone(&self, _repo_root: &str) -> bool {
+            false
+        }
+        fn list_tracked_files(
+            &self,
+            _repo_root: &str,
+            _no_lazy_fetch: bool,
+        ) -> anyhow::Result<super::super::git_source::HeadTree> {
+            Ok(Default::default())
+        }
+        fn count_head_lines(
+            &self,
+            _repo_root: &str,
+            _path: Option<&str>,
+            _no_lazy_fetch: bool,
+        ) -> anyhow::Result<super::super::git_source::HeadCounts> {
+            Ok(Vec::new())
         }
         fn show_prefix(&self) -> anyhow::Result<String> {
             Ok(String::new())
@@ -673,30 +647,18 @@ mod tests {
         );
     }
 
-    /// When an unknown preset is supplied, `config.since` stays `None` (all history)
-    /// and a warning is emitted naming the unrecognised preset.
     #[test]
-    fn test_resolve_config_unknown_preset_emits_warning() {
+    fn test_resolve_config_unknown_preset_returns_error() {
         let source = MockGitSource::ok(None);
         let mut args = base_args();
         args.window_preset = Some("biweekly".to_string());
         let mut warnings = Vec::new();
 
-        let (config, _window) = resolve_config(args, &source, &mut warnings, NOW).unwrap();
-
-        assert!(
-            config.since.is_none(),
-            "expected since=None for unknown preset, got {:?}",
-            config.since
+        let result = resolve_config(args, &source, &mut warnings, NOW);
+        assert_eq!(
+            result.err().map(|err| err.to_string()).as_deref(),
+            Some("--window must be one of sprint, month, quarter, half, year, all; got: biweekly")
         );
-        assert!(
-            !warnings.is_empty(),
-            "expected a warning about the unknown preset, got none"
-        );
-        assert!(
-            warnings.iter().any(|w| w.contains("Unknown window preset")),
-            "warning must contain 'Unknown window preset', got: {:?}",
-            warnings
-        );
+        assert!(warnings.is_empty());
     }
 }

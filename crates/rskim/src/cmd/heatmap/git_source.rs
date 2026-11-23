@@ -3,8 +3,14 @@
 //! Uses `CommandRunner` to execute git commands and parses their output into
 //! `CommitInfo` values via a simple state machine.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crate::cmd::is_repo_relative_safe;
 use crate::runner::{CommandOutput, CommandRunner, MAX_OUTPUT_BYTES, is_spawn_error};
 
+use super::metrics::without_quotes;
+use super::note;
 use super::types::{CommitInfo, FileChangeInfo, HeatmapConfig};
 
 /// `git log` record header: hash, author timestamp, author name and subject,
@@ -42,13 +48,10 @@ fn git_not_found(e: anyhow::Error) -> anyhow::Error {
 /// single `&dyn GitDataSource` instead of splitting into a concrete `&CliGitSource`
 /// for infrastructure and a trait object for data fetch.
 ///
-/// One method takes a path from the user: [`fetch_commits`](Self::fetch_commits)
-/// gives the `--path` value to git. That value goes after `--`, and git runs
-/// with `--literal-pathspecs` (the same as `GIT_LITERAL_PATHSPECS=1`), so git
-/// reads it as a literal path: a folder matches the files below it, and no
-/// glob or pathspec magic applies. A new method that takes a path from the
-/// user must do the same. (`CliGitSource::fetch_diff_files` takes a revision,
-/// not a path: see `build_diff_args`.)
+/// No method passes the repository root as a pathspec or a revision. It goes
+/// after `-C` only. The log and count methods pass `--path` after `--` with
+/// `--literal-pathspecs`, so a folder matches its files without glob or
+/// pathspec magic.
 pub(crate) trait GitDataSource {
     /// Return `true` when the cwd is inside a git repository.
     fn is_git_repo(&self) -> bool;
@@ -72,17 +75,20 @@ pub(crate) trait GitDataSource {
     /// commits gives an empty history.
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<ParsedLog>;
 
-    /// List the paths in the HEAD tree of the repository at `repo_root`,
-    /// relative to that root.
-    ///
-    /// The list comes from the committed tree, not from the index. A branch
-    /// with no commits gives `Ok(None)`.
-    ///
-    /// The paths use the same encoding as the `--numstat` paths of
-    /// [`fetch_commits`](Self::fetch_commits): git C-quotes unusual names in
-    /// both. `Ok(None)` means the list is not available; the caller uses its
-    /// fallback and the run continues.
-    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<Option<Vec<String>>>;
+    /// Return `true` if a HEAD read may fetch objects, including on config errors.
+    fn detect_partial_clone(&self, repo_root: &str) -> bool;
+
+    /// List the complete HEAD tree, with keys relative to `repo_root`.
+    /// Git quotes the keys in the same form as in the log and count output.
+    fn list_tracked_files(&self, repo_root: &str, no_lazy_fetch: bool) -> anyhow::Result<HeadTree>;
+
+    /// Count text lines in HEAD. A scope is literal and relative to the cwd.
+    fn count_head_lines(
+        &self,
+        repo_root: &str,
+        path: Option<&str>,
+        no_lazy_fetch: bool,
+    ) -> anyhow::Result<HeadCounts>;
 
     /// Return the path of the cwd below the repository root
     /// (`git rev-parse --show-prefix`): empty at the root, else it ends in `/`.
@@ -100,6 +106,9 @@ pub(crate) struct CliGitSource {
 
 /// Build the `git log` arg list for a window start and an optional `--path`.
 ///
+/// Disable signature output so each record contains only the expected rows.
+/// Keep paths root-relative so they match the HEAD tree and line counts.
+///
 /// `--literal-pathspecs` goes before the subcommand, so git reads the path
 /// after `--` as a literal path: a folder still matches the files below it,
 /// but a glob or a pathspec magic prefix matches only that literal name. It is
@@ -108,17 +117,23 @@ pub(crate) struct CliGitSource {
 /// no environment.
 fn build_git_log_args(since: Option<u64>, path: Option<&str>) -> Vec<String> {
     let mut args = vec![
+        "-c".to_string(),
+        "log.showSignature=false".to_string(),
+        "-c".to_string(),
+        "diff.relative=false".to_string(),
         "--literal-pathspecs".to_string(),
         "log".to_string(),
         LOG_FORMAT.to_string(),
+        "--raw".to_string(),
         "--numstat".to_string(),
         "--no-merges".to_string(),
         "--date=unix".to_string(),
         "-M".to_string(),
     ];
 
-    if let Some(since) = since {
-        args.push(format!("--since={since}"));
+    if let Some(since) = since.filter(|&epoch| epoch != 0) {
+        // An explicit epoch keeps Git from guessing the date of a bare number.
+        args.push(format!("--since=@{since} +0000"));
     }
 
     if let Some(path) = path {
@@ -131,11 +146,15 @@ fn build_git_log_args(since: Option<u64>, path: Option<&str>) -> Vec<String> {
 
 /// Build the `git diff` arg list for the files changed between `base` and HEAD.
 ///
+/// Keep paths root-relative so the targets match the history paths.
+///
 /// `--end-of-options` makes git read the next argument as a revision, so the
 /// `--diff` value reaches git as a value only. The revision must never go
 /// after `--`: git reads anything there as a path.
 fn build_diff_args(base: &str) -> Vec<String> {
     vec![
+        "-c".to_string(),
+        "diff.relative=false".to_string(),
         "diff".to_string(),
         "--name-only".to_string(),
         "--end-of-options".to_string(),
@@ -150,6 +169,22 @@ impl CliGitSource {
         }
     }
 
+    /// Heatmap does not stop when stderr is closed.
+    fn capture_git(&self, args: &[&str]) -> anyhow::Result<CommandOutput> {
+        let (out, cut) = self.runner.run_stdout_degrade("git", args)?;
+        if cut {
+            note(format_args!(
+                "{}",
+                crate::output::fidelity::output_cap_marker(
+                    "git",
+                    out.stdout.len(),
+                    MAX_OUTPUT_BYTES
+                )
+            ));
+        }
+        Ok(out)
+    }
+
     /// Resolve files changed between `base` and HEAD using three-dot diff.
     ///
     /// Uses `git diff --name-only --end-of-options <base>...HEAD` so that only
@@ -157,7 +192,7 @@ impl CliGitSource {
     pub(crate) fn fetch_diff_files(&self, base: &str) -> anyhow::Result<Vec<String>> {
         let owned_args = build_diff_args(base);
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        let out = self.runner.run("git", &args).map_err(git_not_found)?;
+        let out = self.capture_git(&args).map_err(git_not_found)?;
 
         if out.exit_code != Some(0) {
             let stderr = out.stderr.trim();
@@ -170,9 +205,8 @@ impl CliGitSource {
         Ok(out
             .stdout
             .lines()
-            .map(|l| l.trim())
             .filter(|l| !l.is_empty())
-            .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+            .map(str::to_owned)
             .collect())
     }
 
@@ -183,8 +217,7 @@ impl CliGitSource {
     /// a failed `git log` is then reported, not hidden as an empty history.
     fn head_is_unborn(&self) -> bool {
         matches!(
-            self.runner
-                .run("git", &["rev-parse", "--verify", "--quiet", "HEAD"]),
+            self.capture_git(&["rev-parse", "--verify", "--quiet", "HEAD"]),
             Ok(out) if out.exit_code == Some(1)
         )
     }
@@ -192,10 +225,7 @@ impl CliGitSource {
 
 impl GitDataSource for CliGitSource {
     fn is_git_repo(&self) -> bool {
-        match self
-            .runner
-            .run("git", &["rev-parse", "--is-inside-work-tree"])
-        {
+        match self.capture_git(&["rev-parse", "--is-inside-work-tree"]) {
             Ok(out) => out.exit_code == Some(0),
             Err(_) => false,
         }
@@ -203,17 +233,13 @@ impl GitDataSource for CliGitSource {
 
     fn get_repo_root(&self) -> anyhow::Result<String> {
         let out = self
-            .runner
-            .run("git", &["rev-parse", "--show-toplevel"])
+            .capture_git(&["rev-parse", "--show-toplevel"])
             .map_err(git_not_found)?;
-        Ok(out.stdout.trim().to_string())
+        rev_parse_path(&out, "--show-toplevel")
     }
 
     fn detect_shallow_clone(&self) -> bool {
-        match self
-            .runner
-            .run("git", &["rev-parse", "--is-shallow-repository"])
-        {
+        match self.capture_git(&["rev-parse", "--is-shallow-repository"]) {
             Ok(out) => out.stdout.trim() == "true",
             Err(_) => false,
         }
@@ -225,18 +251,18 @@ impl GitDataSource for CliGitSource {
         }
         let skip = n.saturating_sub(1).to_string();
         let n_str = n.to_string();
-        let out = self.runner.run(
-            "git",
-            &[
-                "log",
-                "--format=%ad",
-                "--date=unix",
-                "-n",
-                &n_str,
-                "--skip",
-                &skip,
-            ],
-        )?;
+        // The first line must be a timestamp, not a signature report.
+        let out = self.capture_git(&[
+            "-c",
+            "log.showSignature=false",
+            "log",
+            "--format=%ad",
+            "--date=unix",
+            "-n",
+            &n_str,
+            "--skip",
+            &skip,
+        ])?;
         // The first line is the timestamp. A line that is not a valid
         // timestamp gives `None`, never a zero timestamp.
         let ts = out
@@ -259,21 +285,81 @@ impl GitDataSource for CliGitSource {
         parsed_log_from(&output, cut, || self.head_is_unborn())
     }
 
-    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
-        // No `-z`: the plain output C-quotes unusual paths exactly as
-        // `--numstat` does, so both lists use one path encoding for any
-        // `core.quotePath` setting.
-        let result = self.runner.run("git", &tracked_files_args(repo_root));
-        Ok(tracked_files_from(result))
+    fn detect_partial_clone(&self, repo_root: &str) -> bool {
+        let result = self.runner.run_stdout_degrade(
+            "git",
+            &[
+                "-C",
+                repo_root,
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^(extensions\.partialclone|remote\..*\.promisor)$",
+            ],
+        );
+        match result {
+            Ok((out, cut)) => config_may_enable_lazy_fetch(&out, cut),
+            Err(_) => true,
+        }
+    }
+
+    fn list_tracked_files(&self, repo_root: &str, no_lazy_fetch: bool) -> anyhow::Result<HeadTree> {
+        let (out, cut) = self
+            .runner
+            .run_stdout_degrade("git", &tracked_files_args(repo_root, no_lazy_fetch))?;
+        tracked_files_from(&out, cut)
+    }
+
+    fn count_head_lines(
+        &self,
+        repo_root: &str,
+        path: Option<&str>,
+        no_lazy_fetch: bool,
+    ) -> anyhow::Result<HeadCounts> {
+        let (out, cut) = self
+            .runner
+            .run_stdout_degrade("git", &head_line_count_args(repo_root, path, no_lazy_fetch))?;
+        head_line_counts_from(&out, cut)
     }
 
     fn show_prefix(&self) -> anyhow::Result<String> {
         let out = self
-            .runner
-            .run("git", &["rev-parse", "--show-prefix"])
+            .capture_git(&["rev-parse", "--show-prefix"])
             .map_err(git_not_found)?;
-        prefix_from(&out)
+        rev_parse_path(&out, "--show-prefix")
     }
+}
+
+/// `git config --null --get-regexp` writes NUL-terminated records with a
+/// newline between the key and value. Allow HEAD reads without the flag only
+/// for no matches or a complete list of explicitly disabled promisor keys.
+/// An extension entry, enabled promisor, or invalid response keeps the flag.
+fn config_may_enable_lazy_fetch(out: &CommandOutput, cut: bool) -> bool {
+    if cut || !out.stderr.is_empty() {
+        return true;
+    }
+    match out.exit_code {
+        Some(1) => !out.stdout.is_empty(),
+        Some(0) => {
+            let Some(records) = out.stdout.strip_suffix('\0') else {
+                return true;
+            };
+            records.split('\0').any(|record| !disabled_promisor(record))
+        }
+        _ => true,
+    }
+}
+
+fn disabled_promisor(record: &str) -> bool {
+    let Some((key, value)) = record.split_once('\n') else {
+        return false;
+    };
+    key.strip_prefix("remote.")
+        .and_then(|key| key.strip_suffix(".promisor"))
+        .is_some_and(|name| !name.is_empty())
+        && ["false", "no", "off", "0", ""]
+            .iter()
+            .any(|disabled| value.eq_ignore_ascii_case(disabled))
 }
 
 /// The arg list that lists the paths of the HEAD tree of `repo_root`.
@@ -281,17 +367,49 @@ impl GitDataSource for CliGitSource {
 /// The paths come from the committed tree, so git does not read the index
 /// and no index setting of the repository applies. A branch with no commits
 /// makes git fail, and the caller then uses its fallback. `--full-tree` lists
-/// the whole tree for any cwd.
-fn tracked_files_args(repo_root: &str) -> [&str; 7] {
-    [
+/// the whole tree for any cwd. If Git cannot read a blob size, `ls-tree -l`
+/// can report `BAD` even with exit 0.
+fn tracked_files_args(repo_root: &str, no_lazy_fetch: bool) -> Vec<&str> {
+    let mut args = Vec::with_capacity(8);
+    args.extend(no_lazy_fetch.then_some("--no-lazy-fetch"));
+    args.extend([
         "-C",
         repo_root,
         "ls-tree",
         "-r",
-        "--name-only",
+        "-l",
         "--full-tree",
         "HEAD",
-    ]
+    ]);
+    args
+}
+
+/// Scope a count from the cwd, but always return root-relative keys.
+fn head_line_count_args<'a>(
+    repo_root: &'a str,
+    path: Option<&'a str>,
+    no_lazy_fetch: bool,
+) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(13);
+    args.extend(no_lazy_fetch.then_some("--no-lazy-fetch"));
+    match path {
+        Some(_) => args.push("--literal-pathspecs"),
+        None => args.extend(["-C", repo_root]),
+    }
+    args.extend([
+        "grep",
+        "-I",
+        "-c",
+        "--full-name",
+        "--no-color",
+        "--no-recurse-submodules",
+        "-e",
+        "",
+        "HEAD",
+        "--",
+    ]);
+    args.extend(path);
+    args
 }
 
 /// Map a `git log` run to its records.
@@ -354,43 +472,95 @@ fn without_last_record(raw: &str) -> &str {
     &raw[..last_start]
 }
 
-/// Map a `git ls-tree` run to its path list.
-///
-/// A spawn error or any exit status other than 0 gives `None` (with one
-/// debug-gated note), and the caller uses its fallback. A run cut at the
-/// runner's output cap does not report exit 0, so a partial list is never
-/// used as a full one.
-fn tracked_files_from(result: anyhow::Result<CommandOutput>) -> Option<Vec<String>> {
-    match result {
-        Ok(out) if out.exit_code == Some(0) => Some(
-            out.stdout
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        Ok(out) => {
-            crate::debug_log!(
-                "[skim:heatmap] git ls-tree exit status {:?}; modules use the top-folder rule",
-                out.exit_code
-            );
-            None
-        }
-        Err(e) => {
-            crate::debug_log!(
-                "[skim:heatmap] git ls-tree did not run ({e}); modules use the top-folder rule"
-            );
-            None
-        }
+pub(crate) type HeadTree = HashMap<String, HeadEntry>;
+pub(crate) type HeadCounts = Vec<(String, u64)>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadEntry {
+    /// The listing supplies zero for an empty file. Git grep supplies text counts.
+    /// After the count call, `None` means binary or outside the requested scope.
+    Regular(Option<u64>),
+    Other,
+}
+
+/// Reject a partial listing. A missing row could otherwise look like a deletion.
+fn tracked_files_from(out: &CommandOutput, cut: bool) -> anyhow::Result<HeadTree> {
+    anyhow::ensure!(
+        !cut && out.exit_code == Some(0),
+        "incomplete git ls-tree output"
+    );
+    let mut entries = HashMap::new();
+    for line in out.stdout.lines() {
+        let (path, entry) =
+            parse_tree_line(line).ok_or_else(|| anyhow::anyhow!("invalid git ls-tree row"))?;
+        anyhow::ensure!(
+            entries.insert(path.to_owned(), entry).is_none(),
+            "duplicate git ls-tree path"
+        );
+    }
+    Ok(entries)
+}
+
+fn parse_tree_line(line: &str) -> Option<(&str, HeadEntry)> {
+    let (metadata, path) = line.split_once('\t')?;
+    let mut fields = metadata.split_ascii_whitespace();
+    let (mode, kind, oid, size) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    let valid_size = (kind == "commit" && size == "-") || size.bytes().all(|b| b.is_ascii_digit());
+    if fields.next().is_some()
+        || mode.len() != 6
+        || !mode.bytes().all(|b| (b'0'..=b'7').contains(&b))
+        || !matches!(kind, "blob" | "commit")
+        || !is_object_id(oid)
+        || !valid_size
+        || path.is_empty()
+        || path.contains(['\t', '\0'])
+        || !disk_path(path).is_some_and(|p| is_repo_relative_safe(&p))
+    {
+        return None;
+    }
+    let entry = match (mode, kind) {
+        ("100644" | "100755", "blob") => HeadEntry::Regular((size == "0").then_some(0)),
+        _ => HeadEntry::Other,
+    };
+    Some((path, entry))
+}
+
+/// No text matches gives an empty result, not a failed count.
+/// Git can report a read error on stderr with exit 0 or 1.
+fn head_line_counts_from(out: &CommandOutput, cut: bool) -> anyhow::Result<HeadCounts> {
+    anyhow::ensure!(!cut && out.stderr.is_empty(), "incomplete git grep output");
+    match out.exit_code {
+        Some(0) => out
+            .stdout
+            .lines()
+            .map(|line| {
+                parse_count_line(line).ok_or_else(|| anyhow::anyhow!("invalid git grep row"))
+            })
+            .collect(),
+        Some(1) if out.stdout.is_empty() => Ok(Vec::new()),
+        _ => anyhow::bail!("git grep did not return line counts"),
     }
 }
 
-/// Read the output of `git rev-parse --show-prefix`.
-fn prefix_from(out: &CommandOutput) -> anyhow::Result<String> {
-    if out.exit_code != Some(0) {
-        anyhow::bail!("git rev-parse --show-prefix failed: {}", out.stderr.trim());
+fn parse_count_line(line: &str) -> Option<(String, u64)> {
+    // Preserve Git quotes. A colon in the name is not the count separator.
+    let (path, count) = line.strip_prefix("HEAD:")?.rsplit_once(':')?;
+    if path.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    // Remove only the line end: the prefix itself ends in `/`.
+    Some((path.to_owned(), count.parse().ok()?))
+}
+
+/// Keep each path byte except Git's line terminator.
+fn rev_parse_path(out: &CommandOutput, flag: &str) -> anyhow::Result<String> {
+    if out.exit_code != Some(0) {
+        anyhow::bail!("git rev-parse {flag} failed: {}", out.stderr.trim());
+    }
     Ok(out
         .stdout
         .strip_suffix('\n')
@@ -410,54 +580,138 @@ pub(crate) struct ParsedLog {
     /// Count of `COMMIT:` records skipped for a missing field, a bad hash or a
     /// bad timestamp. Their numstat lines are skipped with them.
     pub(crate) malformed: usize,
+    /// Records skipped because raw and numstat rows did not pair.
+    pub(crate) unpaired: usize,
+    /// File rows dropped because their resolved path did not decode to a safe path.
+    pub(crate) unsafe_paths: usize,
     /// `Some(ts)` when the git output stopped at the runner's output limit:
     /// the last record was dropped, and `ts` is the author timestamp of the
     /// oldest commit kept. `None` for a full output.
     pub(crate) cut_oldest: Option<i64>,
 }
 
-/// Parse the output of `git log` with [`LOG_FORMAT`] and `--numstat`.
-///
-/// Exposed as `pub(crate)` so unit tests can exercise the parser on hardcoded
-/// strings without spawning a real git process.
+/// Parse `git log` with [`LOG_FORMAT`], `--raw` and `--numstat`.
+/// The runner bounds the input, and each record uses only aliases from newer records.
 #[must_use]
-pub(crate) fn parse_git_log_output(raw: &str) -> ParsedLog {
-    let mut commits: Vec<CommitInfo> = Vec::new();
-    let mut malformed = 0usize;
-    let mut current: Option<CommitInfo> = None;
-
+pub(super) fn parse_git_log_output(raw: &str) -> ParsedLog {
+    let mut parsed = ParsedLog::default();
+    let mut aliases = HashMap::new();
+    let mut rows = RecordRows::default();
+    let mut current = None;
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix(RECORD_PREFIX) {
-            // Flush the previous commit
-            if let Some(c) = current.take() {
-                commits.push(c);
+            if let Some(commit) = current.take() {
+                rows.finish(commit, &mut aliases, &mut parsed);
             }
-            // A bad record leaves `current` as `None`, so its numstat lines
-            // attach to no commit.
+            rows.clear();
             current = parse_commit_header(rest);
             if current.is_none() {
-                malformed += 1;
+                parsed.malformed += 1;
             }
-        } else if line.trim().is_empty() {
-            // Blank lines separate commits — skip
-            continue;
-        } else if let Some(record) = current.as_mut()
-            && let Some(file_change) = parse_numstat_line(line)
-        {
-            // Numstat line: additions\tdeletions\tpath (binary files: - - path)
-            record.changed_files.push(file_change);
+        } else if current.is_some() && !line.is_empty() {
+            rows.push(line);
         }
     }
+    if let Some(commit) = current {
+        rows.finish(commit, &mut aliases, &mut parsed);
+    }
+    parsed
+}
 
-    // Flush the last commit
-    if let Some(c) = current {
-        commits.push(c);
+#[derive(Default)]
+struct RecordRows<'a> {
+    raw: Vec<RawRow<'a>>,
+    stats: Vec<NumstatRow<'a>>,
+    invalid: bool,
+}
+
+impl<'a> RecordRows<'a> {
+    fn clear(&mut self) {
+        self.raw.clear();
+        self.stats.clear();
+        self.invalid = false;
     }
 
-    ParsedLog {
-        commits,
-        malformed,
-        cut_oldest: None,
+    fn push(&mut self, line: &'a str) {
+        if line.starts_with(':') {
+            if let Some(row) = parse_raw_row(line) {
+                self.raw.push(row);
+                return;
+            }
+        } else if let Some(row) = parse_numstat_line(line) {
+            self.stats.push(row);
+            return;
+        }
+        self.invalid = true;
+    }
+
+    fn finish(
+        &self,
+        mut commit: CommitInfo,
+        aliases: &mut HashMap<&'a str, &'a str>,
+        parsed: &mut ParsedLog,
+    ) {
+        let pairs = self.raw.iter().zip(&self.stats);
+        if self.invalid
+            || self.raw.len() != self.stats.len()
+            || pairs
+                .clone()
+                .any(|(raw, stat)| raw.old.is_none() && raw.path != stat.path)
+        {
+            parsed.unpaired += 1;
+            return;
+        }
+
+        let mut indices: HashMap<&str, usize> = HashMap::new();
+        let mut renames = Vec::new();
+        for (raw, stat) in pairs {
+            let path = aliases.get(raw.path).copied().unwrap_or(raw.path);
+            if !disk_path(path).is_some_and(|rel| is_repo_relative_safe(&rel)) {
+                parsed.unsafe_paths += 1;
+                continue;
+            }
+            if let Some(old) = raw.old {
+                renames.push((old, path));
+            }
+            if let Some((add, del)) = stat.lines {
+                if raw.old.is_some() && add == 0 && del == 0 {
+                    continue;
+                }
+                add_file_change(&mut commit.changed_files, &mut indices, path, add, del);
+            }
+        }
+
+        // A newly created path has no prior history under that name. Apply all
+        // changes to the alias table only after every row has used its old state.
+        for raw in &self.raw {
+            if raw.added || raw.old.is_some() {
+                aliases.remove(raw.path);
+            }
+        }
+        aliases.extend(renames);
+        parsed.commits.push(commit);
+    }
+}
+
+fn add_file_change<'a>(
+    files: &mut Vec<FileChangeInfo>,
+    indices: &mut HashMap<&'a str, usize>,
+    path: &'a str,
+    additions: u64,
+    deletions: u64,
+) {
+    let next = files.len();
+    let index = *indices.entry(path).or_insert(next);
+    if let Some(file) = files.get_mut(index) {
+        file.additions = file.additions.saturating_add(additions);
+        file.deletions = file.deletions.saturating_add(deletions);
+    } else {
+        // Keep Git's spelling for joins with cards, HEAD paths and diff paths.
+        files.push(FileChangeInfo {
+            path: PathBuf::from(path),
+            additions,
+            deletions,
+        });
     }
 }
 
@@ -472,7 +726,7 @@ fn parse_commit_header(rest: &str) -> Option<CommitInfo> {
     let author = fields.next()?;
     let subject = fields.next()?;
 
-    if !is_commit_hash(hash) {
+    if !is_object_id(hash) {
         return None;
     }
     let timestamp = parse_unix_timestamp(timestamp)?;
@@ -487,7 +741,7 @@ fn parse_commit_header(rest: &str) -> Option<CommitInfo> {
 }
 
 /// `true` for a full SHA-1 (40) or SHA-256 (64) object name in ASCII hex.
-fn is_commit_hash(s: &str) -> bool {
+fn is_object_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -499,55 +753,130 @@ fn parse_unix_timestamp(s: &str) -> Option<i64> {
     s.parse().ok()
 }
 
-/// Parse a single git numstat line into a `FileChangeInfo`.
-///
-/// Returns `None` for binary files (marked with `-` in both columns) or
-/// malformed lines.
-fn parse_numstat_line(line: &str) -> Option<FileChangeInfo> {
-    let parts: Vec<&str> = line.splitn(3, '\t').collect();
-    if parts.len() < 3 {
+struct RawRow<'a> {
+    path: &'a str,
+    old: Option<&'a str>,
+    added: bool,
+}
+
+fn parse_raw_row(line: &str) -> Option<RawRow<'_>> {
+    let (metadata, paths) = line.split_once('\t')?;
+    let mut fields = metadata.split(' ');
+    for _ in 0..4 {
+        fields.next().filter(|field| !field.is_empty())?;
+    }
+    let status = fields.next()?;
+    if fields.next().is_some() {
         return None;
     }
-
-    let additions_str = parts[0].trim();
-    let deletions_str = parts[1].trim();
-    let raw_path = parts[2].trim();
-
-    // Skip binary files
-    if additions_str == "-" && deletions_str == "-" {
+    let (old, path) = match status {
+        "A" | "D" | "M" | "T" | "U" | "X" | "B" => (None, paths),
+        _ => {
+            let (kind, score) = status.split_at_checked(1)?;
+            if score.is_empty() || !score.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            match kind {
+                "M" => (None, paths),
+                "C" | "R" => {
+                    let (source, path) = paths.split_once('\t')?;
+                    if source.is_empty() {
+                        return None;
+                    }
+                    ((kind == "R").then_some(source), path)
+                }
+                _ => return None,
+            }
+        }
+    };
+    if path.is_empty() || path.contains('\t') {
         return None;
     }
-
-    let additions: u64 = additions_str.parse().unwrap_or(0);
-    let deletions: u64 = deletions_str.parse().unwrap_or(0);
-
-    // Resolve renames: `{old => new}` or `dir/{old => new}/rest`
-    let path = resolve_rename(raw_path);
-
-    Some(FileChangeInfo {
-        path: std::path::PathBuf::from(path),
-        additions,
-        deletions,
+    Some(RawRow {
+        path,
+        old,
+        added: status == "A",
     })
 }
 
-/// Resolve a git rename path like `{old => new}` or `dir/{old => new}/file`.
-fn resolve_rename(raw: &str) -> String {
-    // Find `{...}` brace pair
-    if let (Some(open), Some(close)) = (raw.find('{'), raw.rfind('}'))
-        && open < close
-    {
-        let prefix = &raw[..open];
-        let suffix = &raw[close + 1..];
-        let inner = &raw[open + 1..close];
+/// Binary rows have no line counts but still take part in ordinal pairing.
+struct NumstatRow<'a> {
+    path: &'a str,
+    lines: Option<(u64, u64)>,
+}
 
-        // inner is "old => new"
-        if let Some(arrow_pos) = inner.find(" => ") {
-            let new_part = &inner[arrow_pos + 4..];
-            return format!("{prefix}{new_part}{suffix}");
+fn parse_numstat_line(line: &str) -> Option<NumstatRow<'_>> {
+    let (add, rest) = line.split_once('\t')?;
+    let (del, path) = rest.split_once('\t')?;
+    let lines = match (add, del) {
+        ("-", "-") => None,
+        (a, d)
+            if a.bytes().all(|b| b.is_ascii_digit()) && d.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Some((a.parse().ok()?, d.parse().ok()?))
         }
+        _ => return None,
+    };
+    (!path.is_empty()).then_some(NumstatRow { path, lines })
+}
+
+/// Decode a path from Git output for a check on disk or against path rules.
+/// Keep the quoted form as the shared key for Git log, diff and HEAD paths.
+pub(super) fn disk_path(path: &str) -> Option<PathBuf> {
+    let (inner, quoted) = without_quotes(path);
+    if !quoted {
+        return Some(PathBuf::from(path));
     }
-    raw.to_string()
+    path_from_bytes(c_unescaped(inner)?)
+}
+
+/// The bytes of the text inside git's quotes, or `None` for an escape that
+/// git does not write. Each pass reads at least one byte, so the loop ends
+/// after at most `inner.len()` passes.
+fn c_unescaped(inner: &str) -> Option<Vec<u8>> {
+    let mut rest = inner.bytes();
+    let mut out = Vec::with_capacity(inner.len());
+    while let Some(b) = rest.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        let byte = match rest.next()? {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'"' => b'"',
+            b'\\' => b'\\',
+            // Three octal digits, the first 0-3, so the value fits in a byte.
+            first @ b'0'..=b'3' => {
+                let mut value = first - b'0';
+                for _ in 0..2 {
+                    let digit = rest.next().filter(|d| (b'0'..=b'7').contains(d))?;
+                    value = value * 8 + (digit - b'0');
+                }
+                value
+            }
+            _ => return None,
+        };
+        out.push(byte);
+    }
+    Some(out)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(std::ffi::OsString::from_vec(bytes).into())
+}
+
+/// Off Unix a path is text: bytes that are not UTF-8 name no file.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(Into::into)
 }
 
 // ============================================================================
@@ -578,6 +907,9 @@ mod tests {
         let mut out = String::new();
         for (hash, author, ts, subject, files) in entries {
             out.push_str(&header(hash, &ts.to_string(), author, subject));
+            for (_, _, path) in *files {
+                out.push_str(&format!(":100644 100644 1234 5678 M\t{path}\n"));
+            }
             for (add, del, path) in *files {
                 out.push_str(&format!("{add}\t{del}\t{path}\n"));
             }
@@ -598,7 +930,7 @@ mod tests {
     /// `bad.rs`, then a good record (one file `b.rs`).
     fn log_with_bad_record_between(bad: &str) -> String {
         format!(
-            "{}1\t0\ta.rs\n\n{bad}1\t0\tbad.rs\n\n{}1\t0\tb.rs\n\n",
+            "{}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n\n{bad}1\t0\tbad.rs\n\n{}:100644 100644 1234 5678 M\tb.rs\n1\t0\tb.rs\n\n",
             header(HASH_A, "1000", "Alice", "first"),
             header(HASH_B, "2000", "Bob", "second"),
         )
@@ -617,7 +949,10 @@ mod tests {
     fn output(stdout: &str, exit_code: Option<i32>) -> CommandOutput {
         CommandOutput {
             stdout: stdout.to_string(),
-            stderr: "fatal: test\n".to_string(),
+            stderr: match exit_code {
+                Some(0 | 1) => String::new(),
+                _ => "fatal: test\n".into(),
+            },
             exit_code,
             duration: Duration::ZERO,
         }
@@ -653,7 +988,7 @@ mod tests {
     #[test]
     fn test_parse_single_commit_with_files() {
         let input = format!(
-            "{}5\t2\tsrc/main.rs\n3\t1\tlib/utils.rs\n\n",
+            "{}:100644 100644 1234 5678 M\tsrc/main.rs\n:100644 100644 1234 5678 M\tlib/utils.rs\n5\t2\tsrc/main.rs\n3\t1\tlib/utils.rs\n\n",
             header(HASH_A, "1700000000", "Alice", "chore: update")
         );
         let parsed = parse_git_log_output(&input);
@@ -688,7 +1023,7 @@ mod tests {
     #[test]
     fn test_parse_author_with_pipe_keeps_timestamp_and_subject() {
         let input = format!(
-            "{}1\t0\ta.rs\n\n",
+            "{}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n\n",
             header(HASH_A, "1700000123", "Ann | Ops", "feat: add foo|bar")
         );
         let parsed = parse_git_log_output(&input);
@@ -762,7 +1097,7 @@ mod tests {
     #[test]
     fn test_binary_files_skipped() {
         let input = format!(
-            "{}-\t-\tbinary.bin\n5\t2\treal.rs\n\n",
+            "{}:100644 100644 1234 5678 M\tbinary.bin\n:100644 100644 1234 5678 M\treal.rs\n-\t-\tbinary.bin\n5\t2\treal.rs\n\n",
             header(HASH_A, "1000", "Alice", "msg")
         );
         let parsed = parse_git_log_output(&input);
@@ -770,38 +1105,136 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_numstat_line_ignored() {
+    fn test_malformed_numstat_line_skips_record() {
         let input = format!(
             "{}not-a-numstat-line\n\n",
             header(HASH_A, "1000", "Alice", "msg")
         );
         let parsed = parse_git_log_output(&input);
-        // The malformed line should be silently ignored
-        assert_eq!(parsed.commits[0].changed_files.len(), 0);
+        assert!(parsed.commits.is_empty());
         assert_eq!(parsed.malformed, 0);
+        assert_eq!(parsed.unpaired, 1);
     }
 
     #[test]
-    fn test_rename_resolution_simple() {
-        assert_eq!(resolve_rename("{old.rs => new.rs}"), "new.rs");
+    fn test_rename_merges_final_paths_before_metrics() {
+        let input = format!(
+            "{}:100644 100644 1234 5678 R100\told.rs\tnew.rs\n0\t0\told.rs => new.rs\n\n{}:100644 100644 1234 5678 M\told.rs\n:100644 100644 1234 5678 M\tnew.rs\n1\t2\told.rs\n3\t4\tnew.rs\n",
+            header(HASH_A, "2000", "Alice", "move"),
+            header(HASH_B, "1000", "Alice", "edit"),
+        );
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(paths(&parsed.commits[1]), [Path::new("new.rs")]);
+        assert_eq!(parsed.commits[1].changed_files[0].additions, 4);
+        assert_eq!(parsed.commits[1].changed_files[0].deletions, 6);
     }
 
     #[test]
-    fn test_rename_resolution_with_prefix() {
-        assert_eq!(resolve_rename("src/{old.rs => new.rs}"), "src/new.rs");
-    }
+    fn test_rename_follows_only_the_new_file_after_path_reuse() {
+        let input = format!(
+            "{}:100644 100644 5678 5678 R100\told.rs\tnew.rs\n0\t0\told.rs => new.rs\n\n\
+             {}:000000 100644 0000 5678 A\told.rs\n1\t0\told.rs\n\n\
+             {}:100644 000000 1234 0000 D\told.rs\n0\t1\told.rs\n\n\
+             {}:000000 100644 0000 1234 A\told.rs\n1\t0\told.rs\n",
+            header(HASH_A, "4000", "Alice", "rename second file"),
+            header(HASH_B, "3000", "Alice", "add second file"),
+            header(
+                "cccccccccccccccccccccccccccccccccccccccc",
+                "2000",
+                "Alice",
+                "delete first file"
+            ),
+            header(
+                "dddddddddddddddddddddddddddddddddddddddd",
+                "1000",
+                "Alice",
+                "add first file"
+            ),
+        );
 
-    #[test]
-    fn test_rename_resolution_with_suffix() {
+        let parsed = parse_git_log_output(&input);
         assert_eq!(
-            resolve_rename("src/{old => new}/main.rs"),
-            "src/new/main.rs"
+            parsed.commits.iter().map(paths).collect::<Vec<_>>(),
+            [
+                vec![],
+                vec![Path::new("new.rs")],
+                vec![Path::new("old.rs")],
+                vec![Path::new("old.rs")]
+            ]
         );
     }
 
     #[test]
-    fn test_no_rename_passthrough() {
-        assert_eq!(resolve_rename("src/main.rs"), "src/main.rs");
+    fn test_rename_cycle_resolves_to_one_path_in_one_pass() {
+        let input = format!(
+            "{}:100644 100644 1234 5678 R90\tb.rs\ta.rs\n1\t0\tb.rs => a.rs\n\n\
+             {}:100644 100644 1234 5678 R90\ta.rs\tb.rs\n1\t0\ta.rs => b.rs\n\n\
+             {}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n",
+            header(HASH_A, "3000", "Alice", "move back"),
+            header(HASH_B, "2000", "Alice", "move out"),
+            header(
+                "cccccccccccccccccccccccccccccccccccccccc",
+                "1000",
+                "Alice",
+                "edit"
+            ),
+        );
+
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(parsed.commits.len(), 3);
+        for commit in &parsed.commits {
+            assert_eq!(paths(commit), [Path::new("a.rs")]);
+        }
+    }
+
+    #[test]
+    fn test_log_skips_unpaired_records_without_installing_aliases() {
+        let fresh = header(HASH_A, "2000", "Alice", "bad");
+        let prior = header(HASH_B, "1000", "Alice", "good")
+            + ":000000 100644 0000 1234 A\told.rs\n1\t0\told.rs\n";
+        for bad in [
+            ":100644 100644 1234 5678 R100\told.rs\tnew.rs\n:100644 100644 1234 5678 M\tx.rs\n0\t0\told.rs => new.rs\n",
+            ":100644 100644 1234 5678 R100\told.rs\tnew.rs\n:100644 100644 1234 5678 M\tx.rs\n0\t0\told.rs => new.rs\n1\t0\ty.rs\n",
+            ":100644 100644 1234 5678 M\tx.rs\n+1\t0\tx.rs\n",
+            ":100644 100644 1234 5678 M\tx.rs\n-\t0\tx.rs\n",
+        ] {
+            let parsed = parse_git_log_output(&format!("{fresh}{bad}\n{prior}"));
+            assert_eq!(parsed.unpaired, 1, "{bad}");
+            assert_eq!(parsed.malformed, 0, "{bad}");
+            assert_eq!(parsed.commits.len(), 1, "{bad}");
+            assert_eq!(paths(&parsed.commits[0]), [Path::new("old.rs")]);
+        }
+    }
+
+    #[test]
+    fn test_log_drops_paths_that_are_unsafe_after_decode() {
+        let input = make_log(&[(
+            HASH_A,
+            "Alice",
+            1000,
+            "edit",
+            &[
+                ("1", "0", "/absolute.rs"),
+                ("1", "0", r#""src/\056\056/escape.rs""#),
+                ("1", "0", "safe.rs"),
+            ],
+        )]);
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(paths(&parsed.commits[0]), [Path::new("safe.rs")]);
+        assert_eq!(parsed.unsafe_paths, 2);
+    }
+
+    #[test]
+    fn test_binary_rename_keeps_alias_but_has_no_file_change() {
+        let input = format!(
+            "{}:100644 100644 1234 5678 R100\told.rs\tnew.rs\n-\t-\told.rs => new.rs\n{}:100644 100644 1234 5678 M\told.rs\n1\t0\told.rs\n",
+            header(HASH_A, "2000", "Alice", "move"),
+            header(HASH_B, "1000", "Alice", "edit"),
+        );
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(parsed.unpaired, 0);
+        assert!(parsed.commits[0].changed_files.is_empty());
+        assert_eq!(paths(&parsed.commits[1]), [Path::new("new.rs")]);
     }
 
     // -----------------------------------------------------------------------
@@ -814,17 +1247,31 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-c",
+                "log.showSignature=false",
+                "-c",
+                "diff.relative=false",
                 "--literal-pathspecs",
                 "log",
                 "--format=COMMIT:%H%x00%ad%x00%aN%x00%s",
+                "--raw",
                 "--numstat",
                 "--no-merges",
                 "--date=unix",
                 "-M",
-                "--since=1700000000",
+                "--since=@1700000000 +0000",
                 "--",
                 "src/",
             ]
+        );
+    }
+
+    #[test]
+    fn test_git_log_args_omit_since_for_epoch_zero() {
+        let args = build_git_log_args(Some(0), None);
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--since")),
+            "args: {args:?}"
         );
     }
 
@@ -833,7 +1280,11 @@ mod tests {
     #[test]
     fn test_git_log_args_read_the_path_value_as_a_literal_path() {
         let args = build_git_log_args(None, Some("*"));
-        assert_eq!(args[..2], ["--literal-pathspecs", "log"], "args: {args:?}");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--literal-pathspecs", "log"]),
+            "args: {args:?}"
+        );
         assert_eq!(args[args.len() - 2..], ["--", "*"], "args: {args:?}");
         assert_eq!(
             args.iter().filter(|a| a.as_str() == "--").count(),
@@ -846,7 +1297,14 @@ mod tests {
     fn test_diff_args_put_end_of_options_before_revision() {
         assert_eq!(
             build_diff_args("main"),
-            vec!["diff", "--name-only", "--end-of-options", "main...HEAD"]
+            vec![
+                "-c",
+                "diff.relative=false",
+                "diff",
+                "--name-only",
+                "--end-of-options",
+                "main...HEAD",
+            ]
         );
         let args = build_diff_args("-x");
         let end = args.iter().position(|a| a == "--end-of-options").unwrap();
@@ -856,7 +1314,7 @@ mod tests {
     }
 
     /// Each flag value reaches git as one argument: the `--diff` value after
-    /// `--end-of-options`, the window start as one `--since=<n>` token, and
+    /// `--end-of-options`, the window start with its UTC offset, and
     /// the `--path` value after `--`.
     #[test]
     fn test_flag_values_reach_git_as_one_argument_each() {
@@ -864,14 +1322,21 @@ mod tests {
             let rev = format!("{base}...HEAD");
             assert_eq!(
                 build_diff_args(base),
-                vec!["diff", "--name-only", "--end-of-options", rev.as_str()],
+                vec![
+                    "-c",
+                    "diff.relative=false",
+                    "diff",
+                    "--name-only",
+                    "--end-of-options",
+                    rev.as_str(),
+                ],
                 "--diff {base:?}"
             );
         }
         let log = build_git_log_args(Some(42), Some("-x"));
         assert_eq!(
             log.iter().filter(|a| a.contains("42")).collect::<Vec<_>>(),
-            vec!["--since=42"],
+            vec!["--since=@42 +0000"],
             "args: {log:?}"
         );
         assert_eq!(log[log.len() - 2..], ["--", "-x"], "args: {log:?}");
@@ -885,7 +1350,7 @@ mod tests {
     /// `HASH_B` at 1000 with `b.rs`.
     fn two_records() -> String {
         format!(
-            "{}1\t0\ta.rs\n\n{}1\t0\tb.rs\n\n",
+            "{}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n\n{}:100644 100644 1234 5678 M\tb.rs\n1\t0\tb.rs\n\n",
             header(HASH_A, "2000", "Alice", "second"),
             header(HASH_B, "1000", "Bob", "first"),
         )
@@ -926,6 +1391,17 @@ mod tests {
             assert_two_records(&parsed);
             assert_eq!(parsed.cut_oldest, Some(1000), "exit {exit_code:?}");
         }
+    }
+
+    #[test]
+    fn test_log_cut_in_raw_block_drops_whole_record() {
+        let raw = two_records()
+            + &header(&"c".repeat(40), "500", "Cy", "third")
+            + ":100644 100644 1234 5678 R100\told.rs\tnew.rs\n:100644 100";
+        let parsed = parsed_log_from(&output(&raw, None), true, head_check_not_expected).unwrap();
+        assert_two_records(&parsed);
+        assert_eq!(parsed.unpaired, 0);
+        assert_eq!(parsed.cut_oldest, Some(1000));
     }
 
     #[test]
@@ -973,58 +1449,190 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tracked files and show-prefix
+    // Partial clone config, tracked files and show-prefix
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_partial_clone_config_recognizes_git_settings() {
+        assert!(!config_may_enable_lazy_fetch(&output("", Some(1)), false));
+        for config in [
+            "extensions.partialclone\norigin\0",
+            "extensions.partialclone\n\0",
+        ] {
+            assert!(
+                config_may_enable_lazy_fetch(&output(config, Some(0)), false),
+                "{config:?}"
+            );
+        }
+        for value in ["true", "YeS", "On", "1"] {
+            let config = format!("remote.other.promisor\nfalse\0remote.x.y.promisor\n{value}\0");
+            assert!(
+                config_may_enable_lazy_fetch(&output(&config, Some(0)), false),
+                "{config:?}"
+            );
+        }
+        for value in ["false", "nO", "Off", "0", ""] {
+            let config = format!("remote.x.promisor\n{value}\0");
+            assert!(
+                !config_may_enable_lazy_fetch(&output(&config, Some(0)), false),
+                "{config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_clone_config_fails_closed_on_unexpected_output() {
+        for (stdout, code, cut) in [
+            ("", Some(128), false),
+            ("", None, false),
+            ("", Some(1), true),
+            ("unexpected output", Some(1), false),
+            ("", Some(0), false),
+            ("remote.x.promisor\nfalse", Some(0), false),
+            ("remote.x.promisor\ninvalid\0", Some(0), false),
+            ("remote.x.promisor\0", Some(0), false),
+            ("unexpected.key\nfalse\0", Some(0), false),
+        ] {
+            assert!(
+                config_may_enable_lazy_fetch(&output(stdout, code), cut),
+                "{stdout:?}, {code:?}, cut={cut}"
+            );
+        }
+        let mut error = output("", Some(1));
+        error.stderr = "config read failed".into();
+        assert!(config_may_enable_lazy_fetch(&error, false));
+    }
+
+    #[test]
     fn test_tracked_files_args_read_the_head_tree() {
+        let full = ["-C", "/repo", "ls-tree", "-r", "-l", "--full-tree", "HEAD"];
+        let partial: Vec<_> = ["--no-lazy-fetch"].into_iter().chain(full).collect();
+        assert_eq!(tracked_files_args("/repo", false), full);
+        assert_eq!(tracked_files_args("/repo", true), partial);
+    }
+
+    #[test]
+    fn test_head_count_args_pass_a_literal_scope_without_submodule_recursion() {
+        let full = [
+            "--literal-pathspecs",
+            "grep",
+            "-I",
+            "-c",
+            "--full-name",
+            "--no-color",
+            "--no-recurse-submodules",
+            "-e",
+            "",
+            "HEAD",
+            "--",
+            ":(exclude)src",
+        ];
+        let partial: Vec<_> = ["--no-lazy-fetch"].into_iter().chain(full).collect();
         assert_eq!(
-            tracked_files_args("/repo").as_slice(),
+            head_line_count_args("/repo", Some(":(exclude)src"), false),
+            full
+        );
+        assert_eq!(
+            head_line_count_args("/repo", Some(":(exclude)src"), true),
+            partial
+        );
+    }
+
+    const HEAD_LISTING: &str = concat!(
+        "100644 blob 0123456789012345678901234567890123456789      14\ta.rs\n",
+        "100755 blob 0123456789012345678901234567890123456789       1\tbin.rs\n",
+        "120000 blob 0123456789012345678901234567890123456789       5\tlink.rs\n",
+        "160000 commit 0123456789012345678901234567890123456789       -\tsubmodule\n",
+    );
+
+    #[test]
+    fn test_head_listing_keeps_gitlink_and_padded_size_rows() {
+        let entries = tracked_files_from(&output(HEAD_LISTING, Some(0)), false).unwrap();
+        assert_eq!(
+            entries,
+            HashMap::from([
+                ("a.rs".into(), HeadEntry::Regular(None)),
+                ("bin.rs".into(), HeadEntry::Regular(None)),
+                ("link.rs".into(), HeadEntry::Other),
+                ("submodule".into(), HeadEntry::Other),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_head_listing_rejects_a_partial_result() {
+        for (code, cut) in [(Some(128), false), (None, false), (Some(0), true)] {
+            assert!(tracked_files_from(&output(HEAD_LISTING, code), cut).is_err());
+        }
+        for bad_row in [
+            "invalid row",
+            "100644 blob 0123456789012345678901234567890123456789 -\tbad.rs",
+            "100644 blob 0123456789012345678901234567890123456789 1\t../bad.rs",
+            "100644 blob 0123456789012345678901234567890123456789 1 extra\tbad.rs",
+        ] {
+            let rows = format!("{HEAD_LISTING}{bad_row}\n");
+            assert!(tracked_files_from(&output(&rows, Some(0)), false).is_err());
+        }
+    }
+
+    #[test]
+    fn test_head_counts_keep_quoted_paths_and_colons() {
+        let raw = concat!("HEAD:src/a:b.rs:3\n", "HEAD:\"src/na\\303\\257ve.rs\":11\n",);
+        assert_eq!(
+            head_line_counts_from(&output(raw, Some(0)), false).unwrap(),
             [
-                "-C",
-                "/repo",
-                "ls-tree",
-                "-r",
-                "--name-only",
-                "--full-tree",
-                "HEAD"
+                ("src/a:b.rs".into(), 3),
+                (r#""src/na\303\257ve.rs""#.into(), 11)
             ]
         );
     }
 
     #[test]
-    fn test_tracked_files_nonzero_exit_gives_none() {
-        assert_eq!(tracked_files_from(Ok(output("a.rs\n", Some(128)))), None);
+    fn test_head_counts_accept_only_complete_output_or_an_empty_exit_one() {
+        assert!(
+            head_line_counts_from(&output("", Some(1)), false)
+                .unwrap()
+                .is_empty()
+        );
+        for (stdout, code, cut) in [
+            ("HEAD:ok.rs:2\nother:a.rs:9\n", Some(0), false),
+            ("HEAD:ok.rs:2\nHEAD:a.rs:bad\n", Some(0), false),
+            ("HEAD:ok.rs:2\nHEAD::7\n", Some(0), false),
+            ("HEAD:a.rs:1\n", Some(1), false),
+            ("HEAD:a.rs:1\n", Some(0), true),
+            ("", Some(128), false),
+            ("", None, false),
+        ] {
+            assert!(head_line_counts_from(&output(stdout, code), cut).is_err());
+        }
     }
 
     #[test]
-    fn test_tracked_files_signal_exit_gives_none() {
-        // A run cut at the output cap ends with no exit code; its partial
-        // list must not be used.
-        assert_eq!(tracked_files_from(Ok(output("a.rs\n", None))), None);
-    }
-
-    #[test]
-    fn test_tracked_files_spawn_error_gives_none() {
-        let err = anyhow::Error::new(crate::runner::RunnerError::SpawnFailed {
-            program: "git".to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
-        });
-        assert_eq!(tracked_files_from(Err(err)), None);
+    fn test_head_counts_reject_missing_blobs_even_with_matching_lines() {
+        for (stdout, status) in [("HEAD:ok.rs:2\n", 0), ("", 1)] {
+            let mut out = output(stdout, Some(status));
+            out.stderr = "error: 'HEAD:missing.rs': unable to read blob\n".into();
+            assert!(head_line_counts_from(&out, false).is_err());
+        }
     }
 
     #[test]
     fn test_show_prefix_output_keeps_trailing_slash() {
         assert_eq!(
-            prefix_from(&output("src/cmd/\n", Some(0))).unwrap(),
+            rev_parse_path(&output("src/cmd/\n", Some(0)), "--show-prefix").unwrap(),
             "src/cmd/"
         );
-        assert_eq!(prefix_from(&output("\n", Some(0))).unwrap(), "");
+        assert_eq!(
+            rev_parse_path(&output("\n", Some(0)), "--show-prefix").unwrap(),
+            ""
+        );
     }
 
     #[test]
     fn test_show_prefix_nonzero_exit_is_error() {
-        let msg = prefix_from(&output("", Some(128))).unwrap_err().to_string();
+        let msg = rev_parse_path(&output("", Some(128)), "--show-prefix")
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains("--show-prefix failed"), "got: {msg}");
     }
 
@@ -1110,9 +1718,12 @@ mod tests {
         add_files(root, &["b.rs"]);
 
         let tracked = CliGitSource::new()
-            .list_tracked_files(root.to_str().unwrap())
+            .list_tracked_files(root.to_str().unwrap(), false)
             .unwrap();
-        assert_eq!(tracked, Some(vec!["a.rs".to_string()]));
+        assert_eq!(
+            tracked,
+            HashMap::from([("a.rs".into(), HeadEntry::Regular(None))])
+        );
     }
 
     #[test]
@@ -1122,10 +1733,11 @@ mod tests {
         git_in(root, &["init", "-q"]);
         add_files(root, &["a.rs"]);
 
-        let tracked = CliGitSource::new()
-            .list_tracked_files(root.to_str().unwrap())
-            .unwrap();
-        assert_eq!(tracked, None);
+        assert!(
+            CliGitSource::new()
+                .list_tracked_files(root.to_str().unwrap(), false)
+                .is_err()
+        );
     }
 
     /// The tracked-file list and the numstat paths must use one encoding, or a
@@ -1144,10 +1756,22 @@ mod tests {
         );
         git_in(root, &["commit", "-q", "-m", "init"]);
 
-        let mut tracked = CliGitSource::new()
-            .list_tracked_files(root.to_str().unwrap())
+        let root_arg = root.to_str().unwrap();
+        let source = CliGitSource::new();
+        let mut tracked: Vec<_> = source
+            .list_tracked_files(root_arg, false)
             .unwrap()
-            .expect("the tracked-file list ran in a git repo");
+            .into_keys()
+            .collect();
+        let mut counted: Vec<_> = source
+            .count_head_lines(root_arg, None, false)
+            .unwrap()
+            .into_iter()
+            .map(|(path, count)| {
+                assert_eq!(count, 1, "{path}");
+                path
+            })
+            .collect();
 
         let parsed = log_in(root, None);
         assert_eq!(parsed.commits.len(), 1);
@@ -1159,7 +1783,34 @@ mod tests {
 
         tracked.sort();
         numstat.sort();
+        counted.sort();
         assert_eq!(tracked.len(), 2, "tracked: {tracked:?}");
         assert_eq!(numstat, tracked);
+        assert_eq!(counted, tracked);
+    }
+
+    #[test]
+    fn test_head_counts_use_root_relative_names_from_a_subfolder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let subfolder = root.join("src");
+        git_in(root, &["init", "-q"]);
+        add_files(root, &["top.rs", "src/a.rs", "src/deep/b.rs"]);
+        git_in(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("src/deep/b.rs"), "dirty\nmore\n").unwrap();
+
+        for (scope, expected) in [
+            (
+                None,
+                "HEAD:src/a.rs:1\nHEAD:src/deep/b.rs:1\nHEAD:top.rs:1\n",
+            ),
+            (Some("deep"), "HEAD:src/deep/b.rs:1\n"),
+        ] {
+            let stdout = git_in(
+                &subfolder,
+                &head_line_count_args(root.to_str().unwrap(), scope, false),
+            );
+            assert_eq!(stdout, expected);
+        }
     }
 }

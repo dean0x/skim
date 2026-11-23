@@ -4,6 +4,7 @@
 //! For tests that need a git repo, we create a TempDir and set up deterministic commits.
 
 use predicates::prelude::*;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command as StdCommand;
 mod common;
@@ -37,6 +38,16 @@ fn git_init(dir: &Path) {
         .ok();
 }
 
+fn git_config(dir: &Path, key: &str, value: impl AsRef<OsStr>) {
+    let out = StdCommand::new("git")
+        .args(["config", key])
+        .arg(value)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
 /// Write a file and make a commit.
 fn git_commit(dir: &Path, filename: &str, content: &str, message: &str, timestamp: u64) {
     let file_path = dir.join(filename);
@@ -56,6 +67,10 @@ fn git_commit(dir: &Path, filename: &str, content: &str, message: &str, timestam
         String::from_utf8_lossy(&add_out.stderr)
     );
 
+    git_commit_staged(dir, message, timestamp);
+}
+
+fn git_commit_staged(dir: &Path, message: &str, timestamp: u64) {
     let ts = format!("{timestamp}");
     let commit_out = StdCommand::new("git")
         .args(["commit", "-m", message])
@@ -241,6 +256,66 @@ fn test_heatmap_help_describes_the_short_view_detail_and_cards() {
     }
 }
 
+#[test]
+fn test_heatmap_help_describes_utc_dates_and_window_presets() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("YYYY-MM-DD (00:00 UTC)"))
+        .stdout(predicate::str::contains(
+            "sprint|month|quarter|half|year|all",
+        ))
+        .stdout(predicate::str::contains(
+            "No date cutoff (same as --since 0)",
+        ))
+        .stdout(predicate::str::contains(
+            "An unknown --window preset exits 1 and lists the valid names.",
+        ));
+}
+
+#[test]
+fn test_heatmap_help_describes_hotspot_rank_and_fallback() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "The score is commits in the window x text lines at HEAD.",
+        ))
+        .stdout(predicate::str::contains(
+            "If HEAD data is not available, skim warns and ranks by commits.",
+        ));
+}
+
+#[test]
+fn test_heatmap_help_describes_non_code_filter_for_fix_risk() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "NON-CODE PATHS (--include-docs keeps them)",
+        ))
+        .stdout(predicate::str::contains(
+            "out of the hotspots, fix risk and insights",
+        ));
+}
+
+#[test]
+fn test_heatmap_help_names_new_json_keys() {
+    common::skim()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("files[].lines"))
+        .stdout(predicate::str::contains("files[].score"))
+        .stdout(predicate::str::contains(
+            "left_out.{hotspots,fix_risk,modules}",
+        ))
+        .stdout(predicate::str::contains("left_out.not_at_head"));
+}
+
 // ============================================================================
 // Not a git repo
 // ============================================================================
@@ -330,10 +405,31 @@ fn test_heatmap_json_has_all_metric_keys() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
-    // The hotspot order puts src/main.rs (4 commits) first.
     let file = &parsed["files"][0];
+    let mut keys: Vec<&str> = file
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "authors",
+            "blast_radius",
+            "churn",
+            "fix_risk",
+            "lines",
+            "path",
+            "score",
+            "stability_score"
+        ]
+    );
     assert_eq!(file["path"], "src/main.rs");
     assert_eq!(file["churn"]["commits"], 4, "nested churn.commits");
+    assert_eq!(file["lines"], 1);
+    assert_eq!(file["score"], 4);
     assert!(
         file["stability_score"].is_number(),
         "stability_score must be number"
@@ -375,7 +471,7 @@ fn test_heatmap_text_output_contains_sections() {
     assert_eq!(
         headings,
         [
-            "Hotspots (commits):",
+            "Hotspots (commits x lines):",
             "Coupling (confidence, shared commits):",
             "Fix risk (fix commits/commits, lift, base rate):",
         ],
@@ -427,9 +523,160 @@ fn test_heatmap_since_filters_commits() {
         .stdout(predicate::str::contains("old.rs").not());
 }
 
+#[test]
+fn test_heatmap_since_date_starts_at_utc_midnight() {
+    const MIDNIGHT: u64 = 1_793_491_200; // 2026-11-01 00:00:00 UTC
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "before.rs",
+        "before",
+        "feat: before",
+        MIDNIGHT - 1,
+    );
+    git_commit(dir.path(), "at.rs", "at", "feat: at", MIDNIGHT);
+
+    common::skim()
+        .args(["heatmap", "--since", "2026-11-01"])
+        .env("TZ", "UTC+8")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(" 2026-11-01.."))
+        .stdout(predicate::str::contains(", 1 commit, time window"))
+        .stdout(predicate::str::contains("at.rs"))
+        .stdout(predicate::str::contains("before.rs").not());
+}
+
+#[test]
+fn test_heatmap_since_date_errors_name_all_forms() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for date in [
+        "2026-02-30",
+        "2026-13-01",
+        "2025-02-29",
+        "1969-12-31",
+        "10000-01-01",
+    ] {
+        common::skim()
+            .args(["heatmap", "--since", date])
+            .current_dir(dir.path())
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("--since"))
+            .stderr(predicate::str::contains("epoch seconds"))
+            .stderr(predicate::str::contains("YYYY-MM-DD"))
+            .stderr(predicate::str::contains("duration"));
+    }
+}
+
+#[test]
+fn test_heatmap_since_duration_out_of_range_is_a_usage_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    common::skim()
+        .args(["heatmap", "--since", "200000000000000d"])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "--since expects epoch seconds, a UTC date (YYYY-MM-DD), or a duration (Nd, Nh, Nw)",
+        ))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+#[test]
+fn test_heatmap_since_far_future_date_excludes_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(dir.path(), "a.rs", "one\n", "feat: add file", 2_114_380_800);
+
+    common::skim()
+        .args(["heatmap", "--since", "9999-12-31"])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("No commits found in repository"));
+}
+
 // ============================================================================
 // --window preset
 // ============================================================================
+
+#[test]
+fn test_heatmap_window_all_and_since_zero_include_early_commits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "old.rs",
+        "old\n",
+        "feat: old file",
+        1_000_000_000,
+    );
+    git_commit(
+        dir.path(),
+        "new.rs",
+        "new\n",
+        "feat: new file",
+        1_100_000_000,
+    );
+    git_commit(
+        dir.path(),
+        "Cargo.lock",
+        "lock\n",
+        "chore: lock",
+        1_200_000_000,
+    );
+    let output = StdCommand::new("git")
+        .args(["rev-list", "--count", "--no-merges", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git rev-list");
+    assert!(output.status.success());
+    let total: u64 = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(total, 3);
+
+    for args in [
+        ["--window", "all"],
+        ["--since", "0"],
+        ["--since", "1970-01-01"],
+    ] {
+        let json = heatmap_json_with(dir.path(), &args);
+        assert_eq!(json["window"]["commits_analyzed"], total - 1);
+        assert_eq!(json["window"]["since"], "1970-01-01");
+    }
+}
+
+#[test]
+fn test_heatmap_window_unknown_preset_names_valid_presets() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(dir.path(), "a.rs", "one\n", "feat: add file", 1_700_000_000);
+
+    for args in [
+        vec!["--window=biweekly"],
+        vec!["--since=0", "--window=biweekly"],
+    ] {
+        common::skim()
+            .arg("heatmap")
+            .args(args)
+            .current_dir(dir.path())
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains(
+                "--window must be one of sprint, month, quarter, half, year, all; got: biweekly",
+            ));
+    }
+}
 
 #[test]
 fn test_heatmap_window_sprint_preset() {
@@ -661,6 +908,43 @@ fn test_heatmap_last_flag() {
         .current_dir(dir.path())
         .assert()
         .success();
+}
+
+#[test]
+fn test_heatmap_counts_signed_commits_with_signature_display_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    let key = root.join(".git").join("fixture-signing-key");
+    let keygen = StdCommand::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .output();
+    let keygen = match keygen {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skip signed heatmap test: ssh-keygen is not available");
+            return;
+        }
+        result => result.expect("spawn ssh-keygen"),
+    };
+    assert!(keygen.status.success(), "ssh-keygen failed: {keygen:?}");
+    let signers = root.join(".git").join("fixture-allowed-signers");
+    let public_key = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    std::fs::write(&signers, format!("test@example.com {public_key}")).unwrap();
+    git_config(root, "gpg.format", "ssh");
+    git_config(root, "gpg.ssh.allowedSignersFile", &signers);
+    git_config(root, "user.signingkey", &key);
+    git_config(root, "commit.gpgsign", "true");
+    git_config(root, "log.showSignature", "true");
+    let ts = 1_700_000_000;
+    for (i, text) in ["one", "two", "three"].into_iter().enumerate() {
+        git_commit(root, "a.rs", text, text, ts + i as u64);
+    }
+
+    let all = heatmap_json_with(root, &["--window", "all"]);
+    assert_eq!(all["window"]["commits_analyzed"], 3, "{all}");
+    let last = heatmap_json_with(root, &["--last", "2"]);
+    assert_eq!(last["window"]["commits_analyzed"], 2, "{last}");
 }
 
 // ============================================================================
@@ -1218,6 +1502,681 @@ fn file_entry<'a>(json: &'a serde_json::Value, path: &str) -> &'a serde_json::Va
 }
 
 #[test]
+fn test_heatmap_large_file_with_fewer_commits_ranks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_commit_files(
+        root,
+        &[
+            ("large.rs", &"// large\n".repeat(20)),
+            ("small.rs", "// one\n"),
+        ],
+        "feat: add files",
+        1_700_000_000,
+    );
+    git_commit(root, "small.rs", "// two\n", "fix: small", 1_700_000_001);
+    std::fs::write(root.join("large.rs"), "// uncommitted\n").unwrap();
+    std::fs::write(root.join("HEAD"), "not the revision\n").unwrap();
+
+    let json = heatmap_json_with(root, &["--window", "all"]);
+    assert_eq!(json["files"][0]["path"], "large.rs");
+    assert_eq!(json["files"][0]["churn"]["commits"], 1);
+    assert_eq!(json["files"][0]["lines"], 20);
+    assert_eq!(json["files"][0]["score"], 20);
+    assert_eq!(json["files"][1]["score"], 2);
+}
+
+#[cfg(unix)]
+fn head_rank_fixture(root: &Path) {
+    git_init(root);
+    git_commit_files(
+        root,
+        &[("a.rs", "one\ntwo\nthree\n"), ("z.rs", "one\n")],
+        "feat: add files",
+        1_700_000_000,
+    );
+    git_commit(root, "z.rs", "two\n", "feat: update", 1_700_000_001);
+}
+
+#[cfg(unix)]
+fn heatmap_with_old_git(root: &Path) -> serde_json::Value {
+    let real_git = StdCommand::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success(), "{real_git:?}");
+    let real_git =
+        std::fs::canonicalize(String::from_utf8(real_git.stdout).unwrap().trim()).unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    common::write_stub_script(
+        tools.path(),
+        "git",
+        r#"#!/bin/sh
+for arg do
+    if [ "$arg" = "--no-lazy-fetch" ]; then
+        printf '%s\n' 'unknown option: --no-lazy-fetch' >&2
+        exit 129
+    fi
+done
+exec "$HEATMAP_TEST_REAL_GIT" "$@"
+"#,
+    );
+    let output = common::skim()
+        .env("PATH", common::stub_path(tools.path()))
+        .env("HEATMAP_TEST_REAL_GIT", real_git)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["heatmap", "--window", "all", "--json"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_old_git_keeps_line_rank_for_a_full_clone() {
+    let repo = tempfile::tempdir().unwrap();
+    head_rank_fixture(repo.path());
+
+    let json = heatmap_with_old_git(repo.path());
+    assert_eq!(json["files"][0]["path"], "a.rs", "{json}");
+    assert_eq!(json["files"][0]["lines"], 3);
+    assert_eq!(json["files"][0]["score"], 3);
+    assert_eq!(json["files"][1]["lines"], 1);
+    assert_eq!(json["files"][1]["score"], 2);
+    assert_eq!(json["warnings"], serde_json::json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_old_git_warns_and_ranks_a_partial_clone_by_commits() {
+    let repo = tempfile::tempdir().unwrap();
+    let source = repo.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    head_rank_fixture(&source);
+    git_config(&source, "uploadpack.allowFilter", "true");
+
+    // All fixture blobs fit the filter. Only the rejected option causes fallback.
+    let clone = repo.path().join("clone");
+    let output = StdCommand::new("git")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .args([
+            "clone",
+            "--no-local",
+            "--no-checkout",
+            "--filter=blob:limit=1m",
+        ])
+        .arg(&source)
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let json = heatmap_with_old_git(&clone);
+    assert_eq!(json["files"][0]["path"], "z.rs", "{json}");
+    assert_eq!(json["files"][0]["churn"]["commits"], 2);
+    assert_eq!(json["files"][0]["score"], 0);
+    assert_eq!(
+        json["warnings"],
+        serde_json::json!(["HEAD data is not available. Hotspots rank by commits only."])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_head_failure_keeps_history_in_commit_order() {
+    let repo = tempfile::tempdir().unwrap();
+    head_rank_fixture(repo.path());
+    let tools = tempfile::tempdir().unwrap();
+    common::write_stub_script(
+        tools.path(),
+        "git",
+        r#"#!/bin/sh
+for arg do
+    if [ "$arg" = "$HEATMAP_TEST_FAIL" ]; then
+        printf '%s\n' "$arg" >> "$HEATMAP_TEST_CALLS"
+        exit 128
+    fi
+done
+PATH=$HEATMAP_TEST_PATH exec git "$@"
+"#,
+    );
+    let calls = tools.path().join("calls");
+    for failing in ["ls-tree", "grep"] {
+        std::fs::write(&calls, "").unwrap();
+        let output = common::skim()
+            .env("PATH", common::stub_path(tools.path()))
+            .env("HEATMAP_TEST_PATH", std::env::var_os("PATH").unwrap())
+            .env("HEATMAP_TEST_FAIL", failing)
+            .env("HEATMAP_TEST_CALLS", &calls)
+            .args(["heatmap", "--window", "all", "--detail", "hotspots"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{failing}: {output:?}");
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap(),
+            format!("{failing}\n")
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            section_rows(&text, "Hotspots"),
+            ["    2 x 0 = 0  z.rs", "    1 x 0 = 0  a.rs"],
+            "{failing}: {text}"
+        );
+        let warnings: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("warning:"))
+            .collect();
+        assert_eq!(
+            warnings,
+            ["warning: HEAD data is not available. Hotspots rank by commits only."]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_head_reads_leave_partial_clone_objects_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    git_init(&source);
+    git_config(&source, "uploadpack.allowFilter", "true");
+    git_commit(&source, "old.rs", "old\n", "feat: add old", 1_700_000_000);
+    git_commit(
+        &source,
+        "recent.rs",
+        "new\n",
+        "feat: add new",
+        1_700_001_000,
+    );
+
+    let clone = dir.path().join("clone");
+    let local_git = |cwd: &Path, args: &[&str]| {
+        let output = StdCommand::new("git")
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    local_git(
+        dir.path(),
+        &[
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", source.display()),
+            "clone",
+        ],
+    );
+    // Supply the blob that the history window needs. Leave the old blob absent.
+    local_git(
+        &clone,
+        &[
+            "hash-object",
+            "-w",
+            source.join("recent.rs").to_str().unwrap(),
+        ],
+    );
+    let before = local_git(&clone, &["count-objects", "-v"]);
+
+    let output = common::skim()
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env_remove("GIT_NO_LAZY_FETCH")
+        .args(["heatmap", "--since", "1700000500", "--json"])
+        .current_dir(&clone)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        local_git(&clone, &["count-objects", "-v"]),
+        before,
+        "object store grew"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(sorted_paths(&json, "files"), ["recent.rs"]);
+    assert_eq!(json["files"][0]["churn"]["commits"], 1);
+    assert_eq!(json["files"][0]["score"], 0);
+    assert_eq!(
+        json["warnings"],
+        serde_json::json!(["HEAD data is not available. Hotspots rank by commits only."])
+    );
+}
+
+#[test]
+fn test_heatmap_counts_quoted_head_paths_from_a_subfolder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_config(root, "core.quotePath", "true");
+    git_commit_files(
+        root,
+        &[("top.rs", "a\n"), ("src/deep/café.rs", "a\nb\n")],
+        "feat: add files",
+        1_700_000_000,
+    );
+
+    let cwd = root.join("src");
+    let quoted = r#""src/deep/caf\303\251.rs""#;
+    let all = heatmap_json_with(&cwd, &["--window", "all"]);
+    assert_eq!(file_entry(&all, quoted)["lines"], 2, "{all}");
+    assert_eq!(file_entry(&all, "top.rs")["lines"], 1, "{all}");
+
+    let scoped = heatmap_json_with(&cwd, &["--window", "all", "--path", "deep"]);
+    assert_eq!(sorted_paths(&scoped, "files"), [quoted]);
+    assert_eq!(file_entry(&scoped, quoted)["lines"], 2, "{scoped}");
+}
+
+#[test]
+fn test_heatmap_uses_root_relative_git_paths_with_diff_relative_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let ts = 1_700_000_000;
+    git_init(root);
+    git_config(root, "diff.relative", "true");
+    git_commit(root, "base.rs", "base\n", "feat: add base", ts);
+    git_commit(root, "top.rs", "top\n", "feat: add top", ts + 1);
+    git_commit(root, "src/a.rs", "one\ntwo\n", "feat: add source", ts + 2);
+
+    let cwd = root.join("src");
+    let all = heatmap_json_with(&cwd, &["--window", "all"]);
+    assert_eq!(
+        sorted_paths(&all, "files"),
+        ["base.rs", "src/a.rs", "top.rs"],
+        "{all}"
+    );
+    assert_eq!(all["files"][0]["path"], "src/a.rs", "{all}");
+    assert_eq!(all["files"][0]["score"], 2, "{all}");
+    assert_eq!(all["left_out"]["not_at_head"].as_u64().unwrap_or(0), 0);
+
+    let scoped = heatmap_json_with(&cwd, &["--window", "all", "--path", "a.rs"]);
+    assert_eq!(sorted_paths(&scoped, "files"), ["src/a.rs"], "{scoped}");
+    let diff = heatmap_json_with(&cwd, &["--window", "all", "--diff", "HEAD~2"]);
+    assert_eq!(
+        sorted_paths(&diff, "files"),
+        ["src/a.rs", "top.rs"],
+        "{diff}"
+    );
+}
+
+#[test]
+fn test_heatmap_binary_at_head_is_not_a_hotspot_but_an_empty_file_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_commit_files(
+        root,
+        &[("changed.dat", "text\n"), ("empty.rs", "")],
+        "feat: add text",
+        1_700_000_000,
+    );
+    git_commit(
+        root,
+        "changed.dat",
+        "a\0b",
+        "feat: change data",
+        1_700_000_001,
+    );
+
+    let json = heatmap_json_with(root, &["--window", "all"]);
+    assert_eq!(sorted_paths(&json, "files"), ["empty.rs"]);
+    assert_eq!(file_entry(&json, "empty.rs")["lines"], 0);
+    assert!(json.get("left_out").is_none());
+}
+
+#[test]
+fn test_heatmap_excludes_nonregular_head_paths_but_keeps_deleted_card_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    let base = 1_700_000_000;
+    for i in 0..5 {
+        let content = format!("// live {i}\n");
+        git_commit_files(
+            root,
+            &[
+                ("live.rs", &content),
+                ("gone.rs", &content),
+                ("link.rs", &content),
+                ("module.rs", &content),
+            ],
+            "fix: change files",
+            base + i,
+        );
+    }
+    let git = |args: &[&str]| {
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["config", "user.name", "Other Author"]);
+    for i in 5..11 {
+        git_commit(
+            root,
+            "side.rs",
+            &format!("// side {i}\n"),
+            "feat: side",
+            base + i,
+        );
+    }
+    let before = heatmap_json_with(root, &["--window", "all", "--detail", "bus-factor"]);
+    assert!(sorted_paths(&before, "fix_risk").contains(&"gone.rs".into()));
+    assert!(sorted_paths(&before, "bus_factor").contains(&"gone.rs".into()));
+
+    let blob = git(&["rev-parse", "HEAD:live.rs"]);
+    let commit = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "before-removal"]);
+    git(&["rm", "--", "gone.rs"]);
+    git(&[
+        "update-index",
+        "--cacheinfo",
+        &format!("120000,{blob},link.rs"),
+    ]);
+    git(&[
+        "update-index",
+        "--cacheinfo",
+        &format!("160000,{commit},module.rs"),
+    ]);
+    git_commit_staged(root, "feat: remove regular files", base + 11);
+    git_commit(
+        root,
+        "binary.dat",
+        "binary\0data",
+        "feat: add binary",
+        base + 12,
+    );
+
+    let json = heatmap_json_with(root, &["--window", "all", "--detail", "bus-factor"]);
+    assert_eq!(sorted_paths(&json, "files"), ["live.rs", "side.rs"]);
+    assert_eq!(json["left_out"]["not_at_head"], 3);
+    assert_eq!(json["coupling_graph"], serde_json::json!([]));
+    assert_eq!(
+        file_entry(&json, "live.rs")["blast_radius"],
+        serde_json::json!([])
+    );
+    assert_eq!(sorted_paths(&json, "fix_risk"), ["live.rs"]);
+    assert_eq!(sorted_paths(&json, "bus_factor"), ["live.rs", "side.rs"]);
+    let text = heatmap_stdout(root, &["--window", "all"]);
+    assert!(text.contains("3 paths not at HEAD"), "{text}");
+
+    let card = heatmap_json_with(root, &["--window", "all", "gone.rs"]);
+    assert_eq!(card["cards"][0]["commits"], 6);
+    assert_eq!(card["cards"][0]["partners"][0]["path"], "live.rs");
+    assert_eq!(card["cards"][0]["partners"].as_array().unwrap().len(), 1);
+    assert_eq!(card["files"], serde_json::json!([]));
+
+    let diff = heatmap_json_with(root, &["--window", "all", "--diff", "before-removal"]);
+    assert!(
+        diff["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| { !warning.as_str().unwrap().contains("gone.rs") })
+    );
+}
+
+fn git_move(dir: &Path, old: &str, new: &str) {
+    std::fs::create_dir_all(dir.join(new).parent().unwrap()).unwrap();
+    let out = StdCommand::new("git")
+        .args(["mv", "--", old, new])
+        .current_dir(dir)
+        .output()
+        .expect("git mv");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn git_commit_move(dir: &Path, old: &str, new: &str, message: &str, timestamp: u64) {
+    git_move(dir, old, new);
+    git_commit_staged(dir, message, timestamp);
+}
+
+#[test]
+fn test_heatmap_plain_rename_moves_history_to_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let content = "fn work() {}\n".repeat(20);
+    git_commit(dir.path(), "old.rs", &content, "feat: add", 1_700_000_000);
+    git_move(dir.path(), "old.rs", "new.rs");
+    git_commit(
+        dir.path(),
+        "new.rs",
+        &(content + "// edit\n"),
+        "fix: move",
+        1_700_000_001,
+    );
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(json["files"].as_array().unwrap().len(), 1, "{json}");
+    assert_eq!(file_entry(&json, "new.rs")["churn"]["commits"], 2);
+}
+
+#[test]
+fn test_heatmap_rename_uses_the_new_path_in_all_metric_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    let ts = 1_700_000_000;
+    for i in 0..5 {
+        git_commit_paths_as(
+            root,
+            &["a.rs", "partner.rs"],
+            &format!("fix: before {i}"),
+            ts + i,
+            "Alice",
+        );
+    }
+    git_commit_move(root, "a.rs", "b.rs", "refactor: rename", ts + 5);
+    for i in 0..5 {
+        git_commit_paths_as(
+            root,
+            &["b.rs", "partner.rs"],
+            &format!("fix: after {i}"),
+            ts + 6 + i,
+            "Alice",
+        );
+    }
+    // A second author and a lower base fix rate let both path names meet the gates.
+    for i in 0..12 {
+        git_commit_as(
+            root,
+            "other.rs",
+            &format!("feat: other {i}"),
+            ts + 11 + i,
+            "Bob",
+        );
+    }
+
+    let json = heatmap_json_with(root, &["--window", "all", "--detail", "bus-factor"]);
+    let mut old_path_sections = Vec::new();
+    for key in ["files", "fix_risk", "bus_factor"] {
+        let rows = json[key].as_array().unwrap();
+        assert!(
+            rows.iter().any(|row| row["path"] == "b.rs"),
+            "b.rs missing from {key}: {rows:?}"
+        );
+        if rows.iter().any(|row| row["path"] == "a.rs") {
+            old_path_sections.push(key);
+        }
+    }
+    let edges = json["coupling_graph"].as_array().unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|edge| edge["a"] == "b.rs" && edge["b"] == "partner.rs"),
+        "b.rs missing from coupling_graph: {edges:?}"
+    );
+    if edges
+        .iter()
+        .any(|edge| edge["a"] == "a.rs" || edge["b"] == "a.rs")
+    {
+        old_path_sections.push("coupling_graph");
+    }
+    assert!(
+        old_path_sections.is_empty(),
+        "a.rs remains in {old_path_sections:?}"
+    );
+    assert_eq!(
+        json["left_out"]["not_at_head"].as_u64().unwrap_or(0),
+        0,
+        "the HEAD filter must not hide the old path"
+    );
+    assert_eq!(file_entry(&json, "b.rs")["churn"]["commits"], 10);
+}
+
+#[test]
+fn test_heatmap_brace_rename_paths_use_the_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let moves = [
+        ("src/old/a.rs", "src/new/a.rs"),
+        ("old/b.rs", "new/b.rs"),
+        ("src/c.rs", "src/added/c.rs"),
+        ("src/gone/d.rs", "src/d.rs"),
+    ];
+    git_commit_files(
+        dir.path(),
+        &moves.map(|(old, _)| (old, old)),
+        "feat: add",
+        1_700_000_000,
+    );
+    for (old, new) in moves {
+        git_move(dir.path(), old, new);
+    }
+    git_commit_staged(dir.path(), "refactor: move", 1_700_000_001);
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(
+        json["files"].as_array().unwrap().len(),
+        moves.len(),
+        "{json}"
+    );
+    for (_, new) in moves {
+        assert_eq!(file_entry(&json, new)["churn"]["commits"], 1);
+    }
+}
+
+#[test]
+fn test_heatmap_rename_chain_leaves_reused_old_path_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let ts = 1_700_000_000;
+    git_commit(dir.path(), "old.rs", "first\n", "feat: add original", ts);
+    git_commit_move(
+        dir.path(),
+        "old.rs",
+        "middle.rs",
+        "refactor: move once",
+        ts + 1,
+    );
+    git_commit(
+        dir.path(),
+        "middle.rs",
+        "second\n",
+        "feat: edit original",
+        ts + 2,
+    );
+    git_commit_move(
+        dir.path(),
+        "middle.rs",
+        "final.rs",
+        "refactor: move twice",
+        ts + 3,
+    );
+    git_commit(
+        dir.path(),
+        "old.rs",
+        "another file\n",
+        "feat: add another file",
+        ts + 4,
+    );
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(json["files"].as_array().unwrap().len(), 2, "{json}");
+    assert_eq!(file_entry(&json, "final.rs")["churn"]["commits"], 2);
+    assert_eq!(file_entry(&json, "old.rs")["churn"]["commits"], 1);
+}
+
+#[test]
+fn test_heatmap_rename_alias_applies_before_exclusion_and_cards() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "Cargo.lock",
+        "first\n",
+        "feat: add",
+        1_700_000_000,
+    );
+    git_commit_move(
+        dir.path(),
+        "Cargo.lock",
+        "lib.rs",
+        "refactor: move",
+        1_700_000_001,
+    );
+    git_commit(dir.path(), "lib.rs", "second\n", "fix: edit", 1_700_000_002);
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(file_entry(&json, "lib.rs")["churn"]["commits"], 2);
+    let card = heatmap_stdout(dir.path(), &["--window", "all", "lib.rs"]);
+    assert_eq!(card_lines(&card, "lib.rs")[0], "lib.rs: 2 commits");
+}
+
+#[test]
+fn test_heatmap_rename_arrow_in_file_name_stays_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let path = "src/{old => new}.rs";
+    git_commit(dir.path(), path, "first\n", "feat: add", 1_700_000_000);
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(file_entry(&json, path)["churn"]["commits"], 1);
+}
+
+#[test]
+fn test_heatmap_rename_only_commit_does_not_add_a_touch() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "src/old.rs",
+        "first\n",
+        "feat: add",
+        1_700_000_000,
+    );
+    git_commit_move(
+        dir.path(),
+        "src/old.rs",
+        "src/new.rs",
+        "refactor: move",
+        1_700_000_001,
+    );
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(json["window"]["commits_analyzed"], 1);
+    assert_eq!(file_entry(&json, "src/new.rs")["churn"]["commits"], 1);
+}
+
+#[test]
 fn test_heatmap_coupling_needs_three_shared_commits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ts = recent_ts();
@@ -1463,6 +2422,177 @@ fn test_heatmap_card_warning_uses_the_safe_path_in_text_and_json() {
     let json = heatmap_json_with(dir.path(), &[target]);
     assert_eq!(json["warnings"], serde_json::json!(warnings), "{json:?}");
     assert_eq!(json["cards"][0]["path"], "bulk/b\u{FFFD}c.rs", "{json:?}");
+}
+
+fn diff_warning_repo(root: &Path) {
+    git_init(root);
+    git_config(root, "core.quotePath", "false");
+    let git = |args: &[&str]| {
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    let gone = "gone\u{202e}.rs";
+    let ts = recent_ts();
+    git_commit(root, gone, "// gone\n", "feat: add file", ts);
+    git(&["branch", "base"]);
+    git(&["rm", "--", gone]);
+    git_commit(root, "live.rs", "// live\n", "feat: replace file", ts + 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_diff_keeps_spaces_in_repository_and_file_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo ");
+    std::fs::create_dir(&root).unwrap();
+    git_init(&root);
+    git_commit(&root, "first.rs", "one\n", "feat: first", 1_700_000_000);
+    let path = " spaced.rs ";
+    git_commit(&root, path, "one\ntwo\n", "feat: second", 1_700_000_001);
+
+    let json = heatmap_json_with(&root, &["--window", "all", "--diff", "HEAD~1"]);
+    assert_eq!(json["repository"], "repo ");
+    assert_eq!(sorted_paths(&json, "files"), [path]);
+    assert_eq!(file_entry(&json, path)["lines"], 2);
+    assert_eq!(json["warnings"], serde_json::json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_diff_drops_invalid_paths_without_widening_scope() {
+    let repo = tempfile::tempdir().unwrap();
+    diff_warning_repo(repo.path());
+    let tools = tempfile::tempdir().unwrap();
+    common::write_stub_script(
+        tools.path(),
+        "git",
+        r#"#!/bin/sh
+if [ "$3" = diff ]; then
+    printf '%s\n' '"\056\056/outside.rs"'
+    if [ "$HEATMAP_TEST_INCLUDE_VALID" = yes ]; then
+        printf '%s\n' live.rs
+    fi
+    exit 0
+fi
+PATH=$HEATMAP_TEST_PATH exec git "$@"
+"#,
+    );
+    let run = |include_valid: &str| {
+        common::skim()
+            .env("PATH", common::stub_path(tools.path()))
+            .env("HEATMAP_TEST_PATH", std::env::var_os("PATH").unwrap())
+            .env("HEATMAP_TEST_INCLUDE_VALID", include_valid)
+            .args(["heatmap", "--window", "all", "--diff", "base", "--json"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap()
+    };
+    let mixed = run("yes");
+    let rejected = run("no");
+    assert_eq!(
+        (mixed.status.code(), rejected.status.code()),
+        (Some(0), Some(1))
+    );
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("no valid changed paths"));
+    let json: serde_json::Value = serde_json::from_slice(&mixed.stdout).unwrap();
+    assert_eq!(json["file_targets"], serde_json::json!(["live.rs"]));
+    assert_eq!(sorted_paths(&json, "files"), ["live.rs"]);
+    assert_eq!(json["warnings"], serde_json::json!([]));
+    let stderr = String::from_utf8(mixed.stderr).unwrap();
+    assert!(stderr.contains("1 invalid changed path"), "{stderr}");
+    assert!(!stderr.contains("outside.rs"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_debug_shows_repository_root_in_display_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo\u{0007}root");
+    std::fs::create_dir(&root).unwrap();
+    git_init(&root);
+    git_commit(&root, "live.rs", "one\n", "feat: add file", 1_700_000_000);
+
+    let output = common::skim()
+        .env("SKIM_DEBUG", "1")
+        .args(["heatmap", "--window", "all", "--debug", "--json"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let trace = stderr
+        .lines()
+        .find(|line| line.starts_with("[skim:heatmap] repo root: "))
+        .unwrap();
+    assert!(trace.ends_with("/repo�root"), "{trace:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(file_entry(&json, "live.rs")["lines"], 1);
+}
+
+#[test]
+fn test_heatmap_diff_warning_paths_match_in_stderr_and_json() {
+    let dir = tempfile::tempdir().unwrap();
+    diff_warning_repo(dir.path());
+    let output = common::skim()
+        .env_remove("SKIM_DEBUG")
+        .args([
+            "heatmap",
+            "--window",
+            "all",
+            "--diff",
+            "base",
+            "--exclude",
+            "gone*.rs",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        "skim heatmap: warning: 'gone�.rs' is not a regular file on current branch\n"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["warnings"],
+        serde_json::json!(["targeted file 'gone�.rs' not found in git history"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_diff_warning_with_closed_stderr_keeps_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    diff_warning_repo(dir.path());
+    let args = ["heatmap", "--window", "all", "--diff", "base", "--json"];
+    let baseline = common::skim()
+        .args(args)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(baseline.status.success(), "{baseline:?}");
+    assert!(String::from_utf8_lossy(&baseline.stderr).contains("is not a regular file"));
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = StdCommand::new(assert_cmd::cargo::cargo_bin!("skim"))
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_DEBUG")
+        .args(args)
+        .current_dir(dir.path())
+        .stderr(std::process::Stdio::from(writer))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!output.stdout.is_empty());
+    assert_eq!(output.stdout, baseline.stdout);
 }
 
 #[test]
@@ -1905,9 +3035,11 @@ fn test_heatmap_text_ranks_ties_by_path() {
     create_ranked_repo(dir.path());
 
     let text = heatmap_stdout(dir.path(), &[]);
-    let mut expected: Vec<String> = (0..8).map(|i| format!("    6  src/hub/h{i}.rs")).collect();
-    expected.push("    5  src/pair/p0a.rs".to_string());
-    expected.push("    5  src/pair/p0b.rs".to_string());
+    let mut expected: Vec<String> = (0..8)
+        .map(|i| format!("    6 x 1 = 6  src/hub/h{i}.rs"))
+        .collect();
+    expected.push("    5 x 1 = 5  src/pair/p0a.rs".to_string());
+    expected.push("    5 x 1 = 5  src/pair/p0b.rs".to_string());
     assert_eq!(section_rows(&text, "Hotspots"), expected);
     assert_eq!(
         section_rows(&text, "Coupling"),
@@ -1933,7 +3065,7 @@ fn test_heatmap_text_ranks_ties_by_path() {
 }
 
 #[test]
-fn test_heatmap_hotspots_are_the_ten_highest_churn_files_in_order() {
+fn test_heatmap_hotspots_cap_the_one_line_files_in_score_order() {
     let dir = tempfile::tempdir().expect("tempdir");
     git_init(dir.path());
     let ts = recent_ts();
@@ -1956,8 +3088,10 @@ fn test_heatmap_hotspots_are_the_ten_highest_churn_files_in_order() {
     let rows: Vec<(u64, &str)> = section_rows(&text, "Hotspots")
         .iter()
         .map(|row| {
-            let (count, path) = row.trim_start().split_once("  ").expect("count and path");
-            (count.parse().expect("commit count"), path)
+            let (stats, path) = row.trim_start().split_once("  ").expect("stats and path");
+            let (commits, score) = stats.split_once(" x 1 = ").expect("one line at HEAD");
+            assert_eq!(commits, score, "{row}");
+            (score.parse().expect("hotspot score"), path)
         })
         .collect();
     assert_eq!(
@@ -2011,6 +3145,51 @@ fn create_five_commit_repo(dir: &Path, prefix: &str) {
             ts + i * 60,
         );
     }
+}
+
+#[test]
+fn test_heatmap_fix_risk_counts_non_code_rows_and_include_docs_restores_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    create_five_commit_repo(root, "feat");
+    let ts = recent_ts() + 600;
+    for i in 0..5 {
+        git_commit(
+            root,
+            "docs/guide.md",
+            &format!("Guide {i}\n"),
+            "feat: update guide",
+            ts + i * 2,
+        );
+        let body = format!("// revision {i}\n");
+        git_commit_files(
+            root,
+            &[
+                ("src/live.rs", &body),
+                ("README.md", &body),
+                ("docs/example.rs", &body),
+            ],
+            "fix: update files",
+            ts + i * 2 + 1,
+        );
+    }
+
+    let args = ["--detail", "fix-risk"];
+    let json = heatmap_json_with(root, &args);
+    let paths = sorted_paths(&json, "fix_risk");
+    assert_eq!(paths, ["src/live.rs"]);
+    let all = heatmap_json_with(root, &["--detail", "fix-risk", "--include-docs"]);
+    let all_paths = sorted_paths(&all, "fix_risk");
+    assert_eq!(all_paths, ["README.md", "docs/example.rs", "src/live.rs"]);
+    let restored = all_paths.len() - paths.len();
+    assert_eq!(json["left_out"]["fix_risk"], restored);
+
+    let text = heatmap_stdout(root, &args);
+    let expected = format!("  {restored} non-code files left out (--include-docs)");
+    assert!(
+        section_lines(&text, "Fix risk").contains(&expected.as_str()),
+        "{text}"
+    );
 }
 
 #[test]
@@ -2758,7 +3937,10 @@ fn test_heatmap_diff_gives_the_default_view_not_cards() {
 
     let text = heatmap_stdout(dir.path(), &["--diff", "main"]);
 
-    assert!(text.lines().any(|l| l == "Hotspots (commits):"), "{text}");
+    assert!(
+        text.lines().any(|l| l == "Hotspots (commits x lines):"),
+        "{text}"
+    );
     assert!(card_lines(&text, CARD_FILE).is_empty(), "{text}");
 }
 
@@ -3180,6 +4362,40 @@ fn test_heatmap_card_replaces_control_and_bidi_characters() {
     assert_eq!(card["fix_commits"][0]["subject"], safe_subject);
     assert_eq!(card["owners"][1]["name"], "Eve\u{FFFD}x");
     assert_eq!(card["partners"][0]["path"], "src/b\u{FFFD}c.rs");
+}
+
+#[test]
+fn test_heatmap_default_detail_and_insights_use_the_card_path_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_config(root, "core.quotePath", "false");
+    let path = "src/a\u{202e}.rs";
+    let shown = "src/a�.rs";
+    for i in 0..3 {
+        let body = format!("// revision {i}\n");
+        git_commit_files(
+            root,
+            &[(path, &body), ("src/b.rs", &body)],
+            "feat: change both",
+            recent_ts() + i,
+        );
+    }
+
+    for args in [&[][..], &["--detail", "hotspots"][..], &["--insights"][..]] {
+        let text = heatmap_stdout(root, args);
+        assert!(text.contains(shown), "{text:?}");
+        assert!(!text.contains(path), "{text:?}");
+    }
+    let json = heatmap_json(root);
+    assert_eq!(file_entry(&json, shown)["lines"], 1, "{json}");
+    let insights = heatmap_json_with(root, &["--insights"]);
+    assert!(
+        sorted_paths(&insights, "top_files")
+            .iter()
+            .any(|path| path == shown),
+        "{insights}"
+    );
 }
 
 #[test]

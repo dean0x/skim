@@ -20,6 +20,7 @@ mod types;
 mod view;
 mod window;
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -28,11 +29,11 @@ use crate::analytics::{CommandType, RecordingContext};
 
 use args::{parse_args, print_help};
 use excludes::Excludes;
-use git_source::{CliGitSource, GitDataSource};
+use git_source::{CliGitSource, GitDataSource, HeadEntry, HeadTree, ParsedLog, disk_path};
 use insights::{build_insights_result, compute_insights, keep_code_findings};
 use metrics::{
     CouplingResult, ModuleRoots, compute_authors, compute_churn, compute_coupling,
-    compute_encapsulation, compute_fix_after_touch, compute_stability, module_of, without_quotes,
+    compute_encapsulation, compute_fix_after_touch, compute_stability, module_of,
 };
 use noise::{COUPLING_MAX_FILES, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS};
 use output::{
@@ -47,6 +48,17 @@ use window::{build_window_info, format_epoch, resolve_config};
 // Entry point
 // ============================================================================
 
+/// Heatmap does not stop when stderr is closed.
+fn note(message: std::fmt::Arguments<'_>) {
+    let _ = crate::cmd::execution::write_line_to_stderr(&message.to_string());
+}
+
+fn debug_note(message: std::fmt::Arguments<'_>) {
+    if crate::debug::is_debug_enabled() {
+        note(message);
+    }
+}
+
 /// Run the `skim heatmap` subcommand.
 pub(crate) fn run(
     args: &[String],
@@ -60,8 +72,8 @@ pub(crate) fn run(
     let mut raw_args = match parse_args(args) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("skim heatmap: {e}");
-            eprintln!("Run `skim heatmap --help` for usage.");
+            note(format_args!("skim heatmap: {e}"));
+            note(format_args!("Run `skim heatmap --help` for usage."));
             return Ok(ExitCode::FAILURE);
         }
     };
@@ -99,23 +111,41 @@ fn resolve_diff_files(
 
     match git_source.fetch_diff_files(&base) {
         Ok(files) if files.is_empty() => {
-            eprintln!("skim heatmap: no files changed vs '{base}'");
+            note(format_args!("skim heatmap: no files changed vs '{base}'"));
             Ok(Some(ExitCode::FAILURE))
         }
-        Ok(files) => {
-            // git diff output is repo-root-relative, so resolve paths against
-            // the repo root to avoid cwd-dependent failures. The warning gates
-            // nothing: `args.diff_files` still receives the full diff list, and
-            // apply_file_scope filters the output by set intersection.
-            let root = git_source.get_repo_root().unwrap_or_default();
+        Ok(mut files) => {
+            // Check the decoded path. Keep Git's spelling as the history key.
+            let total = files.len();
+            files.retain(|f| disk_path(f).is_some_and(|p| super::is_repo_relative_safe(&p)));
+            let rejected = total - files.len();
+            if rejected > 0 {
+                let noun = if rejected == 1 { "path" } else { "paths" };
+                note(format_args!(
+                    "skim heatmap: warning: dropped {rejected} invalid changed {noun}"
+                ));
+            }
+            if files.is_empty() {
+                note(format_args!("skim heatmap: no valid changed paths"));
+                return Ok(Some(ExitCode::FAILURE));
+            }
+
+            // Check the accepted paths for the warning, without changing the scope.
+            let root = match git_source.get_repo_root() {
+                Ok(root) => root,
+                Err(e) => {
+                    note(format_args!("skim heatmap: {e}"));
+                    return Ok(Some(ExitCode::FAILURE));
+                }
+            };
             if let Some(warning) = diff_not_file_warning(std::path::Path::new(&root), &files) {
-                eprintln!("skim heatmap: warning: {warning}");
+                note(format_args!("skim heatmap: warning: {warning}"));
             }
             args.diff_files = files;
             Ok(None)
         }
         Err(e) => {
-            eprintln!("skim heatmap: {e}");
+            note(format_args!("skim heatmap: {e}"));
             Ok(Some(ExitCode::FAILURE))
         }
     }
@@ -142,7 +172,10 @@ fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<Str
         .collect();
     match not_files.as_slice() {
         [] => None,
-        [only] => Some(format!("'{only}' is not a regular file on current branch")),
+        [only] => Some(format!(
+            "{} is not a regular file on current branch",
+            warning_name(only)
+        )),
         _ => Some(format!(
             "{} changed paths are not regular files on current branch: {}",
             not_files.len(),
@@ -151,73 +184,10 @@ fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<Str
     }
 }
 
-/// A path from git output as the relative path that it names, for a test
-/// on disk or against the exclude patterns, or `None` when its quoted form
-/// does not decode. git writes a name with unusual bytes in double quotes,
-/// with C escapes and 3-digit octal escapes (the form of
-/// `card::git_quoted`); a test on the quoted text would name no file.
-fn disk_path(path: &str) -> Option<std::path::PathBuf> {
-    let (inner, quoted) = without_quotes(path);
-    if !quoted {
-        return Some(std::path::PathBuf::from(path));
-    }
-    path_from_bytes(c_unescaped(inner)?)
-}
-
-/// The bytes of the text inside git's quotes, or `None` for an escape that
-/// git does not write. Each pass reads at least one byte, so the loop ends
-/// after at most `inner.len()` passes.
-fn c_unescaped(inner: &str) -> Option<Vec<u8>> {
-    let mut rest = inner.bytes();
-    let mut out = Vec::with_capacity(inner.len());
-    while let Some(b) = rest.next() {
-        if b != b'\\' {
-            out.push(b);
-            continue;
-        }
-        let byte = match rest.next()? {
-            b'a' => 0x07,
-            b'b' => 0x08,
-            b't' => b'\t',
-            b'n' => b'\n',
-            b'v' => 0x0b,
-            b'f' => 0x0c,
-            b'r' => b'\r',
-            b'"' => b'"',
-            b'\\' => b'\\',
-            // Three octal digits, the first 0-3, so the value fits in a byte.
-            first @ b'0'..=b'3' => {
-                let mut value = first - b'0';
-                for _ in 0..2 {
-                    let digit = rest.next().filter(|d| (b'0'..=b'7').contains(d))?;
-                    value = value * 8 + (digit - b'0');
-                }
-                value
-            }
-            _ => return None,
-        };
-        out.push(byte);
-    }
-    Some(out)
-}
-
-#[cfg(unix)]
-fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    Some(std::ffi::OsString::from_vec(bytes).into())
-}
-
-/// Off Unix a path is text: bytes that are not UTF-8 name no file.
-#[cfg(not(unix))]
-fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
-    String::from_utf8(bytes).ok().map(Into::into)
-}
-
 /// Kinds of run warning: a shallow clone, more than one window flag, an
-/// unresolved `--last`, an unknown `--window` preset, malformed git log
-/// records, git log output at its limit, commits too large to pair and
-/// `--diff` files not in the window. Each kind adds at most one line, so a
-/// run has at most this many warnings in either JSON output.
+/// unresolved `--last`, skipped git log data, git log output at its
+/// limit, HEAD data, commits too large to pair and `--diff` files not in
+/// the window. Each kind adds at most one line in either JSON output.
 const WARNING_KINDS: usize = 8;
 
 /// True when `warnings` has at most [`WARNING_KINDS`] lines and no line
@@ -225,6 +195,30 @@ const WARNING_KINDS: usize = 8;
 fn one_warning_per_kind(warnings: &[String]) -> bool {
     let distinct: std::collections::HashSet<&str> = warnings.iter().map(String::as_str).collect();
     warnings.len() <= WARNING_KINDS && distinct.len() == warnings.len()
+}
+
+fn skipped_log_warning(parsed: &ParsedLog) -> Option<String> {
+    let groups = [
+        (parsed.malformed, "malformed git log record"),
+        (parsed.unpaired, "unpaired git log record"),
+        (parsed.unsafe_paths, "unsafe path"),
+    ];
+    let counts: Vec<_> = groups
+        .into_iter()
+        .filter(|&(count, _)| count > 0)
+        .map(|(count, noun)| {
+            let plural = if count == 1 { "" } else { "s" };
+            format!("{count} {noun}{plural}")
+        })
+        .collect();
+    (!counts.is_empty()).then(|| format!("Skipped {}.", counts.join(", ")))
+}
+
+/// On an early exit there is no result view to carry this warning.
+fn emit_skipped_log_warning(warning: Option<&str>) {
+    if let Some(warning) = warning {
+        note(format_args!("skim heatmap: {warning}"));
+    }
 }
 
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
@@ -238,6 +232,7 @@ struct PreparedCommits {
     warnings: Vec<String>,
     /// Package roots for module labels; empty means the top-folder rule.
     module_roots: ModuleRoots,
+    head_tree: Option<HeadTree>,
     excludes: Excludes,
 }
 
@@ -256,14 +251,14 @@ fn prepare_commits(
 ) -> anyhow::Result<Option<PreparedCommits>> {
     // Step 1: Validate git environment
     if !source.is_git_repo() {
-        eprintln!("skim heatmap: Not a git repository");
+        note(format_args!("skim heatmap: Not a git repository"));
         return Ok(None);
     }
 
     let repo_root = match source.get_repo_root() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("skim heatmap: {e}");
+            note(format_args!("skim heatmap: {e}"));
             return Ok(None);
         }
     };
@@ -274,7 +269,7 @@ fn prepare_commits(
         match card_targets(source, &repo_root, &args.files) {
             Ok(targets) => args.files = targets,
             Err(e) => {
-                eprintln!("skim heatmap: {e}");
+                note(format_args!("skim heatmap: {e}"));
                 return Ok(None);
             }
         }
@@ -293,12 +288,13 @@ fn prepare_commits(
     let debug = args.debug;
 
     if debug {
-        eprintln!("[skim:heatmap] repo root: {repo_root}");
+        debug_note(format_args!(
+            "[skim:heatmap] repo root: {}",
+            card::shown_path(&repo_root)
+        ));
     }
 
-    // Capture a single clock snapshot for all window-resolution helpers so that
-    // preset_to_since_secs, resolve_config, and build_window_info all use the
-    // same value (temporal consistency).
+    // Resolve and display the window from the same clock snapshot.
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -315,12 +311,12 @@ fn prepare_commits(
         } else {
             "time"
         };
-        eprintln!("[skim:heatmap] window mode: {mode}");
+        debug_note(format_args!("[skim:heatmap] window mode: {mode}"));
         if let Some(since) = config.since {
-            eprintln!(
+            debug_note(format_args!(
                 "[skim:heatmap] since epoch: {since} ({})",
                 format_epoch(since)
-            );
+            ));
         }
     }
 
@@ -330,25 +326,15 @@ fn prepare_commits(
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("not installed") || msg.contains("not in PATH") {
-                eprintln!("skim heatmap: {msg}");
+                note(format_args!("skim heatmap: {msg}"));
             } else {
-                eprintln!("skim heatmap: failed to fetch git log: {msg}");
+                note(format_args!("skim heatmap: failed to fetch git log: {msg}"));
             }
             return Ok(None);
         }
     };
 
-    if parsed.malformed > 0 {
-        let noun = if parsed.malformed == 1 {
-            "record"
-        } else {
-            "records"
-        };
-        warnings.push(format!(
-            "Skipped {} malformed git log {noun} (bad hash or timestamp); their file changes are not counted.",
-            parsed.malformed
-        ));
-    }
+    let skipped_warning = skipped_log_warning(&parsed);
     if let Some(oldest) = parsed.cut_oldest {
         // Author timestamps are ASCII digits only, so they are never negative.
         warnings.push(format!(
@@ -360,11 +346,15 @@ fn prepare_commits(
     let raw_commits = parsed.commits;
 
     if debug {
-        eprintln!("[skim:heatmap] raw commits fetched: {}", raw_commits.len());
+        debug_note(format_args!(
+            "[skim:heatmap] raw commits fetched: {}",
+            raw_commits.len()
+        ));
     }
 
     if raw_commits.is_empty() {
-        eprintln!("skim heatmap: No commits found in repository");
+        emit_skipped_log_warning(skipped_warning.as_deref());
+        note(format_args!("skim heatmap: No commits found in repository"));
         return Ok(None);
     }
 
@@ -381,20 +371,25 @@ fn prepare_commits(
     commits.retain(|c| !c.changed_files.is_empty());
 
     if debug {
-        eprintln!(
+        debug_note(format_args!(
             "[skim:heatmap] commits after exclusion: {} ({} excluded)",
             commits.len(),
             raw_commit_count - commits.len()
-        );
+        ));
     }
 
     // A card can report its filter even when no commits remain.
     if commits.is_empty() && !matches!(config.targets, FileTargets::Cards(_)) {
-        eprintln!("skim heatmap: No analyzable files after exclusions");
+        emit_skipped_log_warning(skipped_warning.as_deref());
+        note(format_args!(
+            "skim heatmap: No analyzable files after exclusions"
+        ));
         return Ok(None);
     }
+    warnings.extend(skipped_warning);
 
-    let module_roots = load_module_roots(source, &repo_root);
+    let (module_roots, head_tree) =
+        load_head_data(source, &repo_root, config.path.as_deref(), &mut warnings);
 
     Ok(Some(PreparedCommits {
         commits,
@@ -404,6 +399,7 @@ fn prepare_commits(
         repo_root,
         warnings,
         module_roots,
+        head_tree,
         excludes,
     }))
 }
@@ -428,21 +424,60 @@ fn card_targets(
     Ok(targets)
 }
 
-/// Read the package roots from the tracked-file list of `repo_root`.
-///
-/// The list is optional input: when it is not available, modules use the
-/// top-folder rule and the run continues.
-fn load_module_roots(source: &dyn GitDataSource, repo_root: &str) -> ModuleRoots {
-    match source.list_tracked_files(repo_root) {
-        Ok(Some(paths)) => ModuleRoots::from_tracked_files(&paths),
-        Ok(None) => ModuleRoots::default(),
-        Err(e) => {
-            crate::debug_log!(
-                "[skim:heatmap] tracked-file list not available ({e}); modules use the top-folder rule"
-            );
-            ModuleRoots::default()
+const HEAD_UNAVAILABLE: &str = "HEAD data is not available. Hotspots rank by commits only.";
+
+/// Keep package roots from a complete listing even if Git cannot count lines.
+fn load_head_data(
+    source: &dyn GitDataSource,
+    repo_root: &str,
+    path: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> (ModuleRoots, Option<HeadTree>) {
+    let no_lazy_fetch = source.detect_partial_clone(repo_root);
+    let Ok(mut entries) = source.list_tracked_files(repo_root, no_lazy_fetch) else {
+        warnings.push(HEAD_UNAVAILABLE.into());
+        return (ModuleRoots::default(), None);
+    };
+    let roots = ModuleRoots::from_tracked_files(entries.keys());
+    let Ok(counts) = source.count_head_lines(repo_root, path, no_lazy_fetch) else {
+        warnings.push(HEAD_UNAVAILABLE.into());
+        return (roots, None);
+    };
+    let mut unmatched = 0;
+    for (path, count) in counts {
+        match entries.get_mut(&path) {
+            Some(HeadEntry::Regular(lines)) => *lines = Some(count),
+            Some(HeadEntry::Other) => (),
+            None => unmatched += 1,
         }
     }
+    if unmatched > 0 {
+        warnings.push(format!(
+            "HEAD data: {unmatched} line-count rows have no tree entry."
+        ));
+    }
+    (roots, Some(entries))
+}
+
+fn trace_head_data(head_tree: Option<&HeadTree>) {
+    let totals = match head_tree {
+        Some(entries) => {
+            let mut regular = 0;
+            let mut counted = 0;
+            for entry in entries.values() {
+                if let HeadEntry::Regular(lines) = entry {
+                    regular += 1;
+                    counted += usize::from(lines.is_some());
+                }
+            }
+            format!(
+                "{} entries, {regular} regular files, {counted} line counts",
+                entries.len()
+            )
+        }
+        None => "unavailable".to_string(),
+    };
+    debug_note(format_args!("[skim:heatmap] HEAD data: {totals}"));
 }
 
 /// Orchestration with injected data source (enables testing).
@@ -467,15 +502,20 @@ fn run_with_source(
         repo_root,
         warnings,
         module_roots,
+        head_tree,
         excludes,
     } = match prepare_commits(source, args)? {
         Some(p) => p,
         None => return Ok(ExitCode::FAILURE),
     };
 
+    if config.debug {
+        trace_head_data(head_tree.as_ref());
+    }
+
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
-    let mut result = compute_heatmap(
+    let result = compute_heatmap(
         &commits,
         &config,
         &window,
@@ -484,6 +524,8 @@ fn run_with_source(
         warnings,
         &module_roots,
     );
+    let (mut result, at_head) = keep_at_head(result, head_tree.as_ref(), &config.targets);
+    result.not_at_head = at_head.not_at_head;
     let spec = view::ViewSpec::from_config(&config);
 
     // File targets scope the result after the full metric computation, so
@@ -491,18 +533,23 @@ fn run_with_source(
     let cards = match &config.targets {
         FileTargets::All => None,
         FileTargets::Diff(files) => {
-            warn_missing_targets(&mut result, files);
+            warn_missing_targets(&mut result, files, &at_head.dropped);
             apply_file_scope(&mut result, files, &module_roots);
             None
         }
-        FileTargets::Cards(paths) => Some(scope_cards(
-            &mut result,
-            &commits,
-            paths,
-            spec.lists(),
-            &module_roots,
-            &excludes,
-        )),
+        FileTargets::Cards(paths) => {
+            let cards = scope_cards(
+                &mut result,
+                &commits,
+                paths,
+                spec.lists(),
+                &module_roots,
+                &excludes,
+            );
+            // A history-only target can give a card, but not a ranked row.
+            result.files.retain(|f| !at_head.dropped.contains(&f.path));
+            Some(cards)
+        }
     };
     // The warning list is complete here, and both JSON outputs give it as is.
     debug_assert!(
@@ -595,13 +642,18 @@ fn record_heatmap_analytics(
 /// Names in a counted warning. The warning counts paths that it does not name.
 const WARNING_NAMES: usize = 3;
 
+/// Path text in all heatmap views shows the same form.
+fn warning_name(path: &str) -> String {
+    format!("'{}'", card::shown_path(path))
+}
+
 /// The first [`WARNING_NAMES`] of `names` in single quotes, then
 /// `" and N more"` for the others.
 fn named_paths(names: &[&str]) -> String {
     let shown: Vec<String> = names
         .iter()
         .take(WARNING_NAMES)
-        .map(|name| format!("'{name}'"))
+        .map(|name| warning_name(name))
         .collect();
     join_warning_names(&shown, names.len())
 }
@@ -616,23 +668,74 @@ fn join_warning_names(shown: &[String], total: usize) -> String {
     format!("{}{rest}", shown.join(", "))
 }
 
+#[derive(Default)]
+struct AtHead {
+    not_at_head: usize,
+    dropped: HashSet<String>,
+}
+
+/// Apply HEAD status after the metrics so module totals and stability keep
+/// the full history. Keep explicit card targets until their cards are built.
+#[must_use]
+fn keep_at_head(
+    mut result: HeatmapResult,
+    head_tree: Option<&HeadTree>,
+    targets: &FileTargets,
+) -> (HeatmapResult, AtHead) {
+    let Some(head_tree) = head_tree else {
+        return (result, AtHead::default());
+    };
+    let card_paths: HashSet<String> = match targets {
+        FileTargets::Cards(paths) => card::history_paths(paths, &result.files)
+            .into_iter()
+            .collect(),
+        FileTargets::All | FileTargets::Diff(_) => HashSet::new(),
+    };
+    let mut at_head = AtHead::default();
+    result.files.retain_mut(|file| {
+        match head_tree.get(&file.path) {
+            Some(HeadEntry::Regular(Some(lines))) => {
+                file.lines = *lines;
+                return true;
+            }
+            // History and grep share the same path scope. An in-scope, nonempty
+            // file with no text count is binary, but it still exists at HEAD.
+            Some(HeadEntry::Regular(None)) => (),
+            Some(HeadEntry::Other) | None => at_head.not_at_head += 1,
+        }
+        at_head.dropped.insert(file.path.clone());
+        card_paths.contains(&file.path)
+    });
+    result
+        .coupling_graph
+        .retain(|edge| !at_head.dropped.contains(&edge.a) && !at_head.dropped.contains(&edge.b));
+    for file in &mut result.files {
+        file.blast_radius
+            .retain(|p| !at_head.dropped.contains(&p.path));
+    }
+    (result, at_head)
+}
+
 /// Add one warning for the `--diff` files that are not in the window's
 /// history. It counts each missing file once and names the first
 /// [`WARNING_NAMES`] in argument order (a set order would change
 /// between runs). A large diff thus adds one warning, not one per file.
-fn warn_missing_targets(result: &mut HeatmapResult, files: &[String]) {
-    use std::collections::HashSet;
-
+fn warn_missing_targets(result: &mut HeatmapResult, files: &[String], dropped: &HashSet<String>) {
     let result_paths: HashSet<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
     let mut seen: HashSet<&str> = HashSet::new();
     let missing: Vec<&str> = files
         .iter()
         .map(String::as_str)
-        .filter(|target| !result_paths.contains(target) && seen.insert(target))
+        .filter(|target| {
+            !result_paths.contains(target) && !dropped.contains(*target) && seen.insert(target)
+        })
         .collect();
     let warning = match missing.as_slice() {
         [] => return,
-        [only] => format!("targeted file '{only}' not found in git history"),
+        [only] => format!(
+            "targeted file {} not found in git history",
+            warning_name(only)
+        ),
         _ => format!(
             "{} targeted files not found in git history: {}",
             missing.len(),
@@ -658,12 +761,11 @@ fn scope_cards(
         .iter()
         .filter(|c| metrics::is_large_commit(c))
         .count();
-    let touches: Vec<_> = cards
-        .rows
+    let touches: Vec<_> = targets
         .iter()
         .zip(counts)
         .filter(|&(_, count)| count > 0)
-        .map(|(card, count)| (card.path.as_str(), count))
+        .map(|(path, count)| (path.as_str(), count))
         .collect();
     scope_coupling_warning(&mut result.warnings, skipped, &touches);
     apply_file_scope(result, &targets, roots);
@@ -688,7 +790,7 @@ fn coupling_warning(skipped: usize, touches: Option<&[(&str, usize)]>) -> Option
                 .take(WARNING_NAMES)
                 .map(|(path, count)| {
                     let verb = if *count == 1 { "touches" } else { "touch" };
-                    format!("{count} {verb} {path}")
+                    format!("{count} {verb} {}", card::shown_path(path))
                 })
                 .collect();
             Some(format!(
@@ -719,8 +821,6 @@ fn scope_coupling_warning(warnings: &mut Vec<String>, skipped: usize, touches: &
 /// (blast radius view). Modules are kept when they hold a targeted file, by
 /// the same [`module_of`] mapping the module metric uses.
 fn apply_file_scope(result: &mut HeatmapResult, files: &[String], roots: &ModuleRoots) {
-    use std::collections::HashSet;
-
     let target_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
 
     // Filter files
@@ -808,13 +908,13 @@ fn compute_heatmap(
 
     if config.debug {
         let elapsed = t0.elapsed();
-        eprintln!(
+        debug_note(format_args!(
             "[skim:heatmap] metrics computed in {:.1}ms — {} files, {} coupling edges, {} modules",
             elapsed.as_secs_f64() * 1000.0,
             churn_map.len(),
             coupling_graph.len(),
             modules.len(),
-        );
+        ));
     }
 
     // Window totals for the view gates: the fix-risk base rate and the
@@ -842,6 +942,7 @@ fn compute_heatmap(
             let blast_radius = blast_radius_map.get(&path).cloned().unwrap_or_default();
 
             FileMetrics {
+                lines: 0,
                 path,
                 churn,
                 stability_score,
@@ -868,6 +969,7 @@ fn compute_heatmap(
 
     // Step 9: Build result
     HeatmapResult {
+        not_at_head: 0,
         generated_at: format_epoch(now_epoch),
         repository,
         window: window_info,
@@ -891,6 +993,37 @@ fn compute_heatmap(
 mod tests {
     use super::*;
 
+    /// Heatmap does not stop when stderr is closed. The shared runner cap
+    /// marker is outside this check. Heatmap uses `run_stdout_degrade` instead.
+    #[test]
+    fn test_heatmap_stderr_source_contract() {
+        let direct_stderr = regex::Regex::new(r"\b(?:eprint|eprintln|debug_log)\s*!").unwrap();
+        let runner_with_marker = regex::Regex::new(r"\.\s*run(?:_with_env)?\s*\(").unwrap();
+        for (file, source) in [
+            ("args.rs", include_str!("args.rs")),
+            ("card.rs", include_str!("card.rs")),
+            ("excludes.rs", include_str!("excludes.rs")),
+            ("git_source.rs", include_str!("git_source.rs")),
+            ("insights.rs", include_str!("insights.rs")),
+            ("metrics.rs", include_str!("metrics.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("noise.rs", include_str!("noise.rs")),
+            ("output.rs", include_str!("output.rs")),
+            ("types.rs", include_str!("types.rs")),
+            ("view.rs", include_str!("view.rs")),
+            ("window.rs", include_str!("window.rs")),
+        ] {
+            let production = source.split("\n#[cfg(test)]").next().unwrap();
+            assert!(!direct_stderr.is_match(production), "{file}: stderr macro");
+            if file == "git_source.rs" {
+                assert!(
+                    !runner_with_marker.is_match(production),
+                    "{file}: runner call"
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // apply_file_scope
     // -----------------------------------------------------------------------
@@ -901,6 +1034,7 @@ mod tests {
             WindowInfo,
         };
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01".to_string(),
             repository: "test".to_string(),
             window: WindowInfo {
@@ -912,6 +1046,7 @@ mod tests {
             },
             files: vec![
                 FileMetrics {
+                    lines: 0,
                     path: "src/main.rs".to_string(),
                     churn: ChurnMetrics {
                         commits: 5,
@@ -923,6 +1058,7 @@ mod tests {
                     blast_radius: vec![],
                 },
                 FileMetrics {
+                    lines: 0,
                     path: "src/lib.rs".to_string(),
                     churn: ChurnMetrics {
                         commits: 3,
@@ -934,6 +1070,7 @@ mod tests {
                     blast_radius: vec![],
                 },
                 FileMetrics {
+                    lines: 0,
                     path: "tests/test.rs".to_string(),
                     churn: ChurnMetrics {
                         commits: 2,
@@ -1024,7 +1161,11 @@ mod tests {
     fn test_warn_missing_targets_names_the_missing_diff_file() {
         let mut result = make_test_result();
         result.warnings.clear();
-        warn_missing_targets(&mut result, &["nonexistent.rs".to_string()]);
+        warn_missing_targets(
+            &mut result,
+            &["nonexistent.rs".to_string()],
+            &HashSet::new(),
+        );
         assert_eq!(
             result.warnings,
             ["targeted file 'nonexistent.rs' not found in git history"]
@@ -1033,14 +1174,21 @@ mod tests {
 
     #[test]
     fn test_warn_missing_targets_gives_one_counted_warning_in_argument_order() {
-        let names = ["z.rs", "a.rs", "m.rs", "z.rs", "k.rs", "b.rs"];
+        let names = [
+            "z\u{202e}.rs",
+            "a.rs",
+            "m.rs",
+            "z\u{202e}.rs",
+            "k.rs",
+            "b.rs",
+        ];
         let targets: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
         let mut result = make_test_result();
         result.warnings.clear();
-        warn_missing_targets(&mut result, &targets);
+        warn_missing_targets(&mut result, &targets, &HashSet::new());
         assert_eq!(
             result.warnings,
-            ["5 targeted files not found in git history: 'z.rs', 'a.rs', 'm.rs' and 2 more"]
+            ["5 targeted files not found in git history: 'z�.rs', 'a.rs', 'm.rs' and 2 more"]
         );
     }
 
@@ -1049,7 +1197,7 @@ mod tests {
         let targets = ["x.rs".to_string(), "y.rs".to_string(), "x.rs".to_string()];
         let mut result = make_test_result();
         result.warnings.clear();
-        warn_missing_targets(&mut result, &targets);
+        warn_missing_targets(&mut result, &targets, &HashSet::new());
         assert_eq!(
             result.warnings,
             ["2 targeted files not found in git history: 'x.rs', 'y.rs'"]
@@ -1061,7 +1209,7 @@ mod tests {
         let mut result = make_test_result();
         result.warnings.clear();
         let present: Vec<String> = result.files.iter().map(|f| f.path.clone()).collect();
-        warn_missing_targets(&mut result, &present);
+        warn_missing_targets(&mut result, &present, &HashSet::new());
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     }
 
@@ -1200,6 +1348,7 @@ mod tests {
         let mut result = make_test_result();
         // Replace the file list with a single deeply-nested path
         result.files = vec![FileMetrics {
+            lines: 0,
             path: "src/cmd/heatmap/mod.rs".to_string(),
             churn: ChurnMetrics {
                 commits: 1,
@@ -1269,9 +1418,8 @@ mod tests {
 
     /// What the stub's `list_tracked_files` gives.
     enum TrackedStub {
-        Listed(Vec<String>),
+        Listed(HeadTree),
         Unavailable,
-        Fails,
     }
 
     /// Stub `GitDataSource`: `fetch_commits` returns `commits`, the
@@ -1283,6 +1431,8 @@ mod tests {
         malformed: usize,
         cut_oldest: Option<i64>,
         tracked: TrackedStub,
+        counts: Option<git_source::HeadCounts>,
+        count_calls: std::cell::RefCell<Vec<(String, Option<String>)>>,
         shallow: bool,
     }
 
@@ -1293,7 +1443,9 @@ mod tests {
                 commits: vec![stub_commit(0, &["src/main.rs"])],
                 malformed,
                 cut_oldest: None,
-                tracked: TrackedStub::Unavailable,
+                tracked: listed(&["src/main.rs"]),
+                counts: Some(Vec::new()),
+                count_calls: Default::default(),
                 shallow: false,
             }
         }
@@ -1334,17 +1486,95 @@ mod tests {
                 commits: self.commits.clone(),
                 malformed: self.malformed,
                 cut_oldest: self.cut_oldest,
+                ..ParsedLog::default()
             })
         }
-        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
+        fn detect_partial_clone(&self, _repo_root: &str) -> bool {
+            false
+        }
+        fn list_tracked_files(
+            &self,
+            _repo_root: &str,
+            _no_lazy_fetch: bool,
+        ) -> anyhow::Result<HeadTree> {
             match &self.tracked {
-                TrackedStub::Listed(paths) => Ok(Some(paths.clone())),
-                TrackedStub::Unavailable => Ok(None),
-                TrackedStub::Fails => Err(anyhow::anyhow!("simulated ls-tree failure")),
+                TrackedStub::Listed(entries) => Ok(entries.clone()),
+                TrackedStub::Unavailable => anyhow::bail!("simulated ls-tree failure"),
             }
+        }
+        fn count_head_lines(
+            &self,
+            repo_root: &str,
+            path: Option<&str>,
+            _no_lazy_fetch: bool,
+        ) -> anyhow::Result<git_source::HeadCounts> {
+            self.count_calls
+                .borrow_mut()
+                .push((repo_root.into(), path.map(str::to_owned)));
+            self.counts
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("simulated grep failure"))
         }
         fn show_prefix(&self) -> anyhow::Result<String> {
             Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn test_head_data_uses_one_scoped_count_and_joins_only_regular_entries() {
+        let source = StubSource {
+            tracked: TrackedStub::Listed(HeadTree::from([
+                ("src/main.rs".into(), HeadEntry::Regular(None)),
+                ("src/link.rs".into(), HeadEntry::Other),
+                ("src/binary.rs".into(), HeadEntry::Regular(None)),
+            ])),
+            counts: Some(vec![
+                ("src/main.rs".into(), 12),
+                ("src/link.rs".into(), 3),
+                ("src/missing.rs".into(), 7),
+                ("src/gone.rs".into(), 1),
+            ]),
+            ..StubSource::with_malformed(0)
+        };
+        let prepared = prepare_commits(
+            &source,
+            HeatmapArgs {
+                path: Some("src".into()),
+                ..HeatmapArgs::default()
+            },
+        )
+        .unwrap()
+        .expect("the run continues");
+        assert_eq!(
+            *source.count_calls.borrow(),
+            [("/stub/repo".into(), Some("src".into()))]
+        );
+        let tree = prepared.head_tree.unwrap();
+        assert_eq!(tree["src/main.rs"], HeadEntry::Regular(Some(12)));
+        assert_eq!(tree["src/link.rs"], HeadEntry::Other);
+        assert_eq!(tree["src/binary.rs"], HeadEntry::Regular(None));
+        assert_eq!(
+            prepared.warnings,
+            ["HEAD data: 2 line-count rows have no tree entry."]
+        );
+    }
+
+    #[test]
+    fn test_head_data_falls_back_once_after_either_failure() {
+        for (tracked, count_calls) in [(TrackedStub::Unavailable, 0), (listed(&["src/main.rs"]), 1)]
+        {
+            let source = StubSource {
+                tracked,
+                counts: None,
+                ..StubSource::with_malformed(0)
+            };
+            let prepared = prepare_commits(&source, HeatmapArgs::default())
+                .unwrap()
+                .expect("the run continues");
+            assert_eq!(source.count_calls.borrow().len(), count_calls);
+            assert!(prepared.head_tree.is_none());
+            assert_eq!(prepared.warnings, [HEAD_UNAVAILABLE]);
+            assert_eq!(prepared.commits.len(), 1);
         }
     }
 
@@ -1364,9 +1594,7 @@ mod tests {
             .expect("one good commit remains");
         assert_eq!(
             malformed_warnings(&prepared),
-            vec![
-                "Skipped 3 malformed git log records (bad hash or timestamp); their file changes are not counted."
-            ]
+            vec!["Skipped 3 malformed git log records."]
         );
         assert_eq!(prepared.commits.len(), 1);
     }
@@ -1379,9 +1607,21 @@ mod tests {
             .expect("one good commit remains");
         assert_eq!(
             malformed_warnings(&prepared),
-            vec![
-                "Skipped 1 malformed git log record (bad hash or timestamp); their file changes are not counted."
-            ]
+            vec!["Skipped 1 malformed git log record."]
+        );
+    }
+
+    #[test]
+    fn test_log_warning_names_each_nonzero_count() {
+        let parsed = ParsedLog {
+            malformed: 1,
+            unpaired: 2,
+            unsafe_paths: 3,
+            ..ParsedLog::default()
+        };
+        assert_eq!(
+            skipped_log_warning(&parsed).as_deref(),
+            Some("Skipped 1 malformed git log record, 2 unpaired git log records, 3 unsafe paths.")
         );
     }
 
@@ -1442,11 +1682,12 @@ mod tests {
             cut_oldest: Some(1_700_000_000),
             tracked: TrackedStub::Unavailable,
             shallow: true,
+            ..StubSource::with_malformed(0)
         };
         // Two window flags, and the stub has fewer than 5 commits.
         let args = HeatmapArgs {
             last_n: Some(5),
-            window_preset: Some("unknown".to_string()),
+            window_preset: Some("all".to_string()),
             ..HeatmapArgs::default()
         };
         let p = prepare_commits(&source, args)
@@ -1461,14 +1702,22 @@ mod tests {
             p.warnings,
             &p.module_roots,
         );
-        warn_missing_targets(&mut result, &["gone.rs".to_string()]);
+        warn_missing_targets(&mut result, &["gone.rs".to_string()], &HashSet::new());
 
-        // `--last` comes before `--window`, so the unknown-preset kind
-        // cannot show with an unresolved `--last`: all other kinds show.
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .filter(|warning| warning.starts_with("HEAD data"))
+                .count(),
+            1,
+            "{:?}",
+            result.warnings
+        );
         let distinct: std::collections::HashSet<&String> = result.warnings.iter().collect();
         assert_eq!(
             result.warnings.len(),
-            WARNING_KINDS - 1,
+            WARNING_KINDS,
             "{:?}",
             result.warnings
         );
@@ -1498,10 +1747,8 @@ mod tests {
     fn module_paths_with(tracked: TrackedStub) -> Vec<String> {
         let source = StubSource {
             commits: package_commits(),
-            malformed: 0,
-            cut_oldest: None,
             tracked,
-            shallow: false,
+            ..StubSource::with_malformed(0)
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()
@@ -1521,7 +1768,12 @@ mod tests {
     }
 
     fn listed(paths: &[&str]) -> TrackedStub {
-        TrackedStub::Listed(paths.iter().map(|p| p.to_string()).collect())
+        TrackedStub::Listed(
+            paths
+                .iter()
+                .map(|&p| (p.into(), HeadEntry::Regular(None)))
+                .collect(),
+        )
     }
 
     #[test]
@@ -1548,14 +1800,6 @@ mod tests {
     }
 
     #[test]
-    fn test_modules_use_top_folder_when_tracked_list_fails() {
-        assert_eq!(
-            module_paths_with(TrackedStub::Fails),
-            vec!["crates", "packages"]
-        );
-    }
-
-    #[test]
     fn test_modules_use_top_folder_when_tracked_list_is_unavailable() {
         assert_eq!(
             module_paths_with(TrackedStub::Unavailable),
@@ -1579,10 +1823,7 @@ mod tests {
     fn result_of(commits: Vec<CommitInfo>) -> HeatmapResult {
         let source = StubSource {
             commits,
-            malformed: 0,
-            cut_oldest: None,
-            tracked: TrackedStub::Unavailable,
-            shallow: false,
+            ..StubSource::with_malformed(0)
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()

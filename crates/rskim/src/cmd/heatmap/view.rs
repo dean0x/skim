@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use super::card::Card;
+use super::card::{Card, serialize_path, shown_path};
 use super::metrics::edge_order;
 use super::noise;
 use super::types::{
@@ -83,8 +83,7 @@ pub(crate) struct ViewSpec {
     /// `Some` only when `--top` was given. Without it, each list has its own
     /// default cap.
     pub(crate) top: Option<usize>,
-    /// True with `--include-docs`: the hotspots, the modules and the insights
-    /// keep the paths that [`noise::is_non_code_path`] names.
+    /// True when the non-code rule keeps all paths in this view.
     pub(crate) include_docs: bool,
 }
 
@@ -128,8 +127,7 @@ impl ViewSpec {
         }
     }
 
-    /// True when `path` stays out of the hotspots, the modules and the
-    /// insights of this view.
+    /// True when the non-code rule leaves `path` out of this view.
     #[must_use]
     pub(crate) fn leaves_out(self, path: &str) -> bool {
         !self.include_docs && noise::is_non_code_path(path)
@@ -317,6 +315,7 @@ impl<T> Section<T> {
 /// A file above the fix-risk base rate.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(crate) struct FixRiskRow<'a> {
+    #[serde(serialize_with = "serialize_path")]
     pub(crate) path: &'a str,
     pub(crate) fix_commits: usize,
     /// Commits that touch the file.
@@ -330,6 +329,7 @@ pub(crate) struct FixRiskRow<'a> {
 /// A file with one dominant author.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub(crate) struct BusFactorRow<'a> {
+    #[serde(serialize_with = "serialize_path")]
     pub(crate) path: &'a str,
     pub(crate) top_author_pct: f64,
     /// Commits that touch the file.
@@ -349,6 +349,7 @@ pub(crate) struct HeatmapView<'a> {
     /// Fix commits divided by all commits in the window, `0.0..=1.0`.
     pub(crate) base_rate: f64,
     pub(crate) hotspots: Section<&'a FileMetrics>,
+    not_at_head: usize,
     pub(crate) coupling: Section<&'a CouplingEdge>,
     pub(crate) fix_risk: Section<FixRiskRow<'a>>,
     pub(crate) modules: Section<&'a ModuleHealth>,
@@ -373,18 +374,25 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
         .filter(|e| !noise::is_doc_path(&e.a) && !noise::is_doc_path(&e.b))
         .collect();
 
-    let fix_risk: Vec<FixRiskRow<'_>> = result
+    let mut fix_risk = Vec::new();
+    let mut fix_risk_left_out = 0;
+    for f in result
         .files
         .iter()
         .filter(|f| noise::passes_lift(f.fix_risk.fix_commits, f.churn.commits, base_rate))
-        .map(|f| FixRiskRow {
+    {
+        if spec.leaves_out(&f.path) {
+            fix_risk_left_out += 1;
+            continue;
+        }
+        fix_risk.push(FixRiskRow {
             path: &f.path,
             fix_commits: f.fix_risk.fix_commits,
             support: f.churn.commits,
             lift: noise::lift(f.fix_risk.fix_commits, f.churn.commits, base_rate),
             lower_bound: noise::wilson_lower_bound(f.fix_risk.fix_commits, f.churn.commits),
-        })
-        .collect();
+        });
+    }
 
     let modules: Vec<&ModuleHealth> = result
         .modules
@@ -416,8 +424,10 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
         base_rate,
         hotspots: Section::ranked(hotspots, hotspot_order, spec.cap(DetailSection::Hotspots))
             .with_left_out(hotspots_left_out),
+        not_at_head: result.not_at_head,
         coupling: Section::ranked(coupling, coupling_order, spec.cap(DetailSection::Coupling)),
-        fix_risk: Section::ranked(fix_risk, fix_risk_order, spec.cap(DetailSection::FixRisk)),
+        fix_risk: Section::ranked(fix_risk, fix_risk_order, spec.cap(DetailSection::FixRisk))
+            .with_left_out(fix_risk_left_out),
         modules: Section::ranked(modules, module_order, spec.cap(DetailSection::Modules))
             .with_left_out(modules_left_out),
         bus_factor: Section::ranked(
@@ -431,11 +441,11 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
 // Row orders. Each one ends on the path, so the order is total and two runs
 // give the same rows.
 
-/// Hotspot order: commits desc, then path asc.
+/// Hotspot order: score desc, commits desc, then path asc.
 fn hotspot_order(x: &&FileMetrics, y: &&FileMetrics) -> Ordering {
-    y.churn
-        .commits
-        .cmp(&x.churn.commits)
+    y.score()
+        .cmp(&x.score())
+        .then_with(|| y.churn.commits.cmp(&x.churn.commits))
         .then_with(|| x.path.cmp(&y.path))
 }
 
@@ -496,16 +506,28 @@ impl<'a> HeatmapView<'a> {
                 self.modules.left_out,
                 ("non-code folder", "non-code folders"),
             ),
-            DetailSection::Coupling | DetailSection::FixRisk | DetailSection::BusFactor => {
-                (0, ("", ""))
-            }
+            DetailSection::FixRisk => (self.fix_risk.left_out, ("non-code file", "non-code files")),
+            DetailSection::Coupling | DetailSection::BusFactor => (0, ("", "")),
         };
-        more_and_left_out_line(
+        let more = more_and_left_out_line(
             self.count(section).hidden(),
             self.spec.remedy(section),
             left_out,
             nouns,
-        )
+        );
+        if section != DetailSection::Hotspots || self.not_at_head == 0 {
+            return more;
+        }
+        let noun = if self.not_at_head == 1 {
+            "path"
+        } else {
+            "paths"
+        };
+        let omitted = format!("{} {noun} not at HEAD", self.not_at_head);
+        Some(match more {
+            Some(more) => format!("{more}; {omitted}"),
+            None => omitted,
+        })
     }
 
     /// The JSON v2 shape of this view, with the cards of a run with file
@@ -544,7 +566,7 @@ impl<'a> HeatmapView<'a> {
             left_out: LeftOutJson::of(self),
             excluded_patterns: &result.excluded_patterns,
             warnings: &result.warnings,
-            file_targets: shown_targets,
+            file_targets: shown_targets.map(|paths| paths.iter().map(|p| shown_path(p)).collect()),
             cards: cards.map(|c| c.rows.as_slice()),
         }
     }
@@ -567,6 +589,7 @@ pub(crate) struct HeatmapJson<'a> {
     version: u8,
     generated_at: &'a str,
     /// The repository name ([`repo_name`]), the same as the text header.
+    #[serde(serialize_with = "serialize_path")]
     repository: &'a str,
     window: &'a WindowInfo,
     base_rate: f64,
@@ -576,34 +599,37 @@ pub(crate) struct HeatmapJson<'a> {
     fix_risk: &'a [FixRiskRow<'a>],
     modules: &'a [&'a ModuleHealth],
     bus_factor: &'a [BusFactorRow<'a>],
-    /// Rows that the non-code rule left out, when any (see `--include-docs`).
+    /// Counts of rows left out by the non-code and HEAD filters, when any.
     #[serde(skip_serializing_if = "Option::is_none")]
     left_out: Option<LeftOutJson>,
     excluded_patterns: &'a [String],
     warnings: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
-    file_targets: Option<&'a [String]>,
+    file_targets: Option<Vec<String>>,
     /// One card per shown file argument, in argument order.
     #[serde(skip_serializing_if = "Option::is_none")]
     cards: Option<&'a [Card]>,
 }
 
-/// The rows that the non-code rule left out of the hotspots (`files[]`) and
-/// the modules.
+/// The types of rows that the non-code and HEAD filters left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct LeftOutJson {
     hotspots: usize,
+    fix_risk: usize,
     modules: usize,
+    not_at_head: usize,
 }
 
 impl LeftOutJson {
-    /// The counts of `view`, or `None` when the rule left out no row.
+    /// The counts of `view`, or `None` when both filters left out no row.
     fn of(view: &HeatmapView<'_>) -> Option<Self> {
         let counts = Self {
             hotspots: view.hotspots.left_out,
+            fix_risk: view.fix_risk.left_out,
             modules: view.modules.left_out,
+            not_at_head: view.not_at_head,
         };
-        (counts.hotspots + counts.modules > 0).then_some(counts)
+        (counts.hotspots > 0 || counts.modules > 0 || counts.not_at_head > 0).then_some(counts)
     }
 }
 
@@ -611,8 +637,11 @@ impl LeftOutJson {
 /// cut to its [`BLAST_RADIUS_JSON_MAX`] strongest partners.
 #[derive(Debug, Serialize)]
 pub(crate) struct FileJson<'a> {
+    #[serde(serialize_with = "serialize_path")]
     path: &'a str,
     churn: &'a ChurnMetrics,
+    lines: u64,
+    score: u64,
     stability_score: u8,
     authors: &'a AuthorMetrics,
     fix_risk: &'a FixRiskMetrics,
@@ -627,6 +656,8 @@ impl<'a> FileJson<'a> {
         Self {
             path: &file.path,
             churn: &file.churn,
+            lines: file.lines,
+            score: file.score(),
             stability_score: file.stability_score,
             authors: &file.authors,
             fix_risk: &file.fix_risk,
@@ -660,6 +691,7 @@ mod tests {
     /// commits (base rate 20%), 2 distinct authors.
     fn empty_result() -> HeatmapResult {
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "repo".to_string(),
             window: WindowInfo {
@@ -683,6 +715,7 @@ mod tests {
     /// A file with `commits` commits, no fix commit, one author with 50%.
     fn file(path: &str, commits: usize) -> FileMetrics {
         FileMetrics {
+            lines: 0,
             path: path.to_string(),
             churn: ChurnMetrics { commits, rate: 0.0 },
             stability_score: 50,
@@ -800,15 +833,33 @@ mod tests {
     }
 
     #[test]
-    fn test_hotspots_tie_on_commits_sorts_path_ascending() {
+    fn test_hotspots_tie_on_score_sorts_commits_then_path() {
         let mut result = empty_result();
         result.files = vec![
-            file("src/b.rs", 3),
-            file("src/a.rs", 3),
-            file("src/c.rs", 5),
+            FileMetrics {
+                lines: 2,
+                ..file("src/c.rs", 3)
+            },
+            FileMetrics {
+                lines: 3,
+                ..file("src/a.rs", 2)
+            },
+            FileMetrics {
+                lines: 2,
+                ..file("src/b.rs", 3)
+            },
         ];
         let view = build_view(&result, &DEFAULT_VIEW);
-        assert_eq!(hotspot_paths(&view), ["src/c.rs", "src/a.rs", "src/b.rs"]);
+        assert_eq!(hotspot_paths(&view), ["src/b.rs", "src/c.rs", "src/a.rs"]);
+    }
+
+    #[test]
+    fn test_hotspot_score_saturates_at_u64_max() {
+        let f = FileMetrics {
+            lines: u64::MAX,
+            ..file("src/a.rs", 2)
+        };
+        assert_eq!(f.score(), u64::MAX);
     }
 
     #[test]
@@ -1074,6 +1125,42 @@ mod tests {
         let view = build_view(&result, &DEFAULT_VIEW);
         let paths: Vec<&str> = view.fix_risk.rows.iter().map(|r| r.path).collect();
         assert_eq!(paths, ["src/five.rs"]);
+    }
+
+    #[test]
+    fn test_fix_risk_leaves_out_non_code_files_unless_requested() {
+        let mut result = empty_result();
+        result.files = vec![
+            with_fixes(file("src/a.rs", 5), 5),
+            with_fixes(file("README.md", 5), 5),
+            with_fixes(file("docs/example.rs", 5), 5),
+            file("docs/guide.md", 5),
+        ];
+        let spec = detail_view(DetailSection::FixRisk, None);
+        let view = build_view(&result, &spec);
+        let paths: Vec<_> = view.fix_risk.rows.iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["src/a.rs"]);
+        assert_eq!(
+            view.more(DetailSection::FixRisk).as_deref(),
+            Some("2 non-code files left out (--include-docs)")
+        );
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
+        assert_eq!(json["left_out"]["fix_risk"], 2);
+
+        for args in [
+            ["--window=all", "--include-docs"],
+            ["--window=all", "--path=./docs"],
+            ["--window=all", "README.md"],
+        ] {
+            let args = super::super::args::parse_args(&args.map(str::to_owned)).unwrap();
+            let source = super::super::git_source::CliGitSource::new();
+            let (config, _) =
+                super::super::window::resolve_config(args, &source, &mut vec![], 0).unwrap();
+            let view = build_view(&result, &ViewSpec::from_config(&config));
+            let paths: Vec<_> = view.fix_risk.rows.iter().map(|r| r.path).collect();
+            assert_eq!(paths, ["README.md", "docs/example.rs", "src/a.rs"]);
+            assert!(view.more(DetailSection::FixRisk).is_none());
+        }
     }
 
     #[test]

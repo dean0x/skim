@@ -267,11 +267,19 @@ The default text view is 30 lines or fewer. The first line names the repository 
 
 | Section | Rows | Row content |
 |---------|------|-------------|
-| Hotspots | 10 | Commits in the window, then the path. Ranked by commits, then path. Doc files and non-code folders are left out (see Non-Code Paths). |
+| Hotspots | 10 | `commits x lines = score`, then the path. |
 | Coupling | 5 | Confidence, shared commits, then the two paths. Code-to-code pairs only: a pair with a doc file (`.md`, `.rst`, `.txt`, …) is not shown. |
 | Fix risk | 5 | Fix commits/commits, lift and base rate, then the path. Only files whose fix rate is above the repository base rate. |
 
-A capped section ends with one line that gives the exact hidden count and the section to open, for example `570 more (--detail coupling)`. When the non-code rule leaves out rows, the same line counts them, for example `864 more (--detail hotspots); 847 non-code files left out (--include-docs)`. Module health and bus factor are not in the default view; `--detail` shows them. The last line points to the per-file card: `Before you edit a file: skim heatmap <file>`.
+A capped section ends with one line that gives the exact hidden count and the section to open. For example: `570 more (--detail coupling)`. When the non-code rule leaves out paths, the same line counts them. For example: `864 more (--detail hotspots); 847 non-code files left out (--include-docs)`.
+
+Module health and bus factor are not in the default view. Use `--detail` to see them. The last line points to the per-file card: `Before you edit a file: skim heatmap <file>`.
+
+#### Hotspot Rank
+
+The score is commits in the window × text lines at HEAD. Skim sorts by score, then by commit count, both from highest to lowest. If both values match, skim sorts by path, lowest first. Skim uses Git to count text lines at HEAD, so uncommitted edits do not change the line count. Empty files have a score of zero. Binary files at HEAD stay out of the ranked lists, even if their history has text changes. In a partial clone, HEAD reads do not fetch objects. If Git cannot turn off these fetches or if HEAD data is not available, skim warns and ranks by commits.
+
+Skim joins history across renames that Git reports. When HEAD data is available, hotspots, coupling, fix risk and bus factor omit paths that are not regular files at HEAD. The hotspot summary counts those paths. A file card can still show the history of such a path.
 
 #### Sections (`--detail`)
 
@@ -279,7 +287,7 @@ A capped section ends with one line that gives the exact hidden count and the se
 
 | Name | Description |
 |------|-------------|
-| `hotspots` | Files changed most often (commits in the window). |
+| `hotspots` | Files with the highest scores (see [Hotspot Rank](#hotspot-rank)). |
 | `coupling` | Code-to-code file pairs that change together, with confidence and shared commits. |
 | `fix-risk` | Files whose fix rate is above the repository base rate, with fix commits/commits, lift and base rate. |
 | `modules` | Encapsulation of each module: the share of its commits that touch no other module. A module is the folder of a tracked `Cargo.toml` or `package.json`, else the top folder. |
@@ -301,7 +309,11 @@ A capped section ends with one line that gives the exact hidden count and the se
 
 #### Non-Code Paths
 
-Doc files (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.txt`, `*.adoc`) and the files under the top folders `docs`, `doc`, `.github`, `.devflow`, `tests` and `test` stay out of the hotspots (and so `files[]`) and the insights. Those folders stay out of the modules. A `tests` folder inside a crate or package (`crates/x/tests/`) stays in. The "more" line counts what is left out; JSON gives `left_out.{hotspots,modules}`, and `--insights --json` gives `counts.left_out`. `--include-docs` keeps them all. The rule does not apply when you name the files yourself: `--diff`, file arguments, and a `--path` that is a non-code folder keep every path. Coupling never pairs a doc file.
+Doc files (`*.md`, `*.mdx`, `*.markdown`, `*.rst`, `*.txt`, `*.adoc`) stay out of hotspots, fix risk and insights. This rule also applies to files under the top folders `docs`, `doc`, `.github`, `.devflow`, `tests` and `test`. These folders also stay out of modules. The folder rule does not apply to a nested folder such as `crates/x/tests/`.
+
+The summary line counts the paths that the rule leaves out. In JSON, `left_out.hotspots` counts non-code files in the hotspot list before the cap. `left_out.fix_risk` counts only non-code files that pass the fix-risk support and lift rules. `left_out.modules` counts non-code folders. With `--insights --json`, `counts.left_out` counts non-code findings.
+
+Use `--include-docs` to keep non-code paths. `--diff`, file arguments and a `--path` that is a non-code folder bypass this filter. Coupling never pairs a doc file.
 
 #### Caps and `--top`
 
@@ -320,15 +332,17 @@ Fix commits on a card stay at 5 or fewer at any `--top`.
 
 | Flag | Description |
 |------|-------------|
-| (default) | Dual mode: max(last 90 days, last 200 commits). Captures whichever window is wider. |
+| (default) | The wider of the last 90 days and the last 200 commits |
 | `--window sprint` | Last 14 days |
 | `--window month` | Last 30 days |
 | `--window quarter` | Last 90 days |
 | `--window half` | Last 180 days |
 | `--window year` | Last 365 days |
-| `--window all` | Entire repository history |
+| `--window all` | No date cutoff, the same as `--since 0` |
 
-The default **dual mode** is designed for repositories of any age: it avoids under-counting on small repos (fewer than 200 commits) while still bounding analysis on large repos.
+An unknown `--window` preset exits 1 and lists the valid names. With `--window all` or `--since 0`, the header still shows `1970-01-01` as the start. The usual history filters still apply.
+
+Use `--since YYYY-MM-DD` to set the cutoff to 00:00 UTC on that date. Use a valid calendar date from `1970-01-01` through `9999-12-31`. `--since` also accepts epoch seconds and durations such as `30d`, `2w` and `24h`.
 
 #### File Cards
 
@@ -350,14 +364,14 @@ crates/rskim/src/cmd/heatmap/view.rs: 7 commits
 - **Fix commits** use the fix-keyword rule: a 7-character SHA, the date and the quoted subject, newest first. In the text view, a `"` or `\` in a subject or an owner name shows as `\"` or `\\`.
 - If a filter leaves out a file, its card says `left out by the default excludes; --no-exclude keeps it` or `left out by --exclude; remove the matching patterns to keep it`. Otherwise, a file with no commits in the window prints `<path>: not in history window (N commits since DATE)` (`1 commit` for one). N and DATE describe the window.
 - The large-commit warning gives the run count and the touch count for each named file. For example: `warning: coupling: 1 commit with more than 50 files not paired (1 touches src/main.rs)`. The line names up to three shown files in argument order, then gives the count of more names. If no shown file has a touch, skim omits the line.
-- Control characters, bidirectional characters and invisible format characters (for example zero-width characters and Unicode tag characters) in subjects, author names and partner paths become U+FFFD. Each of these strings is cut at 72 characters.
+- In subjects, author names and card partner paths, control characters, bidirectional characters and invisible format characters become U+FFFD. Skim limits each of these fields to 72 characters.
 - `./x`, an absolute path under the repository root, a path relative to the current folder and a path with `..` give the same card. A path outside the repository exits 1. skim does not open the file. An absolute path through a symbolic-link prefix (for example macOS `/var`) is refused.
 
 Metrics come from the full window; a card only narrows the display.
 
 #### File Targeting
 
-- **`--path <DIR>`**: Scope the git log itself (commit-level filter). Composable with file arguments.
+- **`--path <DIR>`**: Limit history and HEAD line counts to this path. Use it with file arguments if necessary.
 - **`--diff <BASE>`**: The default view, scoped to the files changed vs `BASE` (three-dot diff). It warns for a changed file with no history in the window. Mutually exclusive with file arguments. Needs git 2.24 or newer.
 
 #### Default Excludes
@@ -382,7 +396,8 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 - Each array of rows has the cap of its section in the view (`files[]` holds the hotspot rows), and each `files[].blast_radius` holds at most 5 partners.
 - `file_targets[]` holds at most 20 targets, and `counts.file_targets` gives their full and shown count. `warnings[]` has at most one line for each kind of warning: the `--diff` files that are not in the window give one line that counts them and names the first 3. `excluded_patterns[]` is the fixed pattern list: the default excludes and the `--exclude` values.
 - `counts.<section>.{total,shown}` gives the full and the shown count of each section (`hotspots`, `coupling`, `fix_risk`, `modules`, `bus_factor`).
-- `files[]` keeps its per-file keys; no support minimum applies to it.
+- `files[]` keeps its per-file keys. No support minimum applies. `files[].lines` gives the text line count at HEAD, or zero if there is no count. `files[].score` gives commits × lines.
+- `left_out.{hotspots,fix_risk,modules}` counts non-code paths. `left_out.not_at_head` counts history paths that are not regular files at HEAD. Skim omits `left_out` if all counts are zero.
 - With file arguments, `cards[]` holds the cards (`path`, `in_window`, `commits`, `counts`, `owners`, `partners`, `fix_commits`) and `counts.cards` their counts. An excluded card has `in_window: false` and an `excluded` field of `"default"` or `"user"`. Other cards omit `excluded`.
 - `--insights --json` gives `insights[]`, `top_files[]` and `flagged_modules[]` for the shown findings only, with `counts.insights`. Its `warnings[]` is the same list as in `--json`.
 - `repository` gives the repository name, the same name as the text header, never the absolute path. This is the same in `--insights --json` and with file arguments.
@@ -391,16 +406,16 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--since <VALUE>` | — | Analyze commits since epoch (seconds) or duration (`30d`, `2w`, `24h`) |
+| `--since <VALUE>` | — | Set the cutoff: epoch seconds, `YYYY-MM-DD` (00:00 UTC), or a duration (`30d`, `2w`, `24h`) |
 | `--last <N>` | — | Analyze last N commits |
-| `--window <PRESET>` | — | Named window preset (see table above) |
-| `--path <DIR>` | — | Scope git log to files under this directory |
+| `--window <PRESET>` | — | Select a preset (see [Time Windows](#time-windows)) |
+| `--path <DIR>` | — | Limit history and HEAD line counts to this path |
 | `--diff <BASE>` | — | Default view for the files changed vs BASE |
 | `--detail <SECTION>` | — | Show 25 rows (or `--top N`) of one section: `hotspots`, `coupling`, `fix-risk`, `modules` or `bus-factor` |
 | `--json`, `--format json` | false | Emit JSON version 2 instead of human-readable text |
 | `--top <N>` | per list (see Caps and `--top`) | Rows of each list in every view |
 | `--no-exclude` | false | Keep the files of the default excludes (see Default Excludes) |
-| `--include-docs` | false | Keep doc files and non-code folders in the hotspots, modules and insights (see Non-Code Paths) |
+| `--include-docs` | false | Keep non-code paths in hotspots, fix risk, modules and insights (see [Non-Code Paths](#non-code-paths)) |
 | `--exclude <PATTERN>` | — | Add extra glob pattern to exclude (repeatable) |
 | `--coupling-threshold <FLOAT>` | 0.5 | Coupling confidence threshold (0.0–1.0) |
 | `--fix-window <N>` | 5 | Proximity window for fix-after-touch detection (commit count) |
@@ -427,8 +442,11 @@ skim heatmap --last 200
 # Analyze last sprint
 skim heatmap --window sprint
 
-# Analyze last 30 days using duration syntax
+# Analyze the last 30 days
 skim heatmap --since 30d
+
+# Analyze commits from 00:00 UTC on November 1, 2026
+skim heatmap --since 2026-11-01
 
 # JSON output for programmatic consumption
 skim heatmap --json

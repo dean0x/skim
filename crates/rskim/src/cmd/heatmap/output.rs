@@ -9,7 +9,7 @@
 //! ranked insights, already sorted, gated and capped, so this module sorts,
 //! filters and caps nothing.
 
-use super::card::{Card, CardCounts};
+use super::card::{Card, CardCounts, shown_path};
 use super::excludes::ExcludeReason;
 use super::noise;
 use super::types::{DetailSection, HeatmapResult, InsightsResult, Severity, WindowInfo};
@@ -86,7 +86,7 @@ fn header_line(label: &str, result: &HeatmapResult) -> String {
         .unwrap_or_default();
     format!(
         "{label}: {} {}..{}, {}, {} window{strategy}{scope}",
-        repo_name(&result.repository),
+        shown_path(repo_name(&result.repository)),
         window.since,
         window.until,
         items(window.commits_analyzed, "commit", "commits"),
@@ -114,7 +114,7 @@ fn push_section(out: &mut String, view: &HeatmapView<'_>, section: DetailSection
 /// each row, in order.
 fn section_heading(section: DetailSection) -> &'static str {
     match section {
-        DetailSection::Hotspots => "Hotspots (commits):",
+        DetailSection::Hotspots => "Hotspots (commits x lines):",
         DetailSection::Coupling => "Coupling (confidence, shared commits):",
         DetailSection::FixRisk => "Fix risk (fix commits/commits, lift, base rate):",
         DetailSection::Modules => "Modules (encapsulation, commits):",
@@ -130,7 +130,15 @@ fn section_rows(view: &HeatmapView<'_>, section: DetailSection) -> Vec<String> {
             .hotspots
             .rows
             .iter()
-            .map(|f| format!("  {:>3}  {}", f.churn.commits, f.path))
+            .map(|f| {
+                format!(
+                    "  {:>3} x {} = {}  {}",
+                    f.churn.commits,
+                    f.lines,
+                    f.score(),
+                    shown_path(&f.path)
+                )
+            })
             .collect(),
         DetailSection::Coupling => view
             .coupling
@@ -141,8 +149,8 @@ fn section_rows(view: &HeatmapView<'_>, section: DetailSection) -> Vec<String> {
                     "  {:>3.0}% {:>3}  {} <-> {}",
                     e.confidence * 100.0,
                     e.support,
-                    e.a,
-                    e.b
+                    shown_path(&e.a),
+                    shown_path(&e.b)
                 )
             })
             .collect(),
@@ -157,7 +165,7 @@ fn section_rows(view: &HeatmapView<'_>, section: DetailSection) -> Vec<String> {
                     r.support,
                     r.lift,
                     view.base_rate * 100.0,
-                    r.path
+                    shown_path(r.path)
                 )
             })
             .collect(),
@@ -168,7 +176,9 @@ fn section_rows(view: &HeatmapView<'_>, section: DetailSection) -> Vec<String> {
             .map(|m| {
                 format!(
                     "  {:>3.0}% {:>3}  {}",
-                    m.encapsulation_pct, m.total_commits, m.path
+                    m.encapsulation_pct,
+                    m.total_commits,
+                    shown_path(&m.path)
                 )
             })
             .collect(),
@@ -176,7 +186,14 @@ fn section_rows(view: &HeatmapView<'_>, section: DetailSection) -> Vec<String> {
             .bus_factor
             .rows
             .iter()
-            .map(|r| format!("  {:>3.0}% {:>3}  {}", r.top_author_pct, r.support, r.path))
+            .map(|r| {
+                format!(
+                    "  {:>3.0}% {:>3}  {}",
+                    r.top_author_pct,
+                    r.support,
+                    shown_path(r.path)
+                )
+            })
             .collect(),
     }
 }
@@ -375,7 +392,7 @@ pub(crate) fn render_insights_text(result: &HeatmapResult, insights: &InsightsRe
             &format!(
                 "  {} {}: {}",
                 severity_label(&insight.severity),
-                insight.file,
+                insight.shown_file,
                 insight.message
             ),
         );
@@ -428,6 +445,7 @@ mod tests {
 
     fn make_result() -> HeatmapResult {
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "/home/dev/work/test-repo".to_string(),
             window: WindowInfo {
@@ -438,6 +456,7 @@ mod tests {
                 effective_strategy: Some("count".to_string()),
             },
             files: vec![FileMetrics {
+                lines: 0,
                 path: "src/main.rs".to_string(),
                 churn: ChurnMetrics {
                     commits: 5,
@@ -486,6 +505,7 @@ mod tests {
     /// A file with `commits` commits, `fix_commits` of them fix commits.
     fn file(path: &str, commits: usize, fix_commits: usize) -> FileMetrics {
         FileMetrics {
+            lines: 0,
             path: path.to_string(),
             churn: ChurnMetrics { commits, rate: 0.1 },
             stability_score: 50,
@@ -501,6 +521,88 @@ mod tests {
             },
             blast_radius: vec![],
         }
+    }
+
+    #[test]
+    fn test_ranked_paths_show_the_card_form_in_text_and_json() {
+        let file = "src/ma\u{200b}in.rs";
+        let partner = "src/li\u{200b}b.rs";
+        let mut result = make_result();
+        result.repository = "/work/rep\u{200b}o".to_string();
+        result.files[0].path = file.to_string();
+        result.files[0].fix_risk.fix_commits = 5;
+        result.files[0].blast_radius[0].path = partner.to_string();
+        result.coupling_graph = vec![edge(file, partner, 0.9, 4)];
+        result.modules[0].path = "sr\u{200b}c".to_string();
+        result.file_targets = Some(vec![file.to_string()]);
+
+        let view = build_view(&result, &DEFAULT_VIEW);
+        let text = render_text(&result, &view);
+        assert!(text.starts_with("Heatmap: rep�o "), "{text}");
+        for row in [
+            "    5 x 0 = 0  src/ma�in.rs",
+            "   90%   4  src/ma�in.rs <-> src/li�b.rs",
+            "  5/5  lift 3.3  base 30%  src/ma�in.rs",
+        ] {
+            assert!(text.lines().any(|line| line == row), "{row:?}\n{text}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&result, &view, None).unwrap()).unwrap();
+        assert_eq!(json["repository"], "rep�o");
+        assert_eq!(json["files"][0]["path"], "src/ma�in.rs");
+        assert_eq!(json["files"][0]["blast_radius"][0]["path"], "src/li�b.rs");
+        assert_eq!(json["coupling_graph"][0]["a"], "src/ma�in.rs");
+        assert_eq!(json["coupling_graph"][0]["b"], "src/li�b.rs");
+        assert_eq!(json["fix_risk"][0]["path"], "src/ma�in.rs");
+        assert_eq!(json["file_targets"][0], "src/ma�in.rs");
+
+        for (section, key, path) in [
+            (DetailSection::Modules, "modules", "sr�c"),
+            (DetailSection::BusFactor, "bus_factor", "src/ma�in.rs"),
+        ] {
+            let spec = ViewSpec {
+                detail: Some(section),
+                ..DEFAULT_VIEW
+            };
+            let view = build_view(&result, &spec);
+            let text = render_text(&result, &view);
+            assert!(text.lines().any(|line| line.ends_with(path)), "{text}");
+            let json: serde_json::Value =
+                serde_json::from_str(&render_json(&result, &view, None).unwrap()).unwrap();
+            assert_eq!(json[key][0]["path"], path);
+        }
+        assert_eq!(result.files[0].path, file);
+    }
+
+    #[test]
+    fn test_insight_paths_show_the_card_form_and_keep_the_joins() {
+        use super::super::insights::{build_insights_result, compute_insights};
+
+        let file = "src/ma\u{200b}in.rs";
+        let mut result = make_result();
+        result.files[0].path = file.to_string();
+        result.coupling_graph = vec![edge(file, "src/li\u{200b}b.rs", 0.9, 4)];
+        result.modules[0].path = "sr\u{200b}c".to_string();
+        result.modules[0].encapsulation_pct = 30.0;
+        let insights = build_insights_result(&result, compute_insights(&result), 20, 0);
+
+        let message = "tightly coupled with src/li�b.rs (90.0% confidence, 4 co-changes)";
+        let text = render_insights_text(&result, &insights);
+        assert!(text.contains(&format!("src/ma�in.rs: {message}")), "{text}");
+        assert!(text.contains("sr�c: poor encapsulation"), "{text}");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_insights_json(&insights).unwrap()).unwrap();
+        let coupling = json["insights"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["category"] == "coupling")
+            .unwrap();
+        assert_eq!(coupling["file"], "src/ma�in.rs");
+        assert_eq!(coupling["message"], message);
+        assert_eq!(json["top_files"][0]["path"], "src/ma�in.rs");
+        assert_eq!(json["flagged_modules"][0]["path"], "sr�c");
     }
 
     fn edge(a: &str, b: &str, confidence: f64, support: usize) -> CouplingEdge {
@@ -618,7 +720,7 @@ mod tests {
         let text = text_of(&result, DEFAULT_VIEW);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1..3], ["warning: first", "warning: second"]);
-        assert_eq!(lines[3], "Hotspots (commits):");
+        assert_eq!(lines[3], "Hotspots (commits x lines):");
     }
 
     #[test]
@@ -633,7 +735,7 @@ mod tests {
         assert_eq!(
             headings,
             [
-                "Hotspots (commits):",
+                "Hotspots (commits x lines):",
                 "Coupling (confidence, shared commits):",
                 "Fix risk (fix commits/commits, lift, base rate):",
                 CARD_HINT,
@@ -649,7 +751,10 @@ mod tests {
         result.files = vec![file("src/a.rs", 12, 0)];
         result.coupling_graph = vec![edge("src/a.rs", "src/b.rs", 0.87, 7)];
         let text = text_of(&result, DEFAULT_VIEW);
-        assert_eq!(section_lines(&text, "Hotspots"), ["   12  src/a.rs"]);
+        assert_eq!(
+            section_lines(&text, "Hotspots"),
+            ["   12 x 0 = 0  src/a.rs"]
+        );
         assert_eq!(
             section_lines(&text, "Coupling"),
             ["   87%   7  src/a.rs <-> src/b.rs"]
@@ -737,8 +842,8 @@ mod tests {
         assert_eq!(
             text.lines().skip(1).collect::<Vec<_>>(),
             [
-                "Hotspots (commits):",
-                "    4  src/f4.rs",
+                "Hotspots (commits x lines):",
+                "    4 x 0 = 0  src/f4.rs",
                 "  3 more (raise --top)"
             ]
         );
@@ -932,6 +1037,7 @@ mod tests {
             severity,
             category: InsightCategory::Stability,
             file: file.to_string(),
+            shown_file: shown_path(file),
             message: msg.to_string(),
             metric_value: 42.0,
             support: 5,

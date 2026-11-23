@@ -112,10 +112,7 @@ fn archive_path(log_path: &Path, index: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// Generate a timestamp string in ISO-8601 format (UTC approximation).
-///
-/// Uses `days_to_date` (Howard Hinnant calendar algorithm) to avoid
-/// pulling in chrono. Includes hour:minute:second for log granularity.
+/// Generate a UTC timestamp in ISO-8601 format with whole seconds.
 fn timestamp_string() -> String {
     let now = std::time::SystemTime::now();
     let secs = now
@@ -124,27 +121,11 @@ fn timestamp_string() -> String {
         .as_secs();
     let days = secs / crate::analytics::SECONDS_PER_DAY;
     let day_secs = secs % crate::analytics::SECONDS_PER_DAY;
-    let (year, month, day) = days_to_date(days);
+    let (year, month, day) = crate::cmd::session::civil::days_to_ymd(days);
     let hour = day_secs / 3600;
     let minute = (day_secs % 3600) / 60;
     let second = day_secs % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-/// Algorithm from http://howardhinnant.github.io/date_algorithms.html
-pub(super) fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
-    let z = days_since_epoch + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 // ============================================================================

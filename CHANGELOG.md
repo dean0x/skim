@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `skim heatmap --since` accepts a date in `YYYY-MM-DD` form and uses 00:00 UTC on that date.
+
+### Changed
+
+- Heatmap ranks hotspots by commits in the window × text lines at HEAD. If scores match, more commits come first. If both values match, skim sorts by path, lowest first. In a partial clone, HEAD reads do not fetch objects. If Git cannot turn off these fetches or if HEAD data is not available, skim warns and ranks by commits. JSON version 2 adds `files[].lines`, `files[].score` and `left_out.not_at_head`.
+- Fix risk leaves out doc files and non-code folders by default, as hotspots do. The text view and `left_out.fix_risk` count only eligible rows. Use `--include-docs` to keep them.
+
+### Fixed
+
+- `--window all` and `--since 0` set no date cutoff. An unknown `--window` preset exits 1 and lists `sprint`, `month`, `quarter`, `half`, `year` and `all`.
+- Heatmap joins file history across renames that Git reports. When HEAD data is available, paths that are not regular files at HEAD stay out of the ranked file lists. File cards can still show their history.
+- Path text in all heatmap views shows the same form.
+- Heatmap does not stop when stderr is closed.
+
 ## [3.2.1] - 2026-11-23
 
 ### Fixed

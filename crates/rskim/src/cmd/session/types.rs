@@ -512,7 +512,9 @@ pub(crate) fn parse_duration_ago(s: &str) -> anyhow::Result<SystemTime> {
     }
     .ok_or_else(|| anyhow::anyhow!("duration value too large: '{s}'"))?;
 
-    Ok(SystemTime::now() - std::time::Duration::from_secs(secs))
+    SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(secs))
+        .ok_or_else(|| anyhow::anyhow!("duration value too large: '{s}'"))
 }
 
 // ============================================================================
@@ -522,6 +524,19 @@ pub(crate) fn parse_duration_ago(s: &str) -> anyhow::Result<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_duration_ago_keeps_valid_units() {
+        use std::time::Duration;
+
+        for (input, secs) in [("2h", 7_200), ("2d", 172_800), ("2w", 1_209_600)] {
+            let duration = Duration::from_secs(secs);
+            let earliest = SystemTime::now() - duration;
+            let parsed = parse_duration_ago(input).unwrap();
+            let latest = SystemTime::now() - duration;
+            assert!((earliest..=latest).contains(&parsed), "{input}: {parsed:?}");
+        }
+    }
 
     // ---- AgentKind::from_str ----
 

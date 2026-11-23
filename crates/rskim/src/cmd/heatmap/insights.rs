@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use super::card::shown_path;
 use super::noise::{
     self, COUPLING_WARNING, ENCAPSULATION_CRITICAL, ENCAPSULATION_WARNING, FIX_RISK_CRITICAL,
     FIX_RISK_WARNING, MIN_FILE_SUPPORT, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS, STABILITY_CRITICAL,
@@ -38,6 +39,7 @@ impl Finding<'_> {
             severity,
             category: self.category,
             file: self.file.to_string(),
+            shown_file: shown_path(self.file),
             message,
             metric_value: self.metric_value,
             support: self.support,
@@ -111,7 +113,8 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
             Severity::Warning,
             format!(
                 "tightly coupled with {} ({conf_pct:.1}% confidence, {} co-changes)",
-                edge.b, edge.support
+                shown_path(&edge.b),
+                edge.support
             ),
         ));
     }
@@ -265,7 +268,7 @@ pub(crate) fn build_insights_result(
     ranked.truncate(cap);
     InsightsResult {
         version: JSON_VERSION,
-        repository: repo_name(&result.repository).to_string(),
+        repository: shown_path(repo_name(&result.repository)),
         window: result.window.clone(),
         counts: InsightCounts {
             insights: Count {
@@ -356,6 +359,7 @@ mod tests {
     /// 20%), 2 distinct authors.
     fn make_empty_result() -> HeatmapResult {
         HeatmapResult {
+            not_at_head: 0,
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             repository: "test-repo".to_string(),
             window: make_window(),
@@ -400,6 +404,7 @@ mod tests {
 
     fn make_file(spec: FileSpec<'_>) -> FileMetrics {
         FileMetrics {
+            lines: 0,
             path: spec.path.to_string(),
             churn: ChurnMetrics {
                 commits: spec.commits,

@@ -102,6 +102,7 @@ fn apply_value_flag(
             args.top_explicit = true;
         }
         ValueFlagAction::Window => {
+            super::window::preset_days(&val)?;
             args.window_preset = Some(val);
         }
         ValueFlagAction::LastN => {
@@ -282,15 +283,19 @@ fn extract_value(args: &[String], i: &mut usize, flag: &str) -> Option<String> {
     }
 }
 
-/// Parse a `--since` value: accepts epoch seconds (integer) or duration strings
-/// like "30d", "2w", "24h".
+/// Parse `--since` as epoch seconds, a UTC date, or a duration.
 fn parse_since_value(val: &str) -> anyhow::Result<u64> {
-    // Try plain integer (epoch seconds)
     if let Ok(epoch) = val.parse::<u64>() {
         return Ok(epoch);
     }
-    // Try duration string
-    let sys_time = crate::cmd::session::types::parse_duration_ago(val)?;
+    if let Ok(epoch) = crate::cmd::session::civil::parse_utc_date(val) {
+        return Ok(epoch);
+    }
+    let sys_time = crate::cmd::session::parse_duration_ago(val).map_err(|_| {
+        anyhow::anyhow!(
+            "--since expects epoch seconds, a UTC date (YYYY-MM-DD), or a duration (Nd, Nh, Nw)"
+        )
+    })?;
     let epoch = sys_time
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("--since: time before Unix epoch"))?
@@ -314,7 +319,8 @@ USAGE:
     skim heatmap [OPTIONS] <FILE>...      One \"before you edit\" card per file
 
 OPTIONS:
-    --since <VALUE>               Analyze commits since epoch (seconds) or duration (30d, 2w, 24h)
+    --since <VALUE>               Set the start: epoch seconds, YYYY-MM-DD (00:00 UTC),
+                                  or a duration (30d, 2w, 24h)
     --last <N>                    Analyze last N commits
     --window <PRESET>             Named window: sprint|month|quarter|half|year|all
     --path <DIR>                  Scope analysis to files under this path
@@ -333,15 +339,21 @@ OPTIONS:
 
 DEFAULT VIEW:
     A header line (repository name, since..until dates, commits, window), then:
-    Hotspots     the 10 files with the most commits
+    Hotspots     the 10 files with the highest scores
     Coupling     the 5 code-to-code pairs with the highest confidence
     Fix risk     5 files whose fix rate is above the repository base rate
     A capped section ends with one \"N more (--detail <section>)\" line.
     Module health and bus factor show only with --detail. The last line
     points to the per-file card: skim heatmap <file>.
 
+HOTSPOT RANK:
+    The score is commits in the window x text lines at HEAD.
+    If scores match, more commits come first. If both values match, skim
+    sorts by path, lowest first.
+    If HEAD data is not available, skim warns and ranks by commits.
+
 SECTIONS (--detail names):
-    hotspots     Files changed most often (commits)
+    hotspots     Files with the highest scores (see HOTSPOT RANK)
     coupling     Code-to-code file pairs that change together (no doc files)
     fix-risk     Fix commits/commits, lift and base rate, for files above the base rate
     modules      Encapsulation of each crate, package (Cargo.toml, package.json) or top folder
@@ -371,11 +383,10 @@ NOISE RULES:
 NON-CODE PATHS (--include-docs keeps them):
     Doc files (*.md, *.mdx, *.markdown, *.rst, *.txt, *.adoc) and files
     under the top folders docs, doc, .github, .devflow, tests and test stay
-    out of the hotspots and the insights; those folders stay out of the
-    modules. The \"N more\" line counts what is left out, and JSON gives
-    left_out.{{hotspots,modules}} and, for --insights, counts.left_out.
+    out of the hotspots, fix risk and insights. These folders also stay out
+    of the modules. The \"N more\" line counts what skim leaves out.
     Coupling never pairs doc files. --diff, file arguments and a --path
-    that is a non-code folder keep every path.
+    that is a non-code folder bypass the non-code filter.
 
 FILE CARDS:
     skim heatmap <FILE>... prints one card per file: commits, owners (only
@@ -400,15 +411,19 @@ DEFAULT EXCLUDES (--no-exclude keeps them):
 
 JSON (version 2):
     One compact line. Each array of rows has the cap of its section, and
-    counts.<section>.{{total,shown}} gives the full and shown counts. files[]
-    holds the hotspot rows; no support minimum applies to it. With file
-    arguments, cards[] holds the cards. file_targets[] holds at most 20
-    targets, and counts.file_targets gives their full count. warnings[] has
-    at most one line for each kind of warning. excluded_patterns[] is the
-    fixed pattern list: the default excludes and the --exclude values.
-    --insights --json gives insights[],
-    top_files[] and flagged_modules[] for the shown findings only, and the
-    same warnings[] as --json.
+    counts.<section>.{{total,shown}} gives the full and shown counts.
+    files[] holds the hotspot rows. No support minimum applies to it.
+    files[].lines is the HEAD text line count, or 0 if there is no count.
+    files[].score is the hotspot score.
+    left_out.{{hotspots,fix_risk,modules}} counts non-code paths.
+    left_out.not_at_head counts history paths that are not regular files at HEAD.
+    With file arguments, cards[] holds the cards. file_targets[] holds at
+    most 20 targets. counts.file_targets gives their full and shown counts.
+    warnings[] has at most one line for each kind of warning.
+    excluded_patterns[] lists the default excludes and the --exclude values.
+    --insights --json gives insights[], top_files[] and flagged_modules[]
+    for the shown findings only. counts.left_out counts non-code findings.
+    warnings[] is the same as in --json.
 
 WINDOW PRESETS:
     sprint     14 days
@@ -416,8 +431,9 @@ WINDOW PRESETS:
     quarter    90 days
     half       180 days
     year       365 days
-    all        No time limit (analyze entire history)
+    all        No date cutoff (same as --since 0)
     (default)  The wider of the last 90 days and the last 200 commits
+    An unknown --window preset exits 1 and lists the valid names.
 
 EXAMPLES:
     skim heatmap                              # Short ranked view
@@ -513,17 +529,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_args_since_date_is_utc_epoch() {
+        let args = parse_args(&["--since=2026-11-01".to_string()]).unwrap();
+        assert_eq!(args.since, Some(1_793_491_200));
+    }
+
+    #[test]
     fn test_parse_args_since_duration() {
-        let args = parse_args(&["--since=30d".to_string()]).unwrap();
-        // Should be set to some epoch in the past
-        assert!(args.since.is_some());
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let since = args.since.unwrap();
-        let diff = now - since;
-        assert!((29 * 86400..=31 * 86400).contains(&diff));
+        let now_epoch = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        for (duration, seconds) in [("30d", 30 * 86_400), ("24h", 86_400), ("2w", 14 * 86_400)] {
+            let before = now_epoch();
+            let since = parse_args(&[format!("--since={duration}")])
+                .unwrap()
+                .since
+                .unwrap();
+            let after = now_epoch();
+            assert!((before..=after).contains(&(since + seconds)), "{duration}");
+        }
     }
 
     #[test]
