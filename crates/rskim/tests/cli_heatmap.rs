@@ -3519,18 +3519,29 @@ fn test_heatmap_two_runs_give_identical_bytes() {
     // Many ties on commits, confidence, support and fix rate.
     create_ranked_repo(dir.path());
 
-    let views: [&[&str]; 6] = [
+    let views: [&[&str]; 7] = [
         &[],
         &["--json"],
         &["--insights"],
         &["--insights", "--json"],
         &["src/hub/h0.rs"],
         &["--json", "src/hub/h0.rs"],
+        &["--map"],
     ];
     for args in views {
         let first = heatmap_stdout(dir.path(), args);
-        let second = heatmap_stdout(dir.path(), args);
         assert!(!first.is_empty(), "{args:?}");
+        if args == ["--map"] {
+            let hubs: Vec<_> = first
+                .lines()
+                .filter(|line| line.starts_with("src/hub/"))
+                .collect();
+            let expected: Vec<_> = (0..8)
+                .map(|i| format!("src/hub/h{i}.rs: 6 commits, 1 line, score 6"))
+                .collect();
+            assert_eq!(hubs, expected, "{first}");
+        }
+        let second = heatmap_stdout(dir.path(), args);
         assert_eq!(first, second, "two runs of {args:?} differ");
     }
 }
@@ -4788,6 +4799,8 @@ fn test_heatmap_map_shows_ranked_file_blocks_with_symbols_and_partners() {
         ],
         "{text}"
     );
+    let max_budget = heatmap_stdout(&root, &["--map", "--window", "all", "--tokens", "10000000"]);
+    assert_eq!(max_budget.as_bytes(), text.as_bytes());
 }
 
 const MAP_CODE_FILES: usize = 32;
@@ -4860,14 +4873,15 @@ fn test_heatmap_map_trailer_counts_shown_files_and_symbol_losses() {
 }
 
 #[test]
-fn test_heatmap_map_two_runs_give_identical_bytes() {
+fn test_heatmap_map_one_token_prints_only_the_trailer() {
     let dir = tempfile::tempdir().unwrap();
     create_map_repo(dir.path());
 
-    let first = heatmap_stdout(dir.path(), MAP_ARGS);
-    let second = heatmap_stdout(dir.path(), MAP_ARGS);
-    assert!(first.contains("  function_item long:3\n"), "{first}");
-    assert_eq!(first.as_bytes(), second.as_bytes());
+    let text = heatmap_stdout(dir.path(), &["--map", "--window", "all", "--tokens", "1"]);
+    assert_eq!(
+        text,
+        "[skim] 0 of 2 files — adjust the map budget with --tokens\n"
+    );
 }
 
 #[test]

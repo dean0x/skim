@@ -288,6 +288,7 @@ mod tests {
             SymbolReason::ParseError,
             SymbolReason::ReadError,
             SymbolReason::TruncatedScan,
+            SymbolReason::NoDeclarations,
         ];
         result.files = (0..reasons.len())
             .map(|i| file(&format!("{i}.rs"), 1, 1))
@@ -314,7 +315,7 @@ mod tests {
         assert_eq!(
             text.lines().last(),
             Some(concat!(
-                "[skim] 6 of 6 files; language: 1; parse budget: 1; parse error: 1; ",
+                "[skim] 7 of 7 files; language: 1; no declarations: 1; parse budget: 1; parse error: 1; ",
                 "read error: 1; size cap: 1; truncated scan: 1 — adjust the map budget with --tokens",
             ))
         );
@@ -416,6 +417,25 @@ mod tests {
         assert_eq!(
             text.lines().last(),
             Some("[skim] 1 of 3 files — adjust the map budget with --tokens")
+        );
+    }
+
+    #[test]
+    fn test_header_over_budget_prints_only_the_trailer() {
+        let text = render_stats(&fixture(), &SPEC, 1, &|s| Some(s.len()));
+        assert_eq!(
+            text,
+            "[skim] 0 of 3 files — adjust the map budget with --tokens\n"
+        );
+    }
+
+    #[test]
+    fn test_header_count_failure_prints_only_the_trailer() {
+        let count = |s: &str| (!s.starts_with("Heatmap map:")).then_some(s.len());
+        let text = render_stats(&fixture(), &SPEC, 1_000, &count);
+        assert_eq!(
+            text,
+            "[skim] 0 of 3 files — adjust the map budget with --tokens\n"
         );
     }
 
