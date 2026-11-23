@@ -37,6 +37,15 @@ fn git_init(dir: &Path) {
         .ok();
 }
 
+fn git_set_quote_path(dir: &Path, value: &str) {
+    let out = StdCommand::new("git")
+        .args(["config", "core.quotePath", value])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
 /// Write a file and make a commit.
 fn git_commit(dir: &Path, filename: &str, content: &str, message: &str, timestamp: u64) {
     let file_path = dir.join(filename);
@@ -1404,6 +1413,30 @@ fn test_heatmap_large_file_with_fewer_commits_ranks_first() {
 }
 
 #[test]
+fn test_heatmap_counts_quoted_head_paths_from_a_subfolder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_set_quote_path(root, "true");
+    git_commit_files(
+        root,
+        &[("top.rs", "a\n"), ("src/deep/café.rs", "a\nb\n")],
+        "feat: add files",
+        1_700_000_000,
+    );
+
+    let cwd = root.join("src");
+    let quoted = r#""src/deep/caf\303\251.rs""#;
+    let all = heatmap_json_with(&cwd, &["--window", "all"]);
+    assert_eq!(file_entry(&all, quoted)["lines"], 2, "{all}");
+    assert_eq!(file_entry(&all, "top.rs")["lines"], 1, "{all}");
+
+    let scoped = heatmap_json_with(&cwd, &["--window", "all", "--path", "deep"]);
+    assert_eq!(sorted_paths(&scoped, "files"), [quoted]);
+    assert_eq!(file_entry(&scoped, quoted)["lines"], 2, "{scoped}");
+}
+
+#[test]
 fn test_heatmap_excludes_nonregular_head_paths_but_keeps_deleted_card_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -1516,6 +1549,11 @@ fn git_move(dir: &Path, old: &str, new: &str) {
     );
 }
 
+fn git_commit_move(dir: &Path, old: &str, new: &str, message: &str, timestamp: u64) {
+    git_move(dir, old, new);
+    git_commit_staged(dir, message, timestamp);
+}
+
 #[test]
 fn test_heatmap_plain_rename_moves_history_to_new_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -1574,8 +1612,13 @@ fn test_heatmap_rename_chain_leaves_reused_old_path_separate() {
     git_init(dir.path());
     let ts = 1_700_000_000;
     git_commit(dir.path(), "old.rs", "first\n", "feat: add original", ts);
-    git_move(dir.path(), "old.rs", "middle.rs");
-    git_commit_staged(dir.path(), "refactor: move once", ts + 1);
+    git_commit_move(
+        dir.path(),
+        "old.rs",
+        "middle.rs",
+        "refactor: move once",
+        ts + 1,
+    );
     git_commit(
         dir.path(),
         "middle.rs",
@@ -1583,8 +1626,13 @@ fn test_heatmap_rename_chain_leaves_reused_old_path_separate() {
         "feat: edit original",
         ts + 2,
     );
-    git_move(dir.path(), "middle.rs", "final.rs");
-    git_commit_staged(dir.path(), "refactor: move twice", ts + 3);
+    git_commit_move(
+        dir.path(),
+        "middle.rs",
+        "final.rs",
+        "refactor: move twice",
+        ts + 3,
+    );
     git_commit(
         dir.path(),
         "old.rs",
@@ -1610,8 +1658,13 @@ fn test_heatmap_rename_alias_applies_before_exclusion_and_cards() {
         "feat: add",
         1_700_000_000,
     );
-    git_move(dir.path(), "Cargo.lock", "lib.rs");
-    git_commit_staged(dir.path(), "refactor: move", 1_700_000_001);
+    git_commit_move(
+        dir.path(),
+        "Cargo.lock",
+        "lib.rs",
+        "refactor: move",
+        1_700_000_001,
+    );
     git_commit(dir.path(), "lib.rs", "second\n", "fix: edit", 1_700_000_002);
 
     let json = heatmap_json_with(dir.path(), &["--window", "all"]);
@@ -1642,8 +1695,13 @@ fn test_heatmap_rename_only_commit_does_not_add_a_touch() {
         "feat: add",
         1_700_000_000,
     );
-    git_move(dir.path(), "src/old.rs", "src/new.rs");
-    git_commit_staged(dir.path(), "refactor: move", 1_700_000_001);
+    git_commit_move(
+        dir.path(),
+        "src/old.rs",
+        "src/new.rs",
+        "refactor: move",
+        1_700_000_001,
+    );
 
     let json = heatmap_json_with(dir.path(), &["--window", "all"]);
     assert_eq!(json["window"]["commits_analyzed"], 1);
@@ -1896,6 +1954,86 @@ fn test_heatmap_card_warning_uses_the_safe_path_in_text_and_json() {
     let json = heatmap_json_with(dir.path(), &[target]);
     assert_eq!(json["warnings"], serde_json::json!(warnings), "{json:?}");
     assert_eq!(json["cards"][0]["path"], "bulk/b\u{FFFD}c.rs", "{json:?}");
+}
+
+fn diff_warning_repo(root: &Path) {
+    git_init(root);
+    git_set_quote_path(root, "false");
+    let git = |args: &[&str]| {
+        let out = StdCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    let gone = "gone\u{202e}.rs";
+    let ts = recent_ts();
+    git_commit(root, gone, "// gone\n", "feat: add file", ts);
+    git(&["branch", "base"]);
+    git(&["rm", "--", gone]);
+    git_commit(root, "live.rs", "// live\n", "feat: replace file", ts + 1);
+}
+
+#[test]
+fn test_heatmap_diff_warning_paths_match_in_stderr_and_json() {
+    let dir = tempfile::tempdir().unwrap();
+    diff_warning_repo(dir.path());
+    let output = common::skim()
+        .env_remove("SKIM_DEBUG")
+        .args([
+            "heatmap",
+            "--window",
+            "all",
+            "--diff",
+            "base",
+            "--exclude",
+            "gone*.rs",
+            "--json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        "skim heatmap: warning: 'gone�.rs' is not a regular file on current branch\n"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json["warnings"],
+        serde_json::json!(["targeted file 'gone�.rs' not found in git history"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_diff_warning_with_closed_stderr_keeps_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    diff_warning_repo(dir.path());
+    let args = ["heatmap", "--window", "all", "--diff", "base", "--json"];
+    let baseline = common::skim()
+        .args(args)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(baseline.status.success(), "{baseline:?}");
+    assert!(String::from_utf8_lossy(&baseline.stderr).contains("is not a regular file"));
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = StdCommand::new(assert_cmd::cargo::cargo_bin!("skim"))
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_DEBUG")
+        .args(args)
+        .current_dir(dir.path())
+        .stderr(std::process::Stdio::from(writer))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!output.stdout.is_empty());
+    assert_eq!(output.stdout, baseline.stdout);
 }
 
 #[test]
@@ -2448,6 +2586,43 @@ fn create_five_commit_repo(dir: &Path, prefix: &str) {
             ts + i * 60,
         );
     }
+}
+
+#[test]
+fn test_heatmap_fix_risk_counts_non_code_rows_and_include_docs_restores_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    create_five_commit_repo(root, "feat");
+    let ts = recent_ts() + 600;
+    for i in 0..5 {
+        let body = format!("// revision {i}\n");
+        git_commit_files(
+            root,
+            &[
+                ("src/live.rs", &body),
+                ("README.md", &body),
+                ("docs/example.rs", &body),
+            ],
+            "fix: update files",
+            ts + i,
+        );
+    }
+
+    let args = ["--detail", "fix-risk"];
+    let json = heatmap_json_with(root, &args);
+    assert_eq!(sorted_paths(&json, "fix_risk"), ["src/live.rs"]);
+    assert_eq!(json["left_out"]["fix_risk"], 2);
+    let text = heatmap_stdout(root, &args);
+    assert!(
+        section_lines(&text, "Fix risk").contains(&"  2 non-code files left out (--include-docs)"),
+        "{text}"
+    );
+
+    let all = heatmap_json_with(root, &["--detail", "fix-risk", "--include-docs"]);
+    assert_eq!(
+        sorted_paths(&all, "fix_risk"),
+        ["README.md", "docs/example.rs", "src/live.rs"]
+    );
 }
 
 #[test]
@@ -3620,6 +3795,40 @@ fn test_heatmap_card_replaces_control_and_bidi_characters() {
     assert_eq!(card["fix_commits"][0]["subject"], safe_subject);
     assert_eq!(card["owners"][1]["name"], "Eve\u{FFFD}x");
     assert_eq!(card["partners"][0]["path"], "src/b\u{FFFD}c.rs");
+}
+
+#[test]
+fn test_heatmap_default_detail_and_insights_use_the_card_path_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_set_quote_path(root, "false");
+    let path = "src/a\u{202e}.rs";
+    let shown = "src/a�.rs";
+    for i in 0..3 {
+        let body = format!("// revision {i}\n");
+        git_commit_files(
+            root,
+            &[(path, &body), ("src/b.rs", &body)],
+            "feat: change both",
+            recent_ts() + i,
+        );
+    }
+
+    for args in [&[][..], &["--detail", "hotspots"][..], &["--insights"][..]] {
+        let text = heatmap_stdout(root, args);
+        assert!(text.contains(shown), "{text:?}");
+        assert!(!text.contains(path), "{text:?}");
+    }
+    let json = heatmap_json(root);
+    assert_eq!(file_entry(&json, shown)["lines"], 1, "{json}");
+    let insights = heatmap_json_with(root, &["--insights"]);
+    assert!(
+        sorted_paths(&insights, "top_files")
+            .iter()
+            .any(|path| path == shown),
+        "{insights}"
+    );
 }
 
 #[test]
