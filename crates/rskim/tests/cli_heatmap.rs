@@ -4432,11 +4432,15 @@ fn test_heatmap_card_path_through_a_symlinked_folder_stays_refused() {
     let output = repos.heatmap("b", &[arg]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(output.stdout.is_empty());
-    // This error cuts a long path to 72 chars.
-    let cut: String = arg.chars().take(69).collect();
+    // This error cuts a path longer than 72 chars to 69 chars and "...".
+    let shown = if arg.chars().count() <= 72 {
+        arg.to_string()
+    } else {
+        format!("{}...", arg.chars().take(69).collect::<String>())
+    };
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(&format!("'{cut}...' is outside the repository root")),
+        stderr.contains(&format!("'{shown}' is outside the repository root")),
         "{stderr}"
     );
 }
