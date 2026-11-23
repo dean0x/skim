@@ -47,13 +47,10 @@ fn git_not_found(e: anyhow::Error) -> anyhow::Error {
 /// single `&dyn GitDataSource` instead of splitting into a concrete `&CliGitSource`
 /// for infrastructure and a trait object for data fetch.
 ///
-/// One method takes a path from the user: [`fetch_commits`](Self::fetch_commits)
-/// gives the `--path` value to git. That value goes after `--`, and git runs
-/// with `--literal-pathspecs` (the same as `GIT_LITERAL_PATHSPECS=1`), so git
-/// reads it as a literal path: a folder matches the files below it, and no
-/// glob or pathspec magic applies. A new method that takes a path from the
-/// user must do the same. (`CliGitSource::fetch_diff_files` takes a revision,
-/// not a path: see `build_diff_args`.)
+/// No method passes the repository root as a pathspec or a revision. It goes
+/// after `-C` only. The log and count methods pass `--path` after `--` with
+/// `--literal-pathspecs`, so a folder matches its files without glob or
+/// pathspec magic.
 pub(crate) trait GitDataSource {
     /// Return `true` when the cwd is inside a git repository.
     fn is_git_repo(&self) -> bool;
@@ -77,17 +74,12 @@ pub(crate) trait GitDataSource {
     /// commits gives an empty history.
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<ParsedLog>;
 
-    /// List the paths in the HEAD tree of the repository at `repo_root`,
-    /// relative to that root.
-    ///
-    /// The list comes from the committed tree, not from the index. A branch
-    /// with no commits gives `Ok(None)`.
-    ///
-    /// The paths use the same encoding as the `--numstat` paths of
-    /// [`fetch_commits`](Self::fetch_commits): git C-quotes unusual names in
-    /// both. `Ok(None)` means the list is not available; the caller uses its
-    /// fallback and the run continues.
-    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<Option<Vec<String>>>;
+    /// List the complete HEAD tree, with keys relative to `repo_root`.
+    /// Git quotes the keys in the same form as in the log and count output.
+    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<HeadTree>;
+
+    /// Count text lines in HEAD. A scope is literal and relative to the cwd.
+    fn count_head_lines(&self, repo_root: &str, path: Option<&str>) -> anyhow::Result<HeadCounts>;
 
     /// Return the path of the cwd below the repository root
     /// (`git rev-parse --show-prefix`): empty at the root, else it ends in `/`.
@@ -266,12 +258,18 @@ impl GitDataSource for CliGitSource {
         parsed_log_from(&output, cut, || self.head_is_unborn())
     }
 
-    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
-        // No `-z`: the plain output C-quotes unusual paths exactly as
-        // `--numstat` does, so both lists use one path encoding for any
-        // `core.quotePath` setting.
-        let result = self.runner.run("git", &tracked_files_args(repo_root));
-        Ok(tracked_files_from(result))
+    fn list_tracked_files(&self, repo_root: &str) -> anyhow::Result<HeadTree> {
+        let (out, cut) = self
+            .runner
+            .run_stdout_degrade("git", &tracked_files_args(repo_root))?;
+        tracked_files_from(&out, cut)
+    }
+
+    fn count_head_lines(&self, repo_root: &str, path: Option<&str>) -> anyhow::Result<HeadCounts> {
+        let (out, cut) = self
+            .runner
+            .run_stdout_degrade("git", &head_line_count_args(repo_root, path))?;
+        head_line_counts_from(&out, cut)
     }
 
     fn show_prefix(&self) -> anyhow::Result<String> {
@@ -295,10 +293,34 @@ fn tracked_files_args(repo_root: &str) -> [&str; 7] {
         repo_root,
         "ls-tree",
         "-r",
-        "--name-only",
+        "-l",
         "--full-tree",
         "HEAD",
     ]
+}
+
+/// Scope a count from the cwd, but always return root-relative keys.
+fn head_line_count_args<'a>(repo_root: &'a str, path: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = Vec::with_capacity(12);
+    match path {
+        Some(_) => args.push("--literal-pathspecs"),
+        None => args.extend(["-C", repo_root]),
+    }
+    args.extend([
+        "grep",
+        "-I",
+        "-c",
+        "--full-name",
+        "--no-color",
+        "--no-recurse-submodules",
+        "-e",
+        "",
+        "HEAD",
+    ]);
+    if let Some(path) = path {
+        args.extend(["--", path]);
+    }
+    args
 }
 
 /// Map a `git log` run to its records.
@@ -361,35 +383,80 @@ fn without_last_record(raw: &str) -> &str {
     &raw[..last_start]
 }
 
-/// Map a `git ls-tree` run to its path list.
-///
-/// A spawn error or any exit status other than 0 gives `None` (with one
-/// debug-gated note), and the caller uses its fallback. A run cut at the
-/// runner's output cap does not report exit 0, so a partial list is never
-/// used as a full one.
-fn tracked_files_from(result: anyhow::Result<CommandOutput>) -> Option<Vec<String>> {
-    match result {
-        Ok(out) if out.exit_code == Some(0) => Some(
-            out.stdout
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        Ok(out) => {
-            crate::debug_log!(
-                "[skim:heatmap] git ls-tree exit status {:?}; modules use the top-folder rule",
-                out.exit_code
-            );
-            None
-        }
-        Err(e) => {
-            crate::debug_log!(
-                "[skim:heatmap] git ls-tree did not run ({e}); modules use the top-folder rule"
-            );
-            None
-        }
+pub(crate) type HeadTree = HashMap<String, HeadEntry>;
+pub(crate) type HeadCounts = Vec<(String, u64)>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadEntry {
+    /// No count for a binary file, an empty file or a path outside the scope.
+    Regular(Option<u64>),
+    Other,
+}
+
+/// Reject a partial listing. A missing row could otherwise look like a deletion.
+fn tracked_files_from(out: &CommandOutput, cut: bool) -> anyhow::Result<HeadTree> {
+    anyhow::ensure!(
+        !cut && out.exit_code == Some(0),
+        "incomplete git ls-tree output"
+    );
+    let mut entries = HashMap::new();
+    for line in out.stdout.lines() {
+        let (path, entry) =
+            parse_tree_line(line).ok_or_else(|| anyhow::anyhow!("invalid git ls-tree row"))?;
+        anyhow::ensure!(
+            entries.insert(path.to_owned(), entry).is_none(),
+            "duplicate git ls-tree path"
+        );
     }
+    Ok(entries)
+}
+
+fn parse_tree_line(line: &str) -> Option<(&str, HeadEntry)> {
+    let (metadata, path) = line.split_once('\t')?;
+    let mut fields = metadata.split_ascii_whitespace();
+    let (mode, kind, oid, size) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    let valid_size = (kind == "commit" && size == "-") || size.bytes().all(|b| b.is_ascii_digit());
+    if fields.next().is_some()
+        || mode.len() != 6
+        || !mode.bytes().all(|b| (b'0'..=b'7').contains(&b))
+        || !matches!(kind, "blob" | "commit")
+        || !is_object_id(oid)
+        || !valid_size
+        || path.is_empty()
+        || path.contains(['\t', '\0'])
+        || !disk_path(path).is_some_and(|p| is_repo_relative_safe(&p))
+    {
+        return None;
+    }
+    let entry = match (mode, kind) {
+        ("100644" | "100755", "blob") => HeadEntry::Regular(None),
+        _ => HeadEntry::Other,
+    };
+    Some((path, entry))
+}
+
+/// No text matches gives an empty result, not a failed count.
+fn head_line_counts_from(out: &CommandOutput, cut: bool) -> anyhow::Result<HeadCounts> {
+    anyhow::ensure!(!cut, "incomplete git grep output");
+    match out.exit_code {
+        Some(0) => Ok(out.stdout.lines().filter_map(parse_count_line).collect()),
+        Some(1) if out.stdout.is_empty() => Ok(Vec::new()),
+        _ => anyhow::bail!("git grep did not return line counts"),
+    }
+}
+
+fn parse_count_line(line: &str) -> Option<(String, u64)> {
+    // Preserve Git quotes. A colon in the name is not the count separator.
+    let (path, count) = line.strip_prefix("HEAD:")?.rsplit_once(':')?;
+    if path.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((path.to_owned(), count.parse().ok()?))
 }
 
 /// Read the output of `git rev-parse --show-prefix`.
@@ -563,7 +630,7 @@ fn parse_commit_header(rest: &str) -> Option<CommitInfo> {
     let author = fields.next()?;
     let subject = fields.next()?;
 
-    if !is_commit_hash(hash) {
+    if !is_object_id(hash) {
         return None;
     }
     let timestamp = parse_unix_timestamp(timestamp)?;
@@ -578,7 +645,7 @@ fn parse_commit_header(rest: &str) -> Option<CommitInfo> {
 }
 
 /// `true` for a full SHA-1 (40) or SHA-256 (64) object name in ASCII hex.
-fn is_commit_hash(s: &str) -> bool {
+fn is_object_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -1201,37 +1268,99 @@ mod tests {
     fn test_tracked_files_args_read_the_head_tree() {
         assert_eq!(
             tracked_files_args("/repo").as_slice(),
+            ["-C", "/repo", "ls-tree", "-r", "-l", "--full-tree", "HEAD"]
+        );
+    }
+
+    #[test]
+    fn test_head_count_args_pass_a_literal_scope_without_submodule_recursion() {
+        assert_eq!(
+            head_line_count_args("/repo", Some(":(exclude)src")),
             [
-                "-C",
-                "/repo",
-                "ls-tree",
-                "-r",
-                "--name-only",
-                "--full-tree",
-                "HEAD"
+                "--literal-pathspecs",
+                "grep",
+                "-I",
+                "-c",
+                "--full-name",
+                "--no-color",
+                "--no-recurse-submodules",
+                "-e",
+                "",
+                "HEAD",
+                "--",
+                ":(exclude)src",
+            ]
+        );
+    }
+
+    const HEAD_LISTING: &str = concat!(
+        "100644 blob 0123456789012345678901234567890123456789      14\ta.rs\n",
+        "100755 blob 0123456789012345678901234567890123456789       1\tbin.rs\n",
+        "120000 blob 0123456789012345678901234567890123456789       5\tlink.rs\n",
+        "160000 commit 0123456789012345678901234567890123456789       -\tsubmodule\n",
+    );
+
+    #[test]
+    fn test_head_listing_keeps_gitlink_and_padded_size_rows() {
+        let entries = tracked_files_from(&output(HEAD_LISTING, Some(0)), false).unwrap();
+        assert_eq!(
+            entries,
+            HashMap::from([
+                ("a.rs".into(), HeadEntry::Regular(None)),
+                ("bin.rs".into(), HeadEntry::Regular(None)),
+                ("link.rs".into(), HeadEntry::Other),
+                ("submodule".into(), HeadEntry::Other),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_head_listing_rejects_a_partial_result() {
+        for (code, cut) in [(Some(128), false), (None, false), (Some(0), true)] {
+            assert!(tracked_files_from(&output(HEAD_LISTING, code), cut).is_err());
+        }
+        for bad_row in [
+            "invalid row",
+            "100644 blob 0123456789012345678901234567890123456789 -\tbad.rs",
+            "100644 blob 0123456789012345678901234567890123456789 1\t../bad.rs",
+            "100644 blob 0123456789012345678901234567890123456789 1 extra\tbad.rs",
+        ] {
+            let rows = format!("{HEAD_LISTING}{bad_row}\n");
+            assert!(tracked_files_from(&output(&rows, Some(0)), false).is_err());
+        }
+    }
+
+    #[test]
+    fn test_head_counts_keep_quoted_paths_and_colons() {
+        let raw = concat!(
+            "HEAD:src/a:b.rs:3\n",
+            "HEAD:\"src/na\\303\\257ve.rs\":11\n",
+            "other:a.rs:9\nHEAD:a.rs:bad\nHEAD::7\n",
+        );
+        assert_eq!(
+            head_line_counts_from(&output(raw, Some(0)), false).unwrap(),
+            [
+                ("src/a:b.rs".into(), 3),
+                (r#""src/na\303\257ve.rs""#.into(), 11)
             ]
         );
     }
 
     #[test]
-    fn test_tracked_files_nonzero_exit_gives_none() {
-        assert_eq!(tracked_files_from(Ok(output("a.rs\n", Some(128)))), None);
-    }
-
-    #[test]
-    fn test_tracked_files_signal_exit_gives_none() {
-        // A run cut at the output cap ends with no exit code; its partial
-        // list must not be used.
-        assert_eq!(tracked_files_from(Ok(output("a.rs\n", None))), None);
-    }
-
-    #[test]
-    fn test_tracked_files_spawn_error_gives_none() {
-        let err = anyhow::Error::new(crate::runner::RunnerError::SpawnFailed {
-            program: "git".to_string(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
-        });
-        assert_eq!(tracked_files_from(Err(err)), None);
+    fn test_head_counts_accept_only_complete_output_or_an_empty_exit_one() {
+        assert!(
+            head_line_counts_from(&output("", Some(1)), false)
+                .unwrap()
+                .is_empty()
+        );
+        for (stdout, code, cut) in [
+            ("HEAD:a.rs:1\n", Some(1), false),
+            ("HEAD:a.rs:1\n", Some(0), true),
+            ("", Some(128), false),
+            ("", None, false),
+        ] {
+            assert!(head_line_counts_from(&output(stdout, code), cut).is_err());
+        }
     }
 
     #[test]
@@ -1333,7 +1462,10 @@ mod tests {
         let tracked = CliGitSource::new()
             .list_tracked_files(root.to_str().unwrap())
             .unwrap();
-        assert_eq!(tracked, Some(vec!["a.rs".to_string()]));
+        assert_eq!(
+            tracked,
+            HashMap::from([("a.rs".into(), HeadEntry::Regular(None))])
+        );
     }
 
     #[test]
@@ -1343,10 +1475,11 @@ mod tests {
         git_in(root, &["init", "-q"]);
         add_files(root, &["a.rs"]);
 
-        let tracked = CliGitSource::new()
-            .list_tracked_files(root.to_str().unwrap())
-            .unwrap();
-        assert_eq!(tracked, None);
+        assert!(
+            CliGitSource::new()
+                .list_tracked_files(root.to_str().unwrap())
+                .is_err()
+        );
     }
 
     /// The tracked-file list and the numstat paths must use one encoding, or a
@@ -1365,10 +1498,22 @@ mod tests {
         );
         git_in(root, &["commit", "-q", "-m", "init"]);
 
-        let mut tracked = CliGitSource::new()
-            .list_tracked_files(root.to_str().unwrap())
+        let root_arg = root.to_str().unwrap();
+        let source = CliGitSource::new();
+        let mut tracked: Vec<_> = source
+            .list_tracked_files(root_arg)
             .unwrap()
-            .expect("the tracked-file list ran in a git repo");
+            .into_keys()
+            .collect();
+        let mut counted: Vec<_> = source
+            .count_head_lines(root_arg, None)
+            .unwrap()
+            .into_iter()
+            .map(|(path, count)| {
+                assert_eq!(count, 1, "{path}");
+                path
+            })
+            .collect();
 
         let parsed = log_in(root, None);
         assert_eq!(parsed.commits.len(), 1);
@@ -1380,7 +1525,34 @@ mod tests {
 
         tracked.sort();
         numstat.sort();
+        counted.sort();
         assert_eq!(tracked.len(), 2, "tracked: {tracked:?}");
         assert_eq!(numstat, tracked);
+        assert_eq!(counted, tracked);
+    }
+
+    #[test]
+    fn test_head_counts_use_root_relative_names_from_a_subfolder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let subfolder = root.join("src");
+        git_in(root, &["init", "-q"]);
+        add_files(root, &["top.rs", "src/a.rs", "src/deep/b.rs"]);
+        git_in(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("src/deep/b.rs"), "dirty\nmore\n").unwrap();
+
+        for (scope, expected) in [
+            (
+                None,
+                "HEAD:src/a.rs:1\nHEAD:src/deep/b.rs:1\nHEAD:top.rs:1\n",
+            ),
+            (Some("deep"), "HEAD:src/deep/b.rs:1\n"),
+        ] {
+            let stdout = git_in(
+                &subfolder,
+                &head_line_count_args(root.to_str().unwrap(), scope),
+            );
+            assert_eq!(stdout, expected);
+        }
     }
 }

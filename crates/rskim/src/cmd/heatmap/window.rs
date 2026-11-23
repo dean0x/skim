@@ -402,8 +402,18 @@ mod tests {
         fn fetch_commits(&self, _config: &HeatmapConfig) -> anyhow::Result<ParsedLog> {
             Ok(ParsedLog::default())
         }
-        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
-            Ok(None)
+        fn list_tracked_files(
+            &self,
+            _repo_root: &str,
+        ) -> anyhow::Result<super::super::git_source::HeadTree> {
+            Ok(Default::default())
+        }
+        fn count_head_lines(
+            &self,
+            _repo_root: &str,
+            _path: Option<&str>,
+        ) -> anyhow::Result<super::super::git_source::HeadCounts> {
+            Ok(Vec::new())
         }
         fn show_prefix(&self) -> anyhow::Result<String> {
             Ok(String::new())

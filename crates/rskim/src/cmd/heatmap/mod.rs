@@ -28,7 +28,7 @@ use crate::analytics::{CommandType, RecordingContext};
 
 use args::{parse_args, print_help};
 use excludes::Excludes;
-use git_source::{CliGitSource, GitDataSource, ParsedLog, disk_path};
+use git_source::{CliGitSource, GitDataSource, HeadEntry, HeadTree, ParsedLog, disk_path};
 use insights::{build_insights_result, compute_insights, keep_code_findings};
 use metrics::{
     CouplingResult, ModuleRoots, compute_authors, compute_churn, compute_coupling,
@@ -153,9 +153,9 @@ fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<Str
 
 /// Kinds of run warning: a shallow clone, more than one window flag, an
 /// unresolved `--last`, skipped git log data, git log output at its
-/// limit, commits too large to pair and `--diff` files not in the window.
-/// Each kind adds at most one line in either JSON output.
-const WARNING_KINDS: usize = 7;
+/// limit, HEAD data, commits too large to pair and `--diff` files not in
+/// the window. Each kind adds at most one line in either JSON output.
+const WARNING_KINDS: usize = 8;
 
 /// True when `warnings` has at most [`WARNING_KINDS`] lines and no line
 /// twice.
@@ -199,6 +199,7 @@ struct PreparedCommits {
     warnings: Vec<String>,
     /// Package roots for module labels; empty means the top-folder rule.
     module_roots: ModuleRoots,
+    head_tree: Option<HeadTree>,
     excludes: Excludes,
 }
 
@@ -346,7 +347,8 @@ fn prepare_commits(
     }
     warnings.extend(skipped_warning);
 
-    let module_roots = load_module_roots(source, &repo_root);
+    let (module_roots, head_tree) =
+        load_head_data(source, &repo_root, config.path.as_deref(), &mut warnings);
 
     Ok(Some(PreparedCommits {
         commits,
@@ -356,6 +358,7 @@ fn prepare_commits(
         repo_root,
         warnings,
         module_roots,
+        head_tree,
         excludes,
     }))
 }
@@ -380,21 +383,60 @@ fn card_targets(
     Ok(targets)
 }
 
-/// Read the package roots from the tracked-file list of `repo_root`.
-///
-/// The list is optional input: when it is not available, modules use the
-/// top-folder rule and the run continues.
-fn load_module_roots(source: &dyn GitDataSource, repo_root: &str) -> ModuleRoots {
-    match source.list_tracked_files(repo_root) {
-        Ok(Some(paths)) => ModuleRoots::from_tracked_files(&paths),
-        Ok(None) => ModuleRoots::default(),
-        Err(e) => {
-            crate::debug_log!(
-                "[skim:heatmap] tracked-file list not available ({e}); modules use the top-folder rule"
-            );
-            ModuleRoots::default()
+const HEAD_UNAVAILABLE: &str = "HEAD data is not available. Hotspots rank by commits only.";
+
+/// Keep package roots from a complete listing even if Git cannot count lines.
+fn load_head_data(
+    source: &dyn GitDataSource,
+    repo_root: &str,
+    path: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> (ModuleRoots, Option<HeadTree>) {
+    let Ok(mut entries) = source.list_tracked_files(repo_root) else {
+        warnings.push(HEAD_UNAVAILABLE.into());
+        return (ModuleRoots::default(), None);
+    };
+    let roots = ModuleRoots::from_tracked_files(entries.keys());
+    let Ok(counts) = source.count_head_lines(repo_root, path) else {
+        warnings.push(HEAD_UNAVAILABLE.into());
+        return (roots, None);
+    };
+    let mut unmatched = 0;
+    for (path, count) in counts {
+        match entries.get_mut(&path) {
+            Some(HeadEntry::Regular(lines)) => *lines = Some(count),
+            Some(HeadEntry::Other) => (),
+            None => unmatched += 1,
         }
     }
+    if unmatched > 0 {
+        warnings.push(format!(
+            "HEAD data: {unmatched} line-count rows have no tree entry."
+        ));
+    }
+    (roots, Some(entries))
+}
+
+fn trace_head_data(head_tree: Option<&HeadTree>) {
+    let totals = match head_tree {
+        Some(entries) => {
+            let mut regular = 0;
+            let mut counted = 0;
+            for entry in entries.values() {
+                if let HeadEntry::Regular(lines) = entry {
+                    regular += 1;
+                    counted += usize::from(lines.is_some());
+                }
+            }
+            format!(
+                "{} entries, {regular} regular files, {counted} line counts",
+                entries.len()
+            )
+        }
+        None => "unavailable".to_string(),
+    };
+    let _ =
+        crate::cmd::execution::write_line_to_stderr(&format!("[skim:heatmap] HEAD data: {totals}"));
 }
 
 /// Orchestration with injected data source (enables testing).
@@ -419,11 +461,16 @@ fn run_with_source(
         repo_root,
         warnings,
         module_roots,
+        head_tree,
         excludes,
     } = match prepare_commits(source, args)? {
         Some(p) => p,
         None => return Ok(ExitCode::FAILURE),
     };
+
+    if config.debug {
+        trace_head_data(head_tree.as_ref());
+    }
 
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
@@ -1221,9 +1268,8 @@ mod tests {
 
     /// What the stub's `list_tracked_files` gives.
     enum TrackedStub {
-        Listed(Vec<String>),
+        Listed(HeadTree),
         Unavailable,
-        Fails,
     }
 
     /// Stub `GitDataSource`: `fetch_commits` returns `commits`, the
@@ -1235,6 +1281,8 @@ mod tests {
         malformed: usize,
         cut_oldest: Option<i64>,
         tracked: TrackedStub,
+        counts: Option<git_source::HeadCounts>,
+        count_calls: std::cell::RefCell<Vec<(String, Option<String>)>>,
         shallow: bool,
     }
 
@@ -1245,7 +1293,9 @@ mod tests {
                 commits: vec![stub_commit(0, &["src/main.rs"])],
                 malformed,
                 cut_oldest: None,
-                tracked: TrackedStub::Unavailable,
+                tracked: listed(&["src/main.rs"]),
+                counts: Some(Vec::new()),
+                count_calls: Default::default(),
                 shallow: false,
             }
         }
@@ -1289,15 +1339,84 @@ mod tests {
                 ..ParsedLog::default()
             })
         }
-        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
+        fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<HeadTree> {
             match &self.tracked {
-                TrackedStub::Listed(paths) => Ok(Some(paths.clone())),
-                TrackedStub::Unavailable => Ok(None),
-                TrackedStub::Fails => Err(anyhow::anyhow!("simulated ls-tree failure")),
+                TrackedStub::Listed(entries) => Ok(entries.clone()),
+                TrackedStub::Unavailable => anyhow::bail!("simulated ls-tree failure"),
             }
+        }
+        fn count_head_lines(
+            &self,
+            repo_root: &str,
+            path: Option<&str>,
+        ) -> anyhow::Result<git_source::HeadCounts> {
+            self.count_calls
+                .borrow_mut()
+                .push((repo_root.into(), path.map(str::to_owned)));
+            self.counts
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("simulated grep failure"))
         }
         fn show_prefix(&self) -> anyhow::Result<String> {
             Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn test_head_data_uses_one_scoped_count_and_joins_only_regular_entries() {
+        let source = StubSource {
+            tracked: TrackedStub::Listed(HeadTree::from([
+                ("src/main.rs".into(), HeadEntry::Regular(None)),
+                ("src/link.rs".into(), HeadEntry::Other),
+                ("src/binary.rs".into(), HeadEntry::Regular(None)),
+            ])),
+            counts: Some(vec![
+                ("src/main.rs".into(), 12),
+                ("src/link.rs".into(), 3),
+                ("src/missing.rs".into(), 7),
+                ("src/gone.rs".into(), 1),
+            ]),
+            ..StubSource::with_malformed(0)
+        };
+        let prepared = prepare_commits(
+            &source,
+            HeatmapArgs {
+                path: Some("src".into()),
+                ..HeatmapArgs::default()
+            },
+        )
+        .unwrap()
+        .expect("the run continues");
+        assert_eq!(
+            *source.count_calls.borrow(),
+            [("/stub/repo".into(), Some("src".into()))]
+        );
+        let tree = prepared.head_tree.unwrap();
+        assert_eq!(tree["src/main.rs"], HeadEntry::Regular(Some(12)));
+        assert_eq!(tree["src/link.rs"], HeadEntry::Other);
+        assert_eq!(tree["src/binary.rs"], HeadEntry::Regular(None));
+        assert_eq!(
+            prepared.warnings,
+            ["HEAD data: 2 line-count rows have no tree entry."]
+        );
+    }
+
+    #[test]
+    fn test_head_data_falls_back_once_after_either_failure() {
+        for (tracked, count_calls) in [(TrackedStub::Unavailable, 0), (listed(&["src/main.rs"]), 1)]
+        {
+            let source = StubSource {
+                tracked,
+                counts: None,
+                ..StubSource::with_malformed(0)
+            };
+            let prepared = prepare_commits(&source, HeatmapArgs::default())
+                .unwrap()
+                .expect("the run continues");
+            assert_eq!(source.count_calls.borrow().len(), count_calls);
+            assert!(prepared.head_tree.is_none());
+            assert_eq!(prepared.warnings, [HEAD_UNAVAILABLE]);
+            assert_eq!(prepared.commits.len(), 1);
         }
     }
 
@@ -1405,6 +1524,7 @@ mod tests {
             cut_oldest: Some(1_700_000_000),
             tracked: TrackedStub::Unavailable,
             shallow: true,
+            ..StubSource::with_malformed(0)
         };
         // Two window flags, and the stub has fewer than 5 commits.
         let args = HeatmapArgs {
@@ -1426,6 +1546,16 @@ mod tests {
         );
         warn_missing_targets(&mut result, &["gone.rs".to_string()]);
 
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .filter(|warning| warning.starts_with("HEAD data"))
+                .count(),
+            1,
+            "{:?}",
+            result.warnings
+        );
         let distinct: std::collections::HashSet<&String> = result.warnings.iter().collect();
         assert_eq!(
             result.warnings.len(),
@@ -1459,10 +1589,8 @@ mod tests {
     fn module_paths_with(tracked: TrackedStub) -> Vec<String> {
         let source = StubSource {
             commits: package_commits(),
-            malformed: 0,
-            cut_oldest: None,
             tracked,
-            shallow: false,
+            ..StubSource::with_malformed(0)
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()
@@ -1482,7 +1610,12 @@ mod tests {
     }
 
     fn listed(paths: &[&str]) -> TrackedStub {
-        TrackedStub::Listed(paths.iter().map(|p| p.to_string()).collect())
+        TrackedStub::Listed(
+            paths
+                .iter()
+                .map(|&p| (p.into(), HeadEntry::Regular(None)))
+                .collect(),
+        )
     }
 
     #[test]
@@ -1509,14 +1642,6 @@ mod tests {
     }
 
     #[test]
-    fn test_modules_use_top_folder_when_tracked_list_fails() {
-        assert_eq!(
-            module_paths_with(TrackedStub::Fails),
-            vec!["crates", "packages"]
-        );
-    }
-
-    #[test]
     fn test_modules_use_top_folder_when_tracked_list_is_unavailable() {
         assert_eq!(
             module_paths_with(TrackedStub::Unavailable),
@@ -1540,10 +1665,7 @@ mod tests {
     fn result_of(commits: Vec<CommitInfo>) -> HeatmapResult {
         let source = StubSource {
             commits,
-            malformed: 0,
-            cut_oldest: None,
-            tracked: TrackedStub::Unavailable,
-            shallow: false,
+            ..StubSource::with_malformed(0)
         };
         let p = prepare_commits(&source, HeatmapArgs::default())
             .unwrap()

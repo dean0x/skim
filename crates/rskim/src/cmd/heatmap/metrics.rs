@@ -501,9 +501,9 @@ impl ModuleRoots {
     ///
     /// A manifest in the repository root gives no root: that layout keeps
     /// the top-folder rule.
-    pub(crate) fn from_tracked_files(paths: &[String]) -> Self {
+    pub(crate) fn from_tracked_files<'a>(paths: impl IntoIterator<Item = &'a String>) -> Self {
         let dirs = paths
-            .iter()
+            .into_iter()
             .filter_map(|p| {
                 let (dir, name) = without_quotes(p).0.rsplit_once('/')?;
                 (!dir.is_empty() && MANIFEST_NAMES.contains(&name)).then(|| dir.to_string())
