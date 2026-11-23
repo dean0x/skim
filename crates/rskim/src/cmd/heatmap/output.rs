@@ -59,7 +59,7 @@ fn push_line(out: &mut String, line: &str) {
 }
 
 /// The warning lines of a text view: at most two (see `text_warnings`).
-fn push_warnings(out: &mut String, warnings: &[String]) {
+pub(super) fn push_warnings(out: &mut String, warnings: &[String]) {
     let (shown, more_warnings) = text_warnings(warnings);
     for warning in shown {
         push_line(out, &format!("warning: {warning}"));
@@ -72,7 +72,7 @@ fn push_warnings(out: &mut String, warnings: &[String]) {
 /// The header line: the repo name (never its absolute path), the window
 /// dates, the commit count, the window strategy and, for file targets, a
 /// scope note.
-fn header_line(label: &str, result: &HeatmapResult) -> String {
+pub(super) fn header_line(label: &str, result: &HeatmapResult) -> String {
     let window = &result.window;
     let strategy = window
         .effective_strategy

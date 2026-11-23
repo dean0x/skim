@@ -48,18 +48,13 @@ use std::{io, thread};
 /// Output captured from a completed command.
 #[derive(Debug, Clone)]
 #[must_use]
-pub(crate) struct CommandOutput {
-    /// Captured standard output (lossy UTF-8), truncated to at most
-    /// [`MAX_OUTPUT_BYTES`].
+pub(crate) struct CommandOutput<T = String> {
+    /// Captured stdout, with a capture limit of [`MAX_OUTPUT_BYTES`] bytes.
+    /// The default type decodes stdout as lossy UTF-8.
     ///
-    /// This type carries **no truncation flag**, which is why
-    /// [`CommandRunner::run_with_env`] discloses the cap itself rather than
-    /// reporting it here: roughly twenty struct-literal construction sites
-    /// across `cmd/` would have to change in lockstep to add a field, so the
-    /// disclosure lives at the one place that observes the loss.
-    /// [`CommandRunner::run_stdout_degrade`] returns the flag beside this
-    /// struct for the one caller that needs to branch on it.
-    pub(crate) stdout: String,
+    /// [`CommandRunner::run_with_env`] reports a cut on stderr.
+    /// The two `run_stdout_*degrade` methods return the cut flag separately.
+    pub(crate) stdout: T,
     /// Captured standard error (lossy UTF-8).
     pub(crate) stderr: String,
     /// Process exit code. `None` when killed by signal (Unix).
@@ -318,8 +313,34 @@ impl CommandRunner {
         }
     }
 
-    /// Execute `program` with `args`, capturing stdout with graceful degrade at
-    /// the [`MAX_OUTPUT_BYTES`] ceiling rather than hard-erroring.
+    /// Capture stdout as lossy UTF-8. Return the capture limit flag separately.
+    pub(crate) fn run_stdout_degrade(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> anyhow::Result<(CommandOutput, bool)> {
+        let (
+            CommandOutput {
+                stdout,
+                stderr,
+                exit_code,
+                duration,
+            },
+            cut,
+        ) = self.run_stdout_bytes_degrade(program, args)?;
+        Ok((
+            CommandOutput {
+                stdout: lossy_utf8(stdout),
+                stderr,
+                exit_code,
+                duration,
+            },
+            cut,
+        ))
+    }
+
+    /// Execute `program` with `args` and capture stdout without decoding it.
+    /// Return a partial capture if stdout exceeds [`MAX_OUTPUT_BYTES`].
     ///
     /// When stdout exceeds the cap, the read end of the stdout pipe is dropped
     /// on return from the reader thread, causing the child process to receive
@@ -329,13 +350,15 @@ impl CommandRunner {
     /// Stderr still uses the hard-error [`read_pipe`] cap: git log errors are
     /// typically short, and a flooded stderr is a real problem worth surfacing.
     ///
+    /// The caller decides whether to use the partial output or reject it.
+    ///
     /// Applies ADR-002 (degrade instead of error at the size cap) scoped to
     /// the git-log output path (reliability-01 / #317 compress-never-truncate).
-    pub(crate) fn run_stdout_degrade(
+    pub(crate) fn run_stdout_bytes_degrade(
         &self,
         program: &str,
         args: &[&str],
-    ) -> anyhow::Result<(CommandOutput, bool)> {
+    ) -> anyhow::Result<(CommandOutput<Vec<u8>>, bool)> {
         ensure_chain_open()?;
         let start = Instant::now();
 
@@ -362,7 +385,8 @@ impl CommandRunner {
 
         // stdout: degrade (partial data + flag) on cap.
         // stderr: hard-error on cap (same as run_with_env).
-        let stdout_handle = thread::spawn(move || read_pipe_degrade(child_stdout));
+        let stdout_handle =
+            thread::spawn(move || read_pipe_bytes_degrade(child_stdout, MAX_OUTPUT_BYTES));
         let stderr_handle = thread::spawn(move || read_pipe(child_stderr));
 
         // Wait before joining: when stdout is truncated the reader thread drops
@@ -957,9 +981,8 @@ fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
 /// the output is incomplete.  Dropping the reader on early return causes SIGPIPE
 /// in the writer process, which exits promptly (no orphan child, no deadlock).
 ///
-/// `limit` is parameterised for unit-testing with sub-ceiling sizes; call-sites
-/// should use [`read_pipe_degrade`], which hard-codes [`MAX_OUTPUT_BYTES`].
-fn read_pipe_degrade_impl<R: Read>(mut reader: R, limit: usize) -> io::Result<(String, bool)> {
+/// Pass [`MAX_OUTPUT_BYTES`] in production. Tests can pass a smaller limit.
+fn read_pipe_bytes_degrade<R: Read>(mut reader: R, limit: usize) -> io::Result<(Vec<u8>, bool)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
 
@@ -972,21 +995,25 @@ fn read_pipe_degrade_impl<R: Read>(mut reader: R, limit: usize) -> io::Result<(S
             // Accumulated bytes fit within the limit; the current chunk would
             // push past it.  Return what we have and signal truncation.
             // Dropping `reader` here propagates SIGPIPE to the writing child.
-            let s = String::from_utf8(buf)
-                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
-            return Ok((s, true));
+            return Ok((buf, true));
         }
         buf.extend_from_slice(&chunk[..n]);
     }
 
-    Ok((
-        String::from_utf8(buf)
-            .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
-        false,
-    ))
+    Ok((buf, false))
 }
 
-/// Wrapper around [`read_pipe_degrade_impl`] using the crate-wide ceiling.
+fn lossy_utf8(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
+fn read_pipe_degrade_impl<R: Read>(reader: R, limit: usize) -> io::Result<(String, bool)> {
+    let (bytes, cut) = read_pipe_bytes_degrade(reader, limit)?;
+    Ok((lossy_utf8(bytes), cut))
+}
+
+/// Read capped stdout and decode it as lossy UTF-8.
 fn read_pipe_degrade<R: Read>(reader: R) -> io::Result<(String, bool)> {
     read_pipe_degrade_impl(reader, MAX_OUTPUT_BYTES)
 }

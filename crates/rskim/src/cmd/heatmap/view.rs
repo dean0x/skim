@@ -288,8 +288,13 @@ pub(crate) struct Section<T> {
 impl<T> Section<T> {
     /// Sort `rows` by `order`, then keep the first `cap`.
     fn ranked(mut rows: Vec<T>, order: impl FnMut(&T, &T) -> Ordering, cap: usize) -> Self {
-        let total = rows.len();
         rows.sort_by(order);
+        Self::from_ranked(rows, cap)
+    }
+
+    /// Keep the first `cap` rows without another sort.
+    fn from_ranked(mut rows: Vec<T>, cap: usize) -> Self {
+        let total = rows.len();
         rows.truncate(cap);
         Self {
             rows,
@@ -356,16 +361,25 @@ pub(crate) struct HeatmapView<'a> {
     pub(crate) bus_factor: Section<BusFactorRow<'a>>,
 }
 
+/// Return all files in hotspot order after the view's non-code filter.
+/// The caller sets its own output cap.
+#[must_use]
+pub(super) fn ranked_files<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Vec<&'a FileMetrics> {
+    let mut files: Vec<_> = result
+        .files
+        .iter()
+        .filter(|f| !spec.leaves_out(&f.path))
+        .collect();
+    files.sort_by(hotspot_order);
+    files
+}
+
 /// Build the ranked view of `result` for `spec`.
 #[must_use]
 pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> HeatmapView<'a> {
     let base_rate = noise::base_rate(result.fix_commits_total, result.window.commits_analyzed);
 
-    let hotspots: Vec<&FileMetrics> = result
-        .files
-        .iter()
-        .filter(|f| !spec.leaves_out(&f.path))
-        .collect();
+    let hotspots = ranked_files(result, spec);
     let hotspots_left_out = result.files.len() - hotspots.len();
 
     let coupling: Vec<&CouplingEdge> = result
@@ -422,7 +436,7 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
     HeatmapView {
         spec: *spec,
         base_rate,
-        hotspots: Section::ranked(hotspots, hotspot_order, spec.cap(DetailSection::Hotspots))
+        hotspots: Section::from_ranked(hotspots, spec.cap(DetailSection::Hotspots))
             .with_left_out(hotspots_left_out),
         not_at_head: result.not_at_head,
         coupling: Section::ranked(coupling, coupling_order, spec.cap(DetailSection::Coupling)),
@@ -851,6 +865,45 @@ mod tests {
         ];
         let view = build_view(&result, &DEFAULT_VIEW);
         assert_eq!(hotspot_paths(&view), ["src/b.rs", "src/c.rs", "src/a.rs"]);
+    }
+
+    #[test]
+    fn hotspot_text_and_json_keep_the_ranked_capped_bytes() {
+        use super::super::output::{render_json, render_text};
+
+        let mut result = empty_result();
+        result.files = [("src/a.rs", 3, 2), ("README.md", 6, 50), ("src/b.rs", 2, 4)]
+            .map(|(path, commits, lines)| FileMetrics {
+                lines,
+                ..file(path, commits)
+            })
+            .into();
+        let spec = ViewSpec {
+            detail: Some(DetailSection::Hotspots),
+            top: Some(1),
+            ..DEFAULT_VIEW
+        };
+        let view = build_view(&result, &spec);
+
+        assert_eq!(
+            render_text(&result, &view),
+            concat!(
+                "Heatmap: repo 2024-10-01..2025-01-01, 20 commits, dual window\n",
+                "Hotspots (commits x lines):\n",
+                "    2 x 4 = 8  src/b.rs\n",
+                "  1 more (raise --top); 1 non-code file left out (--include-docs)\n",
+            )
+        );
+        let json = render_json(&result, &view, None).unwrap();
+        let (_, files) = json.split_once("\"files\":").unwrap();
+        assert_eq!(
+            files.split_once(",\"coupling_graph\":").unwrap().0,
+            concat!(
+                r#"[{"path":"src/b.rs","churn":{"commits":2,"rate":0.0},"lines":4,"score":8,"#,
+                r#""stability_score":50,"authors":{"count":2,"top_author_pct":50.0,"single_owner_risk":false},"#,
+                r#""fix_risk":{"keyword_pct":0.0,"proximity_pct":0.0,"combined_pct":0.0,"fix_commits":0,"insufficient_data":true},"blast_radius":[]}]"#,
+            )
+        );
     }
 
     #[test]

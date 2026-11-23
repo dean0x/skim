@@ -11,6 +11,9 @@ use crate::cmd::session::civil::days_to_ymd;
 // Preset mapping
 // ============================================================================
 
+/// Bounded default for the map, not a measured fit target.
+const DEFAULT_MAP_TOKENS: usize = 1_000;
+
 const WINDOW_PRESETS: [(&str, Option<u64>); 6] = [
     ("sprint", Some(14)),
     ("month", Some(30)),
@@ -151,6 +154,9 @@ pub(super) fn resolve_config(
         top_explicit: args.top_explicit,
         insights: args.insights,
         detail: args.detail,
+        map: args
+            .map
+            .then_some(args.tokens.unwrap_or(DEFAULT_MAP_TOKENS)),
     };
 
     Ok((config, window))
@@ -419,6 +425,9 @@ mod tests {
             _no_lazy_fetch: bool,
         ) -> anyhow::Result<super::super::git_source::HeadCounts> {
             Ok(Vec::new())
+        }
+        fn read_blob(&self, _oid: &str, _size: u64, _no_lazy_fetch: bool) -> Option<String> {
+            None
         }
         fn show_prefix(&self) -> anyhow::Result<String> {
             Ok(String::new())

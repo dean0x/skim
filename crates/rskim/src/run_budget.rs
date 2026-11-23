@@ -62,6 +62,16 @@ impl Body<'_> {
         }
     }
 
+    fn last_byte(&self) -> Option<u8> {
+        match self {
+            Self::Whole(s) | Self::Fixed(s) => s.as_bytes().last(),
+            Self::PreCut { kept, marker, .. } => {
+                marker.as_bytes().last().or_else(|| kept.as_bytes().last())
+            }
+        }
+        .copied()
+    }
+
     fn append_to(&self, output: &mut String) {
         match self {
             Self::Whole(s) | Self::Fixed(s) => output.push_str(s),
@@ -91,16 +101,38 @@ impl Body<'_> {
 /// Otherwise each piece must fit N, the saturating sum must fit 2N, and the
 /// exact joined count must fit N. A missing count fails closed.
 pub(crate) fn set_fits(pieces: &[Piece<'_>], n: usize, count: &Counter<'_>) -> Option<String> {
-    let bytes = pieces.iter().fold(0usize, |sum, p| {
+    set_fits_with_trailer(pieces, n, count, None).ok().flatten()
+}
+
+struct CountFailed;
+
+fn set_fits_with_trailer(
+    pieces: &[Piece<'_>],
+    n: usize,
+    count: &Counter<'_>,
+    trailer: Option<&str>,
+) -> Result<Option<String>, CountFailed> {
+    let mut bytes = pieces.iter().fold(0usize, |sum, p| {
         sum.saturating_add(p.prefix.len())
             .saturating_add(p.body.len())
     });
+    if let Some(trailer) = trailer {
+        let last_byte = pieces.iter().rev().find_map(|piece| {
+            piece
+                .body
+                .last_byte()
+                .or_else(|| piece.prefix.as_bytes().last().copied())
+        });
+        bytes = bytes
+            .saturating_add(trailer.len())
+            .saturating_add(usize::from(needs_trailer_separator(last_byte)));
+    }
     if bytes > n {
         let sum = pieces
             .iter()
             .fold(0usize, |sum, p| sum.saturating_add(p.count));
         if pieces.iter().any(|p| p.count > n) || sum > n.saturating_mul(RUN_SUM_STOP_FACTOR) {
-            return None;
+            return Ok(None);
         }
     }
     let mut output = String::new();
@@ -108,11 +140,8 @@ pub(crate) fn set_fits(pieces: &[Piece<'_>], n: usize, count: &Counter<'_>) -> O
         output.push_str(&p.prefix);
         p.body.append_to(&mut output);
     }
-    if bytes <= n || count(&output).is_some_and(|cost| cost <= n) {
-        Some(output)
-    } else {
-        None
-    }
+    append_trailer(&mut output, trailer);
+    Ok((bytes <= n || count(&output).ok_or(CountFailed)? <= n).then_some(output))
 }
 
 /// Keep the largest path prefix whose floors and reserved trailer fit. Floors
@@ -147,15 +176,15 @@ fn shares(
     n: usize,
     trailer: usize,
     count: &Counter<'_>,
-) -> Vec<(usize, usize)> {
+) -> Option<Vec<(usize, usize)>> {
     let mut available = n.saturating_sub(trailer);
     let mut result = Vec::with_capacity(pieces.len());
     let mut demands = Vec::with_capacity(pieces.len());
     for (idx, p) in pieces.iter().enumerate() {
-        let prefix = count(&p.prefix).unwrap_or(usize::MAX);
+        let prefix = count(&p.prefix)?;
         available = available.saturating_sub(prefix);
         let real = match &p.body {
-            Body::Whole(s) | Body::Fixed(s) => count(s).unwrap_or(usize::MAX),
+            Body::Whole(s) | Body::Fixed(s) => count(s)?,
             Body::PreCut { marked_count, .. } => *marked_count,
         };
         let floor = if matches!(p.body, Body::Fixed(_)) {
@@ -185,7 +214,7 @@ fn shares(
             break;
         }
     }
-    result
+    Some(result)
 }
 
 /// Core adds the final newline after its fit check. Raw cuts count it directly.
@@ -267,7 +296,20 @@ fn cut_piece(
     })
 }
 
-fn join_plan(pieces: &[Piece<'_>], bodies: &[PlannedBody], total: usize) -> String {
+fn needs_trailer_separator(last_byte: Option<u8>) -> bool {
+    last_byte.is_some_and(|byte| byte != b'\n')
+}
+
+fn append_trailer(output: &mut String, trailer: Option<&str>) {
+    if let Some(trailer) = trailer {
+        if needs_trailer_separator(output.as_bytes().last().copied()) {
+            output.push('\n');
+        }
+        output.push_str(trailer);
+    }
+}
+
+fn join_plan(pieces: &[Piece<'_>], bodies: &[PlannedBody], trailer: Option<&str>) -> String {
     let mut output = String::new();
     for (p, body) in pieces.iter().zip(bodies) {
         output.push_str(&p.prefix);
@@ -277,79 +319,106 @@ fn join_plan(pieces: &[Piece<'_>], bodies: &[PlannedBody], total: usize) -> Stri
             p.body.append_to(&mut output);
         }
     }
-    if let Some(trailer) = run_trailer_line(bodies.len(), total) {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&trailer);
-    }
+    append_trailer(&mut output, trailer);
     output
 }
 
-fn trailer_only(total: usize) -> CutPlan {
-    CutPlan {
-        output: run_trailer_line(0, total).unwrap_or_default(),
-        bodies: Vec::new(),
-        omitted: total,
-    }
-}
-
 pub(crate) fn plan_cut(pieces: &[Piece<'_>], n: usize, count: &Counter<'_>) -> CutPlan {
-    plan_cut_inner(pieces, RunBudget::Tokens(n), count)
+    plan_cut_with_trailer(
+        pieces,
+        RunBudget::Tokens(n),
+        count,
+        run_trailer_line,
+        || trailer_cost(pieces.len(), count),
+    )
 }
 
 pub(crate) fn plan_char_cut(pieces: &[Piece<'_>], n: usize, count: &Counter<'_>) -> CutPlan {
-    plan_cut_inner(pieces, RunBudget::Chars(n), count)
+    plan_cut_with_trailer(pieces, RunBudget::Chars(n), count, run_trailer_line, || {
+        trailer_cost(pieces.len(), count)
+    })
 }
 
 /// Plan once, cut each over-share body once in the caller's rayon pool, then
 /// verify the exact stdout string. At most three last-file drops follow the
-/// first exact check. Never return an unverified content candidate. The sole
-/// floor exception is the trailer-only result, which can exceed a tiny N.
-/// Returned bodies match the accepted string and support final-output stats.
-fn plan_cut_inner(pieces: &[Piece<'_>], budget: RunBudget, count: &Counter<'_>) -> CutPlan {
+/// first exact check. The sole floor exception is the trailer-only result,
+/// which can exceed a tiny N. Returned bodies match the accepted string.
+///
+/// `trailer_line` receives the kept and total piece counts. It returns a line
+/// with a final newline, or `None`. The counts can include a header piece.
+/// `reserve` gives the budget cost of the widest possible trailer, without
+/// the join newline. Return `usize::MAX` if its count fails. A full fit does
+/// not need this reservation, so the planner asks for it only on a miss.
+#[must_use]
+pub(crate) fn plan_cut_with_trailer(
+    pieces: &[Piece<'_>],
+    budget: RunBudget,
+    count: &Counter<'_>,
+    trailer_line: impl Fn(usize, usize) -> Option<String>,
+    reserve: impl FnOnce() -> usize,
+) -> CutPlan {
     let (n, trailer_join) = match budget {
         RunBudget::Tokens(n) => (n, 0),
         RunBudget::Chars(n) => (n, 1),
     };
-    if let Some(output) = set_fits(pieces, n, count) {
-        return CutPlan {
-            output,
-            bodies: pieces.iter().map(|p| p.body.whole()).collect(),
-            omitted: 0,
-        };
+    let total = pieces.len();
+    let trailer_only = || CutPlan {
+        output: trailer_line(0, total).unwrap_or_default(),
+        bodies: Vec::new(),
+        omitted: total,
+    };
+    let full_trailer = trailer_line(total, total);
+    match set_fits_with_trailer(pieces, n, count, full_trailer.as_deref()) {
+        Ok(Some(output)) => {
+            return CutPlan {
+                output,
+                bodies: pieces.iter().map(|p| p.body.whole()).collect(),
+                omitted: 0,
+            };
+        }
+        Ok(None) => {}
+        Err(CountFailed) => return trailer_only(),
     }
-    let trailer = trailer_cost(pieces.len(), count).saturating_add(trailer_join);
-    // Character floors add exactly. If they all fit, no trailer will print.
-    // Token joins do not have this property. Keep their existing reserve.
-    let k = if matches!(budget, RunBudget::Chars(_)) && kept_prefix(pieces, n, 0) == pieces.len() {
-        pieces.len()
+    let trailer = reserve().saturating_add(trailer_join);
+    // Character floors add exactly. Skip the reserve if all floors fit and
+    // the full set has no trailer. Token joins do not have this property.
+    let k = if matches!(budget, RunBudget::Chars(_))
+        && full_trailer.is_none()
+        && kept_prefix(pieces, n, 0) == total
+    {
+        total
     } else {
         kept_prefix(pieces, n, trailer)
     };
     if k == 0 {
-        return trailer_only(pieces.len());
+        return trailer_only();
     }
-    let shares = shares(
-        &pieces[..k],
-        n,
-        if k < pieces.len() { trailer } else { 0 },
-        count,
-    );
+    let share_reserve = if k < total || full_trailer.is_some() {
+        trailer
+    } else {
+        0
+    };
+    let Some(shares) = shares(&pieces[..k], n, share_reserve, count) else {
+        return trailer_only();
+    };
     let Some(mut bodies): Option<Vec<_>> = pieces[..k]
         .par_iter()
         .zip(shares)
         .map(|(p, (share, real))| cut_piece(p, share, real, count, budget))
         .collect()
     else {
-        return trailer_only(pieces.len());
+        return trailer_only();
     };
     for attempt in 0..=MAX_DROP_RETRIES {
-        let output = join_plan(pieces, &bodies, pieces.len());
-        if count(&output).is_some_and(|cost| cost <= n) {
+        let trailer = trailer_line(bodies.len(), total);
+        let output = join_plan(pieces, &bodies, trailer.as_deref());
+        let Some(cost) = count(&output) else {
+            break;
+        };
+        if cost <= n {
             return CutPlan {
                 output,
-                omitted: pieces.len().saturating_sub(bodies.len()),
+                omitted: total.saturating_sub(bodies.len()),
                 bodies,
             };
         }
@@ -358,7 +427,7 @@ fn plan_cut_inner(pieces: &[Piece<'_>], budget: RunBudget, count: &Counter<'_>) 
         }
         bodies.pop();
     }
-    trailer_only(pieces.len())
+    trailer_only()
 }
 
 #[cfg(test)]
@@ -536,6 +605,96 @@ mod tests {
             set_fits(&pieces, 6, &|_| panic!("byte fit needs no count")),
             Some("abcdef".to_owned())
         );
+    }
+
+    #[test]
+    fn caller_trailer_and_join_newline_share_the_byte_bound() {
+        let pieces = [piece("", Body::Fixed("abc".into()))];
+        let trailer = |_, _| Some("end\n".to_owned());
+        for n in [3, 7] {
+            let plan = plan_cut_with_trailer(&pieces, RunBudget::Tokens(n), &bytes, trailer, || 4);
+            assert_eq!(plan.output, "end\n");
+            assert!(plan.bodies.is_empty());
+        }
+        let plan = plan_cut_with_trailer(
+            &pieces,
+            RunBudget::Tokens(8),
+            &|_| panic!("byte fit needs no count"),
+            trailer,
+            || 4,
+        );
+        assert_eq!(plan.output, "abc\nend\n");
+        assert_eq!(plan.omitted, 0);
+    }
+
+    #[test]
+    fn caller_trailer_does_not_require_another_count_if_the_first_count_fails() {
+        let mut header = piece("", Body::Fixed("header\nrow\n".into()));
+        header.count = 2;
+        header.floor = 2;
+        let calls = AtomicUsize::new(0);
+        let count = |_: &str| (calls.fetch_add(1, Ordering::Relaxed) > 0).then_some(2);
+        let trailer = |shown, total| (shown < total).then(|| format!("{shown}/{total}\n"));
+        let plan = plan_cut_with_trailer(&[header], RunBudget::Tokens(10), &count, trailer, || 4);
+        assert_eq!(plan.output, "0/1\n");
+        assert!(plan.bodies.is_empty());
+        assert_eq!(plan.omitted, 1);
+    }
+
+    #[test]
+    fn failed_cut_count_returns_the_caller_trailer_without_a_drop() {
+        let pieces = [
+            piece("", Body::Fixed("a\n".into())),
+            piece("", Body::Fixed("b\n".into())),
+            piece("", Body::Fixed("too large\n".into())),
+        ];
+        let trailer = |shown, total| Some(format!("{shown}/{total}\n"));
+        for missing in ["b\n", "a\nb\n2/3\n"] {
+            let count = |s: &str| (s != missing).then_some(s.len());
+            let plan = plan_cut_with_trailer(&pieces, RunBudget::Tokens(8), &count, trailer, || 4);
+            assert_eq!(plan.output, "0/3\n", "missing count for {missing:?}");
+            assert_eq!(plan.omitted, 3);
+        }
+    }
+
+    #[test]
+    fn widest_caller_trailer_is_reserved_before_selecting_the_prefix() {
+        let pieces = [
+            piece("", Body::Fixed("a\n".into())),
+            piece("", Body::Fixed("b\n".into())),
+        ];
+        let trailer = |shown, _| Some(if shown == 0 { "none!!\n" } else { "some\n" }.to_owned());
+        let plan = plan_cut_with_trailer(&pieces, RunBudget::Tokens(8), &bytes, trailer, || 7);
+        assert_eq!(plan.output, "none!!\n");
+        assert_eq!(plan.omitted, 2);
+    }
+
+    #[test]
+    fn caller_trailer_uses_the_kept_prefix_for_at_most_three_drops() {
+        let mut pieces = std::array::from_fn::<_, 6, _>(|_| piece("", Body::Fixed("a\n".into())));
+        pieces[5] = piece("", Body::Fixed("too large for this budget\n".into()));
+        let tried = std::sync::Mutex::new(Vec::new());
+        let count = |s: &str| {
+            if s.contains('/') {
+                tried.lock().unwrap().push(s.to_owned());
+                Some(15)
+            } else {
+                bytes(s)
+            }
+        };
+        let trailer = |shown, total| Some(format!("{shown}/{total}\n"));
+        let plan = plan_cut_with_trailer(&pieces, RunBudget::Tokens(14), &count, trailer, || 4);
+        assert_eq!(
+            *tried.lock().unwrap(),
+            [
+                "a\na\na\na\na\n5/6\n",
+                "a\na\na\na\n4/6\n",
+                "a\na\na\n3/6\n",
+                "a\na\n2/6\n",
+            ]
+        );
+        assert_eq!(plan.output, "0/6\n");
+        assert_eq!(plan.omitted, 6);
     }
 
     #[test]

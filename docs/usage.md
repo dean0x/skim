@@ -258,6 +258,7 @@ Analyzes git commit history to surface risk hotspots: high-churn files, tightly 
 skim heatmap [OPTIONS]              # short ranked view
 skim heatmap --detail <SECTION>     # 25 rows of one section
 skim heatmap --insights             # ranked CRITICAL/WARNING findings
+skim heatmap --map [OPTIONS]        # token-bounded repository map
 skim heatmap [OPTIONS] <FILE>...    # one "before you edit" card per file
 ```
 
@@ -280,6 +281,37 @@ Module health and bus factor are not in the default view. Use `--detail` to see 
 The score is commits in the window × text lines at HEAD. Skim sorts by score, then by commit count, both from highest to lowest. If both values match, skim sorts by path, lowest first. Skim uses Git to count text lines at HEAD, so uncommitted edits do not change the line count. Empty files have a score of zero. Binary files at HEAD stay out of the ranked lists, even if their history has text changes. In a partial clone, HEAD reads do not fetch objects. If Git cannot turn off these fetches or if HEAD data is not available, skim warns and ranks by commits.
 
 Skim joins history across renames that Git reports. When HEAD data is available, hotspots, coupling, fix risk and bus factor omit paths that are not regular files at HEAD. The hotspot summary counts those paths. A file card can still show the history of such a path.
+
+#### Repository Map (`--map`)
+
+Use `skim heatmap --map` to get a text outline of the repository in [hotspot order](#hotspot-rank). The header gives the repository, window dates, commit count and window type. Each file block gives `path: C commits, L lines, score S`. If the file has a co-change partner, one `changes with: path` line gives the first partner.
+
+Symbol rows have the form `kind name:line`, with the tree-sitter kind and a 1-based source line. A member name can have the form `Container::name`. Skim lists the first 12 eligible names per file in source order. A `+N more` line counts extra names from the scan. The rows have no signature text, bodies, initializers or default values.
+
+| Language | Symbol rows |
+|----------|-------------|
+| Rust | Functions, methods, trait function declarations, structs, enums, unions, traits, modules and macros. No constants, statics, type aliases, fields or enum variants. |
+| Go | Functions, methods and named types (`type_spec`). No constants or variables. |
+| TypeScript (with TSX) and JavaScript (with JSX) | Functions, classes and methods, plus TypeScript interfaces and enums. A top-level `const`, `let` or `var` with one identifier gives a `variable_declarator` row. No function-local variables, destructured names, computed method keys or type aliases. |
+| Python | Functions, methods and classes. |
+| Other tree-sitter languages | Named functions, type definitions and containers when the grammar gives the node a `name` field. For example, C and C++ function nodes use `declarator` instead, so these nodes give no rows. |
+| JSON, YAML, TOML and unsupported formats | No symbol rows. The map can still show file stats. |
+
+The map uses the original regular-file blobs at HEAD for file sizes, line counts and symbols. It does not read the work tree, symbolic links or submodule entries. Uncommitted changes do not affect the map.
+
+In a partial clone, the map does not fetch missing blobs for HEAD reads. The history walk can still fetch objects. The parse budget covers at most 500 file attempts, 32 MiB in total and 1 MiB per file. These limits do not use a timer.
+
+Use `--tokens N` to set the cl100k token budget. The default is 1,000. The allowed range is 1 to 10,000,000. The budget covers all of stdout, with the header, warnings, whole file blocks and trailer. If skim cannot fit the header or verify that the output fits, it prints only the trailer. This trailer alone can exceed a very small budget.
+
+The trailer appears if the budget omits a ranked file, a shown file has no symbols, or a declaration scan stops early. In `[skim] S of T files`, `T` counts the ranked files after filters. The line also counts shown files by reason and points to `--tokens`. The reasons are `language`, `no declarations`, `parse budget`, `parse error`, `read error`, `size cap` and `truncated scan`. For example:
+
+```text
+[skim] 1 of 1 files; language: 1 — adjust the map budget with --tokens
+```
+
+Use `--path`, [window flags](#time-windows) and [exclude flags](#default-excludes) to set the scope. The map uses the same [non-code path rules](#non-code-paths) as the hotspot list. If the selected history has no commits, skim exits 1. If one commit is in scope and HEAD data is available, the map ranks files by line count. If the clone is shallow, the shallow history warning is part of the budget.
+
+The map has no JSON form in v1. Do not combine `--map` with `--json`, `--format json`, `--detail`, `--insights`, `--diff`, `--top` or file arguments. `--tokens` requires `--map`. A conflict or an invalid token budget exits 1.
 
 #### Sections (`--detail`)
 
@@ -317,7 +349,7 @@ Use `--include-docs` to keep non-code paths. `--diff`, file arguments and a `--p
 
 #### Caps and `--top`
 
-`--top N` sets the rows of each list in every view. Without it, each list has its own cap:
+Use `--top N` to set the row caps in the default, detail, insights, card and JSON views. Each list has its own default cap:
 
 | View | Default cap | "More" line |
 |------|-------------|-------------|
@@ -376,7 +408,7 @@ Metrics come from the full window; a card only narrows the display.
 
 #### Default Excludes
 
-By default the analysis leaves out lock files, build and dist output, minified bundles, logs, `vendor/` and `node_modules/`, IDE metadata, coverage output, and, at any depth, `CHANGELOG.md`, `*.snap`, `snapshots/`, `*.pb.go`, `*_pb2.py` and `generated/` folders. These files are absent from every section and from `files[]`. `--no-exclude` keeps them; `--exclude <PATTERN>` adds a pattern. The patterns match paths only: a file marked "generated" only in a header line stays in.
+By default the analysis leaves out lock files, build and dist output, minified bundles, logs, `vendor/` and `node_modules/`, IDE metadata, coverage output, and, at any depth, `CHANGELOG.md`, `*.snap`, `snapshots/`, `*.pb.go`, `*_pb2.py` and `generated/` folders. These files are absent from every section and from `files[]`. Use `--exclude <PATTERN>` to add a pattern. `--no-exclude` disables both the default patterns and any `--exclude` patterns. The patterns match paths only: a file marked "generated" only in a header line stays in.
 
 Skim refuses an invalid `--exclude` pattern and gives the reason.
 
@@ -412,11 +444,13 @@ skim heatmap --insights --top 50 --json  # Top 50 findings as JSON
 | `--path <DIR>` | — | Limit history and HEAD line counts to this path |
 | `--diff <BASE>` | — | Default view for the files changed vs BASE |
 | `--detail <SECTION>` | — | Show 25 rows (or `--top N`) of one section: `hotspots`, `coupling`, `fix-risk`, `modules` or `bus-factor` |
-| `--json`, `--format json` | false | Emit JSON version 2 instead of human-readable text |
-| `--top <N>` | per list (see Caps and `--top`) | Rows of each list in every view |
-| `--no-exclude` | false | Keep the files of the default excludes (see Default Excludes) |
-| `--include-docs` | false | Keep non-code paths in hotspots, fix risk, modules and insights (see [Non-Code Paths](#non-code-paths)) |
-| `--exclude <PATTERN>` | — | Add extra glob pattern to exclude (repeatable) |
+| `--json`, `--format json` | false | Emit JSON version 2 instead of text; not valid with `--map` |
+| `--map` | false | Show a text repository map in hotspot order |
+| `--tokens <N>` | 1,000 | Set the map budget in cl100k tokens (1 to 10,000,000); requires `--map` |
+| `--top <N>` | per list (see Caps and `--top`) | Set row caps; not valid with `--map` |
+| `--no-exclude` | false | Disable the default and explicit exclude patterns (see [Default Excludes](#default-excludes)) |
+| `--include-docs` | false | Keep non-code paths in the map, hotspots, fix risk, modules and insights (see [Non-Code Paths](#non-code-paths)) |
+| `--exclude <PATTERN>` | — | Add a glob pattern to exclude (repeatable); `--no-exclude` disables it |
 | `--coupling-threshold <FLOAT>` | 0.5 | Coupling confidence threshold (0.0–1.0) |
 | `--fix-window <N>` | 5 | Proximity window for fix-after-touch detection (commit count) |
 | `--insights` | false | Show ranked findings only |
@@ -447,6 +481,12 @@ skim heatmap --since 30d
 
 # Analyze commits from 00:00 UTC on November 1, 2026
 skim heatmap --since 2026-11-01
+
+# Get a repository map with the default budget
+skim heatmap --map
+
+# Set a 300-token budget for files under crates/rskim/src/
+skim heatmap --map --tokens 300 --path crates/rskim/src/
 
 # JSON output for programmatic consumption
 skim heatmap --json

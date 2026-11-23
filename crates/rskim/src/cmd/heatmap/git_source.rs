@@ -90,6 +90,9 @@ pub(crate) trait GitDataSource {
         no_lazy_fetch: bool,
     ) -> anyhow::Result<HeadCounts>;
 
+    /// Read the exact text of a listed HEAD blob, or reject the result.
+    fn read_blob(&self, oid: &str, size: u64, no_lazy_fetch: bool) -> Option<String>;
+
     /// Return the path of the cwd below the repository root
     /// (`git rev-parse --show-prefix`): empty at the root, else it ends in `/`.
     fn show_prefix(&self) -> anyhow::Result<String>;
@@ -106,6 +109,7 @@ pub(crate) trait GitDataSource {
 pub(crate) struct CliGitSource {
     runner: CommandRunner,
     dir: Option<String>,
+    original_head_objects: bool,
 }
 
 /// Why [`CliGitSource::toplevel_in`] gave no repository root.
@@ -180,15 +184,32 @@ impl CliGitSource {
         Self {
             runner: CommandRunner::new(),
             dir: None,
+            original_head_objects: false,
         }
     }
 
     /// A source whose git commands all run in `dir`, not in the cwd.
     pub(crate) fn in_dir(dir: String) -> Self {
         Self {
-            runner: CommandRunner::new(),
             dir: Some(dir),
+            ..Self::new()
         }
+    }
+
+    /// Read HEAD metadata from the same original objects as the map's blob reads.
+    /// Other views keep Git's normal treatment of replacement refs.
+    pub(super) fn with_original_head_objects(self, original_head_objects: bool) -> Self {
+        Self {
+            original_head_objects,
+            ..self
+        }
+    }
+
+    fn run_head_query(&self, mut args: Vec<&str>) -> anyhow::Result<(CommandOutput, bool)> {
+        if self.original_head_objects {
+            args.insert(0, "--no-replace-objects");
+        }
+        self.run_git(&args)
     }
 
     /// Run git with `args`, in `dir` when it is set.
@@ -341,7 +362,7 @@ impl GitDataSource for CliGitSource {
     }
 
     fn list_tracked_files(&self, repo_root: &str, no_lazy_fetch: bool) -> anyhow::Result<HeadTree> {
-        let (out, cut) = self.run_git(&tracked_files_args(repo_root, no_lazy_fetch))?;
+        let (out, cut) = self.run_head_query(tracked_files_args(repo_root, no_lazy_fetch))?;
         tracked_files_from(&out, cut)
     }
 
@@ -351,8 +372,16 @@ impl GitDataSource for CliGitSource {
         path: Option<&str>,
         no_lazy_fetch: bool,
     ) -> anyhow::Result<HeadCounts> {
-        let (out, cut) = self.run_git(&head_line_count_args(repo_root, path, no_lazy_fetch))?;
+        let (out, cut) =
+            self.run_head_query(head_line_count_args(repo_root, path, no_lazy_fetch))?;
         head_line_counts_from(&out, cut)
+    }
+
+    fn read_blob(&self, oid: &str, size: u64, no_lazy_fetch: bool) -> Option<String> {
+        read_blob_with(oid, size, no_lazy_fetch, |args| {
+            let full = with_dir(self.dir.as_deref(), args);
+            self.runner.run_stdout_bytes_degrade("git", &full)
+        })
     }
 
     fn show_prefix(&self) -> anyhow::Result<String> {
@@ -508,12 +537,37 @@ fn without_last_record(raw: &str) -> &str {
 pub(crate) type HeadTree = HashMap<String, HeadEntry>;
 pub(crate) type HeadCounts = Vec<(String, u64)>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HeadEntry {
-    /// The listing supplies zero for an empty file. Git grep supplies text counts.
-    /// After the count call, `None` means binary or outside the requested scope.
-    Regular(Option<u64>),
+    Regular {
+        oid: String,
+        size: u64,
+        /// The listing supplies zero for an empty file. Git grep supplies text counts.
+        /// After the count call, `None` means binary or outside the requested scope.
+        lines: Option<u64>,
+    },
     Other,
+}
+
+fn read_blob_with(
+    oid: &str,
+    size: u64,
+    no_lazy_fetch: bool,
+    run: impl FnOnce(&[&str]) -> anyhow::Result<(CommandOutput<Vec<u8>>, bool)>,
+) -> Option<String> {
+    if !is_object_id(oid) {
+        return None;
+    }
+    // A partial clone can lack the object at read time, even after a full listing.
+    let mut args = Vec::with_capacity(5);
+    args.extend(no_lazy_fetch.then_some("--no-lazy-fetch"));
+    // The ID names the bytes themselves, not a substitute from a replace ref.
+    args.extend(["--no-replace-objects", "cat-file", "blob", oid]);
+    let (out, cut) = run(&args).ok()?;
+    if cut || out.exit_code != Some(0) || u64::try_from(out.stdout.len()).ok() != Some(size) {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 /// Reject a partial listing. A missing row could otherwise look like a deletion.
@@ -557,7 +611,14 @@ fn parse_tree_line(line: &str) -> Option<(&str, HeadEntry)> {
         return None;
     }
     let entry = match (mode, kind) {
-        ("100644" | "100755", "blob") => HeadEntry::Regular((size == "0").then_some(0)),
+        ("100644" | "100755", "blob") => {
+            let size = size.parse().ok()?;
+            HeadEntry::Regular {
+                oid: oid.to_owned(),
+                size,
+                lines: (size == 0).then_some(0),
+            }
+        }
         _ => HeadEntry::Other,
     };
     Some((path, entry))
@@ -1616,6 +1677,69 @@ mod tests {
         );
     }
 
+    fn blob_output(stdout: &[u8], exit_code: Option<i32>) -> CommandOutput<Vec<u8>> {
+        CommandOutput {
+            stdout: stdout.to_vec(),
+            stderr: String::new(),
+            exit_code,
+            duration: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_blob_read_submits_only_a_checked_object_id() {
+        for oid in ["a".repeat(40), "B".repeat(64)] {
+            let full = ["--no-replace-objects", "cat-file", "blob", oid.as_str()];
+            let partial = [
+                "--no-lazy-fetch",
+                "--no-replace-objects",
+                "cat-file",
+                "blob",
+                &oid,
+            ];
+            for (no_lazy_fetch, expected) in [(false, full.as_slice()), (true, partial.as_slice())]
+            {
+                let blob = read_blob_with(&oid, 3, no_lazy_fetch, |args| {
+                    assert_eq!(args, expected);
+                    Ok((blob_output("é\n".as_bytes(), Some(0)), false))
+                });
+                assert_eq!(blob.as_deref(), Some("é\n"));
+            }
+        }
+        for oid in ["-h", "HEAD:src/main.rs", &"g".repeat(40), &"a".repeat(39)] {
+            assert_eq!(
+                read_blob_with(oid, 0, false, |_| panic!("invalid oid reached git")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_blob_read_rejects_an_incomplete_or_non_text_result() {
+        for (stdout, size, code, cut) in [
+            (b"abc".as_slice(), 3, Some(128), false),
+            (b"abc", 3, None, false),
+            (b"abc", 3, Some(0), true),
+            (b"ab", 3, Some(0), false),
+            (b"abcd", 3, Some(0), false),
+            (b"\xe9", 1, Some(0), false),
+            (b"\xf0\x9f\x98", 3, Some(0), false),
+        ] {
+            assert_eq!(
+                read_blob_with(&"a".repeat(40), size, false, |_| Ok((
+                    blob_output(stdout, code),
+                    cut
+                ))),
+                None,
+                "{stdout:?}, {size}, {code:?}, {cut}"
+            );
+        }
+        assert_eq!(
+            read_blob_with(&"a".repeat(40), 0, false, |_| anyhow::bail!("failed")),
+            None
+        );
+    }
+
     const HEAD_LISTING: &str = concat!(
         "100644 blob 0123456789012345678901234567890123456789      14\ta.rs\n",
         "100755 blob 0123456789012345678901234567890123456789       1\tbin.rs\n",
@@ -1623,14 +1747,22 @@ mod tests {
         "160000 commit 0123456789012345678901234567890123456789       -\tsubmodule\n",
     );
 
+    fn regular(size: u64) -> HeadEntry {
+        HeadEntry::Regular {
+            oid: "0123456789012345678901234567890123456789".into(),
+            size,
+            lines: None,
+        }
+    }
+
     #[test]
     fn test_head_listing_keeps_gitlink_and_padded_size_rows() {
         let entries = tracked_files_from(&output(HEAD_LISTING, Some(0)), false).unwrap();
         assert_eq!(
             entries,
             HashMap::from([
-                ("a.rs".into(), HeadEntry::Regular(None)),
-                ("bin.rs".into(), HeadEntry::Regular(None)),
+                ("a.rs".into(), regular(14)),
+                ("bin.rs".into(), regular(1)),
                 ("link.rs".into(), HeadEntry::Other),
                 ("submodule".into(), HeadEntry::Other),
             ])
@@ -1860,9 +1992,103 @@ mod tests {
         let tracked = CliGitSource::new()
             .list_tracked_files(root.to_str().unwrap(), false)
             .unwrap();
+        assert_eq!(tracked.len(), 1);
+        let HeadEntry::Regular { oid, size, lines } = &tracked["a.rs"] else {
+            panic!("a.rs must be a regular file");
+        };
+        assert_eq!((*size, *lines), (2, None));
+        let source = CliGitSource::in_dir(root.to_str().unwrap().into());
+        assert_eq!(source.read_blob(oid, *size, false).as_deref(), Some("x\n"));
+    }
+
+    #[test]
+    fn test_partial_clone_blob_read_leaves_missing_object_unfetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q", "source"]);
+        let remote = root.join("source");
+        git_in(&remote, &["config", "uploadpack.allowFilter", "true"]);
+        add_files(&remote, &["a.rs"]);
+        git_in(&remote, &["commit", "-q", "-m", "one"]);
+        let oid = git_in(&remote, &["rev-parse", "HEAD:a.rs"]);
+        let oid = oid.trim();
+        git_in(
+            root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                "--filter=blob:none",
+                "source",
+                "clone",
+            ],
+        );
+        let clone = root.join("clone");
+        git_in(&clone, &["config", "protocol.file.allow", "always"]);
+        let missing = git_in(
+            &clone,
+            &["rev-list", "--objects", "--missing=print", "HEAD"],
+        );
+        assert!(
+            missing
+                .lines()
+                .any(|line| line.strip_prefix('?') == Some(oid)),
+            "{missing}"
+        );
+        let before = git_in(&clone, &["count-objects", "-v"]);
+        let clone_path = clone.to_str().unwrap();
+        let source = CliGitSource::in_dir(clone_path.into());
+        let no_lazy_fetch = source.detect_partial_clone(clone_path);
+        assert!(no_lazy_fetch);
+
+        let text = source.read_blob(oid, 2, no_lazy_fetch);
+
+        assert_eq!(git_in(&clone, &["count-objects", "-v"]), before);
+        assert_eq!(text, None);
+    }
+
+    #[test]
+    fn test_blob_reader_keeps_declarations_in_text_with_replacement_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), "// \u{fffd}\nfn keep() {}\n").unwrap();
+        git_in(root, &["add", "a.rs"]);
+        git_in(root, &["commit", "-q", "-m", "one"]);
+        let root = root.to_str().unwrap();
+        let source = CliGitSource::in_dir(root.into());
+        let tree = source.list_tracked_files(root, false).unwrap();
+        let mut reader = super::super::symbols::Reader::new(Some(&tree), |oid, size| {
+            source.read_blob(oid, size, false)
+        });
+
+        let symbols = reader.read("a.rs");
+
+        assert_eq!(symbols.reason, None);
+        assert_eq!(symbols.rows.len(), 1);
         assert_eq!(
-            tracked,
-            HashMap::from([("a.rs".into(), HeadEntry::Regular(None))])
+            (symbols.rows[0].name.as_str(), symbols.rows[0].line),
+            ("keep", 2)
+        );
+    }
+
+    #[test]
+    fn test_blob_read_ignores_replace_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_in(root, &["init", "-q"]);
+        std::fs::write(root.join("blob"), "original\n").unwrap();
+        let original = git_in(root, &["hash-object", "-w", "blob"]);
+        std::fs::write(root.join("blob"), "replaced\n").unwrap();
+        let replace = git_in(root, &["hash-object", "-w", "blob"]);
+        git_in(root, &["replace", original.trim(), replace.trim()]);
+
+        let source = CliGitSource::in_dir(root.to_str().unwrap().into());
+        assert_eq!(
+            source.read_blob(original.trim(), 9, false).as_deref(),
+            Some("original\n")
         );
     }
 
