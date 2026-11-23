@@ -186,7 +186,6 @@ impl CliGitSource {
         Ok(out
             .stdout
             .lines()
-            .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
             .collect())
@@ -217,7 +216,7 @@ impl GitDataSource for CliGitSource {
         let out = self
             .capture_git(&["rev-parse", "--show-toplevel"])
             .map_err(git_not_found)?;
-        Ok(out.stdout.trim().to_string())
+        rev_parse_path(&out, "--show-toplevel")
     }
 
     fn detect_shallow_clone(&self) -> bool {
@@ -282,7 +281,7 @@ impl GitDataSource for CliGitSource {
         let out = self
             .capture_git(&["rev-parse", "--show-prefix"])
             .map_err(git_not_found)?;
-        prefix_from(&out)
+        rev_parse_path(&out, "--show-prefix")
     }
 }
 
@@ -321,10 +320,9 @@ fn head_line_count_args<'a>(repo_root: &'a str, path: Option<&'a str>) -> Vec<&'
         "-e",
         "",
         "HEAD",
+        "--",
     ]);
-    if let Some(path) = path {
-        args.extend(["--", path]);
-    }
+    args.extend(path);
     args
 }
 
@@ -393,7 +391,8 @@ pub(crate) type HeadCounts = Vec<(String, u64)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeadEntry {
-    /// No count for a binary file, an empty file or a path outside the scope.
+    /// The listing supplies zero for an empty file. Git grep supplies text counts.
+    /// After the count call, `None` means binary or outside the requested scope.
     Regular(Option<u64>),
     Other,
 }
@@ -439,7 +438,7 @@ fn parse_tree_line(line: &str) -> Option<(&str, HeadEntry)> {
         return None;
     }
     let entry = match (mode, kind) {
-        ("100644" | "100755", "blob") => HeadEntry::Regular(None),
+        ("100644" | "100755", "blob") => HeadEntry::Regular((size == "0").then_some(0)),
         _ => HeadEntry::Other,
     };
     Some((path, entry))
@@ -449,7 +448,13 @@ fn parse_tree_line(line: &str) -> Option<(&str, HeadEntry)> {
 fn head_line_counts_from(out: &CommandOutput, cut: bool) -> anyhow::Result<HeadCounts> {
     anyhow::ensure!(!cut, "incomplete git grep output");
     match out.exit_code {
-        Some(0) => Ok(out.stdout.lines().filter_map(parse_count_line).collect()),
+        Some(0) => out
+            .stdout
+            .lines()
+            .map(|line| {
+                parse_count_line(line).ok_or_else(|| anyhow::anyhow!("invalid git grep row"))
+            })
+            .collect(),
         Some(1) if out.stdout.is_empty() => Ok(Vec::new()),
         _ => anyhow::bail!("git grep did not return line counts"),
     }
@@ -464,12 +469,11 @@ fn parse_count_line(line: &str) -> Option<(String, u64)> {
     Some((path.to_owned(), count.parse().ok()?))
 }
 
-/// Read the output of `git rev-parse --show-prefix`.
-fn prefix_from(out: &CommandOutput) -> anyhow::Result<String> {
+/// Keep each path byte except Git's line terminator.
+fn rev_parse_path(out: &CommandOutput, flag: &str) -> anyhow::Result<String> {
     if out.exit_code != Some(0) {
-        anyhow::bail!("git rev-parse --show-prefix failed: {}", out.stderr.trim());
+        anyhow::bail!("git rev-parse {flag} failed: {}", out.stderr.trim());
     }
-    // Remove only the line end: the prefix itself ends in `/`.
     Ok(out
         .stdout
         .strip_suffix('\n')
@@ -1337,11 +1341,7 @@ mod tests {
 
     #[test]
     fn test_head_counts_keep_quoted_paths_and_colons() {
-        let raw = concat!(
-            "HEAD:src/a:b.rs:3\n",
-            "HEAD:\"src/na\\303\\257ve.rs\":11\n",
-            "other:a.rs:9\nHEAD:a.rs:bad\nHEAD::7\n",
-        );
+        let raw = concat!("HEAD:src/a:b.rs:3\n", "HEAD:\"src/na\\303\\257ve.rs\":11\n",);
         assert_eq!(
             head_line_counts_from(&output(raw, Some(0)), false).unwrap(),
             [
@@ -1359,6 +1359,9 @@ mod tests {
                 .is_empty()
         );
         for (stdout, code, cut) in [
+            ("HEAD:ok.rs:2\nother:a.rs:9\n", Some(0), false),
+            ("HEAD:ok.rs:2\nHEAD:a.rs:bad\n", Some(0), false),
+            ("HEAD:ok.rs:2\nHEAD::7\n", Some(0), false),
             ("HEAD:a.rs:1\n", Some(1), false),
             ("HEAD:a.rs:1\n", Some(0), true),
             ("", Some(128), false),
@@ -1371,15 +1374,20 @@ mod tests {
     #[test]
     fn test_show_prefix_output_keeps_trailing_slash() {
         assert_eq!(
-            prefix_from(&output("src/cmd/\n", Some(0))).unwrap(),
+            rev_parse_path(&output("src/cmd/\n", Some(0)), "--show-prefix").unwrap(),
             "src/cmd/"
         );
-        assert_eq!(prefix_from(&output("\n", Some(0))).unwrap(), "");
+        assert_eq!(
+            rev_parse_path(&output("\n", Some(0)), "--show-prefix").unwrap(),
+            ""
+        );
     }
 
     #[test]
     fn test_show_prefix_nonzero_exit_is_error() {
-        let msg = prefix_from(&output("", Some(128))).unwrap_err().to_string();
+        let msg = rev_parse_path(&output("", Some(128)), "--show-prefix")
+            .unwrap_err()
+            .to_string();
         assert!(msg.contains("--show-prefix failed"), "got: {msg}");
     }
 

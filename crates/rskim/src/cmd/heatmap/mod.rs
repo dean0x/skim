@@ -119,7 +119,13 @@ fn resolve_diff_files(
             // the repo root to avoid cwd-dependent failures. The warning gates
             // nothing: `args.diff_files` still receives the full diff list, and
             // apply_file_scope filters the output by set intersection.
-            let root = git_source.get_repo_root().unwrap_or_default();
+            let root = match git_source.get_repo_root() {
+                Ok(root) => root,
+                Err(e) => {
+                    note(format_args!("skim heatmap: {e}"));
+                    return Ok(Some(ExitCode::FAILURE));
+                }
+            };
             if let Some(warning) = diff_not_file_warning(std::path::Path::new(&root), &files) {
                 note(format_args!("skim heatmap: warning: {warning}"));
             }
@@ -669,25 +675,28 @@ fn keep_at_head(
             .collect(),
         FileTargets::All | FileTargets::Diff(_) => HashSet::new(),
     };
-    let mut dropped = HashSet::new();
+    let mut at_head = AtHead::default();
     result.files.retain_mut(|file| {
-        if let Some(HeadEntry::Regular(lines)) = head_tree.get(&file.path) {
-            file.lines = lines.unwrap_or(0);
-            return true;
+        match head_tree.get(&file.path) {
+            Some(HeadEntry::Regular(Some(lines))) => {
+                file.lines = *lines;
+                return true;
+            }
+            // History and grep share the same path scope. An in-scope, nonempty
+            // file with no text count is binary, but it still exists at HEAD.
+            Some(HeadEntry::Regular(None)) => (),
+            Some(HeadEntry::Other) | None => at_head.not_at_head += 1,
         }
-        dropped.insert(file.path.clone());
+        at_head.dropped.insert(file.path.clone());
         card_paths.contains(&file.path)
     });
     result
         .coupling_graph
-        .retain(|edge| !dropped.contains(&edge.a) && !dropped.contains(&edge.b));
+        .retain(|edge| !at_head.dropped.contains(&edge.a) && !at_head.dropped.contains(&edge.b));
     for file in &mut result.files {
-        file.blast_radius.retain(|p| !dropped.contains(&p.path));
+        file.blast_radius
+            .retain(|p| !at_head.dropped.contains(&p.path));
     }
-    let at_head = AtHead {
-        not_at_head: dropped.len(),
-        dropped,
-    };
     (result, at_head)
 }
 

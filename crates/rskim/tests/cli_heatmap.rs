@@ -1463,6 +1463,7 @@ fn test_heatmap_large_file_with_fewer_commits_ranks_first() {
     );
     git_commit(root, "small.rs", "// two\n", "fix: small", 1_700_000_001);
     std::fs::write(root.join("large.rs"), "// uncommitted\n").unwrap();
+    std::fs::write(root.join("HEAD"), "not the revision\n").unwrap();
 
     let json = heatmap_json_with(root, &["--window", "all"]);
     assert_eq!(json["files"][0]["path"], "large.rs");
@@ -1494,6 +1495,31 @@ fn test_heatmap_counts_quoted_head_paths_from_a_subfolder() {
     let scoped = heatmap_json_with(&cwd, &["--window", "all", "--path", "deep"]);
     assert_eq!(sorted_paths(&scoped, "files"), [quoted]);
     assert_eq!(file_entry(&scoped, quoted)["lines"], 2, "{scoped}");
+}
+
+#[test]
+fn test_heatmap_binary_at_head_is_not_a_hotspot_but_an_empty_file_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_commit_files(
+        root,
+        &[("changed.dat", "text\n"), ("empty.rs", "")],
+        "feat: add text",
+        1_700_000_000,
+    );
+    git_commit(
+        root,
+        "changed.dat",
+        "a\0b",
+        "feat: change data",
+        1_700_000_001,
+    );
+
+    let json = heatmap_json_with(root, &["--window", "all"]);
+    assert_eq!(sorted_paths(&json, "files"), ["empty.rs"]);
+    assert_eq!(file_entry(&json, "empty.rs")["lines"], 0);
+    assert!(json.get("left_out").is_none());
 }
 
 #[test]
@@ -2033,6 +2059,24 @@ fn diff_warning_repo(root: &Path) {
     git(&["branch", "base"]);
     git(&["rm", "--", gone]);
     git_commit(root, "live.rs", "// live\n", "feat: replace file", ts + 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_diff_keeps_spaces_in_repository_and_file_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo ");
+    std::fs::create_dir(&root).unwrap();
+    git_init(&root);
+    git_commit(&root, "first.rs", "one\n", "feat: first", 1_700_000_000);
+    let path = " spaced.rs ";
+    git_commit(&root, path, "one\ntwo\n", "feat: second", 1_700_000_001);
+
+    let json = heatmap_json_with(&root, &["--window", "all", "--diff", "HEAD~1"]);
+    assert_eq!(json["repository"], "repo ");
+    assert_eq!(sorted_paths(&json, "files"), [path]);
+    assert_eq!(file_entry(&json, path)["lines"], 2);
+    assert_eq!(json["warnings"], serde_json::json!([]));
 }
 
 #[test]
