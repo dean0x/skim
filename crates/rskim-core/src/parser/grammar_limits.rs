@@ -3,8 +3,8 @@
 use crate::{Language, Result, SkimError};
 
 /// Read Markdown as raw text when its nesting estimate reaches this limit.
-/// From tree-sitter-md 0.5.4, the grammar also has a limit of its own: past
-/// it, the grammar reads block markers as text.
+/// From tree-sitter-md 0.5.4, the grammar also has a deeper limit of its own:
+/// past that depth, it reads block markers as text.
 const MARKDOWN_NESTING_LIMIT: usize = 200;
 
 #[must_use = "the input limit must pass before the parse"]
