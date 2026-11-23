@@ -103,8 +103,8 @@ pub(crate) struct HeatmapArgs {
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
-    /// Keep doc files and non-code folders in the hotspots, the modules
-    /// and the insights (`--include-docs`).
+    /// Keep doc files and non-code folders in hotspots, fix risk, modules
+    /// and insights (`--include-docs`).
     pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
     pub(crate) extra_excludes: Vec<globset::Glob>,
@@ -229,8 +229,8 @@ pub(crate) struct HeatmapConfig {
     pub(crate) top_n: usize,
     /// Skip default exclude patterns.
     pub(crate) no_exclude: bool,
-    /// Keep doc files and non-code folders in the hotspots, the modules
-    /// and the insights (`--include-docs`).
+    /// Keep doc files and non-code folders in hotspots, fix risk, modules
+    /// and insights (`--include-docs`).
     pub(crate) include_docs: bool,
     /// Additional glob patterns to exclude.
     pub(crate) extra_excludes: Vec<globset::Glob>,

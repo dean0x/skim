@@ -83,8 +83,7 @@ pub(crate) struct ViewSpec {
     /// `Some` only when `--top` was given. Without it, each list has its own
     /// default cap.
     pub(crate) top: Option<usize>,
-    /// True with `--include-docs`: the hotspots, the modules and the insights
-    /// keep the paths that [`noise::is_non_code_path`] names.
+    /// True when the non-code rule keeps all paths in this view.
     pub(crate) include_docs: bool,
 }
 
@@ -128,8 +127,7 @@ impl ViewSpec {
         }
     }
 
-    /// True when `path` stays out of the hotspots, the modules and the
-    /// insights of this view.
+    /// True when the non-code rule leaves `path` out of this view.
     #[must_use]
     pub(crate) fn leaves_out(self, path: &str) -> bool {
         !self.include_docs && noise::is_non_code_path(path)
@@ -374,8 +372,7 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
         .filter(|e| !noise::is_doc_path(&e.a) && !noise::is_doc_path(&e.b))
         .collect();
 
-    let fix_risk: Vec<FixRiskRow<'_>> = result
-        .files
+    let fix_risk: Vec<FixRiskRow<'_>> = hotspots
         .iter()
         .filter(|f| noise::passes_lift(f.fix_risk.fix_commits, f.churn.commits, base_rate))
         .map(|f| FixRiskRow {
@@ -419,7 +416,8 @@ pub(crate) fn build_view<'a>(result: &'a HeatmapResult, spec: &ViewSpec) -> Heat
             .with_left_out(hotspots_left_out),
         not_at_head: result.not_at_head,
         coupling: Section::ranked(coupling, coupling_order, spec.cap(DetailSection::Coupling)),
-        fix_risk: Section::ranked(fix_risk, fix_risk_order, spec.cap(DetailSection::FixRisk)),
+        fix_risk: Section::ranked(fix_risk, fix_risk_order, spec.cap(DetailSection::FixRisk))
+            .with_left_out(hotspots_left_out),
         modules: Section::ranked(modules, module_order, spec.cap(DetailSection::Modules))
             .with_left_out(modules_left_out),
         bus_factor: Section::ranked(
@@ -498,9 +496,8 @@ impl<'a> HeatmapView<'a> {
                 self.modules.left_out,
                 ("non-code folder", "non-code folders"),
             ),
-            DetailSection::Coupling | DetailSection::FixRisk | DetailSection::BusFactor => {
-                (0, ("", ""))
-            }
+            DetailSection::FixRisk => (self.fix_risk.left_out, ("non-code file", "non-code files")),
+            DetailSection::Coupling | DetailSection::BusFactor => (0, ("", "")),
         };
         let more = more_and_left_out_line(
             self.count(section).hidden(),
@@ -607,6 +604,7 @@ pub(crate) struct HeatmapJson<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct LeftOutJson {
     hotspots: usize,
+    fix_risk: usize,
     modules: usize,
     not_at_head: usize,
 }
@@ -616,6 +614,7 @@ impl LeftOutJson {
     fn of(view: &HeatmapView<'_>) -> Option<Self> {
         let counts = Self {
             hotspots: view.hotspots.left_out,
+            fix_risk: view.fix_risk.left_out,
             modules: view.modules.left_out,
             not_at_head: view.not_at_head,
         };
@@ -1114,6 +1113,41 @@ mod tests {
         let view = build_view(&result, &DEFAULT_VIEW);
         let paths: Vec<&str> = view.fix_risk.rows.iter().map(|r| r.path).collect();
         assert_eq!(paths, ["src/five.rs"]);
+    }
+
+    #[test]
+    fn test_fix_risk_leaves_out_non_code_files_unless_requested() {
+        let mut result = empty_result();
+        result.files = vec![
+            with_fixes(file("src/a.rs", 5), 5),
+            with_fixes(file("README.md", 5), 5),
+            with_fixes(file("docs/example.rs", 5), 5),
+        ];
+        let spec = detail_view(DetailSection::FixRisk, None);
+        let view = build_view(&result, &spec);
+        let paths: Vec<_> = view.fix_risk.rows.iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["src/a.rs"]);
+        assert_eq!(
+            view.more(DetailSection::FixRisk).as_deref(),
+            Some("2 non-code files left out (--include-docs)")
+        );
+        let json = serde_json::to_value(view.to_json(&result, None)).unwrap();
+        assert_eq!(json["left_out"]["fix_risk"], 2);
+
+        for args in [
+            ["--window=all", "--include-docs"],
+            ["--window=all", "--path=./docs"],
+            ["--window=all", "README.md"],
+        ] {
+            let args = super::super::args::parse_args(&args.map(str::to_owned)).unwrap();
+            let source = super::super::git_source::CliGitSource::new();
+            let (config, _) =
+                super::super::window::resolve_config(args, &source, &mut vec![], 0).unwrap();
+            let view = build_view(&result, &ViewSpec::from_config(&config));
+            let paths: Vec<_> = view.fix_risk.rows.iter().map(|r| r.path).collect();
+            assert_eq!(paths, ["README.md", "docs/example.rs", "src/a.rs"]);
+            assert!(view.more(DetailSection::FixRisk).is_none());
+        }
     }
 
     #[test]
