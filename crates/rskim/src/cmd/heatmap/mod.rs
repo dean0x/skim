@@ -28,11 +28,11 @@ use crate::analytics::{CommandType, RecordingContext};
 
 use args::{parse_args, print_help};
 use excludes::Excludes;
-use git_source::{CliGitSource, GitDataSource};
+use git_source::{CliGitSource, GitDataSource, ParsedLog, disk_path};
 use insights::{build_insights_result, compute_insights, keep_code_findings};
 use metrics::{
     CouplingResult, ModuleRoots, compute_authors, compute_churn, compute_coupling,
-    compute_encapsulation, compute_fix_after_touch, compute_stability, module_of, without_quotes,
+    compute_encapsulation, compute_fix_after_touch, compute_stability, module_of,
 };
 use noise::{COUPLING_MAX_FILES, MIN_PAIR_SUPPORT, MODULE_MIN_COMMITS};
 use output::{
@@ -151,70 +151,8 @@ fn diff_not_file_warning(root: &std::path::Path, files: &[String]) -> Option<Str
     }
 }
 
-/// A path from git output as the relative path that it names, for a test
-/// on disk or against the exclude patterns, or `None` when its quoted form
-/// does not decode. git writes a name with unusual bytes in double quotes,
-/// with C escapes and 3-digit octal escapes (the form of
-/// `card::git_quoted`); a test on the quoted text would name no file.
-fn disk_path(path: &str) -> Option<std::path::PathBuf> {
-    let (inner, quoted) = without_quotes(path);
-    if !quoted {
-        return Some(std::path::PathBuf::from(path));
-    }
-    path_from_bytes(c_unescaped(inner)?)
-}
-
-/// The bytes of the text inside git's quotes, or `None` for an escape that
-/// git does not write. Each pass reads at least one byte, so the loop ends
-/// after at most `inner.len()` passes.
-fn c_unescaped(inner: &str) -> Option<Vec<u8>> {
-    let mut rest = inner.bytes();
-    let mut out = Vec::with_capacity(inner.len());
-    while let Some(b) = rest.next() {
-        if b != b'\\' {
-            out.push(b);
-            continue;
-        }
-        let byte = match rest.next()? {
-            b'a' => 0x07,
-            b'b' => 0x08,
-            b't' => b'\t',
-            b'n' => b'\n',
-            b'v' => 0x0b,
-            b'f' => 0x0c,
-            b'r' => b'\r',
-            b'"' => b'"',
-            b'\\' => b'\\',
-            // Three octal digits, the first 0-3, so the value fits in a byte.
-            first @ b'0'..=b'3' => {
-                let mut value = first - b'0';
-                for _ in 0..2 {
-                    let digit = rest.next().filter(|d| (b'0'..=b'7').contains(d))?;
-                    value = value * 8 + (digit - b'0');
-                }
-                value
-            }
-            _ => return None,
-        };
-        out.push(byte);
-    }
-    Some(out)
-}
-
-#[cfg(unix)]
-fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    Some(std::ffi::OsString::from_vec(bytes).into())
-}
-
-/// Off Unix a path is text: bytes that are not UTF-8 name no file.
-#[cfg(not(unix))]
-fn path_from_bytes(bytes: Vec<u8>) -> Option<std::path::PathBuf> {
-    String::from_utf8(bytes).ok().map(Into::into)
-}
-
 /// Kinds of run warning: a shallow clone, more than one window flag, an
-/// unresolved `--last`, malformed git log records, git log output at its
+/// unresolved `--last`, skipped git log data, git log output at its
 /// limit, commits too large to pair and `--diff` files not in the window.
 /// Each kind adds at most one line in either JSON output.
 const WARNING_KINDS: usize = 7;
@@ -224,6 +162,30 @@ const WARNING_KINDS: usize = 7;
 fn one_warning_per_kind(warnings: &[String]) -> bool {
     let distinct: std::collections::HashSet<&str> = warnings.iter().map(String::as_str).collect();
     warnings.len() <= WARNING_KINDS && distinct.len() == warnings.len()
+}
+
+fn skipped_log_warning(parsed: &ParsedLog) -> Option<String> {
+    let groups = [
+        (parsed.malformed, "malformed git log record"),
+        (parsed.unpaired, "unpaired git log record"),
+        (parsed.unsafe_paths, "unsafe path"),
+    ];
+    let counts: Vec<_> = groups
+        .into_iter()
+        .filter(|&(count, _)| count > 0)
+        .map(|(count, noun)| {
+            let plural = if count == 1 { "" } else { "s" };
+            format!("{count} {noun}{plural}")
+        })
+        .collect();
+    (!counts.is_empty()).then(|| format!("Skipped {}.", counts.join(", ")))
+}
+
+/// On an early exit there is no result view to carry this warning.
+fn emit_skipped_log_warning(warning: Option<&str>) {
+    if let Some(warning) = warning {
+        let _ = crate::cmd::execution::write_line_to_stderr(&format!("skim heatmap: {warning}"));
+    }
 }
 
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
@@ -295,9 +257,7 @@ fn prepare_commits(
         eprintln!("[skim:heatmap] repo root: {repo_root}");
     }
 
-    // Capture a single clock snapshot for all window-resolution helpers so that
-    // preset_to_since_secs, resolve_config, and build_window_info all use the
-    // same value (temporal consistency).
+    // Resolve and display the window from the same clock snapshot.
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -337,17 +297,7 @@ fn prepare_commits(
         }
     };
 
-    if parsed.malformed > 0 {
-        let noun = if parsed.malformed == 1 {
-            "record"
-        } else {
-            "records"
-        };
-        warnings.push(format!(
-            "Skipped {} malformed git log {noun} (bad hash or timestamp); their file changes are not counted.",
-            parsed.malformed
-        ));
-    }
+    let skipped_warning = skipped_log_warning(&parsed);
     if let Some(oldest) = parsed.cut_oldest {
         // Author timestamps are ASCII digits only, so they are never negative.
         warnings.push(format!(
@@ -363,6 +313,7 @@ fn prepare_commits(
     }
 
     if raw_commits.is_empty() {
+        emit_skipped_log_warning(skipped_warning.as_deref());
         eprintln!("skim heatmap: No commits found in repository");
         return Ok(None);
     }
@@ -389,9 +340,11 @@ fn prepare_commits(
 
     // A card can report its filter even when no commits remain.
     if commits.is_empty() && !matches!(config.targets, FileTargets::Cards(_)) {
+        emit_skipped_log_warning(skipped_warning.as_deref());
         eprintln!("skim heatmap: No analyzable files after exclusions");
         return Ok(None);
     }
+    warnings.extend(skipped_warning);
 
     let module_roots = load_module_roots(source, &repo_root);
 
@@ -1333,6 +1286,7 @@ mod tests {
                 commits: self.commits.clone(),
                 malformed: self.malformed,
                 cut_oldest: self.cut_oldest,
+                ..ParsedLog::default()
             })
         }
         fn list_tracked_files(&self, _repo_root: &str) -> anyhow::Result<Option<Vec<String>>> {
@@ -1363,9 +1317,7 @@ mod tests {
             .expect("one good commit remains");
         assert_eq!(
             malformed_warnings(&prepared),
-            vec![
-                "Skipped 3 malformed git log records (bad hash or timestamp); their file changes are not counted."
-            ]
+            vec!["Skipped 3 malformed git log records."]
         );
         assert_eq!(prepared.commits.len(), 1);
     }
@@ -1378,9 +1330,21 @@ mod tests {
             .expect("one good commit remains");
         assert_eq!(
             malformed_warnings(&prepared),
-            vec![
-                "Skipped 1 malformed git log record (bad hash or timestamp); their file changes are not counted."
-            ]
+            vec!["Skipped 1 malformed git log record."]
+        );
+    }
+
+    #[test]
+    fn test_log_warning_names_each_nonzero_count() {
+        let parsed = ParsedLog {
+            malformed: 1,
+            unpaired: 2,
+            unsafe_paths: 3,
+            ..ParsedLog::default()
+        };
+        assert_eq!(
+            skipped_log_warning(&parsed).as_deref(),
+            Some("Skipped 1 malformed git log record, 2 unpaired git log records, 3 unsafe paths.")
         );
     }
 
@@ -1445,7 +1409,7 @@ mod tests {
         // Two window flags, and the stub has fewer than 5 commits.
         let args = HeatmapArgs {
             last_n: Some(5),
-            window_preset: Some("unknown".to_string()),
+            window_preset: Some("all".to_string()),
             ..HeatmapArgs::default()
         };
         let p = prepare_commits(&source, args)
@@ -1462,12 +1426,10 @@ mod tests {
         );
         warn_missing_targets(&mut result, &["gone.rs".to_string()]);
 
-        // `--last` comes before `--window`, so the unknown-preset kind
-        // cannot show with an unresolved `--last`: all other kinds show.
         let distinct: std::collections::HashSet<&String> = result.warnings.iter().collect();
         assert_eq!(
             result.warnings.len(),
-            WARNING_KINDS - 1,
+            WARNING_KINDS,
             "{:?}",
             result.warnings
         );

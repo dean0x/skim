@@ -3,8 +3,13 @@
 //! Uses `CommandRunner` to execute git commands and parses their output into
 //! `CommitInfo` values via a simple state machine.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crate::cmd::is_repo_relative_safe;
 use crate::runner::{CommandOutput, CommandRunner, MAX_OUTPUT_BYTES, is_spawn_error};
 
+use super::metrics::without_quotes;
 use super::types::{CommitInfo, FileChangeInfo, HeatmapConfig};
 
 /// `git log` record header: hash, author timestamp, author name and subject,
@@ -111,6 +116,7 @@ fn build_git_log_args(since: Option<u64>, path: Option<&str>) -> Vec<String> {
         "--literal-pathspecs".to_string(),
         "log".to_string(),
         LOG_FORMAT.to_string(),
+        "--raw".to_string(),
         "--numstat".to_string(),
         "--no-merges".to_string(),
         "--date=unix".to_string(),
@@ -411,54 +417,138 @@ pub(crate) struct ParsedLog {
     /// Count of `COMMIT:` records skipped for a missing field, a bad hash or a
     /// bad timestamp. Their numstat lines are skipped with them.
     pub(crate) malformed: usize,
+    /// Records skipped because raw and numstat rows did not pair.
+    pub(crate) unpaired: usize,
+    /// File rows dropped because their resolved path did not decode to a safe path.
+    pub(crate) unsafe_paths: usize,
     /// `Some(ts)` when the git output stopped at the runner's output limit:
     /// the last record was dropped, and `ts` is the author timestamp of the
     /// oldest commit kept. `None` for a full output.
     pub(crate) cut_oldest: Option<i64>,
 }
 
-/// Parse the output of `git log` with [`LOG_FORMAT`] and `--numstat`.
-///
-/// Exposed as `pub(crate)` so unit tests can exercise the parser on hardcoded
-/// strings without spawning a real git process.
+/// Parse `git log` with [`LOG_FORMAT`], `--raw` and `--numstat`.
+/// The runner bounds the input, and each record uses only aliases from newer records.
 #[must_use]
-pub(crate) fn parse_git_log_output(raw: &str) -> ParsedLog {
-    let mut commits: Vec<CommitInfo> = Vec::new();
-    let mut malformed = 0usize;
-    let mut current: Option<CommitInfo> = None;
-
+pub(super) fn parse_git_log_output(raw: &str) -> ParsedLog {
+    let mut parsed = ParsedLog::default();
+    let mut aliases = HashMap::new();
+    let mut rows = RecordRows::default();
+    let mut current = None;
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix(RECORD_PREFIX) {
-            // Flush the previous commit
-            if let Some(c) = current.take() {
-                commits.push(c);
+            if let Some(commit) = current.take() {
+                rows.finish(commit, &mut aliases, &mut parsed);
             }
-            // A bad record leaves `current` as `None`, so its numstat lines
-            // attach to no commit.
+            rows.clear();
             current = parse_commit_header(rest);
             if current.is_none() {
-                malformed += 1;
+                parsed.malformed += 1;
             }
-        } else if line.trim().is_empty() {
-            // Blank lines separate commits — skip
-            continue;
-        } else if let Some(record) = current.as_mut()
-            && let Some(file_change) = parse_numstat_line(line)
-        {
-            // Numstat line: additions\tdeletions\tpath (binary files: - - path)
-            record.changed_files.push(file_change);
+        } else if current.is_some() && !line.is_empty() {
+            rows.push(line);
         }
     }
+    if let Some(commit) = current {
+        rows.finish(commit, &mut aliases, &mut parsed);
+    }
+    parsed
+}
 
-    // Flush the last commit
-    if let Some(c) = current {
-        commits.push(c);
+#[derive(Default)]
+struct RecordRows<'a> {
+    raw: Vec<RawRow<'a>>,
+    stats: Vec<NumstatRow<'a>>,
+    invalid: bool,
+}
+
+impl<'a> RecordRows<'a> {
+    fn clear(&mut self) {
+        self.raw.clear();
+        self.stats.clear();
+        self.invalid = false;
     }
 
-    ParsedLog {
-        commits,
-        malformed,
-        cut_oldest: None,
+    fn push(&mut self, line: &'a str) {
+        if line.starts_with(':') {
+            if let Some(row) = parse_raw_row(line) {
+                self.raw.push(row);
+                return;
+            }
+        } else if let Some(row) = parse_numstat_line(line) {
+            self.stats.push(row);
+            return;
+        }
+        self.invalid = true;
+    }
+
+    fn finish(
+        &self,
+        mut commit: CommitInfo,
+        aliases: &mut HashMap<&'a str, &'a str>,
+        parsed: &mut ParsedLog,
+    ) {
+        let pairs = self.raw.iter().zip(&self.stats);
+        if self.invalid
+            || self.raw.len() != self.stats.len()
+            || pairs
+                .clone()
+                .any(|(raw, stat)| raw.old.is_none() && raw.path != stat.path)
+        {
+            parsed.unpaired += 1;
+            return;
+        }
+
+        let mut indices: HashMap<&str, usize> = HashMap::new();
+        let mut renames = Vec::new();
+        for (raw, stat) in pairs {
+            let path = aliases.get(raw.path).copied().unwrap_or(raw.path);
+            if !disk_path(path).is_some_and(|rel| is_repo_relative_safe(&rel)) {
+                parsed.unsafe_paths += 1;
+                continue;
+            }
+            if let Some(old) = raw.old {
+                renames.push((old, path));
+            }
+            if let Some((add, del)) = stat.lines {
+                if raw.old.is_some() && add == 0 && del == 0 {
+                    continue;
+                }
+                add_file_change(&mut commit.changed_files, &mut indices, path, add, del);
+            }
+        }
+
+        // A newly created path has no prior history under that name. Apply all
+        // changes to the alias table only after every row has used its old state.
+        for raw in &self.raw {
+            if raw.added || raw.old.is_some() {
+                aliases.remove(raw.path);
+            }
+        }
+        aliases.extend(renames);
+        parsed.commits.push(commit);
+    }
+}
+
+fn add_file_change<'a>(
+    files: &mut Vec<FileChangeInfo>,
+    indices: &mut HashMap<&'a str, usize>,
+    path: &'a str,
+    additions: u64,
+    deletions: u64,
+) {
+    let next = files.len();
+    let index = *indices.entry(path).or_insert(next);
+    if let Some(file) = files.get_mut(index) {
+        file.additions = file.additions.saturating_add(additions);
+        file.deletions = file.deletions.saturating_add(deletions);
+    } else {
+        // Keep Git's spelling for joins with cards, HEAD paths and diff paths.
+        files.push(FileChangeInfo {
+            path: PathBuf::from(path),
+            additions,
+            deletions,
+        });
     }
 }
 
@@ -500,55 +590,130 @@ fn parse_unix_timestamp(s: &str) -> Option<i64> {
     s.parse().ok()
 }
 
-/// Parse a single git numstat line into a `FileChangeInfo`.
-///
-/// Returns `None` for binary files (marked with `-` in both columns) or
-/// malformed lines.
-fn parse_numstat_line(line: &str) -> Option<FileChangeInfo> {
-    let parts: Vec<&str> = line.splitn(3, '\t').collect();
-    if parts.len() < 3 {
+struct RawRow<'a> {
+    path: &'a str,
+    old: Option<&'a str>,
+    added: bool,
+}
+
+fn parse_raw_row(line: &str) -> Option<RawRow<'_>> {
+    let (metadata, paths) = line.split_once('\t')?;
+    let mut fields = metadata.split(' ');
+    for _ in 0..4 {
+        fields.next().filter(|field| !field.is_empty())?;
+    }
+    let status = fields.next()?;
+    if fields.next().is_some() {
         return None;
     }
-
-    let additions_str = parts[0].trim();
-    let deletions_str = parts[1].trim();
-    let raw_path = parts[2].trim();
-
-    // Skip binary files
-    if additions_str == "-" && deletions_str == "-" {
+    let (old, path) = match status {
+        "A" | "D" | "M" | "T" | "U" | "X" | "B" => (None, paths),
+        _ => {
+            let (kind, score) = status.split_at_checked(1)?;
+            if score.is_empty() || !score.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            match kind {
+                "M" => (None, paths),
+                "C" | "R" => {
+                    let (source, path) = paths.split_once('\t')?;
+                    if source.is_empty() {
+                        return None;
+                    }
+                    ((kind == "R").then_some(source), path)
+                }
+                _ => return None,
+            }
+        }
+    };
+    if path.is_empty() || path.contains('\t') {
         return None;
     }
-
-    let additions: u64 = additions_str.parse().unwrap_or(0);
-    let deletions: u64 = deletions_str.parse().unwrap_or(0);
-
-    // Resolve renames: `{old => new}` or `dir/{old => new}/rest`
-    let path = resolve_rename(raw_path);
-
-    Some(FileChangeInfo {
-        path: std::path::PathBuf::from(path),
-        additions,
-        deletions,
+    Some(RawRow {
+        path,
+        old,
+        added: status == "A",
     })
 }
 
-/// Resolve a git rename path like `{old => new}` or `dir/{old => new}/file`.
-fn resolve_rename(raw: &str) -> String {
-    // Find `{...}` brace pair
-    if let (Some(open), Some(close)) = (raw.find('{'), raw.rfind('}'))
-        && open < close
-    {
-        let prefix = &raw[..open];
-        let suffix = &raw[close + 1..];
-        let inner = &raw[open + 1..close];
+/// Binary rows have no line counts but still take part in ordinal pairing.
+struct NumstatRow<'a> {
+    path: &'a str,
+    lines: Option<(u64, u64)>,
+}
 
-        // inner is "old => new"
-        if let Some(arrow_pos) = inner.find(" => ") {
-            let new_part = &inner[arrow_pos + 4..];
-            return format!("{prefix}{new_part}{suffix}");
+fn parse_numstat_line(line: &str) -> Option<NumstatRow<'_>> {
+    let (add, rest) = line.split_once('\t')?;
+    let (del, path) = rest.split_once('\t')?;
+    let lines = match (add, del) {
+        ("-", "-") => None,
+        (a, d)
+            if a.bytes().all(|b| b.is_ascii_digit()) && d.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Some((a.parse().ok()?, d.parse().ok()?))
         }
+        _ => return None,
+    };
+    (!path.is_empty()).then_some(NumstatRow { path, lines })
+}
+
+/// Decode a path from Git output for a check on disk or against path rules.
+/// Keep the quoted form as the shared key for Git log, diff and HEAD paths.
+pub(super) fn disk_path(path: &str) -> Option<PathBuf> {
+    let (inner, quoted) = without_quotes(path);
+    if !quoted {
+        return Some(PathBuf::from(path));
     }
-    raw.to_string()
+    path_from_bytes(c_unescaped(inner)?)
+}
+
+/// The bytes of the text inside git's quotes, or `None` for an escape that
+/// git does not write. Each pass reads at least one byte, so the loop ends
+/// after at most `inner.len()` passes.
+fn c_unescaped(inner: &str) -> Option<Vec<u8>> {
+    let mut rest = inner.bytes();
+    let mut out = Vec::with_capacity(inner.len());
+    while let Some(b) = rest.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        let byte = match rest.next()? {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'"' => b'"',
+            b'\\' => b'\\',
+            // Three octal digits, the first 0-3, so the value fits in a byte.
+            first @ b'0'..=b'3' => {
+                let mut value = first - b'0';
+                for _ in 0..2 {
+                    let digit = rest.next().filter(|d| (b'0'..=b'7').contains(d))?;
+                    value = value * 8 + (digit - b'0');
+                }
+                value
+            }
+            _ => return None,
+        };
+        out.push(byte);
+    }
+    Some(out)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(std::ffi::OsString::from_vec(bytes).into())
+}
+
+/// Off Unix a path is text: bytes that are not UTF-8 name no file.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(Into::into)
 }
 
 // ============================================================================
@@ -579,6 +744,9 @@ mod tests {
         let mut out = String::new();
         for (hash, author, ts, subject, files) in entries {
             out.push_str(&header(hash, &ts.to_string(), author, subject));
+            for (_, _, path) in *files {
+                out.push_str(&format!(":100644 100644 1234 5678 M\t{path}\n"));
+            }
             for (add, del, path) in *files {
                 out.push_str(&format!("{add}\t{del}\t{path}\n"));
             }
@@ -599,7 +767,7 @@ mod tests {
     /// `bad.rs`, then a good record (one file `b.rs`).
     fn log_with_bad_record_between(bad: &str) -> String {
         format!(
-            "{}1\t0\ta.rs\n\n{bad}1\t0\tbad.rs\n\n{}1\t0\tb.rs\n\n",
+            "{}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n\n{bad}1\t0\tbad.rs\n\n{}:100644 100644 1234 5678 M\tb.rs\n1\t0\tb.rs\n\n",
             header(HASH_A, "1000", "Alice", "first"),
             header(HASH_B, "2000", "Bob", "second"),
         )
@@ -654,7 +822,7 @@ mod tests {
     #[test]
     fn test_parse_single_commit_with_files() {
         let input = format!(
-            "{}5\t2\tsrc/main.rs\n3\t1\tlib/utils.rs\n\n",
+            "{}:100644 100644 1234 5678 M\tsrc/main.rs\n:100644 100644 1234 5678 M\tlib/utils.rs\n5\t2\tsrc/main.rs\n3\t1\tlib/utils.rs\n\n",
             header(HASH_A, "1700000000", "Alice", "chore: update")
         );
         let parsed = parse_git_log_output(&input);
@@ -689,7 +857,7 @@ mod tests {
     #[test]
     fn test_parse_author_with_pipe_keeps_timestamp_and_subject() {
         let input = format!(
-            "{}1\t0\ta.rs\n\n",
+            "{}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n\n",
             header(HASH_A, "1700000123", "Ann | Ops", "feat: add foo|bar")
         );
         let parsed = parse_git_log_output(&input);
@@ -763,7 +931,7 @@ mod tests {
     #[test]
     fn test_binary_files_skipped() {
         let input = format!(
-            "{}-\t-\tbinary.bin\n5\t2\treal.rs\n\n",
+            "{}:100644 100644 1234 5678 M\tbinary.bin\n:100644 100644 1234 5678 M\treal.rs\n-\t-\tbinary.bin\n5\t2\treal.rs\n\n",
             header(HASH_A, "1000", "Alice", "msg")
         );
         let parsed = parse_git_log_output(&input);
@@ -771,38 +939,78 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_numstat_line_ignored() {
+    fn test_malformed_numstat_line_skips_record() {
         let input = format!(
             "{}not-a-numstat-line\n\n",
             header(HASH_A, "1000", "Alice", "msg")
         );
         let parsed = parse_git_log_output(&input);
-        // The malformed line should be silently ignored
-        assert_eq!(parsed.commits[0].changed_files.len(), 0);
+        assert!(parsed.commits.is_empty());
         assert_eq!(parsed.malformed, 0);
+        assert_eq!(parsed.unpaired, 1);
     }
 
     #[test]
-    fn test_rename_resolution_simple() {
-        assert_eq!(resolve_rename("{old.rs => new.rs}"), "new.rs");
-    }
-
-    #[test]
-    fn test_rename_resolution_with_prefix() {
-        assert_eq!(resolve_rename("src/{old.rs => new.rs}"), "src/new.rs");
-    }
-
-    #[test]
-    fn test_rename_resolution_with_suffix() {
-        assert_eq!(
-            resolve_rename("src/{old => new}/main.rs"),
-            "src/new/main.rs"
+    fn test_rename_merges_final_paths_before_metrics() {
+        let input = format!(
+            "{}:100644 100644 1234 5678 R100\told.rs\tnew.rs\n0\t0\told.rs => new.rs\n\n{}:100644 100644 1234 5678 M\told.rs\n:100644 100644 1234 5678 M\tnew.rs\n1\t2\told.rs\n3\t4\tnew.rs\n",
+            header(HASH_A, "2000", "Alice", "move"),
+            header(HASH_B, "1000", "Alice", "edit"),
         );
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(paths(&parsed.commits[1]), [Path::new("new.rs")]);
+        assert_eq!(parsed.commits[1].changed_files[0].additions, 4);
+        assert_eq!(parsed.commits[1].changed_files[0].deletions, 6);
     }
 
     #[test]
-    fn test_no_rename_passthrough() {
-        assert_eq!(resolve_rename("src/main.rs"), "src/main.rs");
+    fn test_log_skips_unpaired_records_without_installing_aliases() {
+        let fresh = header(HASH_A, "2000", "Alice", "bad");
+        let prior = header(HASH_B, "1000", "Alice", "good")
+            + ":000000 100644 0000 1234 A\told.rs\n1\t0\told.rs\n";
+        for bad in [
+            ":100644 100644 1234 5678 R100\told.rs\tnew.rs\n:100644 100644 1234 5678 M\tx.rs\n0\t0\told.rs => new.rs\n",
+            ":100644 100644 1234 5678 R100\told.rs\tnew.rs\n:100644 100644 1234 5678 M\tx.rs\n0\t0\told.rs => new.rs\n1\t0\ty.rs\n",
+            ":100644 100644 1234 5678 M\tx.rs\n+1\t0\tx.rs\n",
+            ":100644 100644 1234 5678 M\tx.rs\n-\t0\tx.rs\n",
+        ] {
+            let parsed = parse_git_log_output(&format!("{fresh}{bad}\n{prior}"));
+            assert_eq!(parsed.unpaired, 1, "{bad}");
+            assert_eq!(parsed.malformed, 0, "{bad}");
+            assert_eq!(parsed.commits.len(), 1, "{bad}");
+            assert_eq!(paths(&parsed.commits[0]), [Path::new("old.rs")]);
+        }
+    }
+
+    #[test]
+    fn test_log_drops_paths_that_are_unsafe_after_decode() {
+        let input = make_log(&[(
+            HASH_A,
+            "Alice",
+            1000,
+            "edit",
+            &[
+                ("1", "0", "/absolute.rs"),
+                ("1", "0", r#""src/\056\056/escape.rs""#),
+                ("1", "0", "safe.rs"),
+            ],
+        )]);
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(paths(&parsed.commits[0]), [Path::new("safe.rs")]);
+        assert_eq!(parsed.unsafe_paths, 2);
+    }
+
+    #[test]
+    fn test_binary_rename_keeps_alias_but_has_no_file_change() {
+        let input = format!(
+            "{}:100644 100644 1234 5678 R100\told.rs\tnew.rs\n-\t-\told.rs => new.rs\n{}:100644 100644 1234 5678 M\told.rs\n1\t0\told.rs\n",
+            header(HASH_A, "2000", "Alice", "move"),
+            header(HASH_B, "1000", "Alice", "edit"),
+        );
+        let parsed = parse_git_log_output(&input);
+        assert_eq!(parsed.unpaired, 0);
+        assert!(parsed.commits[0].changed_files.is_empty());
+        assert_eq!(paths(&parsed.commits[1]), [Path::new("new.rs")]);
     }
 
     // -----------------------------------------------------------------------
@@ -818,6 +1026,7 @@ mod tests {
                 "--literal-pathspecs",
                 "log",
                 "--format=COMMIT:%H%x00%ad%x00%aN%x00%s",
+                "--raw",
                 "--numstat",
                 "--no-merges",
                 "--date=unix",
@@ -886,7 +1095,7 @@ mod tests {
     /// `HASH_B` at 1000 with `b.rs`.
     fn two_records() -> String {
         format!(
-            "{}1\t0\ta.rs\n\n{}1\t0\tb.rs\n\n",
+            "{}:100644 100644 1234 5678 M\ta.rs\n1\t0\ta.rs\n\n{}:100644 100644 1234 5678 M\tb.rs\n1\t0\tb.rs\n\n",
             header(HASH_A, "2000", "Alice", "second"),
             header(HASH_B, "1000", "Bob", "first"),
         )
@@ -927,6 +1136,17 @@ mod tests {
             assert_two_records(&parsed);
             assert_eq!(parsed.cut_oldest, Some(1000), "exit {exit_code:?}");
         }
+    }
+
+    #[test]
+    fn test_log_cut_in_raw_block_drops_whole_record() {
+        let raw = two_records()
+            + &header(&"c".repeat(40), "500", "Cy", "third")
+            + ":100644 100644 1234 5678 R100\told.rs\tnew.rs\n:100644 100";
+        let parsed = parsed_log_from(&output(&raw, None), true, head_check_not_expected).unwrap();
+        assert_two_records(&parsed);
+        assert_eq!(parsed.unpaired, 0);
+        assert_eq!(parsed.cut_oldest, Some(1000));
     }
 
     #[test]

@@ -56,6 +56,10 @@ fn git_commit(dir: &Path, filename: &str, content: &str, message: &str, timestam
         String::from_utf8_lossy(&add_out.stderr)
     );
 
+    git_commit_staged(dir, message, timestamp);
+}
+
+fn git_commit_staged(dir: &Path, message: &str, timestamp: u64) {
     let ts = format!("{timestamp}");
     let commit_out = StdCommand::new("git")
         .args(["commit", "-m", message])
@@ -1351,6 +1355,154 @@ fn file_entry<'a>(json: &'a serde_json::Value, path: &str) -> &'a serde_json::Va
         .iter()
         .find(|f| f["path"] == path)
         .unwrap_or_else(|| panic!("{path} missing from files[]"))
+}
+
+fn git_move(dir: &Path, old: &str, new: &str) {
+    std::fs::create_dir_all(dir.join(new).parent().unwrap()).unwrap();
+    let out = StdCommand::new("git")
+        .args(["mv", "--", old, new])
+        .current_dir(dir)
+        .output()
+        .expect("git mv");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_heatmap_plain_rename_moves_history_to_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let content = "fn work() {}\n".repeat(20);
+    git_commit(dir.path(), "old.rs", &content, "feat: add", 1_700_000_000);
+    git_move(dir.path(), "old.rs", "new.rs");
+    git_commit(
+        dir.path(),
+        "new.rs",
+        &(content + "// edit\n"),
+        "fix: move",
+        1_700_000_001,
+    );
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(json["files"].as_array().unwrap().len(), 1, "{json}");
+    assert_eq!(file_entry(&json, "new.rs")["churn"]["commits"], 2);
+}
+
+#[test]
+fn test_heatmap_brace_rename_paths_use_the_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let moves = [
+        ("src/old/a.rs", "src/new/a.rs"),
+        ("old/b.rs", "new/b.rs"),
+        ("src/c.rs", "src/added/c.rs"),
+        ("src/gone/d.rs", "src/d.rs"),
+    ];
+    git_commit_files(
+        dir.path(),
+        &moves.map(|(old, _)| (old, old)),
+        "feat: add",
+        1_700_000_000,
+    );
+    for (old, new) in moves {
+        git_move(dir.path(), old, new);
+    }
+    git_commit_staged(dir.path(), "refactor: move", 1_700_000_001);
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(
+        json["files"].as_array().unwrap().len(),
+        moves.len(),
+        "{json}"
+    );
+    for (_, new) in moves {
+        assert_eq!(file_entry(&json, new)["churn"]["commits"], 1);
+    }
+}
+
+#[test]
+fn test_heatmap_rename_chain_leaves_reused_old_path_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let ts = 1_700_000_000;
+    git_commit(dir.path(), "old.rs", "first\n", "feat: add original", ts);
+    git_move(dir.path(), "old.rs", "middle.rs");
+    git_commit_staged(dir.path(), "refactor: move once", ts + 1);
+    git_commit(
+        dir.path(),
+        "middle.rs",
+        "second\n",
+        "feat: edit original",
+        ts + 2,
+    );
+    git_move(dir.path(), "middle.rs", "final.rs");
+    git_commit_staged(dir.path(), "refactor: move twice", ts + 3);
+    git_commit(
+        dir.path(),
+        "old.rs",
+        "another file\n",
+        "feat: add another file",
+        ts + 4,
+    );
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(json["files"].as_array().unwrap().len(), 2, "{json}");
+    assert_eq!(file_entry(&json, "final.rs")["churn"]["commits"], 2);
+    assert_eq!(file_entry(&json, "old.rs")["churn"]["commits"], 1);
+}
+
+#[test]
+fn test_heatmap_rename_alias_applies_before_exclusion_and_cards() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "Cargo.lock",
+        "first\n",
+        "feat: add",
+        1_700_000_000,
+    );
+    git_move(dir.path(), "Cargo.lock", "lib.rs");
+    git_commit_staged(dir.path(), "refactor: move", 1_700_000_001);
+    git_commit(dir.path(), "lib.rs", "second\n", "fix: edit", 1_700_000_002);
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(file_entry(&json, "lib.rs")["churn"]["commits"], 2);
+    let card = heatmap_stdout(dir.path(), &["--window", "all", "lib.rs"]);
+    assert_eq!(card_lines(&card, "lib.rs")[0], "lib.rs: 2 commits");
+}
+
+#[test]
+fn test_heatmap_rename_arrow_in_file_name_stays_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    let path = "src/{old => new}.rs";
+    git_commit(dir.path(), path, "first\n", "feat: add", 1_700_000_000);
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(file_entry(&json, path)["churn"]["commits"], 1);
+}
+
+#[test]
+fn test_heatmap_rename_only_commit_does_not_add_a_touch() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "src/old.rs",
+        "first\n",
+        "feat: add",
+        1_700_000_000,
+    );
+    git_move(dir.path(), "src/old.rs", "src/new.rs");
+    git_commit_staged(dir.path(), "refactor: move", 1_700_000_001);
+
+    let json = heatmap_json_with(dir.path(), &["--window", "all"]);
+    assert_eq!(json["window"]["commits_analyzed"], 1);
+    assert_eq!(file_entry(&json, "src/new.rs")["churn"]["commits"], 1);
 }
 
 #[test]
