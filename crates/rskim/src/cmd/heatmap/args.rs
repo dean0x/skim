@@ -393,10 +393,12 @@ FILE CARDS:
     with 2 or more authors), co-change partners with 3 or more shared commits
     (tests first), and fix commits from history, newest first. A file outside
     the window prints \"not in history window\". --insights <FILE> prints the
-    same card. ./x, an absolute path under the repository root and a path
-    relative to the current folder give the same card; a path outside the
-    repository exits 1. Metrics come from the full window; a card only
-    narrows the display.
+    same card. ./x, an absolute path and a path relative to the current
+    folder give the same card. The card comes from the git repository that
+    holds the file, also when the current folder is in another repository
+    or in none; there, --path is relative to the root of that repository.
+    A path in no repository, or files from two repositories, exit 1.
+    Metrics come from the full window; a card only narrows the display.
 
 FILE TARGETING:
     --path scopes the git log itself (commit-level filter); it composes with

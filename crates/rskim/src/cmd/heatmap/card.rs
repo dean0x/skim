@@ -141,6 +141,19 @@ pub(crate) fn normalise_target(arg: &str, repo_root: &str, prefix: &str) -> anyh
     Ok(relative.to_string())
 }
 
+/// The file argument `arg` as an absolute path, by text only: a relative
+/// `arg` goes below `cwd`, then `.`, `..` and repeated `/` fold as in
+/// [`normalise_target`]. `cwd` must be absolute.
+#[must_use]
+pub(crate) fn absolute_arg(arg: &str, cwd: &str) -> String {
+    debug_assert!(Path::new(cwd).is_absolute(), "the cwd is absolute");
+    if Path::new(arg).is_absolute() {
+        fold_dots(arg)
+    } else {
+        fold_dots(&format!("{cwd}/{arg}"))
+    }
+}
+
 /// Fold the `.` and `..` components and the repeated `/` of `path`, by
 /// text. A leading `/` stays. A `..` with no folder before it stays too, so
 /// the containment check refuses the path.
@@ -594,6 +607,20 @@ mod tests {
                 format!("'{arg}' names the repository root, not a file"),
                 "{arg} from {prefix:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_absolute_arg_joins_a_relative_arg_to_the_cwd_and_folds_it() {
+        for (arg, expected) in [
+            ("src/main.rs", "/work/repo/src/main.rs"),
+            ("./src//main.rs", "/work/repo/src/main.rs"),
+            ("../other/lib.rs", "/work/other/lib.rs"),
+            ("/abs/./x/../y.rs", "/abs/y.rs"),
+            // A `..` above `/` stays, as in `normalise_target`.
+            ("../../../../x.rs", "/../../x.rs"),
+        ] {
+            assert_eq!(absolute_arg(arg, "/work/repo"), expected, "{arg}");
         }
     }
 

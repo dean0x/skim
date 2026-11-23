@@ -29,7 +29,9 @@ use crate::analytics::{CommandType, RecordingContext};
 
 use args::{parse_args, print_help};
 use excludes::Excludes;
-use git_source::{CliGitSource, GitDataSource, HeadEntry, HeadTree, ParsedLog, disk_path};
+use git_source::{
+    CliGitSource, GitDataSource, HeadEntry, HeadTree, NoToplevel, ParsedLog, disk_path,
+};
 use insights::{build_insights_result, compute_insights, keep_code_findings};
 use metrics::{
     CouplingResult, ModuleRoots, compute_authors, compute_churn, compute_coupling,
@@ -78,7 +80,16 @@ pub(crate) fn run(
         }
     };
 
-    let git_source = CliGitSource::new();
+    let git_source = match card_source(&raw_args.files) {
+        Ok((source, files)) => {
+            raw_args.files = files;
+            source
+        }
+        Err(e) => {
+            note(format_args!("skim heatmap: {e}"));
+            return Ok(ExitCode::FAILURE);
+        }
+    };
 
     // Resolve --diff to concrete file list (borrows raw_args mutably)
     if let Some(exit) = resolve_diff_files(&git_source, &mut raw_args)? {
@@ -87,6 +98,60 @@ pub(crate) fn run(
 
     // Move raw_args into run_with_source for resolution and execution
     run_with_source(&git_source, raw_args, analytics)
+}
+
+/// The git source for the file cards, and the file arguments to use with it.
+///
+/// The source is the repository that holds the files, which is not always
+/// the repository of the cwd. Each file must be in a repository, and all of
+/// them in the same one: two repositories in one call are refused, so the
+/// cards always share one history. When the files are in the cwd
+/// repository, the source and the arguments stay as they are. Else git runs
+/// in the repository of the files, and each argument becomes its absolute
+/// path. No file is opened: git runs in the nearest folder above each path.
+fn card_source(files: &[String]) -> anyhow::Result<(CliGitSource, Vec<String>)> {
+    let here = CliGitSource::new();
+    if files.is_empty() {
+        return Ok((here, Vec::new()));
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("cannot read the current folder: {e}"))?;
+    // The text rules of the cards need a UTF-8 cwd. Without one, git keeps
+    // the cwd repository, as before.
+    let Some(cwd) = cwd.to_str() else {
+        return Ok((here, files.to_vec()));
+    };
+
+    let mut located = Vec::with_capacity(files.len());
+    for arg in files {
+        let path = card::absolute_arg(arg, cwd);
+        let root = here.toplevel_of(&path).map_err(|e| match e {
+            NoToplevel::NoRepository => {
+                anyhow::anyhow!("'{}' is in no git repository", card::shown_path(arg))
+            }
+            NoToplevel::Git(message) => anyhow::anyhow!(message),
+        })?;
+        located.push((arg, path, root));
+    }
+
+    let Some((first, _, root)) = located.first() else {
+        return Ok((here, Vec::new()));
+    };
+    if let Some((other, _, _)) = located.iter().find(|(_, _, r)| r != root) {
+        anyhow::bail!(
+            "'{}' and '{}' are in different repositories. Give the files of one repository in each call.",
+            card::shown_path(first),
+            card::shown_path(other)
+        );
+    }
+    if here.get_repo_root().is_ok_and(|cwd_root| cwd_root == *root) {
+        return Ok((here, files.to_vec()));
+    }
+    let source = CliGitSource::in_dir(root.clone());
+    Ok((
+        source,
+        located.into_iter().map(|(_, path, _)| path).collect(),
+    ))
 }
 
 /// Resolve `--diff` to a concrete file list, mutating `args.diff_files`.
