@@ -427,6 +427,55 @@ fn test_heatmap_since_filters_commits() {
         .stdout(predicate::str::contains("old.rs").not());
 }
 
+#[test]
+fn test_heatmap_since_date_starts_at_utc_midnight() {
+    const MIDNIGHT: u64 = 1_793_491_200; // 2026-11-01 00:00:00 UTC
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    git_commit(
+        dir.path(),
+        "before.rs",
+        "before",
+        "feat: before",
+        MIDNIGHT - 1,
+    );
+    git_commit(dir.path(), "at.rs", "at", "feat: at", MIDNIGHT);
+
+    common::skim()
+        .args(["heatmap", "--since", "2026-11-01"])
+        .env("TZ", "UTC+8")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(" 2026-11-01.."))
+        .stdout(predicate::str::contains(", 1 commit, time window"))
+        .stdout(predicate::str::contains("at.rs"))
+        .stdout(predicate::str::contains("before.rs").not());
+}
+
+#[test]
+fn test_heatmap_since_date_errors_name_all_forms() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for date in [
+        "2026-02-30",
+        "2026-13-01",
+        "2025-02-29",
+        "1969-12-31",
+        "10000-01-01",
+    ] {
+        common::skim()
+            .args(["heatmap", "--since", date])
+            .current_dir(dir.path())
+            .assert()
+            .code(1)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains("--since"))
+            .stderr(predicate::str::contains("epoch seconds"))
+            .stderr(predicate::str::contains("YYYY-MM-DD"))
+            .stderr(predicate::str::contains("duration"));
+    }
+}
+
 // ============================================================================
 // --window preset
 // ============================================================================

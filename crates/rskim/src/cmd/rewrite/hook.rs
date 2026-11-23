@@ -926,18 +926,15 @@ fn audit_archive_path(log_path: &std::path::Path, index: u32) -> std::path::Path
     std::path::PathBuf::from(path)
 }
 
-/// Get today's date as YYYY-MM-DD string.
+/// Get today's UTC date as a YYYY-MM-DD string.
 fn today_date_string() -> String {
-    // Use SystemTime to avoid pulling in chrono dependency
     let now = std::time::SystemTime::now();
     let secs = now
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // Convert to days since epoch, then to date components
-    let days = secs / 86400;
-    // Simple date calculation (good enough for stamp file purposes)
-    let (year, month, day) = crate::cmd::hook_log::days_to_date(days);
+    let days = secs / crate::analytics::SECONDS_PER_DAY;
+    let (year, month, day) = crate::cmd::session::civil::days_to_ymd(days);
     format!("{year:04}-{month:02}-{day:02}")
 }
 

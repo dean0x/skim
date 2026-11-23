@@ -282,15 +282,19 @@ fn extract_value(args: &[String], i: &mut usize, flag: &str) -> Option<String> {
     }
 }
 
-/// Parse a `--since` value: accepts epoch seconds (integer) or duration strings
-/// like "30d", "2w", "24h".
+/// Parse `--since` as epoch seconds, a UTC date, or a duration.
 fn parse_since_value(val: &str) -> anyhow::Result<u64> {
-    // Try plain integer (epoch seconds)
     if let Ok(epoch) = val.parse::<u64>() {
         return Ok(epoch);
     }
-    // Try duration string
-    let sys_time = crate::cmd::session::types::parse_duration_ago(val)?;
+    if let Ok(epoch) = crate::cmd::session::civil::parse_utc_date(val) {
+        return Ok(epoch);
+    }
+    let sys_time = crate::cmd::session::parse_duration_ago(val).map_err(|_| {
+        anyhow::anyhow!(
+            "--since expects epoch seconds, a UTC date (YYYY-MM-DD), or a duration (Nd, Nh, Nw)"
+        )
+    })?;
     let epoch = sys_time
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("--since: time before Unix epoch"))?
@@ -513,17 +517,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_args_since_date_is_utc_epoch() {
+        let args = parse_args(&["--since=2026-11-01".to_string()]).unwrap();
+        assert_eq!(args.since, Some(1_793_491_200));
+    }
+
+    #[test]
     fn test_parse_args_since_duration() {
-        let args = parse_args(&["--since=30d".to_string()]).unwrap();
-        // Should be set to some epoch in the past
-        assert!(args.since.is_some());
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let since = args.since.unwrap();
-        let diff = now - since;
-        assert!((29 * 86400..=31 * 86400).contains(&diff));
+        let now_epoch = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        for (duration, seconds) in [("30d", 30 * 86_400), ("24h", 86_400), ("2w", 14 * 86_400)] {
+            let before = now_epoch();
+            let since = parse_args(&[format!("--since={duration}")])
+                .unwrap()
+                .since
+                .unwrap();
+            let after = now_epoch();
+            assert!((before..=after).contains(&(since + seconds)), "{duration}");
+        }
     }
 
     #[test]

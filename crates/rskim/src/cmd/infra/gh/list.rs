@@ -13,6 +13,7 @@
 //!   a fallback, not the primary format.
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation.
 
+use crate::cmd::session::civil::{days_from_civil, digits};
 use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
@@ -114,14 +115,9 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // Elapsed time from RFC-3339 timestamps (no date dependency)
 // ============================================================================
 //
-// `gh` reports run timing as two RFC-3339 instants and skim has no date crate
-// (and is not adding one to a security-audited binary for a subtraction).
-// These four functions are the whole of it: a total parser, a civil-date
-// conversion, a formatter, and the combinator the renderer calls.
-//
-// Every one is pure and allocation-free except the two that build the output
-// String, and every scan is bounded by a fixed field width or by
-// `MAX_FRACTION_DIGITS`.
+// `gh` reports two RFC-3339 instants for each run. The parser uses the
+// shared civil-date conversion and does not allocate. Each scan has a
+// fixed field width or the `MAX_FRACTION_DIGITS` limit.
 
 /// Maximum fractional-second digits accepted in a timestamp.
 ///
@@ -129,41 +125,6 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 /// timestamp with more precision than this is rejected rather than truncated:
 /// misreading an instant is worse than declining to read it.
 const MAX_FRACTION_DIGITS: usize = 9;
-
-/// Days from 1970-01-01 to the given proleptic-Gregorian civil date.
-///
-/// Howard Hinnant's `days_from_civil`. It is exact for every date in range and
-/// uses only truncating integer division — the `y - 399` adjustment is what
-/// makes Rust's toward-zero division agree with the floor division the
-/// algorithm is derived for. No allocation, no branching on input length, and
-/// no overflow: `rfc3339_to_unix_secs` bounds the year at four digits, so the
-/// result cannot leave `i64`.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (m + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// Parse exactly `len` ASCII digits at `start`.
-///
-/// Returns `None` if the slice is short or holds a non-digit. The loop is
-/// bounded by `len`, which every caller passes as a fixed field width.
-fn digits(bytes: &[u8], start: usize, len: usize) -> Option<i64> {
-    let end = start.checked_add(len)?;
-    let slice = bytes.get(start..end)?;
-    let mut acc: i64 = 0;
-    for &byte in slice {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        acc = acc * 10 + i64::from(byte - b'0');
-    }
-    Some(acc)
-}
 
 /// Parse an RFC-3339 timestamp into seconds since the Unix epoch.
 ///
@@ -185,8 +146,8 @@ fn digits(bytes: &[u8], start: usize, len: usize) -> Option<i64> {
 /// EVERY month, with no per-month table and no February/leap-year case. So
 /// `2026-02-31` and `2026-04-31` are accepted and resolve to a real instant a
 /// few days past the end of that month rather than being rejected. Totality
-/// and boundedness are preserved either way — `days_from_civil` is defined for
-/// any `(y, m, d)` triple — so the laxness costs correctness about WHICH DATES
+/// and boundedness are preserved either way — `days_from_civil` accepts the
+/// bounded fields above — so the laxness costs correctness about WHICH DATES
 /// EXIST, and nothing else.
 ///
 /// That is safe here and only here. The single consumer renders the result
@@ -1115,32 +1076,6 @@ mod tests {
         assert_eq!(
             elapsed_label(start, Some("2026-01-15T14:31:20Z"), false).as_deref(),
             Some("1m20s+")
-        );
-    }
-
-    /// Cross-checks `days_from_civil` at the boundaries the algorithm is most
-    /// likely to get wrong: the epoch itself, a leap day, the day after a leap
-    /// day, and a century that is not a leap year.
-    #[test]
-    fn test_days_from_civil_boundaries() {
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(1969, 12, 31), -1);
-        assert_eq!(days_from_civil(1971, 1, 1), 365);
-        assert_eq!(days_from_civil(1972, 1, 1), 730);
-        // 1972 was a leap year: Feb 29 exists and Mar 1 follows it.
-        assert_eq!(
-            days_from_civil(1972, 3, 1) - days_from_civil(1972, 2, 29),
-            1
-        );
-        // 1900 was NOT a leap year (divisible by 100, not by 400).
-        assert_eq!(
-            days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28),
-            1
-        );
-        // 2000 WAS a leap year (divisible by 400).
-        assert_eq!(
-            days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28),
-            2
         );
     }
 

@@ -5,6 +5,7 @@
 //! Copilot CLI, Cursor, Gemini CLI, Crush); new agents are added by
 //! implementing the trait -- no conditionals in business logic.
 
+pub(in crate::cmd) mod civil;
 mod claude;
 mod codex;
 mod copilot;
