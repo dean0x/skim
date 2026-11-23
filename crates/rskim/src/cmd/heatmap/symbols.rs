@@ -205,6 +205,23 @@ mod tests {
     }
 
     #[test]
+    fn js_and_ts_keep_plain_methods_but_not_computed_keys() {
+        let source = "class Item {\n  plain() {}\n  [method]() {}\n  get [k]() { return 1; }\n}\n";
+        let paths = ["item.js", "item.ts", "item.tsx", "item.jsx"];
+        let actual = paths.map(|path| (path, read(path, source).rows));
+        let expected = paths.map(|path| {
+            (
+                path,
+                vec![
+                    row("class_declaration", "Item", 1),
+                    row("method_definition", "Item::plain", 2),
+                ],
+            )
+        });
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn quoted_non_ascii_tsx_path_keeps_declarations_after_jsx() {
         let tsx = "const before = <div />;\nexport function after() { return null; }\n";
         assert_eq!(
