@@ -102,32 +102,31 @@ fn git_show_blob_with_a_mode_reads_raw_markdown() {
 }
 
 #[test]
-fn git_show_and_diff_keep_changed_markdown_lines() {
+fn git_diff_full_prints_only_the_hunk_at_the_markdown_limit() {
     let repo = SearchRepo::new();
-    let before = nested_report("Old notes");
-    let after = nested_report("New notes");
-    repo.write("report.md", &before);
+    // The indent reaches the estimate limit. The grammar reads it as code text.
+    let indent = " ".repeat(397);
+    let report = |body| format!("# Report\n\n```\n{indent}{body}\n```\n");
+    repo.write("report.md", report("Old notes"));
     commit(&repo, "Add report");
-    repo.write("report.md", &after);
+    repo.write("report.md", report("New notes"));
 
-    let working = run(skim_git(&mut repo.skim(), &repo, &["diff"]));
+    // With no hunk context, only a successful parse can add the heading and fence.
+    let working = run(skim_git(
+        &mut repo.skim(),
+        &repo,
+        &["diff", "--mode=full", "-U0"],
+    ));
     commit(&repo, "Update report");
     let revision = run(skim_git(
         &mut repo.skim(),
         &repo,
-        &["diff", "HEAD~1", "HEAD"],
+        &["diff", "--mode=full", "-U0", "HEAD~1", "HEAD"],
     ));
-    let show = run(skim_git(&mut repo.skim(), &repo, &["show", "HEAD"]));
-    let expected = format!(
-        "report.md (modified)\n 1 # Report\n 2 \n-3 {}\n+3 {}\n",
-        before.lines().last().unwrap(),
-        after.lines().last().unwrap()
-    );
+    let expected = format!("report.md (modified)\n-4 {indent}Old notes\n+4 {indent}New notes\n");
     for output in [working, revision] {
         assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     }
-    let stdout = String::from_utf8(show.stdout).unwrap();
-    assert!(stdout.ends_with(&expected), "{stdout}");
 }
 
 #[test]
