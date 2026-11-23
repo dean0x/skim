@@ -108,8 +108,8 @@ pub(crate) struct CliGitSource {
     dir: Option<String>,
 }
 
-/// Why [`CliGitSource::toplevel_of`] gave no repository root.
-#[derive(Debug, PartialEq, Eq)]
+/// Why [`CliGitSource::toplevel_in`] gave no repository root.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NoToplevel {
     /// No repository holds the path.
     NoRepository,
@@ -197,29 +197,18 @@ impl CliGitSource {
         self.runner.run_stdout_degrade("git", &full)
     }
 
-    /// The root of the work tree that holds `path`, as git reports it.
+    /// The root of the work tree that holds the folder `folder`, as git
+    /// reports it.
     ///
-    /// Git runs in the nearest folder above `path` that exists, so a path
-    /// that is not on disk (a deleted file) still finds its repository. The
-    /// file itself is never opened. `path` must be absolute.
-    pub(crate) fn toplevel_of(&self, path: &str) -> Result<String, NoToplevel> {
-        debug_assert!(
-            Path::new(path).is_absolute(),
-            "toplevel_of takes an absolute path"
-        );
-        // `ancestors` ends at the file system root, so the walk is bounded.
-        let folder = Path::new(path)
-            .ancestors()
-            .skip(1)
-            .find(|p| p.is_dir())
-            .and_then(Path::to_str);
-        let Some(folder) = folder else {
-            return Err(NoToplevel::NoRepository);
-        };
-        let out = self
+    /// [`toplevel_from`] reads git's English "not a git repository" text.
+    /// With a git that prints translated messages, a folder in no
+    /// repository gives [`NoToplevel::Git`] with git's own text instead:
+    /// the run still exits 1. The runner takes no environment here, so the
+    /// call cannot set `LC_ALL`.
+    pub(crate) fn toplevel_in(&self, folder: &str) -> Result<String, NoToplevel> {
+        let (out, _) = self
             .run_git(&["-C", folder, "rev-parse", "--show-toplevel"])
-            .map_err(|e| NoToplevel::Git(git_not_found(e).to_string()))?
-            .0;
+            .map_err(|e| NoToplevel::Git(git_not_found(e).to_string()))?;
         toplevel_from(&out)
     }
 
@@ -600,7 +589,19 @@ fn parse_count_line(line: &str) -> Option<(String, u64)> {
     Some((path.to_owned(), count.parse().ok()?))
 }
 
-/// Keep each path byte except Git's line terminator.
+/// The nearest folder at or above the absolute `path` that exists: `path`
+/// itself when it is a folder. A path that is not on disk (a deleted file)
+/// thus still has a folder for git to run in. Nothing is opened; the check
+/// follows symlinks, as git does. `ancestors` ends at the file system root,
+/// so the walk has one step per path component at most.
+pub(crate) fn nearest_folder(path: &str) -> Option<&str> {
+    debug_assert!(Path::new(path).is_absolute(), "the path is absolute");
+    Path::new(path)
+        .ancestors()
+        .find(|p| p.is_dir())
+        .and_then(Path::to_str)
+}
+
 /// `args` after `-C <dir>`, or `args` alone when there is no `dir`. A later
 /// `-C` in `args` is read relative to `dir`; the callers give it an absolute
 /// path.
@@ -633,6 +634,7 @@ fn toplevel_from(out: &CommandOutput) -> Result<String, NoToplevel> {
     }
 }
 
+/// Keep each path byte except Git's line terminator.
 fn rev_parse_path(out: &CommandOutput, flag: &str) -> anyhow::Result<String> {
     if out.exit_code != Some(0) {
         anyhow::bail!("git rev-parse {flag} failed: {}", out.stderr.trim());
@@ -1743,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn test_in_dir_source_reads_that_repo_and_toplevel_of_finds_it() {
+    fn test_in_dir_source_reads_that_repo_and_toplevel_in_finds_it() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         git_in(&root, &["init", "-q"]);
@@ -1757,9 +1759,20 @@ mod tests {
 
         // A file that is not on disk, below a folder that is not on disk.
         let gone = format!("{root_text}/src/gone/deleted.rs");
+        let src = format!("{root_text}/src");
+        assert_eq!(nearest_folder(&gone), Some(src.as_str()));
+        // A folder is its own nearest folder.
+        assert_eq!(nearest_folder(root_text), Some(root_text));
         assert_eq!(
-            CliGitSource::new().toplevel_of(&gone),
+            CliGitSource::new().toplevel_in(&src),
             Ok(root_text.to_string())
+        );
+        assert_eq!(
+            CliGitSource::new()
+                .toplevel_in(&format!("{root_text}/.git"))
+                .map_err(|e| matches!(e, NoToplevel::Git(_))),
+            Err(true),
+            "a folder inside .git is a git failure, not 'no repository'"
         );
     }
 

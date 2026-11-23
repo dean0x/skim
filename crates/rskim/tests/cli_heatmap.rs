@@ -4297,6 +4297,129 @@ fn test_heatmap_cards_from_two_repos_exit_1_with_no_card() {
     }
 }
 
+fn stdout_of(output: &std::process::Output) -> String {
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout.clone()).expect("utf-8 stdout")
+}
+
+fn assert_refused(output: &std::process::Output, message: &str) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(message), "want {message:?} in {stderr}");
+}
+
+#[test]
+fn test_heatmap_card_of_a_repo_root_names_the_root() {
+    let repos = RepoPair::new();
+    for (cwd, arg) in [
+        ("a", "."),
+        ("a", "./"),
+        ("a/src", ".."),
+        ("b", "../a"),
+        ("plain", "../a"),
+    ] {
+        let output = repos.heatmap(cwd, &[arg]);
+        assert_refused(
+            &output,
+            &format!("'{arg}' names the repository root, not a file"),
+        );
+    }
+}
+
+#[test]
+fn test_heatmap_card_with_git_dir_set_keeps_the_cwd_repo() {
+    let repos = RepoPair::new();
+    let expected = stdout_of(&repos.heatmap("a", &[CARD_FILE]));
+    let absolute = repos.path("a/.git");
+    for git_dir in [std::ffi::OsStr::new(".git"), absolute.as_os_str()] {
+        let output = common::skim()
+            .args(["heatmap", CARD_FILE])
+            .env("GIT_CEILING_DIRECTORIES", &repos.root)
+            .env("GIT_DIR", git_dir)
+            .current_dir(repos.path("a"))
+            .output()
+            .unwrap();
+        assert_eq!(stdout_of(&output), expected, "GIT_DIR={git_dir:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_heatmap_card_through_a_symlinked_folder_in_the_cwd_repo_keeps_the_cwd_repo() {
+    let repos = RepoPair::new();
+    // The link is in repo `a`, and it points into repo `b`.
+    std::os::unix::fs::symlink(repos.path("b"), repos.path("a/linkdir")).expect("symlink");
+    let text = stdout_of(&repos.heatmap("a", &["linkdir/main.rs"]));
+    let card = card_lines(&text, "linkdir/main.rs");
+    assert_eq!(card.len(), 1, "{text}");
+    assert!(
+        card[0].starts_with("linkdir/main.rs: not in history window ("),
+        "{text}"
+    );
+}
+
+#[test]
+fn test_heatmap_card_path_that_leaves_and_reenters_the_cwd_repo_gives_the_card() {
+    let repos = RepoPair::new();
+    let expected = stdout_of(&repos.heatmap("a", &[CARD_FILE]));
+    assert_eq!(
+        stdout_of(&repos.heatmap("a", &["../a/src/core.rs"])),
+        expected
+    );
+    assert_eq!(
+        stdout_of(&repos.heatmap("a/src", &["../../a/src/core.rs"])),
+        expected
+    );
+}
+
+#[test]
+fn test_heatmap_card_with_path_scope_from_a_subfolder_keeps_the_cwd_scope() {
+    let repos = RepoPair::new();
+    let expected = stdout_of(&repos.heatmap("a", &["--path", "src", CARD_FILE]));
+    assert_eq!(
+        stdout_of(&repos.heatmap("a/src", &["--path", ".", "core.rs"])),
+        expected
+    );
+}
+
+#[test]
+fn test_heatmap_card_git_failure_in_another_repo_names_the_path() {
+    let repos = RepoPair::new();
+    let output = repos.heatmap("b", &["../a/.git/config"]);
+    assert_refused(
+        &output,
+        "'../a/.git/config': git rev-parse --show-toplevel failed",
+    );
+}
+
+#[test]
+fn test_heatmap_cards_in_one_folder_of_another_repo_ask_git_once_for_the_root() {
+    let repos = RepoPair::new();
+    let trace = repos.path("trace.log");
+    let output = common::skim()
+        .args([
+            "heatmap",
+            "../a/src/core.rs",
+            "../a/src/util.rs",
+            "../a/src/gone.rs",
+        ])
+        .env("GIT_CEILING_DIRECTORIES", &repos.root)
+        .env("GIT_TRACE", &trace)
+        .current_dir(repos.path("b"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let log = std::fs::read_to_string(&trace).expect("git trace");
+    // One call for the cwd root, one for the folder `a/src`, and one in the
+    // run itself. Without the cache of each folder, each file adds a call.
+    let calls = log
+        .lines()
+        .filter(|l| l.contains("rev-parse --show-toplevel"))
+        .count();
+    assert_eq!(calls, 3, "{log}");
+}
+
 #[cfg(unix)]
 #[test]
 fn test_heatmap_card_path_through_a_symlinked_folder_stays_refused() {

@@ -102,56 +102,101 @@ pub(crate) fn run(
 
 /// The git source for the file cards, and the file arguments to use with it.
 ///
-/// The source is the repository that holds the files, which is not always
-/// the repository of the cwd. Each file must be in a repository, and all of
-/// them in the same one: two repositories in one call are refused, so the
-/// cards always share one history. When the files are in the cwd
-/// repository, the source and the arguments stay as they are. Else git runs
-/// in the repository of the files, and each argument becomes its absolute
-/// path. No file is opened: git runs in the nearest folder above each path.
+/// A path below the cwd repository by text keeps that repository and the
+/// text rules of [`card::normalise_target`], as before. Only a path outside
+/// it, or any path when the cwd is in no repository, asks git for the
+/// repository that holds it (see [`locate_card`]). All files must be in one
+/// repository: two repositories in one call are refused, so the cards
+/// always share one history. When the files are in another repository, git
+/// runs there.
+///
+/// With `GIT_DIR` or `GIT_WORK_TREE` set, git does not look for the
+/// repository above a folder. On a platform other than unix, the text rules
+/// expect `/`. In these cases, and with a cwd that is not a UTF-8 path, the
+/// cwd repository stays the only one, as before.
 fn card_source(files: &[String]) -> anyhow::Result<(CliGitSource, Vec<String>)> {
     let here = CliGitSource::new();
-    if files.is_empty() {
-        return Ok((here, Vec::new()));
+    if files.is_empty() || !cfg!(unix) || git_repo_env_set() {
+        return Ok((here, files.to_vec()));
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("cannot read the current folder: {e}"))?;
-    // The text rules of the cards need a UTF-8 cwd. Without one, git keeps
-    // the cwd repository, as before.
-    let Some(cwd) = cwd.to_str() else {
+    let cwd = std::env::current_dir().ok();
+    let Some(cwd) = cwd.as_deref().and_then(std::path::Path::to_str) else {
         return Ok((here, files.to_vec()));
     };
+    let cwd_repo = here.get_repo_root().ok().zip(here.show_prefix().ok());
 
-    let mut located = Vec::with_capacity(files.len());
+    let mut folders = std::collections::HashMap::new();
+    let mut first: Option<(&str, String)> = None;
+    let mut args = Vec::with_capacity(files.len());
     for arg in files {
-        let path = card::absolute_arg(arg, cwd);
-        let root = here.toplevel_of(&path).map_err(|e| match e {
-            NoToplevel::NoRepository => {
-                anyhow::anyhow!("'{}' is in no git repository", card::shown_path(arg))
-            }
-            NoToplevel::Git(message) => anyhow::anyhow!(message),
-        })?;
-        located.push((arg, path, root));
+        let (root, pass) = locate_card(&here, cwd, cwd_repo.as_ref(), &mut folders, arg)?;
+        match &first {
+            Some((first_arg, first_root)) if *first_root != root => anyhow::bail!(
+                "'{}' and '{}' are in different repositories. Give the files of one repository in each call.",
+                card::shown_path(first_arg),
+                card::shown_path(arg)
+            ),
+            Some(_) => {}
+            None => first = Some((arg, root)),
+        }
+        args.push(pass);
     }
 
-    let Some((first, _, root)) = located.first() else {
-        return Ok((here, Vec::new()));
+    match first {
+        Some((_, root)) if cwd_repo.is_none_or(|(cwd_root, _)| cwd_root != root) => {
+            Ok((CliGitSource::in_dir(root), args))
+        }
+        _ => Ok((here, args)),
+    }
+}
+
+/// The repository root of one file argument, and the argument to pass on.
+///
+/// A path below the cwd repository by text passes on as typed. Else git
+/// runs in the nearest folder on disk at or above the absolute path (no
+/// file is opened), and the absolute path passes on: it maps to the same
+/// repo-relative path from any folder. `folders` keeps the root of each
+/// folder, so files in one folder start one git process. Each error names
+/// the argument as typed.
+fn locate_card(
+    here: &CliGitSource,
+    cwd: &str,
+    cwd_repo: Option<&(String, String)>,
+    folders: &mut std::collections::HashMap<String, String>,
+    arg: &str,
+) -> anyhow::Result<(String, String)> {
+    if let Some((root, prefix)) = cwd_repo {
+        match card::normalise_target(arg, root, prefix) {
+            Ok(_) => return Ok((root.clone(), arg.to_owned())),
+            Err(card::TargetError::Outside(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let path = card::absolute_arg(arg, cwd);
+    let shown = card::shown_path(arg);
+    let Some(folder) = git_source::nearest_folder(&path) else {
+        anyhow::bail!("'{shown}' is in no git repository");
     };
-    if let Some((other, _, _)) = located.iter().find(|(_, _, r)| r != root) {
-        anyhow::bail!(
-            "'{}' and '{}' are in different repositories. Give the files of one repository in each call.",
-            card::shown_path(first),
-            card::shown_path(other)
-        );
-    }
-    if here.get_repo_root().is_ok_and(|cwd_root| cwd_root == *root) {
-        return Ok((here, files.to_vec()));
-    }
-    let source = CliGitSource::in_dir(root.clone());
-    Ok((
-        source,
-        located.into_iter().map(|(_, path, _)| path).collect(),
-    ))
+    let root = if let Some(root) = folders.get(folder) {
+        root.clone()
+    } else {
+        let root = here.toplevel_in(folder).map_err(|e| match e {
+            NoToplevel::NoRepository => anyhow::anyhow!("'{shown}' is in no git repository"),
+            NoToplevel::Git(message) => anyhow::anyhow!("'{shown}': {message}"),
+        })?;
+        folders.insert(folder.to_owned(), root.clone());
+        root
+    };
+    card::target_below(&path, &root, arg)?;
+    Ok((root, path))
+}
+
+/// True when `GIT_DIR` or `GIT_WORK_TREE` is set and not empty. Git hooks
+/// set `GIT_DIR`.
+fn git_repo_env_set() -> bool {
+    ["GIT_DIR", "GIT_WORK_TREE"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
 }
 
 /// Resolve `--diff` to a concrete file list, mutating `args.diff_files`.
