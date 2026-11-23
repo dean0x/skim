@@ -109,6 +109,7 @@ pub(crate) trait GitDataSource {
 pub(crate) struct CliGitSource {
     runner: CommandRunner,
     dir: Option<String>,
+    original_head_objects: bool,
 }
 
 /// Why [`CliGitSource::toplevel_in`] gave no repository root.
@@ -183,15 +184,32 @@ impl CliGitSource {
         Self {
             runner: CommandRunner::new(),
             dir: None,
+            original_head_objects: false,
         }
     }
 
     /// A source whose git commands all run in `dir`, not in the cwd.
     pub(crate) fn in_dir(dir: String) -> Self {
         Self {
-            runner: CommandRunner::new(),
             dir: Some(dir),
+            ..Self::new()
         }
+    }
+
+    /// Read HEAD metadata from the same original objects as the map's blob reads.
+    /// Other views keep Git's normal treatment of replacement refs.
+    pub(super) fn with_original_head_objects(self, original_head_objects: bool) -> Self {
+        Self {
+            original_head_objects,
+            ..self
+        }
+    }
+
+    fn run_head_query(&self, mut args: Vec<&str>) -> anyhow::Result<(CommandOutput, bool)> {
+        if self.original_head_objects {
+            args.insert(0, "--no-replace-objects");
+        }
+        self.run_git(&args)
     }
 
     /// Run git with `args`, in `dir` when it is set.
@@ -344,7 +362,7 @@ impl GitDataSource for CliGitSource {
     }
 
     fn list_tracked_files(&self, repo_root: &str, no_lazy_fetch: bool) -> anyhow::Result<HeadTree> {
-        let (out, cut) = self.run_git(&tracked_files_args(repo_root, no_lazy_fetch))?;
+        let (out, cut) = self.run_head_query(tracked_files_args(repo_root, no_lazy_fetch))?;
         tracked_files_from(&out, cut)
     }
 
@@ -354,7 +372,8 @@ impl GitDataSource for CliGitSource {
         path: Option<&str>,
         no_lazy_fetch: bool,
     ) -> anyhow::Result<HeadCounts> {
-        let (out, cut) = self.run_git(&head_line_count_args(repo_root, path, no_lazy_fetch))?;
+        let (out, cut) =
+            self.run_head_query(head_line_count_args(repo_root, path, no_lazy_fetch))?;
         head_line_counts_from(&out, cut)
     }
 

@@ -86,7 +86,7 @@ pub(crate) fn run(
     let git_source = match card_source(&raw_args.files) {
         Ok((source, files)) => {
             raw_args.files = files;
-            source
+            source.with_original_head_objects(raw_args.map)
         }
         Err(e) => {
             note(format_args!("skim heatmap: {e}"));

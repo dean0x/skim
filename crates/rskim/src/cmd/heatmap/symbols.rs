@@ -1,7 +1,7 @@
 //! Bounded symbol reads from the HEAD tree.
 
 use rskim_core::{
-    Declaration, Parser, ast_size_limit, declarations, detect_language_from_path,
+    Declaration, Language, Parser, ast_size_limit, declarations, detect_language_from_path,
     enclosing_declaration,
 };
 
@@ -103,6 +103,13 @@ impl<'a, F: Fn(&str, u64) -> Option<String>> Reader<'a, F> {
         for d in scan.decls {
             // Ask the declaration owner if this kind can enclose a byte.
             if enclosing_declaration(std::slice::from_ref(&d), d.byte_range.start) != Some(&d) {
+                continue;
+            }
+            // A bracketed JS or TS method key is an expression, not a declared name.
+            if matches!(lang, Language::JavaScript | Language::TypeScript)
+                && d.kind == "method_definition"
+                && d.name.starts_with('[')
+            {
                 continue;
             }
             if found.rows.len() == MAX_SYMBOLS {

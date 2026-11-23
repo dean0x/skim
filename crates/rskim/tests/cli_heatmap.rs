@@ -5036,6 +5036,57 @@ fn test_heatmap_map_keeps_head_symbols_after_an_uncommitted_edit() {
     assert_eq!(after.as_bytes(), before.as_bytes());
 }
 
+#[test]
+fn test_heatmap_map_shows_method_names_but_not_key_expressions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = "class Report {\n[keyFor('title')]() {}\ntitle() {}\n}\n";
+    git_init(root);
+    git_commit_files(
+        root,
+        &[("report.js", source), ("report.ts", source)],
+        "feat: add reports",
+        MAP_COMMIT_TIME,
+    );
+    let text = heatmap_stdout(root, MAP_ARGS);
+    for path in ["report.js", "report.ts"] {
+        assert!(
+            text.contains(&format!(
+                "{path}: 1 commit, 4 lines, score 4\n  class_declaration Report:1\n  method_definition Report::title:3\n"
+            )),
+            "{text}"
+        );
+    }
+    assert!(!text.contains("keyFor"), "{text}");
+}
+
+#[test]
+fn test_heatmap_map_takes_stats_and_symbols_from_the_same_head_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    git_commit_files(
+        root,
+        &[
+            ("a.rs", "fn original() {}\n"),
+            ("b.rs", "\nfn other() {}\n"),
+        ],
+        "feat: add files",
+        MAP_COMMIT_TIME,
+    );
+    let out = StdCommand::new("git")
+        .args(["replace", "HEAD:a.rs", "HEAD:b.rs"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = heatmap_stdout(root, MAP_ARGS);
+    assert!(
+        text.contains("a.rs: 1 commit, 1 line, score 1\n  function_item original:1\n"),
+        "{text}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_heatmap_map_closed_stderr_keeps_full_stdout() {
@@ -5067,7 +5118,7 @@ fn test_heatmap_map_closed_stderr_keeps_full_stdout() {
 }
 
 #[test]
-fn test_heatmap_help_names_map_and_its_token_budget() {
+fn test_heatmap_help_describes_the_map_budget_and_symbol_rows() {
     common::skim()
         .args(["heatmap", "--help"])
         .assert()
@@ -5076,5 +5127,13 @@ fn test_heatmap_help_names_map_and_its_token_budget() {
         .stdout(predicate::str::contains("--tokens <N>"))
         .stdout(predicate::str::contains(
             "default: 1000; range: 1 to 10000000",
+        ))
+        .stdout(predicate::str::contains("row caps below (not for --map)"))
+        .stdout(predicate::str::contains("12 symbol rows per file"))
+        .stdout(predicate::str::contains("kind name:line"))
+        .stdout(predicate::str::contains("+N more"))
+        .stdout(predicate::str::contains("top-level const names"))
+        .stdout(predicate::str::contains(
+            "JSON, YAML and TOML have no symbol rows",
         ));
 }

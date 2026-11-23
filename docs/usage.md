@@ -292,12 +292,12 @@ Symbol rows have the form `kind name:line`, with the tree-sitter kind and a 1-ba
 |----------|-------------|
 | Rust | Functions, methods, trait function declarations, structs, enums, unions, traits, modules and macros. No constants, statics, type aliases, fields or enum variants. |
 | Go | Functions, methods and named types (`type_spec`). No constants or variables. |
-| TypeScript (with TSX) and JavaScript (with JSX) | Functions, classes and methods, plus TypeScript interfaces and enums. A top-level `const`, `let` or `var` with one identifier gives a `variable_declarator` row. No function-local variables, destructured names or type aliases. |
+| TypeScript (with TSX) and JavaScript (with JSX) | Functions, classes and methods, plus TypeScript interfaces and enums. A top-level `const`, `let` or `var` with one identifier gives a `variable_declarator` row. No function-local variables, destructured names, computed method keys or type aliases. |
 | Python | Functions, methods and classes. |
 | Other tree-sitter languages | Named functions, type definitions and containers when the grammar gives the node a `name` field. For example, C and C++ function nodes use `declarator` instead, so these nodes give no rows. |
 | JSON, YAML, TOML and unsupported formats | No symbol rows. The map can still show file stats. |
 
-Skim reads symbols only from regular files at HEAD. It does not read the work tree, symbolic links or submodule entries. Uncommitted changes do not affect the map. The parse budget covers at most 500 file attempts, 32 MiB in total and 1 MiB per file. These limits do not use a timer.
+The map uses the original regular-file blobs at HEAD for file sizes, line counts and symbols. It does not read the work tree, symbolic links or submodule entries. In a partial clone, a symbol read can fetch a missing blob. Uncommitted changes do not affect the map. The parse budget covers at most 500 file attempts, 32 MiB in total and 1 MiB per file. These limits do not use a timer.
 
 Use `--tokens N` to set the cl100k token budget. The default is 1,000. The allowed range is 1 to 10,000,000. The budget covers all of stdout, with the header, warnings, whole file blocks and trailer. If skim cannot fit the header or verify that the output fits, it prints only the trailer. This trailer alone can exceed a very small budget.
 

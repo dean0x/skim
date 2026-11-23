@@ -337,7 +337,7 @@ skim heatmap --detail coupling   # 25 rows of one section
 skim heatmap --top 3             # --top sets the rows of every view
 skim heatmap --diff main         # default view for the files changed vs main
 skim heatmap --insights          # top 20 ranked findings
-skim heatmap --map               # token-bounded map with HEAD symbols
+skim heatmap --map               # HEAD symbol map: --tokens; no --top
 skim heatmap --json              # JSON version 2: compact and capped
 ```
 <!-- skim-end -->"#,
@@ -819,8 +819,7 @@ mod tests {
         // call the insights JSON "agent-friendly".
         assert!(content.contains("skim heatmap --detail"));
         assert!(!content.contains("agent-friendly"));
-        // It names that --top sets the rows of every view and that the JSON
-        // is version 2, and it gives the JSON as capped.
+        // Keep the established row-cap and JSON examples. The map line names its exception.
         assert!(
             content
                 .contains("skim heatmap --top 3             # --top sets the rows of every view\n")
@@ -835,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_every_render_names_the_token_bounded_heatmap_map() {
-        let map_line = "skim heatmap --map               # token-bounded map with HEAD symbols";
+        let map_line = "skim heatmap --map               # HEAD symbol map: --tokens; no --top";
         for (name, content) in all_renders() {
             assert_eq!(
                 content.lines().filter(|line| *line == map_line).count(),

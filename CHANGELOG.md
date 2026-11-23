@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `skim heatmap --since` accepts a date in `YYYY-MM-DD` form and uses 00:00 UTC on that date.
-- `skim heatmap --map` shows file stats and symbol names from HEAD in hotspot order. Use `--tokens N` to set the text map's budget (default 1,000; range 1 to 10,000,000).
+- `skim heatmap --map` shows file stats and up to 12 `kind name:line` rows from HEAD per file in hotspot order. A `+N more` line counts extra names. TypeScript and JavaScript include top-level `const` names. Data formats have no symbol rows. Use `--tokens N` to set the text map's budget (default 1,000; range 1 to 10,000,000).
 - Agent guidance includes `skim heatmap --map` for a repository outline.
 
 ### Changed

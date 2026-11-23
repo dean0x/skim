@@ -360,7 +360,7 @@ OPTIONS:
     --path <DIR>                  Scope analysis to files under this path
     --diff <BASE>                 Default view for the files changed vs BASE (three-dot diff)
     --detail <SECTION>            One full section: hotspots|coupling|fix-risk|modules|bus-factor
-    --top <N>                     Rows of each list in every view (replaces the caps below)
+    --top <N>                     Set the row caps below (not for --map)
     --json, --format json         Output JSON (version 2: one compact line, capped, with counts)
     --no-exclude                  Keep the files of the default excludes (see DEFAULT EXCLUDES)
     --include-docs                Keep doc files and non-code folders (see NON-CODE PATHS)
@@ -387,6 +387,18 @@ HOTSPOT RANK:
     If scores match, more commits come first. If both values match, skim
     sorts by path, lowest first.
     If HEAD data is not available, skim warns and ranks by commits.
+
+REPOSITORY MAP:
+    Each file block shows commits, lines at HEAD and score. If the file has
+    a co-change partner, a \"changes with\" line names the first partner.
+    Up to 12 symbol rows per file show kind name:line in source order.
+    Lines start at 1. A +N more line counts extra names from the scan.
+    Rust and Go show functions, methods and named types, not fields or constants.
+    TypeScript and JavaScript also show top-level const names, not local variables.
+    Python shows classes, methods and functions. Other grammars show named
+    functions, types and containers. JSON, YAML and TOML have no symbol rows.
+    The cl100k budget covers the header, warnings, whole file blocks and trailer.
+    A trailer alone can exceed a small budget.
 
 SECTIONS (--detail names):
     hotspots     Files with the highest scores (see HOTSPOT RANK)
