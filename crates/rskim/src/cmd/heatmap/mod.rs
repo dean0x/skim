@@ -17,6 +17,7 @@ mod map;
 mod metrics;
 mod noise;
 mod output;
+mod symbols;
 mod types;
 mod view;
 mod window;
@@ -63,6 +64,7 @@ fn debug_note(message: std::fmt::Arguments<'_>) {
 }
 
 /// Run the `skim heatmap` subcommand.
+#[allow(clippy::disallowed_methods)] // Heatmap analysis output uses a locked handle.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -98,7 +100,7 @@ pub(crate) fn run(
     }
 
     // Move raw_args into run_with_source for resolution and execution
-    run_with_source(&git_source, raw_args, analytics)
+    run_with_source(&git_source, raw_args, analytics, &mut io::stdout().lock())
 }
 
 /// The git source for the file cards, and the file arguments to use with it.
@@ -558,7 +560,7 @@ fn load_head_data(
     let mut unmatched = 0;
     for (path, count) in counts {
         match entries.get_mut(&path) {
-            Some(HeadEntry::Regular(lines)) => *lines = Some(count),
+            Some(HeadEntry::Regular { lines, .. }) => *lines = Some(count),
             Some(HeadEntry::Other) => (),
             None => unmatched += 1,
         }
@@ -577,7 +579,7 @@ fn trace_head_data(head_tree: Option<&HeadTree>) {
             let mut regular = 0;
             let mut counted = 0;
             for entry in entries.values() {
-                if let HeadEntry::Regular(lines) = entry {
+                if let HeadEntry::Regular { lines, .. } = entry {
                     regular += 1;
                     counted += usize::from(lines.is_some());
                 }
@@ -600,11 +602,11 @@ fn trace_head_data(head_tree: Option<&HeadTree>) {
 ///
 /// All git I/O is routed through `source` — infra checks (repo detection, root,
 /// shallow clone, commit count) and the commit fetch all use the same trait object.
-#[allow(clippy::disallowed_methods)] // Heatmap analysis output; skim-generated, locked handle for atomic multi-line write
 fn run_with_source(
     source: &dyn GitDataSource,
     args: HeatmapArgs,
     analytics: &crate::analytics::AnalyticsConfig,
+    out: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
     let PreparedCommits {
         commits,
@@ -672,8 +674,11 @@ fn run_with_source(
 
     // Step 10: Render
     let elapsed = start_time.elapsed();
-    let mut stdout = io::stdout().lock();
-    let label = write_output(&mut stdout, &result, &config, &spec, cards.as_ref())?;
+    let mut symbols =
+        symbols::Reader::new(head_tree.as_ref(), |oid, size| source.read_blob(oid, size));
+    let label = write_output(out, &result, &config, &spec, cards.as_ref(), |path| {
+        symbols.read(path)
+    })?;
 
     // Step 11: Fire-and-forget analytics
     record_heatmap_analytics(analytics, label, elapsed);
@@ -693,10 +698,17 @@ fn write_output(
     config: &HeatmapConfig,
     spec: &view::ViewSpec,
     cards: Option<&view::Section<card::Card>>,
+    read_symbols: impl FnMut(&str) -> symbols::FileSymbols,
 ) -> anyhow::Result<&'static str> {
     if let Some(budget) = config.map {
         let cl100k_ready = crate::tokens::cl100k_is_ready();
-        let text = map::render(result, spec, budget, &|s| map_token_count(s, cl100k_ready));
+        let text = map::render(
+            result,
+            spec,
+            budget,
+            &|s| map_token_count(s, cl100k_ready),
+            read_symbols,
+        );
         out.write_all(text.as_bytes())?;
         return Ok("skim heatmap --map");
     }
@@ -821,13 +833,15 @@ fn keep_at_head(
     let mut at_head = AtHead::default();
     result.files.retain_mut(|file| {
         match head_tree.get(&file.path) {
-            Some(HeadEntry::Regular(Some(lines))) => {
+            Some(HeadEntry::Regular {
+                lines: Some(lines), ..
+            }) => {
                 file.lines = *lines;
                 return true;
             }
             // History and grep share the same path scope. An in-scope, nonempty
             // file with no text count is binary, but it still exists at HEAD.
-            Some(HeadEntry::Regular(None)) => (),
+            Some(HeadEntry::Regular { lines: None, .. }) => (),
             Some(HeadEntry::Other) | None => at_head.not_at_head += 1,
         }
         at_head.dropped.insert(file.path.clone());
@@ -1561,6 +1575,7 @@ mod tests {
         tracked: TrackedStub,
         counts: Option<git_source::HeadCounts>,
         count_calls: std::cell::RefCell<Vec<(String, Option<String>)>>,
+        blob_calls: std::cell::Cell<usize>,
         shallow: bool,
     }
 
@@ -1574,6 +1589,7 @@ mod tests {
                 tracked: listed(&["src/main.rs"]),
                 counts: Some(Vec::new()),
                 count_calls: Default::default(),
+                blob_calls: Default::default(),
                 shallow: false,
             }
         }
@@ -1643,6 +1659,10 @@ mod tests {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("simulated grep failure"))
         }
+        fn read_blob(&self, _oid: &str, _size: u64) -> Option<String> {
+            self.blob_calls.set(self.blob_calls.get() + 1);
+            None
+        }
         fn show_prefix(&self) -> anyhow::Result<String> {
             Ok(String::new())
         }
@@ -1652,9 +1672,9 @@ mod tests {
     fn test_head_data_uses_one_scoped_count_and_joins_only_regular_entries() {
         let source = StubSource {
             tracked: TrackedStub::Listed(HeadTree::from([
-                ("src/main.rs".into(), HeadEntry::Regular(None)),
+                ("src/main.rs".into(), regular(None)),
                 ("src/link.rs".into(), HeadEntry::Other),
-                ("src/binary.rs".into(), HeadEntry::Regular(None)),
+                ("src/binary.rs".into(), regular(None)),
             ])),
             counts: Some(vec![
                 ("src/main.rs".into(), 12),
@@ -1678,9 +1698,9 @@ mod tests {
             [("/stub/repo".into(), Some("src".into()))]
         );
         let tree = prepared.head_tree.unwrap();
-        assert_eq!(tree["src/main.rs"], HeadEntry::Regular(Some(12)));
+        assert_eq!(tree["src/main.rs"], regular(Some(12)));
         assert_eq!(tree["src/link.rs"], HeadEntry::Other);
-        assert_eq!(tree["src/binary.rs"], HeadEntry::Regular(None));
+        assert_eq!(tree["src/binary.rs"], regular(None));
         assert_eq!(
             prepared.warnings,
             ["HEAD data: 2 line-count rows have no tree entry."]
@@ -1895,13 +1915,16 @@ mod tests {
         paths
     }
 
+    fn regular(lines: Option<u64>) -> HeadEntry {
+        HeadEntry::Regular {
+            oid: "a".repeat(40),
+            size: 2,
+            lines,
+        }
+    }
+
     fn listed(paths: &[&str]) -> TrackedStub {
-        TrackedStub::Listed(
-            paths
-                .iter()
-                .map(|&p| (p.into(), HeadEntry::Regular(None)))
-                .collect(),
-        )
+        TrackedStub::Listed(paths.iter().map(|&p| (p.into(), regular(None))).collect())
     }
 
     #[test]
@@ -2222,12 +2245,41 @@ mod tests {
             resolve_config(args, &StubSource::with_malformed(0), &mut Vec::new(), 0).unwrap();
         let spec = view::ViewSpec::from_config(&config);
         let mut out = Vec::new();
-        let label = write_output(&mut out, &make_test_result(), &config, &spec, None).unwrap();
+        let label = write_output(&mut out, &make_test_result(), &config, &spec, None, |_| {
+            symbols::FileSymbols::default()
+        })
+        .unwrap();
         assert_eq!(label, "skim heatmap --map");
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("Heatmap map: test 2024-10-01..2025-01-01, 10 commits"));
         assert!(text.contains("src/main.rs"));
         assert!(!text.contains("Hotspots (commits x lines):"));
+    }
+
+    #[test]
+    fn test_map_without_head_listing_keeps_stats_and_reads_no_blobs() {
+        let source = StubSource {
+            tracked: TrackedStub::Unavailable,
+            ..StubSource::with_malformed(0)
+        };
+        let args = parse_args(&["--map".into(), "--since=0".into()]).unwrap();
+        let mut out = Vec::new();
+        let exit = run_with_source(
+            &source,
+            args,
+            &crate::analytics::AnalyticsConfig::from_process(true, None),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(source.blob_calls.get(), 0);
+        assert!(text.contains(HEAD_UNAVAILABLE));
+        assert!(text.contains("src/main.rs: 1 commit, 0 lines, score 0\n"));
+        assert_eq!(
+            text.lines().last(),
+            Some("[skim] 1 of 1 files; read error: 1 — adjust the map budget with --tokens")
+        );
     }
 
     // -----------------------------------------------------------------------
