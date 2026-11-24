@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-11-24
+
 ### Added
 
 - `skim heatmap --since` accepts a date in `YYYY-MM-DD` form and uses 00:00 UTC on that date.
